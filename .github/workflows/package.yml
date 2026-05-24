@@ -85,7 +85,7 @@ jobs:
             dir="$(dirname "$skill_md")"
             name="$(basename "$dir")"
             # Zip files only (SKILL.md at archive root), no directory entries, skip .gitignore.
-            ( cd "$dir" && find . -type f ! -name '.gitignore' ! -path './docs/*' | sed 's|^\./||' | sort | zip -X "../dist/${name}.skill" -@ )
+            ( cd "$dir" && find . -type f ! -name '.gitignore' | sed 's|^\./||' | sort | zip -X "../dist/${name}.skill" -@ )
             echo "Built dist/${name}.skill"
           done
           ls -l dist

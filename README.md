@@ -42,11 +42,11 @@ long lines, a table of contents, running headers, and widow/orphan control.
 Bundles the needed LaTeX packages locally, so no full texlive install. Ships a
 self-contained test fixture that doubles as the smoke test.
 
-Sample pages from that fixture (full PDF: [`markdown-latex-report/docs/sample-report.pdf`](markdown-latex-report/docs/sample-report.pdf)):
+Sample pages from that fixture (full PDF: [`demo/markdown-latex-report/sample-report.pdf`](demo/markdown-latex-report/sample-report.pdf)):
 
 | Title and contents | Code with line wrapping | Nine-column table |
 | :---: | :---: | :---: |
-| [![title and contents](markdown-latex-report/docs/preview/01-title-toc.png)](markdown-latex-report/docs/sample-report.pdf) | [![code listing with wrapping](markdown-latex-report/docs/preview/02-code-wrapping.png)](markdown-latex-report/docs/sample-report.pdf) | [![nine column table](markdown-latex-report/docs/preview/03-wide-table.png)](markdown-latex-report/docs/sample-report.pdf) |
+| [![title and contents](demo/markdown-latex-report/preview/01-title-toc.png)](demo/markdown-latex-report/sample-report.pdf) | [![code listing with wrapping](demo/markdown-latex-report/preview/02-code-wrapping.png)](demo/markdown-latex-report/sample-report.pdf) | [![nine column table](demo/markdown-latex-report/preview/03-wide-table.png)](demo/markdown-latex-report/sample-report.pdf) |
 
 ## Installation
 
