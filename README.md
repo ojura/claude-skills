@@ -24,6 +24,15 @@ captures feature-gating headers from the SPA, and provides a clean Python API
 for listing conversations, downloading file attachments, and reading Code-web
 session event streams. Only needs the sessionKey cookie.
 
+### cdp-daemon
+
+Drives an already-running Chrome over the DevTools Protocol from scripts without
+triggering a permission modal on every call. Holds one persistent CDP
+WebSocket, auto-presses Chrome's "Allow remote debugging?" dialog via AT-SPI,
+and exposes a small local HTTP API for targets, attach, eval, arbitrary CDP
+calls, and a buffered event stream. Useful for reading cookies, evaluating JS,
+navigating, or watching network traffic in the user's real logged-in browser.
+
 ## Installation
 
 Copy a skill directory into your Claude Code skills location, or install the
