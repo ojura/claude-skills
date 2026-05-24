@@ -45,9 +45,9 @@ self-contained test fixture that doubles as the smoke test.
 Sample pages from that fixture (full PDF: [`markdown-latex-report/docs/sample-report.pdf`](markdown-latex-report/docs/sample-report.pdf)):
 
 <p align="center">
-  <a href="markdown-latex-report/docs/sample-report.pdf#page=1"><img src="markdown-latex-report/docs/preview/01-title-toc.png" width="270" alt="title and contents"></a>
-  <a href="markdown-latex-report/docs/sample-report.pdf#page=8"><img src="markdown-latex-report/docs/preview/02-code-wrapping.png" width="270" alt="code listing with line wrapping"></a>
-  <a href="markdown-latex-report/docs/sample-report.pdf#page=6"><img src="markdown-latex-report/docs/preview/03-chart-and-table.png" width="270" alt="chart and a content-rich table"></a>
+  <a href="markdown-latex-report/docs/sample-report.pdf"><img src="markdown-latex-report/docs/preview/01-title-toc.png" width="270" alt="title and contents"></a>
+  <a href="markdown-latex-report/docs/sample-report.pdf"><img src="markdown-latex-report/docs/preview/02-code-wrapping.png" width="270" alt="code listing with line wrapping"></a>
+  <a href="markdown-latex-report/docs/sample-report.pdf"><img src="markdown-latex-report/docs/preview/03-chart-and-table.png" width="270" alt="chart and a content-rich table"></a>
 </p>
 <p align="center"><em>Title and contents &middot; code with line wrapping &middot; a generated chart with a column-sized table.<br>Click any page for the full PDF.</em></p>
 

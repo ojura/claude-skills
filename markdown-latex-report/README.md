@@ -20,15 +20,15 @@ travels with it. Click any page to open the full PDF.
 
 **Title block and table of contents**
 
-[![title and contents](docs/preview/01-title-toc.png)](docs/sample-report.pdf#page=1)
+[![title and contents](docs/preview/01-title-toc.png)](docs/sample-report.pdf)
 
 **Code listings that wrap long lines (note the continuation arrows) with identifier-aware breaks in inline code**
 
-[![code listing with line wrapping](docs/preview/02-code-wrapping.png)](docs/sample-report.pdf#page=8)
+[![code listing with line wrapping](docs/preview/02-code-wrapping.png)](docs/sample-report.pdf)
 
 **A generated chart, and a table whose columns auto-size to fit: long `.cpp` paths break at the slashes, and a C++ template in the prose column breaks inside the angle brackets**
 
-[![chart and a content-rich table](docs/preview/03-chart-and-table.png)](docs/sample-report.pdf#page=6)
+[![chart and a content-rich table](docs/preview/03-chart-and-table.png)](docs/sample-report.pdf)
 
 ## What you get
 
