@@ -17,6 +17,8 @@ The skill provides a frozen Playwright/Chromium pipeline plus the discipline rul
 
 This skill is for **iterative print layout work**, not one-shot PDF conversion. If you have a single HTML file and want a PDF once, plain `chrome --headless --print-to-pdf` works fine. The skill earns its place when you are going to render-inspect-edit the same document fifteen times and want the inspection loop to be cheap and the discipline rules to stick.
 
+It is especially useful for getting ChatGPT to iterate fast on non-trivial HTML renders. Left to its own devices on a layout with embedded Google Fonts, ChatGPT tends to reach for its built-in PDF tooling, switch rendering engines mid-task, or silently substitute fonts when the requested family does not resolve, so a one-line edit turns into a re-litigation of the whole approach and a PDF that looks fine but is set in the wrong typeface. This skill pins the engine, forces deterministic font embedding, and fails loudly instead of substituting, which keeps the model on a short edit-render-inspect loop rather than reasoning its way off the rails.
+
 ## Quick start
 
 ```bash
