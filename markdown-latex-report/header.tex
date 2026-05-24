@@ -1,0 +1,250 @@
+% header.tex: pandoc header-includes for report.
+% Polishes tables, links, code, headings, and margins using only
+% widely-available LaTeX packages (texlive-latex-base/recommended).
+% Verified against: booktabs, longtable, tabularx, array, colortbl,
+% xcolor, hyperref, caption, fancyhdr, fancyvrb.
+
+% ---- Tables ----
+\usepackage{booktabs}      % \toprule \midrule \bottomrule
+\usepackage{longtable}     % multi-page tables (pandoc default)
+\usepackage{tabularx}      % X column type with auto-wrap
+\usepackage{array}         % >{...} column prefix, \arraybackslash
+\usepackage{colortbl}      % row coloring
+\setlength{\tabcolsep}{3pt}     % was 6pt; column widths assume a small inter-column budget
+\renewcommand{\arraystretch}{1.15}
+\setlength{\arrayrulewidth}{0.3pt}
+
+% Two-line subtitle helper: each line stays centered in the title block.
+% No vspace between lines (so they read as one breath); \par alone for the
+% break opportunity.
+\newcommand{\subtwoline}[2]{#1\par\nobreak #2}
+
+% Pre-empt pandoc's default \subtitle by defining it ourselves first;
+% pandoc's later \providecommand will then no-op. The \vspace gives the
+% title room to breathe before the subtitle block starts.
+\makeatletter
+\newcommand{\subtitle}[1]{%
+  \apptocmd{\@title}{\par\vspace{0.9em}{\large #1\par}}{}{}%
+}
+\makeatother
+
+% TeX Gyre Pagella's right-single-quote (U+2019) glyph is visually heavy;
+% pandoc's smart-quote conversion produces \textquoteright from every
+% apostrophe in body text, which then renders as that heavy glyph. Remap
+% to the typewriter straight apostrophe \textquotesingle for a leaner
+% look. Applies uniformly to all body-text apostrophes.
+\renewcommand{\textquoteright}{\textquotesingle}
+
+% Targeted footnote spacing: \thanks footnotes (\fnsymbol) stay compact;
+% only the first numeric body footnote on a page gets extra leading space,
+% so the † → 1 transition has visual separation while * → † stays tight.
+% Trick: wrap \@makefntext to prepend a vskip when the marker is numeric
+% AND the previous footnote was a symbolic one. We track that via a flag.
+\makeatletter
+\newif\if@prevfnsymbolic
+\@prevfnsymbolictrue   % start true: first body footnote on title page benefits
+
+% Save the original \thanks (article-class defined macro that mutates
+% the title's thanks-list and bumps the footnote counter).
+\let\@hdr@orig@thanks\thanks
+\renewcommand{\thanks}[1]{%
+  \@hdr@orig@thanks{#1}%
+  \global\@prevfnsymbolictrue}
+
+\let\@hdr@orig@makefntext\@makefntext
+\renewcommand{\@makefntext}[1]{%
+  \ifnum\value{footnote}>0
+    \if@prevfnsymbolic
+      \vspace{0.5em}%
+      \global\@prevfnsymbolicfalse
+    \fi
+  \fi
+  \@hdr@orig@makefntext{#1}}
+\makeatother
+% Note: \arrayrulecolor{ruleline!35} is set further down, after \definecolor.
+
+% ---- Color theme ----
+\usepackage{xcolor}
+\definecolor{accent}{HTML}{1F6FB5}     % steel-blue
+\definecolor{accent2}{HTML}{B85C00}    % burnt-orange (warnings)
+\definecolor{rowalt}{HTML}{F4F7FA}     % subtle alternating row
+\definecolor{ruleline}{HTML}{4A6076}
+\arrayrulecolor{ruleline!35}    % faint inter-row rules in longtables
+
+% ---- microtype: protrusion, expansion, character-level tracking ----
+% Subtle typographic polish: small glyph protrusion into the right margin,
+% imperceptible font expansion to improve justification, and smarter
+% character tracking. Works out of the box with lualatex + fontspec.
+\usepackage{microtype}
+
+% ---- Widow / orphan control ----
+% widows-and-orphans (Mittelbach) does two things: (1) `[prevent-all]`
+% sets \clubpenalty, \widowpenalty, \displaywidowpenalty, \brokenpenalty
+% all to 10 000, forbidding the page-breaker from creating any of them;
+% (2) reports any that nevertheless slip through in the .log so we can
+% deal with them by hand. The package is bundled locally; see Makefile.
+\usepackage[prevent-all]{widows-and-orphans}
+\definecolor{codebg}{HTML}{F4F4EE}
+\definecolor{codeborder}{HTML}{D5D9DC}
+
+% ---- Hyperlinks: colored, not boxed ----
+\usepackage[colorlinks=true,
+            linkcolor=accent,
+            urlcolor=accent,
+            citecolor=accent,
+            allbordercolors={1 1 1}]{hyperref}
+
+% ---- Heading styles via plain \makeatletter overrides (no titlesec) ----
+\makeatletter
+\renewcommand\section{\@startsection{section}{1}{\z@}%
+  {-3.5ex plus -1ex minus -.2ex}%
+  {2.0ex plus .2ex}%
+  {\normalfont\Large\bfseries\color{accent}}}
+\renewcommand\subsection{\@startsection{subsection}{2}{\z@}%
+  {-2.5ex plus -1ex minus -.2ex}%
+  {1.2ex plus .2ex}%
+  {\normalfont\large\bfseries\color{accent}}}
+\renewcommand\subsubsection{\@startsection{subsubsection}{3}{\z@}%
+  {-2.0ex plus -.7ex minus -.2ex}%
+  {.8ex plus .2ex}%
+  {\normalfont\normalsize\bfseries\color{accent!75!black}}}
+\makeatother
+
+% ---- Code (verbatim and inline) ----
+% fvextra extends fancyvrb with breaklines support. Bundled locally
+% (fvextra.sty, upquote.sty) so the build works without modifying the
+% texlive install. fvextra requires upquote.
+\usepackage{upquote}
+\usepackage{fvextra}
+% Verbatim blocks: framed, subtle background, break long lines at
+% whitespace AND at characters when needed. Applies to pandoc's
+% Highlighting environment via inherited \fvset defaults.
+\fvset{frame=single,
+       rulecolor=\color{codeborder},
+       framesep=4pt,
+       fontsize=\small,
+       breaklines=true,
+       breakanywhere=true,
+       breakindent=2em,
+       samepage=true}        % no page-break inside a Verbatim block
+
+% Pandoc defines `Highlighting` via \DefineVerbatimEnvironment WITHOUT
+% picking up our \fvset{samepage=true} global default (it overrides
+% \FV@KeyValues with just commandchars). Re-bind it with samepage in the
+% per-env option list so \interlinepenalty=10000 is in scope inside the
+% env.
+\usepackage{etoolbox}
+\AtBeginDocument{%
+  \DefineVerbatimEnvironment{Highlighting}{Verbatim}%
+    {commandchars=\\\{\},samepage=true}%
+}
+
+% fvextra @Break (active under breaklines=true) emits an anti-aliasing
+% overlap glue (\vspace{-\FV@backgroundcolorboxoverlap}, default 0.25pt)
+% AFTER each line's hbox via \FV@bgcoloroverlap (fvextra.sty:3698). That
+% glue node sits UPSTREAM of fancyvrb's \penalty\interlinepenalty (which
+% goes before the next box). TeX's break-finding sees the glue as a
+% feasible candidate at p=0, ignoring the downstream penalty. samepage
+% therefore has no teeth on syntax-highlighted blocks.
+%
+% Why a naive `\nobreak\vspace{-X}` isn't enough:
+%   fancyvrb's @i (the first-line dispatcher) wraps line-processing in an
+%   extra `\hbox{}`, so the trailing \FV@bgcoloroverlap runs in restricted
+%   HMODE. In hmode, `\vspace{-X}` expands to `\vadjust{\vskip-X\vskip 0pt}`
+%   -- the \vskip nodes get queued for emission into the OUTER vlist AFTER
+%   the line's hbox is shipped. A preceding `\nobreak` in hmode emits a
+%   penalty INSIDE the hbox -- which the page-breaker can't see (penalties
+%   inside hboxes don't affect page-breaking). Net result: the \vskip
+%   lands in the outer vlist unprotected, and the page-breaker still sees
+%   a p=0 candidate immediately after the first verbatim line.
+%
+% Fix: build the protective penalty + glue as one atomic vlist unit. In
+% vmode, emit \penalty\@M then \vskip directly. In hmode (the @i case),
+% wrap BOTH inside a single \vadjust so they enter the outer vlist
+% together. \vspace's hmode/vmode duality is the trap; bypassing \vspace
+% removes it. The overlap remains visually (PDF anti-aliasing trick to
+% hide seams between line backgrounds) but the page-breaker never sees
+% it as a feasible candidate.
+\makeatletter
+\def\FV@bgcoloroverlap{%
+  \ifx\FV@backgroundcolorboxoverlap\relax
+  \else
+    \ifvmode
+      \penalty\@M
+      \vskip-\FV@backgroundcolorboxoverlap\relax
+    \else
+      \vadjust{\penalty\@M\vskip-\FV@backgroundcolorboxoverlap\relax}%
+    \fi
+  \fi}
+\makeatother
+
+% ---- Captions ----
+\usepackage[font=small,labelfont=bf,labelsep=period]{caption}
+
+% ---- Breakable \texttt for table cells ----
+% Long identifiers like applyCorrectionsPolarAndConvertToCartesian are
+% atomic tokens that won't break to fit narrow columns. Workaround: a
+% pandoc Lua filter (filter-codebreaks.lua) rewrites \texttt{...} content
+% to insert \allowbreak{} at separators (::, _, ., -, /, () and camelCase
+% boundaries. Identifiers without any natural break may still bleed a
+% few points; that's the cost of all-lowercase compound names.
+
+% ---- Margins ----
+\usepackage[margin=0.9in,top=0.85in,bottom=1.0in]{geometry}
+
+% ---- Header / footer ----
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{}
+% Running header text. Set \runninghead in your document (or via pandoc
+% header-includes) to put a label top-left; defaults to empty.
+\providecommand{\runninghead}{}
+\fancyhead[L]{\small\color{ruleline}\runninghead}
+\fancyhead[R]{\small\color{ruleline}\thepage}
+\fancyfoot[C]{}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+\setlength{\headheight}{14pt}
+\setlength{\headsep}{18pt}
+
+% ---- Pandoc-friendly tightlist ----
+% Pandoc emits \tightlist for any list whose items lack blank lines between
+% them. Default zeros itemsep + parskip; we leave a small itemsep so even
+% "tight" lists with multi-sentence items breathe a little.
+\providecommand{\tightlist}{\setlength{\itemsep}{0.35em}\setlength{\parskip}{0pt}}
+
+% ---- Diff syntax highlighting: green for +, red for - ----
+% Pandoc's skylighting maps ```diff added/removed lines to \VariableTok and
+% \StringTok respectively, which the default pygments style renders as two
+% nearly identical blues (RGB 0.10/0.09/0.49 vs 0.25/0.44/0.63), invisible
+% as a diff. Override with conventional green/red so + and - read at a
+% glance. C++ string literals (also \StringTok) become red, which matches
+% common IDE themes; variable highlighting in other languages (e.g. shell)
+% becomes green. Pandoc emits the \newcommand{...} definitions ahead of
+% the include-in-header content, so \renewcommand here lands cleanly.
+\definecolor{diffaddcolor}{HTML}{007020}
+\definecolor{diffdelcolor}{HTML}{B22222}
+\renewcommand{\VariableTok}[1]{\textcolor{diffaddcolor}{#1}}
+\renewcommand{\StringTok}[1]{\textcolor{diffdelcolor}{#1}}
+
+% ---- longtable spacing ----
+\setlength{\LTpre}{6pt}
+\setlength{\LTpost}{6pt}
+
+% ---- Graphics extension priority: prefer PDF over PNG ----
+% (allows extensionless image refs in markdown, or works alongside
+%  the report's explicit `.pdf` refs.)
+\DeclareGraphicsExtensions{.pdf,.png,.jpg}
+
+% ---- Global graphics: cap to text area, keep aspect ratio ----
+% Matplotlib charts are typically saved at a fixed inch size that's
+% wider than this report's text column; without this they overflow
+% the right margin.
+\setkeys{Gin}{width=\linewidth,keepaspectratio}
+
+% ---- Pandoc passes `figure`-floats through; let them break across pages ----
+\usepackage{float}
+\floatplacement{figure}{H}
+
+% ---- A "softnote" for cross-reference paragraphs ----
+\providecommand{\softnote}[1]{\par\medskip\noindent{\itshape\color{ruleline}#1}\par\medskip}
