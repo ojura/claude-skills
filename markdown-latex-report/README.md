@@ -26,9 +26,9 @@ travels with it. Click any page to open the full PDF.
 
 [![code listing with line wrapping](docs/preview/02-code-wrapping.png)](docs/sample-report.pdf)
 
-**A nine-column table with columns auto-sized to fit the page, no overflow**
+**A generated chart, and a table whose columns auto-size to fit: long `.cpp` paths break at the slashes, and a C++ template in the prose column breaks inside the angle brackets**
 
-[![nine column table](docs/preview/03-wide-table.png)](docs/sample-report.pdf)
+[![chart and a content-rich table](docs/preview/03-chart-and-table.png)](docs/sample-report.pdf)
 
 ## What you get
 

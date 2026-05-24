@@ -44,9 +44,9 @@ self-contained test fixture that doubles as the smoke test.
 
 Sample pages from that fixture (full PDF: [`markdown-latex-report/docs/sample-report.pdf`](markdown-latex-report/docs/sample-report.pdf)):
 
-| Title and contents | Code with line wrapping | Nine-column table |
+| Title and contents | Code with line wrapping | Chart and rich table |
 | :---: | :---: | :---: |
-| [![title and contents](markdown-latex-report/docs/preview/01-title-toc.png)](markdown-latex-report/docs/sample-report.pdf) | [![code listing with wrapping](markdown-latex-report/docs/preview/02-code-wrapping.png)](markdown-latex-report/docs/sample-report.pdf) | [![nine column table](markdown-latex-report/docs/preview/03-wide-table.png)](markdown-latex-report/docs/sample-report.pdf) |
+| [![title and contents](markdown-latex-report/docs/preview/01-title-toc.png)](markdown-latex-report/docs/sample-report.pdf) | [![code listing with wrapping](markdown-latex-report/docs/preview/02-code-wrapping.png)](markdown-latex-report/docs/sample-report.pdf) | [![chart and a content-rich table](markdown-latex-report/docs/preview/03-chart-and-table.png)](markdown-latex-report/docs/sample-report.pdf) |
 
 ## Installation
 
