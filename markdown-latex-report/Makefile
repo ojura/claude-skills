@@ -12,6 +12,7 @@
 REPORT      ?= test/REPORT.md
 CHARTS_DIR  ?= test/charts
 PLOT        ?= $(CHARTS_DIR)/plot_findings.py
+PYTHON      ?= python3
 OUT         := $(basename $(notdir $(REPORT))).pdf
 
 PANDOC_MAINFONT ?= TeX Gyre Pagella
@@ -29,7 +30,7 @@ all: $(OUT)
 charts: $(CHARTS_STAMP)
 
 $(CHARTS_STAMP): $(PLOT)
-	/usr/bin/python3 $(PLOT)
+	$(PYTHON) $(PLOT)
 	@touch $@
 
 # ---- PDF ----

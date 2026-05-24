@@ -172,6 +172,33 @@ or hardware accessory required), and High (requires hardware revision or has kno
 
 ![Headline speedup summary: geometric mean over all bread types per optimisation.](charts/headline_speedups.png){width=90%}
 
+# Source Map
+
+Every finding in this report traces to one of the firmware source files below. Paths are given
+in full, relative to the firmware tree root, because three of the files share a `sample_` prefix
+and the reader will otherwise confuse them. The line counts are for the `v3.4.1-stable` revision.
+
+| source file | subsystem | lines | headline finding |
+| :--- | :--- | ---: | :--- |
+| `firmware/coil_driver/pre_energisation_scheduler.cpp` | coil | 412 | Cold start is on the critical path; pre-energise at bread-presence instead of latch-confirmed. |
+| `firmware/darkness_control/sample_darkness_lookup_table.cpp` | darkness | 880 | Linear 512-entry scan every 10 ms; replace with `DarknessLUT<uint16_t, 512, InterpolationMode::Linear>`. |
+| `firmware/state_machine/bread_presence_transition_handlers.cpp` | state machine | 1204 | Adds the `onBreadPresenceConfirmed` transition and the early-removal cancel path. |
+| `firmware/slot_control/calibrate_and_engage_sweep.cpp` | slot control | 333 | One-time width sweep removes the per-cycle squeeze-force retry. |
+| `firmware/thermal/adaptive_throttle_bypass_controller.cpp` | thermal | 291 | Throttle threshold inherited from a smaller vent; bypass below 30 C ambient. |
+| `firmware/spring/per_weight_class_spring_constant_table.cpp` | spring | 156 | Single 750 g calibration over-shoots light loads; index by bread class instead. |
+
+The data carried through these paths is held in a handful of strongly-typed containers. Their
+declared types are verbose enough that they wrap, which is intentional: the alternative is a forest
+of `typedef`s that hide the actual layout from review.
+
+| container | declared type | where |
+| :--- | :--- | :--- |
+| spring table | `std::unordered_map<BreadClass, SpringConstantTable<float, kMaxBreadClasses>>` | `spring/per_weight_class_spring_constant_table.cpp` |
+| thermal ring | `std::array<ThermalSample, POLL_WINDOW_SAMPLES>` | `thermal/adaptive_throttle_bypass_controller.cpp` |
+| event queue | `std::variant<ColdStartEvent, PreWarmEvent, EjectEvent, BreadRemovedEarlyEvent>` | `state_machine/bread_presence_transition_handlers.cpp` |
+| darkness LUT | `DarknessLUT<uint16_t, 512, InterpolationMode::Linear>` | `darkness_control/sample_darkness_lookup_table.cpp` |
+| job record | `std::optional<ToastJob>` returned by `slot_control::estimateBreadClass` | `slot_control/calibrate_and_engage_sweep.cpp` |
+
 ---
 
 # Chapter 1. Coil Pre-energisation
