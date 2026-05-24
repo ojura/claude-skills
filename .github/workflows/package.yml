@@ -7,6 +7,11 @@ on:
 permissions:
   contents: write
 
+# Opt the bundled JS actions into Node 24 now (they ship on Node 20, which is
+# being retired). Silences the deprecation warning and future-proofs the runs.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   test-polisher:
     # Reports pass/fail only. Does NOT gate the package job below.
@@ -62,6 +67,14 @@ jobs:
           pages=$(pdfinfo REPORT.pdf | awk '/^Pages:/ {print $2}')
           echo "REPORT.pdf has $pages pages"
           test "$pages" -gt 10
+
+      - name: Upload built report PDF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-fixture-pdf
+          path: markdown-latex-report/REPORT.pdf
+          if-no-files-found: warn
 
   package:
     runs-on: ubuntu-latest
