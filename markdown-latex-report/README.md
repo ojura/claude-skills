@@ -14,13 +14,13 @@ skill is the accumulated fix for all of that, packaged as a reusable build.
 ## Sample output
 
 These pages are from the bundled test fixture, rendered by the pipeline. The full
-PDF lives in the repo at [`demo/markdown-latex-report/sample-report.pdf`](../demo/markdown-latex-report/sample-report.pdf)
-(GitHub opens it in its PDF viewer). Preview images render on GitHub; they are
-not part of the installed skill.
+PDF ships with the skill at [`docs/sample-report.pdf`](docs/sample-report.pdf)
+(GitHub opens it in its PDF viewer), so the skill is self-contained: the demo
+travels with it.
 
 | Title and contents | Code with line wrapping | Nine-column table |
 | :---: | :---: | :---: |
-| [![title and contents](../demo/markdown-latex-report/preview/01-title-toc.png)](../demo/markdown-latex-report/sample-report.pdf) | [![code listing with wrapping](../demo/markdown-latex-report/preview/02-code-wrapping.png)](../demo/markdown-latex-report/sample-report.pdf) | [![nine column table](../demo/markdown-latex-report/preview/03-wide-table.png)](../demo/markdown-latex-report/sample-report.pdf) |
+| [![title and contents](docs/preview/01-title-toc.png)](docs/sample-report.pdf) | [![code listing with wrapping](docs/preview/02-code-wrapping.png)](docs/sample-report.pdf) | [![nine column table](docs/preview/03-wide-table.png)](docs/sample-report.pdf) |
 
 ## What you get
 

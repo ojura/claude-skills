@@ -8,3 +8,6 @@
 test/charts/*.png
 test/charts/*.pdf
 test/charts/.stamp
+
+# Demo PDF is committed so the skill is self-contained
+!docs/sample-report.pdf
