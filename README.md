@@ -10,7 +10,11 @@ Renders HTML into magazine-quality PDFs with embedded fonts and deterministic,
 print-correct layout. A fixed Playwright pipeline, strict font discipline (no
 silent substitution), timing instrumentation, and a layout-review checklist.
 Built through a cross-environment iteration between an OpenAI model, an
-Anthropic model, and the author. See its SKILL.md and README for usage.
+Anthropic model, and the author. Especially useful for getting ChatGPT to
+iterate fast on non-trivial HTML renders: it pins the rendering engine and
+forces deterministic font embedding, so a one-line edit does not turn into an
+engine switch or a silent font substitution. See its SKILL.md and README for
+usage.
 
 ### claude-web-fetcher
 
