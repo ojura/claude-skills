@@ -8,3 +8,6 @@
 test/charts/*.png
 test/charts/*.pdf
 test/charts/.stamp
+
+# Demo assets are tracked (committed for the README)
+!docs/sample-report.pdf

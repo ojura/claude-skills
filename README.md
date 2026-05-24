@@ -33,6 +33,21 @@ and exposes a small local HTTP API for targets, attach, eval, arbitrary CDP
 calls, and a buffered event stream. Useful for reading cookies, evaluating JS,
 navigating, or watching network traffic in the user's real logged-in browser.
 
+### markdown-latex-report
+
+Turns a single Markdown file into a polished, book-quality PDF via pandoc and
+lualatex. A Lua filter auto-sizes table columns (wide tables never overflow) and
+breaks long identifiers in inline code; the preamble adds code listings that wrap
+long lines, a table of contents, running headers, and widow/orphan control.
+Bundles the needed LaTeX packages locally, so no full texlive install. Ships a
+self-contained test fixture that doubles as the smoke test.
+
+Sample pages from that fixture (full PDF: [`markdown-latex-report/docs/sample-report.pdf`](markdown-latex-report/docs/sample-report.pdf)):
+
+| Title and contents | Code with line wrapping | Nine-column table |
+| :---: | :---: | :---: |
+| [![title and contents](markdown-latex-report/docs/preview/01-title-toc.png)](markdown-latex-report/docs/sample-report.pdf) | [![code listing with wrapping](markdown-latex-report/docs/preview/02-code-wrapping.png)](markdown-latex-report/docs/sample-report.pdf) | [![nine column table](markdown-latex-report/docs/preview/03-wide-table.png)](markdown-latex-report/docs/sample-report.pdf) |
+
 ## Installation
 
 Copy a skill directory into your Claude Code skills location, or install the

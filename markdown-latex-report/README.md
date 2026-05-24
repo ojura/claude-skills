@@ -11,6 +11,16 @@ margin, long code lines run off the page, long identifiers in inline code break
 in ugly places or not at all, and you get widows and orphans everywhere. This
 skill is the accumulated fix for all of that, packaged as a reusable build.
 
+## Sample output
+
+These pages are from the bundled test fixture, rendered by the pipeline. The full
+PDF is [`docs/sample-report.pdf`](docs/sample-report.pdf) (GitHub opens it in its
+PDF viewer).
+
+| Title and contents | Code with line wrapping | Nine-column table |
+| :---: | :---: | :---: |
+| [![title and contents](docs/preview/01-title-toc.png)](docs/sample-report.pdf) | [![code listing with wrapping](docs/preview/02-code-wrapping.png)](docs/sample-report.pdf) | [![nine column table](docs/preview/03-wide-table.png)](docs/sample-report.pdf) |
+
 ## What you get
 
 - Wide tables that compute their own column widths from content and never
