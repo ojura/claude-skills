@@ -30,6 +30,39 @@ jobs:
       - name: Run quick smoke test
         run: bash claude-html-pdf-polisher/scripts/test_skill_quick.sh
 
+  test-report:
+    # Builds the markdown-latex-report fixture PDF. Reports pass/fail only;
+    # does NOT gate the package job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pandoc \
+            texlive-luatex texlive-latex-recommended texlive-latex-extra \
+            texlive-fonts-recommended fonts-texgyre \
+            poppler-utils
+          pip install matplotlib numpy
+
+      - name: Build the report fixture
+        working-directory: markdown-latex-report
+        run: make
+
+      - name: Assert PDF produced
+        working-directory: markdown-latex-report
+        run: |
+          test -s REPORT.pdf
+          pages=$(pdfinfo REPORT.pdf | awk '/^Pages:/ {print $2}')
+          echo "REPORT.pdf has $pages pages"
+          test "$pages" -gt 10
+
   package:
     runs-on: ubuntu-latest
     steps:
