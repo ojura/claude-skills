@@ -8,6 +8,28 @@ permissions:
   contents: write
 
 jobs:
+  test-polisher:
+    # Reports pass/fail only. Does NOT gate the package job below.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils
+
+      - name: Install Python deps
+        run: pip install playwright pillow pypdfium2 pymupdf
+
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run quick smoke test
+        run: bash claude-html-pdf-polisher/scripts/test_skill_quick.sh
+
   package:
     runs-on: ubuntu-latest
     steps:
