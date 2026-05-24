@@ -16,11 +16,19 @@ skill is the accumulated fix for all of that, packaged as a reusable build.
 These pages are from the bundled test fixture, rendered by the pipeline. The full
 PDF ships with the skill at [`docs/sample-report.pdf`](docs/sample-report.pdf)
 (GitHub opens it in its PDF viewer), so the skill is self-contained: the demo
-travels with it.
+travels with it. Click any page to open the full PDF.
 
-| Title and contents | Code with line wrapping | Nine-column table |
-| :---: | :---: | :---: |
-| [![title and contents](docs/preview/01-title-toc.png)](docs/sample-report.pdf) | [![code listing with wrapping](docs/preview/02-code-wrapping.png)](docs/sample-report.pdf) | [![nine column table](docs/preview/03-wide-table.png)](docs/sample-report.pdf) |
+**Title block and table of contents**
+
+[![title and contents](docs/preview/01-title-toc.png)](docs/sample-report.pdf)
+
+**Code listings that wrap long lines (note the continuation arrows) with identifier-aware breaks in inline code**
+
+[![code listing with line wrapping](docs/preview/02-code-wrapping.png)](docs/sample-report.pdf)
+
+**A nine-column table with columns auto-sized to fit the page, no overflow**
+
+[![nine column table](docs/preview/03-wide-table.png)](docs/sample-report.pdf)
 
 ## What you get
 
