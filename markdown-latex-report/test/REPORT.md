@@ -1306,6 +1306,12 @@ purposes of this report.
 
 ## I.2 Reference Implementation
 
+The reference implementation is presented in four parts. We keep each part short
+deliberately: a listing that runs longer than a page is a listing nobody reads.
+
+First, the module preamble and the physical constants. All constants are from empirical
+calibration against the BEADS v2.1 corpus, in SI units unless noted.
+
 ```python
 #!/usr/bin/env python3
 """pop_time_model.py: Crispmaster 9000 pop-time theoretical minimum estimator.
@@ -1314,87 +1320,80 @@ Usage: python3 pop_time_model.py --bread-type=white_thin --darkness-target=0.65
 """
 
 import argparse
-import math
-from dataclasses import dataclass, field
-from typing import Callable
+from dataclasses import dataclass
 
 # Physical constants for bread thermal model (all SI units unless otherwise noted)
-BREAD_THERMAL_CONDUCTIVITY_W_PER_MK = 0.14          # W/(m*K): typical for white bread
-BREAD_DENSITY_KG_PER_M3 = 270.0                      # kg/m^3: typical for sliced white bread
-BREAD_SPECIFIC_HEAT_J_PER_KGK = 2800.0               # J/(kg*K): typical for bread
-COIL_POWER_DENSITY_W_PER_M2 = 8500.0                 # W/m^2: Crispmaster 9000 coil rated output
-AMBIENT_TEMPERATURE_C = 20.0                          # degrees C: standard test condition
-DARKNESS_TARGET_NOMINAL = 0.65                        # normalised; corresponds to 'medium' setting
+BREAD_DENSITY_KG_PER_M3 = 270.0          # kg/m^3: typical for sliced white bread
+BREAD_SPECIFIC_HEAT_J_PER_KGK = 2800.0   # J/(kg*K): typical for bread
+COIL_POWER_DENSITY_W_PER_M2 = 8500.0     # W/m^2: Crispmaster 9000 coil rated output
+AMBIENT_TEMPERATURE_C = 20.0             # degrees C: standard test condition
+DARKNESS_TARGET_NOMINAL = 0.65           # normalised; corresponds to 'medium' setting
+WATER_SPECIFIC_HEAT_J_PER_KGK = 4186.0   # J/(kg*K): for the moisture correction term
+```
 
+Next, the bread parameter type and the corpus table. Each entry was fitted to 1000-trial
+measurements; the four floats are thickness, density factor, moisture fraction, and per-face
+wall contact area.
 
+```python
 @dataclass
 class BreadParameters:
     """Physical parameters for a bread type. All dimensions in metres."""
     name: str
     thickness_m: float
     density_factor: float      # relative to BREAD_DENSITY_KG_PER_M3
-    moisture_fraction: float   # 0.0 to 1.0; higher moisture increases effective specific heat
+    moisture_fraction: float   # 0.0 to 1.0; higher moisture raises effective specific heat
     contact_area_m2: float     # wall contact area per face
 
 
-# BEADS v2.1 bread corpus parameters (empirically calibrated against 1000-trial measurements)
 BREAD_CORPUS: dict[str, BreadParameters] = {
-    'white_thin':    BreadParameters('White (thin)',    0.010, 0.82, 0.38, 0.0120),
-    'white_thick':   BreadParameters('White (thick)',   0.014, 0.88, 0.40, 0.0124),
-    'wholegrain':    BreadParameters('Wholegrain',      0.013, 1.05, 0.42, 0.0122),
-    'rye':           BreadParameters('Rye',             0.015, 1.18, 0.44, 0.0125),
-    'sourdough':     BreadParameters('Sourdough',       0.018, 1.10, 0.46, 0.0123),
-    'bagel_half':    BreadParameters('Bagel half',      0.020, 1.22, 0.48, 0.0118),
-    'english_muffin':BreadParameters('English Muffin', 0.019, 0.95, 0.43, 0.0120),
-    'crumpet':       BreadParameters('Crumpet',         0.022, 0.88, 0.52, 0.0115),
+    'white_thin':     BreadParameters('White (thin)',   0.010, 0.82, 0.38, 0.0120),
+    'white_thick':    BreadParameters('White (thick)',  0.014, 0.88, 0.40, 0.0124),
+    'wholegrain':     BreadParameters('Wholegrain',     0.013, 1.05, 0.42, 0.0122),
+    'rye':            BreadParameters('Rye',            0.015, 1.18, 0.44, 0.0125),
+    'sourdough':      BreadParameters('Sourdough',      0.018, 1.10, 0.46, 0.0123),
+    'bagel_half':     BreadParameters('Bagel half',     0.020, 1.22, 0.48, 0.0118),
+    'english_muffin': BreadParameters('English Muffin', 0.019, 0.95, 0.43, 0.0120),
+    'crumpet':        BreadParameters('Crumpet',        0.022, 0.88, 0.52, 0.0115),
 }
+```
 
+The core of the model is a single function: a 1D surface-heating estimate with a moisture
+correction to the effective specific heat. It returns a lower bound that real firmware cannot
+reach without hardware changes.
 
+```python
 def theoretical_minimum_ms(bread: BreadParameters, darkness_target: float,
-                            coil_power_w_per_m2: float = COIL_POWER_DENSITY_W_PER_M2,
-                            ambient_c: float = AMBIENT_TEMPERATURE_C) -> float:
-    """Compute the theoretical minimum pop-time in milliseconds for a given bread type.
-    Assumes ideal coil (no warm-up time), zero firmware overhead, and perfect wall contact.
-    This is a lower bound; real firmware cannot achieve this without hardware changes."""
+                           coil_power_w_per_m2: float = COIL_POWER_DENSITY_W_PER_M2) -> float:
+    """Theoretical minimum pop-time (ms) for a bread type. Assumes an ideal coil (no
+    warm-up), zero firmware overhead, and perfect wall contact. Lower bound only."""
     effective_density = bread.density_factor * BREAD_DENSITY_KG_PER_M3
-    # Moisture increases effective specific heat (water: 4186 J/(kg*K))
+    # Moisture raises effective specific heat (water is far higher than dry crumb)
     effective_cp = (BREAD_SPECIFIC_HEAT_J_PER_KGK * (1.0 - bread.moisture_fraction) +
-                    4186.0 * bread.moisture_fraction)
-    # Energy required to raise surface temperature to darkness threshold
-    # Simplified: treat as surface heating problem with 1D conduction into slab
-    delta_t_target = 180.0 * darkness_target   # degrees C above ambient at target darkness
-    slab_half_thickness = bread.thickness_m / 2.0
-    mass_per_m2 = effective_density * slab_half_thickness  # kg/m^2 of contact area
+                    WATER_SPECIFIC_HEAT_J_PER_KGK * bread.moisture_fraction)
+    delta_t_target = 180.0 * darkness_target        # degrees C above ambient at target
+    mass_per_m2 = effective_density * (bread.thickness_m / 2.0)  # kg/m^2 of contact area
     energy_per_m2 = mass_per_m2 * effective_cp * delta_t_target  # J/m^2
+    total_energy = energy_per_m2 * bread.contact_area_m2         # J
     heat_flux = coil_power_w_per_m2 * bread.contact_area_m2      # W
-    total_energy = energy_per_m2 * bread.contact_area_m2          # J
-    time_s = total_energy / heat_flux
-    return time_s * 1000.0  # convert to ms
+    return (total_energy / heat_flux) * 1000.0      # seconds to milliseconds
+```
 
+Finally, the command-line entry point, which either prints a single estimate or a table over
+the whole corpus.
 
+```python
 def main():
     parser = argparse.ArgumentParser(description='Pop-time theoretical minimum estimator')
-    parser.add_argument('--bread-type', default='white_thin', choices=list(BREAD_CORPUS.keys()),
-                        help='Bread type from BEADS v2.1 corpus')
-    parser.add_argument('--darkness-target', type=float, default=DARKNESS_TARGET_NOMINAL,
-                        help='Darkness target [0.0, 1.0]; 0.65 is medium setting')
-    parser.add_argument('--coil-power', type=float, default=COIL_POWER_DENSITY_W_PER_M2,
-                        help='Coil power density W/m^2; default is Crispmaster 9000 rated')
+    parser.add_argument('--bread-type', default='white_thin', choices=list(BREAD_CORPUS.keys()))
+    parser.add_argument('--darkness-target', type=float, default=DARKNESS_TARGET_NOMINAL)
     parser.add_argument('--all', action='store_true', help='Print table for all bread types')
     args = parser.parse_args()
 
-    if args.all:
-        print(f"{'Bread Type':<20} {'Thickness (mm)':>15} {'Moisture (%)':>13} {'Min Pop-Time (ms)':>18}")
-        print('-' * 70)
-        for key, bread in BREAD_CORPUS.items():
-            t_ms = theoretical_minimum_ms(bread, args.darkness_target, args.coil_power)
-            print(f"{bread.name:<20} {bread.thickness_m*1000:>15.1f} {bread.moisture_fraction*100:>13.1f} {t_ms:>18.1f}")
-    else:
-        bread = BREAD_CORPUS[args.bread_type]
-        t_ms = theoretical_minimum_ms(bread, args.darkness_target, args.coil_power)
-        print(f"Bread type:       {bread.name}")
-        print(f"Darkness target:  {args.darkness_target:.2f}")
-        print(f"Theoretical min:  {t_ms:.1f} ms")
+    targets = BREAD_CORPUS.values() if args.all else [BREAD_CORPUS[args.bread_type]]
+    for bread in targets:
+        t_ms = theoretical_minimum_ms(bread, args.darkness_target)
+        print(f"{bread.name:<20} {bread.thickness_m * 1000:>6.1f} mm  ->  {t_ms:>7.1f} ms")
 
 
 if __name__ == '__main__':
@@ -1535,41 +1534,42 @@ results to the dashboard. The enclosure maintains ambient temperature to within 
 Celsius; the BEADS runner records ambient temperature at the start of each trial and discards
 trials where ambient temperature deviates by more than 0.5 degrees from the target.
 
-```bash
-# beads_runner.sh: entry point for the CI benchmark harness
-# Called by the post-commit hook with the firmware binary as argument.
-# Runs the BEADS v2.1 suite on all four rack units and exits nonzero on any acceptance failure.
+The harness is `beads_runner.sh`, invoked by the post-commit hook with the firmware binary as
+its argument. It flashes all four rack units, runs the suite, and exits nonzero on any acceptance
+failure. The configuration block defines the rack ports, the acceptance thresholds, and the
+bread corpus.
 
+```bash
 #!/usr/bin/env bash
+# beads_runner.sh: entry point for the CI benchmark harness.
 set -euo pipefail
 
 FIRMWARE_BINARY="${1:?Usage: beads_runner.sh <firmware.bin>}"
-BEADS_VERSION="2.1"
 RACK_UNITS=("/dev/ttyUSB0" "/dev/ttyUSB1" "/dev/ttyUSB2" "/dev/ttyUSB3")
 RESULTS_DIR="/tmp/beads_results_$(date +%Y%m%d_%H%M%S)"
 ACCEPTANCE_THRESHOLD_MEAN_MS=1.0
 ACCEPTANCE_THRESHOLD_P99_MS=5.0
 ACCEPTANCE_THRESHOLD_RETRY_PCT=0.5
 TRIAL_COUNT=200
-BREAD_TYPES=("white_thin" "white_thick" "wholegrain" "rye" "sourdough" "bagel_half" "english_muffin" "crumpet")
-
+BREAD_TYPES=("white_thin" "white_thick" "wholegrain" "rye" \
+             "sourdough" "bagel_half" "english_muffin" "crumpet")
 mkdir -p "${RESULTS_DIR}"
-echo "BEADS v${BEADS_VERSION} CI run: firmware=${FIRMWARE_BINARY} units=${#RACK_UNITS[@]} trials=${TRIAL_COUNT}"
-echo "Results: ${RESULTS_DIR}"
+```
 
+Flashing and benchmarking both run in parallel across the four units, with each unit covering
+two bread types. The script waits on all background jobs before aggregating.
+
+```bash
 # Flash firmware to all rack units in parallel
 for unit in "${RACK_UNITS[@]}"; do
     beads flash --port="${unit}" --firmware="${FIRMWARE_BINARY}" &
 done
 wait
-echo "Firmware flashed to all units."
 
-# Run benchmark suite on all units in parallel; each unit covers 2 bread types
+# Run the suite on all units in parallel; each unit covers 2 bread types
 PIDS=()
 for i in "${!RACK_UNITS[@]}"; do
-    bread_lo=$(( i * 2 ))
-    bread_hi=$(( bread_lo + 1 ))
-    bread_subset=("${BREAD_TYPES[@]:$bread_lo:2}")
+    bread_subset=("${BREAD_TYPES[@]:$(( i * 2 )):2}")
     beads run --port="${RACK_UNITS[$i]}" \
               --bread-types="${bread_subset[*]}" \
               --trials="${TRIAL_COUNT}" \
@@ -1578,9 +1578,12 @@ for i in "${!RACK_UNITS[@]}"; do
     PIDS+=($!)
 done
 for pid in "${PIDS[@]}"; do wait "$pid"; done
-echo "Benchmark runs complete."
+```
 
-# Aggregate and check acceptance criteria
+The final stage aggregates the per-unit results and checks them against the acceptance
+thresholds, comparing to the `v3.4.1-stable` baseline. A nonzero exit here blocks the merge.
+
+```bash
 beads check-acceptance \
     --results-dir="${RESULTS_DIR}" \
     --mean-threshold="${ACCEPTANCE_THRESHOLD_MEAN_MS}" \
