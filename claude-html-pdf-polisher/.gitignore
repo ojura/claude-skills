@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Skill build artifacts (publish as GitHub Releases, not in tree)
+*.skill
+*.zip
+/skill_dist/
+
+# Local work output if someone runs the wrappers from inside the repo
+/render_work/
+/polisher_skill_quick_test/
+/polisher_skill_full_test/

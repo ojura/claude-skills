@@ -1,0 +1,3 @@
+interface:
+  display_name: "Claude HTML PDF Polisher"
+  short_description: "Iterate Claude-generated HTML/CSS print layouts into polished PDFs with a fixed Playwright pipeline."
