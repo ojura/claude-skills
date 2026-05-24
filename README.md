@@ -49,7 +49,7 @@ Sample pages from that fixture (full PDF: [`markdown-latex-report/docs/sample-re
   <a href="markdown-latex-report/docs/sample-report.pdf"><img src="markdown-latex-report/docs/preview/02-code-wrapping.png" width="270" alt="code listing with line wrapping"></a>
   <a href="markdown-latex-report/docs/sample-report.pdf"><img src="markdown-latex-report/docs/preview/03-chart-and-table.png" width="270" alt="chart and a content-rich table"></a>
 </p>
-<p align="center"><em>Title and contents &middot; code with line wrapping &middot; a generated chart with a column-sized table. Click any page for the full PDF.</em></p>
+<p align="center"><em>Title and contents &middot; code with line wrapping &middot; a generated chart with a column-sized table.<br>Click any page for the full PDF.</em></p>
 
 ## Installation
 
