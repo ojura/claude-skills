@@ -73,6 +73,18 @@ single message is never dropped on count alone). Optionally titles retained
 sessions for a themed, chronological picker, mtime-neutrally so none are exposed
 to the mtime-keyed retention sweep.
 
+### recover-deleted-sessions
+
+Recovers Claude Code session transcripts deleted by `rm`, `find -delete`, or a
+retention sweep. Volatility-ordered triage: stop writes to the affected
+filesystem, grab the volatile sources first (open fds, live `claude --resume`
+process memory, the webview renderer's in-memory session state over CDP), take
+the cheap byte-perfect wins (out-of-tree backups, the ext4 journal), then carve
+the raw block device by content pattern and recover the id-less records via ext4
+journal inode extents. Merges, dedupes, validates, repairs app-truncated
+survivors, and restores only on explicit OK. Bundles the proven (scrubbed)
+forensic scripts from a real 60/66-session recovery.
+
 ## Installation
 
 Copy a skill directory into your Claude Code skills location, or install the
