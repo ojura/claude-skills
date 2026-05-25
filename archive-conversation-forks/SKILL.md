@@ -137,15 +137,20 @@ file edit). This registry is the source of truth for what is running right now.
 **Do NOT infer live state from file mtime, "modified today," or the task-output tmp path.**
 They mislead: `--fork-session` mints a new session id, so the live file can differ from what
 recency or the tmp dir suggests (real case: heuristics pointed at `a24119fe` while the
-registry showed the live session was `464771a1`). The `RECENT_HOURS` mtime check in Step 2 is
-only a fallback for sessions with no registry entry. (Optionally `os.kill(pid, 0)` to drop a stale `<pid>.json` from a crashed process; treating a stale entry as live merely over-protects, which is benign.)
+registry showed the live session was `464771a1` - the failure was an agent NOT reading the
+registry, never the registry missing a running session). The registry lists one entry per running
+process and is authoritative; recent-mtime adds no liveness signal, only noise (opening an old chat to
+inspect it bumps its mtime without making it live), so Step 2 uses NO mtime fallback - the registry
+alone decides what is live, read here and re-read again at mutation time (Step 6). (Optionally
+`os.kill(pid, 0)` to drop a stale `<pid>.json` from a crashed process; treating a stale entry as live merely over-protects, which is benign.)
 
 **HARD GATE - identify the live set ONLY from the registry; never proceed on a guess.** Resolve
 each running `sessionId` to its `<sessionId>.jsonl`, confirm the file exists, and take the union as
 the never-touch live set. If the registry is missing/unreadable, or a running `sessionId` doesn't
 resolve to a file, **STOP and ask** - do not fall back to recency, newest mtime, filename, or "the
-one I think I'm in." A wrong live set is not a local error: it seeds the locks, the moves, and the
-titles, so a bad guess cascades through everything downstream. **Why guessing is uniquely lethal
+one I think I'm in." A registry that reads cleanly but lists nothing running IS a valid empty live set:
+proceed with `live={}` once you have confirmed it is genuinely empty (not unreadable). A wrong live set
+is not a local error: it seeds the locks, the moves, and the titles, so a bad guess cascades downstream. **Why guessing is uniquely lethal
 here:** a live conversation forked from a parent is **fork-shaped** - mostly-contained in that
 parent plus a short live tail - so by *content* it is **indistinguishable from an archivable
 `[fork]`**. The registry is the only signal that says "this fork-shaped file is live." Guess by
@@ -188,9 +193,9 @@ records as `(lpu, parentUuid, n_msgs_before_this_boundary)`, the **raw** and **p
 fingerprint lists, and the capped fingerprint->text map. Then build the lpu DAG and partition:
 
 ```python
-import json, glob, os, hashlib, datetime, time
+import json, glob, os, hashlib, datetime
 from collections import defaultdict
-def f8(p): return os.path.basename(p)[:8]
+def f8(p): return os.path.basename(p)[:8]   # 8-char uuid prefix: readable, and used in every report
 def norm(ts):
     # Normalise BOTH forms (epoch-ms int, or ISO string with/without Z/offset) to a naive-UTC ISO
     # string, so lexical max/compare is sound. The store mixes the two, and a raw `str(ts)` of a
@@ -199,15 +204,20 @@ def norm(ts):
     if ts is None: return ""
     try:
         if isinstance(ts,(int,float)):
-            dt=datetime.datetime.utcfromtimestamp(ts/1000)
+            # not utcfromtimestamp() (deprecated in Python 3.12): build an aware UTC dt, then drop tzinfo
+            dt=datetime.datetime.fromtimestamp(ts/1000, datetime.timezone.utc).replace(tzinfo=None)
         else:
             dt=datetime.datetime.fromisoformat(str(ts).replace("Z","+00:00"))
             if dt.tzinfo: dt=dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
         return dt.isoformat()
-    except: return ""   # unparseable -> sort LAST/empty, never a bare int string that mis-sorts vs ISO
+    except: return ""   # unparseable -> "" sorts FIRST/earliest, i.e. treated as oldest: it won't win the recency tiebreak (the safe default)
 
-fps={}; fps_prose={}; ftext={}; owned={}; lref={}; bnd={}; nmsg={}; lts={}; mtime={}; firstmsg={}; global_uuid=defaultdict(set)
-for p in sorted(glob.glob("*.jsonl")):
+fps={}; fps_prose={}; ftext={}; owned={}; lref={}; bnd={}; nmsg={}; lts={}; firstmsg={}; global_uuid=defaultdict(set)
+files=sorted(glob.glob("*.jsonl"))
+# exact set-difference is the whole safety model, so a shared 8-char f8 prefix would silently overwrite
+# one file's sets with another's. Guard it (switch to full-uuid keys if it ever fires):
+assert len({f8(p) for p in files})==len(files), "8-char uuid-prefix collision; key on full uuid"
+for p in files:
     k=f8(p); F=[]; Fp=[]; us=set(); L=set(); B=[]; last=""; n=0; fu=""
     for line in open(p,encoding="utf-8",errors="replace"):
         if '"file-history-snapshot"' in line[:80]: continue
@@ -230,13 +240,15 @@ for p in sorted(glob.glob("*.jsonl")):
             disp=(disp or "").strip()
             if disp: Fp.append(hashlib.md5((o["type"]+disp).encode("utf-8","replace")).hexdigest()[:12])
             if o["type"]=="user" and disp and not fu: fu=disp[:200]   # first plain user message (debris signal)
-            if h not in ftext:   # capped raw-fingerprint -> verbatim text, for downstream quoting
-                ftext[h]=(o["type"], disp.replace("\n"," ")[:600])
+            if h not in ftext:   # capped raw-fingerprint -> text PREVIEW (+ truncation flag), for the doc/judgment
+                # 2000 = a PREVIEW, not a full read. The truncation flag lets the judgment treat any message
+                # that hit the cap as substantive (KEEP): a key/proof can hide past the cap, so a truncated
+                # message is NEVER archived on the preview alone. (memory ~ distinct-fps * 2000.)
+                ftext[h]=(o["type"], disp.replace("\n"," ")[:2000], len(disp)>2000)
             t=norm(o.get("timestamp"));  last=max(last,t) if t else last
         if o.get("type")=="system" and o.get("subtype")=="compact_boundary":
             B.append((o.get("logicalParentUuid"), o.get("parentUuid"), n))  # n = msgs before boundary
     fps[k]=F; fps_prose[k]=Fp; owned[k]=us; lref[k]=L; bnd[k]=B; nmsg[k]=len(F); lts[k]=last; firstmsg[k]=fu
-    mtime[k]=os.path.getmtime(p)
 
 # phantom lpus = referenced but owned by no file
 all_lpus={lp for k in bnd for (lp,_,_) in bnd[k] if lp}
@@ -273,39 +285,38 @@ def canonical(ks):
     cand=[k for k in ks if not is_debris(k)] or ks
     return max(cand, key=lambda k:(len(set(fps[k])), lts[k]))
 
-# keep-locked closure: seed + transitive load-bearing over BOTH edge types
-RECENT_HOURS=12
-# AUTHORITATIVE never-touch: live sessionIds from ~/.claude/sessions/*.json (Step 0).
-# Consult status AND liveness, not just sessionId: a crashed process can leave a stale <pid>.json
-# with status "running". A wrongly-live seed silently skips measurement (the wrong-seed miss above),
-# so drop the dead - over-protection (keeping a truly-live one) is the benign direction.
+# keep-locked closure: seed (canonicals + live) + transitive load-bearing over BOTH edge types.
+# AUTHORITATIVE never-touch: live sessionIds from ~/.claude/sessions/*.json (Step 0). NO mtime term -
+# recent-mtime is NOT a liveness signal (opening a chat to inspect it bumps its mtime; the registry,
+# not mtime, says what is live). Consult status AND liveness: a crashed process can leave a stale
+# <pid>.json with status "running", so drop the dead (os.kill below) - over-protection is benign.
 live=set()
 for sp in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
     try:
         d=json.load(open(sp))
-        if d.get("status")!="running": continue        # not live per the registry's own field
-        try: os.kill(int(d["pid"]),0)                   # ESRCH/ValueError => process gone => stale entry
-        except Exception: continue
-        sid=d.get("sessionId","")[:8]
-        # ENFORCE, don't prefix-match-and-hope: resolve the live sessionId to an actual file in the
-        # store. fps keys are filename[:8]; only equal to sid if the file is named <sessionId>.jsonl
-        # (true in practice, but a forked live session is the case Step 0 warns about - verify it).
-        if sid not in fps:
-            HALT(f"live session {sid} from the registry has no file in this store - resolve before "
-                 f"proceeding; do NOT guess which file is live")   # never silently skip a live session
-        live.add(sid)
-    except: pass
+    except (OSError, ValueError):                       # unreadable/malformed registry file -> skip THIS entry
+        continue
+    if d.get("status")!="running": continue             # not live per the registry's own field
+    try: os.kill(int(d["pid"]),0)                        # ProcessLookupError => process gone => stale entry
+    except (ProcessLookupError, ValueError, KeyError): continue   # (own-user sessions never raise EPERM)
+    sid=d.get("sessionId","")[:8]
+    # OUTSIDE any try, so a raising HALT is NEVER swallowed: resolve the live sessionId to an actual file.
+    # fps keys are filename[:8], equal to sid only if the file is named <sessionId>.jsonl (a forked live
+    # session is the case Step 0 warns about). A running session with no file STOPS the run, never skips.
+    if sid not in fps:
+        HALT(f"live session {sid} from the registry has no file in this store - resolve before "
+             f"proceeding; do NOT guess which file is live")
+    live.add(sid)
 if not live:
-    # registry empty/unreadable, or no running session resolved: do NOT fall back to a recency guess.
-    confirm_no_live_or_HALT()   # Step 0 hard gate: a missing live set stops the run, never defaults
+    # A READABLE registry with nothing running is a valid empty live set: proceed with live={} after the
+    # operator confirms nothing is running. A MISSING/UNREADABLE registry is a HARD STOP. Either way,
+    # never fall back to a recency/mtime guess.
+    confirm_no_live_or_HALT()
+# seed = multi-file-tree canonicals + live. Single-file trees need no seed: union-find already merged
+# any file with a cross-file lpu target (a dep edge) or a co-referenced phantom (shared lpu), so a
+# single-file tree has no cross-file/phantom obligation to close over. NO mtime term (see above).
 seed={canonical(ks) for ks in trees.values() if len(ks)>1}
-seed|={k for k in fps if k in live}                                    # live (authoritative)
-seed|={k for k in fps if (time.time()-mtime[k]) < RECENT_HOURS*3600}   # fallback: recently active
-# CAVEAT: this mtime fallback is defeated by Step 7's opt-in equalisation - a session active
-# recently but equalised to an OLD mtime won't be caught here, and if it's not currently running
-# the Step 0 registry won't catch it either. This includes equalisation from a PRIOR run, which the
-# current operator can't control - so the live registry, not mtime, is the real live signal; this
-# fallback only helps for a never-equalised store. Worst case is over-archiving a recoverable file.
+seed|={k for k in fps if k in live}                                    # live (authoritative, Step 0)
 unsatisfiable={}   # kept file -> {phantom lpus it needs but NO file can source}: origin truly gone
 def locked_closure(seed):
     locked=set(seed); changed=True
@@ -324,73 +335,95 @@ def locked_closure(seed):
                     best=max(srcs, key=lambda s:len(set(fps[s])))  # richest origin
                     locked.add(best); changed=True
     return locked
-locked=locked_closure(seed)
-# Surface unsatisfiable phantoms: a kept file needs a phantom no file can backfill -> its deep origin
-# is genuinely lost (not a cleanup error, but a data-fidelity note worth reporting, never swallowed).
-if unsatisfiable: report_unsatisfiable_phantoms(unsatisfiable)   # e.g. print/flag in the session_map
+locked=locked_closure(seed)   # PRELIMINARY (canonicals+live); the per-tree keep below uses it. The
+                              # DEFINITIVE closure + the unsatisfiable report run after KEPT is known
+                              # (the re-close below), so unsatisfiable reflects the full kept set.
 
-# Per-tree archive judgment FIRST, accumulating the forks we KEEP (this feeds the full kept set below).
-# archive candidate = non-locked, non-canonical fork whose UNIQUE content is trivial (< CEILING msgs)
-# AFTER reading it, OR captured in a user-named durable artifact. Else keep.
+canonicals={canonical(ks) for ks in trees.values()}   # defined once; used by KEPT, C5, and the marker loop
+
+# Per-tree archive judgment: CLASSIFY each non-kept fork as keep-for-unique vs archive-candidate. The
+# orchestrator reads uniq VERBATIM (ftext) INLINE here - an LLM-grade read by the operator running the
+# procedure, not a delegated subagent - and it must finalize BEFORE the re-close (it feeds KEPT). Do NOT
+# move anything yet: a fork judged redundant here can be the sole phantom-backfill SOURCE of a kept-unique
+# fork we keep below, which the re-close protects. Collect candidates; archive after the re-close.
 CEILING=50         # >= this many unique msgs => AUTO-KEEP. Below => JUDGE content, never auto-archive.
-kept_unique_forks=set()
+kept_unique_forks=set(); tree_archive_candidates=set()
 for ks in trees.values():
     if len(ks)==1: continue
     canon=canonical(ks); keep=set(ks)&locked | {canon}
     kept_fp=set().union(*(set(fps[k]) for k in keep)) if keep else set()
     for k in [x for x in ks if x not in keep]:
-        uniq=set(fps[k])-kept_fp           # content found NOWHERE in the kept set
-        if len(uniq)>=CEILING:             # substantial unique work -> AUTO-KEEP, don't even ask
+        uniq=set(fps[k])-kept_fp           # unique vs THIS TREE's kept files (cross-tree dup -> recall pass)
+        if len(uniq)>=CEILING:             # substantial tree-local unique -> AUTO-KEEP, don't even ask
             kept_unique_forks.add(k)
-        else:                              # JUDGMENT ZONE: read uniq VERBATIM (ftext) and judge value.
-            # archive ONLY if self-evidently worthless (empty/tool-only turns, exact replays already in
-            # the canonical, fork-test artifacts, trivial one-shot Q&A). ANY substantive content (a
-            # decision, derivation, key, datum, non-trivial answer, code) -> KEEP. Default KEEP if unsure.
-            judge(k, uniq)                 # placeholder -> either ARCHIVE(k,...) or kept_unique_forks.add(k)
-        # Count is NEVER the sole archive trigger; CEILING only auto-keeps (a 1-message fork can
-        # hold a private key or a proof). Record uniq verbatim (ftext) for the doc + the judgment.
+        else:                              # JUDGMENT ZONE: read uniq VERBATIM (ftext); a uniq message whose
+            # ftext truncation flag is set is auto-substantive (KEEP). Archive ONLY if self-evidently
+            # worthless (empty/tool-only turns, exact replays in the canonical, fork-test artifacts, trivial
+            # one-shot Q&A). ANY substantive content (a decision, derivation, key, datum, code) -> KEEP.
+            judge(k, uniq)                 # -> kept_unique_forks.add(k) OR tree_archive_candidates.add(k)
+        # Count is NEVER the sole archive trigger; CEILING only auto-keeps (a 1-message fork can be a key).
 
-# The FULL kept set, defined ONCE and reused by BOTH the locked-set measurement and the recall pass.
-KEPT = {canonical(ks) for ks in trees.values()} | set(locked) | kept_unique_forks
+# FULL kept set, THEN re-close so EVERY kept file's backfill source / cross-file ancestor is locked.
+# ORPHAN FIX: the seed closure saw only canonicals+live, NOT the kept-unique forks just decided. A kept
+# fork can itself NEED a phantom whose sole source is content-redundant; without this re-close that source
+# is archived and the fork's deep origin orphaned. Re-closing over the FULL kept set folds the source into
+# locked (hence KEPT), so it is protected, not archived.
+KEPT = canonicals | set(locked) | kept_unique_forks
+unsatisfiable={}                           # (re)compute on the DEFINITIVE closure over KEPT, not the seed one
+locked = locked_closure(KEPT); KEPT |= locked
+if unsatisfiable: report_unsatisfiable_phantoms(unsatisfiable)
 
-# MARK every retained file that is NOT a canonical and NOT live - ONE decision, FOUR outcomes.
-# `KEPT - canonicals - live` is the union of: cross-file ancestors, phantom sources, the recent-mtime
-# fallback seed, AND the kept-unique forks. Do NOT assume "ancestor -> bridge": the recent-mtime
-# members are NOT reconstructed prefixes of anything - they can be disjoint substantial standalones,
-# so `[main]` and `none` must be reachable here, not only `[scroll-dep]`/`[fork]`. (Canonicals are
-# `[main]` from selection; live are never-touch. None of these is ever archived - all are in KEPT;
-# load-bearing protects from MOVING, the loop only titles.)
-canonicals={canonical(ks) for ks in trees.values()}
-# load-bearing is PURELY STRUCTURAL and mtime-independent: k is load-bearing iff some KEPT/live file
-# reconstructs scrollback from it - k owns a uuid referenced cross-file, OR k can source a phantom a
-# kept file needs. Deliberately NOTHING about mtime or `locked`: opening a chat in Claude bumps its
-# mtime, so recent-mtime is NOT liveness and NOT a marker signal (during a cleanup it often just means
-# "the user inspected this while deciding"). The recent-mtime seed ONLY protects a just-opened file
-# from archival; it never sets the marker. The marker is structure + residue, period.
+# load-bearing is PURELY STRUCTURAL: k is load-bearing iff some KEPT/live file reconstructs scrollback
+# from it - k owns a uuid referenced cross-file, OR k can source a phantom a kept file needs. Nothing
+# about mtime (the registry, not mtime, is liveness) and nothing about `locked` per se.
 consumers = KEPT | live
 loadbearing  = {b for a in consumers for lp in lref[a] for b in global_uuid.get(lp,()) if b!=a}  # cross-file targets
 needed       = set().union(*(needs(a) for a in consumers)) if consumers else set()                # phantoms they need
 loadbearing |= {s for s in fps if sources(s) & needed}                                            # files that source them
+# loadbearing (ALL sources of a needed phantom) >= the ONE richest source the closure locks; the
+# redundant extra sources stay archivable.
+
+# A fork auto-kept on TREE-LOCAL uniqueness can be GLOBALLY redundant (its tree-unique content duplicated
+# in another tree's kept file). Re-measure vs the full kept set: a kept-unique fork with EXACTLY 0 global
+# residue that backs nothing had incomplete info -> drop it to the recall pass (which archives 0-unique
+# safely). Keeps the taxonomy sound: every remaining ~0-residue KEPT file is then load-bearing -> [scroll-dep].
+for k in sorted(kept_unique_forks):
+    if k in loadbearing: continue
+    if not (set(fps[k]) - set().union(*(set(fps[j]) for j in KEPT if j!=k))):
+        KEPT.discard(k); kept_unique_forks.discard(k); locked.discard(k)   # keep `locked` a subset of KEPT
+
+# Deferred per-tree archives: a candidate moves only if the re-close did NOT lock it (i.e. not load-bearing).
+for k in sorted(tree_archive_candidates - KEPT):
+    # SAFETY ASSERT (backstop to the re-close): archiving k must leave every needed phantom k sources with
+    # ANOTHER kept source - NOT `sources(k) & needed == set()` (a redundant EXTRA source legitimately
+    # sources a needed phantom yet is archivable). The right check: no phantom is left sourceless.
+    for P in (sources(k) & needed):
+        assert any(P in sources(s) for s in KEPT if s!=k), f"archiving {k} would orphan phantom {P}"
+    ARCHIVE(k, "redundant fork; unique content judged worthless after a verbatim read")
+
+# MARK every retained file that is NOT a canonical and NOT live - ONE decision, the markers below.
+# `KEPT - canonicals - live` is the union of cross-file ancestors, phantom sources, and the kept-unique
+# forks. Do NOT assume "ancestor -> bridge": a kept-unique fork is NOT a reconstructed prefix of anything;
+# it can be a disjoint substantial standalone, so `[main]` and `none` must be reachable here, not only
+# `[scroll-dep]`/`[fork]`. (Canonicals are `[main]` from selection; live are never-touch. None of these is
+# ever archived - all are in KEPT; load-bearing protects from MOVING, the loop only titles.)
 for k in sorted(KEPT - canonicals - live):
-    # containment is the family axis -> PROSE overlap with the best-containing head. `head` ALWAYS
-    # resolves to some canonical, so it is meaningful ONLY on the contained branches: gate on `ov`
-    # FIRST and name NO parent for [main].
     head=max(canonicals, key=lambda h: len(set(fps_prose[k]) & set(fps_prose[h])), default=None)
     ov=(len(set(fps_prose[k]) & set(fps_prose[head]))/max(1,len(set(fps_prose[k])))) if head else 0.0
     residue=set(fps[k]) - set().union(*(set(fps[j]) for j in KEPT if j!=k))   # RAW residue, then READ it
-    # NEAR-DISJOINT (low ov):  substantial residue -> [main] (a sub-lineage head, NO parent named)
-    #                          minor                -> none   (a minor standalone)
-    # MOSTLY-CONTAINED (high ov):
-    #   substantive residue                     -> [fork] of `head` (name it; title by the residue)
-    #   trivial/~0 residue AND k in loadbearing  -> [scroll-dep] of the canonical it backs (a recently-
-    #       OPENED file can land here - structural load-bearing decides it, not mtime; only REGISTRY-live
-    #       is never a scroll-dep, recent-mtime is not liveness)
-    #   trivial/~0 residue AND NOT loadbearing   -> a redundant duplicate: normally an archive candidate;
-    #       if it is in KEPT only because recent-mtime protected it (the user just opened it), leave it
-    #       PROVISIONALLY kept and unmarked - re-evaluate once it is clearly not being inspected.
-    # RAW residue catches tool-only content (a pure bridge has ~0 of ANY content). substantial-vs-minor
-    # and trivial-vs-substantive are READ-and-JUDGE judgments, never a CEILING cutoff (CEILING only
-    # auto-KEEPS a fork; reusing it as a title threshold is the borrowed-constant proxy to avoid).
+    # 1) load-bearing AND ~0 residue -> [scroll-dep] of the canonical it backs, REGARDLESS of ov: a pure
+    #    bridge can be prose-disjoint from every head (ov~0) yet raw-redundant. Only REGISTRY-live is never
+    #    a scroll-dep (it is actively growing, not a dead ~0-unique bridge).
+    # 2) else by PROSE containment vs the best-containing head (`head` ALWAYS resolves, so gate on `ov`;
+    #    name a parent ONLY when k is genuinely mostly-contained in head's prose - the Step-3 family signal):
+    #      NEAR-DISJOINT (low ov):  substantial residue -> [main] (a sub-lineage head, NO parent named)
+    #                               minor                -> none   (a minor standalone)
+    #      MOSTLY-CONTAINED (high ov), substantive residue -> [fork] of `head` (name it; title by residue)
+    # There is NO "~0 residue AND NOT load-bearing" branch: recent-mtime is gone and C5 demoted the
+    # globally-redundant kept-unique forks, so every ~0-residue file reaching here is load-bearing (case 1).
+    # RAW residue catches tool-only content (a pure bridge has ~0 of ANY content). substantial-vs-minor and
+    # trivial-vs-substantive are READ-and-JUDGE (the ftext truncation flag forces a long unique msg to KEEP),
+    # never a CEILING cutoff (CEILING only auto-KEEPS a fork; reusing it as a title threshold is the proxy to avoid).
 ```
 
 Record, per archive candidate: its unique message texts (verbatim, from `ftext`), its
@@ -414,15 +447,15 @@ After the per-tree partition, run a global containment pass.
 # Step 2 above and shared by the locked-set measurement and this recall pass - no second definition.
 keptset={k:set(fps[k]) for k in KEPT}
 kept_union=set().union(*keptset.values()) if keptset else set()
-canon_all={canonical(ks) for ks in trees.values()}
-for A in [a for a in fps if a not in KEPT and a not in canon_all and a not in live]:
+# `a not in KEPT` already excludes every canonical (canonicals are a subset of KEPT), so no separate guard.
+for A in [a for a in fps if a not in KEPT and a not in live]:
     # set-difference against the UNION of the whole kept set, NOT any single container - a session
     # whose content is split-contained across two smaller kept files is still 0-unique and redundant
     # (the single-container test `len(fps[b])>=len(fps[A])` had exactly that recall hole).
     missing = set(fps[A]) - kept_union
-    best = min(KEPT, key=lambda b: len(set(fps[A])-keptset[b]), default=None)  # closest single container, for the doc only
+    best = min(KEPT, key=lambda b: len(set(fps[A])-keptset[b]), default=None)  # closest single file, for the doc only
     if not missing:                       # 0 unique vs the kept set: PROVEN redundant (every msg lives somewhere kept)
-        ARCHIVE(A, f"0 unique vs the kept set (closest single container {best})")
+        ARCHIVE(A, f"0 unique vs the kept set as a whole (split-contained; closest single file {best}, which need not individually contain A)")
     elif len(missing) < CEILING:          # JUDGMENT ZONE
         SONNET_CONFIRM(A, best, missing)  # a Sonnet READS missing; archive iff trivial/preserved
     # else: substantial unique -> KEEP
@@ -438,8 +471,11 @@ replay most content; the canonical is the primary by recency + distinct-content)
 
 (`ARCHIVE()`, `SONNET_CONFIRM()`, `judge()`, `nominate_debris()`, `report_unsatisfiable_phantoms()`,
 `HALT()` / `confirm_no_live_or_HALT()` above are pseudocode placeholders - wire them to your move /
-confirm / debris / stop-and-ask steps. `KEPT`, `live`, `kept_unique_forks` etc. are real variables
-defined in the pass.)
+confirm / debris / stop-and-ask steps. `judge()` only ADDS to `kept_unique_forks` or
+`tree_archive_candidates` (it never moves a file - the deferred C6 loop does, after the re-close); the
+orchestrator runs `judge()` inline since it feeds `KEPT`, whereas `SONNET_CONFIRM()` is the recall-pass
+read, batched to the Step-5 agents. `KEPT`, `live`, `kept_unique_forks`, `tree_archive_candidates` etc.
+are real variables defined in the pass.)
 
 **Deterministic debris nomination.** The per-tree partition skips single-file trees
 (`if len(ks)==1: continue`), so a standalone throwaway (an empty `/clear`, a `/resume`, a bare
@@ -479,7 +515,7 @@ sweep, which the protections below guard against size-agnostically.
 - **False family** = files that share only an identical first message (skill preambles like a `/`-prefixed command invocation, or identical compaction headers). The script unions on **lpu values, never on first-message content**, so false families do not merge by construction. Keep a content common-prefix-length (cpl) calculation only as a **diagnostic** to sanity-check tree membership; do not drive the partition off it.
 - **Content-fork members (lpu-union UNDER-groups - do not stop at the lpu tree).** lpu grouping only catches forks that share an lpu value. A fork made by copying messages (fresh uuids, no shared lpu), or a long conversation that continued under a new topic/issue, will NOT union by lpu and masquerades as a separate session/theme. Detect these with a **prose-only** content-overlap pass over the `fps_prose` set from Step 2 (user/assistant TEXT only, no `tool_use`/`tool_result`): if a file shares more than ~60% of its `fps_prose` messages with a larger family member, it is a fork of that family. **Use `fps_prose`, never raw `fps`, for this** - raw content-overlap is confounded by shared tool-results (two sessions that edited the same files share those fingerprints). Real run: one session was 82% *prose*-shared with another theme's canonical (same family, but mis-themed as separate), while a tooling-heavy session showed 100% *raw* overlap with that same canonical yet 1% prose (all shared file-edits) and was a different conversation. The lpu tree is necessary but not sufficient for family membership.
 - **Canonical** = most *distinct* content, recency as tiebreak, chosen among non-debris files (a content floor, so a 3-message newest fork-test never wins over a 2000-message sibling). This ranks on raw-distinct (`len(set(fps[k]))`), which counts tool-churn as content; within a true fork family that still picks the most complete member. If you ever see a canonical chosen wrongly because one member is tool-heavy rather than conversation-heavy, switch the rank key to prose-distinct (`len(set(fps_prose[k]))`); not worth doing pre-emptively.
-- **Load-bearing (never move)** = the `locked` closure: cross-file lpu targets plus phantom-backfill sources, transitively, seeded from canonicals, live sessions (Step 0), and recently-active sessions.
+- **Load-bearing (never move)** = the `locked` closure: cross-file lpu targets plus phantom-backfill sources, transitively, seeded from canonicals and live sessions (Step 0), then re-closed over the full kept set so a kept fork's own backfill source is never archived.
 - **Archive candidate** = a non-locked, non-canonical fork whose unique content, *after someone reads it*, is self-evidently worthless. Compute unique content by set-difference against the kept files, not by prefix-divergence ("diverged at msg 2" and "4 unique messages" routinely disagree; set-difference is the one that matters for data loss). Then **judge the messages, never the count.** A single message can hold a private key, a derivation, or irreplaceable data. `CEILING` (default 50) only auto-*keeps* forks at or above it. Below it is a judgment zone: read the unique messages and archive only the self-evidently worthless (empty / tool-only turns, exact replays already in the canonical, fork-test artifacts, trivial one-shot Q&A). Anything substantive is flagged for human judgment and kept by default.
 
 **Durable-artifact override.** This is the one case where a *high*-unique fork (>= CEILING)
@@ -503,6 +539,14 @@ its unique messages quoted verbatim, the divergence point), and the load-bearing
 in place and why. Each emits `<theme>.json` listing the files its theme proposes to archive.
 Pass each agent the verbatim unique-message texts (`ftext`) so it never opens a multi-MB file.
 
+**Division of labour with the Step-2 script.** The script already SETTLED the deterministic archives
+(exact 0-unique containment in the recall pass) and the orchestrator already ran the per-tree `judge()`
+reads inline (they fed `KEPT`). What is left for these agents is the recall pass's `SONNET_CONFIRM`
+zone - the nonzero-but-below-`CEILING` unique cases: read the `missing` messages verbatim (from `ftext`;
+a message flagged truncated is auto-substantive, so keep it) and confirm each is trivial/preserved
+(archive) or genuinely unique (keep). The agents do NOT re-derive the deterministic 0-unique archives;
+they resolve the judgment-zone cases and document both the settled and the judged.
+
 Each README MUST include an **`## Ingestion`** section: what the theme's canonical should fold
 in, measured as **unique-vs-canonical** (set-difference against the canonical's OWN
 fingerprints, not the whole kept set), split by provenance: (a) **from archived forks**, and
@@ -514,11 +558,16 @@ explicitly "nothing to ingest".
 
 ## Step 6 - finalize the moves (orchestrator only)
 
+**Re-read the live registry first (Step 0 is a snapshot).** Steps 4-5 and the user gate can take minutes
+to hours, during which a session may have gone live. Re-read `~/.claude/sessions/*.json` immediately
+before any `mv` and drop any now-live session from the move list. The registry is the sole liveness
+authority - consult it again at mutation time; never substitute an mtime guess.
+
 0.  **Backup precondition (checked gate, not just a principle).** Before the *first* mutation in the whole run - this move, or Step 7's titling/equalisation, whichever you reach first - confirm a current out-of-tree backup exists OR the `SessionStart` backup hook has fired this session. Do not proceed past this line otherwise. This is the gap that bites in practice: equalising or moving before any backup exists means the first slip has no recovery point.
 1.  Aggregate the keep/archive list. **Show the user the full list (forks + every debris file, with unique-msg counts) and get explicit go/no-go before moving anything.**
 2.  Create `~/claude-archive/<theme>/` dirs (agents already wrote the READMEs there).
 3.  `mv` each confirmed file into its theme dir, preserving the uuid filename. Write `~/claude-archive/manifest.json`: archived-file -> original-path -> theme -> canonical -> reason (enough to restore with one command).
-4.  **Post-move verification (hard gate):** re-scan the project dir; for every kept canonical confirm (a) all its cross-file lpu targets still resolve in the project dir, and (b) every phantom it needs still has a kept backfill source. **Recompute `needs()` / `sources()` VERBATIM (Step 2's definitions) over the POST-move file set** - the pre-move maps are stale, and a re-derived approximation (e.g. `par is not None` without the `nb>0` half) gives false orphan flags. Zero orphans on both. Confirm `total - moved` files remain and no live/registry session was touched.
+4.  **Post-move verification (hard gate):** re-scan the project dir; for every kept file - canonical OR retained fork, since a kept fork can need a phantom too - confirm (a) all its cross-file lpu targets still resolve in the project dir, and (b) every phantom it needs still has a kept backfill source. **Recompute `needs()` / `sources()` VERBATIM (Step 2's definitions) over the POST-move file set** - the pre-move maps are stale, and a re-derived approximation (e.g. `par is not None` without the `nb>0` half) gives false orphan flags. Zero orphans on both. Confirm `total - moved` files remain and no live/registry session was touched.
 
 **Operational / low-value but distinct sessions** (skill re-runs, toy experiments, one-off
 config tasks, stray Q&A) are neither redundant nor debris: their content is unique, just
@@ -579,7 +628,7 @@ append for dormant files.
 ## Safety invariants
 
 - **Size is never grounds for deletion or for withholding protection. Small does not imply unimportant.** A one-message session can hold a key, a proof, or the single answer that mattered. The retention sweep deletes small transcripts as readily as large ones, so every guard here is size-agnostic: the backup hook copies every `*.jsonl` however small, `cleanupPeriodDays` and the archive's out-of-sweep location cover all files equally, and archival decisions read content (the CEILING judgment zone), never trust message count. Debris nomination needs a throwaway opening on top of small size and a user confirmation, and is a move, not a delete.
-- **Never move or file-edit:** any file in the `locked` closure (cross-file ancestors and phantom-backfill sources), canonical files, any fork with >= CEILING unique msgs (unless a durable artifact captures it), any below-CEILING fork whose unique content was judged substantive, or any session in the `~/.claude/sessions` live registry (Step 0; RECENT_HOURS mtime is only a fallback).
+- **Never move or file-edit:** any file in the `locked` closure (cross-file ancestors and phantom-backfill sources, re-closed over the full kept set), canonical files, any fork with >= CEILING unique msgs (unless a durable artifact captures it), any below-CEILING fork whose unique content was judged substantive, or any session in the `~/.claude/sessions` live registry (Step 0, re-read at mutation time; the registry alone decides liveness, never mtime).
 - **Move, never delete.** `~/claude-archive` is outside the project dir; the extension stops listing moved files but they are fully recoverable via the manifest. Because the retention sweep walks only `~/.claude/projects/`, a moved file is **sweep-proof regardless of mtime** - so archiving an old session is itself the safest handling of it, not just a decluttering step.
 - **Titles are append-only, dormant-only, and mtime-neutral.** Never file-edit a live session's title (it flips back via Patch F); rename live sessions in-app. After appending a `custom-title`, restore the file's *own prior* mtime (captured before the append) - the picker is recency-sorted, and bumping mtime to now destroys the chronological list. Writing a *computed* last-activity mtime (equalisation) is opt-in: user authorisation + sweep disabled, never the default.
 - **Agents are read-only on session JSONLs;** only the orchestrator moves files, only after the user gate and the post-move orphan + phantom re-scan.
@@ -589,7 +638,6 @@ append for dormant files.
 ## Knobs
 
 - `CEILING` (default 50): a fork with >= this many unique-vs-kept messages is auto-kept in place. Below it is the *judgment zone*: read the unique messages and archive only the self-evidently worthless; never auto-archive on count (a one-message fork can be priceless). This knob acts only in the keep direction. Over-merge protection is union-on-lpu; false-family detection is union-on-lpu-not-content; neither is this knob's job.
-- `RECENT_HOURS` (default 12): fallback only. The `~/.claude/sessions` registry (Step 0) is authoritative for live sessions; this mtime window just catches sessions with no registry entry.
 - `DEBRIS_MAX` (default 11): single-file trees this small with throwaway openings are debris candidates (still user-confirmed before moving).
 
 ## Design rationale (non-obvious decisions)
@@ -597,6 +645,10 @@ append for dormant files.
 These are the choices a reader is most likely to second-guess; the body specifies the mechanics.
 
 - **Phantom protection retains one backfill *source* per needed phantom, not every phantom referencer.** Locking every file that references a needed phantom lpu also locks byte-identical duplicate forks (rooted at the phantom boundary, no in-file pre-content) and guts the cleanup. `locked_closure` keeps the richest origin-bearing source instead.
+
+- **The keep-lock closure is re-run over the FULL kept set, not just the seed.** A fork kept for its own unique content can itself need a phantom whose only backfill source is content-redundant; the seed closure (canonicals + live) never walks that fork's needs, so a one-pass closure would archive the source and orphan the fork. Re-closing over `KEPT` (`locked = locked_closure(KEPT); KEPT |= locked`) folds every kept file's needs back in, so no kept file's needed phantom is ever left without a kept source.
+
+- **The registry is the sole liveness signal; there is no mtime fallback.** `~/.claude/sessions/*.json` lists one entry per running process, so a running session is always registered; the documented near-miss was an agent *not reading* the registry, never the registry omitting a session. recent-mtime added only noise (inspecting an old chat bumps its mtime), so it is gone. The Step-0 read plus a Step-6 mutation-time re-read make the registry authoritative end to end, narrowing any snapshot-staleness to the instant of the move.
 
 - **Content-fork detection is prose-only, not raw fingerprint overlap.** Raw overlap is confounded by shared tool-results: two sessions that edited the same files share those fingerprints. A real case showed 100% raw but 1% prose overlap between unrelated conversations, and 82% prose between a mis-themed fork and its true family. The lpu tree alone under-groups (copied-content forks share no lpu).
 
