@@ -424,7 +424,7 @@ Give the picker a themed shape by appending a `custom-title` record to each reta
 - **Banned compression tells** (this is what "terse invented phrase" looks like in practice): semicolon-chains standing in for clauses, `/` and `=` as word-savers, dropped articles and verbs, coined compound abbreviations. Write it the way you would say it out loud to a colleague.
 
     - BAD: `cache: retry/backoff refactor; unique = jitter calc + TTL bug fix (both in client.go)`
-    - GOOD: `cache: The widest thread on the retry-and-backoff refactor, covering the connection-pool changes and the exponential-backoff rewrite. The only content unique to this fork, not preserved in any kept session, is the jitter-calculation discussion and the TTL-expiry bug fix, both now in client.go.`
+    - GOOD: `cache: The widest thread on the retry-and-backoff refactor, covering the connection-pool changes and the exponential-backoff rewrite. Unique to this fork: the jitter-calculation discussion and the TTL-expiry bug fix, both now in client.go.`
 
 Format (exactly what the extension itself writes; append-only, last-wins, reversible):
 
