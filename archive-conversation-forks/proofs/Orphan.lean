@@ -184,4 +184,45 @@ theorem no_orphan
       demoted_guard source_lb hpick_src hneeded
   exact ⟨pick P, ⟨hpick_final, hnotdem⟩, hpick_src⟩
 
+/-
+  ============================================================================================
+  RECALL-PASS NO-LOSS (the second archive path's safety property).
+
+  `no_orphan` above guarantees the STRUCTURAL safety of archiving: a kept session's needed
+  phantom always keeps a source. The recall pass archives on a DIFFERENT criterion - exact
+  content redundancy - so it needs its own safety theorem: archiving a 0-unique candidate
+  loses no message. Messages are opaque here (`fps f m` = "file `f` carries message-fingerprint
+  `m`"); this is a separate, content-level layer from the structural closure above.
+  ============================================================================================
+-/
+
+/-- "Every message of `A` lives in some kept file" - `A`'s content is fully preserved by `KEPT`. -/
+def preserved {Msg : Type} (fps : File → Msg → Prop) (KEPT : FSet File) (A : File) : Prop :=
+  ∀ m, fps A m → ∃ b, KEPT b ∧ fps b m
+
+/--
+  The recall pass's `missing` set: messages of `A` not found in any kept file. The committed code
+  computes `missing = set(fps[A]) - kept_union` and archives `A` iff `missing` is empty.
+-/
+def missing {Msg : Type} (fps : File → Msg → Prop) (KEPT : FSet File) (A : File) : Msg → Prop :=
+  fun m => fps A m ∧ ¬ ∃ b, KEPT b ∧ fps b m
+
+/--
+  RECALL NO-LOSS. If the recall test passes (`missing A` is empty: every message of `A` is in some
+  kept file), then archiving `A` preserves all of `A`'s content. The hypothesis `hempty` is exactly
+  the committed code's `if not missing` test stated set-theoretically, so this certifies that the
+  0-unique archive decision loses nothing - the content-level counterpart of `no_orphan`'s structural
+  guarantee. `A`'s own membership is irrelevant: the witness `b` may be any kept file (the code's
+  "split-contained across several kept files" case is covered, since `b` is existentially quantified
+  per message, not a single container).
+-/
+theorem recall_no_loss {Msg : Type} (fps : File → Msg → Prop) (KEPT : FSet File) (A : File)
+    (hempty : ∀ m, ¬ missing fps KEPT A m) :
+    preserved fps KEPT A := by
+  intro m hm
+  -- mathlib-free classical case-split (no `by_contra` tactic in core).
+  rcases Classical.em (∃ b, KEPT b ∧ fps b m) with h | h
+  · exact h
+  · exact absurd ⟨hm, h⟩ (hempty m)
+
 end Orphan

@@ -1,13 +1,20 @@
 import Orphan
+import Markers
 open Orphan
 
-/- VERIFY-OUTCOME 1: no hidden axioms / sorry. Should print only the standard trusted core
-   (propext, Classical.choice, Quot.sound) or fewer - and crucially NOT `sorryAx`. -/
+/- VERIFY-OUTCOME 1: no hidden axioms / sorry. The structural lemmas are fully constructive
+   ("does not depend on any axioms"). The recall/marker theorems use `Classical.em`, so they
+   list the trusted core (`Classical.choice`, `propext`, `Quot.sound`); that is NOT a `sorry`.
+   The crucial check is that NONE lists `sorryAx`. -/
 #print axioms no_orphan
 #print axioms closure_closed_under_needs
 #print axioms final_closed_under_needs
 #print axioms source_survives_C5
 #print axioms kept0_subset_final
+#print axioms recall_no_loss
+#print axioms live_subset_keptC5
+#print axioms marker_no_hole
+#print axioms nonseed_loadbearing
 
 /- VERIFY-OUTCOME 2: the theorem is NON-VACUOUS. Build a concrete store where:
    - the hypotheses (hpick, demoted_guard, source_lb) all hold,
@@ -70,3 +77,65 @@ theorem witness_is_f1 : (Classical.choose concrete_no_orphan) = f1 := by
   exact h.2
 
 #print axioms concrete_no_orphan
+
+/- VERIFY-OUTCOME 3: the RECALL no-loss theorem is non-vacuous. A concrete store with one message
+   carried by both the archive candidate `f0` and a kept file `f1`: the recall test passes
+   (`missing` empty) and `recall_no_loss` yields real content preservation. -/
+def msgFps : Fil → Pha → Prop := fun _ _ => True          -- both files carry the (single) message `p0`
+def keptB  : FSet Fil := fun f => f = f1                   -- f1 is kept
+
+theorem recall_missing_empty : ∀ m, ¬ missing msgFps keptB f0 m := by
+  intro _ h
+  -- missing = (carries m) ∧ ¬∃ kept b carrying m; but f1 is kept and carries m, contradiction.
+  exact h.2 ⟨f1, rfl, trivial⟩
+
+theorem concrete_recall_no_loss : preserved msgFps keptB f0 :=
+  recall_no_loss msgFps keptB f0 recall_missing_empty
+
+#print axioms concrete_recall_no_loss
+
+/- VERIFY-OUTCOME 4: MARKER no-hole is non-vacuous. Enriched store where a kept-unique fork `g0`
+   is non-canonical, non-live, survives C5, is NOT load-bearing, and HAS nonzero residue - so it
+   lands in the `∃ residue` disjunct (a real `[main]`/`[fork]`/none member, not the deleted cell). -/
+inductive Fil2 | g0 | c0
+deriving DecidableEq
+
+open Fil2
+
+def canon2 : FSet Fil2 := fun f => f = c0                  -- c0 is a canonical
+def live2  : FSet Fil2 := fun _ => False                   -- nothing live
+def kuf2   : FSet Fil2 := fun f => f = g0                  -- g0 is a kept-unique fork
+def demo2  : FSet Fil2 := fun _ => False                   -- nothing demoted
+def lb2    : FSet Fil2 := fun _ => False                   -- nothing load-bearing
+def cross2 : Fil2 → Fil2 → Prop := fun _ _ => False
+def needs2 : Fil2 → Pha → Prop := fun _ _ => False         -- no phantom needs
+def src2   : Fil2 → Pha → Prop := fun _ _ => False
+def pick2  : Pha → Fil2 := fun _ => c0
+def resid2 : Fil2 → Pha → Prop := fun f _ => f = g0        -- g0 has a globally-unique message
+
+-- g0 is in KEPT_C5: in the seed (as a kuf) and not demoted.
+theorem g0_keptC5 : KEPT_C5 cross2 needs2 src2 pick2 (seed0 canon2 live2 kuf2) demo2 g0 := by
+  refine ⟨Closure.seed ?_, ?_⟩
+  · exact Or.inr (Or.inr rfl)         -- g0 ∈ kuf ⊆ seed0
+  · intro h; cases h                   -- ¬ demoted
+
+theorem g0_not_canon : ¬ canon2 g0 := by intro h; cases h
+theorem g0_not_live  : ¬ live2 g0  := by intro h; cases h
+
+-- the C5-survivor-residue contract: a surviving non-loadbearing kuf has residue (here, g0 does).
+theorem c5_resid2 : ∀ x, kuf2 x → ¬ demo2 x → ¬ lb2 x → ∃ m, resid2 x m := by
+  intro x hk _ _
+  -- hk : x = g0, so resid2 x p0 holds.
+  exact ⟨p0, hk⟩
+
+-- no cross/phan edges in this store, so cross_lb/phan_lb hold vacuously.
+theorem cross_lb2 : ∀ k b, Closure cross2 needs2 src2 pick2 (seed0 canon2 live2 kuf2) k →
+    cross2 k b → lb2 b := by intro _ _ _ h; cases h
+theorem phan_lb2 : ∀ f P, Closure cross2 needs2 src2 pick2 (seed0 canon2 live2 kuf2) f →
+    needs2 f P → (∃ s, src2 s P) → lb2 (pick2 P) := by intro _ _ _ h; cases h
+
+theorem concrete_marker_no_hole : lb2 g0 ∨ ∃ m, resid2 g0 m :=
+  marker_no_hole cross2 needs2 src2 pick2 canon2 live2 kuf2 demo2 lb2 resid2
+    cross_lb2 phan_lb2 c5_resid2 g0_keptC5 g0_not_canon g0_not_live
+
+#print axioms concrete_marker_no_hole
