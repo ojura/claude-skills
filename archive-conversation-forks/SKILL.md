@@ -77,7 +77,7 @@ mitigations below, each independent of the buggy setting:
     done
     ```
 
-    wired in `~/.claude/settings.json` as `{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"~/.claude/hooks/backup-sessions.sh"}]}]}}`. Because it never overwrites with a smaller file, no rewind, compaction, or mtime edit can shrink the backup below the largest state ever captured - which, for an append-only file, contains all real content. (A content-hash-per-state variant - one backup file per distinct hash, never overwrite - is maximally defensive if you distrust the append-only guarantee, but it costs O(growth) storage: a full copy at every session start the file grew. Under the verified append-only behaviour it preserves nothing high-water doesn't, so it is not the default.)
+    wired in `~/.claude/settings.json` as `{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"~/.claude/hooks/backup-sessions.sh"}]}]}}`. Because it never overwrites with a smaller file, no rewind, compaction, or mtime edit can shrink the backup below the largest state ever captured - which, for an append-only file, contains all real content. (A content-hash-per-state variant - one backup file per distinct hash, never overwrite - is maximally defensive if you distrust the append-only guarantee, but it costs O(growth) storage: a full copy at every session start the file grew. Under the verified append-only behaviour it preserves nothing high-water doesn't, so it is not the default.) **Re-verify the append-only premise against your Claude Code version**: this entire high-water guarantee rests on the JSONL being append-only (largest state = superset of every earlier one), cited to `patches.md` and true for current versions. If a future version ever compacts *in place*, high-water backup would silently lose content - so treat append-only as a version-specific claim to re-check (exactly like the setting-sources bypass above), not a permanent invariant; when in doubt, use the content-hash variant.
 
 ---
 
@@ -125,7 +125,7 @@ There are **two** classes of load-bearing file, and you must protect both:
 - **Redundant structural-role files are archive candidates, not auto-keeps.** When several files can serve one structural role (e.g. two phantom-backfill sources for the same phantom), keep the richest and run the rest through the archive judgment on their read residue. (Real miss: a redundant source survived only by over-keeping; its 45 "unique" were operational noise plus two findings already present in a kept file.)
 - **A wrong seed silently skips measurement.** A file wrongly seeded as live (Step 0) or wrongly locked never gets measured - which is how a session 99% contained in the *real* live session stays in the picker. So if a "live" or load-bearing file *measures* ~zero-unique against another, suspect the seed/lock, re-check Step 0, and treat it as the redundant copy it is. "It's big" and "it's load-bearing" never substitute for the number or the read.
 
-The fork/compaction data model (Patches A, D, F, H, J, K) is documented in `github.com/ojura/claude-patches` (`docs/patches.md`); read it first if you have it. If not, the rules above are the operative summary. **If sessions have already been lost/deleted, this skill does not recover them - see the companion `recover-deleted-sessions-ext4` skill.**
+The fork/compaction data model (Patches A, D, F, H, J, K) is documented in `github.com/ojura/claude-patches` (`docs/patches.md`); read it first if you have it. If not, the rules above are the operative summary. **Keep the phantom-source locking even on a vanilla install (no `claude-patches`).** A phantom source holds real user/assistant messages that the *current* stock renderer simply fails to stitch into the needer's scrollback - **missing user messages are a rendering bug, not data absence** - and cross-file backfill should land upstream eventually (`claude-patches` does it today). Preserving the sources keeps that content in the store and ready to reconstruct the moment backfill is available; archiving them because today's renderer ignores them would move out real, if currently-unrendered, history. So phantom-source locking is forward-looking insurance, not over-correction. (The "do not over-correct" rule above still holds, but it is narrower than "skip phantoms on vanilla": it frees only byte-identical *non-sources* - forks with zero pre-content before their phantom boundary, which hold nothing to backfill from.) **If sessions have already been lost/deleted, this skill does not recover them - see the companion `recover-deleted-sessions-ext4` skill.**
 
 ## Step 0 - read the live-session registry (authoritative, do this FIRST)
 
@@ -176,15 +176,18 @@ import json, glob, os, hashlib, datetime, time
 from collections import defaultdict
 def f8(p): return os.path.basename(p)[:8]
 def norm(ts):
+    # NB: epoch-ms -> naive ISO (no tz), but an already-ISO string is returned as-is (may carry Z/offset),
+    # so this is an APPROXIMATE sort key - fine for first/last display and the rare canonical tiebreak
+    # (only when distinct-counts tie exactly), not for precise cross-tz ordering. Parse to epoch if you need that.
     if ts is None: return ""
     if isinstance(ts,(int,float)):
         try: return datetime.datetime.utcfromtimestamp(ts/1000).isoformat()
         except: return str(ts)
     return str(ts)
 
-fps={}; fps_prose={}; ftext={}; owned={}; lref={}; bnd={}; nmsg={}; lts={}; mtime={}; global_uuid=defaultdict(set)
+fps={}; fps_prose={}; ftext={}; owned={}; lref={}; bnd={}; nmsg={}; lts={}; mtime={}; firstmsg={}; global_uuid=defaultdict(set)
 for p in sorted(glob.glob("*.jsonl")):
-    k=f8(p); F=[]; Fp=[]; us=set(); L=set(); B=[]; last=""; n=0
+    k=f8(p); F=[]; Fp=[]; us=set(); L=set(); B=[]; last=""; n=0; fu=""
     for line in open(p,encoding="utf-8",errors="replace"):
         if '"file-history-snapshot"' in line[:80]: continue
         try: o=json.loads(line)
@@ -205,12 +208,13 @@ for p in sorted(glob.glob("*.jsonl")):
             disp=c if isinstance(c,str) else " ".join(b.get("text","") for b in c if isinstance(b,dict) and b.get("type")=="text") if isinstance(c,list) else ""
             disp=(disp or "").strip()
             if disp: Fp.append(hashlib.md5((o["type"]+disp).encode("utf-8","replace")).hexdigest()[:12])
+            if o["type"]=="user" and disp and not fu: fu=disp[:200]   # first plain user message (debris signal)
             if h not in ftext:   # capped raw-fingerprint -> verbatim text, for downstream quoting
                 ftext[h]=(o["type"], disp.replace("\n"," ")[:600])
             t=norm(o.get("timestamp"));  last=max(last,t) if t else last
         if o.get("type")=="system" and o.get("subtype")=="compact_boundary":
             B.append((o.get("logicalParentUuid"), o.get("parentUuid"), n))  # n = msgs before boundary
-    fps[k]=F; fps_prose[k]=Fp; owned[k]=us; lref[k]=L; bnd[k]=B; nmsg[k]=len(F); lts[k]=last
+    fps[k]=F; fps_prose[k]=Fp; owned[k]=us; lref[k]=L; bnd[k]=B; nmsg[k]=len(F); lts[k]=last; firstmsg[k]=fu
     mtime[k]=os.path.getmtime(p)
 
 # phantom lpus = referenced but owned by no file
@@ -258,6 +262,10 @@ for sp in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
 seed={canonical(ks) for ks in trees.values() if len(ks)>1}
 seed|={k for k in fps if k in live}                                    # live (authoritative)
 seed|={k for k in fps if (time.time()-mtime[k]) < RECENT_HOURS*3600}   # fallback: recently active
+# CAVEAT: this mtime fallback is defeated by Step 7's opt-in equalisation - a session active
+# recently but equalised to an OLD mtime won't be caught here, and if it's not currently running
+# the Step 0 registry won't catch it either. Worst case is over-archiving a recoverable file; to
+# be safe, don't equalise sessions you might still be classifying, and lean on the live registry.
 def locked_closure(seed):
     locked=set(seed); changed=True
     while changed:
@@ -321,19 +329,25 @@ zero-unique redundant sessions in the picker - a recall failure (this happened i
 five sessions that were 100% contained in a kept file survived because they were in their own
 lpu-trees).
 
-After the per-tree partition, run a global containment pass. KEPT = canonicals + locked
-(load-bearing) + kept-unique forks.
+After the per-tree partition, run a global containment pass.
 
 ```python
+# KEPT = the FULL retained set. Distinct from kept_all earlier (which was only canonicals+locked,
+# used to measure the locked set): KEPT additionally includes the kept-unique forks - the
+# non-canonical forks the per-tree pass above decided to keep (>=CEILING unique or judged substantive).
+kept_unique_forks = ...   # wire from the per-tree pass: forks it kept rather than archived
+KEPT = {canonical(ks) for ks in trees.values()} | set(locked) | kept_unique_forks
 keptset={k:set(fps[k]) for k in KEPT}
+kept_union=set().union(*keptset.values()) if keptset else set()
 canon_all={canonical(ks) for ks in trees.values()}
 for A in [a for a in fps if a not in KEPT and a not in canon_all and a not in live]:
-    # fewest unique messages against ANY single equal-or-larger kept container
-    cands=[b for b in KEPT if len(set(fps[b]))>=len(set(fps[A]))]
-    best=min(cands, key=lambda b: len(set(fps[A])-keptset[b]), default=None)
-    missing = (set(fps[A]) - keptset[best]) if best else set(fps[A])
-    if not missing:                       # 0 unique: PROVEN redundant, every msg verbatim in best
-        ARCHIVE(A, f"100% contained in {best}")
+    # set-difference against the UNION of the whole kept set, NOT any single container - a session
+    # whose content is split-contained across two smaller kept files is still 0-unique and redundant
+    # (the single-container test `len(fps[b])>=len(fps[A])` had exactly that recall hole).
+    missing = set(fps[A]) - kept_union
+    best = min(KEPT, key=lambda b: len(set(fps[A])-keptset[b]), default=None)  # closest single container, for the doc only
+    if not missing:                       # 0 unique vs the kept set: PROVEN redundant (every msg lives somewhere kept)
+        ARCHIVE(A, f"0 unique vs the kept set (closest single container {best})")
     elif len(missing) < CEILING:          # JUDGMENT ZONE
         SONNET_CONFIRM(A, best, missing)  # a Sonnet READS missing; archive iff trivial/preserved
     # else: substantial unique -> KEEP
@@ -361,8 +375,10 @@ for ks in trees.values():
     if len(ks)!=1: continue
     k=ks[0]
     if k in locked or k in live: continue
-    fu=first_plain_user_msg(k)   # first non-tool, non-meta user message
-    if nmsg[k] <= DEBRIS_MAX and (not fu or fu.lstrip().startswith(("/","cd ")) or is_boilerplate(fu)):
+    fu=firstmsg.get(k,"")        # first plain user message, captured in Step 2's pass above
+    # is_boilerplate: an operator heuristic (keep it conservative) - matches known throwaway openings:
+    # a `<ide_opened_file>` echo, a bare "You here?" / "test", whitespace-only, or a skill preamble.
+    if nmsg[k] <= DEBRIS_MAX and (not fu or fu.lstrip().startswith(("/","cd ","<ide_opened_file")) or is_boilerplate(fu)):
         nominate_debris(k)       # route to a debris/ theme; still shown in the user gate before moving
 ```
 
@@ -443,7 +459,7 @@ Give the picker a themed shape by appending a `custom-title` record to each reta
     - **`[scroll-dep] <main>`** - a `locked` file mostly contained in a `[main]` with **~0 unique** (a pure scrollback bridge). It is kept (not archived) *because it is load-bearing*; that retain-vs-archive call is settled by load-bearing status, never containment %, before any marker is assigned (see the gate in READ THIS FIRST). Name the canonical it backs, and **name the residue read verbatim, never a bare count**: "8 unique" hides that the 8 are policy-refusals; "unique: refusals + asides" tells the reader to skip it. If the residue is genuinely substantive it is not a scroll-dep, it is a `[fork]`.
     - **(no marker)** - a **minor standalone**: a small one-off below the substance floor, in no family. The title alone carries it.
 
-    The four are mutually exclusive by two measured axes - **containment** (near-disjoint vs mostly-inside-a-head) and **unique content** (substantial / modest / ~zero): near-disjoint + substantial = `[main]`; mostly-contained + has-unique = `[fork]`; mostly-contained + ~zero-unique = `[scroll-dep]`; minor + standalone = none. `[main]`-vs-standalone is the substance floor; `[main]`-vs-`[fork]` is containment. All measured, never eyeballed.
+    The four are decided by **three measured discriminators**: **containment** (near-disjoint vs mostly-inside-a-head), **amount of unique content** (substantial / modest / ~zero), and a **substance floor** (a real body of work vs a minor one-off). Near-disjoint + substantial = `[main]`; mostly-contained + modest-unique = `[fork]`; mostly-contained + ~zero-unique = `[scroll-dep]`; near-disjoint + below-the-floor = none (minor standalone). So `[main]`-vs-`[fork]` is **containment**, and `[main]`-vs-none (both near-disjoint) is the **substance floor** - a distinct third axis, not derivable from the other two. **Pin the floor concretely** (it has no `CEILING`-style constant, so state it): "substantial" = on the order of the other heads - hundreds of messages / many dozens of unique-prose; a near-disjoint session below ~`CEILING` unique-prose is a minor standalone, not a `[main]`. All three discriminators are measured, never eyeballed.
 - **Read the session before titling it.** A title written from the first message alone is how you get "shell/setup ops" jargon; the real topic is usually mid-conversation.
 - **Name the substance, never the opening.** Family, sub-label, and sentence describe what the session is *for* - the work it actually did, which lives mid-conversation. Never title from what was on screen when it opened: a seed/context prompt, a skill preamble, the first command, or the first artifact it happened to decode. Real misses: a card-RE fork titled `card-header` after the FAT32 dump on its first screen, and a patch-reapply titled `cli-subprocess` after a mid-session tangent. The first message is the least representative line in the session (same root as `shell/setup ops`); the acceptance test above is the gate.
 - **No character limit; "truncates" is not a budget.** Write 1 to 2 complete, plain sentences. "The picker truncates the tail" is the reason to put the gist first so it survives truncation; it is NOT a width to fit, and never a licence to abbreviate, drop words, or compress. A readable sentence the picker cuts off beats a complete one nobody can parse. (Real failure: a run invented a ~96-char cap out of the word "truncates", and once it had a number to optimise, readability lost - it produced cryptic fragments the author themselves could not read.)
