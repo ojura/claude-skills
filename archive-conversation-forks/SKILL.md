@@ -280,6 +280,7 @@ seed|={k for k in fps if (time.time()-mtime[k]) < RECENT_HOURS*3600}   # fallbac
 # the Step 0 registry won't catch it either. This includes equalisation from a PRIOR run, which the
 # current operator can't control - so the live registry, not mtime, is the real live signal; this
 # fallback only helps for a never-equalised store. Worst case is over-archiving a recoverable file.
+unsatisfiable={}   # kept file -> {phantom lpus it needs but NO file can source}: origin truly gone
 def locked_closure(seed):
     locked=set(seed); changed=True
     while changed:
@@ -290,30 +291,23 @@ def locked_closure(seed):
                     if b not in locked: locked.add(b); changed=True
             for P in needs(k):                          # (2) phantom backfill: keep >=1 source
                 srcs=[s for s in fps if P in sources(s)]
-                if srcs and not (set(srcs)&locked):
+                if not srcs:                            # needed phantom with NO viable source ->
+                    unsatisfiable.setdefault(k,set()).add(P)   # origin truly gone; SURFACE, don't silently pass
+                    continue
+                if not (set(srcs)&locked):
                     best=max(srcs, key=lambda s:len(set(fps[s])))  # richest origin
                     locked.add(best); changed=True
     return locked
 locked=locked_closure(seed)
+# Surface unsatisfiable phantoms: a kept file needs a phantom no file can backfill -> its deep origin
+# is genuinely lost (not a cleanup error, but a data-fidelity note worth reporting, never swallowed).
+if unsatisfiable: report_unsatisfiable_phantoms(unsatisfiable)   # e.g. print/flag in the session_map
 
-# MEASURE the locked set the SAME way as archive candidates - load-bearing protects a file from
-# being MOVED, never from being MEASURED. Each locked file's unique-vs-rest-of-kept decides its
-# title and flags redundant structural-role dups, by the number + a verbatim read, never by size.
-kept_all=set(locked) | {canonical(ks) for ks in trees.values()}
-for k in sorted(locked):
-    rest=set().union(*(set(fps[j]) for j in kept_all if j!=k))
-    uniq=set(fps[k])-rest
-    # uniq==0        -> [scroll-dep]; title names the residue ("none"), not a count
-    # 0<uniq<CEILING -> READ uniq verbatim (ftext). If trivial: [scroll-dep] titled by what the
-    #                   residue IS; and if another kept file fills k's structural role, k is a
-    #                   REDUNDANT source -> archive candidate, NOT an auto-keep.
-    # uniq>=CEILING  -> genuinely-unique kept fork -> [fork] (a locked file is mostly-contained
-    #                   by construction, so [fork], not [main]), never [scroll-dep].
-
-# archive candidate = non-locked, non-canonical fork whose UNIQUE content is trivial
-# (< CEILING msgs) AFTER reading it, OR captured in a user-named durable artifact. Else keep.
+# Per-tree archive judgment FIRST, accumulating the forks we KEEP (this feeds the full kept set below).
+# archive candidate = non-locked, non-canonical fork whose UNIQUE content is trivial (< CEILING msgs)
+# AFTER reading it, OR captured in a user-named durable artifact. Else keep.
 CEILING=50         # >= this many unique msgs => AUTO-KEEP. Below => JUDGE content, never auto-archive.
-kept_unique_forks=set()                    # forks KEPT (not archived) here; feeds KEPT in the recall pass below
+kept_unique_forks=set()
 for ks in trees.values():
     if len(ks)==1: continue
     canon=canonical(ks); keep=set(ks)&locked | {canon}
@@ -329,6 +323,25 @@ for ks in trees.values():
             judge(k, uniq)                 # placeholder -> either ARCHIVE(k,...) or kept_unique_forks.add(k)
         # Count is NEVER the sole archive trigger; CEILING only auto-keeps (a 1-message fork can
         # hold a private key or a proof). Record uniq verbatim (ftext) for the doc + the judgment.
+
+# The FULL kept set, defined ONCE and reused by BOTH the locked-set measurement and the recall pass.
+KEPT = {canonical(ks) for ks in trees.values()} | set(locked) | kept_unique_forks
+
+# MEASURE the locked set with IDENTICAL rigor, against the FULL kept set (now that kept_unique_forks
+# exists - measuring against only canonicals+locked would over-mark [fork] a locked file whose residue
+# actually lives in a kept fork). Load-bearing protects a file from being MOVED, never from being
+# MEASURED, and this measurement decides ONLY the file's title: a locked file is NEVER archived. It is
+# in `locked` because it is load-bearing, and redundancy was already resolved when locked_closure
+# locked only the RICHEST source per phantom - the non-richest siblings were never locked and flow
+# through the archive path above, not here.
+for k in sorted(locked):
+    rest=set().union(*(set(fps[j]) for j in KEPT if j!=k))
+    uniq=set(fps[k])-rest
+    # uniq==0        -> [scroll-dep]; title names the residue ("none"), not a count
+    # 0<uniq<CEILING -> READ uniq verbatim (ftext): trivial residue -> [scroll-dep] (named by what it
+    #                   IS); substantive residue -> [fork]. Either way KEPT, never archived.
+    # uniq>=CEILING  -> [fork] (a locked file is mostly-contained by construction, so [fork], not
+    #                   [main]), never [scroll-dep], never archived.
 ```
 
 Record, per archive candidate: its unique message texts (verbatim, from `ftext`), its
@@ -348,11 +361,8 @@ lpu-trees).
 After the per-tree partition, run a global containment pass.
 
 ```python
-# KEPT = the FULL retained set. Distinct from kept_all earlier (which was only canonicals+locked,
-# used to measure the locked set): KEPT additionally includes the kept-unique forks - the
-# non-canonical forks the per-tree pass above decided to keep (>=CEILING unique or judged substantive),
-# accumulated into `kept_unique_forks` there.
-KEPT = {canonical(ks) for ks in trees.values()} | set(locked) | kept_unique_forks
+# KEPT is the FULL retained set (canonicals + locked + kept_unique_forks), already defined ONCE in
+# Step 2 above and shared by the locked-set measurement and this recall pass - no second definition.
 keptset={k:set(fps[k]) for k in KEPT}
 kept_union=set().union(*keptset.values()) if keptset else set()
 canon_all={canonical(ks) for ks in trees.values()}
@@ -478,7 +488,7 @@ Give the picker a themed shape by appending a `custom-title` record to each reta
     - **`[scroll-dep] <main>`** - a `locked` file mostly contained in a `[main]` with **~0 unique** (a pure scrollback bridge). It is kept (not archived) *because it is load-bearing*; that retain-vs-archive call is settled by load-bearing status, never containment %, before any marker is assigned (see the gate in READ THIS FIRST). Name the canonical it backs, and **name the residue read verbatim, never a bare count**: "8 unique" hides that the 8 are policy-refusals; "unique: refusals + asides" tells the reader to skip it. If the residue is genuinely substantive it is not a scroll-dep, it is a `[fork]`.
     - **(no marker)** - a **minor standalone**: a small one-off below the substance floor, in no family. The title alone carries it.
 
-    The four are decided by **three measured discriminators**: **containment** (near-disjoint vs mostly-inside-a-head), **amount of unique content** (substantial / modest / ~zero), and a **substance floor** (a real body of work vs a minor one-off). Near-disjoint + substantial = `[main]`; mostly-contained + modest-unique = `[fork]`; mostly-contained + ~zero-unique = `[scroll-dep]`; near-disjoint + below-the-floor = none (minor standalone). So all three boundaries are drawn by a different discriminator: `[main]`-vs-`[fork]` by **containment**; `[fork]`-vs-`[scroll-dep]` (both mostly-contained) by **amount of unique content** (modest vs ~zero); `[main]`-vs-none (both near-disjoint) by the **substance floor** - a distinct third axis, not derivable from the other two. **Pin the floor concretely** (it has no `CEILING`-style constant, so state it): "substantial" means a real *body of work*, not a high message count - on the order of the other heads, hundreds of messages / many dozens of unique-prose AND genuinely a primary line of work. A near-disjoint session that is high-count but low-value (a config one-off, a toy, an operational re-run) is **not** a `[main]`: it is a minor standalone (none), kept by the per-item user call of the next paragraph. `[main]` is reserved for a primary line of work; count alone never promotes a one-off to it. All three discriminators are measured, never eyeballed.
+    The four are decided by **three discriminators - two measured, one judged**. **Containment** (near-disjoint vs mostly-inside-a-head) is measured by `fps_prose` overlap; **amount of unique content** (substantial / modest / ~zero) by the unique-fingerprint count against `CEILING` / 0. The **substance floor** (a real body of work vs a minor one-off) is **not** reducible to a constant - **the LLM judges it, and in genuinely uncertain cases the user decides** (several calls in a real run went to the user). The boundaries: `[main]`-vs-`[fork]` is containment (measured); `[fork]`-vs-`[scroll-dep]` is amount-of-unique-content (measured); `[main]`-vs-none is the substance floor (judged). For the floor the numbers give only **eyeball cues, never the verdict**: a session with far fewer of its-own (found-nowhere-else) messages than `CEILING`, or far smaller than the sessions already marked `[main]` (the "order of the other heads" - same rough magnitude), is **possibly** a minor one-off - a flag to look closer, never a presumption. **Small is not the same as unimportant**; raw count alone neither promotes a one-off to `[main]` nor dismisses a small-but-substantial session. `[main]` is reserved for a primary line of work, and that call is judgment, not arithmetic. (Reducing the cue to a hard constant is exactly the proxy the rationale section warns against - so this rule is deliberately a judgment with assists, not a formula.)
 - **Read the session before titling it.** A title written from the first message alone is how you get "shell/setup ops" jargon; the real topic is usually mid-conversation.
 - **Name the substance, never the opening.** Family, sub-label, and sentence describe what the session is *for* - the work it actually did, which lives mid-conversation. Never title from what was on screen when it opened: a seed/context prompt, a skill preamble, the first command, or the first artifact it happened to decode. Real misses: a card-RE fork titled `card-header` after the FAT32 dump on its first screen, and a patch-reapply titled `cli-subprocess` after a mid-session tangent. The first message is the least representative line in the session (same root as `shell/setup ops`); the acceptance test above is the gate.
 - **No character limit; "truncates" is not a budget.** Write 1 to 2 complete, plain sentences. "The picker truncates the tail" is the reason to put the gist first so it survives truncation; it is NOT a width to fit, and never a licence to abbreviate, drop words, or compress. A readable sentence the picker cuts off beats a complete one nobody can parse. (Real failure: a run invented a ~96-char cap out of the word "truncates", and once it had a number to optimise, readability lost - it produced cryptic fragments the author themselves could not read.)
