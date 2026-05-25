@@ -13,8 +13,8 @@ using the session cookie.
 Use `acquire_session_key()` which tries all sources automatically:
 
 ```python
-import sys
-sys.path.insert(0, "/home/juraj/.claude/skills/claude-web-fetcher")
+import sys, os
+sys.path.insert(0, os.path.expanduser("~/.claude/skills/claude-web-fetcher"))
 from claude_web import acquire_session_key
 
 session_key = acquire_session_key()  # tries file, Desktop, Firefox in order
@@ -32,8 +32,8 @@ A standalone extractor script is also available at `extract_from_chrome.py` for 
 ## Usage
 
 ```python
-import sys
-sys.path.insert(0, "/home/juraj/.claude/skills/claude-web-fetcher")
+import sys, os
+sys.path.insert(0, os.path.expanduser("~/.claude/skills/claude-web-fetcher"))
 from claude_web import ClaudeWeb, acquire_session_key
 from pathlib import Path
 
