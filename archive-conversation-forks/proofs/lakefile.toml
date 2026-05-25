@@ -1,0 +1,8 @@
+name = "orphan"
+defaultTargets = ["Orphan", "Check"]
+
+[[lean_lib]]
+name = "Orphan"
+
+[[lean_lib]]
+name = "Check"
