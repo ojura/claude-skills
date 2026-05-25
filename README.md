@@ -60,6 +60,19 @@ Sample pages from that fixture (full PDF: [`markdown-latex-report/docs/sample-re
 </p>
 <p align="center"><em>Title and contents &middot; code with line wrapping &middot; a generated chart with a column-sized table.<br>Click any page for the full PDF.</em></p>
 
+### archive-conversation-forks
+
+Declutters the Claude Code session picker by grouping a project's session JSONLs
+into fork families, keeping the canonical (most complete) session per family, and
+moving redundant forks out to `~/claude-archive` with a restore manifest - moved,
+never deleted. Builds raw and prose distinct-content fingerprints to tell true
+forks from sessions that merely share tool-edits, protects every cross-file and
+phantom `logicalParentUuid` ancestor a kept session needs for scrollback, and
+archives only what is provably redundant or read-and-confirmed disposable (a
+single message is never dropped on count alone). Optionally titles retained
+sessions for a themed, chronological picker, mtime-neutrally so none are exposed
+to the mtime-keyed retention sweep.
+
 ## Installation
 
 Copy a skill directory into your Claude Code skills location, or install the
