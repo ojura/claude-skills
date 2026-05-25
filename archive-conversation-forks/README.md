@@ -19,7 +19,9 @@ never deleted.
   confirmed disposable. Substantive unique content is kept, and a single message
   is never archived on message-count alone (it could be a key or a proof).
 - Optionally titles the retained sessions for a themed, chronological picker,
-  mtime-neutrally so nothing is exposed to the retention sweep.
+  mtime-neutrally - titling restores each file's own prior mtime, so it never
+  *worsens* a file's sweep exposure (it doesn't make an already-old file safe;
+  it just doesn't make a recent one look old).
 
 ## Safety
 
@@ -28,9 +30,11 @@ never deleted.
 - **lpu-safe.** Never orphans a kept session's cross-file or phantom-backfill
   ancestors, so a moved file can't break another session's scrollback.
 - Reads `~/.claude/sessions/*.json` first, so live sessions are never touched.
-- Disables the mtime-keyed retention sweep and backs the store up out-of-tree
-  before any mutation - that sweep can silently delete kept sessions, and any
-  tool that touches a file's mtime can trip it.
+- Has you disable the mtime-keyed retention sweep (a user-gated step) and back the
+  store up out-of-tree before any mutation - that sweep can silently delete kept
+  sessions, and any tool that touches a file's mtime can trip it. Disabling the
+  sweep is necessary but not sufficient on its own (it's bypassable), so the
+  out-of-tree backup is the real guard.
 
 See `SKILL.md` for the full procedure. Companion: `recover-deleted-sessions-ext4`,
 for when sessions are already lost.

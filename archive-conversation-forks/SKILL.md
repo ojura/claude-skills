@@ -77,7 +77,7 @@ mitigations below, each independent of the buggy setting:
     done
     ```
 
-    wired in `~/.claude/settings.json` as `{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"~/.claude/hooks/backup-sessions.sh"}]}]}}`. Because it never overwrites with a smaller file, no rewind, compaction, or mtime edit can shrink the backup below the largest state ever captured - which, for an append-only file, contains all real content. (A content-hash-per-state variant - one backup file per distinct hash, never overwrite - is maximally defensive if you distrust the append-only guarantee, but it costs O(growth) storage: a full copy at every session start the file grew. Under the verified append-only behaviour it preserves nothing high-water doesn't, so it is not the default.) **Re-verify the append-only premise against your Claude Code version**: this entire high-water guarantee rests on the JSONL being append-only (largest state = superset of every earlier one), cited to `patches.md` and true for current versions. If a future version ever compacts *in place*, high-water backup would silently lose content - so treat append-only as a version-specific claim to re-check (exactly like the setting-sources bypass above), not a permanent invariant; when in doubt, use the content-hash variant.
+    wired in `~/.claude/settings.json` as `{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"~/.claude/hooks/backup-sessions.sh"}]}]}}`. Because it never overwrites with a smaller file, no rewind, compaction, or mtime edit can shrink the backup below the largest state ever captured - which, for an append-only file, contains all real content. (A content-hash-per-state variant - one backup file per distinct hash, never overwrite - is maximally defensive if you distrust the append-only guarantee, but it costs a full copy of the (growing) file at every session-start it changed - total storage O(distinct states x size), which balloons for a long session. Under the verified append-only behaviour it preserves nothing high-water doesn't, so it is not the default.) **Re-verify the append-only premise against your Claude Code version**: this entire high-water guarantee rests on the JSONL being append-only (largest state = superset of every earlier one), cited to `patches.md` and true for current versions. If a future version ever compacts *in place*, high-water backup would silently lose content - so treat append-only as a version-specific claim to re-check (exactly like the setting-sources bypass above), not a permanent invariant; when in doubt, use the content-hash variant. **Cost note:** the hook `find`s ALL of `~/.claude/projects` (every project) on every session start once wired - defence-in-depth, but a standing per-launch cost; scope the `find` to the project dir you're working if that matters.
 
 ---
 
@@ -176,14 +176,19 @@ import json, glob, os, hashlib, datetime, time
 from collections import defaultdict
 def f8(p): return os.path.basename(p)[:8]
 def norm(ts):
-    # NB: epoch-ms -> naive ISO (no tz), but an already-ISO string is returned as-is (may carry Z/offset),
-    # so this is an APPROXIMATE sort key - fine for first/last display and the rare canonical tiebreak
-    # (only when distinct-counts tie exactly), not for precise cross-tz ordering. Parse to epoch if you need that.
+    # Normalise BOTH forms (epoch-ms int, or ISO string with/without Z/offset) to a naive-UTC ISO
+    # string, so lexical max/compare is sound. The store mixes the two, and a raw `str(ts)` of a
+    # `+02:00` value sorts after a `Z` value of a later instant - a real mis-sort for both the
+    # first/last display and the canonical tiebreak. Parsing to UTC removes that.
     if ts is None: return ""
-    if isinstance(ts,(int,float)):
-        try: return datetime.datetime.utcfromtimestamp(ts/1000).isoformat()
-        except: return str(ts)
-    return str(ts)
+    try:
+        if isinstance(ts,(int,float)):
+            dt=datetime.datetime.utcfromtimestamp(ts/1000)
+        else:
+            dt=datetime.datetime.fromisoformat(str(ts).replace("Z","+00:00"))
+            if dt.tzinfo: dt=dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        return dt.isoformat()
+    except: return str(ts)
 
 fps={}; fps_prose={}; ftext={}; owned={}; lref={}; bnd={}; nmsg={}; lts={}; mtime={}; firstmsg={}; global_uuid=defaultdict(set)
 for p in sorted(glob.glob("*.jsonl")):
@@ -254,18 +259,27 @@ def canonical(ks):
 
 # keep-locked closure: seed + transitive load-bearing over BOTH edge types
 RECENT_HOURS=12
-# AUTHORITATIVE never-touch: live sessionIds from ~/.claude/sessions/*.json (Step 0)
+# AUTHORITATIVE never-touch: live sessionIds from ~/.claude/sessions/*.json (Step 0).
+# Consult status AND liveness, not just sessionId: a crashed process can leave a stale <pid>.json
+# with status "running". A wrongly-live seed silently skips measurement (the wrong-seed miss above),
+# so drop the dead - over-protection (keeping a truly-live one) is the benign direction.
 live=set()
 for sp in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
-    try: live.add(json.load(open(sp)).get("sessionId","")[:8])
+    try:
+        d=json.load(open(sp))
+        if d.get("status")!="running": continue        # not live per the registry's own field
+        try: os.kill(int(d["pid"]),0)                   # ESRCH/ValueError => process gone => stale entry
+        except Exception: continue
+        live.add(d.get("sessionId","")[:8])
     except: pass
 seed={canonical(ks) for ks in trees.values() if len(ks)>1}
 seed|={k for k in fps if k in live}                                    # live (authoritative)
 seed|={k for k in fps if (time.time()-mtime[k]) < RECENT_HOURS*3600}   # fallback: recently active
 # CAVEAT: this mtime fallback is defeated by Step 7's opt-in equalisation - a session active
 # recently but equalised to an OLD mtime won't be caught here, and if it's not currently running
-# the Step 0 registry won't catch it either. Worst case is over-archiving a recoverable file; to
-# be safe, don't equalise sessions you might still be classifying, and lean on the live registry.
+# the Step 0 registry won't catch it either. This includes equalisation from a PRIOR run, which the
+# current operator can't control - so the live registry, not mtime, is the real live signal; this
+# fallback only helps for a never-equalised store. Worst case is over-archiving a recoverable file.
 def locked_closure(seed):
     locked=set(seed); changed=True
     while changed:
@@ -299,18 +313,20 @@ for k in sorted(locked):
 # archive candidate = non-locked, non-canonical fork whose UNIQUE content is trivial
 # (< CEILING msgs) AFTER reading it, OR captured in a user-named durable artifact. Else keep.
 CEILING=50         # >= this many unique msgs => AUTO-KEEP. Below => JUDGE content, never auto-archive.
+kept_unique_forks=set()                    # forks KEPT (not archived) here; feeds KEPT in the recall pass below
 for ks in trees.values():
     if len(ks)==1: continue
     canon=canonical(ks); keep=set(ks)&locked | {canon}
     kept_fp=set().union(*(set(fps[k]) for k in keep)) if keep else set()
     for k in [x for x in ks if x not in keep]:
         uniq=set(fps[k])-kept_fp           # content found NOWHERE in the kept set
-        # >= CEILING -> keep in place (substantial unique work, don't even ask)
-        # <  CEILING -> JUDGMENT ZONE: read uniq VERBATIM (via ftext) and judge its value;
-        #               archive ONLY if self-evidently worthless (empty/tool-only turns, exact
-        #               replays already in the canonical, fork-test artifacts, trivial one-shot
-        #               Q&A). Any substantive content (a decision, derivation, key, datum,
-        #               non-trivial answer, code) -> FLAG for human judgment, default KEEP.
+        if len(uniq)>=CEILING:             # substantial unique work -> AUTO-KEEP, don't even ask
+            kept_unique_forks.add(k)
+        else:                              # JUDGMENT ZONE: read uniq VERBATIM (ftext) and judge value.
+            # archive ONLY if self-evidently worthless (empty/tool-only turns, exact replays already in
+            # the canonical, fork-test artifacts, trivial one-shot Q&A). ANY substantive content (a
+            # decision, derivation, key, datum, non-trivial answer, code) -> KEEP. Default KEEP if unsure.
+            judge(k, uniq)                 # placeholder -> either ARCHIVE(k,...) or kept_unique_forks.add(k)
         # Count is NEVER the sole archive trigger; CEILING only auto-keeps (a 1-message fork can
         # hold a private key or a proof). Record uniq verbatim (ftext) for the doc + the judgment.
 ```
@@ -334,8 +350,8 @@ After the per-tree partition, run a global containment pass.
 ```python
 # KEPT = the FULL retained set. Distinct from kept_all earlier (which was only canonicals+locked,
 # used to measure the locked set): KEPT additionally includes the kept-unique forks - the
-# non-canonical forks the per-tree pass above decided to keep (>=CEILING unique or judged substantive).
-kept_unique_forks = ...   # wire from the per-tree pass: forks it kept rather than archived
+# non-canonical forks the per-tree pass above decided to keep (>=CEILING unique or judged substantive),
+# accumulated into `kept_unique_forks` there.
 KEPT = {canonical(ks) for ks in trees.values()} | set(locked) | kept_unique_forks
 keptset={k:set(fps[k]) for k in KEPT}
 kept_union=set().union(*keptset.values()) if keptset else set()
@@ -371,14 +387,17 @@ the themer's soft flag plus the user gate - the weakest link, and "a clean list"
 hinges on debris removal. Nominate it deterministically too:
 
 ```python
+def is_boilerplate(s):   # operator heuristic (tune to your store; conservative). True for throwaway openers:
+    s=(s or "").strip().lower()
+    return (not s
+            or s.startswith(("<", "[request interrupted"))   # <ide_opened_file>/<command-name>/<local-command-caveat>/...
+            or s in ("test","hi","hello","ping","you here?","?"))
 for ks in trees.values():
     if len(ks)!=1: continue
     k=ks[0]
     if k in locked or k in live: continue
     fu=firstmsg.get(k,"")        # first plain user message, captured in Step 2's pass above
-    # is_boilerplate: an operator heuristic (keep it conservative) - matches known throwaway openings:
-    # a `<ide_opened_file>` echo, a bare "You here?" / "test", whitespace-only, or a skill preamble.
-    if nmsg[k] <= DEBRIS_MAX and (not fu or fu.lstrip().startswith(("/","cd ","<ide_opened_file")) or is_boilerplate(fu)):
+    if nmsg[k] <= DEBRIS_MAX and (not fu or fu.lstrip().startswith(("/","cd ")) or is_boilerplate(fu)):
         nominate_debris(k)       # route to a debris/ theme; still shown in the user gate before moving
 ```
 
@@ -459,7 +478,7 @@ Give the picker a themed shape by appending a `custom-title` record to each reta
     - **`[scroll-dep] <main>`** - a `locked` file mostly contained in a `[main]` with **~0 unique** (a pure scrollback bridge). It is kept (not archived) *because it is load-bearing*; that retain-vs-archive call is settled by load-bearing status, never containment %, before any marker is assigned (see the gate in READ THIS FIRST). Name the canonical it backs, and **name the residue read verbatim, never a bare count**: "8 unique" hides that the 8 are policy-refusals; "unique: refusals + asides" tells the reader to skip it. If the residue is genuinely substantive it is not a scroll-dep, it is a `[fork]`.
     - **(no marker)** - a **minor standalone**: a small one-off below the substance floor, in no family. The title alone carries it.
 
-    The four are decided by **three measured discriminators**: **containment** (near-disjoint vs mostly-inside-a-head), **amount of unique content** (substantial / modest / ~zero), and a **substance floor** (a real body of work vs a minor one-off). Near-disjoint + substantial = `[main]`; mostly-contained + modest-unique = `[fork]`; mostly-contained + ~zero-unique = `[scroll-dep]`; near-disjoint + below-the-floor = none (minor standalone). So `[main]`-vs-`[fork]` is **containment**, and `[main]`-vs-none (both near-disjoint) is the **substance floor** - a distinct third axis, not derivable from the other two. **Pin the floor concretely** (it has no `CEILING`-style constant, so state it): "substantial" = on the order of the other heads - hundreds of messages / many dozens of unique-prose; a near-disjoint session below ~`CEILING` unique-prose is a minor standalone, not a `[main]`. All three discriminators are measured, never eyeballed.
+    The four are decided by **three measured discriminators**: **containment** (near-disjoint vs mostly-inside-a-head), **amount of unique content** (substantial / modest / ~zero), and a **substance floor** (a real body of work vs a minor one-off). Near-disjoint + substantial = `[main]`; mostly-contained + modest-unique = `[fork]`; mostly-contained + ~zero-unique = `[scroll-dep]`; near-disjoint + below-the-floor = none (minor standalone). So all three boundaries are drawn by a different discriminator: `[main]`-vs-`[fork]` by **containment**; `[fork]`-vs-`[scroll-dep]` (both mostly-contained) by **amount of unique content** (modest vs ~zero); `[main]`-vs-none (both near-disjoint) by the **substance floor** - a distinct third axis, not derivable from the other two. **Pin the floor concretely** (it has no `CEILING`-style constant, so state it): "substantial" means a real *body of work*, not a high message count - on the order of the other heads, hundreds of messages / many dozens of unique-prose AND genuinely a primary line of work. A near-disjoint session that is high-count but low-value (a config one-off, a toy, an operational re-run) is **not** a `[main]`: it is a minor standalone (none), kept by the per-item user call of the next paragraph. `[main]` is reserved for a primary line of work; count alone never promotes a one-off to it. All three discriminators are measured, never eyeballed.
 - **Read the session before titling it.** A title written from the first message alone is how you get "shell/setup ops" jargon; the real topic is usually mid-conversation.
 - **Name the substance, never the opening.** Family, sub-label, and sentence describe what the session is *for* - the work it actually did, which lives mid-conversation. Never title from what was on screen when it opened: a seed/context prompt, a skill preamble, the first command, or the first artifact it happened to decode. Real misses: a card-RE fork titled `card-header` after the FAT32 dump on its first screen, and a patch-reapply titled `cli-subprocess` after a mid-session tangent. The first message is the least representative line in the session (same root as `shell/setup ops`); the acceptance test above is the gate.
 - **No character limit; "truncates" is not a budget.** Write 1 to 2 complete, plain sentences. "The picker truncates the tail" is the reason to put the gist first so it survives truncation; it is NOT a width to fit, and never a licence to abbreviate, drop words, or compress. A readable sentence the picker cuts off beats a complete one nobody can parse. (Real failure: a run invented a ~96-char cap out of the word "truncates", and once it had a number to optimise, readability lost - it produced cryptic fragments the author themselves could not read.)
