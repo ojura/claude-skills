@@ -105,6 +105,12 @@ There are **two** classes of load-bearing file, and you must protect both:
 
 **HARD RULE: a `compact_boundary` is never an origin.** It is always a stitch with a real predecessor - in-file, cross-file (Patch J), or phantom-shared (Patch K). A boundary at `parentUuid:null` with nothing before it does NOT mean the session is rootless / standalone / originless; it means its origin is **entirely external** and must be reconstructed - which is the case that most needs lineage work, not the one to dismiss. Concluding "this file carries no origin / is a standalone" from a leading boundary is a hard error: in a real run it produced a wrong family map (forks of one big conversation got mis-read as separate standalones, and a fork's `[main]` was nearly dropped). In code, `nb==0` at a boundary means "origin is external," never "no origin." Safety to archive must come from **content-redundancy** (0 unique vs the kept set), never from a file "looking rootless."
 
+**HARD RULE: keep, `[scroll-dep]`, and archive are ONE decision, made by measurement + read - identical rigor for all three.** Every file gets the same two things: the unique-vs-kept set-difference (a number) and a verbatim read of that unique residue. The skill's archive path already does this; the trap is exempting the *locked* set because it is load-bearing. **Load-bearing protects a file from being *moved*, never from being *measured*.** Three corollaries:
+
+- **Measure the locked set too; never infer content from size.** Run the unique-vs-kept set-difference on every load-bearing file. Load-bearing AND ~zero-unique ⇒ `[scroll-dep]`, established by the number, not by length. (Real miss: a 2142-message locked file was eyeballed as "must be content"; measured, it held 8 unique messages, all policy-refusals and banter.)
+- **Redundant structural-role files are archive candidates, not auto-keeps.** When several files can serve one structural role (e.g. two phantom-backfill sources for the same phantom), keep the richest and run the rest through the archive judgment on their read residue. (Real miss: a redundant source survived only by over-keeping; its 45 "unique" were operational noise plus two findings already present in a kept file.)
+- **A wrong seed silently skips measurement.** A file wrongly seeded as live (Step 0) or wrongly locked never gets measured - which is how a session 99% contained in the *real* live session stays in the picker. So if a "live" or load-bearing file *measures* ~zero-unique against another, suspect the seed/lock, re-check Step 0, and treat it as the redundant copy it is. "It's big" and "it's load-bearing" never substitute for the number or the read.
+
 The fork/compaction data model (Patches A, D, F, H, J, K) is documented in `github.com/ojura/claude-patches` (`docs/patches.md`); read it first if you have it. If not, the rules above are the operative summary. **If sessions have already been lost/deleted, this skill does not recover them - see the companion `recover-deleted-sessions-ext4` skill.**
 
 ## Step 0 - read the live-session registry (authoritative, do this FIRST)
@@ -248,6 +254,19 @@ def locked_closure(seed):
                     locked.add(best); changed=True
     return locked
 locked=locked_closure(seed)
+
+# MEASURE the locked set the SAME way as archive candidates - load-bearing protects a file from
+# being MOVED, never from being MEASURED. Each locked file's unique-vs-rest-of-kept decides its
+# title and flags redundant structural-role dups, by the number + a verbatim read, never by size.
+kept_all=set(locked) | {canonical(ks) for ks in trees.values()}
+for k in sorted(locked):
+    rest=set().union(*(set(fps[j]) for j in kept_all if j!=k))
+    uniq=set(fps[k])-rest
+    # uniq==0        -> [scroll-dep]; title names the residue ("none"), not a count
+    # 0<uniq<CEILING -> READ uniq verbatim (ftext). If trivial: [scroll-dep] titled by what the
+    #                   residue IS; and if another kept file fills k's structural role, k is a
+    #                   REDUNDANT source -> archive candidate, NOT an auto-keep.
+    # uniq>=CEILING  -> genuinely-unique kept fork: its own label, not [scroll-dep].
 
 # archive candidate = non-locked, non-canonical fork whose UNIQUE content is trivial
 # (< CEILING msgs) AFTER reading it, OR captured in a user-named durable artifact. Else keep.
@@ -398,7 +417,7 @@ Give the picker a themed shape by appending a `custom-title` record to each reta
 
 - **Format: `<family> <sub-label>: <1 to 2 sentences, gist first>`.** Use an **umbrella family** label (e.g. `backend`, `claude-patches`) with a **sub-label** for the sub-area: an **issue number** where the store has issue tracking (`1234`, `1290`), otherwise a short **topic tag** (`auth`, `search`, `parser`). Assign the sub-label by **topic, not branch**: many sessions all run on one long-lived branch, so the branch field is a poor theme signal. (The `[main]` / `[scroll-dep]` markers below are project-agnostic and apply either way.) The sentences say what the session actually is or did; the picker truncates, so the first clause must carry the meaning. NOT a bare slug, NOT a terse invented phrase (a real run rejected `fork-empty` and `shell/setup ops` as meaningless), NOT 3+ sentences, and NEVER the raw first message (a tool/command echo or `<ide_opened_file>` tag). Date-only differentiators (`(Apr 3)`) are uninformative.
 - Canonical of a fork-family theme -> prefix with **`[main]`** at the very front, then the label + what the whole thread is/did. (`[main]` pairs with `[scroll-dep]` so the family's primary and its kept scrollback segments are both flagged even when the picker truncates.) **A distinct sub-lineage head also gets `[main]`** - it is not one-per-family: e.g. within a `claude-patches` family, both the empty-fork-diagnosis canonical and the patch-development head are `[main]` of their respective sub-lineages. A retained fork with only modest unique content -> label + what is unique to it (no marker).
-- A load-bearing segment kept ONLY for scrollback (a `locked` file fully contained in its canonical, zero unique content) -> prefix the WHOLE title with **`[scroll-dep]`** at the very front, before the label, so it is flagged even when the picker truncates; then name which canonical it backs. The containment pass already identifies these.
+- A load-bearing segment kept ONLY for scrollback (a `locked` file measured ~zero-unique against the kept set) -> prefix the WHOLE title with **`[scroll-dep]`** at the very front, before the label, so it is flagged even when the picker truncates; then name which canonical it backs. **Name the unique residue, read verbatim - never a bare count.** This is the titling-side of "judge the messages, never the count": "8 unique" hides that the 8 are policy-refusals and falsely implies something worth mining, whereas "unique: refusals + asides" tells the reader to skip it. A `[scroll-dep]` entry's whole value is naming the irreplaceable slice, so the read precedes the title; if the residue is genuinely substantive, it is not a scroll-dep, it is a kept fork with its own label.
 - **Read the session before titling it.** A title written from the first message alone is how you get "shell/setup ops" jargon; the real topic is usually mid-conversation.
 
 Format (exactly what the extension itself writes; append-only, last-wins, reversible):
