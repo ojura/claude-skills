@@ -32,5 +32,5 @@ never deleted.
   before any mutation - that sweep can silently delete kept sessions, and any
   tool that touches a file's mtime can trip it.
 
-See `SKILL.md` for the full procedure. Companion: `recover-deleted-sessions`,
+See `SKILL.md` for the full procedure. Companion: `recover-deleted-sessions-ext4`,
 for when sessions are already lost.

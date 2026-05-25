@@ -105,7 +105,7 @@ There are **two** classes of load-bearing file, and you must protect both:
 
 **HARD RULE: a `compact_boundary` is never an origin.** It is always a stitch with a real predecessor - in-file, cross-file (Patch J), or phantom-shared (Patch K). A boundary at `parentUuid:null` with nothing before it does NOT mean the session is rootless / standalone / originless; it means its origin is **entirely external** and must be reconstructed - which is the case that most needs lineage work, not the one to dismiss. Concluding "this file carries no origin / is a standalone" from a leading boundary is a hard error: in a real run it produced a wrong family map (forks of one big conversation got mis-read as separate standalones, and a fork's `[main]` was nearly dropped). In code, `nb==0` at a boundary means "origin is external," never "no origin." Safety to archive must come from **content-redundancy** (0 unique vs the kept set), never from a file "looking rootless."
 
-The fork/compaction data model (Patches A, D, F, H, J, K) is documented in `github.com/ojura/claude-patches` (`docs/patches.md`); read it first if you have it. If not, the rules above are the operative summary. **If sessions have already been lost/deleted, this skill does not recover them - see the companion `recover-deleted-sessions` skill.**
+The fork/compaction data model (Patches A, D, F, H, J, K) is documented in `github.com/ojura/claude-patches` (`docs/patches.md`); read it first if you have it. If not, the rules above are the operative summary. **If sessions have already been lost/deleted, this skill does not recover them - see the companion `recover-deleted-sessions-ext4` skill.**
 
 ## Step 0 - read the live-session registry (authoritative, do this FIRST)
 
@@ -454,4 +454,4 @@ These are the choices a reader is most likely to second-guess; the body specifie
 
 - **Titling is mtime-neutral by default; chronological equalisation is opt-in.** Restoring the file's own pre-append mtime keeps the recency-sorted picker intact without ever changing a file's deletion exposure. Writing a *computed* true-last-activity mtime would order the picker perfectly but is exactly what deletes old sessions under the live sweep, so it requires user authorisation and the sweep disabled.
 
-- **Recovery is out of scope.** If sessions are already lost, that is the companion `recover-deleted-sessions` skill.
+- **Recovery is out of scope.** If sessions are already lost, that is the companion `recover-deleted-sessions-ext4` skill.

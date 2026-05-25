@@ -1,4 +1,4 @@
-# Recover deleted Claude Code sessions
+# Recover deleted Claude Code sessions (ext4)
 
 Recover session transcripts (`~/.claude/projects/<slug>/<sessionId>.jsonl`) that were deleted by
 `rm`, `find -delete`, or a retention sweep. The recovery rate is dominated by what decays fastest,

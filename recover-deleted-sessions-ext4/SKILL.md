@@ -1,16 +1,17 @@
 ---
-name: recover-deleted-sessions
+name: recover-deleted-sessions-ext4
 description: >
   Recover Claude Code session transcripts that were deleted / lost / rm'd / find -delete'd
-  / vanished from ~/.claude/projects/<slug>/. Volatility-ordered triage: stop writes to the
-  affected fs, check existing backups + the ext4 journal, dump LIVE claude --resume process
+  / vanished from ~/.claude/projects/<slug>/. Assumes ext4 (the common Linux default); on
+  copy-on-write filesystems (btrfs/ZFS) recover via a snapshot/rollback instead. Volatility-ordered
+  triage: stop writes to the affected fs, check existing backups + the ext4 journal, dump LIVE claude --resume process
   memory and webview/CDP state before those processes exit, then raw-disk carve, then
   journal-extent recovery, then merge + dedupe and restore only on explicit OK. Trigger when
   the user says session JSONLs were deleted, a cleanup/rm wiped ~/.claude/projects, the
   session picker lost conversations, or "get my .claude back".
 ---
 
-# Recover deleted Claude Code sessions
+# Recover deleted Claude Code sessions (ext4)
 
 Session transcripts live as `~/.claude/projects/<slug>/<sessionId>.jsonl` (plus per-session
 `<sessionId>/subagents/` and `<sessionId>/tool-results/` dirs). When a batch is deleted with
@@ -19,6 +20,15 @@ backups, the ext4 journal, live process / webview memory, and raw-disk block car
 recovery rate is dominated by volatility: every block freed by the delete is a candidate for the
 next write, and every running `claude --resume` process is holding session content in RAM that
 evaporates the moment it exits.** Order the work by what decays fastest.
+
+**Filesystem scope: ext4.** The carve (Step 3) is content-pattern-based and runs on any raw block
+device, but the undelete reasoning here is ext4-specific: ext4 zeroes the inode's extent tree on
+unlink (so there is no undelete), and Step 5 reads pre-deletion inode extents from the JBD2 journal.
+On a copy-on-write filesystem (btrfs, ZFS) do not carve - recover from a snapshot (`btrfs subvolume`
+/ `zfs rollback`), which is byte-perfect and trivial by comparison. XFS, APFS, ext3, and NTFS have
+different inode/journal semantics: the volatile-source steps (0-2: stop writes, backups, live
+process + webview memory) apply unchanged, but the journal-extent step and the "no undelete" claim
+need that filesystem's equivalent. Confirm yours with `df -T ~/.claude`.
 
 This skill is distilled from one real incident: 55 session JSONLs (~592 MB) deleted from
 `~/.claude/projects/<slug>/`, recovered to 60/66 sessions (91% session-count, ~100%

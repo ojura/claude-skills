@@ -73,7 +73,7 @@ single message is never dropped on count alone). Optionally titles retained
 sessions for a themed, chronological picker, mtime-neutrally so none are exposed
 to the mtime-keyed retention sweep.
 
-### recover-deleted-sessions
+### recover-deleted-sessions-ext4
 
 Recovers Claude Code session transcripts deleted by `rm`, `find -delete`, or a
 retention sweep. Volatility-ordered triage: stop writes to the affected
