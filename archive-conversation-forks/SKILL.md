@@ -96,6 +96,20 @@ session needs for scrollback or origin display. Moving it out of the project dir
 breaks the canonical's transcript.** This is the "dropping lpus" failure the skill exists to
 prevent. Do NOT decide archival by content length alone.
 
+**Nor by containment percentage.** Archive is **a different axis from the markers, and exclusive of
+all of them**: a file is either RETAINED (and then carries exactly one of `[main]` / `[fork]` /
+`[scroll-dep]` / none) **or** ARCHIVED (moved out of the picker) - never both. The retain-vs-archive
+split comes **first**; a marker is assigned only to what's kept. That first split is gated by
+load-bearing status: **a load-bearing file can never be archived** - a kept or live session
+reconstructs scrollback from it cross-file, so moving it orphans that session, the worst outcome.
+Containment % is necessary-but-not-sufficient and never the gate: a 99.6%-contained file can still
+be load-bearing. Only a file that is *both* not-load-bearing *and* redundant is an archive
+candidate; a load-bearing ~0-unique file is kept and marked `[scroll-dep]`. (Real miss: an operator
+offered "archive OR mark `[scroll-dep]`" as interchangeable choices for a 99.6%-contained file - they
+are not choices for the same file; load-bearing decides retain-vs-archive first, and that file was
+load-bearing for the *live* session. "99.6% contained" never answers "is it load-bearing"; only lpu /
+phantom dependency does.)
+
 There are **two** classes of load-bearing file, and you must protect both:
 
 1.  **Cross-file lpu targets.** File B is load-bearing if some other file references (via lpu) a uuid that B owns. Easy to compute from `global_uuid`.
@@ -206,6 +220,11 @@ def sources(k):   # phantom lpus this file can BACKFILL (has pre-content before 
     return {lp for (lp,par,nb) in bnd[k] if lp in phantom and (par is not None or nb>0)}
 def needs(k):     # phantom lpus this file relies on a sibling for (boundary at root, no pre-content)
     return {lp for (lp,par,nb) in bnd[k] if lp in phantom and par is None and nb==0}
+# DISCIPLINE: use sources()/needs() VERBATIM everywhere you verify orphans or backfill - never
+# re-derive a quick approximation. A file is a source if it has ANY pre-content before its phantom
+# boundary: `par is not None OR nb>0`. The lazy `par is not None`-only form (dropping the nb>0 half)
+# was reimplemented loosely TWICE in a real run and produced false orphan flags both times. The
+# precise predicate is cheap; the approximation is the bug.
 
 # union-find trees: link files sharing an lpu value, or a cross-file dep edge
 parent={k:k for k in fps}
@@ -403,7 +422,7 @@ explicitly "nothing to ingest".
 1.  Aggregate the keep/archive list. **Show the user the full list (forks + every debris file, with unique-msg counts) and get explicit go/no-go before moving anything.**
 2.  Create `~/claude-archive/<theme>/` dirs (agents already wrote the READMEs there).
 3.  `mv` each confirmed file into its theme dir, preserving the uuid filename. Write `~/claude-archive/manifest.json`: archived-file -> original-path -> theme -> canonical -> reason (enough to restore with one command).
-4.  **Post-move verification (hard gate):** re-scan the project dir; for every kept canonical confirm (a) all its cross-file lpu targets still resolve in the project dir, and (b) every phantom it needs still has a kept backfill source. Zero orphans on both. Confirm `total - moved` files remain and no live/registry session was touched.
+4.  **Post-move verification (hard gate):** re-scan the project dir; for every kept canonical confirm (a) all its cross-file lpu targets still resolve in the project dir, and (b) every phantom it needs still has a kept backfill source. **Recompute `needs()` / `sources()` VERBATIM (Step 2's definitions) over the POST-move file set** - the pre-move maps are stale, and a re-derived approximation (e.g. `par is not None` without the `nb>0` half) gives false orphan flags. Zero orphans on both. Confirm `total - moved` files remain and no live/registry session was touched.
 
 **Operational / low-value but distinct sessions** (skill re-runs, toy experiments, one-off
 config tasks, stray Q&A) are neither redundant nor debris: their content is unique, just
@@ -417,11 +436,11 @@ without a per-item user decision.
 Give the picker a themed shape by appending a `custom-title` record to each retained session:
 
 - **Format: `<family> <sub-label>: <1 to 2 sentences, gist first>`.** Use an **umbrella family** label (e.g. `backend`, `claude-patches`) with a **sub-label** for the sub-area: an **issue number** where the store has issue tracking (`1234`, `1290`), otherwise a short **topic tag** (`auth`, `search`, `parser`). Assign the sub-label by **topic, not branch**: many sessions all run on one long-lived branch, so the branch field is a poor theme signal. (The markers below - `[main]` / `[fork]` / `[scroll-dep]` - are project-agnostic and apply either way.) The sentences say what the session actually is or did; the picker truncates the *tail*, which is the reason to front-load the gist - NOT a width to fit (see "no character limit" below). NOT a bare slug, NOT a terse invented phrase (a real run rejected `fork-empty` and `shell/setup ops` as meaningless), NOT 3+ sentences, and NEVER the raw first message (a tool/command echo or `<ide_opened_file>` tag). Date-only differentiators (`(Apr 3)`) are uninformative.
-- **Marker taxonomy - every retained session is exactly one of four, decided by *containment* and *unique content*, never by issue number, branch, or a one-per-family assumption.** Put the marker at the very front so it survives picker truncation.
+- **Marker taxonomy - every retained session is exactly one of four, decided by *containment* and *unique content*, never by issue number, branch, or a one-per-family assumption.** (Archive is **not** a fifth marker: it is the prior retain-vs-move-out decision, exclusive of all four - only retained files are marked.) Put the marker at the very front so it survives picker truncation.
 
     - **`[main]`** - a **near-disjoint, substantial** body of work (a head): low `fps_prose` overlap with the other heads. **Lone or with offshoots both qualify** - a lone substantial standalone is a `[main]` with zero forks, and having no children never demotes it. (Real miss: an 1887 head 99% disjoint from the 2110 head was left unmarked because `[main]` was assigned one-per-family; a 2268 frame-naming head, equally disjoint, was missed the same way. Both are `[main]`.)
     - **`[fork] <main>`** - a kept offshoot **mostly contained** in a `[main]` (high overlap) but holding *modest unique content* worth keeping. Name the main it belongs to and what is unique to it. (e.g. a rotations session 82% contained in the 2110 head: `[fork]` of it, unique = the rotations carry-through.)
-    - **`[scroll-dep] <main>`** - a `locked` file mostly contained in a `[main]` with **~0 unique** (a pure scrollback bridge). Name the canonical it backs, and **name the residue read verbatim, never a bare count**: "8 unique" hides that the 8 are policy-refusals; "unique: refusals + asides" tells the reader to skip it. If the residue is genuinely substantive it is not a scroll-dep, it is a `[fork]`.
+    - **`[scroll-dep] <main>`** - a `locked` file mostly contained in a `[main]` with **~0 unique** (a pure scrollback bridge). It is kept (not archived) *because it is load-bearing*; that retain-vs-archive call is settled by load-bearing status, never containment %, before any marker is assigned (see the gate in READ THIS FIRST). Name the canonical it backs, and **name the residue read verbatim, never a bare count**: "8 unique" hides that the 8 are policy-refusals; "unique: refusals + asides" tells the reader to skip it. If the residue is genuinely substantive it is not a scroll-dep, it is a `[fork]`.
     - **(no marker)** - a **minor standalone**: a small one-off below the substance floor, in no family. The title alone carries it.
 
     The four are mutually exclusive by two measured axes - **containment** (near-disjoint vs mostly-inside-a-head) and **unique content** (substantial / modest / ~zero): near-disjoint + substantial = `[main]`; mostly-contained + has-unique = `[fork]`; mostly-contained + ~zero-unique = `[scroll-dep]`; minor + standalone = none. `[main]`-vs-standalone is the substance floor; `[main]`-vs-`[fork]` is containment. All measured, never eyeballed.
