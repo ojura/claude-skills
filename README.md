@@ -33,6 +33,15 @@ and exposes a small local HTTP API for targets, attach, eval, arbitrary CDP
 calls, and a buffered event stream. Useful for reading cookies, evaluating JS,
 navigating, or watching network traffic in the user's real logged-in browser.
 
+### chatgpt-archive-toolkit
+
+Archives a logged-in ChatGPT account/workspace through `cdp-daemon`, preserving
+raw conversation JSON, branch variants, reasoning/tool metadata returned by the
+backend, file/media references, Library nodes, endpoint snapshots, and signed
+downloads. Installs a static dark local browser for reading conversations,
+collapsing noisy technical payloads, browsing files/artifacts/raw API captures,
+and validating archive coverage.
+
 ### markdown-latex-report
 
 Turns a single Markdown file into a polished, book-quality PDF via pandoc and

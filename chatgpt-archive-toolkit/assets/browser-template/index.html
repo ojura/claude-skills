@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ChatGPT Archive Browser</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <div id="app" class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div>
+            <div class="brand-title">ChatGPT Archive</div>
+            <div id="brand-subtitle" class="brand-subtitle">Loading local export</div>
+          </div>
+        </div>
+
+        <label class="search-box">
+          <span class="search-icon">/</span>
+          <input id="global-search" type="search" autocomplete="off" placeholder="Search conversations, files, refs">
+        </label>
+
+        <nav class="nav-list" aria-label="Views">
+          <button class="nav-item active" data-view="overview">Overview</button>
+          <button class="nav-item" data-view="conversations">Conversations</button>
+          <button class="nav-item" data-view="files">Files</button>
+          <button class="nav-item" data-view="library">Library</button>
+          <button class="nav-item" data-view="artifacts">Artifacts</button>
+          <button class="nav-item" data-view="endpoints">Raw API</button>
+        </nav>
+
+        <div class="sidebar-section">
+          <div class="section-label">Conversations</div>
+          <div id="conversation-list" class="conversation-list"></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h1 id="view-title">Overview</h1>
+            <div id="view-subtitle" class="muted">Preparing dump browser</div>
+          </div>
+          <div id="view-actions" class="actions"></div>
+        </header>
+
+        <section id="content" class="content">
+          <div class="loading">Loading export indexes...</div>
+        </section>
+      </main>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

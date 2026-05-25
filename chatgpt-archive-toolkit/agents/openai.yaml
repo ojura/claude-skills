@@ -1,0 +1,4 @@
+interface:
+  display_name: "ChatGPT Archive Toolkit"
+  short_description: "Capture, validate, and browse ChatGPT archives."
+  default_prompt: "Use $chatgpt-archive-toolkit to archive my ChatGPT workspace from Chrome CDP and create a local browser for it."
