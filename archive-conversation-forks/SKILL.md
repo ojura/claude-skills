@@ -140,6 +140,22 @@ recency or the tmp dir suggests (real case: heuristics pointed at `a24119fe` whi
 registry showed the live session was `464771a1`). The `RECENT_HOURS` mtime check in Step 2 is
 only a fallback for sessions with no registry entry. (Optionally `os.kill(pid, 0)` to drop a stale `<pid>.json` from a crashed process; treating a stale entry as live merely over-protects, which is benign.)
 
+**HARD GATE - identify the live set ONLY from the registry; never proceed on a guess.** Resolve
+each running `sessionId` to its `<sessionId>.jsonl`, confirm the file exists, and take the union as
+the never-touch live set. If the registry is missing/unreadable, or a running `sessionId` doesn't
+resolve to a file, **STOP and ask** - do not fall back to recency, newest mtime, filename, or "the
+one I think I'm in." A wrong live set is not a local error: it seeds the locks, the moves, and the
+titles, so a bad guess cascades through everything downstream. **Why guessing is uniquely lethal
+here:** a live conversation forked from a parent is **fork-shaped** - mostly-contained in that
+parent plus a short live tail - so by *content* it is **indistinguishable from an archivable
+`[fork]`**. The registry is the only signal that says "this fork-shaped file is live." Guess by
+containment and you can mark the live session `[fork]` and **archive the very conversation you are
+running in** (real near-miss: a 99.6%-contained file was almost archived that the live session
+needed). Note the shape: a live session is **never** a `[scroll-dep]` (it is actively growing, not
+a dead ~0-unique bridge) - at most it looks like a fork, which is exactly the trap. (This failure is
+the wrong-seed miss made concrete: an agent that guessed its own conversation instead of reading the
+registry locked the wrong file and the error cascaded.)
+
 This goes first because every later step (the keep-lock seed, the moves, the titling) depends
 on the never-touch set being right, and a fork/restore can revert in-memory or on-disk state
 (it has clobbered `MEMORY.md` index lines mid-session), so do not trust assumptions about
@@ -188,7 +204,7 @@ def norm(ts):
             dt=datetime.datetime.fromisoformat(str(ts).replace("Z","+00:00"))
             if dt.tzinfo: dt=dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
         return dt.isoformat()
-    except: return str(ts)
+    except: return ""   # unparseable -> sort LAST/empty, never a bare int string that mis-sorts vs ISO
 
 fps={}; fps_prose={}; ftext={}; owned={}; lref={}; bnd={}; nmsg={}; lts={}; mtime={}; firstmsg={}; global_uuid=defaultdict(set)
 for p in sorted(glob.glob("*.jsonl")):
@@ -270,8 +286,18 @@ for sp in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
         if d.get("status")!="running": continue        # not live per the registry's own field
         try: os.kill(int(d["pid"]),0)                   # ESRCH/ValueError => process gone => stale entry
         except Exception: continue
-        live.add(d.get("sessionId","")[:8])
+        sid=d.get("sessionId","")[:8]
+        # ENFORCE, don't prefix-match-and-hope: resolve the live sessionId to an actual file in the
+        # store. fps keys are filename[:8]; only equal to sid if the file is named <sessionId>.jsonl
+        # (true in practice, but a forked live session is the case Step 0 warns about - verify it).
+        if sid not in fps:
+            HALT(f"live session {sid} from the registry has no file in this store - resolve before "
+                 f"proceeding; do NOT guess which file is live")   # never silently skip a live session
+        live.add(sid)
     except: pass
+if not live:
+    # registry empty/unreadable, or no running session resolved: do NOT fall back to a recency guess.
+    confirm_no_live_or_HALT()   # Step 0 hard gate: a missing live set stops the run, never defaults
 seed={canonical(ks) for ks in trees.values() if len(ks)>1}
 seed|={k for k in fps if k in live}                                    # live (authoritative)
 seed|={k for k in fps if (time.time()-mtime[k]) < RECENT_HOURS*3600}   # fallback: recently active
@@ -327,21 +353,44 @@ for ks in trees.values():
 # The FULL kept set, defined ONCE and reused by BOTH the locked-set measurement and the recall pass.
 KEPT = {canonical(ks) for ks in trees.values()} | set(locked) | kept_unique_forks
 
-# MEASURE the locked set with IDENTICAL rigor, against the FULL kept set (now that kept_unique_forks
-# exists - measuring against only canonicals+locked would over-mark [fork] a locked file whose residue
-# actually lives in a kept fork). Load-bearing protects a file from being MOVED, never from being
-# MEASURED, and this measurement decides ONLY the file's title: a locked file is NEVER archived. It is
-# in `locked` because it is load-bearing, and redundancy was already resolved when locked_closure
-# locked only the RICHEST source per phantom - the non-richest siblings were never locked and flow
-# through the archive path above, not here.
-for k in sorted(locked):
-    rest=set().union(*(set(fps[j]) for j in KEPT if j!=k))
-    uniq=set(fps[k])-rest
-    # uniq==0        -> [scroll-dep]; title names the residue ("none"), not a count
-    # 0<uniq<CEILING -> READ uniq verbatim (ftext): trivial residue -> [scroll-dep] (named by what it
-    #                   IS); substantive residue -> [fork]. Either way KEPT, never archived.
-    # uniq>=CEILING  -> [fork] (a locked file is mostly-contained by construction, so [fork], not
-    #                   [main]), never [scroll-dep], never archived.
+# MARK every retained file that is NOT a canonical and NOT live - ONE decision, FOUR outcomes.
+# `KEPT - canonicals - live` is the union of: cross-file ancestors, phantom sources, the recent-mtime
+# fallback seed, AND the kept-unique forks. Do NOT assume "ancestor -> bridge": the recent-mtime
+# members are NOT reconstructed prefixes of anything - they can be disjoint substantial standalones,
+# so `[main]` and `none` must be reachable here, not only `[scroll-dep]`/`[fork]`. (Canonicals are
+# `[main]` from selection; live are never-touch. None of these is ever archived - all are in KEPT;
+# load-bearing protects from MOVING, the loop only titles.)
+canonicals={canonical(ks) for ks in trees.values()}
+# load-bearing is PURELY STRUCTURAL and mtime-independent: k is load-bearing iff some KEPT/live file
+# reconstructs scrollback from it - k owns a uuid referenced cross-file, OR k can source a phantom a
+# kept file needs. Deliberately NOTHING about mtime or `locked`: opening a chat in Claude bumps its
+# mtime, so recent-mtime is NOT liveness and NOT a marker signal (during a cleanup it often just means
+# "the user inspected this while deciding"). The recent-mtime seed ONLY protects a just-opened file
+# from archival; it never sets the marker. The marker is structure + residue, period.
+consumers = KEPT | live
+loadbearing  = {b for a in consumers for lp in lref[a] for b in global_uuid.get(lp,()) if b!=a}  # cross-file targets
+needed       = set().union(*(needs(a) for a in consumers)) if consumers else set()                # phantoms they need
+loadbearing |= {s for s in fps if sources(s) & needed}                                            # files that source them
+for k in sorted(KEPT - canonicals - live):
+    # containment is the family axis -> PROSE overlap with the best-containing head. `head` ALWAYS
+    # resolves to some canonical, so it is meaningful ONLY on the contained branches: gate on `ov`
+    # FIRST and name NO parent for [main].
+    head=max(canonicals, key=lambda h: len(set(fps_prose[k]) & set(fps_prose[h])), default=None)
+    ov=(len(set(fps_prose[k]) & set(fps_prose[head]))/max(1,len(set(fps_prose[k])))) if head else 0.0
+    residue=set(fps[k]) - set().union(*(set(fps[j]) for j in KEPT if j!=k))   # RAW residue, then READ it
+    # NEAR-DISJOINT (low ov):  substantial residue -> [main] (a sub-lineage head, NO parent named)
+    #                          minor                -> none   (a minor standalone)
+    # MOSTLY-CONTAINED (high ov):
+    #   substantive residue                     -> [fork] of `head` (name it; title by the residue)
+    #   trivial/~0 residue AND k in loadbearing  -> [scroll-dep] of the canonical it backs (a recently-
+    #       OPENED file can land here - structural load-bearing decides it, not mtime; only REGISTRY-live
+    #       is never a scroll-dep, recent-mtime is not liveness)
+    #   trivial/~0 residue AND NOT loadbearing   -> a redundant duplicate: normally an archive candidate;
+    #       if it is in KEPT only because recent-mtime protected it (the user just opened it), leave it
+    #       PROVISIONALLY kept and unmarked - re-evaluate once it is clearly not being inspected.
+    # RAW residue catches tool-only content (a pure bridge has ~0 of ANY content). substantial-vs-minor
+    # and trivial-vs-substantive are READ-and-JUDGE judgments, never a CEILING cutoff (CEILING only
+    # auto-KEEPS a fork; reusing it as a title threshold is the borrowed-constant proxy to avoid).
 ```
 
 Record, per archive candidate: its unique message texts (verbatim, from `ftext`), its
@@ -387,8 +436,10 @@ Two rules learned the hard way:
 Never archive a canonical even when it is highly contained in one of its own forks (forks
 replay most content; the canonical is the primary by recency + distinct-content).
 
-(`KEPT`, `ARCHIVE()`, `SONNET_CONFIRM()` above are pseudocode placeholders; wire them to your
-kept-set and your move/confirm steps.)
+(`ARCHIVE()`, `SONNET_CONFIRM()`, `judge()`, `nominate_debris()`, `report_unsatisfiable_phantoms()`,
+`HALT()` / `confirm_no_live_or_HALT()` above are pseudocode placeholders - wire them to your move /
+confirm / debris / stop-and-ask steps. `KEPT`, `live`, `kept_unique_forks` etc. are real variables
+defined in the pass.)
 
 **Deterministic debris nomination.** The per-tree partition skips single-file trees
 (`if len(ks)==1: continue`), so a standalone throwaway (an empty `/clear`, a `/resume`, a bare
