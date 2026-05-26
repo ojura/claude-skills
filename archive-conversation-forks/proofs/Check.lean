@@ -1,12 +1,13 @@
 import Orphan
 import Markers
 import Family
+import Fixpoint
 open Orphan
 
-/- VERIFY-OUTCOME 1: no hidden axioms / sorry. The structural lemmas are fully constructive
-   ("does not depend on any axioms"). The recall/marker theorems use `Classical.em`, so they
-   list the trusted core (`Classical.choice`, `propext`, `Quot.sound`); that is NOT a `sorry`.
-   The crucial check is that NONE lists `sorryAx`. -/
+/- VERIFY-OUTCOME 1: no hidden axioms / sorry. Every theorem here is fully constructive ("does not
+   depend on any axioms") EXCEPT `canonical_mem` / `canonical_nondebris` (and their concrete
+   witnesses), which list only `propext` (from `List.filter` reasoning). The crucial checks: NONE
+   lists `sorryAx`, `Classical.choice`, or `Lean.ofReduceBool`. -/
 #print axioms no_orphan
 #print axioms closure_closed_under_needs
 #print axioms final_closed_under_needs
@@ -25,6 +26,11 @@ open Orphan
 #print axioms Family.content_not_a_generator
 #print axioms Family.canonical_mem
 #print axioms Family.canonical_nondebris
+-- Fixpoint internalisation: the bridge facts derived, not assumed.
+#print axioms FixProto.hpick_from_closed
+#print axioms FixProto.source_lb_from_def
+#print axioms FixProto.demoted_guard_from_def
+#print axioms FixProto.no_orphan_from_closed
 
 /- VERIFY-OUTCOME 2: the theorem is NON-VACUOUS. Build a concrete store where:
    - the hypotheses (hpick, demoted_guard, source_lb) all hold,
@@ -190,3 +196,29 @@ theorem concrete_canonical_nondebris : ¬ debris3 n0 :=
 
 #print axioms concrete_canonical_mem
 #print axioms concrete_canonical_nondebris
+
+/- VERIFY-OUTCOME 7: the INTERNALISED no-orphan (no_orphan_from_closed) is non-vacuous. A concrete
+   closed `locked` (containing a needer f0 and its source f1), with the loop's fixpoint condition
+   `IsClosed` actually proved for this store - so the conclusion (a source survives in the post-C5
+   set) is a real claim derived from IsClosed, not from an assumed hpick/source_lb/demoted_guard. -/
+def crossN : Fil → Fil → Prop := fun _ _ => False
+def needsN : Fil → Pha → Prop := fun f _ => f = f0
+def srcN   : Fil → Pha → Prop := fun f _ => f = f1
+def lockedN : FSet Fil := fun _ => True            -- both files locked (a valid closed set here)
+def consumersN : FSet Fil := fun _ => True
+def residueN : FSet Fil := fun _ => True           -- nonzero residue everywhere -> nothing demoted
+
+-- IsClosed holds for this store: no cross edges; the only needed phantom (p0, needed by f0) has
+-- source f1, which is locked. So phan_closed is witnessed by f1.
+theorem lockedN_closed : FixProto.IsClosed crossN needsN srcN lockedN where
+  cross_closed := by intro _ _ _ e; cases e
+  phan_closed  := by intro _ _ _ _ _; exact ⟨f1, trivial, rfl⟩
+
+theorem concrete_no_orphan_from_closed :
+    ∃ s, (lockedN s ∧ ¬ FixProto.demoted needsN srcN consumersN residueN s) ∧ srcN s p0 := by
+  refine FixProto.no_orphan_from_closed crossN needsN srcN lockedN_closed
+    (fun _ _ => trivial) (f := f0) (P := p0) ⟨trivial, ?_⟩ rfl ⟨f1, rfl⟩
+  -- ¬ demoted f0: demoted = ¬loadbearing ∧ ¬residue, but residueN is True, so its second half fails.
+  intro hd; exact hd.2 trivial
+
+#print axioms concrete_no_orphan_from_closed

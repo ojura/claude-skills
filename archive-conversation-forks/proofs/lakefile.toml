@@ -1,5 +1,5 @@
 name = "orphan"
-defaultTargets = ["Orphan", "Markers", "Family", "Check"]
+defaultTargets = ["Orphan", "Markers", "Family", "Fixpoint", "Check"]
 
 [[lean_lib]]
 name = "Orphan"
@@ -9,6 +9,9 @@ name = "Markers"
 
 [[lean_lib]]
 name = "Family"
+
+[[lean_lib]]
+name = "Fixpoint"
 
 [[lean_lib]]
 name = "Check"

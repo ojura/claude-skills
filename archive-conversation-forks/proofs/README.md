@@ -51,6 +51,27 @@ member (`canonical_mem`) and respects the content floor (`canonical_nondebris`: 
 whenever a non-debris member exists). Which specific file it picks (the max-distinct / recency
 key) is deliberately not modelled - membership and the floor are the safety-relevant properties.
 
+**`FixProto.*` (the bridge facts derived, not assumed).** `no_orphan` is stated over three bridge
+hypotheses (`hpick`, `source_lb`, `demoted_guard`) that connect the abstract model to the code.
+`Fixpoint.lean` discharges all three from strictly weaker inputs, so they are no longer bald
+assumptions:
+
+- `source_lb` and `demoted_guard` become **lemmas** (`source_lb_from_def`, `demoted_guard_from_def`)
+  once `loadbearing` and `demoted` are modelled as their actual set definitions - `loadbearing s =
+  (s sources some needed phantom)` and `demoted = (not loadbearing and zero residue)` - exactly the
+  committed `loadbearing |= {s | sources(s) & needed}` and the C5 `if k in loadbearing: continue`
+  guard. They fall straight out of those definitions.
+- `hpick` is derived (`hpick_from_closed`) from a single structural fact, `IsClosed locked`: the
+  committed `while changed:` loop reached its fixpoint. `IsClosed` says exactly what loop
+  termination says - no cross edge and no phantom rule can add anything more - so at the fixpoint
+  every needed phantom of a locked file with a source keeps SOME source in `locked` (faithful to the
+  `if not (set(srcs) & locked)` guard, which stops at some source, not the richest). This replaces a
+  per-phantom existence claim that looked like it needed choice with one obviously-code-true fact.
+
+`no_orphan_from_closed` reassembles the main result from these: same conclusion as `no_orphan`, but
+assuming only `IsClosed locked` plus the set definitions, not the three bridge hypotheses. All four
+`FixProto` results are fully axiom-free.
+
 Properties of the proofs:
 
 - **Axiom honesty.** Every theorem here is **fully constructive** except two, and even those use
@@ -113,11 +134,22 @@ These proofs certify the **set algebra**: given facts the code establishes, arch
 orphans a kept session, never drops a message of a 0-unique candidate, never moves a live
 session, and the marker tree has no hole. They are **not** a proof of the Python end to end:
 
-- The hypotheses (`hpick`, `demoted_guard`, `source_lb`, the `cross_lb` / `phan_lb` /
-  `C5_survivor` / `live_not_demoted` facts) are transcribed from the Step 2 code; the
-  proofs certify the logic *given* them. That the Python actually implements them (the JSONL
-  parse, the union-find partition, `canonical()`, the fixpoint loop) is checked by the
-  property-based fuzz, not by Lean.
+- After the `Fixpoint.lean` internalisation, the bridge hypotheses are mostly *derived*, not
+  assumed. `source_lb` and `demoted_guard` follow from the set definitions of `loadbearing` /
+  `demoted`; `hpick` follows from `IsClosed locked`. What remains assumed shrinks to **one
+  structural fact: `IsClosed locked`** (the `while changed:` loop reached its fixpoint), plus the
+  closure-inversion facts (`cross_lb` / `phan_lb`) and the marker side-conditions (`C5_survivor` /
+  `live_not_demoted`), each a direct reading of a code line. That the Python *implements* these (the
+  JSONL parse, the actual union-find, `canonical()`, the loop body) is checked by the property-based
+  fuzz, not by Lean.
+- The one place a finiteness/termination proof is deliberately omitted: `IsClosed locked` asserts
+  the loop reaches a fixpoint, which it does because each iteration that changes anything adds a
+  universe element to `locked` (a monotone fixpoint over a finite set). Mechanizing that step is
+  either a sizeable core-Lean `List.filter` cardinality argument or a mathlib `Finset.card`
+  one-liner; mathlib is **not** used here (it is not wired as a build dependency, so importing it
+  would break the stock-image `lake build`), and the core-Lean counting proof was judged
+  disproportionate for a textbook-obvious fact (loop-over-finite-set terminates) that is not a place
+  bugs hide. So `IsClosed` is the single honest remaining assumption, stated rather than dressed up.
 - `pick P` abstracts the source the closure **realises** for a phantom `P` at fixpoint, not
   the literal richest source. The committed `locked_closure` adds its richest candidate only
   when no source of `P` is already locked (`if not (set(srcs) & locked)`), so a different,
@@ -151,5 +183,6 @@ session, and the marker tree has no hole. They are **not** a proof of the Python
 - `Orphan.lean` - the closure, the re-close, C5 safety, `no_orphan`, and the recall no-loss theorem.
 - `Markers.lean` - the closure-inversion lemma, `live_subset_keptC5`, and `marker_no_hole`.
 - `Family.lean` - union-find as an equivalence (the co-tree and false-family lemmas) and `canonical()` membership + floor.
+- `Fixpoint.lean` - `IsClosed`, the bridge facts derived (`hpick_from_closed`, `source_lb_from_def`, `demoted_guard_from_def`), and `no_orphan_from_closed`.
 - `Check.lean` - the axiom audit (`#print axioms`) and concrete non-vacuity models for all theorems.
 - `lakefile.toml`, `lean-toolchain` - build configuration (Lean 4.10.0, no dependencies).
