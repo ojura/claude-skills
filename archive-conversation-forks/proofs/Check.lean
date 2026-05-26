@@ -22,6 +22,11 @@ open Orphan
 #print axioms live_subset_keptC5_wired
 #print axioms marker_no_hole_wired
 -- marker classification (#5 mechanical core): the decision tree is total, exclusive, exhaustive.
+-- NOTE: the no-hole guarantee is carried by `marker_no_hole` (the deleted cell is unreachable in the
+-- real range), NOT by `classify`'s totality (a function trivially returns something). `classify` also
+-- folds two operator judgments (substance floor, triviality) into the one `substantive` Bool and is
+-- slightly more decisive than the loop prose (it picks `none` for the high-ov + non-substantive case
+-- the comments leave open): it documents one faithful resolution, not the only admissible one.
 #print axioms classify_total
 #print axioms scrollDep_iff
 #print axioms main_iff
@@ -145,7 +150,11 @@ theorem concrete_recall_no_loss : preserved msgFps keptB f0 :=
 
 /- VERIFY-OUTCOME 4: MARKER no-hole is non-vacuous. Enriched store where a kept-unique fork `g0`
    is non-canonical, non-live, survives C5, is NOT load-bearing, and HAS nonzero residue - so it
-   lands in the `∃ residue` disjunct (a real `[main]`/`[fork]`/none member, not the deleted cell). -/
+   lands in the `∃ residue` disjunct (a real `[main]`/`[fork]`/none member, not the deleted cell).
+   WHY a STATIC `residue` predicate is faithful here: the marker loop ranges over C5 survivors, and C5
+   removes only EXACTLY-0-residue files (which contribute no unique message), so removing them only
+   GROWS every survivor's residue against the shrinking kept set. A survivor with nonzero residue
+   keeps it against the final KEPT, so static `residue` never overstates a survivor's uniqueness. -/
 inductive Fil2 | g0 | c0
 deriving DecidableEq
 

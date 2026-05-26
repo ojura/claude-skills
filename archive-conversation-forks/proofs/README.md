@@ -8,7 +8,7 @@ proved alongside it.
 
 ## What is proved
 
-**`Orphan.no_orphan` (the main result).**
+**`FixProto.no_orphan_from_closed` (the main result, unconditional).**
 
 > For every store and every operator `judge` policy, every needed phantom `P` of a
 > finally-kept file `f`, if `P` has **any** source anywhere in the store, retains a
@@ -18,12 +18,29 @@ In plain terms: the cleanup never archives the last phantom-backfill source of a
 keeps, so a kept session's deep origin can never be orphaned by the move. ("Phantom",
 "source", "needs", and the keep-locked closure are defined in `../SKILL.md`.)
 
+There are two forms of this result, and the unconditional one is the main result.
+`Orphan.no_orphan` is the **conditional core**: it takes the three bridge facts (`hpick` /
+`source_lb` / `demoted_guard`) as hypotheses, so on its own it proves no-orphan *given* them.
+`FixProto.no_orphan_from_closed` is the **unconditional** result: it discharges all three from
+`IsClosed locked` (the loop reached its fixpoint) plus the set definitions of `loadbearing` /
+`demoted`, and `IsClosed` is itself discharged by the termination proof (`closed_superset_exists`).
+So `no_orphan_from_closed` assumes nothing the code does not establish; that is THE result a reader
+should land on. `no_orphan` is the reusable lemma it is built from.
+
 **`Orphan.recall_no_loss` (the recall pass's content-level safety).** The recall pass archives
 a candidate `A` when its message set is fully contained in the union of the kept files
 (`missing = fps[A] - kept_union` is empty). This theorem proves that decision loses nothing:
 if the test passes, every message of `A` still lives in some kept file. Where `no_orphan` is
 the *structural* safety of archiving (never drop a needed source), `recall_no_loss` is the
-*content* safety (never drop a message). Together they cover both archive paths.
+*content* safety (never drop a message).
+
+**Scope of the content-safety guarantee.** `recall_no_loss` machine-checks content preservation for
+EXACTLY the 0-unique recall path (the `missing = ∅` test). The other two archive paths - the C6
+per-tree archive of judged-worthless forks, and the nonzero-recall `SONNET_CONFIRM` path - have NO
+content-safety theorem, by design: that the unique residue on those paths is genuinely worthless is
+the operator / Sonnet verbatim read, not a math predicate. `no_orphan` still covers all three paths
+*structurally* (none ever orphans a kept session's source), but content-safety on the judged paths
+rests on the read, not on Lean.
 
 **`Orphan.live_subset_keptC5` (live sessions are never moved).** Every live session (from the
 `~/.claude/sessions` registry) is in the final kept set: the code seeds live into the closure
@@ -45,6 +62,16 @@ function of the measured inputs, and `classify_total` / `scrollDep_iff` / `main_
 branch-guards pairwise disjoint and jointly exhaustive (by `decide` over the Bool input cube). The
 one genuinely-judgment input - whether the residue is "substantive" - enters as an opaque Bool, so
 this formalises everything mechanical about the tree and isolates the single operator call.
+
+Two honest notes on `classify`. First, the no-hole guarantee (no retained file falls through the
+deleted `~0-residue AND NOT load-bearing` cell) is carried by **`marker_no_hole`**, not by
+`classify`'s totality - a total function trivially returns something for every input; what matters is
+that the *real* range can never hit the removed branch, which is the load-bearing argument in
+`marker_no_hole`. Second, `classify` folds two distinct operator judgments into the single
+`substantive` Bool (the `[main]`-vs-none substance floor and the `[fork]`-vs-none triviality call),
+and it is slightly MORE decisive than the loop comments: for the high-ov + non-substantive case the
+prose leaves open, `classify` commits to `none`. So `classify` documents one faithful resolution of
+the tree, not the only admissible one; `marker_no_hole` is the load-bearing guarantee.
 
 **`Family.*` (union-find grouping and `canonical()` selection).** The union-find partition is
 modelled as the equivalence closure of the edge relation (shared-lpu or cross-file `dep`); the
@@ -163,17 +190,20 @@ build` from this directory inside the container.
 
 ## Honest scope
 
-These proofs cover the entire **algorithm** of Step 2 - the set algebra (archiving never orphans a
-kept session, never drops a message of a 0-unique candidate, never moves a live session), the marker
-tree (exhaustive, and the assignment total + mutually exclusive), the union-find grouping (an
-equivalence; co-tree and false-family), `canonical()` (membership, content floor, and max-key
-selection), the keep-locked loop's termination, and even the `find` path-compression optimisation.
-The bridge facts that connect the abstract model to the code are *derived*, not assumed, and the one
-loop-body oracle is *constructed*. So the single remaining gap is genuinely irreducible for a
-model-level proof: whether the **Python** computes what the abstract relations (`cross`, `needs`,
-`sources`, the fingerprints, the key scalars) say - the JSONL parse, the actual mutable union-find,
-the real `canonical()` key computation, the loop body. That boundary is checked by the property-based
-fuzz, not by Lean; everything *above* it is now formalised. Concretely, what stays out of model:
+These proofs cover the **structural algorithm** of Step 2 - archiving never orphans a kept session
+(`no_orphan`, all paths), never moves a live session, the marker tree is exhaustive with a total +
+mutually-exclusive assignment, the union-find grouping is an equivalence (co-tree and false-family),
+`canonical()` returns a member / respects the floor / picks the max key, the keep-locked loop
+terminates, and even the `find` path-compression optimisation preserves components. The bridge facts
+connecting the abstract model to the code are *derived*, not assumed, and the one loop-body oracle is
+*constructed*. Two things are deliberately NOT machine-checked, for different reasons. (a) **Content
+safety on the judged archive paths**: `recall_no_loss` proves it for the 0-unique recall path only;
+the C6 judged-worthless and nonzero-`SONNET_CONFIRM` paths rest on the operator / Sonnet read (see
+the content-safety scope note above) - "worthless residue" is not a math predicate. (b) The
+**model-to-Python boundary** (genuinely irreducible for a model-level proof): whether the Python
+computes what the abstract relations (`cross`, `needs`, `sources`, the fingerprints, the key scalars)
+say - the JSONL parse, the actual mutable union-find, the real `canonical()` key computation, the
+loop body - checked by the property-based fuzz. Concretely, what stays out of model:
 
 - After `Fixpoint.lean` and `Termination.lean`, the bridge facts are all *derived*, not assumed.
   `source_lb`, `cross_lb`, `phan_lb`, `demoted_guard`, `live_not_demoted`, and `C5_survivor` all
@@ -213,6 +243,12 @@ fuzz, not by Lean; everything *above* it is now formalised. Concretely, what sta
   is ONE genuinely-judgment input: whether the residue read is "substantive" - not a math predicate,
   so it enters `classify` as an opaque Bool. Given the bucket classification, the assignment is fully
   pinned down; only the substantive/not call is the operator's.
+- The marker proofs model `residue` as a STATIC predicate, and that is faithful for the files the
+  marker loop ranges over (C5 survivors) by a residue-monotonicity argument: C5 removes only files
+  with EXACTLY 0 residue, which contribute no unique message, so removing them can only GROW every
+  other file's residue against the shrinking kept set. Hence a C5 survivor with nonzero residue keeps
+  nonzero residue against the final `KEPT` - the static model never overstates a survivor's residue.
+  (Mirrors the in-code comment in `SKILL.md`'s C5 block.)
 - `canonical()` is formalised at the property level (`canonical_mem` returns a member,
   `canonical_nondebris` respects the content floor) AND the selection level: `Family.Canon` builds the
   key's lexicographic order in core Lean (`klt` / `kle` over `Nat × Nat × Nat`, with totality,
