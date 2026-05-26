@@ -137,6 +137,15 @@ session, and the marker tree has no hole. They are **not** a proof of the Python
   Those remain fuzz-checked. (`marker_no_hole` itself needs no tree model: it works from the
   closure inversion plus the enriched seed.)
 
+  These are deliberately **structural-only**, and that is safe because grouping and canonical
+  choice are not on the data-loss path: a wrong grouping or a wrong canonical pick can only cause a
+  file to be KEPT that might have been archivable (over-keep), never cause a unique file to be lost.
+  Data loss is gated downstream by `no_orphan` (a needed source is preserved regardless of tree
+  shape) and `recall_no_loss` (redundancy is measured against the whole kept union, not per-tree),
+  both of which hold for any grouping. So the worst case of a union-find or `canonical()` error is a
+  cluttered picker, not a dropped session - which is why leaving them at the structural / fuzz level
+  is acceptable.
+
 ## Files
 
 - `Orphan.lean` - the closure, the re-close, C5 safety, `no_orphan`, and the recall no-loss theorem.

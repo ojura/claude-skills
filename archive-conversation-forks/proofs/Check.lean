@@ -16,8 +16,13 @@ open Orphan
 #print axioms live_subset_keptC5
 #print axioms marker_no_hole
 #print axioms nonseed_loadbearing
+#print axioms Family.sameTree_refl
+#print axioms Family.sameTree_symm
+#print axioms Family.sameTree_trans
+#print axioms Family.shared_lpu_sameTree
 #print axioms Family.needer_source_coTree
 #print axioms Family.noEdges_sameTree_eq
+#print axioms Family.content_not_a_generator
 #print axioms Family.canonical_mem
 #print axioms Family.canonical_nondebris
 
