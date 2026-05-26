@@ -83,14 +83,17 @@ The marker theorems are wired the same way: `marker_no_hole_wired` and `live_sub
 decomposition, `closure ⊆ consumers`, `hpick`, and `live`/`kuf` disjointness - each a code fact -
 so nothing about loadbearing/demoted is assumed at the marker layer either. Both are axiom-free.
 
-**`TermList.*` (`IsClosed` is achievable, not assumed).** `closed_superset_exists` proves that over a
-finite universe a closed `locked ⊇ seed` exists, so `IsClosed` - the one fact `hpick` rested on - is
-discharged rather than assumed. This is the committed loop's termination: each changing iteration
-adds a universe element, a monotone fixpoint over a finite set. The decreasing measure (`gap`, the
-count of not-yet-included universe elements) and its strict-drop lemma (`gap_lt`) are hand-rolled in
-core Lean (no mathlib) and closed by `Nat.strongInductionOn`. The only residue is the `expand`
-loop-body oracle, which is constructible for any concrete decidable store (demonstrated by
-`concrete_termination`).
+**`TermList.*` (`IsClosed` is achievable, with the oracle constructed).** `closed_superset_exists`
+proves that over a finite universe a closed `locked ⊇ seed` exists, so `IsClosed` - the one fact
+`hpick` rested on - is discharged rather than assumed. This is the committed loop's termination: each
+changing iteration adds a universe element, a monotone fixpoint over a finite set. The decreasing
+measure (`gap`, the count of not-yet-included universe elements) and its strict-drop lemma (`gap_lt`)
+are hand-rolled in core Lean (no mathlib) and closed by `Nat.strongInductionOn`. The loop-body oracle
+is **constructed, not assumed**: for a finite store with decidable relations, `expand` is a decidable
+finite search (`crossViol` / `phanViol` / `phanSrc`) that returns a forced new element or certifies
+bounded closedness (`closed_of_none`), and `closed_superset_exists_constructed` runs the whole loop
+with it - no oracle parameter. Bounded closedness (`ClosedB`) coincides with the committed loop's
+fixpoint condition over a finite store.
 
 Properties of the proofs:
 
@@ -161,19 +164,24 @@ session, and the marker tree has no hole. They are **not** a proof of the Python
   phantom-source halves) and `demoted` (the actual three-conjunct C5 guard `kuf ∧ ¬loadbearing ∧
   ¬residue`); `hpick` follows from `IsClosed locked`; and `IsClosed` itself is no longer assumed - it
   is *proven achievable* (`closed_superset_exists`: a closed `locked ⊇ seed` exists over a finite
-  universe). The only residue left inside the algebra is the `expand` step below. That the Python
-  *implements* the abstract relations (the JSONL parse, the actual union-find, `canonical()`, the
-  loop body) is checked by the property-based fuzz, not by Lean.
+  universe). The loop-body oracle that drives it is itself *constructed*, not assumed (see below). So
+  the only thing not formalised is whether the Python *implements* the abstract relations (the JSONL
+  parse, the actual union-find, `canonical()`, the loop body) - checked by the property-based fuzz.
 - The termination proof (`Termination.lean`) is **mathlib-free, in core Lean**. Core Lean 4.10's
   `List` lacks `Sublist` and `countP`, so the decreasing-measure lemma (`gap_lt`: adding a forced
   element strictly shrinks the count of not-yet-included universe elements) and its monotonicity
   helper are hand-rolled by plain structural induction, then fed to `Nat.strongInductionOn`. Mathlib
   (a `Finset.card` one-liner) was evaluated and declined: it is not wired as a build dependency, so
-  importing it would break the stock-image `lake build`, and the core proof is only two small lemmas.
-  The residue here is the `expand` parameter of `closed_superset_exists` - the loop-body oracle that,
-  given a not-yet-closed set, returns a forced new element (or certifies closure). For a concrete
-  store with decidable relations `expand` is constructible, not assumed; `Check.lean`'s
-  `concrete_termination` builds it explicitly and runs the theorem, showing it is realisable.
+  importing it would break the stock-image `lake build`, and the core proof is a handful of lemmas.
+- The loop-body oracle (`expand`) is **constructed, not assumed.** For a finite store with DECIDABLE
+  relations, `expand` is built as a decidable finite search (`crossViol` / `phanViol` / `phanSrc`)
+  that, given a not-yet-closed set, returns a forced new element or certifies bounded closedness
+  (`closed_of_none`, the refutation direction). `closed_superset_exists_constructed` then runs the
+  whole loop with that constructed oracle - no oracle parameter - yielding a bounded-closed superset.
+  Closedness here is BOUNDED (`ClosedB`: quantifiers over the finite universe and phantom list, source
+  existential bounded to the universe), the faithful model of a loop that never scans infinitely; over
+  a finite store it coincides with the committed loop's fixpoint condition. `Check.lean`'s
+  `concrete_termination_constructed` runs it on a concrete store with no oracle passed in.
 - `pick P` abstracts the source the closure **realises** for a phantom `P` at fixpoint, not
   the literal richest source. The committed `locked_closure` adds its richest candidate only
   when no source of `P` is already locked (`if not (set(srcs) & locked)`), so a different,
@@ -208,6 +216,6 @@ session, and the marker tree has no hole. They are **not** a proof of the Python
 - `Markers.lean` - the closure-inversion lemma, `live_subset_keptC5`, and `marker_no_hole`.
 - `Family.lean` - union-find as an equivalence (the co-tree and false-family lemmas) and `canonical()` membership + floor.
 - `Fixpoint.lean` - `IsClosed`, the seven bridge facts derived (`hpick_from_closed`, `source_lb_from_def`, `cross_lb_from_def`, `demoted_guard_from_def`, `live_not_demoted_from_def`, `C5_survivor_from_def`), and `no_orphan_from_closed`.
-- `Termination.lean` - `gap_lt` and `closed_superset_exists`: a closed set exists over a finite universe, discharging `IsClosed`. Core Lean, hand-rolled (no mathlib).
+- `Termination.lean` - `gap_lt` + `closed_superset_exists` (a closed set exists over a finite universe, discharging `IsClosed`), and the constructed loop-body oracle (`expand` / `closed_of_none` / `closed_superset_exists_constructed`). Core Lean, hand-rolled (no mathlib).
 - `Check.lean` - the axiom audit (`#print axioms`) and concrete non-vacuity models for all theorems.
 - `lakefile.toml`, `lean-toolchain` - build configuration (Lean 4.10.0, no dependencies).

@@ -40,6 +40,10 @@ open Orphan
 #print axioms TermList.gap_lt
 #print axioms TermList.length_filter_le_of_imp
 #print axioms TermList.closed_superset_exists
+-- #2: expand CONSTRUCTED (oracle proven, not assumed) + the oracle-free existence capstone.
+#print axioms TermList.closed_of_none
+#print axioms TermList.expand
+#print axioms TermList.closed_superset_exists_constructed
 
 /- VERIFY-OUTCOME 2: the theorem is NON-VACUOUS. Build a concrete store where:
    - the hypotheses (hpick, demoted_guard, source_lb) all hold,
@@ -331,3 +335,17 @@ theorem concrete_termination :
   TermList.closed_superset_exists crossT needsT srcT [f0] expandT []
 
 #print axioms concrete_termination
+
+/- VERIFY-OUTCOME 8b: the CONSTRUCTED-oracle version is non-vacuous - no `expand` passed in. The
+   store's relations are decidable (all identically False here), so `closed_superset_exists_constructed`
+   builds the search itself and yields a bounded-closed superset. Confirms the oracle is realisable. -/
+instance : DecidableRel crossT := fun _ _ => isFalse (by unfold crossT; exact id)
+instance : ∀ a p, Decidable (needsT a p) := fun _ _ => isFalse (by unfold needsT; exact id)
+instance : ∀ a p, Decidable (srcT a p) := fun _ _ => isFalse (by unfold srcT; exact id)
+
+theorem concrete_termination_constructed :
+    ∃ M : List Fil, (∀ y, y ∈ ([] : List Fil) → y ∈ M)
+      ∧ TermList.ClosedB crossT needsT srcT [f0] ([] : List Pha) M :=
+  TermList.closed_superset_exists_constructed crossT needsT srcT [f0] [] []
+
+#print axioms concrete_termination_constructed
