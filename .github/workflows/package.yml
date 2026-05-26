@@ -71,6 +71,18 @@ jobs:
           path: markdown-latex-report/REPORT.pdf
           if-no-files-found: warn
 
+  test-lean:
+    # Compiles the archive-conversation-forks Lean proof (mathlib-free, pinned Lean 4.10.0
+    # via proofs/lean-toolchain). Reports pass/fail only; does NOT gate the package job below.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build the Lean proof
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: archive-conversation-forks/proofs
+
   package:
     runs-on: ubuntu-latest
     steps:
