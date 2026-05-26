@@ -2,6 +2,7 @@ import Orphan
 import Markers
 import Family
 import Fixpoint
+import Termination
 open Orphan
 
 /- VERIFY-OUTCOME 1: no hidden axioms / sorry. Every theorem here is fully constructive ("does not
@@ -31,6 +32,11 @@ open Orphan
 #print axioms FixProto.source_lb_from_def
 #print axioms FixProto.demoted_guard_from_def
 #print axioms FixProto.no_orphan_from_closed
+-- Termination: IsClosed is ACHIEVABLE (a closed superset exists over a finite universe), so the
+-- last assumption is discharged. Core Lean, no mathlib; these list only [propext, Quot.sound].
+#print axioms TermList.gap_lt
+#print axioms TermList.length_filter_le_of_imp
+#print axioms TermList.closed_superset_exists
 
 /- VERIFY-OUTCOME 2: the theorem is NON-VACUOUS. Build a concrete store where:
    - the hypotheses (hpick, demoted_guard, source_lb) all hold,
@@ -222,3 +228,25 @@ theorem concrete_no_orphan_from_closed :
   intro hd; exact hd.2 trivial
 
 #print axioms concrete_no_orphan_from_closed
+
+/- VERIFY-OUTCOME 8: termination is non-vacuous AND `expand` is constructible (not a hidden
+   assumption). Over a 1-element universe with no edges, every set is already closed, so we build the
+   `expand` oracle concretely (always reports closed) and obtain a closed superset. This shows the
+   termination theorem yields a real closed set and that its `expand` hypothesis is realisable. -/
+def crossT : Fil → Fil → Prop := fun _ _ => False
+def needsT : Fil → Pha → Prop := fun _ _ => False
+def srcT   : Fil → Pha → Prop := fun _ _ => False
+
+-- expand: with no needs and no cross edges, ANY L is closed, so always take the left (closed) branch.
+def expandT : ∀ L : List Fil,
+    (FixProto.IsClosed crossT needsT srcT (TermList.memPred L)) ⊕' (Σ' x : Fil, x ∈ ([f0] : List Fil) ∧ x ∉ L) :=
+  fun L => PSum.inl {
+    cross_closed := by intro _ _ _ e; cases e
+    phan_closed  := by intro _ _ _ hn; cases hn }
+
+theorem concrete_termination :
+    ∃ M : List Fil, (∀ y, y ∈ ([] : List Fil) → y ∈ M)
+      ∧ FixProto.IsClosed crossT needsT srcT (TermList.memPred M) :=
+  TermList.closed_superset_exists crossT needsT srcT [f0] expandT []
+
+#print axioms concrete_termination

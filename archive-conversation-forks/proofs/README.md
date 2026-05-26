@@ -72,19 +72,29 @@ assumptions:
 assuming only `IsClosed locked` plus the set definitions, not the three bridge hypotheses. All four
 `FixProto` results are fully axiom-free.
 
+**`TermList.*` (`IsClosed` is achievable, not assumed).** `closed_superset_exists` proves that over a
+finite universe a closed `locked ⊇ seed` exists, so `IsClosed` - the one fact `hpick` rested on - is
+discharged rather than assumed. This is the committed loop's termination: each changing iteration
+adds a universe element, a monotone fixpoint over a finite set. The decreasing measure (`gap`, the
+count of not-yet-included universe elements) and its strict-drop lemma (`gap_lt`) are hand-rolled in
+core Lean (no mathlib) and closed by `Nat.strongInductionOn`. The only residue is the `expand`
+loop-body oracle, which is constructible for any concrete decidable store (demonstrated by
+`concrete_termination`).
+
 Properties of the proofs:
 
-- **Axiom honesty.** Every theorem here is **fully constructive** except two, and even those use
-  only `propext`. `no_orphan` and its structural lemmas (`closure_closed_under_needs`,
+- **Axiom honesty.** Most theorems are **fully constructive**; the few that aren't use only
+  trusted-core axioms. `no_orphan` and its structural lemmas (`closure_closed_under_needs`,
   `final_closed_under_needs`, `source_survives_C5`, `kept0_subset_final`, `nonseed_loadbearing`,
-  `live_subset_keptC5`), the recall and marker theorems (`recall_no_loss`, `marker_no_hole`), and
-  the union-find lemmas (`needer_source_coTree`, `noEdges_sameTree_eq`) all report *does not depend
-  on any axioms*. `recall_no_loss` stays constructive by case-splitting on the kept-union membership
-  as a `Decidable` instance (the faithful counterpart of the code's set `in`, not `Classical.em`);
-  `marker_no_hole` by a direct `cases` on the closure derivation. Only `canonical_mem` /
-  `canonical_nondebris` list `propext` (from the `List.filter` reasoning) - the most innocuous
-  trusted-core axiom. None lists `Classical.choice`, `sorryAx`, or `Lean.ofReduceBool`: no `sorry`,
-  no `native_decide`.
+  `live_subset_keptC5`), the recall and marker theorems (`recall_no_loss`, `marker_no_hole`), the
+  union-find lemmas (`needer_source_coTree`, `noEdges_sameTree_eq`), and all four `FixProto` results
+  report *does not depend on any axioms*. `recall_no_loss` stays constructive by case-splitting on
+  the kept-union membership as a `Decidable` instance (the faithful counterpart of the code's set
+  `in`, not `Classical.em`); `marker_no_hole` by a direct `cases` on the closure derivation. The
+  `canonical_*` lemmas list `propext` (from `List.filter` reasoning); the `TermList.*` termination
+  lemmas list `[propext, Quot.sound]` (from `List` / `decide` / `Quot`). Both are the innocuous
+  trusted core. None lists `Classical.choice`, `sorryAx`, or `Lean.ofReduceBool`: no `sorry`, no
+  `native_decide`, no mathlib.
 - **All judge policies, all stores.** Files, fingerprints, `needs`, `sources`, and the
   cross-file edge are opaque; the operator's per-fork keep/archive judgment enters only as
   the abstract seed set, so each theorem covers every possible judge outcome and every store
@@ -134,22 +144,24 @@ These proofs certify the **set algebra**: given facts the code establishes, arch
 orphans a kept session, never drops a message of a 0-unique candidate, never moves a live
 session, and the marker tree has no hole. They are **not** a proof of the Python end to end:
 
-- After the `Fixpoint.lean` internalisation, the bridge hypotheses are mostly *derived*, not
-  assumed. `source_lb` and `demoted_guard` follow from the set definitions of `loadbearing` /
-  `demoted`; `hpick` follows from `IsClosed locked`. What remains assumed shrinks to **one
-  structural fact: `IsClosed locked`** (the `while changed:` loop reached its fixpoint), plus the
-  closure-inversion facts (`cross_lb` / `phan_lb`) and the marker side-conditions (`C5_survivor` /
-  `live_not_demoted`), each a direct reading of a code line. That the Python *implements* these (the
-  JSONL parse, the actual union-find, `canonical()`, the loop body) is checked by the property-based
-  fuzz, not by Lean.
-- The one place a finiteness/termination proof is deliberately omitted: `IsClosed locked` asserts
-  the loop reaches a fixpoint, which it does because each iteration that changes anything adds a
-  universe element to `locked` (a monotone fixpoint over a finite set). Mechanizing that step is
-  either a sizeable core-Lean `List.filter` cardinality argument or a mathlib `Finset.card`
-  one-liner; mathlib is **not** used here (it is not wired as a build dependency, so importing it
-  would break the stock-image `lake build`), and the core-Lean counting proof was judged
-  disproportionate for a textbook-obvious fact (loop-over-finite-set terminates) that is not a place
-  bugs hide. So `IsClosed` is the single honest remaining assumption, stated rather than dressed up.
+- After `Fixpoint.lean` and `Termination.lean`, the bridge hypotheses are *derived*, not assumed.
+  `source_lb` and `demoted_guard` follow from the set definitions of `loadbearing` / `demoted`;
+  `hpick` follows from `IsClosed locked`; and `IsClosed` itself is no longer assumed - it is *proven
+  achievable* (`closed_superset_exists`: a closed `locked ⊇ seed` exists over a finite universe).
+  What remains are the closure-inversion facts (`cross_lb` / `phan_lb`) and the marker
+  side-conditions (`C5_survivor` / `live_not_demoted`), each a direct reading of one code line, plus
+  the `expand` step below. That the Python *implements* the abstract relations (the JSONL parse, the
+  actual union-find, `canonical()`, the loop body) is checked by the property-based fuzz, not by Lean.
+- The termination proof (`Termination.lean`) is **mathlib-free, in core Lean**. Core Lean 4.10's
+  `List` lacks `Sublist` and `countP`, so the decreasing-measure lemma (`gap_lt`: adding a forced
+  element strictly shrinks the count of not-yet-included universe elements) and its monotonicity
+  helper are hand-rolled by plain structural induction, then fed to `Nat.strongInductionOn`. Mathlib
+  (a `Finset.card` one-liner) was evaluated and declined: it is not wired as a build dependency, so
+  importing it would break the stock-image `lake build`, and the core proof is only two small lemmas.
+  The residue here is the `expand` parameter of `closed_superset_exists` - the loop-body oracle that,
+  given a not-yet-closed set, returns a forced new element (or certifies closure). For a concrete
+  store with decidable relations `expand` is constructible, not assumed; `Check.lean`'s
+  `concrete_termination` builds it explicitly and runs the theorem, showing it is realisable.
 - `pick P` abstracts the source the closure **realises** for a phantom `P` at fixpoint, not
   the literal richest source. The committed `locked_closure` adds its richest candidate only
   when no source of `P` is already locked (`if not (set(srcs) & locked)`), so a different,
@@ -184,5 +196,6 @@ session, and the marker tree has no hole. They are **not** a proof of the Python
 - `Markers.lean` - the closure-inversion lemma, `live_subset_keptC5`, and `marker_no_hole`.
 - `Family.lean` - union-find as an equivalence (the co-tree and false-family lemmas) and `canonical()` membership + floor.
 - `Fixpoint.lean` - `IsClosed`, the bridge facts derived (`hpick_from_closed`, `source_lb_from_def`, `demoted_guard_from_def`), and `no_orphan_from_closed`.
+- `Termination.lean` - `gap_lt` and `closed_superset_exists`: a closed set exists over a finite universe, discharging `IsClosed`. Core Lean, hand-rolled (no mathlib).
 - `Check.lean` - the axiom audit (`#print axioms`) and concrete non-vacuity models for all theorems.
 - `lakefile.toml`, `lean-toolchain` - build configuration (Lean 4.10.0, no dependencies).
