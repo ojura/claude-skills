@@ -205,6 +205,18 @@ computes what the abstract relations (`cross`, `needs`, `sources`, the fingerpri
 say - the JSONL parse, the actual mutable union-find, the real `canonical()` key computation, the
 loop body - checked by the property-based fuzz. Concretely, what stays out of model:
 
+A specific, operator-facing instance of (b) worth calling out: `needs` and `sources` are **opaque
+relations** in the proof (`variable (needs sources : File -> Phantom -> Prop)`), so the `par`/`nb`
+boundary logic that *computes* them - `sources(k) = {lp for (lp,par,nb) in bnd[k] if lp in phantom and
+(par is not None or nb>0)}` - is entirely below the proof and fuzz-checked only. The practical
+consequence: **the proof cannot protect a hand-rolled or eyeballed orphan check.** It certifies the
+algebra *given* `needs` / `sources`; an operator who re-derives or eyeballs those predicates instead
+of running the committed set-difference has stepped outside everything the proof guarantees - and that
+par/nb layer is exactly where the code has been miswritten before (the `par is not None`-only
+approximation that dropped the `nb>0` half). Run the committed predicate, never a re-derived one; do
+not let this proof's existence tempt the shortcut. (Mirrors the `sources()`/`needs()` DISCIPLINE note
+in `../SKILL.md`.)
+
 - After `Fixpoint.lean` and `Termination.lean`, the bridge facts are all *derived*, not assumed.
   `source_lb`, `cross_lb`, `phan_lb`, `demoted_guard`, `live_not_demoted`, and `C5_survivor` all
   follow from the set definitions of `loadbearing` (now the actual UNION of the cross-target and
