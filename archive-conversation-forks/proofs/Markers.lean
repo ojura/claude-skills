@@ -179,4 +179,67 @@ theorem marker_no_hole_wired {Msg : Type}
     · exact Or.inl hlb
     · exact Or.inr hr
 
+/-
+  ============================================================================================
+  MARKER CLASSIFICATION (the mechanical core of #5). `marker_no_hole` above proves the partition has
+  no unreachable cell (every retained file is loadbearing-or-residue, so none falls through). This
+  section proves the COMPLEMENTARY mechanical fact: the documented decision tree assigns EXACTLY ONE
+  marker per file, deterministically, with the four branch-guards pairwise disjoint and jointly
+  exhaustive. What stays OUT of scope (genuinely a judgment, not math): whether the residue read is
+  "substantive" - that enters as an opaque Bool input. We formalise that GIVEN the bucket
+  classification, the assignment is well-defined and matches the committed tree.
+  ============================================================================================
+-/
+
+/-- The four markers a retained file can carry. -/
+inductive Marker | main | fork | scrollDep | none
+deriving DecidableEq, Repr
+
+/-- The committed marker decision tree (Step 2 marker loop) as a TOTAL function of the measured
+    inputs: `lb` (load-bearing, structural), `highOv` (prose overlap high vs low), `substantive`
+    (residue read as substantive - the operator judgment, here an opaque Bool), `zeroResid` (residue
+    ~0). Mirrors the comments: load-bearing ∧ ~0-residue ⇒ [scroll-dep] regardless of ov; else by
+    (ov, substantive): low+substantive ⇒ [main], high+substantive ⇒ [fork], otherwise none. -/
+def classify (lb highOv substantive zeroResid : Bool) : Marker :=
+  if lb && zeroResid then Marker.scrollDep
+  else
+    match highOv, substantive with
+    | false, true  => Marker.main
+    | false, false => Marker.none
+    | true,  true  => Marker.fork
+    | true,  false => Marker.none
+
+/-- TOTAL: every input yields a marker (anchors "exactly one marker per file"). -/
+theorem classify_total (lb highOv substantive zeroResid : Bool) :
+    ∃ m, classify lb highOv substantive zeroResid = m := ⟨_, rfl⟩
+
+/-- Each marker is produced under EXACTLY its documented guard (branch correctness + mutual
+    exclusivity), by exhausting the 16-case Bool cube. Axiom-free. -/
+theorem scrollDep_iff (lb highOv substantive zeroResid : Bool) :
+    classify lb highOv substantive zeroResid = Marker.scrollDep ↔ (lb = true ∧ zeroResid = true) := by
+  cases lb <;> cases highOv <;> cases substantive <;> cases zeroResid <;> decide
+
+theorem main_iff (lb highOv substantive zeroResid : Bool) :
+    classify lb highOv substantive zeroResid = Marker.main ↔
+      (¬(lb = true ∧ zeroResid = true) ∧ highOv = false ∧ substantive = true) := by
+  cases lb <;> cases highOv <;> cases substantive <;> cases zeroResid <;> decide
+
+theorem fork_iff (lb highOv substantive zeroResid : Bool) :
+    classify lb highOv substantive zeroResid = Marker.fork ↔
+      (¬(lb = true ∧ zeroResid = true) ∧ highOv = true ∧ substantive = true) := by
+  cases lb <;> cases highOv <;> cases substantive <;> cases zeroResid <;> decide
+
+theorem none_iff (lb highOv substantive zeroResid : Bool) :
+    classify lb highOv substantive zeroResid = Marker.none ↔
+      (¬(lb = true ∧ zeroResid = true) ∧ substantive = false) := by
+  cases lb <;> cases highOv <;> cases substantive <;> cases zeroResid <;> decide
+
+/-- EXHAUSTIVE: every input lands in exactly one of the four markers (no gap). -/
+theorem classify_exhaustive (lb highOv substantive zeroResid : Bool) :
+    classify lb highOv substantive zeroResid = Marker.scrollDep ∨
+    classify lb highOv substantive zeroResid = Marker.main ∨
+    classify lb highOv substantive zeroResid = Marker.fork ∨
+    classify lb highOv substantive zeroResid = Marker.none := by
+  cases lb <;> cases highOv <;> cases substantive <;> cases zeroResid <;> decide
+
 end Orphan

@@ -38,6 +38,14 @@ decision tree is unreachable. The proof is by inversion on the closure derivatio
 both of which are load-bearing) plus C5's demotion contract (a surviving non-load-bearing
 kept-unique fork must have had nonzero residue). This was previously checked by fuzz only.
 
+**`Orphan.classify` + `*_iff` (the marker assignment is total and mutually exclusive).** Complementing
+the no-hole (exhaustiveness) result, `classify` models the documented decision tree as a total
+function of the measured inputs, and `classify_total` / `scrollDep_iff` / `main_iff` / `fork_iff` /
+`none_iff` / `classify_exhaustive` prove every input yields exactly one marker, with the four
+branch-guards pairwise disjoint and jointly exhaustive (by `decide` over the Bool input cube). The
+one genuinely-judgment input - whether the residue is "substantive" - enters as an opaque Bool, so
+this formalises everything mechanical about the tree and isolates the single operator call.
+
 **`Family.*` (union-find grouping and `canonical()` selection).** The union-find partition is
 modelled as the equivalence closure of the edge relation (shared-lpu or cross-file `dep`); the
 imperative path-compressed `find` computes exactly this equivalence, so abstracting to it loses
@@ -188,18 +196,24 @@ session, and the marker tree has no hole. They are **not** a proof of the Python
   already-locked source can be the one kept. The proofs depend only on the existential the
   code guarantees ("some source of a needed phantom stays locked"), via the `hpick` contract,
   and are generic over which source that is. They do not assume the richest source is locked.
-- `marker_no_hole` proves the marker partition has no unreachable-into hole; it does **not**
-  prove the markers are semantically correct (that a `[fork]` is really mostly-contained, etc.).
-  The `ov` / `residue` thresholds are operator read-and-judge calls, not arithmetic, so that
-  layer is deliberately outside the formalisation.
-- The union-find partition and `canonical()` are formalised in `Family.lean` at the
-  EQUIVALENCE / property level (it is an equivalence; shared-lpu and needer-source group; content
-  does not merge; canonical returns a member and respects the floor). What is NOT formalised: the
-  imperative path-compressed `find` itself (it computes the same equivalence, but the mutable data
-  structure is bookkeeping with no extra math), the exact `canonical` max-key choice (only
-  membership and the floor matter for safety), and the full family/theme assignment of Steps 4-5.
-  Those remain fuzz-checked. (`marker_no_hole` itself needs no tree model: it works from the
-  closure inversion plus the enriched seed.)
+- Marker classification is formalised at TWO levels. `marker_no_hole` proves the partition has no
+  unreachable-into hole (no file falls through); and `classify` + `classify_total` /
+  `scrollDep_iff` / `main_iff` / `fork_iff` / `none_iff` / `classify_exhaustive` prove the documented
+  decision tree is a TOTAL function assigning exactly one marker, with the four branch-guards
+  pairwise disjoint and jointly exhaustive (by `decide` over the input cube). What stays out of model
+  is ONE genuinely-judgment input: whether the residue read is "substantive" - not a math predicate,
+  so it enters `classify` as an opaque Bool. Given the bucket classification, the assignment is fully
+  pinned down; only the substantive/not call is the operator's.
+- `canonical()` is formalised at the property level (`canonical_mem` returns a member,
+  `canonical_nondebris` respects the content floor). The exact max-key tiebreak (most-distinct, then
+  recency, then uuid) is **not** formalised: a faithful model of the key needs the distinct-count and
+  parsed-timestamp, which is the model-to-Python boundary, and the abstract argmax needs mathlib's
+  `LinearOrder`; membership + floor are what the safety theorems actually consume, and any wrong
+  max-choice over-keeps rather than loses (gated by `no_orphan` / `recall_no_loss`). The union-find
+  partition is formalised AS the equivalence `SameTree` (`Family.lean`: equivalence laws, shared-lpu
+  and needer-source grouping, content-does-not-merge); the imperative path-compressed `find` computes
+  exactly that equivalence, so the mutable optimisation is implementation detail with no extra math -
+  legitimately left to the fuzz. The full family/theme assignment of Steps 4-5 is fuzz-checked.
 
   These are deliberately **structural-only**, and that is safe because grouping and canonical
   choice are not on the data-loss path: a wrong grouping or a wrong canonical pick can only cause a
@@ -213,7 +227,7 @@ session, and the marker tree has no hole. They are **not** a proof of the Python
 ## Files
 
 - `Orphan.lean` - the closure, the re-close, C5 safety, `no_orphan`, and the recall no-loss theorem.
-- `Markers.lean` - the closure-inversion lemma, `live_subset_keptC5`, and `marker_no_hole`.
+- `Markers.lean` - the closure-inversion lemma, `live_subset_keptC5`, `marker_no_hole`, the wired capstones, and the marker classification (`classify` + total/exclusive/exhaustive lemmas).
 - `Family.lean` - union-find as an equivalence (the co-tree and false-family lemmas) and `canonical()` membership + floor.
 - `Fixpoint.lean` - `IsClosed`, the seven bridge facts derived (`hpick_from_closed`, `source_lb_from_def`, `cross_lb_from_def`, `demoted_guard_from_def`, `live_not_demoted_from_def`, `C5_survivor_from_def`), and `no_orphan_from_closed`.
 - `Termination.lean` - `gap_lt` + `closed_superset_exists` (a closed set exists over a finite universe, discharging `IsClosed`), and the constructed loop-body oracle (`expand` / `closed_of_none` / `closed_superset_exists_constructed`). Core Lean, hand-rolled (no mathlib).

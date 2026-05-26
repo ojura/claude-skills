@@ -21,6 +21,13 @@ open Orphan
 -- fully-wired marker capstones: stated over the DEFINED loadbearing/demoted, side-conditions discharged.
 #print axioms live_subset_keptC5_wired
 #print axioms marker_no_hole_wired
+-- marker classification (#5 mechanical core): the decision tree is total, exclusive, exhaustive.
+#print axioms classify_total
+#print axioms scrollDep_iff
+#print axioms main_iff
+#print axioms fork_iff
+#print axioms none_iff
+#print axioms classify_exhaustive
 #print axioms Family.sameTree_refl
 #print axioms Family.sameTree_symm
 #print axioms Family.sameTree_trans
