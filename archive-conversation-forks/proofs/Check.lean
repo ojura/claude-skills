@@ -18,6 +18,9 @@ open Orphan
 #print axioms live_subset_keptC5
 #print axioms marker_no_hole
 #print axioms nonseed_loadbearing
+-- fully-wired marker capstones: stated over the DEFINED loadbearing/demoted, side-conditions discharged.
+#print axioms live_subset_keptC5_wired
+#print axioms marker_no_hole_wired
 #print axioms Family.sameTree_refl
 #print axioms Family.sameTree_symm
 #print axioms Family.sameTree_trans
@@ -166,6 +169,47 @@ theorem concrete_marker_no_hole : lb2 g0 ∨ ∃ m, resid2 g0 m :=
     cross_lb2 phan_lb2 c5_survivor2 g0_keptC5 g0_not_canon g0_not_live
 
 #print axioms concrete_marker_no_hole
+
+/- VERIFY-OUTCOME 4b: the WIRED marker capstone is non-vacuous - stated over the DEFINED
+   loadbearing/demoted with the side-conditions discharged internally. Reuse the g0/c0 store. -/
+def consum2 : FSet Fil2 := fun _ => True                     -- both files are consumers
+-- loadbearing is provably false for every file here (no cross edges at all, and only g0 sources
+-- nothing while c0 sources nothing either - src2 is identically False).
+instance : ∀ y, Decidable (FixProto.loadbearing needs2 src2 cross2 consum2 y) := fun y =>
+  isFalse (by
+    unfold FixProto.loadbearing cross2 src2
+    rintro (⟨a, _, hc⟩ | ⟨P, hs, _⟩)
+    · exact hc
+    · exact hs.elim)
+-- ∃ m, resid2 y m is decidable for every y (resid2 y p0 = (y = g0)).
+instance : ∀ y, Decidable (∃ m, resid2 y m) := fun y =>
+  if h : y = g0 then isTrue ⟨p0, h⟩
+  else isFalse (by rintro ⟨m, hm⟩; exact h hm)
+
+-- g0 ∈ KEPT_C5 over the DEFINED demoted: in the seed (kuf), and not demoted (it has residue).
+theorem g0_keptC5_wired :
+    KEPT_C5 cross2 needs2 src2 pick2 (seed0 canon2 live2 kuf2)
+      (FixProto.demoted needs2 src2 cross2 kuf2 consum2 (fun y => ∃ m, resid2 y m)) g0 := by
+  refine ⟨Closure.seed (Or.inr (Or.inr rfl)), ?_⟩
+  intro hd; exact hd.2.2 ⟨p0, rfl⟩            -- ¬residue fails: g0 has residue
+
+theorem concrete_marker_no_hole_wired :
+    FixProto.loadbearing needs2 src2 cross2 consum2 g0 ∨ ∃ m, resid2 g0 m :=
+  marker_no_hole_wired cross2 needs2 src2 pick2 canon2 live2 kuf2 consum2 resid2
+    (fun _ _ => trivial)                       -- closure ⊆ consumers (consumers = ⊤)
+    (fun _ he => he.elim (fun s hs => hs.elim))  -- hpick: vacuous (no sources)
+    g0_keptC5_wired g0_not_canon g0_not_live
+
+-- live = {c0}, disjoint from kuf2 = {g0}; c0 survives C5.
+theorem concrete_live_subset_wired :
+    KEPT_C5 cross2 needs2 src2 pick2 (seed0 canon2 (fun f => f = c0) kuf2)
+      (FixProto.demoted needs2 src2 cross2 kuf2 consum2 (fun _ => True)) c0 :=
+  live_subset_keptC5_wired cross2 needs2 src2 pick2 canon2 (fun f => f = c0) kuf2 consum2 (fun _ => True)
+    (by intro x hx; rw [hx]; unfold kuf2; decide)   -- c0 ∉ kuf2 (={g0})
+    (x := c0) rfl
+
+#print axioms concrete_marker_no_hole_wired
+#print axioms concrete_live_subset_wired
 
 /- VERIFY-OUTCOME 5: the FAMILY co-tree lemma is non-vacuous. Two files both carrying phantom lpu
    `pL` in their lref are forced into the same tree - the real reason a needer and its source group. -/

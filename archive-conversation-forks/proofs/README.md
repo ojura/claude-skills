@@ -76,6 +76,13 @@ discharges all of them from strictly weaker inputs, so none is a bald assumption
 assuming only `IsClosed locked` plus the set definitions, not the bridge hypotheses. All seven
 `FixProto` results are fully axiom-free.
 
+The marker theorems are wired the same way: `marker_no_hole_wired` and `live_subset_keptC5_wired`
+(in `Markers.lean`) restate `marker_no_hole` / `live_subset_keptC5` over the FixProto-DEFINED
+`loadbearing` and `demoted`, discharging the `cross_lb` / `phan_lb` / `live_not_demoted` /
+`C5_survivor` side-conditions internally via the `*_from_def` lemmas. Their only inputs are the seed
+decomposition, `closure ⊆ consumers`, `hpick`, and `live`/`kuf` disjointness - each a code fact -
+so nothing about loadbearing/demoted is assumed at the marker layer either. Both are axiom-free.
+
 **`TermList.*` (`IsClosed` is achievable, not assumed).** `closed_superset_exists` proves that over a
 finite universe a closed `locked ⊇ seed` exists, so `IsClosed` - the one fact `hpick` rested on - is
 discharged rather than assumed. This is the committed loop's termination: each changing iteration

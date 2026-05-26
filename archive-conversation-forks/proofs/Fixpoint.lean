@@ -1,6 +1,8 @@
 /-
-  PROTOTYPE v2 (mathlib-free): internalise `hpick`/`source_lb`/`demoted_guard` by deriving them
-  from manifestly-code-true facts, NOT assuming them. Core Lean only.
+  Internalise the bridge facts (mathlib-free, core Lean): `hpick`, `source_lb`, `cross_lb`,
+  `demoted_guard`, `live_not_demoted`, `C5_survivor` are DERIVED here from manifestly-code-true
+  inputs (the `IsClosed` fixpoint condition and the actual set definitions of `loadbearing` /
+  `demoted`), NOT assumed.
 
   Architecture:
   * `IsClosed L`  - L is closed under the cross edge and the phantom rule (SOME source of a needed
