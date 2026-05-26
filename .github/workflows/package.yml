@@ -102,17 +102,16 @@ jobs:
           done
           ls -l dist
 
-      - name: Compute release tag
-        id: tag
+      - name: Publish rolling 'latest' release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "tag=v$(date -u +%Y.%m.%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-
-      - name: Create release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: ${{ steps.tag.outputs.tag }}
-          body: |
-            Automated build from ${{ github.sha }}.
-            Each `.skill` is a zip of its skill directory. Unzip into your Claude Code skills location.
-          files: dist/*.skill
+          # One rolling release that always reflects the current main, bundles refreshed each push.
+          # Remove the previous release + its (moving) tag, then recreate at this commit.
+          gh release delete latest --yes || true
+          git push origin :refs/tags/latest || true
+          gh release create latest \
+            --target "$GITHUB_SHA" \
+            --title "Latest skills" \
+            --notes "Rolling build from \`$GITHUB_SHA\` ($(date -u +%Y-%m-%d)). Each \`.skill\` is a zip of its skill directory; unzip into your Claude Code skills location." \
+            dist/*.skill
