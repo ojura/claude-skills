@@ -211,6 +211,7 @@ def crossN : Fil → Fil → Prop := fun _ _ => False
 def needsN : Fil → Pha → Prop := fun f _ => f = f0
 def srcN   : Fil → Pha → Prop := fun f _ => f = f1
 def lockedN : FSet Fil := fun _ => True            -- both files locked (a valid closed set here)
+def kufN   : FSet Fil := fun _ => False            -- no kept-unique forks here
 def consumersN : FSet Fil := fun _ => True
 def residueN : FSet Fil := fun _ => True           -- nonzero residue everywhere -> nothing demoted
 
@@ -221,13 +222,49 @@ theorem lockedN_closed : FixProto.IsClosed crossN needsN srcN lockedN where
   phan_closed  := by intro _ _ _ _ _; exact ⟨f1, trivial, rfl⟩
 
 theorem concrete_no_orphan_from_closed :
-    ∃ s, (lockedN s ∧ ¬ FixProto.demoted needsN srcN consumersN residueN s) ∧ srcN s p0 := by
+    ∃ s, (lockedN s ∧ ¬ FixProto.demoted needsN srcN crossN kufN consumersN residueN s) ∧ srcN s p0 := by
   refine FixProto.no_orphan_from_closed crossN needsN srcN lockedN_closed
     (fun _ _ => trivial) (f := f0) (P := p0) ⟨trivial, ?_⟩ rfl ⟨f1, rfl⟩
-  -- ¬ demoted f0: demoted = ¬loadbearing ∧ ¬residue, but residueN is True, so its second half fails.
-  intro hd; exact hd.2 trivial
+  -- ¬ demoted f0: demoted = kuf ∧ ¬lb ∧ ¬residue, but kufN f0 is False, so the conjunction fails.
+  intro hd; exact hd.1
 
 #print axioms concrete_no_orphan_from_closed
+
+/- VERIFY-OUTCOME 9: the four marker side-conditions, previously hypotheses, are now DERIVED from the
+   loadbearing/demoted set definitions (FixProto). Axiom-free; each a few lines. -/
+#print axioms FixProto.cross_lb_from_def
+#print axioms FixProto.live_not_demoted_from_def
+#print axioms FixProto.C5_survivor_from_def
+
+-- Non-vacuity: cross_lb on a store with a real cross edge; live_not_demoted with live/kuf disjoint;
+-- C5_survivor where a surviving kuf has residue.
+theorem concrete_cross_lb :
+    FixProto.loadbearing needsN srcN (fun a _ => a = f0) consumersN f1 :=
+  FixProto.cross_lb_from_def needsN srcN (fun a _ => a = f0) consumersN (a := f0) trivial rfl
+
+theorem concrete_live_not_demoted :
+    ¬ FixProto.demoted needsN srcN crossN kufN consumersN residueN f0 :=
+  FixProto.live_not_demoted_from_def needsN srcN crossN kufN consumersN residueN (live := fun _ => True)
+    (fun _ _ h => h) trivial
+
+-- Decidable instances for the concrete store: loadbearing f0 is provably false (no cross edge to
+-- f0, and f0 sources nothing since srcN f0 P = (f0 = f1) is false); residueN f0 is provably true.
+instance : Decidable (FixProto.loadbearing needsN srcN crossN consumersN f0) :=
+  isFalse (by
+    unfold FixProto.loadbearing crossN srcN
+    rintro (⟨a, _, hc⟩ | ⟨P, hs, _⟩)
+    · exact hc                       -- crossN a f0 = False
+    · exact absurd hs (by decide))   -- srcN f0 P = (f0 = f1), decidably false
+instance : Decidable (residueN f0) := isTrue trivial
+
+theorem concrete_C5_survivor :
+    FixProto.loadbearing needsN srcN crossN consumersN f0 ∨ residueN f0 :=
+  FixProto.C5_survivor_from_def needsN srcN crossN (fun _ => True) consumersN residueN
+    (x := f0) trivial (fun hd => hd.2.2 trivial)
+
+#print axioms concrete_cross_lb
+#print axioms concrete_live_not_demoted
+#print axioms concrete_C5_survivor
 
 /- VERIFY-OUTCOME 8: termination is non-vacuous AND `expand` is constructible (not a hidden
    assumption). Over a 1-element universe with no edges, every set is already closed, so we build the

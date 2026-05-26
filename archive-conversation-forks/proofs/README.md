@@ -51,16 +51,20 @@ member (`canonical_mem`) and respects the content floor (`canonical_nondebris`: 
 whenever a non-debris member exists). Which specific file it picks (the max-distinct / recency
 key) is deliberately not modelled - membership and the floor are the safety-relevant properties.
 
-**`FixProto.*` (the bridge facts derived, not assumed).** `no_orphan` is stated over three bridge
-hypotheses (`hpick`, `source_lb`, `demoted_guard`) that connect the abstract model to the code.
-`Fixpoint.lean` discharges all three from strictly weaker inputs, so they are no longer bald
-assumptions:
+**`FixProto.*` (the bridge facts derived, not assumed).** The theorems in `Orphan` / `Markers` are
+stated over bridge hypotheses (`hpick`, `source_lb`, `cross_lb`, `phan_lb`, `demoted_guard`,
+`live_not_demoted`, `C5_survivor`) that connect the abstract model to the code. `Fixpoint.lean`
+discharges all of them from strictly weaker inputs, so none is a bald assumption:
 
-- `source_lb` and `demoted_guard` become **lemmas** (`source_lb_from_def`, `demoted_guard_from_def`)
-  once `loadbearing` and `demoted` are modelled as their actual set definitions - `loadbearing s =
-  (s sources some needed phantom)` and `demoted = (not loadbearing and zero residue)` - exactly the
-  committed `loadbearing |= {s | sources(s) & needed}` and the C5 `if k in loadbearing: continue`
-  guard. They fall straight out of those definitions.
+- The six `loadbearing` / `demoted` facts become **lemmas** once those two predicates are modelled as
+  their actual committed definitions: `loadbearing` as the UNION of the cross-file-target half and
+  the phantom-source half (SKILL.md `loadbearing |= {targets} ∪ {s | sources(s) & needed}`), and
+  `demoted` as the three-conjunct C5 guard `kuf ∧ ¬loadbearing ∧ ¬residue` (`for k in kuf: if k in
+  loadbearing: continue; if not residue: discard`). `source_lb_from_def` / `cross_lb_from_def`
+  (loadbearing from either half), `demoted_guard_from_def` (demoted ⇒ ¬loadbearing),
+  `live_not_demoted_from_def` (live disjoint from `kuf` ⇒ not demoted), and `C5_survivor_from_def`
+  (a surviving `kuf` is loadbearing or has residue, by a decidable case-split - constructive) all
+  fall out of those definitions.
 - `hpick` is derived (`hpick_from_closed`) from a single structural fact, `IsClosed locked`: the
   committed `while changed:` loop reached its fixpoint. `IsClosed` says exactly what loop
   termination says - no cross edge and no phantom rule can add anything more - so at the fixpoint
@@ -69,7 +73,7 @@ assumptions:
   per-phantom existence claim that looked like it needed choice with one obviously-code-true fact.
 
 `no_orphan_from_closed` reassembles the main result from these: same conclusion as `no_orphan`, but
-assuming only `IsClosed locked` plus the set definitions, not the three bridge hypotheses. All four
+assuming only `IsClosed locked` plus the set definitions, not the bridge hypotheses. All seven
 `FixProto` results are fully axiom-free.
 
 **`TermList.*` (`IsClosed` is achievable, not assumed).** `closed_superset_exists` proves that over a
@@ -144,14 +148,15 @@ These proofs certify the **set algebra**: given facts the code establishes, arch
 orphans a kept session, never drops a message of a 0-unique candidate, never moves a live
 session, and the marker tree has no hole. They are **not** a proof of the Python end to end:
 
-- After `Fixpoint.lean` and `Termination.lean`, the bridge hypotheses are *derived*, not assumed.
-  `source_lb` and `demoted_guard` follow from the set definitions of `loadbearing` / `demoted`;
-  `hpick` follows from `IsClosed locked`; and `IsClosed` itself is no longer assumed - it is *proven
-  achievable* (`closed_superset_exists`: a closed `locked ⊇ seed` exists over a finite universe).
-  What remains are the closure-inversion facts (`cross_lb` / `phan_lb`) and the marker
-  side-conditions (`C5_survivor` / `live_not_demoted`), each a direct reading of one code line, plus
-  the `expand` step below. That the Python *implements* the abstract relations (the JSONL parse, the
-  actual union-find, `canonical()`, the loop body) is checked by the property-based fuzz, not by Lean.
+- After `Fixpoint.lean` and `Termination.lean`, the bridge facts are all *derived*, not assumed.
+  `source_lb`, `cross_lb`, `phan_lb`, `demoted_guard`, `live_not_demoted`, and `C5_survivor` all
+  follow from the set definitions of `loadbearing` (now the actual UNION of the cross-target and
+  phantom-source halves) and `demoted` (the actual three-conjunct C5 guard `kuf ∧ ¬loadbearing ∧
+  ¬residue`); `hpick` follows from `IsClosed locked`; and `IsClosed` itself is no longer assumed - it
+  is *proven achievable* (`closed_superset_exists`: a closed `locked ⊇ seed` exists over a finite
+  universe). The only residue left inside the algebra is the `expand` step below. That the Python
+  *implements* the abstract relations (the JSONL parse, the actual union-find, `canonical()`, the
+  loop body) is checked by the property-based fuzz, not by Lean.
 - The termination proof (`Termination.lean`) is **mathlib-free, in core Lean**. Core Lean 4.10's
   `List` lacks `Sublist` and `countP`, so the decreasing-measure lemma (`gap_lt`: adding a forced
   element strictly shrinks the count of not-yet-included universe elements) and its monotonicity
@@ -195,7 +200,7 @@ session, and the marker tree has no hole. They are **not** a proof of the Python
 - `Orphan.lean` - the closure, the re-close, C5 safety, `no_orphan`, and the recall no-loss theorem.
 - `Markers.lean` - the closure-inversion lemma, `live_subset_keptC5`, and `marker_no_hole`.
 - `Family.lean` - union-find as an equivalence (the co-tree and false-family lemmas) and `canonical()` membership + floor.
-- `Fixpoint.lean` - `IsClosed`, the bridge facts derived (`hpick_from_closed`, `source_lb_from_def`, `demoted_guard_from_def`), and `no_orphan_from_closed`.
+- `Fixpoint.lean` - `IsClosed`, the seven bridge facts derived (`hpick_from_closed`, `source_lb_from_def`, `cross_lb_from_def`, `demoted_guard_from_def`, `live_not_demoted_from_def`, `C5_survivor_from_def`), and `no_orphan_from_closed`.
 - `Termination.lean` - `gap_lt` and `closed_superset_exists`: a closed set exists over a finite universe, discharging `IsClosed`. Core Lean, hand-rolled (no mathlib).
 - `Check.lean` - the axiom audit (`#print axioms`) and concrete non-vacuity models for all theorems.
 - `lakefile.toml`, `lean-toolchain` - build configuration (Lean 4.10.0, no dependencies).
