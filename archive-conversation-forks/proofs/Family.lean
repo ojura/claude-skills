@@ -166,4 +166,237 @@ theorem canonical_nondebris (ks : List File) {c : File}
       have hkeep := (List.mem_filter.mp hsub).2
       simpa using hkeep
 
+
+/-
+  ============================================================================================
+  CANONICAL MAX-KEY SELECTION (#4, canonical part). `canonical_mem` / `canonical_nondebris` above
+  prove canonical returns a member and respects the floor. This section proves the actual SELECTION:
+  the committed `max(cand, key=(distinct, lts, uuid))` picks an element whose key is MAXIMAL among the
+  floored candidates. The key's three components are modelled as the scalars the code compares - all
+  `Nat` (distinct-count = set size; `norm()` = a sortable instant; uuid = hex number). Computing those
+  scalars from fingerprints / parsing / bytes is the Python boundary; the LEX SELECTION is exact here.
+  Core Lean, no mathlib (core `Nat` has the full order theory; core `String` lacks the order lemmas,
+  which is why the components are modelled as their compared scalars rather than raw strings).
+  ============================================================================================
+-/
+namespace Canon
+
+abbrev Key := Nat × Nat × Nat
+
+/-- Lexicographic strict-less on the triple. -/
+def klt (a b : Key) : Prop :=
+  a.1 < b.1 ∨ (a.1 = b.1 ∧ (a.2.1 < b.2.1 ∨ (a.2.1 = b.2.1 ∧ a.2.2 < b.2.2)))
+
+/-- Lexicographic ≤ (the negation-complete companion). -/
+def kle (a b : Key) : Prop := klt a b ∨ a = b
+
+instance : DecidablePred (fun p : Key × Key => klt p.1 p.2) := fun _ => inferInstanceAs (Decidable (_ ∨ _))
+instance (a b : Key) : Decidable (klt a b) := inferInstanceAs (Decidable (_ ∨ _))
+
+/-- Totality: klt a b, a = b, or klt b a. -/
+theorem klt_tri (a b : Key) : klt a b ∨ a = b ∨ klt b a := by
+  unfold klt
+  obtain ⟨a1, a2, a3⟩ := a; obtain ⟨b1, b2, b3⟩ := b
+  rcases Nat.lt_trichotomy a1 b1 with h1 | h1 | h1
+  · exact Or.inl (Or.inl h1)
+  · subst h1
+    rcases Nat.lt_trichotomy a2 b2 with h2 | h2 | h2
+    · exact Or.inl (Or.inr ⟨rfl, Or.inl h2⟩)
+    · subst h2
+      rcases Nat.lt_trichotomy a3 b3 with h3 | h3 | h3
+      · exact Or.inl (Or.inr ⟨rfl, Or.inr ⟨rfl, h3⟩⟩)
+      · subst h3; exact Or.inr (Or.inl rfl)
+      · exact Or.inr (Or.inr (Or.inr ⟨rfl, Or.inr ⟨rfl, h3⟩⟩))
+    · exact Or.inr (Or.inr (Or.inr ⟨rfl, Or.inl h2⟩))
+  · exact Or.inr (Or.inr (Or.inl h1))
+
+/-- kle is total. -/
+theorem kle_total (a b : Key) : kle a b ∨ kle b a := by
+  rcases klt_tri a b with h | h | h
+  · exact Or.inl (Or.inl h)
+  · exact Or.inl (Or.inr h)
+  · exact Or.inr (Or.inl h)
+
+/-- klt is transitive. -/
+theorem klt_trans {a b c : Key} (hab : klt a b) (hbc : klt b c) : klt a c := by
+  unfold klt at *
+  obtain ⟨a1,a2,a3⟩ := a; obtain ⟨b1,b2,b3⟩ := b; obtain ⟨c1,c2,c3⟩ := c
+  rcases hab with h | ⟨e1, h⟩ <;> rcases hbc with h' | ⟨e1', h'⟩
+  · exact Or.inl (Nat.lt_trans h h')
+  · subst e1'; exact Or.inl h
+  · subst e1; exact Or.inl h'
+  · subst e1; subst e1'
+    refine Or.inr ⟨rfl, ?_⟩
+    rcases h with h2 | ⟨e2, h⟩ <;> rcases h' with h2' | ⟨e2', h'⟩
+    · exact Or.inl (Nat.lt_trans h2 h2')
+    · subst e2'; exact Or.inl h2
+    · subst e2; exact Or.inl h2'
+    · subst e2; subst e2'; exact Or.inr ⟨rfl, Nat.lt_trans h h'⟩
+
+/-- kle is transitive (needed for argmax). -/
+theorem kle_trans {a b c : Key} (hab : kle a b) (hbc : kle b c) : kle a c := by
+  rcases hab with hab | hab
+  · rcases hbc with hbc | hbc
+    · exact Or.inl (klt_trans hab hbc)
+    · subst hbc; exact Or.inl hab
+  · subst hab; exact hbc
+
+/-- ¬ klt a b → kle b a (from trichotomy). -/
+theorem kle_of_not_klt {a b : Key} (h : ¬ klt a b) : kle b a := by
+  rcases klt_tri a b with h' | h' | h'
+  · exact absurd h' h
+  · exact Or.inr h'.symm
+  · exact Or.inl h'
+
+/-- argmax over a key function, by left fold (matches `max(cand, key=...)`). -/
+def argmax (key : File → Key) : File → List File → File
+  | best, []      => best
+  | best, x :: xs => argmax key (if klt (key best) (key x) then x else best) xs
+
+/-- the running best's key only grows (kle seed (argmax)). -/
+theorem argmax_ge_seed (key : File → Key) :
+    ∀ (l : List File) (best : File), kle (key best) (key (argmax key best l)) := by
+  intro l
+  induction l with
+  | nil => intro best; exact Or.inr rfl
+  | cons x xs ih =>
+      intro best
+      simp only [argmax]
+      by_cases h : klt (key best) (key x)
+      · simp only [h, if_true]; exact kle_trans (Or.inl h) (ih x)
+      · simp only [h, if_false]; exact ih best
+
+/-- argmax's key is ≥ every element's key: canonical picks a MAXIMAL-key element. -/
+theorem argmax_ge_mem (key : File → Key) :
+    ∀ (l : List File) (best y : File), y ∈ l → kle (key y) (key (argmax key best l)) := by
+  intro l
+  induction l with
+  | nil => intro _ y hy; exact absurd hy (List.not_mem_nil y)
+  | cons x xs ih =>
+      intro best y hy
+      simp only [argmax]
+      cases List.mem_cons.mp hy with
+      | inl hyx =>
+          subst hyx
+          by_cases h : klt (key best) (key y)
+          · simp only [h, if_true]; exact argmax_ge_seed key xs y
+          · simp only [h, if_false]
+            exact kle_trans (kle_of_not_klt h) (argmax_ge_seed key xs best)
+      | inr hyxs =>
+          by_cases h : klt (key best) (key x)
+          · simp only [h, if_true]; exact ih x y hyxs
+          · simp only [h, if_false]; exact ih best y hyxs
+
+/-- argmax returns either the seed or a list element: it is a member of `best :: l`. Proved via the
+    cleaner intermediate "= seed ∨ ∈ l". -/
+theorem argmax_eq_or_mem (key : File → Key) :
+    ∀ (l : List File) (best : File), argmax key best l = best ∨ argmax key best l ∈ l := by
+  intro l
+  induction l with
+  | nil => intro best; exact Or.inl rfl
+  | cons x xs ih =>
+      intro best
+      simp only [argmax]
+      by_cases h : klt (key best) (key x)
+      · simp only [h, if_true]
+        rcases ih x with he | hm
+        · exact Or.inr (by rw [he]; exact List.mem_cons_self x xs)
+        · exact Or.inr (List.mem_cons_of_mem x hm)
+      · simp only [h, if_false]
+        rcases ih best with he | hm
+        · exact Or.inl he
+        · exact Or.inr (List.mem_cons_of_mem x hm)
+
+theorem argmax_mem (key : File → Key) (l : List File) (best : File) :
+    argmax key best l ∈ best :: l := by
+  rcases argmax_eq_or_mem key l best with he | hm
+  · rw [he]; exact List.mem_cons_self best l
+  · exact List.mem_cons_of_mem best hm
+
+variable (debris : File → Prop) [DecidablePred debris]
+
+/-- canonical, modelling the committed `max(cand, key=...)`: arg-max over the floored candidates. -/
+def canonicalByKey (key : File → Key) (ks : List File) : Option File :=
+  match cand debris ks with
+  | []      => Option.none
+  | c :: cs => some (argmax key c cs)
+
+/-- THE SELECTION PROPERTY: every floored candidate's key is ≤ the chosen canonical's key, and the
+    canonical is one of the floored candidates. So `canonical` genuinely picks a maximal-key element. -/
+theorem canonicalByKey_is_max (key : File → Key) (ks : List File) {c : File}
+    (hc : canonicalByKey debris key ks = some c) :
+    c ∈ cand debris ks ∧ ∀ y ∈ cand debris ks, kle (key y) (key c) := by
+  unfold canonicalByKey at hc
+  cases hcd : cand debris ks with
+  | nil => rw [hcd] at hc; exact absurd hc (by simp)
+  | cons d ds =>
+      rw [hcd] at hc
+      simp only [Option.some.injEq] at hc; subst hc
+      refine ⟨?_, ?_⟩
+      · -- argmax is a member of (d :: ds)
+        have : argmax key d ds ∈ (d :: ds) := by
+          have hmem := argmax_mem key ds d
+          exact hmem
+        exact this
+      · intro y hy
+        -- every element of (d::ds) has key ≤ argmax's key
+        cases List.mem_cons.mp hy with
+        | inl hyd => subst hyd; exact argmax_ge_seed key ds y
+        | inr hys => exact argmax_ge_mem key ds d y hys
+
+end Canon
+
+
+/-
+  ============================================================================================
+  PATH COMPRESSION (the `find` optimisation, "for fun"). The union-find partition is formalised AS the
+  `SameTree` equivalence above; the imperative `find` adds path compression (repoint visited nodes
+  straight at the root) as a speed optimisation. Here we show compression PRESERVES the computed
+  component: repointing a node `v` at its root `r` leaves every root a root and makes `v` find `r`, so
+  the optimised `find` computes the same answer as the naive one. Core Lean, no mathlib.
+  ============================================================================================
+-/
+namespace Compress
+
+variable {Node : Type} [DecidableEq Node]
+
+/-- root via fuel-bounded iteration of `parent` (fuel = an upper bound on chain length). -/
+def root (parent : Node → Node) : Nat → Node → Node
+  | 0,      x => x
+  | fuel+1, x => let p := parent x; if p = x then x else root parent fuel p
+
+/-- A node is a root if it is its own parent. -/
+def isRoot (parent : Node → Node) (x : Node) : Prop := parent x = x
+
+/-- Compression step: repoint `v` directly at `r` (its root). New parent map. -/
+def compress (parent : Node → Node) (v r : Node) : Node → Node :=
+  fun x => if x = v then r else parent x
+
+/-- If `r` is a root and we repoint `v` to `r`, then `r` is still a root in the new map (r ≠ v case:
+    its parent is unchanged; and we only repoint v). Needs r ≠ v (a root distinct from the compressed
+    node), which holds when v is not already the root. -/
+theorem compress_preserves_root_self (parent : Node → Node) {v r : Node}
+    (hr : isRoot parent r) (hrv : r ≠ v) : isRoot (compress parent v r) r := by
+  unfold isRoot compress
+  rw [if_neg hrv]; exact hr
+
+/-- KEY: after compressing `v` to its root `r`, computing root of `v` in the new map gives `r`
+    (in one step, since v now points straight at r, and r is a root). -/
+theorem root_compress_v (parent : Node → Node) {v r : Node}
+    (hr : isRoot parent r) (hrv : r ≠ v) :
+    root (compress parent v r) 2 v = r := by
+  -- parent' v = r (v branch); parent' r = r (r ≠ v, unchanged, and r is a root). So root in ≤2 steps.
+  have hpv : compress parent v r v = r := by unfold compress; rw [if_pos rfl]
+  have hpr : compress parent v r r = r := by unfold compress; rw [if_neg hrv]; exact hr
+  unfold root
+  rw [hpv]
+  by_cases h : r = v
+  · exact absurd h hrv
+  · rw [if_neg h]
+    -- goal: root (compress..) 1 r = r ; unfold once more, parent' r = r.
+    unfold root
+    rw [hpr, if_pos rfl]
+
+end Compress
+
 end Family

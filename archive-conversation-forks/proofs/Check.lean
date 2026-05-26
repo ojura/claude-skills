@@ -37,6 +37,14 @@ open Orphan
 #print axioms Family.content_not_a_generator
 #print axioms Family.canonical_mem
 #print axioms Family.canonical_nondebris
+-- canonical max-key SELECTION (#4 canonical part): lex order + argmax picks a maximal-key element.
+#print axioms Family.Canon.kle_total
+#print axioms Family.Canon.klt_trans
+#print axioms Family.Canon.argmax_ge_mem
+#print axioms Family.Canon.canonicalByKey_is_max
+-- path compression (#4 find part, "for fun"): compression preserves the computed component.
+#print axioms Family.Compress.compress_preserves_root_self
+#print axioms Family.Compress.root_compress_v
 -- Fixpoint internalisation: the bridge facts derived, not assumed.
 #print axioms FixProto.hpick_from_closed
 #print axioms FixProto.source_lb_from_def
@@ -257,6 +265,32 @@ theorem concrete_canonical_nondebris : ¬ debris3 n0 :=
 
 #print axioms concrete_canonical_mem
 #print axioms concrete_canonical_nondebris
+
+/- VERIFY-OUTCOME 6b: canonical MAX-KEY selection is non-vacuous. Key gives n0 more distinct content
+   (5) than s0 (1); among the floored candidates [n0,s0] canonicalByKey picks the maximal-key one. -/
+def key3 : Fil3 → Family.Canon.Key := fun f => if f = n0 then (5, 0, 0) else (1, 0, 0)
+def nodeb3 : Fil3 → Prop := fun _ => False         -- nothing debris here, so cand = the whole list
+instance : DecidablePred nodeb3 := fun _ => isFalse (by unfold nodeb3; exact id)
+
+theorem concrete_canonical_max :
+    ∃ c, Family.Canon.canonicalByKey nodeb3 key3 [n0, s0] = some c ∧
+      (∀ y ∈ Family.cand nodeb3 [n0, s0], Family.Canon.kle (key3 y) (key3 c)) := by
+  have hpick : Family.Canon.canonicalByKey nodeb3 key3 [n0, s0]
+      = some (Family.Canon.argmax key3 n0 [s0]) := rfl
+  exact ⟨_, hpick, (Family.Canon.canonicalByKey_is_max nodeb3 key3 [n0, s0] hpick).2⟩
+
+#print axioms concrete_canonical_max
+
+/- VERIFY-OUTCOME 6c: path compression is non-vacuous. parent: n0 → s0, s0 → s0 (s0 root). Compress
+   n0 to s0; root of n0 in the compressed map is s0 (the same component). -/
+def par3 : Fil3 → Fil3 := fun f => if f = n0 then s0 else s0   -- n0↦s0, s0↦s0
+
+theorem concrete_compress :
+    Family.Compress.root (Family.Compress.compress par3 n0 s0) 2 n0 = s0 :=
+  Family.Compress.root_compress_v par3 (r := s0) (v := n0)
+    (by unfold Family.Compress.isRoot par3; decide) (by decide)
+
+#print axioms concrete_compress
 
 /- VERIFY-OUTCOME 7: the INTERNALISED no-orphan (no_orphan_from_closed) is non-vacuous. A concrete
    closed `locked` (containing a needer f0 and its source f1), with the loop's fixpoint condition

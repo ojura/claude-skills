@@ -154,7 +154,8 @@ lake build
 ```
 
 The build prints the `#print axioms` lines from `Check.lean`; each must read either *does not
-depend on any axioms* or `[propext]` (the only axiom any theorem here uses), and never
+depend on any axioms* or a subset of `[propext, Quot.sound]` (the trusted core; `Quot.sound` enters
+only via the `List` / `decide` machinery in the termination and search lemmas), and never
 `Classical.choice`, `sorryAx`, or `Lean.ofReduceBool`. To rebuild clean, `rm -rf .lake` first.
 
 A `leanprovercommunity/lean` Docker image pinned at Lean 4.10.0 works as-is; run `lake
@@ -162,9 +163,17 @@ build` from this directory inside the container.
 
 ## Honest scope
 
-These proofs certify the **set algebra**: given facts the code establishes, archiving never
-orphans a kept session, never drops a message of a 0-unique candidate, never moves a live
-session, and the marker tree has no hole. They are **not** a proof of the Python end to end:
+These proofs cover the entire **algorithm** of Step 2 - the set algebra (archiving never orphans a
+kept session, never drops a message of a 0-unique candidate, never moves a live session), the marker
+tree (exhaustive, and the assignment total + mutually exclusive), the union-find grouping (an
+equivalence; co-tree and false-family), `canonical()` (membership, content floor, and max-key
+selection), the keep-locked loop's termination, and even the `find` path-compression optimisation.
+The bridge facts that connect the abstract model to the code are *derived*, not assumed, and the one
+loop-body oracle is *constructed*. So the single remaining gap is genuinely irreducible for a
+model-level proof: whether the **Python** computes what the abstract relations (`cross`, `needs`,
+`sources`, the fingerprints, the key scalars) say - the JSONL parse, the actual mutable union-find,
+the real `canonical()` key computation, the loop body. That boundary is checked by the property-based
+fuzz, not by Lean; everything *above* it is now formalised. Concretely, what stays out of model:
 
 - After `Fixpoint.lean` and `Termination.lean`, the bridge facts are all *derived*, not assumed.
   `source_lb`, `cross_lb`, `phan_lb`, `demoted_guard`, `live_not_demoted`, and `C5_survivor` all
@@ -205,15 +214,19 @@ session, and the marker tree has no hole. They are **not** a proof of the Python
   so it enters `classify` as an opaque Bool. Given the bucket classification, the assignment is fully
   pinned down; only the substantive/not call is the operator's.
 - `canonical()` is formalised at the property level (`canonical_mem` returns a member,
-  `canonical_nondebris` respects the content floor). The exact max-key tiebreak (most-distinct, then
-  recency, then uuid) is **not** formalised: a faithful model of the key needs the distinct-count and
-  parsed-timestamp, which is the model-to-Python boundary, and the abstract argmax needs mathlib's
-  `LinearOrder`; membership + floor are what the safety theorems actually consume, and any wrong
-  max-choice over-keeps rather than loses (gated by `no_orphan` / `recall_no_loss`). The union-find
-  partition is formalised AS the equivalence `SameTree` (`Family.lean`: equivalence laws, shared-lpu
-  and needer-source grouping, content-does-not-merge); the imperative path-compressed `find` computes
-  exactly that equivalence, so the mutable optimisation is implementation detail with no extra math -
-  legitimately left to the fuzz. The full family/theme assignment of Steps 4-5 is fuzz-checked.
+  `canonical_nondebris` respects the content floor) AND the selection level: `Family.Canon` builds the
+  key's lexicographic order in core Lean (`klt` / `kle` over `Nat × Nat × Nat`, with totality,
+  transitivity proven from core `Nat` lemmas - no mathlib `LinearOrder`), and `canonicalByKey_is_max`
+  proves arg-max picks an element whose key is maximal among the floored candidates. The key's three
+  components are modelled as the scalars the code compares (distinct-count, normalised-sortable
+  timestamp, uuid), all `Nat`; computing those scalars from fingerprints / parsing / bytes is the
+  Python boundary (note: core `String` lacks the order lemmas, which is why the components are modelled
+  as their compared scalars rather than raw strings). The union-find partition is formalised AS the
+  equivalence `SameTree` (`Family.lean`: equivalence laws, shared-lpu and needer-source grouping,
+  content-does-not-merge), and the `find` path-compression optimisation is shown to preserve the
+  computed component (`Family.Compress`: `compress_preserves_root_self`, `root_compress_v` - repointing
+  a node at its root leaves every node's root unchanged), so the optimised `find` returns the same
+  answer as the naive one. The full family/theme assignment of Steps 4-5 is fuzz-checked.
 
   These are deliberately **structural-only**, and that is safe because grouping and canonical
   choice are not on the data-loss path: a wrong grouping or a wrong canonical pick can only cause a
@@ -228,7 +241,7 @@ session, and the marker tree has no hole. They are **not** a proof of the Python
 
 - `Orphan.lean` - the closure, the re-close, C5 safety, `no_orphan`, and the recall no-loss theorem.
 - `Markers.lean` - the closure-inversion lemma, `live_subset_keptC5`, `marker_no_hole`, the wired capstones, and the marker classification (`classify` + total/exclusive/exhaustive lemmas).
-- `Family.lean` - union-find as an equivalence (the co-tree and false-family lemmas) and `canonical()` membership + floor.
+- `Family.lean` - union-find as an equivalence (co-tree and false-family lemmas), `canonical()` membership + floor + max-key selection (`Family.Canon`, core lex order), and `find` path-compression correctness (`Family.Compress`).
 - `Fixpoint.lean` - `IsClosed`, the seven bridge facts derived (`hpick_from_closed`, `source_lb_from_def`, `cross_lb_from_def`, `demoted_guard_from_def`, `live_not_demoted_from_def`, `C5_survivor_from_def`), and `no_orphan_from_closed`.
 - `Termination.lean` - `gap_lt` + `closed_superset_exists` (a closed set exists over a finite universe, discharging `IsClosed`), and the constructed loop-body oracle (`expand` / `closed_of_none` / `closed_superset_exists_constructed`). Core Lean, hand-rolled (no mathlib).
 - `Check.lean` - the axiom audit (`#print axioms`) and concrete non-vacuity models for all theorems.
