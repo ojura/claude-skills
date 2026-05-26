@@ -82,11 +82,18 @@ theorem live_subset_keptC5
   globally-unique messages of `x`; "nonzero residue" is `∃ m, residue x m`.
 
   Hypotheses (each a committed-code fact):
-  * `cross_lb`, `phan_lb`     : the loadbearing-from-closure facts (see `nonseed_loadbearing`).
-  * `C5_survivor_residue`     : a kept-unique fork that survives C5 and is NOT load-bearing has
-                                nonzero residue. This is C5's contract read backwards: C5 demotes a
-                                kuf iff (not load-bearing AND exactly-0 residue), so a SURVIVING
-                                non-load-bearing kuf must have had nonzero residue.
+  * `cross_lb`, `phan_lb`  : the loadbearing-from-closure facts (see `nonseed_loadbearing`); the
+                             cross-file target / phantom source of a closure member is load-bearing.
+  * `C5_survivor`          : C5's actual postcondition. C5 demotes a kept-unique fork iff
+                             (not load-bearing AND exactly-0 residue), so a SURVIVING kuf is
+                             load-bearing OR has nonzero residue. Passing this disjunction directly
+                             (rather than "not load-bearing -> residue") keeps the proof constructive:
+                             no need to decide `loadbearing x`.
+
+  FULLY CONSTRUCTIVE. The proof is a direct `cases` on the closure derivation (`seed` / `cross` /
+  `phan`), so it needs neither `Classical.em` nor any decidability instance: it depends on NO axioms.
+  (The `seed` case splits the `canonicals ∨ live ∨ kuf` disjunction the seed already carries; the
+  `cross` / `phan` cases hand back load-bearing directly. This inlines `nonseed_loadbearing`.)
 -/
 theorem marker_no_hole {Msg : Type}
     (canonicals live kuf demoted loadbearing : FSet File)
@@ -95,24 +102,21 @@ theorem marker_no_hole {Msg : Type}
                   cross k b → loadbearing b)
     (phan_lb  : ∀ f P, Closure cross needs sources pick (seed0 canonicals live kuf) f →
                   needs f P → (∃ s, sources s P) → loadbearing (pick P))
-    (C5_survivor_residue : ∀ x, kuf x → ¬ demoted x → ¬ loadbearing x → ∃ m, residue x m)
+    (C5_survivor : ∀ x, kuf x → ¬ demoted x → loadbearing x ∨ ∃ m, residue x m)
     {x : File}
     (hx : KEPT_C5 cross needs sources pick (seed0 canonicals live kuf) demoted x)
     (hncanon : ¬ canonicals x) (hnlive : ¬ live x) :
     loadbearing x ∨ ∃ m, residue x m := by
   obtain ⟨hfin, hnotdem⟩ := hx
-  -- hfin : Closure(seed0) x.  Classify x by whether it is in the seed.
-  by_cases hseed : seed0 canonicals live kuf x
-  · -- x is in the seed = canonicals ∨ live ∨ kuf. Not canonical, not live ⇒ kuf.
-    rcases hseed with hc | hl | hk
-    · exact absurd hc hncanon
-    · exact absurd hl hnlive
-    · -- x ∈ kuf, survives C5 (¬demoted). If not loadbearing, C5_survivor_residue gives residue.
-      rcases Classical.em (loadbearing x) with hlb | hnlb
-      · exact Or.inl hlb
-      · exact Or.inr (C5_survivor_residue x hk hnotdem hnlb)
-  · -- x not in seed ⇒ entered via cross/phan ⇒ load-bearing (inversion).
-    exact Or.inl (nonseed_loadbearing cross needs sources pick
-      (seed0 canonicals live kuf) loadbearing cross_lb phan_lb hfin hseed)
+  -- Direct inversion on HOW x entered the closure - constructive, no `em`, no decidability.
+  cases hfin with
+  | seed hs =>
+      -- x ∈ seed = canonicals ∨ live ∨ kuf. Not canonical, not live ⇒ kuf ⇒ C5's postcondition.
+      rcases hs with hc | hl | hk
+      · exact absurd hc hncanon
+      · exact absurd hl hnlive
+      · exact C5_survivor x hk hnotdem
+  | cross hk e    => exact Or.inl (cross_lb _ _ hk e)
+  | phan hf hn he => exact Or.inl (phan_lb _ _ hf hn he)
 
 end Orphan

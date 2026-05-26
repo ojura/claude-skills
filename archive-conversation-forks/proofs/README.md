@@ -38,14 +38,32 @@ decision tree is unreachable. The proof is by inversion on the closure derivatio
 both of which are load-bearing) plus C5's demotion contract (a surviving non-load-bearing
 kept-unique fork must have had nonzero residue). This was previously checked by fuzz only.
 
+**`Family.*` (union-find grouping and `canonical()` selection).** The union-find partition is
+modelled as the equivalence closure of the edge relation (shared-lpu or cross-file `dep`); the
+imperative path-compressed `find` computes exactly this equivalence, so abstracting to it loses
+no math content. Proved: it is an equivalence (so `trees` is a genuine partition); files sharing
+an lpu value are same-tree; the **co-tree lemma** (a phantom needer and its sources both carry
+the phantom in `lref`, so they group together) - which is the structural fact that grounds the
+no-orphan setting, since it is *why* a needer's tree canonical can reach it; and false-family
+non-merge (`SameTree` is generated only by lref/dep edges, never by message content, so files
+sharing only a first message are not forced together). For `canonical()`: it returns a tree
+member (`canonical_mem`) and respects the content floor (`canonical_nondebris`: non-debris
+whenever a non-debris member exists). Which specific file it picks (the max-distinct / recency
+key) is deliberately not modelled - membership and the floor are the safety-relevant properties.
+
 Properties of the proofs:
 
-- **Axiom honesty.** `no_orphan` and its structural lemmas (`closure_closed_under_needs`,
-  `final_closed_under_needs`, `source_survives_C5`, `kept0_subset_final`,
-  `nonseed_loadbearing`, `live_subset_keptC5`) are **fully constructive**: `#print axioms`
-  reports *does not depend on any axioms*. `recall_no_loss` and `marker_no_hole` use a
-  classical case-split, so they list the standard trusted core
-  (`propext`, `Classical.choice`, `Quot.sound`). None lists `sorryAx`: there are no `sorry`s.
+- **Axiom honesty.** Every theorem here is **fully constructive** except two, and even those use
+  only `propext`. `no_orphan` and its structural lemmas (`closure_closed_under_needs`,
+  `final_closed_under_needs`, `source_survives_C5`, `kept0_subset_final`, `nonseed_loadbearing`,
+  `live_subset_keptC5`), the recall and marker theorems (`recall_no_loss`, `marker_no_hole`), and
+  the union-find lemmas (`needer_source_coTree`, `noEdges_sameTree_eq`) all report *does not depend
+  on any axioms*. `recall_no_loss` stays constructive by case-splitting on the kept-union membership
+  as a `Decidable` instance (the faithful counterpart of the code's set `in`, not `Classical.em`);
+  `marker_no_hole` by a direct `cases` on the closure derivation. Only `canonical_mem` /
+  `canonical_nondebris` list `propext` (from the `List.filter` reasoning) - the most innocuous
+  trusted-core axiom. None lists `Classical.choice`, `sorryAx`, or `Lean.ofReduceBool`: no `sorry`,
+  no `native_decide`.
 - **All judge policies, all stores.** Files, fingerprints, `needs`, `sources`, and the
   cross-file edge are opaque; the operator's per-fork keep/archive judgment enters only as
   the abstract seed set, so each theorem covers every possible judge outcome and every store
@@ -83,8 +101,8 @@ lake build
 ```
 
 The build prints the `#print axioms` lines from `Check.lean`; each must read either *does not
-depend on any axioms* or a list drawn only from `propext` / `Classical.choice` / `Quot.sound`
-(the trusted core), and never `sorryAx`. To rebuild from a clean state, `rm -rf .lake` first.
+depend on any axioms* or `[propext]` (the only axiom any theorem here uses), and never
+`Classical.choice`, `sorryAx`, or `Lean.ofReduceBool`. To rebuild clean, `rm -rf .lake` first.
 
 A `leanprovercommunity/lean` Docker image pinned at Lean 4.10.0 works as-is; run `lake
 build` from this directory inside the container.
@@ -96,7 +114,7 @@ orphans a kept session, never drops a message of a 0-unique candidate, never mov
 session, and the marker tree has no hole. They are **not** a proof of the Python end to end:
 
 - The hypotheses (`hpick`, `demoted_guard`, `source_lb`, the `cross_lb` / `phan_lb` /
-  `C5_survivor_residue` / `live_not_demoted` facts) are transcribed from the Step 2 code; the
+  `C5_survivor` / `live_not_demoted` facts) are transcribed from the Step 2 code; the
   proofs certify the logic *given* them. That the Python actually implements them (the JSONL
   parse, the union-find partition, `canonical()`, the fixpoint loop) is checked by the
   property-based fuzz, not by Lean.
@@ -110,13 +128,19 @@ session, and the marker tree has no hole. They are **not** a proof of the Python
   prove the markers are semantically correct (that a `[fork]` is really mostly-contained, etc.).
   The `ov` / `residue` thresholds are operator read-and-judge calls, not arithmetic, so that
   layer is deliberately outside the formalisation.
-- The union-find tree partition, the family-grouping rules, and `canonical()` selection are
-  **not** formalised here; they are checked by fuzz. (`marker_no_hole` sidesteps union-find by
-  working from the closure inversion plus the enriched seed, so it needs no tree model.)
+- The union-find partition and `canonical()` are formalised in `Family.lean` at the
+  EQUIVALENCE / property level (it is an equivalence; shared-lpu and needer-source group; content
+  does not merge; canonical returns a member and respects the floor). What is NOT formalised: the
+  imperative path-compressed `find` itself (it computes the same equivalence, but the mutable data
+  structure is bookkeeping with no extra math), the exact `canonical` max-key choice (only
+  membership and the floor matter for safety), and the full family/theme assignment of Steps 4-5.
+  Those remain fuzz-checked. (`marker_no_hole` itself needs no tree model: it works from the
+  closure inversion plus the enriched seed.)
 
 ## Files
 
 - `Orphan.lean` - the closure, the re-close, C5 safety, `no_orphan`, and the recall no-loss theorem.
 - `Markers.lean` - the closure-inversion lemma, `live_subset_keptC5`, and `marker_no_hole`.
+- `Family.lean` - union-find as an equivalence (the co-tree and false-family lemmas) and `canonical()` membership + floor.
 - `Check.lean` - the axiom audit (`#print axioms`) and concrete non-vacuity models for all theorems.
 - `lakefile.toml`, `lean-toolchain` - build configuration (Lean 4.10.0, no dependencies).

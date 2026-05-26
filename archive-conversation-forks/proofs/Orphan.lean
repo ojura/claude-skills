@@ -215,14 +215,20 @@ def missing {Msg : Type} (fps : File → Msg → Prop) (KEPT : FSet File) (A : F
   guarantee. `A`'s own membership is irrelevant: the witness `b` may be any kept file (the code's
   "split-contained across several kept files" case is covered, since `b` is existentially quantified
   per message, not a single container).
+
+  FULLY CONSTRUCTIVE. "m lives in some kept file" is `Decidable` (the committed code computes it as a
+  Python `in` against the kept-union set), so the case-split is `Decidable`, NOT classical: this
+  theorem depends on NO axioms. The decidability instance is the faithful counterpart of the set
+  membership the code actually evaluates.
 -/
 theorem recall_no_loss {Msg : Type} (fps : File → Msg → Prop) (KEPT : FSet File) (A : File)
+    [∀ m, Decidable (∃ b, KEPT b ∧ fps b m)]
     (hempty : ∀ m, ¬ missing fps KEPT A m) :
     preserved fps KEPT A := by
   intro m hm
-  -- mathlib-free classical case-split (no `by_contra` tactic in core).
-  rcases Classical.em (∃ b, KEPT b ∧ fps b m) with h | h
-  · exact h
-  · exact absurd ⟨hm, h⟩ (hempty m)
+  -- Decidable (not classical) case-split on the kept-union membership the code computes.
+  cases (inferInstance : Decidable (∃ b, KEPT b ∧ fps b m)) with
+  | isTrue h  => exact h
+  | isFalse h => exact absurd ⟨hm, h⟩ (hempty m)
 
 end Orphan
