@@ -176,7 +176,12 @@ destination (create later).
 
 ## Step 2 - build a deterministic session_map (scripted, NOT delegated to an LLM)
 
-This pass decides what is safe to move, so it must be exact. Gotchas confirmed in practice:
+This pass decides what is safe to move, so it must be exact. **It is an LLM-orchestrated procedure, not a
+turnkey script:** the Python below computes the *structural* sets (fingerprints, the lpu DAG, the
+keep-locked closure) deterministically, while the capitalized stubs (`judge`, `ARCHIVE`, `SONNET_CONFIRM`,
+`HALT`, `confirm_no_live_or_HALT`, `nominate_debris`, `report_unsatisfiable_phantoms`) are the points where
+the orchestrating model reads content and the user confirms - you wire them to your read / move / stop
+steps (see the note after the code). It will NOT run as-is, by design. Gotchas confirmed in practice:
 
 - `jq` is sometimes a broken snap. Use `python3`.
 - Files start with large `file-history-snapshot` records (most of the bytes). Skip them: `if '"file-history-snapshot"' in line[:80]: continue`.
@@ -210,13 +215,17 @@ def norm(ts):
             dt=datetime.datetime.fromisoformat(str(ts).replace("Z","+00:00"))
             if dt.tzinfo: dt=dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
         return dt.isoformat()
-    except: return ""   # unparseable -> "" sorts FIRST/earliest, i.e. treated as oldest: it won't win the recency tiebreak (the safe default)
+    except Exception: return ""   # unparseable -> "" sorts FIRST/earliest, i.e. treated as oldest: it won't win the recency tiebreak (the safe default). NOT a bare `except` (would swallow KeyboardInterrupt).
 
 fps={}; fps_prose={}; ftext={}; owned={}; lref={}; bnd={}; nmsg={}; lts={}; firstmsg={}; global_uuid=defaultdict(set)
-files=sorted(glob.glob("*.jsonl"))
-# exact set-difference is the whole safety model, so a shared 8-char f8 prefix would silently overwrite
-# one file's sets with another's. Guard it (switch to full-uuid keys if it ever fires):
-assert len({f8(p) for p in files})==len(files), "8-char uuid-prefix collision; key on full uuid"
+# STORE = the slug dir CONFIRMED in Step 1 (do NOT rely on the current working directory): glob THERE.
+STORE=os.path.expanduser("~/.claude/projects/<slug>")   # e.g. ".../-home-you-proj"; full paths flow through below
+files=sorted(glob.glob(os.path.join(STORE,"*.jsonl")))
+# exact set-difference is the whole safety model, so a shared 8-char f8 prefix would silently overwrite one
+# file's sets with another's. A bare `assert` is stripped under `python -O`, and this is a data-safety guard,
+# so raise explicitly (if it ever fires, key the internal sets on the full uuid, not the 8-char prefix):
+if len({f8(p) for p in files}) != len(files):
+    raise RuntimeError("8-char uuid-prefix collision in the store; key internal sets on the full uuid")
 for p in files:
     k=f8(p); F=[]; Fp=[]; us=set(); L=set(); B=[]; last=""; n=0; fu=""
     for line in open(p,encoding="utf-8",errors="replace"):
@@ -280,33 +289,46 @@ for k in fps: trees[find(k)].append(k)
 
 # canonical: most DISTINCT content, recency as tiebreak, among non-debris (content floor)
 DEBRIS_MAX=11
-def is_debris(k): return nmsg[k] <= DEBRIS_MAX
+# DISTINCT count (len(set)), not raw len(F)=nmsg: a rewound/replayed fork-test inflates the raw count past
+# the floor, but DISTINCT content is what the floor is about (the doc's own distinct-vs-raw discipline).
+def is_debris(k): return len(set(fps[k])) <= DEBRIS_MAX
 def canonical(ks):
     cand=[k for k in ks if not is_debris(k)] or ks
-    return max(cand, key=lambda k:(len(set(fps[k])), lts[k]))
+    # final `, k` tiebreak: when distinct-count AND last-ts tie (e.g. byte-identical duplicate forks),
+    # pick the lexically-first filename - deterministic, instead of max()'s accidental dict-insertion order.
+    return max(cand, key=lambda k:(len(set(fps[k])), lts[k], k))
 
 # keep-locked closure: seed (canonicals + live) + transitive load-bearing over BOTH edge types.
 # AUTHORITATIVE never-touch: live sessionIds from ~/.claude/sessions/*.json (Step 0). NO mtime term -
 # recent-mtime is NOT a liveness signal (opening a chat to inspect it bumps its mtime; the registry,
 # not mtime, says what is live). Consult status AND liveness: a crashed process can leave a stale
 # <pid>.json with status "running", so drop the dead (os.kill below) - over-protection is benign.
-live=set()
+live=set(); registry_unreadable=False
 for sp in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
     try:
         d=json.load(open(sp))
-    except (OSError, ValueError):                       # unreadable/malformed registry file -> skip THIS entry
-        continue
+    except (OSError, ValueError):
+        registry_unreadable=True; continue   # a CORRUPT <pid>.json may HIDE a running session -> HALT after
+                                              # the loop, never silently skip (the prose promises STOP-on-unreadable)
     if d.get("status")!="running": continue             # not live per the registry's own field
+    # os.kill(pid,0) proves the PID is OCCUPIED, not that it is YOUR session (PIDs get reused). That only ever
+    # OVER-protects (a reused-PID stale entry is kept), never under-protects, so it is safe in this direction.
     try: os.kill(int(d["pid"]),0)                        # ProcessLookupError => process gone => stale entry
     except (ProcessLookupError, ValueError, KeyError): continue   # (own-user sessions never raise EPERM)
     sid=d.get("sessionId","")[:8]
-    # OUTSIDE any try, so a raising HALT is NEVER swallowed: resolve the live sessionId to an actual file.
-    # fps keys are filename[:8], equal to sid only if the file is named <sessionId>.jsonl (a forked live
-    # session is the case Step 0 warns about). A running session with no file STOPS the run, never skips.
+    # The registry is GLOBAL (every running Claude process, all projects). A session running in ANOTHER
+    # project has no file in THIS store, so `sid not in fps` does NOT by itself mean an inconsistency.
+    # OUTSIDE any try, so a raising HALT is NEVER swallowed:
     if sid not in fps:
-        HALT(f"live session {sid} from the registry has no file in this store - resolve before "
-             f"proceeding; do NOT guess which file is live")
+        # Could be (a) a session in a different project (safe to skip) or (b) a this-project session whose
+        # file is genuinely missing (a real inconsistency). Do NOT auto-skip on a cwd guess - a worktree maps
+        # to a different cwd yet a SHARED store (Step 1) - so STOP and let the operator decide from the cwd:
+        HALT(f"running session {sid} (cwd {d.get('cwd')!r}) has no <{sid}>.jsonl in this store. If its cwd is "
+             f"a DIFFERENT project, skip it; if THIS project, resolve before proceeding - never guess.")
     live.add(sid)
+if registry_unreadable:
+    HALT("a file under ~/.claude/sessions failed to parse - a running session may be hidden by it; resolve "
+         "before proceeding, do not run on a partial live set")
 if not live:
     # A READABLE registry with nothing running is a valid empty live set: proceed with live={} after the
     # operator confirms nothing is running. A MISSING/UNREADABLE registry is a HARD STOP. Either way,
@@ -383,6 +405,13 @@ loadbearing |= {s for s in fps if sources(s) & needed}                          
 # loadbearing (ALL sources of a needed phantom) >= the ONE richest source the closure locks; the
 # redundant extra sources stay archivable.
 
+# `loadbearing`/`needed` are computed ONCE, ABOVE, and deliberately NOT recomputed after this C5 demotion.
+# Recomputing would strand a demoted fork's now-unneeded source as `~0-residue AND NOT loadbearing AND in
+# KEPT` - reintroducing the exact marker-tree hole C5 exists to close. The stale (pre-C5) value only ever
+# OVER-marks such a source `[scroll-dep]` (keep), the safe direction. (And C5 removes only 0-residue files,
+# which contribute no unique message, so later residues only GROW: a C5 survivor still has nonzero residue
+# against the final KEPT, so the static `residue` model stays faithful for survivors.)
+#
 # A fork auto-kept on TREE-LOCAL uniqueness can be GLOBALLY redundant (its tree-unique content duplicated
 # in another tree's kept file). Re-measure vs the full kept set: a kept-unique fork with EXACTLY 0 global
 # residue that backs nothing had incomplete info -> drop it to the recall pass (which archives 0-unique
@@ -398,7 +427,8 @@ for k in sorted(tree_archive_candidates - KEPT):
     # ANOTHER kept source - NOT `sources(k) & needed == set()` (a redundant EXTRA source legitimately
     # sources a needed phantom yet is archivable). The right check: no phantom is left sourceless.
     for P in (sources(k) & needed):
-        assert any(P in sources(s) for s in KEPT if s!=k), f"archiving {k} would orphan phantom {P}"
+        if not any(P in sources(s) for s in KEPT if s!=k):   # raise, not assert: a data-safety guard must
+            raise RuntimeError(f"archiving {k} would orphan phantom {P}")   # not be elidable by `python -O`
     ARCHIVE(k, "redundant fork; unique content judged worthless after a verbatim read")
 
 # MARK every retained file that is NOT a canonical and NOT live - ONE decision, the markers below.
@@ -409,6 +439,8 @@ for k in sorted(tree_archive_candidates - KEPT):
 # ever archived - all are in KEPT; load-bearing protects from MOVING, the loop only titles.)
 for k in sorted(KEPT - canonicals - live):
     head=max(canonicals, key=lambda h: len(set(fps_prose[k]) & set(fps_prose[h])), default=None)
+    # head is None only in a degenerate store with NO canonicals; then ov=0.0 routes to the low-ov branch
+    # ([main]/none, no parent named), so the [fork]-of-head branch is never reached with head=None.
     ov=(len(set(fps_prose[k]) & set(fps_prose[head]))/max(1,len(set(fps_prose[k])))) if head else 0.0
     residue=set(fps[k]) - set().union(*(set(fps[j]) for j in KEPT if j!=k))   # RAW residue, then READ it
     # 1) load-bearing AND ~0 residue -> [scroll-dep] of the canonical it backs, REGARDLESS of ov: a pure
@@ -454,6 +486,13 @@ for A in [a for a in fps if a not in KEPT and a not in live]:
     # (the single-container test `len(fps[b])>=len(fps[A])` had exactly that recall hole).
     missing = set(fps[A]) - kept_union
     best = min(KEPT, key=lambda b: len(set(fps[A])-keptset[b]), default=None)  # closest single file, for the doc only
+    # SAFETY backstop, same shape as the C6 guard: content-redundancy and phantom-source status are
+    # INDEPENDENT axes, so before archiving A confirm every phantom A sources that a kept file needs still
+    # has a kept source. Safe by construction (the re-close locks a needed SOLE source into KEPT, so a recall
+    # candidate is at most a REDUNDANT extra source), but both archive paths must enforce the same invariant.
+    for P in (sources(A) & needed):
+        if not any(P in sources(s) for s in KEPT):   # A is not in KEPT, so any kept source suffices
+            raise RuntimeError(f"archiving {A} would orphan phantom {P} - recall-pass orphan guard")
     if not missing:                       # 0 unique vs the kept set: PROVEN redundant (every msg lives somewhere kept)
         ARCHIVE(A, f"0 unique vs the kept set as a whole (split-contained; closest single file {best}, which need not individually contain A)")
     elif len(missing) < CEILING:          # JUDGMENT ZONE
@@ -494,7 +533,7 @@ for ks in trees.values():
     k=ks[0]
     if k in locked or k in live: continue
     fu=firstmsg.get(k,"")        # first plain user message, captured in Step 2's pass above
-    if nmsg[k] <= DEBRIS_MAX and (not fu or fu.lstrip().startswith(("/","cd ")) or is_boilerplate(fu)):
+    if is_debris(k) and (not fu or fu.lstrip().startswith(("/","cd ")) or is_boilerplate(fu)):   # distinct-count floor (see is_debris)
         nominate_debris(k)       # route to a debris/ theme; still shown in the user gate before moving
 ```
 
@@ -566,7 +605,17 @@ authority - consult it again at mutation time; never substitute an mtime guess.
 0.  **Backup precondition (checked gate, not just a principle).** Before the *first* mutation in the whole run - this move, or Step 7's titling/equalisation, whichever you reach first - confirm a current out-of-tree backup exists OR the `SessionStart` backup hook has fired this session. Do not proceed past this line otherwise. This is the gap that bites in practice: equalising or moving before any backup exists means the first slip has no recovery point.
 1.  Aggregate the keep/archive list. **Show the user the full list (forks + every debris file, with unique-msg counts) and get explicit go/no-go before moving anything.**
 2.  Create `~/claude-archive/<theme>/` dirs (agents already wrote the READMEs there).
-3.  `mv` each confirmed file into its theme dir, preserving the uuid filename. Write `~/claude-archive/manifest.json`: archived-file -> original-path -> theme -> canonical -> reason (enough to restore with one command).
+3.  `mv` each confirmed file into its theme dir, preserving the uuid filename. Write `~/claude-archive/manifest.json` as a list of `{archived, original, theme, canonical, reason}` records, e.g.:
+
+    ```json
+    [{"archived":"~/claude-archive/2110-rework/9b5c....jsonl","original":"~/.claude/projects/<slug>/9b5c....jsonl","theme":"2110-rework","canonical":"a1b2....jsonl","reason":"0 unique vs the kept set"}]
+    ```
+
+    so one command restores everything (move each record's `archived` back to its `original`):
+
+    ```bash
+    python3 -c 'import json,shutil,os; [shutil.move(os.path.expanduser(r["archived"]), os.path.expanduser(r["original"])) for r in json.load(open(os.path.expanduser("~/claude-archive/manifest.json")))]'
+    ```
 4.  **Post-move verification (hard gate):** re-scan the project dir; for every kept file - canonical OR retained fork, since a kept fork can need a phantom too - confirm (a) all its cross-file lpu targets still resolve in the project dir, and (b) every phantom it needs still has a kept backfill source. **Recompute `needs()` / `sources()` VERBATIM (Step 2's definitions) over the POST-move file set** - the pre-move maps are stale, and a re-derived approximation (e.g. `par is not None` without the `nb>0` half) gives false orphan flags. Zero orphans on both. Confirm `total - moved` files remain and no live/registry session was touched.
 
 **Operational / low-value but distinct sessions** (skill re-runs, toy experiments, one-off
@@ -633,7 +682,7 @@ append for dormant files.
 - **Titles are append-only, dormant-only, and mtime-neutral.** Never file-edit a live session's title (it flips back via Patch F); rename live sessions in-app. After appending a `custom-title`, restore the file's *own prior* mtime (captured before the append) - the picker is recency-sorted, and bumping mtime to now destroys the chronological list. Writing a *computed* last-activity mtime (equalisation) is opt-in: user authorisation + sweep disabled, never the default.
 - **Agents are read-only on session JSONLs;** only the orchestrator moves files, only after the user gate and the post-move orphan + phantom re-scan.
 - Working artifacts and the manifest live under `~/claude-archive/`, never in the project's JSONL dir (the extension globs `*.jsonl`, so a `.json`/`.md` there is ignored, but keep it clean anyway).
-- **Back up the whole project dir to a separate device before any destructive step.** A move is only as recoverable as the archived copies + manifest, and the retention sweep plus mtime fragility can still delete *kept* files out from under you - including via the setting-sources bypass (STOP section), which ignores `cleanupPeriodDays` entirely and which this skill's own subagents can trigger mid-run. In a real run 11 kept sessions were deleted mid-cleanup and were recoverable only because an out-of-tree backup (`~/claude_archive`, a separate disk) happened to exist. Do not rely on the manifest, or on `cleanupPeriodDays`, alone; the `SessionStart` backup hook (STOP section) is the durable guard.
+- **Back up the whole project dir to a separate device before any destructive step.** A move is only as recoverable as the archived copies + manifest, and the retention sweep plus mtime fragility can still delete *kept* files out from under you - including via the setting-sources bypass (STOP section), which ignores `cleanupPeriodDays` entirely and which this skill's own subagents can trigger mid-run. In a real run 11 kept sessions were deleted mid-cleanup and were recoverable only because an out-of-tree backup on a separate disk happened to exist. Do not rely on the manifest, or on `cleanupPeriodDays`, alone; the `SessionStart` backup hook (STOP section) is the durable guard.
 
 ## Knobs
 
@@ -644,9 +693,9 @@ append for dormant files.
 
 These are the choices a reader is most likely to second-guess; the body specifies the mechanics.
 
-- **Phantom protection retains one backfill *source* per needed phantom, not every phantom referencer.** Locking every file that references a needed phantom lpu also locks byte-identical duplicate forks (rooted at the phantom boundary, no in-file pre-content) and guts the cleanup. `locked_closure` keeps the richest origin-bearing source instead.
+- **Phantom protection retains one backfill *source* per needed phantom, not every phantom referencer.** Locking every file that references a needed phantom lpu also locks byte-identical duplicate forks (rooted at the phantom boundary, no in-file pre-content) and guts the cleanup. `locked_closure` keeps **one** origin-bearing source per needed phantom instead - the richest when it must choose fresh, but an already-locked source (e.g. one pulled in by a cross-file edge) satisfies the requirement without adding another, so the kept source is "some source", not necessarily the richest.
 
-- **The keep-lock closure is re-run over the FULL kept set, not just the seed.** A fork kept for its own unique content can itself need a phantom whose only backfill source is content-redundant; the seed closure (canonicals + live) never walks that fork's needs, so a one-pass closure would archive the source and orphan the fork. Re-closing over `KEPT` (`locked = locked_closure(KEPT); KEPT |= locked`) folds every kept file's needs back in, so no kept file's needed phantom is ever left without a kept source.
+- **The keep-lock closure is re-run over the FULL kept set, not just the seed.** A fork kept for its own unique content can itself need a phantom whose only backfill source is content-redundant; the seed closure (canonicals + live) never walks that fork's needs, so a one-pass closure would archive the source and orphan the fork. Re-closing over `KEPT` (`locked = locked_closure(KEPT); KEPT |= locked`) folds every kept file's needs back in, so no kept file's needed phantom is ever left without a kept source. This no-orphan invariant is mechanically proved in `proofs/` (a constructive, axiom-free Lean 4 development; see `proofs/README.md` for exactly what is and isn't covered).
 
 - **The registry is the sole liveness signal; there is no mtime fallback.** `~/.claude/sessions/*.json` lists one entry per running process, so a running session is always registered; the documented near-miss was an agent *not reading* the registry, never the registry omitting a session. recent-mtime added only noise (inspecting an old chat bumps its mtime), so it is gone. The Step-0 read plus a Step-6 mutation-time re-read make the registry authoritative end to end, narrowing any snapshot-staleness to the instant of the move.
 
