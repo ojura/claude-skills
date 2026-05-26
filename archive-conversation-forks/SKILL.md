@@ -270,7 +270,11 @@ def needs(k):     # phantom lpus this file relies on a sibling for (boundary at 
 # re-derive a quick approximation. A file is a source if it has ANY pre-content before its phantom
 # boundary: `par is not None OR nb>0`. The lazy `par is not None`-only form (dropping the nb>0 half)
 # was reimplemented loosely TWICE in a real run and produced false orphan flags both times. The
-# precise predicate is cheap; the approximation is the bug.
+# precise predicate is cheap; the approximation is the bug. The Lean proof (proofs/) ASSUMES these
+# predicates are computed correctly - it does NOT cover this par/nb layer (that is the model-to-code
+# boundary, fuzz-checked only). So the proof cannot protect a hand-rolled or eyeballed orphan check, and
+# this layer is exactly where it has been miswritten before: run THIS committed set-difference, never a
+# re-derived one, and do not let the proof's existence tempt the shortcut.
 
 # union-find trees: link files sharing an lpu value, or a cross-file dep edge
 parent={k:k for k in fps}
