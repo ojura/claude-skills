@@ -118,6 +118,26 @@ The marker theorems are wired the same way: `marker_no_hole_wired` and `live_sub
 decomposition, `closure ⊆ consumers`, `hpick`, and `live`/`kuf` disjointness - each a code fact -
 so nothing about loadbearing/demoted is assumed at the marker layer either. Both are axiom-free.
 
+**`Boundary.*` (the par/nb reconstruction of `needs` / `sources`, promoted from opaque to defined).**
+In `Orphan.lean` / `Fixpoint.lean` the relations `needs` / `sources : File → Phantom → Prop` are
+opaque `variable`s, so the structural theorems hold for *any* needs/sources. `Boundary.lean` does the
+same move `Fixpoint.lean` does for `loadbearing` / `demoted`, one layer deeper: it DEFINES them as the
+committed set-builder over each file's `compact_boundary` records `(lpu, par, nb)` (`sourcesOf` /
+`needsOf`, SKILL.md `sources(k)` / `needs(k)` verbatim). The payoff is the par/nb CLASSIFICATION - the
+single place this code has been miswritten before (the `par is not None`-only form that dropped the
+`nb>0` half, turning a backfill SOURCE into a NEEDER, the orphan-causing direction). Proved: the
+per-record source/need test is a TOTAL, MUTUALLY-EXCLUSIVE partition (`rec_excl` / `rec_total` /
+`rec_iff`: a need is the EXACT negation of a source), with the mechanical 2-bit core closed by `decide`
+(`bit_partition`, the same technique as `classify_exhaustive`); and the historical bug is exhibited as
+a machine-checked DIVERGENCE (`lazy_flips_source_to_need`: on a null-parent-but-real-pre-content record
+the committed test says SOURCE while the lazy par-only test says NEED). `no_orphan_from_closed_bnd`
+restates the unconditional no-orphan over the DEFINED relations - instantiation, since the algebra was
+always generic over needs/sources - so the guarantee lands on the relations the skill actually
+computes, not on opaque stand-ins. All `Boundary` results are **fully axiom-free**. SCOPE: this proves
+the LOGIC of needs/sources GIVEN the `(lpu, par, nb)` records; the JSONL→records parse stays
+fuzz-checked (see Honest scope), so the gap on needs/sources shrinks from "all of the par/nb layer" to
+"only the triple extraction".
+
 **`TermList.*` (`IsClosed` is achievable, with the oracle constructed).** `closed_superset_exists`
 proves that over a finite universe a closed `locked ⊇ seed` exists, so `IsClosed` - the one fact
 `hpick` rested on - is discharged rather than assumed. This is the committed loop's termination: each
@@ -136,7 +156,9 @@ Properties of the proofs:
   trusted-core axioms. `no_orphan` and its structural lemmas (`closure_closed_under_needs`,
   `final_closed_under_needs`, `source_survives_C5`, `kept0_subset_final`, `nonseed_loadbearing`,
   `live_subset_keptC5`), the recall and marker theorems (`recall_no_loss`, `marker_no_hole`), the
-  union-find lemmas (`needer_source_coTree`, `noEdges_sameTree_eq`), and all four `FixProto` results
+  union-find lemmas (`needer_source_coTree`, `noEdges_sameTree_eq`), all four `FixProto` results, and
+  every `Boundary` result (`rec_excl` / `rec_total` / `rec_iff`, `bit_partition`,
+  `lazy_flips_source_to_need`, `no_orphan_from_closed_bnd`)
   report *does not depend on any axioms*. `recall_no_loss` stays constructive by case-splitting on
   the kept-union membership as a `Decidable` instance (the faithful counterpart of the code's set
   `in`, not `Classical.em`); `marker_no_hole` by a direct `cases` on the closure derivation. The
@@ -145,9 +167,11 @@ Properties of the proofs:
   trusted core. None lists `Classical.choice`, `sorryAx`, or `Lean.ofReduceBool`: no `sorry`, no
   `native_decide`, no mathlib.
 - **All judge policies, all stores.** Files, fingerprints, `needs`, `sources`, and the
-  cross-file edge are opaque; the operator's per-fork keep/archive judgment enters only as
-  the abstract seed set, so each theorem covers every possible judge outcome and every store
-  shape at once. This is strictly stronger than the property-based fuzz the skill was also
+  cross-file edge are opaque in the structural theorems; the operator's per-fork keep/archive judgment
+  enters only as the abstract seed set, so each theorem covers every possible judge outcome and every
+  store shape at once. (`Boundary.lean` *additionally* pins `needs` / `sources` to their committed
+  boundary set-builder and feeds that defined instance back through the same theorems - extra coverage,
+  not a loss of generality.) This is strictly stronger than the property-based fuzz the skill was also
   checked against, which only samples judge outcomes.
 - **Non-vacuous.** `Check.lean` instantiates each theorem on a concrete store where its
   precondition genuinely holds (a kept file that needs a sourced phantom; a 0-unique recall
@@ -201,21 +225,28 @@ safety on the judged archive paths**: `recall_no_loss` proves it for the 0-uniqu
 the C6 judged-worthless and nonzero-`SONNET_CONFIRM` paths rest on the operator / Sonnet read (see
 the content-safety scope note above) - "worthless residue" is not a math predicate. (b) The
 **model-to-Python boundary** (genuinely irreducible for a model-level proof): whether the Python
-computes what the abstract relations (`cross`, `needs`, `sources`, the fingerprints, the key scalars)
-say - the JSONL parse, the actual mutable union-find, the real `canonical()` key computation, the
-loop body - checked by the property-based fuzz. Concretely, what stays out of model:
+computes what the abstract relations (`cross`, the fingerprints, the key scalars) and the
+`needs`/`sources` boundary records say - the JSONL parse, the actual mutable union-find, the real
+`canonical()` key computation, the loop body - checked by the property-based fuzz. Concretely, what
+stays out of model:
 
-A specific, operator-facing instance of (b) worth calling out: `needs` and `sources` are **opaque
-relations** in the proof (`variable (needs sources : File -> Phantom -> Prop)`), so the `par`/`nb`
-boundary logic that *computes* them - `sources(k) = {lp for (lp,par,nb) in bnd[k] if lp in phantom and
-(par is not None or nb>0)}` - is entirely below the proof and fuzz-checked only. The practical
-consequence: **the proof cannot protect a hand-rolled or eyeballed orphan check.** It certifies the
-algebra *given* `needs` / `sources`; an operator who re-derives or eyeballs those predicates instead
-of running the committed set-difference has stepped outside everything the proof guarantees - and that
-par/nb layer is exactly where the code has been miswritten before (the `par is not None`-only
-approximation that dropped the `nb>0` half). Run the committed predicate, never a re-derived one; do
-not let this proof's existence tempt the shortcut. (Mirrors the `sources()`/`needs()` DISCIPLINE note
-in `../SKILL.md`.)
+A specific, operator-facing instance of (b), now NARROWED by `Boundary.lean`. `needs` / `sources`
+USED to be fully opaque relations (`variable (needs sources : File -> Phantom -> Prop)`), so the
+par/nb logic that *computes* them was entirely below the proof. `Boundary.lean` now DEFINES them as
+the committed set-builder - `sourcesOf` / `needsOf` over the `(lpu, par, nb)` records, `sources(k) =
+{lp for (lp,par,nb) in bnd[k] if lp in phantom and (par is not None or nb>0)}` verbatim - and
+machine-checks the classification: the per-record source/need partition (`rec_iff`: a need is the
+EXACT negation of a source) and the `par is not None`-only bug as a checked divergence
+(`lazy_flips_source_to_need`). So the par/nb LOGIC, precisely where the code has been miswritten
+before (the lazy form that dropped the `nb>0` half), is **no longer fuzz-only - it is proved**. What
+remains fuzz-checked is strictly the JSONL→records EXTRACTION: that `bnd[k]` really holds this file's
+`(logicalParentUuid, parentUuid-is-present, msgs-before)` triples. The practical consequence is
+unchanged and still load-bearing: **the proof certifies the committed set-builder, not a re-derived
+approximation.** The theorems are about `sourcesOf` / `needsOf` AS WRITTEN; an operator who eyeballs or
+hand-rolls the orphan check instead of running the committed definition steps outside what is proved,
+and `lazy_flips_source_to_need` is exactly the proof that the shortcut diverges (a source read as a
+need). Run the committed predicate, never a re-derived one; do not let this proof's existence tempt
+the shortcut. (Mirrors the `sources()`/`needs()` DISCIPLINE note in `../SKILL.md`.)
 
 - After `Fixpoint.lean` and `Termination.lean`, the bridge facts are all *derived*, not assumed.
   `source_lb`, `cross_lb`, `phan_lb`, `demoted_guard`, `live_not_demoted`, and `C5_survivor` all
@@ -291,6 +322,7 @@ in `../SKILL.md`.)
 - `Markers.lean` - the closure-inversion lemma, `live_subset_keptC5`, `marker_no_hole`, the wired capstones, and the marker classification (`classify` + total/exclusive/exhaustive lemmas).
 - `Family.lean` - union-find as an equivalence (co-tree and false-family lemmas), `canonical()` membership + floor + max-key selection (`Family.Canon`, core lex order), and `find` path-compression correctness (`Family.Compress`).
 - `Fixpoint.lean` - `IsClosed`, the seven bridge facts derived (`hpick_from_closed`, `source_lb_from_def`, `cross_lb_from_def`, `demoted_guard_from_def`, `live_not_demoted_from_def`, `C5_survivor_from_def`), and `no_orphan_from_closed`.
+- `Boundary.lean` - the par/nb layer: `needs` / `sources` DEFINED as the committed set-builder over `(lpu, par, nb)` records (`sourcesOf` / `needsOf`), the per-record source/need partition (`rec_excl` / `rec_total` / `rec_iff`, 2-bit cube `bit_partition`), the `par is not None`-only bug as a checked divergence (`lazy_flips_source_to_need`), and `no_orphan_from_closed_bnd` (the unconditional no-orphan over the defined relations). Axiom-free.
 - `Termination.lean` - `gap_lt` + `closed_superset_exists` (a closed set exists over a finite universe, discharging `IsClosed`), and the constructed loop-body oracle (`expand` / `closed_of_none` / `closed_superset_exists_constructed`). Core Lean, hand-rolled (no mathlib).
 - `Check.lean` - the axiom audit (`#print axioms`) and concrete non-vacuity models for all theorems.
 - `lakefile.toml`, `lean-toolchain` - build configuration (Lean 4.10.0, no dependencies).

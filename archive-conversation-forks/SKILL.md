@@ -270,11 +270,14 @@ def needs(k):     # phantom lpus this file relies on a sibling for (boundary at 
 # re-derive a quick approximation. A file is a source if it has ANY pre-content before its phantom
 # boundary: `par is not None OR nb>0`. The lazy `par is not None`-only form (dropping the nb>0 half)
 # was reimplemented loosely TWICE in a real run and produced false orphan flags both times. The
-# precise predicate is cheap; the approximation is the bug. The Lean proof (proofs/) ASSUMES these
-# predicates are computed correctly - it does NOT cover this par/nb layer (that is the model-to-code
-# boundary, fuzz-checked only). So the proof cannot protect a hand-rolled or eyeballed orphan check, and
-# this layer is exactly where it has been miswritten before: run THIS committed set-difference, never a
-# re-derived one, and do not let the proof's existence tempt the shortcut.
+# precise predicate is cheap; the approximation is the bug. The Lean proof now DEFINES these predicates
+# (proofs/Boundary.lean: `sourcesOf`/`needsOf` over the (lpu,par,nb) records) and MACHINE-CHECKS the
+# par/nb classification - the per-record source/need partition (`rec_iff`) and THIS bug as a checked
+# divergence (`lazy_flips_source_to_need`: a null-parent-but-nb>0 record is a SOURCE under the committed
+# test, a NEED under the lazy one). It proves the par/nb LOGIC given the records; only the JSONL->records
+# extraction stays fuzz-checked. So the proof certifies THIS committed set-builder, not a re-derived
+# approximation: run it VERBATIM, never an eyeballed orphan check - the proof literally shows the lazy
+# shortcut diverges, but only protects you if you actually run the committed definition.
 
 # union-find trees: link files sharing an lpu value, or a cross-file dep edge
 parent={k:k for k in fps}

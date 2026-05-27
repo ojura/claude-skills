@@ -2,6 +2,7 @@ import Orphan
 import Markers
 import Family
 import Fixpoint
+import Boundary
 import Termination
 open Orphan
 
@@ -399,3 +400,55 @@ theorem concrete_termination_constructed :
   TermList.closed_superset_exists_constructed crossT needsT srcT [f0] [] []
 
 #print axioms concrete_termination_constructed
+
+/- VERIFY-OUTCOME 10: the par/nb BOUNDARY layer (Boundary.lean). `needs`/`sources` are no longer
+   opaque - they are the committed set-builder over `(lpu, par, nb)` records. Audited here:
+   (a) the per-record classification is a TOTAL, MUTUALLY-EXCLUSIVE partition (rec_excl/total/iff) with
+       the 2-bit cube closed by `decide` (bit_partition), and the `par is not None`-only bug is a
+       CHECKED divergence (lazy_flips_source_to_need) - all axiom-free;
+   (b) a concrete boundary store feeds the DEFINED relations through the unconditional no-orphan, with
+       the surviving source being a record the par-only bug would have DROPPED (parPresent=false, nb>0). -/
+#print axioms Boundary.rec_excl
+#print axioms Boundary.rec_total
+#print axioms Boundary.rec_iff
+#print axioms Boundary.bit_partition
+#print axioms Boundary.lazy_flips_source_to_need
+#print axioms Boundary.no_orphan_from_closed_bnd
+
+-- f0 has a ROOT phantom boundary for p0 (-> needsOf); f1 has a phantom boundary with pre-content via
+-- nb>0 (-> sourcesOf) - the SAME record shape (null parent, real pre-content) the lazy par-only test drops.
+def bndB : Fil → List (Boundary.Bdy Pha)
+  | f0 => [⟨p0, false, 0⟩]     -- root: parPresent=false, nb=0  -> NeedRec
+  | f1 => [⟨p0, false, 3⟩]     -- pre-content via nb=3>0        -> SourceRec (null parent: bug-relevant)
+def phantomB : Pha → Prop := fun _ => True
+
+theorem f0_needsB : Boundary.needsOf phantomB bndB f0 p0 :=
+  ⟨⟨p0, false, 0⟩, List.mem_cons_self _ _, rfl, trivial, rfl, rfl⟩
+theorem f1_sourcesB : Boundary.sourcesOf phantomB bndB f1 p0 :=
+  ⟨⟨p0, false, 3⟩, List.mem_cons_self _ _, rfl, trivial, Or.inr (by decide)⟩
+
+def crossB : Fil → Fil → Prop := fun _ _ => False
+def lockedB : FSet Fil := fun _ => True
+def kufB : FSet Fil := fun _ => False
+def consumersB : FSet Fil := fun _ => True
+def residueB : FSet Fil := fun _ => True
+
+-- IsClosed for the boundary-DEFINED relations: no cross edges; any needed phantom with a source keeps
+-- that source locked (everything is locked here, so the given source already works).
+theorem lockedB_closed :
+    FixProto.IsClosed crossB (Boundary.needsOf phantomB bndB) (Boundary.sourcesOf phantomB bndB) lockedB where
+  cross_closed := fun _ _ _ e => e.elim
+  phan_closed  := fun _ _ _ _ hsrc => by obtain ⟨s, hs⟩ := hsrc; exact ⟨s, trivial, hs⟩
+
+-- Instantiate the unconditional no-orphan over the par/nb relations. The witness is f1, retained -
+-- and f1 sources p0 via a (parPresent=false, nb=3) record, the exact one a `par is not None`-only
+-- check would have dropped. So the proof keeps precisely the source the historical bug orphaned.
+theorem concrete_no_orphan_from_closed_bnd :
+    ∃ s, (lockedB s ∧ ¬ FixProto.demoted (Boundary.needsOf phantomB bndB)
+            (Boundary.sourcesOf phantomB bndB) crossB kufB consumersB residueB s)
+         ∧ Boundary.sourcesOf phantomB bndB s p0 := by
+  refine Boundary.no_orphan_from_closed_bnd phantomB bndB crossB lockedB_closed (fun _ _ => trivial)
+    (f := f0) (P := p0) ⟨trivial, ?_⟩ f0_needsB ⟨f1, f1_sourcesB⟩
+  intro hd; exact hd.1     -- ¬ demoted f0: demoted needs kufB f0 = False
+
+#print axioms concrete_no_orphan_from_closed_bnd
