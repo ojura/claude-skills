@@ -9,16 +9,26 @@ Endpoints:
                                                 → Runtime.evaluate
   POST /cdp           {method, [params], [sessionId]}  → arbitrary CDP method
   GET  /events?since=N&method=substr&limit=N   → buffered CDP events (Network.*, Runtime.*, etc.)
-  GET  /status                                 → daemon status (connected, pending, log_tail)
+  GET  /status                                 → daemon status (state, diag, connected, log_tail)
+  POST /reconnect                              → force a fresh connect attempt
   POST /shutdown                               → exit cleanly
 
-Start:  python3 ~/.local/bin/cdp_daemon.py & disown
-Test:   curl 127.0.0.1:7799/targets | jq
+Start:  python3 cdp_daemon.py & disown
+Test:   curl 127.0.0.1:7799/status | jq
 
-Depends on ~/.local/bin/clear_modals.py for the AT-SPI Allow press.
+Connection is self-complete and fails loudly: the HTTP API comes up FIRST, so
+/status is always answerable even while (re)connecting or after a failure. The
+connect path diagnoses *why* the auto-press can't click Chrome's "Allow remote
+debugging?" dialog (almost always: renderer accessibility is OFF, so the dialog
+is invisible to AT-SPI), tells the user exactly what to do, and keeps
+re-pressing + retrying so a manual Allow (or flipping on accessibility mid-wait)
+also lands. It never exits with a bare traceback.
+
+Depends on clear_modals.py (alongside) for the AT-SPI Allow press + the
+accessibility self-check.
 """
 import socket, struct, json, sys, subprocess, secrets, threading, time, collections, os
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST, PORT, PATH = "127.0.0.1", 43809, "/devtools/browser"
 DAEMON_PORT = 7799
@@ -27,7 +37,8 @@ PRESSER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clear_modals
 # === CDP connection (single global socket + lock) ===
 cdp_sock = None
 cdp_leftover = b""
-cdp_lock = threading.Lock()
+cdp_lock = threading.Lock()   # serializes socket writes
+id_lock = threading.Lock()    # serializes id allocation + pending registration (threaded HTTP)
 next_id = [0]
 pending = {}  # id -> threading.Event with .response attribute
 log_lines = []
@@ -37,6 +48,25 @@ events = collections.deque(maxlen=10000)
 events_lock = threading.Lock()
 event_seq = [0]
 
+# Connection state, surfaced via /status so a failed/odd connect is always
+# observable rather than a dead process with a bare traceback.
+cdp_state = "init"   # init|connecting|waiting_for_allow|connected|no_chrome|failed|disconnected
+cdp_diag = ""        # human-readable explanation of the current state
+disconnected = threading.Event()
+reconnect_now = threading.Event()
+
+# Pre-built WebSocket upgrade request to Chrome's browser-level DevTools endpoint.
+WS_REQ = (
+    f"GET {PATH} HTTP/1.1\r\n"
+    "Host: localhost\r\n"
+    "User-Agent: curl/8.5.0\r\n"
+    "Accept: */*\r\n"
+    "Connection: Upgrade\r\n"
+    "Upgrade: websocket\r\n"
+    "Sec-WebSocket-Version: 13\r\n"
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+).encode()
+
 
 def log(msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
@@ -45,46 +75,164 @@ def log(msg):
     if len(log_lines) > 500: log_lines.pop(0)
 
 
+def set_state(state, diag=""):
+    """Record connection state + a human diagnosis (surfaced via /status and logged)."""
+    global cdp_state, cdp_diag
+    cdp_state = state
+    if diag:
+        cdp_diag = diag
+        log(diag)
+
+
+# === Connect + Allow flow ===
 def press_allow_once():
-    """Spawn presser subprocess, returns the Popen object (caller waits/timeouts)."""
-    p = subprocess.Popen(["/usr/bin/python3", PRESSER, "--wait"],
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    return p
+    """Spawn the AT-SPI presser (clear_modals.py --wait). Returns the Popen."""
+    return subprocess.Popen(["/usr/bin/python3", PRESSER, "--wait"],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 
-def open_cdp():
+def accessibility_health():
+    """(chrome_found, renderer_a11y) via clear_modals, or (None, None) if unavailable.
+
+    Lets the daemon explain *why* the auto-press will fail up front instead of
+    silently waiting out a timeout."""
+    try:
+        sys.path.insert(0, os.path.dirname(PRESSER))
+        import clear_modals
+        return clear_modals.chrome_accessibility_health()
+    except Exception as e:
+        log(f"(accessibility self-check unavailable: {e})")
+        return (None, None)
+
+
+def ws_upgrade(timeout):
+    """One connect + WS-upgrade attempt to Chrome's /devtools/browser endpoint.
+
+    Returns one of:
+      ("ok", sock, leftover_bytes)  upgraded (101)
+      ("noport", errmsg)            devtools port unreachable (Chrome not up with the flag)
+      ("denied", statusline)        HTTP response that wasn't 101 (e.g. 403 = not allowed yet)
+      ("timeout", msg)              no response in time (Allow dialog up, not yet clicked)
+      ("error", msg)
+    """
+    try:
+        s = socket.create_connection((HOST, PORT), timeout=10)
+    except OSError as e:
+        return ("noport", str(e))
+    s.settimeout(timeout)
+    try:
+        s.sendall(WS_REQ)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            ch = s.recv(4096)
+            if not ch:
+                s.close()
+                return ("denied", "socket closed before headers")
+            buf += ch
+        status = buf.split(b"\r\n", 1)[0].decode()
+        if "101" in status:
+            return ("ok", s, buf[buf.find(b"\r\n\r\n") + 4:])
+        s.close()
+        return ("denied", status)
+    except socket.timeout:
+        s.close()
+        return ("timeout", "no response (Allow not granted yet)")
+    except Exception as e:
+        try: s.close()
+        except Exception: pass
+        return ("error", str(e))
+
+
+def connect_once(budget=150):
+    """Drive the connect + Allow flow to completion. Returns True if connected.
+
+    Self-complete: diagnoses an auto-press failure up front, keeps re-pressing and
+    retrying so a *manual* Allow (or enabling accessibility mid-wait) also lands,
+    and on giving up records a clear reason in /status instead of crashing."""
     global cdp_sock, cdp_leftover
+    set_state("connecting", "opening CDP...")
     presser = press_allow_once()
     log(f"presser pid={presser.pid}")
-    s = socket.create_connection((HOST, PORT), timeout=60)
-    key = "dGhlIHNhbXBsZSBub25jZQ=="
-    req = (
-        f"GET {PATH} HTTP/1.1\r\n"
-        "Host: localhost\r\n"
-        "User-Agent: curl/8.5.0\r\n"
-        "Accept: */*\r\n"
-        "Connection: Upgrade\r\n"
-        "Upgrade: websocket\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        f"Sec-WebSocket-Key: {key}\r\n\r\n"
-    ).encode()
-    s.sendall(req)
-    buf = b""
-    while b"\r\n\r\n" not in buf:
-        ch = s.recv(4096)
-        if not ch: raise RuntimeError("socket closed before headers")
-        buf += ch
-    status = buf.split(b"\r\n", 1)[0].decode()
-    if "101" not in status: raise RuntimeError(f"WS upgrade failed: {status}")
-    log(f"CDP connected ({status})")
-    try:
-        out, _ = presser.communicate(timeout=2)
-        if out: log(f"presser: {out.strip()[:200]}")
-    except Exception:
-        presser.terminate()
-    s.settimeout(None)
-    cdp_sock = s
-    cdp_leftover = buf[buf.find(b"\r\n\r\n") + 4:]
+
+    found, renderer = accessibility_health()
+    if found is False:
+        set_state("waiting_for_allow",
+                  "ACTION REQUIRED: Chrome is not visible via AT-SPI, so the 'Allow remote "
+                  "debugging?' dialog cannot be auto-clicked. Click Allow in Chrome manually.")
+    elif renderer is False:
+        set_state("waiting_for_allow",
+                  "ACTION REQUIRED: auto-press UNAVAILABLE - Chrome renderer accessibility is OFF, "
+                  "so the 'Allow remote debugging?' dialog is invisible to AT-SPI. FIX: click Allow "
+                  "in Chrome now, or enable 'Native accessibility API support' at "
+                  "chrome://accessibility (or relaunch with --force-renderer-accessibility). "
+                  "Retrying until allowed.")
+    elif renderer:
+        log("accessibility OK - auto-pressing Allow.")
+
+    deadline = time.time() + budget
+    next_press = time.time() + 15
+    last = None
+    while time.time() < deadline:
+        # Re-press periodically: if accessibility gets switched on mid-wait, the
+        # next presser run will click the dialog automatically.
+        if time.time() >= next_press:
+            if presser.poll() is not None:
+                presser = press_allow_once()
+            next_press = time.time() + 15
+
+        kind, *rest = ws_upgrade(timeout=min(20, max(2, deadline - time.time())))
+        if kind == "ok":
+            sock, leftover = rest
+            sock.settimeout(None)
+            cdp_sock, cdp_leftover = sock, leftover
+            try:
+                out, _ = presser.communicate(timeout=1)
+                if out: log(f"presser: {out.strip()[:200]}")
+            except Exception:
+                try: presser.terminate()
+                except Exception: pass
+            set_state("connected", "CDP connected.")
+            return True
+        if kind == "noport":
+            set_state("no_chrome",
+                      f"ALERT: cannot reach Chrome DevTools at {HOST}:{PORT} ({rest[0]}). "
+                      f"Launch Chrome with --remote-debugging-port={PORT}.")
+            time.sleep(3)
+            continue
+        msg = rest[0] if rest else kind
+        if msg != last:
+            last = msg
+            tail = "" if cdp_state == "waiting_for_allow" else " - click Allow if a dialog is shown"
+            log(f"not allowed yet ({kind}: {msg}){tail}")
+        time.sleep(2)
+
+    set_state("failed",
+              "ALERT: gave up after %ds - remote debugging was never allowed. The auto-presser "
+              "could not click Allow (likely renderer accessibility OFF) and no manual Allow was "
+              "detected. Enable accessibility or click Allow, then POST /reconnect (or just wait; "
+              "it keeps retrying)." % budget)
+    return False
+
+
+def connection_manager():
+    """Keep a live CDP socket: connect, hold until it drops, then reconnect.
+
+    Runs forever in a thread so the HTTP API (started first) is always up. After
+    a failed attempt it backs off and retries, so fixing accessibility / clicking
+    Allow later self-heals without a restart."""
+    while True:
+        if connect_once():
+            disconnected.clear()
+            threading.Thread(target=reader_thread, daemon=True).start()
+            # Block until the socket drops or a manual /reconnect is requested.
+            while not disconnected.wait(timeout=1):
+                if reconnect_now.is_set():
+                    break
+            reconnect_now.clear()
+        else:
+            # Failed; wait a bit (or until /reconnect) before trying again.
+            reconnect_now.wait(timeout=20)
+            reconnect_now.clear()
 
 
 # === WS framing ===
@@ -129,12 +277,15 @@ def ws_recv_raw():
 
 
 def reader_thread():
-    while True:
-        try:
+    """Demux CDP responses (by id) and buffer events. On socket drop, clear the
+    connection and signal the manager to reconnect instead of dying silently."""
+    global cdp_sock
+    try:
+        while True:
             text = ws_recv_raw()
             if text is None:
                 log("CDP closed by server")
-                return
+                break
             if not text: continue
             obj = json.loads(text)
             mid = obj.get("id")
@@ -152,27 +303,38 @@ def reader_thread():
                         "params": obj.get("params", {}),
                         "sessionId": obj.get("sessionId"),
                     })
-        except EOFError:
-            log("CDP socket EOF in reader")
-            return
-        except Exception as e:
-            log(f"reader err: {e}")
-            return
+    except EOFError:
+        log("CDP socket EOF in reader")
+    except Exception as e:
+        log(f"reader err: {e}")
+    finally:
+        cdp_sock = None
+        # Fail any in-flight calls so callers get a clear error, not a hang.
+        for ev in list(pending.values()):
+            try: ev.set()
+            except Exception: pass
+        set_state("disconnected", "CDP socket dropped; reconnecting.")
+        disconnected.set()
 
 
 def cdp_call(method, params=None, sessionId=None, timeout=15):
-    mid = next_id[0]
-    next_id[0] += 1
-    msg = {"id": mid, "method": method, "params": params or {}}
-    if sessionId: msg["sessionId"] = sessionId
+    if cdp_sock is None:
+        raise RuntimeError(f"CDP not connected (state={cdp_state}): {cdp_diag or 'connecting'}")
     ev = threading.Event()
     ev.response = None
-    pending[mid] = ev
+    with id_lock:
+        mid = next_id[0]
+        next_id[0] += 1
+        pending[mid] = ev
+    msg = {"id": mid, "method": method, "params": params or {}}
+    if sessionId: msg["sessionId"] = sessionId
     ws_send(json.dumps(msg))
     if not ev.wait(timeout):
-        del pending[mid]
+        pending.pop(mid, None)
         raise TimeoutError(f"{method} timed out after {timeout}s")
-    del pending[mid]
+    pending.pop(mid, None)
+    if ev.response is None:
+        raise RuntimeError(f"{method} failed: CDP socket dropped mid-call (state={cdp_state})")
     return ev.response
 
 
@@ -198,6 +360,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, r.get("result", {}).get("targetInfos", []))
             elif u.path == "/status":
                 self._send(200, {
+                    "state": cdp_state,
+                    "diag": cdp_diag,
                     "connected": cdp_sock is not None,
                     "pending": len(pending),
                     "next_id": next_id[0],
@@ -238,9 +402,12 @@ class Handler(BaseHTTPRequestHandler):
                              sessionId=body.get("sessionId"),
                              timeout=body.get("timeout", 15))
                 self._send(200, r)
+            elif self.path == "/reconnect":
+                reconnect_now.set()
+                self._send(200, {"ok": True, "state": cdp_state})
             elif self.path == "/shutdown":
                 self._send(200, {"ok": True})
-                threading.Thread(target=lambda: (time.sleep(0.1), sys.exit(0))).start()
+                threading.Thread(target=lambda: (time.sleep(0.1), os._exit(0))).start()
             else:
                 self._send(404, {"error": "not found"})
         except Exception as e:
@@ -248,8 +415,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    log("opening CDP...")
-    open_cdp()
-    threading.Thread(target=reader_thread, daemon=True).start()
+    # HTTP API FIRST (in a thread) so /status is always answerable - even while
+    # connecting or after a connect failure. The daemon never dies silently.
+    threading.Thread(
+        target=lambda: ThreadingHTTPServer(("127.0.0.1", DAEMON_PORT), Handler).serve_forever(),
+        daemon=True).start()
     log(f"HTTP API on http://127.0.0.1:{DAEMON_PORT}")
-    HTTPServer(("127.0.0.1", DAEMON_PORT), Handler).serve_forever()
+    # Connection manager owns the single CDP socket and reconnects on drop.
+    connection_manager()
