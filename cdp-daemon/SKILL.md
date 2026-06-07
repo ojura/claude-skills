@@ -120,8 +120,9 @@ soon as it appears, rather than wrapping inline.
   the SW's JS global (same target id, fresh scope), wiping any warm-injected hook.
   Hook a cold worker via auto-hook, not a warm one you then reload.
 - **Recover a crashed browser via AT-SPI.** After a Chrome crash the relaunch
-  shows a "Restore" prompt; press it the same way `clear_modals.py` presses
-  "Allow" (find the `Restore` push-button in the a11y tree and invoke `press`).
+  shows a "Restore pages?" prompt; `clear_modals.py` presses its "Restore"
+  button alongside "Allow" (see `BUTTON_NAMES`), so the daemon's connect-time
+  presser recovers the session automatically.
 
 ## Files
 

@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Press Chrome's "Allow remote debugging?" Allow button(s) via AT-SPI.
+"""Press Chrome's "Allow remote debugging?" and crash-recovery "Restore"
+button(s) via AT-SPI.
 
 Uses Chrome's accessibility tree (enabled by --force-renderer-accessibility)
-to find the Allow button without focus stealing or keyboard injection.
+to find the buttons without focus stealing or keyboard injection. Two prompts
+are handled (see BUTTON_NAMES):
+  - "Allow remote debugging?" -> "Allow"   (pops on every fresh CDP WebSocket)
+  - "Restore pages?"          -> "Restore" (pops after a Chrome crash; pressing
+                                 it recovers the prior session/tabs on relaunch)
 
 Bug to avoid: Chrome exposes the Allow button as TWO push-button nodes under
 the same `alert: 'Allow remote debugging?'` parent. find_all() and press
@@ -10,7 +15,7 @@ EVERY match. Pressing only the first is unreliable.
 
 Usage:
   clear_modals.py           single-shot scan (exits 0 immediately)
-  clear_modals.py --wait    poll until at least one Allow is pressed
+  clear_modals.py --wait    poll until at least one button is pressed
                             (or 60s deadline). Use this from the daemon.
 """
 import sys, time
@@ -18,16 +23,21 @@ import gi
 gi.require_version('Atspi', '2.0')
 from gi.repository import Atspi
 
+# Modal buttons we press. "Allow" clears the remote-debugging consent dialog
+# that pops on every fresh CDP WebSocket; "Restore" clears Chrome's crash
+# "Restore pages?" prompt so a relaunch recovers the prior session/tabs.
+BUTTON_NAMES = ('Allow', 'Restore')
 
-def find_all(node, role_match, name_match, depth=0, max_depth=30, out=None):
+
+def find_all(node, role_match, names, depth=0, max_depth=30, out=None):
     if out is None: out = []
     if node is None or depth > max_depth: return out
     try:
-        if node.get_role_name() in role_match and node.get_name() == name_match:
+        if node.get_role_name() in role_match and node.get_name() in names:
             out.append(node)
         for i in range(node.get_child_count()):
             try:
-                find_all(node.get_child_at_index(i), role_match, name_match, depth+1, max_depth, out)
+                find_all(node.get_child_at_index(i), role_match, names, depth+1, max_depth, out)
             except Exception:
                 pass
     except Exception:
@@ -49,14 +59,14 @@ def press_button(btn):
 
 
 def scan_and_press():
-    """Scan AT-SPI desktop for Chrome's Allow buttons; press all found."""
+    """Scan AT-SPI desktop for Chrome's Allow/Restore buttons; press all found."""
     desk = Atspi.get_desktop(0)
     pressed = 0
     for i in range(desk.get_child_count()):
         try:
             app = desk.get_child_at_index(i)
             if app and app.get_name() == 'Google Chrome':
-                buttons = find_all(app, ('push button', 'button'), 'Allow')
+                buttons = find_all(app, ('push button', 'button'), BUTTON_NAMES)
                 for btn in buttons:
                     if press_button(btn):
                         pressed += 1
@@ -116,9 +126,10 @@ def main():
         print(f'pressed {n}')
         return
 
-    # Wait mode: keep scanning until the modal appears AND we press at
-    # least one Allow button. Chrome adds the modal asynchronously after
-    # the WS upgrade, so a single startup scan misses it.
+    # Wait mode: keep scanning until a modal appears AND we press at least
+    # one button (Allow or Restore). Chrome adds the Allow modal asynchronously
+    # after the WS upgrade, so a single startup scan misses it; the crash
+    # "Restore pages?" prompt is up at relaunch and caught by the same scan.
     # Health check: if after ~2s Chrome's accessibility tree is empty,
     # bail fast with a clear diagnostic. The most common cause is the
     # global Accessibility flag being off in chrome://accessibility;
@@ -155,7 +166,7 @@ def main():
                       'lives in the renderer-side tree and is invisible without it.')
                 sys.exit(3)
         time.sleep(0.3)
-    print(f'timeout (no Allow button found in {rounds} rounds)')
+    print(f'timeout (no Allow/Restore button found in {rounds} rounds)')
     sys.exit(1)
 
 
