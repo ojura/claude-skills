@@ -36,6 +36,15 @@ On connect it spawns `clear_modals.py --wait`, which polls the AT-SPI tree for
 Chrome's Allow button(s) and presses every match (Chrome exposes two
 push-button nodes under the same alert; pressing only the first is unreliable).
 
+If Chrome renderer accessibility is OFF, the Allow dialog is invisible to AT-SPI
+and cannot be auto-pressed. In that case the daemon does **not** spam dialogs:
+each fresh CDP connection attempt pops its own Allow dialog, so instead of
+retrying on a timer it opens **one** connection and holds it (Chrome completes
+that exact pending request the instant you click Allow once), then goes idle.
+`POST /reconnect` to try again after enabling accessibility or clicking Allow;
+`POST /shutdown` to stop. `/shutdown` always terminates the process (it
+`os._exit`s from the HTTP thread), even while a connect is mid-flight.
+
 ## HTTP API
 
 | Method | Path | Body | Returns |

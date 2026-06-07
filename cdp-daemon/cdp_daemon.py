@@ -171,66 +171,75 @@ def connect_once(budget=150):
     and on giving up records a clear reason in /status instead of crashing."""
     global cdp_sock, cdp_leftover
     set_state("connecting", "opening CDP...")
-    presser = press_allow_once()
-    log(f"presser pid={presser.pid}")
-
     found, renderer = accessibility_health()
-    if found is False:
-        set_state("waiting_for_allow",
-                  "ACTION REQUIRED: Chrome is not visible via AT-SPI, so the 'Allow remote "
-                  "debugging?' dialog cannot be auto-clicked. Click Allow in Chrome manually.")
-    elif renderer is False:
-        set_state("waiting_for_allow",
-                  "ACTION REQUIRED: auto-press UNAVAILABLE - Chrome renderer accessibility is OFF, "
-                  "so the 'Allow remote debugging?' dialog is invisible to AT-SPI. FIX: click Allow "
-                  "in Chrome now, or enable 'Native accessibility API support' at "
-                  "chrome://accessibility (or relaunch with --force-renderer-accessibility). "
-                  "Retrying until allowed.")
-    elif renderer:
-        log("accessibility OK - auto-pressing Allow.")
+    auto = bool(renderer) and found is not False
 
-    deadline = time.time() + budget
-    next_press = time.time() + 15
-    last = None
-    while time.time() < deadline:
-        # Re-press periodically: if accessibility gets switched on mid-wait, the
-        # next presser run will click the dialog automatically.
-        if time.time() >= next_press:
-            if presser.poll() is not None:
-                presser = press_allow_once()
-            next_press = time.time() + 15
-
-        kind, *rest = ws_upgrade(timeout=min(20, max(2, deadline - time.time())))
-        if kind == "ok":
-            sock, leftover = rest
-            sock.settimeout(None)
-            cdp_sock, cdp_leftover = sock, leftover
-            try:
-                out, _ = presser.communicate(timeout=1)
-                if out: log(f"presser: {out.strip()[:200]}")
-            except Exception:
+    if auto:
+        # Accessibility is on: the presser clicks Chrome's Allow dialog within ~1-2s,
+        # so short connect retries pop at most a dialog or two before it lands.
+        presser = press_allow_once()
+        log(f"presser pid={presser.pid}; accessibility OK - auto-pressing Allow.")
+        set_state("waiting_for_allow", "auto-pressing Chrome's 'Allow remote debugging?' dialog...")
+        deadline = time.time() + budget
+        next_press = time.time() + 8
+        while time.time() < deadline:
+            if time.time() >= next_press:
+                if presser.poll() is not None:
+                    presser = press_allow_once()
+                next_press = time.time() + 8
+            kind, *rest = ws_upgrade(timeout=min(15, max(2, deadline - time.time())))
+            if kind == "ok":
+                sock, leftover = rest
+                sock.settimeout(None)
+                cdp_sock, cdp_leftover = sock, leftover
+                try:
+                    out, _ = presser.communicate(timeout=1)
+                    if out: log(f"presser: {out.strip()[:200]}")
+                except Exception:
+                    try: presser.terminate()
+                    except Exception: pass
+                set_state("connected", "CDP connected.")
+                return True
+            if kind == "noport":
+                set_state("no_chrome",
+                          f"ALERT: cannot reach Chrome DevTools at {HOST}:{PORT} ({rest[0]}). "
+                          f"Launch Chrome with --remote-debugging-port={PORT}.")
                 try: presser.terminate()
                 except Exception: pass
-            set_state("connected", "CDP connected.")
-            return True
-        if kind == "noport":
-            set_state("no_chrome",
-                      f"ALERT: cannot reach Chrome DevTools at {HOST}:{PORT} ({rest[0]}). "
-                      f"Launch Chrome with --remote-debugging-port={PORT}.")
-            time.sleep(3)
-            continue
-        msg = rest[0] if rest else kind
-        if msg != last:
-            last = msg
-            tail = "" if cdp_state == "waiting_for_allow" else " - click Allow if a dialog is shown"
-            log(f"not allowed yet ({kind}: {msg}){tail}")
-        time.sleep(2)
+                return False
+            time.sleep(2)
+        try: presser.terminate()
+        except Exception: pass
+        set_state("failed",
+                  "ALERT: gave up after %ds - auto-press did not land the Allow. "
+                  "POST /reconnect to retry." % budget)
+        return False
 
+    # No auto-press (renderer accessibility OFF, or Chrome not visible to AT-SPI).
+    # Avoid dialog spam: open exactly ONE connection and HOLD it. Chrome completes
+    # this same pending request the instant the user clicks Allow, so no repeated
+    # dialogs appear; if the user never clicks, we time out once and go idle.
+    why = "Chrome is not visible via AT-SPI" if found is False else "Chrome renderer accessibility is OFF"
+    set_state("waiting_for_allow",
+              "ACTION REQUIRED: click Allow ONCE in Chrome's 'Allow remote debugging?' dialog "
+              "(auto-press unavailable: %s). A single connection is held open waiting for your "
+              "click - the daemon will NOT pop repeated dialogs. To stop waiting: POST /shutdown." % why)
+    kind, *rest = ws_upgrade(timeout=max(5, budget))   # one long-held attempt = one dialog
+    if kind == "ok":
+        sock, leftover = rest
+        sock.settimeout(None)
+        cdp_sock, cdp_leftover = sock, leftover
+        set_state("connected", "CDP connected.")
+        return True
+    if kind == "noport":
+        set_state("no_chrome",
+                  f"ALERT: cannot reach Chrome DevTools at {HOST}:{PORT} ({rest[0]}). "
+                  f"Launch Chrome with --remote-debugging-port={PORT}.")
+        return False
     set_state("failed",
-              "ALERT: gave up after %ds - remote debugging was never allowed. The auto-presser "
-              "could not click Allow (likely renderer accessibility OFF) and no manual Allow was "
-              "detected. Enable accessibility or click Allow, then POST /reconnect (or just wait; "
-              "it keeps retrying)." % budget)
+              "Remote debugging was not allowed (%s). Click Allow in Chrome, then POST /reconnect. "
+              "The daemon is now idle and will not pop further dialogs until you do."
+              % (rest[0] if rest else kind))
     return False
 
 
@@ -249,9 +258,17 @@ def connection_manager():
                 if reconnect_now.is_set():
                     break
             reconnect_now.clear()
-        else:
-            # Failed; wait a bit (or until /reconnect) before trying again.
+        elif cdp_state == "no_chrome":
+            # Chrome not up yet: poll quietly (this pops no Allow dialog) until it
+            # appears or a /reconnect is requested.
             reconnect_now.wait(timeout=20)
+            reconnect_now.clear()
+        else:
+            # Connect needs a human (manual Allow click / enable accessibility). Do
+            # NOT retry on a timer - that is what popped repeated dialogs. Go idle and
+            # wait for an explicit POST /reconnect (or /shutdown).
+            log("idle: connect needs a manual Allow; waiting for POST /reconnect (no auto-retry).")
+            reconnect_now.wait()
             reconnect_now.clear()
 
 
