@@ -11,7 +11,18 @@ Endpoints:
   GET  /events?since=N&method=substr&limit=N   → buffered CDP events (Network.*, Runtime.*, etc.)
   GET  /status                                 → daemon status (state, diag, connected, log_tail)
   POST /reconnect                              → force a fresh connect attempt
+  POST /autohook      {urlSubstr, script}|{clear:true}  → inject script into matching targets at attach
+                                                          (re-registering same urlSubstr REPLACES, never stacks a duplicate)
+  GET  /autohooked                             → recent auto-hook injections (sid, url, result)
   POST /shutdown                               → exit cleanly
+
+Auto-hook: pair with Target.setAutoAttach{waitForDebuggerOnStart, filter incl.
+shared_worker, flatten} on the BROWSER session. A COLD shared worker pauses at
+start (Chrome M143+); on Target.attachedToTarget the reader thread injects the
+script then runIfWaitingForDebugger to resume, so the hook lands before the
+worker's first line. Only PAUSED (waitingForDebugger) targets are injected - a
+busy worker never services eval and would stall the socket to timeout; matching
+paused targets get the script, non-matching paused ones are just resumed.
 
 Start:  python3 cdp_daemon.py & disown
 Test:   curl 127.0.0.1:7799/status | jq
@@ -54,6 +65,15 @@ cdp_state = "init"   # init|connecting|waiting_for_allow|connected|no_chrome|fai
 cdp_diag = ""        # human-readable explanation of the current state
 disconnected = threading.Event()
 reconnect_now = threading.Event()
+
+# Auto-hook: inject a script into a target the instant it attaches PAUSED at start
+# (arm Target.setAutoAttach{waitForDebuggerOnStart} on the browser session), so a
+# worker is instrumented before its first line runs; the reader thread injects then
+# resumes. Only paused (waitingForDebugger) targets are injected: a busy worker
+# never services Runtime.evaluate and would stall the single socket to timeout.
+autohooks = []                              # [{"urlSubstr": str, "script": str}]
+autohook_lock = threading.Lock()
+autohooked = collections.deque(maxlen=80)   # recent {sid, url, result} for observability
 
 # Pre-built WebSocket upgrade request to Chrome's browser-level DevTools endpoint.
 WS_REQ = (
@@ -276,6 +296,53 @@ def ws_recv_raw():
     return payload.decode("utf-8", errors="replace")
 
 
+def _run_autohook(sid, url, script):
+    """Inject `script` into a freshly-attached target ASAP, then resume it if it
+    was paused. Runs in its own thread so the reader keeps demuxing (cdp_call
+    would otherwise deadlock the reader waiting on its own response)."""
+    res = None
+    try:
+        r = cdp_call("Runtime.evaluate", {"expression": script, "returnByValue": True},
+                     sessionId=sid, timeout=10)
+        res = ((r.get("result", {}) or {}).get("result", {}) or {}).get("value")
+    except Exception as e:
+        res = f"inject-err:{e}"
+    try:
+        cdp_call("Runtime.runIfWaitingForDebugger", {}, sessionId=sid, timeout=5)
+    except Exception:
+        pass
+    autohooked.append({"sid": sid, "url": (url or "")[:90], "result": res})
+    log(f"autohook -> {(url or '')[:48]} : {str(res)[:48]}")
+
+
+def _on_attached(params):
+    """On Target.attachedToTarget for a target PAUSED at start (waitingForDebugger=true),
+    inject any matching autohook then resume it. Targets that are already running
+    (not waiting) are ignored: injecting then is too late to beat their init AND each
+    Runtime.evaluate into a busy worker blocks for the full timeout, which - multiplied
+    across every pre-existing worker when a broad filter is armed - wedges the single
+    CDP socket. Non-matching paused targets are resumed so a browser-wide
+    waitForDebuggerOnStart does not hang unrelated workers."""
+    try:
+        sid = params.get("sessionId")
+        url = (params.get("targetInfo") or {}).get("url", "")
+        if not sid or not params.get("waitingForDebugger"):
+            return
+        with autohook_lock:
+            hooks = list(autohooks)
+        matched = False
+        for h in hooks:
+            if h["urlSubstr"] in url:
+                matched = True
+                threading.Thread(target=_run_autohook, args=(sid, url, h["script"]), daemon=True).start()
+        if not matched:
+            threading.Thread(
+                target=lambda: cdp_call("Runtime.runIfWaitingForDebugger", {}, sessionId=sid, timeout=5),
+                daemon=True).start()
+    except Exception as e:
+        log(f"_on_attached err: {e}")
+
+
 def reader_thread():
     """Demux CDP responses (by id) and buffer events. On socket drop, clear the
     connection and signal the manager to reconnect instead of dying silently."""
@@ -303,6 +370,8 @@ def reader_thread():
                         "params": obj.get("params", {}),
                         "sessionId": obj.get("sessionId"),
                     })
+                if obj["method"] == "Target.attachedToTarget" and autohooks:
+                    _on_attached(obj.get("params", {}))
     except EOFError:
         log("CDP socket EOF in reader")
     except Exception as e:
@@ -377,6 +446,8 @@ class Handler(BaseHTTPRequestHandler):
                     out = [e for e in events if e["seq"] > since
                            and (method_filter is None or method_filter in e["method"])]
                 self._send(200, out[-limit:])
+            elif u.path == "/autohooked":
+                self._send(200, list(autohooked))
             else:
                 self._send(404, {"error": "not found"})
         except Exception as e:
@@ -405,6 +476,21 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/reconnect":
                 reconnect_now.set()
                 self._send(200, {"ok": True, "state": cdp_state})
+            elif self.path == "/autohook":
+                # Register a script to inject into every target whose URL contains
+                # urlSubstr, the instant it attaches. Registering REPLACES any existing
+                # rule with the same urlSubstr (re-registering updates in place and never
+                # stacks a stale duplicate, which the already-installed hook would
+                # otherwise win via `if(globalThis.__W) return 'already'`). Distinct
+                # urlSubstrs coexist; {clear:true} wipes all rules.
+                with autohook_lock:
+                    if body.get("clear"):
+                        autohooks.clear()
+                    if body.get("script") and body.get("urlSubstr") is not None:
+                        autohooks[:] = [h for h in autohooks if h["urlSubstr"] != body["urlSubstr"]]
+                        autohooks.append({"urlSubstr": body["urlSubstr"], "script": body["script"]})
+                    count = len(autohooks)
+                self._send(200, {"ok": True, "count": count})
             elif self.path == "/shutdown":
                 self._send(200, {"ok": True})
                 threading.Thread(target=lambda: (time.sleep(0.1), os._exit(0))).start()
