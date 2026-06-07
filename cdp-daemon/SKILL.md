@@ -107,6 +107,19 @@ soon as it appears, rather than wrapping inline.
   constructor needs a browser-process handshake the suspended task loop cannot
   complete, so the injecting `Runtime.evaluate` never returns. Defer such calls
   with `setTimeout(0)` (runs post-resume) and read captures from a global instead.
+- **A busy worker's eval is queued, not rejected.** `Runtime.evaluate` on a worker
+  mid-task does not fail; it waits in the worker's inspector queue and runs the next
+  time the worker yields to its event loop (V8 services interrupts only at
+  safepoints). So a call that "failed" under a short timeout can succeed with a long
+  one if the worker ever yields. Only a worker in one perpetual never-returning
+  synchronous call (e.g. a WASM engine main loop) is truly uninjectable. Use long
+  timeouts and fire concurrently (the ThreadingHTTPServer demuxes by id) rather than
+  declaring "unhookable" from a short-timeout miss.
+- **Hook before the page's own scripts.** `Page.addScriptToEvaluateOnNewDocument`
+  runs your script in the main world before any page script on the next navigation.
+  Use it to wrap `MessagePort`/`Worker`/`crypto.subtle`/library globals before the
+  app captures references to them, then `Page.navigate`. A warm `Runtime.evaluate`
+  after load is too late: the app already holds the originals.
 - **WASM exports can't be monkey-patched.** They are non-writable and
   non-configurable, so `defineProperty`/assignment silently fails. Wrap
   `WebAssembly.instantiate`/`instantiateStreaming`/`Instance` and return a value
@@ -123,6 +136,18 @@ soon as it appears, rather than wrapping inline.
   shows a "Restore pages?" prompt; `clear_modals.py` presses its "Restore"
   button alongside "Allow" (see `BUTTON_NAMES`), so the daemon's connect-time
   presser recovers the session automatically.
+
+## Capturing high-volume events (WebSocket frames, Network)
+
+`/events` is a 10k rolling ring. A busy WebSocket or a `Network.*` flood can emit
+far more than 10k events between polls, silently dropping the oldest. To capture a
+complete stream, `Network.enable` on the owning session(s), then DRAIN
+incrementally: poll `/events?since=<lastSeq>`, advance the cursor to the max `seq`
+returned, append, and persist each round (every few hundred ms of activity). For
+WebSocket payloads read `Network.webSocketFrameReceived` -> `response.payloadData`
+(base64 for binary frames). This captures an app's wire protocol directly, without
+touching its workers - often the cleanest path when the data never crosses a
+hookable in-page boundary (it may travel via shared memory the page reads instead).
 
 ## Files
 
