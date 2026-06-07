@@ -5,8 +5,10 @@ description: Dump a non-E2EE Messenger conversation's complete history + media t
 
 # Messenger thread export
 
-Exports a full Messenger conversation (every message + photos/files/videos + link cards)
-to `index.html` + `media/` + `messages.json`, readable in any browser.
+Exports a full Messenger conversation (every message + photos/files/videos/audio + link cards)
+to a bundle: `index.html` (references `media/` by relative path) + `media/` + `messages.json`.
+`messages.json` is the full conversation as decrypted plaintext JSON (`{mid, sender, ts, text,
+status}`) - treat it as the most sensitive artifact and do not share it casually.
 
 ## Scope and consent
 
@@ -54,14 +56,18 @@ A thread open at `/e2ee/t/<e2eeid>` shows the *e2ee thread id* in the URL, **not
 threadKey. The threadKey is still the contact's FBID. With that thread open, get it from the DB:
 
 ```js
-// run via cdp-daemon /eval on the thread's page target
+// run via cdp-daemon /eval on the thread's page target. The threads table has NO name column,
+// so join participants (threadKey -> contactId) against contacts (id -> name).
 (async()=>{const db=await require('LSDatabaseSingleton').getLSDatabaseSingletonPromiseOrValue();
  const I64=require('I64'),ReQL=require('ReQL');
- const t=await ReQL.toArrayAsync(ReQL.fromTableAscending(db.tables.threads));
- return JSON.stringify(t.map(r=>[I64.to_string(r.threadKey), r.threadName||r.name]));})()
+ const cs=await ReQL.toArrayAsync(ReQL.fromTableAscending(db.tables.contacts));
+ const nm={}; cs.forEach(c=>{try{nm[I64.to_string(c.id)]=c.name||c.firstName;}catch(e){}});
+ const ps=await ReQL.toArrayAsync(ReQL.fromTableAscending(db.tables.participants));
+ const by={}; ps.forEach(p=>{try{const k=I64.to_string(p.threadKey);(by[k]=by[k]||[]).push(nm[I64.to_string(p.contactId)]||I64.to_string(p.contactId));}catch(e){}});
+ return JSON.stringify(Object.entries(by));})()
 ```
 
-Match the contact by name; that row's `threadKey` is the FBID to pass. (This works only for a
+Find the `[threadKey, [names]]` entry whose names include your contact; that `threadKey` is the FBID to pass. (This works only for a
 non-secret thread served over the e2ee transport. A true E2EE "secret" thread is **not**
 supported - see Gotchas - and the script aborts loudly if it detects one.)
 
@@ -78,7 +84,7 @@ supported - see Gotchas - and the script aborts loudly if it detects one.)
    bypasses the UI's scroll guard (`hasMoreBefore && !isLoadingBefore`) that causes the stall.
    **The completeness proof is a gate, not a hope:** after walking both directions the script
    re-reads the range rows and aborts unless there is exactly ONE row with both flags false
-   (the sentinels are min=0, max=9999999999999). It **fails closed** - a CDP/eval error returns a
+   (the boolean flags, not the timestamps, are the proof). It **fails closed** - a CDP/eval error returns a
    typed `{error}` (never an empty `{}` that would read as "done"), a stalled or fragmented
    thread aborts, and nothing is written on an unproven sync.
 
@@ -91,8 +97,10 @@ supported - see Gotchas - and the script aborts loudly if it detects one.)
    vault key: `new Uint8Array(require('MAWVaultMaterials').getVaultMaterials().encryptionKey)`,
    the same for every thread and message (the EAR vault key; distinct from the per-DB maw_ear
    keychain key). Decrypt is tri-state (decrypted / plaintext-passthrough / **failed**); failures
-   are counted, rendered as a distinct red `[DECRYPT FAILED]` marker (not the benign `[non-text]`),
-   and a high failure rate or zero wrapped rows aborts as a likely E2EE/wrong-key thread.
+   are counted and rendered as a distinct red `[DECRYPT FAILED]` marker (not the benign `[non-text]`).
+   The script aborts as a likely E2EE/wrong-key thread on EVIDENCE of an unreadable scheme - a
+   systemic decrypt-failure rate, or a majority of non-empty message texts that are not vault-wrapped
+   (so a legitimate media/sticker-only thread, which simply has no text, is not false-aborted).
 
 3. **Media + links.** `db.tables.attachments` (filter threadKey): media rows carry
    `playableUrl`/`imageUrl`/`previewUrl` (+ the matching `*MimeType`) + `filename`; XMA
@@ -101,9 +109,10 @@ supported - see Gotchas - and the script aborts loudly if it detects one.)
    **several** attachments (albums), so media is stored as a **list per messageId** - every
    attachment is downloaded and rendered, not just the last. Download with `curl -A "Mozilla/5.0"`;
    CDN URLs expire, so step 1's sync re-issues fresh ones immediately before download. Downloads
-   are **validated**: an expired URL returns a 68-byte 1x1 PNG placeholder, which is detected and
-   rejected (one retry, then a visible `[media unavailable]` marker), and the artifact reports
-   `downloaded/total` so any gap is honest rather than counted as success.
+   are **validated by content**: the bytes must match the declared media class (image/video magic),
+   and expired-URL 1x1 placeholders, HTML/XML error pages, and non-200 responses are rejected (one
+   retry, then a visible `[media unavailable]` marker). The artifact reports `downloaded/total`
+   counted per attachment slot, so the header, banner, and inline markers always agree.
 
 ## Gotchas
 
