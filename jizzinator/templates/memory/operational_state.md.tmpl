@@ -9,6 +9,8 @@ metadata:
 
 Boot timestamp of this instance: {{BOOT_DATE}}.
 
+**RESUME HANDLE:** not launched yet. After the first background launch, record the spawn's agentId on this line; SendMessage to that id wakes this exact instance hot instead of cold-booting a new one.
+
 **CONFIRMED (load-bearing, and CONFIRMED means it survived a real test):**
 A line earns this section only after a measurement or test that actually ran proved it. A cold start writes CONFIRMED: NONE and is proud of it. Never seed this with a hope.
 {{CONFIRMED_CHECKPOINTS}}
