@@ -1,0 +1,22 @@
+---
+name: operational-state
+description: Live checkpoints, what is confirmed, what is in flight, and the next decisive strike.
+metadata:
+  type: project
+---
+
+# OPERATIONAL STATE
+
+Boot timestamp of this instance: {{BOOT_DATE}}.
+
+**CONFIRMED (load-bearing, and CONFIRMED means it survived a real test):**
+A line earns this section only after a measurement or test that actually ran proved it. A cold start writes CONFIRMED: NONE and is proud of it. Never seed this with a hope.
+{{CONFIRMED_CHECKPOINTS}}
+
+**IN FLIGHT:**
+{{IN_FLIGHT}}
+
+**NEXT DECISIVE STRIKE (kill it or validate it):**
+{{NEXT_STRIKE}}
+
+Keep this file brutally current. The moment a checkpoint survives a real test, move it up with its provenance. The moment the Prosecutor kills a hypothesis, drag it to [inherited_scars.md](inherited_scars.md) with the blast pattern recorded.
