@@ -85,6 +85,17 @@ journal inode extents. Merges, dedupes, validates, repairs app-truncated
 survivors, and restores only on explicit OK. Bundles the proven (scrubbed)
 forensic scripts from a real 60/66-session recovery.
 
+### sudo-listener
+
+A self-contained, PSK-authenticated root command channel over loopback, in one Python file that
+is both server and client. The server runs as root, binds `127.0.0.1`, and for each request
+checks an HMAC-SHA256 signature made with a `0600` pre-shared key (auto-generated, never sent over
+the socket); it rejects replays by requiring each request's timestamp to be newer than the last
+one it ran, then runs the command as root and streams stdout, stderr, and the exit code back,
+logging every request and its output. A deliberate, auditable alternative to passwordless
+(`NOPASSWD`) sudo for letting a local non-root process or AI agent run controlled root commands;
+its safety rests on the key file's `0600` permissions plus the loopback-only bind. No dependencies.
+
 ## Installation
 
 Copy a skill directory into your Claude Code skills location, or install the
