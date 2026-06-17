@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Long-lived CDP daemon. Opens one persistent WS to Chrome at 43809 (auto-pressing Allow
+"""Long-lived CDP daemon. Opens one persistent WS to Chrome at its live DevTools port (auto-pressing Allow
 on connect), exposes a local HTTP API on 127.0.0.1:7799 for CDP calls.
 
 Endpoints:
@@ -41,7 +41,26 @@ accessibility self-check.
 import socket, struct, json, sys, subprocess, secrets, threading, time, collections, os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-HOST, PORT, PATH = "127.0.0.1", 43809, "/devtools/browser"
+HOST = "127.0.0.1"
+
+
+def _discover_endpoint():
+    """Read Chrome's live DevTools endpoint from DevToolsActivePort.
+
+    Chrome rewrites that file on every launch: line 1 is the port, line 2 the
+    browser-target WS path (UUID-suffixed on current Chrome, where the bare
+    /devtools/browser path 404s). Falls back to the legacy hardcoded endpoint
+    when the file is missing.
+    """
+    try:
+        lines = open(os.path.expanduser(
+            "~/.config/google-chrome/DevToolsActivePort")).read().split()
+        return int(lines[0]), lines[1]
+    except Exception:
+        return 43809, "/devtools/browser"
+
+
+PORT, PATH = _discover_endpoint()
 DAEMON_PORT = 7799
 PRESSER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clear_modals.py")
 
@@ -203,7 +222,7 @@ def connect_once(budget=150):
             if kind == "noport":
                 set_state("no_chrome",
                           f"ALERT: cannot reach Chrome DevTools at {HOST}:{PORT} ({rest[0]}). "
-                          f"Launch Chrome with --remote-debugging-port={PORT}.")
+                          f"Enable remote debugging in the already-running Chrome via its 'Allow remote debugging?' prompt; --remote-debugging-port does not work for the default/main user profile.")
                 try: presser.terminate()
                 except Exception: pass
                 return False
@@ -234,7 +253,7 @@ def connect_once(budget=150):
     if kind == "noport":
         set_state("no_chrome",
                   f"ALERT: cannot reach Chrome DevTools at {HOST}:{PORT} ({rest[0]}). "
-                  f"Launch Chrome with --remote-debugging-port={PORT}.")
+                  f"Enable remote debugging in the already-running Chrome via its 'Allow remote debugging?' prompt; --remote-debugging-port does not work for the default/main user profile.")
         return False
     set_state("failed",
               "Remote debugging was not allowed (%s). Click Allow in Chrome, then POST /reconnect. "

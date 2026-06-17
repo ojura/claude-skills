@@ -15,9 +15,16 @@ prompts.
 
 ## Prerequisites
 
-- Chrome running with remote debugging enabled. The daemon expects the
-  DevTools endpoint on `127.0.0.1:43809` (edit `PORT` in `cdp_daemon.py` to
-  match your launch flag, e.g. `--remote-debugging-port=43809`).
+- Chrome running with remote debugging enabled on its **main/default profile**.
+  Important: `--remote-debugging-port` does **NOT** work for the default/main
+  user profile - Chrome 136+ ignores the flag there as a security measure. So do
+  not rely on that flag. Remote debugging is instead enabled at runtime by opening
+  `chrome://inspect` in the target Chrome, which opens the local DevTools endpoint
+  on the running profile and raises the "Allow remote debugging?" consent prompt -
+  which this daemon auto-presses. The daemon does not assume a fixed port: it discovers the live
+  endpoint (port + UUID WebSocket path) from
+  `~/.config/google-chrome/DevToolsActivePort`, falling back to
+  `127.0.0.1:43809` only if that file is missing.
 - For the auto-Allow press: `python3-gi` with the AT-SPI bindings
   (`gi.repository.Atspi`), and Chrome launched with
   `--force-renderer-accessibility` (or "Native accessibility API support"

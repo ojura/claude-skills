@@ -15,7 +15,8 @@ local HTTP API. One modal, then silence.
 
 ## What it does
 
-- Holds one long-lived CDP WebSocket to Chrome (default `127.0.0.1:43809`).
+- Holds one long-lived CDP WebSocket to Chrome, at the endpoint auto-discovered
+  from Chrome's `DevToolsActivePort` file (host/port not hardcoded).
 - Auto-presses the Allow dialog via AT-SPI on connect (`clear_modals.py`).
 - Exposes `127.0.0.1:7799` with endpoints for `getTargets`, `attachToTarget`,
   `Runtime.evaluate`, arbitrary CDP methods, a rolling event buffer, and status.
@@ -38,8 +39,11 @@ curl 127.0.0.1:7799/status
 curl 127.0.0.1:7799/targets | jq
 ```
 
-See [`SKILL.md`](SKILL.md) for the full endpoint table, the prerequisites (Chrome
-remote-debugging port, AT-SPI renderer accessibility), and worked examples.
+See [`SKILL.md`](SKILL.md) for the full endpoint table, the prerequisites
+(AT-SPI renderer accessibility), and worked examples. Note: `--remote-debugging-port`
+does NOT work for Chrome's default/main user profile; enable debugging via
+`chrome://inspect`, and the daemon discovers the live endpoint from
+`DevToolsActivePort`.
 
 ## Files
 
