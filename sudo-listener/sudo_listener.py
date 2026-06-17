@@ -154,8 +154,14 @@ def send_frame(sock, tag, payload):
 def read_request_line(sock):
     # The request is one newline-terminated line; read only up to the newline so we
     # never depend on the client closing its write side (no half-close timeout games).
+    # If the line passes the cap before a newline arrives, say so (request-too-long)
+    # rather than silently truncating and later failing the HMAC as a misleading
+    # "auth-failed".
+    limit = 1 << 16  # 64 KiB
     buf = b""
-    while b"\n" not in buf and len(buf) < (1 << 16):
+    while b"\n" not in buf:
+        if len(buf) >= limit:
+            raise ValueError("request-too-long")
         c = sock.recv(4096)
         if not c:
             break
@@ -219,6 +225,9 @@ def handle(conn, addr, guard):
             line = read_request_line(conn).rstrip(b"\r")
         except socket.timeout:
             reject(conn, peer, "no-request-within-timeout")
+            return
+        except ValueError:
+            reject(conn, peer, "request-too-long")
             return
         conn.settimeout(None)  # the command itself may run arbitrarily long
 
@@ -355,10 +364,11 @@ def sign(psk, cmd):
 
 
 def _demux(sock):
-    # Returns (exit_code, reject_reason); reject_reason is None on a normal reply.
-    # Bounds-checks server-supplied frame lengths (the server is trusted, but a bug
-    # or impersonator shouldn't be able to make the client allocate gigabytes or crash).
-    rc, reason = 0, None
+    # Returns (exit_code, reject_reason). exit_code stays None until the server sends an
+    # explicit exit frame, so a truncated or aborted reply is reported as a failure rather
+    # than a false exit 0. Server frame lengths are bounds-checked (the server is trusted,
+    # but a bug or impersonator must not make the client allocate gigabytes or crash).
+    rc, reason = None, None
     f = sock.makefile("rb")
     while True:
         hdr = f.read(5)
@@ -377,9 +387,9 @@ def _demux(sock):
         elif tag == 2:
             sys.stderr.buffer.write(payload); sys.stderr.buffer.flush()
         elif tag == 3:
-            if len(payload) != 4:
-                break
-            (rc,) = struct.unpack(">i", payload); break
+            if len(payload) == 4:
+                (rc,) = struct.unpack(">i", payload)
+            break
         elif tag == 4:
             reason = payload.decode("utf-8", "replace"); break
     return rc, reason
@@ -404,6 +414,9 @@ def client(cmd):
         finally:
             s.close()
         if reason is None:
+            if rc is None:  # reply ended without an exit frame (truncated/aborted)
+                sys.stderr.write("sudo_listener: incomplete reply from server (no exit status)\n")
+                return 125
             return rc
         if reason.startswith("stale") and attempt < RETRIES - 1:
             time.sleep(0.01 * (attempt + 1))  # brief backoff, then re-sign with a fresh ts
