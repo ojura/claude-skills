@@ -75,7 +75,9 @@ exec python3 /path/to/sudo_listener.py run "$@"
   reject(reason). Reading the request as a single newline-terminated line means the client never
   half-closes, so there are no socket linger/timeout games.
 - **Concurrency:** one thread per connection; the command runs as a `bash -c` subprocess with
-  `stdin=/dev/null`. Clean shutdown on SIGINT/SIGTERM.
+  `stdin=/dev/null` and `start_new_session=True`, so it has no controlling terminal and cannot
+  open, block on, or corrupt the listener's own tty via `/dev/tty` (e.g. a stray `mysql -p`
+  password prompt). Clean shutdown on SIGINT/SIGTERM.
 - **Audit:** every request logs `RUN: <cmd>` and `DONE: exit=.. in ..s (out/err bytes)`, plus
   the command's full output (suppress with `--quiet`).
 

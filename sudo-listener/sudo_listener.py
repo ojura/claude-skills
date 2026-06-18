@@ -261,9 +261,18 @@ def handle(conn, addr, guard):
         shown = cmd if len(cmd) <= 800 else cmd[:800] + (" ...[+%d chars]" % (len(cmd) - 800))
         log("%s RUN: %s" % (peer, shown))
         t0 = time.time()
+        # Run each command in its own session with no controlling terminal
+        # (start_new_session => setsid). stdin=DEVNULL detaches the child from our
+        # stdin but not from /dev/tty (the controlling terminal). Under sudo that
+        # tty is the listener's own pty, so any command that opens /dev/tty can
+        # hang on it and corrupt it for the whole listener. Concrete case: an empty
+        # $PW turns `mysql -p"$PW"` into a bare `mysql -p`, which prompts on
+        # /dev/tty, blocks indefinitely, and leaves the pty in -echo/-isig,
+        # silently killing Ctrl-C. With no controlling terminal /dev/tty cannot be
+        # opened at all.
         p = subprocess.Popen(["bash", "-c", cmd], stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
-                             env=_child_env(), cwd="/")
+                             env=_child_env(), cwd="/", start_new_session=True)
         streams = {p.stdout.fileno(): (1, p.stdout), p.stderr.fileno(): (2, p.stderr)}
         nbytes = {1: 0, 2: 0}
         teed, last_nl = False, True
