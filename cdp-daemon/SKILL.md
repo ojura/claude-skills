@@ -52,6 +52,32 @@ that exact pending request the instant you click Allow once), then goes idle.
 `POST /shutdown` to stop. `/shutdown` always terminates the process (it
 `os._exit`s from the HTTP thread), even while a connect is mid-flight.
 
+## Waiting for the connect from an agent (fail with a non-zero exit)
+
+On the manual-Allow path the connect blocks on a human clicking Allow, so an agent
+that wants to resume the instant it lands should background a single `until`-loop and
+let its exit re-invoke it. This is the single-notification case, so use
+`Bash(run_in_background)` with an `until`-loop, **not** Monitor (Monitor is for
+one-event-per-occurrence streams).
+
+The catch worth stating: make the **timeout/failure path exit non-zero**. A loop that
+prints a timeout and then falls through to an implicit `exit 0` makes "Allow never
+clicked" look identical to "connected" in the completion notification's exit code, so
+the agent can't tell success from failure without reading the output file.
+
+```bash
+# Bash(run_in_background): arm a fresh pending connect, then block until connected.
+# exit 0 = connected (resume the real work);  exit 1 = never clicked (re-prompt / re-arm).
+curl -s -X POST 127.0.0.1:7799/reconnect >/dev/null 2>&1
+for i in $(seq 1 240); do
+  curl -s --max-time 2 127.0.0.1:7799/status 2>/dev/null | grep -q '"connected": true' \
+    && { echo "connected after ${i}s"; exit 0; }
+  sleep 1
+done
+echo "timeout: Allow not clicked in 240s" >&2
+exit 1
+```
+
 ## HTTP API
 
 | Method | Path | Body | Returns |
