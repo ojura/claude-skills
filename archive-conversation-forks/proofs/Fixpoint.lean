@@ -138,4 +138,72 @@ theorem no_orphan_from_closed
     intro hd; exact (demoted_guard_from_def needs sources cross kuf consumers residue hd) hslb
   exact ⟨s, ⟨hslocked, hsnotdem⟩, hssrc⟩
 
+/--
+  DEBRIS-INCLUSIVE no-orphan. The committed pipeline removes files from the picker on TWO
+  non-loadbearing paths: C5 demotion (`demoted` above) AND the Step-2 debris nomination
+  (`nominate_debris`, guarded by `if k in loadbearing: continue`, so `debris k → ¬ loadbearing k`).
+  The final picker is `locked` minus BOTH. No-orphan survives the second removal for the SAME reason
+  it survives C5: the source the fixpoint realises is load-bearing, and BOTH removal paths take only
+  NON-load-bearing files, so the realised source lies in neither. This covers the debris path - the one
+  the SKILL.md guard change `locked`→`loadbearing` introduced. `no_orphan` was already generic over `demoted` (it constrains it only
+  through `demoted_guard`); this theorem makes the second non-loadbearing removal explicit and checked.
+
+  `debris_guard` is precisely the `if k in loadbearing: continue` test. We do NOT assume "stubs own no
+  uuid": a 0-message stub can own a `compact_boundary` uuid, so `nmsg==0` does not by itself rule out
+  load-bearing. The guard decides it directly by testing membership in `loadbearing`, and the hypothesis
+  states exactly what that runtime test enforces: a nominated debris file is not load-bearing.
+-/
+theorem no_orphan_from_closed_debris
+    {locked kuf consumers residue debris : FSet File}
+    (hclosed : IsClosed cross needs sources locked)
+    (locked_subset_consumers : ∀ x, locked x → consumers x)
+    (debris_guard : ∀ k, debris k → ¬ loadbearing needs sources cross consumers k)
+    {f : File} {P : Phantom}
+    (hf : (locked f ∧ ¬ demoted needs sources cross kuf consumers residue f) ∧ ¬ debris f)
+    (hneed : needs f P)
+    (hsrc : ∃ s, sources s P) :
+    ∃ s, (locked s ∧ ¬ demoted needs sources cross kuf consumers residue s) ∧ ¬ debris s
+          ∧ sources s P := by
+  -- The C5 result already supplies a source `s` that is locked and not C5-demoted.
+  obtain ⟨s, hs_keptC5, hssrc⟩ :=
+    no_orphan_from_closed cross needs sources hclosed locked_subset_consumers hf.1 hneed hsrc
+  -- That source sources `P`, which `f` (a consumer) needs, so it is load-bearing - hence not debris.
+  have hcons_needs : ∃ g, consumers g ∧ needs g P :=
+    ⟨f, locked_subset_consumers f hf.1.1, hneed⟩
+  have hslb : loadbearing needs sources cross consumers s :=
+    source_lb_from_def needs sources cross consumers hssrc hcons_needs
+  have hsnotdebris : ¬ debris s := fun hd => (debris_guard s hd) hslb
+  exact ⟨s, hs_keptC5, hsnotdebris, hssrc⟩
+
+/-- `consumers` with `d` removed, as an `FSet` (the real predicate `loadbearing` takes). -/
+def without (consumers : FSet File) (d : File) : FSet File := fun x => consumers x ∧ x ≠ d
+
+/--
+  LOADBEARING STABILITY. For a file `d` that (i) is no OTHER file's cross-target source
+  (`∀ b, b ≠ d → ¬ cross d b`) and (ii) shares no needed phantom with any other file
+  (`∀ P, needs d P → ∀ s, s ≠ d → ¬ sources s P`), removing `d` from `consumers` leaves `loadbearing`
+  unchanged on every `b ≠ d`. These two hypotheses are EXACTLY the two halves of the `len(ks)==1`
+  singleton-tree guard, re-expressed in the `cross`/`needs`/`sources` vocabulary `loadbearing` uses; the
+  `Family` bridge lemmas (`singleton_d_no_cross` / `singleton_d_no_share`) discharge them from the guard.
+  This is what lets the FROZEN `loadbearing` (computed once with `d` still a consumer) equal the
+  recompute-without-`d` value for every `b ≠ d`, so discarding a singleton debris file changes no other
+  file's load-bearing status. The hypothesis is `∀ b, b ≠ d → ¬ cross d b` (not `∀ b`): a `cross d d`
+  self-edge is harmless and the singleton guard does not exclude it. -/
+theorem loadbearing_stable
+    (cross : File → File → Prop) (consumers : FSet File) {d : File}
+    (d_no_cross : ∀ b, b ≠ d → ¬ cross d b)
+    (d_no_share : ∀ P, needs d P → ∀ s, s ≠ d → ¬ sources s P)
+    {b : File} (hb : b ≠ d) :
+    loadbearing needs sources cross consumers b
+      ↔ loadbearing needs sources cross (without consumers d) b := by
+  constructor
+  · rintro (⟨a, hcons, hcr⟩ | ⟨P, hsrc, a, hcons, hneed⟩)
+    · refine Or.inl ⟨a, ⟨hcons, ?_⟩, hcr⟩
+      rintro rfl; exact (d_no_cross b hb) hcr
+    · refine Or.inr ⟨P, hsrc, a, ⟨hcons, ?_⟩, hneed⟩
+      rintro rfl; exact (d_no_share P hneed b hb) hsrc
+  · rintro (⟨a, ⟨hcons, _⟩, hcr⟩ | ⟨P, hsrc, a, ⟨hcons, _⟩, hneed⟩)
+    · exact Or.inl ⟨a, hcons, hcr⟩
+    · exact Or.inr ⟨P, hsrc, a, hcons, hneed⟩
+
 end FixProto

@@ -40,11 +40,11 @@ NOT loadbearing. Random-ish fuzz over small stores.
 import os, sys, random
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import trace_patched as P   # the local trace_patched.py (post-fix model) in this dir
-def mkfile(fps, owned, bnds, extra_lref=()):
+def mkfile(fingerprints, owned, bnds, extra_lref=()):
     lref=set(extra_lref)
     for (lp,par,nb) in bnds:
         if lp: lref.add(lp)
-    return dict(fps=fps, owned=owned, lref=lref, bnd=bnds)
+    return dict(fingerprints=fingerprints, owned=owned, lref=lref, bnd=bnds)
 
 def fuzz_once(rng):
     n=rng.randint(2,7)

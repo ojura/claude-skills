@@ -11,7 +11,7 @@ def HALT_raise(msg): raise RuntimeError(msg)         # "stop and ask" as an exce
 def HALT_print_continue(msg): print("HALT:",msg)     # if someone made it non-raising
 
 # Simulate registry: one running session whose sessionId is NOT a file in the store.
-fps = {"REALFILE": []}   # the only file in store
+fingerprints = {"REALFILE": []}   # the only file in store
 registry = [{"pid": os.getpid(), "sessionId": "GHOSTSESSIONxxxx", "status":"running"}]
 
 def run_live_block(HALT):
@@ -22,7 +22,7 @@ def run_live_block(HALT):
             try: os.kill(int(d["pid"]),0)
             except Exception: continue
             sid=d.get("sessionId","")[:8]
-            if sid not in fps:
+            if sid not in fingerprints:
                 HALT(f"live session {sid} has no file - resolve before proceeding")
             live.add(sid)
         except: pass                       # <-- the swallow

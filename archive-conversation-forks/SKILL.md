@@ -127,6 +127,18 @@ There are **two** classes of load-bearing file, and you must protect both:
 
 The fork/compaction data model (Patches A, D, F, H, J, K) is documented in `github.com/ojura/claude-patches` (`docs/patches.md`); read it first if you have it. If not, the rules above are the operative summary. **Keep the phantom-source locking even on a vanilla install (no `claude-patches`).** A phantom source holds real user/assistant messages that the *current* stock renderer simply fails to stitch into the needer's scrollback - **missing user messages are a rendering bug, not data absence** - and cross-file backfill should land upstream eventually (`claude-patches` does it today). Preserving the sources keeps that content in the store and ready to reconstruct the moment backfill is available; archiving them because today's renderer ignores them would move out real, if currently-unrendered, history. So phantom-source locking is forward-looking insurance, not over-correction. (The "do not over-correct" rule above still holds, but it is narrower than "skip phantoms on vanilla": it frees only byte-identical *non-sources* - forks with zero pre-content before their phantom boundary, which hold nothing to backfill from.) **If sessions have already been lost/deleted, this skill does not recover them - see the companion `recover-deleted-sessions-ext4` skill.**
 
+**HARD RULE: an empty fork-family result does NOT downscope the task.** When the deterministic pass finds
+no fork families (every session a standalone single-file tree), the pull is to reframe the whole job as
+smaller - "this is fundamentally just debris cleanup and titling, not consolidation" - and skip the
+per-file rigor. Resist it. Absence of forks changes NOTHING about the standard: every retained file still
+gets the unique-vs-kept measurement, a verbatim read of its residue, the cross-tree prose-overlap pass
+(content-forks hide WITHOUT a shared lpu - Step 3), and a title that passes the Step-7 acceptance test.
+The hedge words are the tell - "though", "just", "fundamentally", "only", "roughly N sessions" - and each
+marks a place effort is about to be dropped. (Real run: two such framings in one session, both caught by
+the user; one nearly skipped the prose-overlap pass that then found two real duplicate forks.) This is the
+same proxy-substitution the Design rationale warns about: a qualitative goal ("clean up the picker")
+quietly swapped for an easier proxy ("move the obvious junk"). Do the whole task at full rigor.
+
 ## Step 0 - read the live-session registry (authoritative, do this FIRST)
 
 Before touching anything, read `~/.claude/sessions/*.json`: one JSON per **running** Claude
@@ -190,7 +202,7 @@ steps (see the note after the code). It will NOT run as-is, by design. Gotchas c
 - A long file is not the most complete one: fork-debugging sessions replay content, so compare **distinct** fingerprints, not raw message counts.
 - `/rewind` and ctrl-z do **not** shrink the on-disk JSONL; they orphan a dead branch and keep appending (the rendered conversation shrinks, the file only grows). So a fingerprint pass over the raw file includes orphaned dead-branch messages: distinct-count reflects *all content the file ever held*, not just the live `parentUuid` chain. This is usually harmless (those messages are still real content, and containment/dedup handle them), but be aware a heavily-rewound session's distinct-count is inflated by dead branches when ranking canonicals.
 - The judgment zone and the per-theme docs both need verbatim text, but the design forbids reopening multi-MB files downstream. So capture a capped **fingerprint -> text** map here, in the one pass.
-- **Compute TWO fingerprint sets, both load-bearing.** A **raw** set (`fps`, hashes `type` + full `content` via `json.dumps`, so it includes `tool_use` / `tool_result`) drives byte-redundancy and containment, i.e. archival **safety** - using prose here would over-archive (same discussion done with different tool work looks "contained"). A **prose** set (`fps_prose`, user/assistant **text only**, no tool blocks) drives **family / theme grouping** - using raw here under-discriminates (two sessions that edited the same files look like one family). They are only half-distinguishable after the fact, so build both in this pass.
+- **Compute TWO fingerprint sets, both load-bearing.** A **raw** set (`fingerprints`, hashes `type` + full `content` via `json.dumps`, so it includes `tool_use` / `tool_result`) drives byte-redundancy and containment, i.e. archival **safety** - using prose here would over-archive (same discussion done with different tool work looks "contained"). A **prose** set (`fingerprints_prose`, user/assistant **text only**, no tool blocks) drives **family / theme grouping** - using raw here under-discriminates (two sessions that edited the same files look like one family). They are only half-distinguishable after the fact, so build both in this pass.
 
 Per file extract: msg count, distinct-msg count, first plain user message, gitBranch,
 first/last timestamp (normalised), set of owned uuids, lpu references, the `compact_boundary`
@@ -217,7 +229,7 @@ def norm(ts):
         return dt.isoformat()
     except Exception: return ""   # unparseable -> "" sorts FIRST/earliest, i.e. treated as oldest: it won't win the recency tiebreak (the safe default). NOT a bare `except` (would swallow KeyboardInterrupt).
 
-fps={}; fps_prose={}; ftext={}; owned={}; lref={}; bnd={}; nmsg={}; lts={}; firstmsg={}; global_uuid=defaultdict(set)
+fingerprints={}; fingerprints_prose={}; ftext={}; owned={}; lref={}; bnd={}; nmsg={}; lts={}; firstmsg={}; global_uuid=defaultdict(set)
 # STORE = the slug dir CONFIRMED in Step 1 (do NOT rely on the current working directory): glob THERE.
 STORE=os.path.expanduser("~/.claude/projects/<slug>")   # e.g. ".../-home-you-proj"; full paths flow through below
 files=sorted(glob.glob(os.path.join(STORE,"*.jsonl")))
@@ -252,12 +264,12 @@ for p in files:
             if h not in ftext:   # capped raw-fingerprint -> text PREVIEW (+ truncation flag), for the doc/judgment
                 # 2000 = a PREVIEW, not a full read. The truncation flag lets the judgment treat any message
                 # that hit the cap as substantive (KEEP): a key/proof can hide past the cap, so a truncated
-                # message is NEVER archived on the preview alone. (memory ~ distinct-fps * 2000.)
+                # message is NEVER archived on the preview alone. (memory ~ distinct-fingerprints * 2000.)
                 ftext[h]=(o["type"], disp.replace("\n"," ")[:2000], len(disp)>2000)
             t=norm(o.get("timestamp"));  last=max(last,t) if t else last
         if o.get("type")=="system" and o.get("subtype")=="compact_boundary":
             B.append((o.get("logicalParentUuid"), o.get("parentUuid"), n))  # n = msgs before boundary
-    fps[k]=F; fps_prose[k]=Fp; owned[k]=us; lref[k]=L; bnd[k]=B; nmsg[k]=len(F); lts[k]=last; firstmsg[k]=fu
+    fingerprints[k]=F; fingerprints_prose[k]=Fp; owned[k]=us; lref[k]=L; bnd[k]=B; nmsg[k]=len(F); lts[k]=last; firstmsg[k]=fu
 
 # phantom lpus = referenced but owned by no file
 all_lpus={lp for k in bnd for (lp,_,_) in bnd[k] if lp}
@@ -280,30 +292,30 @@ def needs(k):     # phantom lpus this file relies on a sibling for (boundary at 
 # shortcut diverges, but only protects you if you actually run the committed definition.
 
 # union-find trees: link files sharing an lpu value, or a cross-file dep edge
-parent={k:k for k in fps}
+parent={k:k for k in fingerprints}
 def find(x):
     while parent[x]!=x: parent[x]=parent[parent[x]]; x=parent[x]
     return x
 bylpu=defaultdict(list)
-for k in fps:
+for k in fingerprints:
     for lp in lref[k]: bylpu[lp].append(k)
 for ks in bylpu.values():
     for k in ks[1:]: parent[find(k)]=find(ks[0])
-dep={(a,b) for a in fps for lp in lref[a] for b in global_uuid.get(lp,()) if b!=a}
+dep={(a,b) for a in fingerprints for lp in lref[a] for b in global_uuid.get(lp,()) if b!=a}
 for a,b in dep: parent[find(a)]=find(b)
 trees=defaultdict(list)
-for k in fps: trees[find(k)].append(k)
+for k in fingerprints: trees[find(k)].append(k)
 
 # canonical: most DISTINCT content, recency as tiebreak, among non-debris (content floor)
 DEBRIS_MAX=11
 # DISTINCT count (len(set)), not raw len(F)=nmsg: a rewound/replayed fork-test inflates the raw count past
 # the floor, but DISTINCT content is what the floor is about (the doc's own distinct-vs-raw discipline).
-def is_debris(k): return len(set(fps[k])) <= DEBRIS_MAX
+def is_debris(k): return len(set(fingerprints[k])) <= DEBRIS_MAX
 def canonical(ks):
     cand=[k for k in ks if not is_debris(k)] or ks
     # final `, k` tiebreak: when distinct-count AND last-ts tie (e.g. byte-identical duplicate forks),
     # pick the lexically-first filename - deterministic, instead of max()'s accidental dict-insertion order.
-    return max(cand, key=lambda k:(len(set(fps[k])), lts[k], k))
+    return max(cand, key=lambda k:(len(set(fingerprints[k])), lts[k], k))
 
 # keep-locked closure: seed (canonicals + live) + transitive load-bearing over BOTH edge types.
 # AUTHORITATIVE never-touch: live sessionIds from ~/.claude/sessions/*.json (Step 0). NO mtime term -
@@ -324,9 +336,9 @@ for sp in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
     except (ProcessLookupError, ValueError, KeyError): continue   # (own-user sessions never raise EPERM)
     sid=d.get("sessionId","")[:8]
     # The registry is GLOBAL (every running Claude process, all projects). A session running in ANOTHER
-    # project has no file in THIS store, so `sid not in fps` does NOT by itself mean an inconsistency.
+    # project has no file in THIS store, so `sid not in fingerprints` does NOT by itself mean an inconsistency.
     # OUTSIDE any try, so a raising HALT is NEVER swallowed:
-    if sid not in fps:
+    if sid not in fingerprints:
         # Could be (a) a session in a different project (safe to skip) or (b) a this-project session whose
         # file is genuinely missing (a real inconsistency). Do NOT auto-skip on a cwd guess - a worktree maps
         # to a different cwd yet a SHARED store (Step 1) - so STOP and let the operator decide from the cwd:
@@ -345,7 +357,7 @@ if not live:
 # any file with a cross-file lpu target (a dep edge) or a co-referenced phantom (shared lpu), so a
 # single-file tree has no cross-file/phantom obligation to close over. NO mtime term (see above).
 seed={canonical(ks) for ks in trees.values() if len(ks)>1}
-seed|={k for k in fps if k in live}                                    # live (authoritative, Step 0)
+seed|={k for k in fingerprints if k in live}                                    # live (authoritative, Step 0)
 unsatisfiable={}   # kept file -> {phantom lpus it needs but NO file can source}: origin truly gone
 def locked_closure(seed):
     locked=set(seed); changed=True
@@ -356,12 +368,12 @@ def locked_closure(seed):
                 for b in global_uuid.get(lp,()):
                     if b not in locked: locked.add(b); changed=True
             for P in needs(k):                          # (2) phantom backfill: keep >=1 source
-                srcs=[s for s in fps if P in sources(s)]
+                srcs=[s for s in fingerprints if P in sources(s)]
                 if not srcs:                            # needed phantom with NO viable source ->
                     unsatisfiable.setdefault(k,set()).add(P)   # origin truly gone; SURFACE, don't silently pass
                     continue
                 if not (set(srcs)&locked):
-                    best=max(srcs, key=lambda s:len(set(fps[s])))  # richest origin
+                    best=max(srcs, key=lambda s:len(set(fingerprints[s])))  # richest origin
                     locked.add(best); changed=True
     return locked
 locked=locked_closure(seed)   # PRELIMINARY (canonicals+live); the per-tree keep below uses it. The
@@ -380,9 +392,9 @@ kept_unique_forks=set(); tree_archive_candidates=set()
 for ks in trees.values():
     if len(ks)==1: continue
     canon=canonical(ks); keep=set(ks)&locked | {canon}
-    kept_fp=set().union(*(set(fps[k]) for k in keep)) if keep else set()
+    kept_fp=set().union(*(set(fingerprints[k]) for k in keep)) if keep else set()
     for k in [x for x in ks if x not in keep]:
-        uniq=set(fps[k])-kept_fp           # unique vs THIS TREE's kept files (cross-tree dup -> recall pass)
+        uniq=set(fingerprints[k])-kept_fp           # unique vs THIS TREE's kept files (cross-tree dup -> recall pass)
         if len(uniq)>=CEILING:             # substantial tree-local unique -> AUTO-KEEP, don't even ask
             kept_unique_forks.add(k)
         else:                              # JUDGMENT ZONE: read uniq VERBATIM (ftext); a uniq message whose
@@ -408,16 +420,48 @@ if unsatisfiable: report_unsatisfiable_phantoms(unsatisfiable)
 consumers = KEPT | live
 loadbearing  = {b for a in consumers for lp in lref[a] for b in global_uuid.get(lp,()) if b!=a}  # cross-file targets
 needed       = set().union(*(needs(a) for a in consumers)) if consumers else set()                # phantoms they need
-loadbearing |= {s for s in fps if sources(s) & needed}                                            # files that source them
+loadbearing |= {s for s in fingerprints if sources(s) & needed}                                            # files that source them
 # loadbearing (ALL sources of a needed phantom) >= the ONE richest source the closure locks; the
 # redundant extra sources stay archivable.
 
-# `loadbearing`/`needed` are computed ONCE, ABOVE, and deliberately NOT recomputed after this C5 demotion.
-# Recomputing would strand a demoted fork's now-unneeded source as `~0-residue AND NOT loadbearing AND in
-# KEPT` - reintroducing the exact marker-tree hole C5 exists to close. The stale (pre-C5) value only ever
-# OVER-marks such a source `[scroll-dep]` (keep), the safe direction. (And C5 removes only 0-residue files,
-# which contribute no unique message, so later residues only GROW: a C5 survivor still has nonzero residue
-# against the final KEPT, so the static `residue` model stays faithful for survivors.)
+# DEBRIS-FIRST DISCARD - the one-window placement. Nominate throwaway singletons HERE: after `loadbearing`
+# is frozen, but BEFORE C5/recall/markers measure containment. The window is exactly one. A debris file's
+# own edges must still count when `loadbearing` is computed, or it could strip another file's protection;
+# but the file must be GONE from KEPT before any residue / kept_union is measured, or a debris shell can be
+# the sole kept container of another file's message - that file is then archived as "redundant" and the
+# debris file is archived too, so the message survives only in archived files. Discarding in a LATE pass was
+# exactly that loss (recall measuring against a KEPT that still held debris, and C5 reading a fork as
+# 0-residue because a debris file duplicated it). This ordering loses no content; the proofs in
+# proofs/ establish it (content_safe_post_debris, c5_demote_no_loss); a singleton debris file is provably non-loadbearing
+# (the loadbearing-stability lemma), so discarding it changes no other file's loadbearing status.
+def is_boilerplate(s):   # throwaway openers; conservative, tune to your store (see the debris subsection below)
+    s=(s or "").strip().lower()
+    return (not s or s.startswith(("<", "[request interrupted"))
+            or s in ("test","hi","hello","ping","you here?","?"))
+debris=set()
+for ks in trees.values():
+    if len(ks)!=1: continue                  # debris is ALWAYS a singleton tree -> debris is a subset of canonicals
+    k=ks[0]
+    if k in loadbearing or k in live: continue   # loadbearing (the frozen set), NEVER locked (see the trap below)
+    fu=firstmsg.get(k,"")
+    if nmsg[k]==0 or (is_debris(k) and (not fu or fu.lstrip().startswith(("/","cd ")) or fu.strip()=="cd" or is_boilerplate(fu))):
+        debris.add(k)
+for k in debris:
+    KEPT.discard(k); kept_unique_forks.discard(k); locked.discard(k)   # shrink KEPT ONLY - canonicals stays tree-derived
+    nominate_debris(k)                       # route to a debris/ theme; record in all_archived; user confirms at Step-6
+
+# `loadbearing`/`needed` are computed ONCE, ABOVE (over consumers WITH debris still in), and deliberately NOT
+# recomputed after the debris discard or the C5 demotion. The frozen value can only OVER-include - it never
+# drops a real cross-target or source - which is the safe direction; and a singleton debris file is
+# non-loadbearing anyway, so the discard changes no kept file's loadbearing status. (Recomputing after C5
+# would instead strand a demoted fork's now-unneeded source as `~0-residue AND NOT loadbearing AND in KEPT`,
+# reopening the marker hole C5 closes.) RESIDUE MONOTONICITY: removing ANY file from KEPT - a debris file
+# (which may have NONZERO residue) or a C5 0-residue fork - drops it from the subtracted union, so every
+# survivor's residue only GROWS. The static `residue` model never overstates a survivor's uniqueness, and the
+# `~0-residue AND NOT loadbearing` marker hole cannot reopen (proofs/: residue_grows_on_shrink,
+# nonzero_residue_survives_shrink). Monotonicity holds for removing ANY file from KEPT, not just a 0-residue
+# one, so the model stays faithful whether the removed file is debris (possibly nonzero residue) or a C5
+# 0-residue fork.
 #
 # A fork auto-kept on TREE-LOCAL uniqueness can be GLOBALLY redundant (its tree-unique content duplicated
 # in another tree's kept file). Re-measure vs the full kept set: a kept-unique fork with EXACTLY 0 global
@@ -425,7 +469,7 @@ loadbearing |= {s for s in fps if sources(s) & needed}                          
 # safely). Keeps the taxonomy sound: every remaining ~0-residue KEPT file is then load-bearing -> [scroll-dep].
 for k in sorted(kept_unique_forks):
     if k in loadbearing: continue
-    if not (set(fps[k]) - set().union(*(set(fps[j]) for j in KEPT if j!=k))):
+    if not (set(fingerprints[k]) - set().union(*(set(fingerprints[j]) for j in KEPT if j!=k))):
         KEPT.discard(k); kept_unique_forks.discard(k); locked.discard(k)   # keep `locked` a subset of KEPT
 
 # Deferred per-tree archives: a candidate moves only if the re-close did NOT lock it (i.e. not load-bearing).
@@ -445,11 +489,11 @@ for k in sorted(tree_archive_candidates - KEPT):
 # `[scroll-dep]`/`[fork]`. (Canonicals are `[main]` from selection; live are never-touch. None of these is
 # ever archived - all are in KEPT; load-bearing protects from MOVING, the loop only titles.)
 for k in sorted(KEPT - canonicals - live):
-    head=max(canonicals, key=lambda h: len(set(fps_prose[k]) & set(fps_prose[h])), default=None)
+    head=max(canonicals, key=lambda h: len(set(fingerprints_prose[k]) & set(fingerprints_prose[h])), default=None)
     # head is None only in a degenerate store with NO canonicals; then ov=0.0 routes to the low-ov branch
     # ([main]/none, no parent named), so the [fork]-of-head branch is never reached with head=None.
-    ov=(len(set(fps_prose[k]) & set(fps_prose[head]))/max(1,len(set(fps_prose[k])))) if head else 0.0
-    residue=set(fps[k]) - set().union(*(set(fps[j]) for j in KEPT if j!=k))   # RAW residue, then READ it
+    ov=(len(set(fingerprints_prose[k]) & set(fingerprints_prose[head]))/max(1,len(set(fingerprints_prose[k])))) if head else 0.0
+    residue=set(fingerprints[k]) - set().union(*(set(fingerprints[j]) for j in KEPT if j!=k))   # RAW residue, then READ it
     # 1) load-bearing AND ~0 residue -> [scroll-dep] of the canonical it backs, REGARDLESS of ov: a pure
     #    bridge can be prose-disjoint from every head (ov~0) yet raw-redundant. Only REGISTRY-live is never
     #    a scroll-dep (it is actively growing, not a dead ~0-unique bridge).
@@ -482,17 +526,21 @@ lpu-trees).
 After the per-tree partition, run a global containment pass.
 
 ```python
-# KEPT is the FULL retained set (canonicals + locked + kept_unique_forks), already defined ONCE in
-# Step 2 above and shared by the locked-set measurement and this recall pass - no second definition.
-keptset={k:set(fps[k]) for k in KEPT}
+# KEPT is the FULL retained set, defined ONCE in Step 2 above. CRITICAL: debris was already discarded from
+# KEPT in the Step-2 debris-first window, so `kept_union` below is debris-free. Were debris still in KEPT, a
+# debris shell could be the sole container that makes a candidate read 0-unique - the candidate would be
+# archived and the debris file archived too, losing the message. Measuring containment over the debris-free
+# KEPT is exactly what `content_safe_post_debris` certifies (proofs/).
+keptset={k:set(fingerprints[k]) for k in KEPT}
 kept_union=set().union(*keptset.values()) if keptset else set()
-# `a not in KEPT` already excludes every canonical (canonicals are a subset of KEPT), so no separate guard.
-for A in [a for a in fps if a not in KEPT and a not in live]:
+# `a not in KEPT` excludes every canonical (a subset of KEPT). Also exclude `debris`: those were archived in
+# Step 2, so they must not re-enter as recall candidates.
+for A in [a for a in fingerprints if a not in KEPT and a not in live and a not in debris]:
     # set-difference against the UNION of the whole kept set, NOT any single container - a session
     # whose content is split-contained across two smaller kept files is still 0-unique and redundant
-    # (the single-container test `len(fps[b])>=len(fps[A])` had exactly that recall hole).
-    missing = set(fps[A]) - kept_union
-    best = min(KEPT, key=lambda b: len(set(fps[A])-keptset[b]), default=None)  # closest single file, for the doc only
+    # (the single-container test `len(fingerprints[b])>=len(fingerprints[A])` had exactly that recall hole).
+    missing = set(fingerprints[A]) - kept_union
+    best = min(KEPT, key=lambda b: len(set(fingerprints[A])-keptset[b]), default=None)  # closest single file, for the doc only
     # SAFETY backstop, same shape as the C6 guard: content-redundancy and phantom-source status are
     # INDEPENDENT axes, so before archiving A confirm every phantom A sources that a kept file needs still
     # has a kept source. Safe by construction (the re-close locks a needed SOLE source into KEPT, so a recall
@@ -523,26 +571,51 @@ orchestrator runs `judge()` inline since it feeds `KEPT`, whereas `SONNET_CONFIR
 read, batched to the Step-5 agents. `KEPT`, `live`, `kept_unique_forks`, `tree_archive_candidates` etc.
 are real variables defined in the pass.)
 
-**Deterministic debris nomination.** The per-tree partition skips single-file trees
-(`if len(ks)==1: continue`), so a standalone throwaway (an empty `/clear`, a `/resume`, a bare
-`cd`, a one-shot that produced nothing) is never nominated by the script and falls entirely to
-the themer's soft flag plus the user gate - the weakest link, and "a clean list" usually
-hinges on debris removal. Nominate it deterministically too:
+**Deterministic debris nomination, guarded on `loadbearing`, never `locked`.** You decide whether a file
+is debris from the file's own content: an empty resume or fork stub with zero messages, a command-only
+shell (`/clear`, `/effort max`, `/resume`, `/model`), a bare `cd`, a one-shot that produced nothing. That
+classification needs nothing from the tree or the closure. What it does need is the load-bearing check,
+because debris must not be archived if some kept file reconstructs scrollback from it, and a file is
+load-bearing only after `loadbearing` is computed (right after the C4 re-close finalizes `KEPT`). So the
+scan runs at that point, in the main Step-2 block above: right after `loadbearing` is built, you nominate
+the debris and `KEPT.discard` it there, before C5 demotion, before the recall pass, and before the marker
+loop. Discarding it there is what keeps those passes honest. Each one measures containment against `KEPT`,
+and a debris file left in `KEPT` could be the only container it credits, so the file it "covers" would be
+archived and the debris moved out from under it. That is the loss just described - a debris file credited
+as the sole container, then archived alongside the file it covered - which the content theorems in `proofs/`
+rule out (`content_safe_post_debris`, `c5_demote_no_loss`). Present the
+debris hits to the user in the same Step-6 gate as the fork archives, so the user approves one list and
+never finds debris mid-titling; "one list up front" is about what the user sees in the gate, not about
+when the scan runs. The `is_boilerplate` helper the loop uses (defined with the loop in the main block)
+flags throwaway openers conservatively: an empty message, a `<...>` command tag, a `[request interrupted`,
+or a bare greeting.
 
-```python
-def is_boilerplate(s):   # operator heuristic (tune to your store; conservative). True for throwaway openers:
-    s=(s or "").strip().lower()
-    return (not s
-            or s.startswith(("<", "[request interrupted"))   # <ide_opened_file>/<command-name>/<local-command-caveat>/...
-            or s in ("test","hi","hello","ping","you here?","?"))
-for ks in trees.values():
-    if len(ks)!=1: continue
-    k=ks[0]
-    if k in locked or k in live: continue
-    fu=firstmsg.get(k,"")        # first plain user message, captured in Step 2's pass above
-    if is_debris(k) and (not fu or fu.lstrip().startswith(("/","cd ")) or is_boilerplate(fu)):   # distinct-count floor (see is_debris)
-        nominate_debris(k)       # route to a debris/ theme; still shown in the user gate before moving
-```
+**The guard is `loadbearing`, NOT `locked` - this is a real trap.** When nearly every session is a
+standalone single-file tree (no real fork families), each is its own canonical, so the C4 re-close
+balloons `locked` to ~ALL files (`locked = locked_closure(KEPT)` with `KEPT ⊇ canonicals ⊇` every
+single-file-tree member). `if k in locked` then skips EVERY debris candidate and nominates nothing,
+silently. (Real run: 9 empty stubs + 11 command-only shells were all suppressed this way and only
+surfaced late, mid-titling.) Guard on the genuinely **load-bearing** set instead - cross-file lpu
+targets plus phantom sources - and the line-555 guard excludes a file the moment it is load-bearing (a
+0-message stub can still own a `compact_boundary` uuid, so do not infer non-load-bearing from a zero
+message count; the guard tests membership directly). Archiving a non-load-bearing file (the debris path is
+a SECOND non-load-bearing demotion alongside C5) is proved in `proofs/` not to orphan any kept session
+(`FixProto.no_orphan_from_closed_debris`), and not to strand another kept file's only copy of a message:
+the recall and C5 passes measure
+containment over the post-debris `KEPT` (`content_safe_post_debris`, `c5_demote_no_loss`), and removing
+debris only grows other files' residue (`residue_grows_on_shrink`), so the marker tree is unaffected.
+`debris ⊆ canonicals` (`Family.singleton_canonicalPick`) keeps debris out of the marker range
+(`marker_range_excludes_debris`), and a singleton debris file changes no other file's load-bearing status
+(`loadbearing_stable`). Whether the debris file's *own* content is worthless stays the operator's read,
+not a theorem.
+
+**A trivial one-shot question is debris too - but route it to the user gate, not an auto-nominate.** A
+session whose only substantive turn is a single unanswered question (e.g. "Can I resume chat with this
+agent directly?"), especially when a larger kept session covers the same ground, is throwaway - but its
+opener is plain prose, so `is_boilerplate` misses it. Don't auto-archive on a 1-turn heuristic (a
+one-message session can hold a key); instead flag any `<=1`-substantive-turn one-shot to the **per-item
+user gate** (Step 6) with its text, defaulting to keep. (Real run: a 1-message "can I resume this agent"
+question was kept by default until the user called it out.)
 
 Keep it conservative (the user still confirms debris before it moves), but do not leave debris
 detection entirely to LLM judgment.
@@ -559,8 +632,8 @@ sweep, which the protections below guard against size-agnostically.
 
 - **Fork family** = files in the same lpu tree. Files sharing the same phantom lpu in their first compact_boundary are forks of one conversation tree.
 - **False family** = files that share only an identical first message (skill preambles like a `/`-prefixed command invocation, or identical compaction headers). The script unions on **lpu values, never on first-message content**, so false families do not merge by construction. Keep a content common-prefix-length (cpl) calculation only as a **diagnostic** to sanity-check tree membership; do not drive the partition off it.
-- **Content-fork members (lpu-union UNDER-groups - do not stop at the lpu tree).** lpu grouping only catches forks that share an lpu value. A fork made by copying messages (fresh uuids, no shared lpu), or a long conversation that continued under a new topic/issue, will NOT union by lpu and masquerades as a separate session/theme. Detect these with a **prose-only** content-overlap pass over the `fps_prose` set from Step 2 (user/assistant TEXT only, no `tool_use`/`tool_result`): if a file shares more than ~60% of its `fps_prose` messages with a larger family member, it is a fork of that family. **Use `fps_prose`, never raw `fps`, for this** - raw content-overlap is confounded by shared tool-results (two sessions that edited the same files share those fingerprints). Real run: one session was 82% *prose*-shared with another theme's canonical (same family, but mis-themed as separate), while a tooling-heavy session showed 100% *raw* overlap with that same canonical yet 1% prose (all shared file-edits) and was a different conversation. The lpu tree is necessary but not sufficient for family membership.
-- **Canonical** = most *distinct* content, recency as tiebreak, chosen among non-debris files (a content floor, so a 3-message newest fork-test never wins over a 2000-message sibling). This ranks on raw-distinct (`len(set(fps[k]))`), which counts tool-churn as content; within a true fork family that still picks the most complete member. If you ever see a canonical chosen wrongly because one member is tool-heavy rather than conversation-heavy, switch the rank key to prose-distinct (`len(set(fps_prose[k]))`); not worth doing pre-emptively.
+- **Content-fork members (lpu-union UNDER-groups - do not stop at the lpu tree).** lpu grouping only catches forks that share an lpu value. A fork made by copying messages (fresh uuids, no shared lpu), or a long conversation that continued under a new topic/issue, will NOT union by lpu and masquerades as a separate session/theme. Detect these with a **prose-only** content-overlap pass over the `fingerprints_prose` set from Step 2 (user/assistant TEXT only, no `tool_use`/`tool_result`): if a file shares more than ~60% of its `fingerprints_prose` messages with a larger family member, it is a fork of that family. **Use `fingerprints_prose`, never raw `fingerprints`, for this** - raw content-overlap is confounded by shared tool-results (two sessions that edited the same files share those fingerprints). Real run: one session was 82% *prose*-shared with another theme's canonical (same family, but mis-themed as separate), while a tooling-heavy session showed 100% *raw* overlap with that same canonical yet 1% prose (all shared file-edits) and was a different conversation. The lpu tree is necessary but not sufficient for family membership.
+- **Canonical** = most *distinct* content, recency as tiebreak, chosen among non-debris files (a content floor, so a 3-message newest fork-test never wins over a 2000-message sibling). This ranks on raw-distinct (`len(set(fingerprints[k]))`), which counts tool-churn as content; within a true fork family that still picks the most complete member. If you ever see a canonical chosen wrongly because one member is tool-heavy rather than conversation-heavy, switch the rank key to prose-distinct (`len(set(fingerprints_prose[k]))`); not worth doing pre-emptively.
 - **Load-bearing (never move)** = the `locked` closure: cross-file lpu targets plus phantom-backfill sources, transitively, seeded from canonicals and live sessions (Step 0), then re-closed over the full kept set so a kept fork's own backfill source is never archived.
 - **Archive candidate** = a non-locked, non-canonical fork whose unique content, *after someone reads it*, is self-evidently worthless. Compute unique content by set-difference against the kept files, not by prefix-divergence ("diverged at msg 2" and "4 unique messages" routinely disagree; set-difference is the one that matters for data loss). Then **judge the messages, never the count.** A single message can hold a private key, a derivation, or irreplaceable data. `CEILING` (default 50) only auto-*keeps* forks at or above it. Below it is a judgment zone: read the unique messages and archive only the self-evidently worthless (empty / tool-only turns, exact replays already in the canonical, fork-test artifacts, trivial one-shot Q&A). Anything substantive is flagged for human judgment and kept by default.
 
@@ -639,13 +712,14 @@ Give the picker a themed shape by appending a `custom-title` record to each reta
 - **Format: `<family> <sub-label>: <1 to 2 sentences, gist first>`.** Use an **umbrella family** label (e.g. `backend`, `claude-patches`) with a **sub-label** for the sub-area: an **issue number** where the store has issue tracking (`1234`, `1290`), otherwise a short **topic tag** (`auth`, `search`, `parser`). Assign the sub-label by **topic, not branch**: many sessions all run on one long-lived branch, so the branch field is a poor theme signal. (The markers below - `[main]` / `[fork]` / `[scroll-dep]` - are project-agnostic and apply either way.) The sentences say what the session actually is or did; the picker truncates the *tail*, which is the reason to front-load the gist - NOT a width to fit (see "no character limit" below). NOT a bare slug, NOT a terse invented phrase (a real run rejected `fork-empty` and `shell/setup ops` as meaningless), NOT 3+ sentences, and NEVER the raw first message (a tool/command echo or `<ide_opened_file>` tag). Date-only differentiators (`(Apr 3)`) are uninformative.
 - **Marker taxonomy - every retained session is exactly one of four, decided by *containment* and *unique content*, never by issue number, branch, or a one-per-family assumption.** (Archive is **not** a fifth marker: it is the prior retain-vs-move-out decision, exclusive of all four - only retained files are marked.) Put the marker at the very front so it survives picker truncation.
 
-    - **`[main]`** - a **near-disjoint, substantial** body of work (a head): low `fps_prose` overlap with the other heads. **Lone or with offshoots both qualify** - a lone substantial standalone is a `[main]` with zero forks, and having no children never demotes it. (Real miss: an 1887 head 99% disjoint from the 2110 head was left unmarked because `[main]` was assigned one-per-family; a 2268 frame-naming head, equally disjoint, was missed the same way. Both are `[main]`.)
+    - **`[main]`** - a **near-disjoint, substantial** body of work (a head): low `fingerprints_prose` overlap with the other heads. **Lone or with offshoots both qualify** - a lone substantial standalone is a `[main]` with zero forks, and having no children never demotes it. (Real miss: an 1887 head 99% disjoint from the 2110 head was left unmarked because `[main]` was assigned one-per-family; a 2268 frame-naming head, equally disjoint, was missed the same way. Both are `[main]`.)
     - **`[fork] <main>`** - a kept offshoot **mostly contained** in a `[main]` (high overlap) but holding *modest unique content* worth keeping. Name the main it belongs to and what is unique to it. (e.g. a rotations session 82% contained in the 2110 head: `[fork]` of it, unique = the rotations carry-through.)
     - **`[scroll-dep] <main>`** - a `locked` file mostly contained in a `[main]` with **~0 unique** (a pure scrollback bridge). It is kept (not archived) *because it is load-bearing*; that retain-vs-archive call is settled by load-bearing status, never containment %, before any marker is assigned (see the gate in READ THIS FIRST). Name the canonical it backs, and **name the residue read verbatim, never a bare count**: "8 unique" hides that the 8 are policy-refusals; "unique: refusals + asides" tells the reader to skip it. If the residue is genuinely substantive it is not a scroll-dep, it is a `[fork]`.
     - **(no marker)** - a **minor standalone**: a small one-off below the substance floor, in no family. The title alone carries it.
 
-    The four are decided by **three discriminators - two measured, one judged**. **Containment** (near-disjoint vs mostly-inside-a-head) is measured by `fps_prose` overlap; **amount of unique content** (substantial / modest / ~zero) by the unique-fingerprint count against `CEILING` / 0. The **substance floor** (a real body of work vs a minor one-off) is **not** reducible to a constant - **the LLM judges it, and in genuinely uncertain cases the user decides** (several calls in a real run went to the user). The boundaries: `[main]`-vs-`[fork]` is containment (measured); `[fork]`-vs-`[scroll-dep]` is amount-of-unique-content (measured); `[main]`-vs-none is the substance floor (judged). For the floor the numbers give only **eyeball cues, never the verdict**: a session with far fewer of its-own (found-nowhere-else) messages than `CEILING`, or far smaller than the sessions already marked `[main]` (the "order of the other heads" - same rough magnitude), is **possibly** a minor one-off - a flag to look closer, never a presumption. **Small is not the same as unimportant**; raw count alone neither promotes a one-off to `[main]` nor dismisses a small-but-substantial session. `[main]` is reserved for a primary line of work, and that call is judgment, not arithmetic. (Reducing the cue to a hard constant is exactly the proxy the rationale section warns against - so this rule is deliberately a judgment with assists, not a formula.)
+    The four are decided by **three discriminators - two measured, one judged**. **Containment** (near-disjoint vs mostly-inside-a-head) is measured by `fingerprints_prose` overlap; **amount of unique content** (substantial / modest / ~zero) by the unique-fingerprint count against `CEILING` / 0. The **substance floor** (a real body of work vs a minor one-off) is **not** reducible to a constant - **the LLM judges it, and in genuinely uncertain cases the user decides** (several calls in a real run went to the user). The boundaries: `[main]`-vs-`[fork]` is containment (measured); `[fork]`-vs-`[scroll-dep]` is amount-of-unique-content (measured); `[main]`-vs-none is the substance floor (judged). For the floor the numbers give only **eyeball cues, never the verdict**: a session with far fewer of its-own (found-nowhere-else) messages than `CEILING`, or far smaller than the sessions already marked `[main]` (the "order of the other heads" - same rough magnitude), is **possibly** a minor one-off - a flag to look closer, never a presumption. **Small is not the same as unimportant**; raw count alone neither promotes a one-off to `[main]` nor dismisses a small-but-substantial session. `[main]` is reserved for a primary line of work, and that call is judgment, not arithmetic. (Reducing the cue to a hard constant is exactly the proxy the rationale section warns against - so this rule is deliberately a judgment with assists, not a formula.)
 - **Read the session before titling it.** A title written from the first message alone is how you get "shell/setup ops" jargon; the real topic is usually mid-conversation.
+- **Sonnets may do the READING; the orchestrator keeps the SYNTHESIS global.** For many sessions, the verbatim read is delegable to Sonnet agents (like the Step-5 README agents) - each reports what its session is *for* and quotes representative mid-conversation turns. But the **family labels and the marker taxonomy (`[main]`/`[fork]`/`[scroll-dep]`/none) are a GLOBAL decision**: they depend on cross-session containment and which head a fork belongs to, so independent agents assigning final titles lose consistency (no agent sees the others' family labels). Have agents return per-session substance, then assign family + sub-label + marker yourself in ONE pass holding the whole family map. (For a small store the orchestrator's own per-session digest of user-message throughlines is usually read enough; reach for agents when the sessions are large or many.)
 - **Name the substance, never the opening.** Family, sub-label, and sentence describe what the session is *for* - the work it actually did, which lives mid-conversation. Never title from what was on screen when it opened: a seed/context prompt, a skill preamble, the first command, or the first artifact it happened to decode. Real misses: a card-RE fork titled `card-header` after the FAT32 dump on its first screen, and a patch-reapply titled `cli-subprocess` after a mid-session tangent. The first message is the least representative line in the session (same root as `shell/setup ops`); the acceptance test above is the gate.
 - **No character limit; "truncates" is not a budget.** Write 1 to 2 complete, plain sentences. "The picker truncates the tail" is the reason to put the gist first so it survives truncation; it is NOT a width to fit, and never a licence to abbreviate, drop words, or compress. A readable sentence the picker cuts off beats a complete one nobody can parse. (Real failure: a run invented a ~96-char cap out of the word "truncates", and once it had a number to optimise, readability lost - it produced cryptic fragments the author themselves could not read.)
 - **Acceptance test (pass/fail, not an adjective).** Read the title as someone who never saw the session. If understanding it needs context only the person who ran it holds - raw uuids, coined abbreviations, symbol shorthand - it fails; rewrite. The bar is literally: a colleague who did not do the work, including future-you, understands it cold. If the author of the work cannot parse it, it is wrong.

@@ -29,18 +29,30 @@ should land on. `no_orphan` is the reusable lemma it is built from.
 
 **`Orphan.recall_no_loss` (the recall pass's content-level safety).** The recall pass archives
 a candidate `A` when its message set is fully contained in the union of the kept files
-(`missing = fps[A] - kept_union` is empty). This theorem proves that decision loses nothing:
+(`missing = fingerprints[A] - kept_union` is empty). This theorem proves that decision loses nothing:
 if the test passes, every message of `A` still lives in some kept file. Where `no_orphan` is
 the *structural* safety of archiving (never drop a needed source), `recall_no_loss` is the
 *content* safety (never drop a message).
 
-**Scope of the content-safety guarantee.** `recall_no_loss` machine-checks content preservation for
-EXACTLY the 0-unique recall path (the `missing = ∅` test). The other two archive paths - the C6
-per-tree archive of judged-worthless forks, and the nonzero-recall `SONNET_CONFIRM` path - have NO
-content-safety theorem, by design: that the unique residue on those paths is genuinely worthless is
-the operator / Sonnet verbatim read, not a math predicate. `no_orphan` still covers all three paths
-*structurally* (none ever orphans a kept session's source), but content-safety on the judged paths
-rests on the read, not on Lean.
+**Scope of the content-safety guarantee.** A move can lose content in one specific way: archiving a file
+that holds the only copy of some message a kept file still needs. The proof separates that from a different
+question it deliberately leaves to a person. For each archived file ask two things. First, is this file's
+own content worthless? That is the operator's verbatim read (for debris) or the Sonnet's read (for a judged
+fork); it is not a math predicate, so it stays out of Lean. Second, does archiving this file strand another
+file's only copy of a message? That one is a math predicate, and it is proved.
+
+Four paths archive a file: the 0-unique recall path, the C6 per-tree archive of judged-worthless forks, the
+nonzero-recall `SONNET_CONFIRM` path, and the Step-2 debris nomination. `recall_no_loss` covers the
+0-unique recall path: when its `missing = ∅` test passes, every message of the archived file still lives in
+a kept file. `content_safe_post_debris` and `c5_demote_no_loss` extend this to the debris and C5 paths: the
+recall and C5 archives measure containment against the kept set *after* debris is removed, so the file they
+credit as the container is itself never a debris file that is also leaving. The load-bearing ordering is
+that debris is discarded before the recall and C5 passes compute containment, so no path keeps a container
+a later path then moves. The C6 judged-worthless path and the nonzero `SONNET_CONFIRM` path still have no
+message-loss theorem, by design: whether their unique residue is worthless is the read, not Lean.
+`no_orphan` covers all four paths *structurally* (none ever orphans a kept session's phantom source); the
+message-loss guarantee now holds for the recall, debris, and C5 paths, and only the worthlessness judgment
+rests on the read.
 
 **`Orphan.live_subset_keptC5` (live sessions are never moved).** Every live session (from the
 `~/.claude/sessions` registry) is in the final kept set: the code seeds live into the closure
@@ -72,6 +84,30 @@ that the *real* range can never hit the removed branch, which is the load-bearin
 and it is slightly MORE decisive than the loop comments: for the high-ov + non-substantive case the
 prose leaves open, `classify` commits to `none`. So `classify` documents one faithful resolution of
 the tree, not the only admissible one; `marker_no_hole` is the load-bearing guarantee.
+
+**`FixProto.no_orphan_from_closed_debris` + `Family.singleton_canonicalPick` / `Orphan.marker_range_excludes_debris` (the DEBRIS demotion, brought inside the proof).** The committed pipeline removes files
+from the picker on TWO non-load-bearing paths, not one: C5 demotion AND the Step-2 `nominate_debris`
+(guarded by `if k in loadbearing: continue`, so `debris k → ¬loadbearing k`). `no_orphan` was always
+generic over the removal set - it constrains `demoted` ONLY through `demoted_guard : removed → ¬loadbearing`
+- so the second removal composes: `no_orphan_from_closed_debris` proves no-orphan survives `locked` minus
+BOTH demotions, because the fixpoint-realised source is load-bearing and NEITHER path removes a
+load-bearing file. The marker side needs nothing extra structurally: `Family.singleton_canonicalPick`
+proves a singleton tree's canonical is its sole member (whether or not it is `is_debris`, since the
+floored `cand` falls back to `ks`), hence `debris ⊆ canonicals` (`debris_nominated_canonical`), and
+`marker_range_excludes_debris` then shows the marker loop's `¬canonicals` range never contains a debris
+file - so `marker_no_hole` carries verbatim. This closes the gap the SKILL.md guard change
+(`locked`→`loadbearing` in debris nomination) would otherwise have left: the new archive path is
+machine-checked, not assumed safe. Structurally, `no_orphan_from_closed_debris` shows debris removal never
+orphans a kept session's phantom source. For content, `content_safe_post_debris` and `c5_demote_no_loss`
+show the recall and C5 passes credit only a kept file that survives debris removal, so archiving a debris
+file never strands another file's only copy of a message; this rests on discarding debris before those
+passes compute containment, and on `residue_grows_on_shrink` (removing debris only grows other files'
+residue, so the marker tree is untouched). A singleton debris file changes no other file's load-bearing
+status (`loadbearing_stable`). The new theorems are fully constructive (no axioms); the `canonicalPick`
+and the concrete debris witnesses list only `propext`, like the other `canonical_*` lemmas. What still
+rests on the operator's read is one thing: whether the debris file's own content is worthless. That a file
+holds nothing worth keeping is a person's judgment; that archiving it loses no other file's message is now
+proved.
 
 **`Family.*` (union-find grouping and `canonical()` selection).** The union-find partition is
 modelled as the equivalence closure of the edge relation (shared-lpu or cross-file `dep`); the
@@ -220,10 +256,14 @@ mutually-exclusive assignment, the union-find grouping is an equivalence (co-tre
 `canonical()` returns a member / respects the floor / picks the max key, the keep-locked loop
 terminates, and even the `find` path-compression optimisation preserves components. The bridge facts
 connecting the abstract model to the code are *derived*, not assumed, and the one loop-body oracle is
-*constructed*. Two things are deliberately NOT machine-checked, for different reasons. (a) **Content
-safety on the judged archive paths**: `recall_no_loss` proves it for the 0-unique recall path only;
-the C6 judged-worthless and nonzero-`SONNET_CONFIRM` paths rest on the operator / Sonnet read (see
-the content-safety scope note above) - "worthless residue" is not a math predicate. (b) The
+*constructed*. Two things are deliberately NOT machine-checked, for different reasons. (a) **Whether a
+judged residue is worthless**: `recall_no_loss`, `content_safe_post_debris`, and `c5_demote_no_loss` prove
+no archived file strands another file's only message on the 0-unique recall, debris, and C5 paths; only
+the C6 judged-worthless and nonzero-`SONNET_CONFIRM` paths lack a message-loss theorem, because whether
+their unique residue is worthless is the operator / Sonnet read (see the content-safety scope note above),
+not a math predicate. The debris path is additionally exercised by the property-based fuzz
+(`check_no_lost_message` in `step2_model.py`, which fails on the old debris-last ordering and passes on the
+window-of-one fix). (b) The
 **model-to-Python boundary** (genuinely irreducible for a model-level proof): whether the Python
 computes what the abstract relations (`cross`, the fingerprints, the key scalars) and the
 `needs`/`sources` boundary records say - the JSONL parse, the actual mutable union-find, the real
@@ -318,10 +358,10 @@ the shortcut. (Mirrors the `sources()`/`needs()` DISCIPLINE note in `../SKILL.md
 
 ## Files
 
-- `Orphan.lean` - the closure, the re-close, C5 safety, `no_orphan`, and the recall no-loss theorem.
-- `Markers.lean` - the closure-inversion lemma, `live_subset_keptC5`, `marker_no_hole`, the wired capstones, and the marker classification (`classify` + total/exclusive/exhaustive lemmas).
-- `Family.lean` - union-find as an equivalence (co-tree and false-family lemmas), `canonical()` membership + floor + max-key selection (`Family.Canon`, core lex order), and `find` path-compression correctness (`Family.Compress`).
-- `Fixpoint.lean` - `IsClosed`, the seven bridge facts derived (`hpick_from_closed`, `source_lb_from_def`, `cross_lb_from_def`, `demoted_guard_from_def`, `live_not_demoted_from_def`, `C5_survivor_from_def`), and `no_orphan_from_closed`.
+- `Orphan.lean` - the closure, the re-close, C5 safety, `no_orphan`, the recall no-loss theorem, and the content-safety-under-debris theorems (`content_safe_post_debris` and `c5_demote_no_loss` for the recall and C5 paths over the post-debris kept set, plus `residue_grows_on_shrink` / `nonzero_residue_survives_shrink`).
+- `Markers.lean` - the closure-inversion lemma, `live_subset_keptC5`, `marker_no_hole`, `marker_range_excludes_debris` (the marker range omits debris), the wired capstones, and the marker classification (`classify` + total/exclusive/exhaustive lemmas).
+- `Family.lean` - union-find as an equivalence (co-tree and false-family lemmas), `canonical()` membership + floor + max-key selection (`Family.Canon`, core lex order), `singleton_canonicalPick` / `debris_nominated_canonical` (`debris ⊆ canonicals`), the loadbearing-stability bridges (`singleton_d_no_cross` / `singleton_d_no_share`, discharging the singleton guard into the stability hypotheses), and `find` path-compression correctness (`Family.Compress`).
+- `Fixpoint.lean` - `IsClosed`, the seven bridge facts derived (`hpick_from_closed`, `source_lb_from_def`, `cross_lb_from_def`, `demoted_guard_from_def`, `live_not_demoted_from_def`, `C5_survivor_from_def`), `no_orphan_from_closed`, `no_orphan_from_closed_debris` (no-orphan survives the debris demotion), and `loadbearing_stable` (discarding a singleton debris file changes no other file's load-bearing status).
 - `Boundary.lean` - the par/nb layer: `needs` / `sources` DEFINED as the committed set-builder over `(lpu, par, nb)` records (`sourcesOf` / `needsOf`), the per-record source/need partition (`rec_excl` / `rec_total` / `rec_iff`, 2-bit cube `bit_partition`), the `par is not None`-only bug as a checked divergence (`lazy_flips_source_to_need`), and `no_orphan_from_closed_bnd` (the unconditional no-orphan over the defined relations). Axiom-free.
 - `Termination.lean` - `gap_lt` + `closed_superset_exists` (a closed set exists over a finite universe, discharging `IsClosed`), and the constructed loop-body oracle (`expand` / `closed_of_none` / `closed_superset_exists_constructed`). Core Lean, hand-rolled (no mathlib).
 - `Check.lean` - the axiom audit (`#print axioms`) and concrete non-vacuity models for all theorems.

@@ -8,11 +8,11 @@ because the closure runs BEFORE kept_unique_forks is known / is not seeded with 
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import trace as T   # the local trace.py (pre-fix model) in this dir, not the stdlib trace module
-def mkfile(fps, owned, bnds, extra_lref=(), mtime=0.0):
+def mkfile(fingerprints, owned, bnds, extra_lref=(), mtime=0.0):
     lref=set(extra_lref)
     for (lp,par,nb) in bnds:
         if lp: lref.add(lp)
-    return dict(fps=fps, owned=owned, lref=lref, bnd=bnds, mtime=mtime)
+    return dict(fingerprints=fingerprints, owned=owned, lref=lref, bnd=bnds, mtime=mtime)
 
 base = {
   "CANONXXX": mkfile(["c%d"%i for i in range(300)], ["uSH","uc"], []),

@@ -3,8 +3,8 @@ Faithful re-implementation of the SKILL.md Step 2 set construction, to probe
 the structural CLAIMS against what the code actually computes.
 
 We model files abstractly: each file k has
-  fps[k]      : list of raw fingerprints
-  fps_prose[k]: list of prose fingerprints
+  fingerprints[k]      : list of raw fingerprints
+  fingerprints_prose[k]: list of prose fingerprints
   owned[k]    : set of uuids
   lref[k]     : set of lpu values referenced
   bnd[k]      : list of (lpu, parentUuid, n_before)
@@ -15,25 +15,25 @@ from collections import defaultdict
 import time
 
 def build_world(files):
-    fps        = {k: v["fps"] for k,v in files.items()}
-    fps_prose  = {k: v.get("fps_prose", v["fps"]) for k,v in files.items()}
+    fingerprints        = {k: v["fingerprints"] for k,v in files.items()}
+    fingerprints_prose  = {k: v.get("fingerprints_prose", v["fingerprints"]) for k,v in files.items()}
     owned      = {k: set(v["owned"]) for k,v in files.items()}
     lref       = {k: set(v["lref"]) for k,v in files.items()}
     bnd        = {k: list(v["bnd"]) for k,v in files.items()}
-    nmsg       = {k: len(v["fps"]) for k,v in files.items()}
+    nmsg       = {k: len(v["fingerprints"]) for k,v in files.items()}
     lts        = {k: v.get("lts","") for k,v in files.items()}
     mtime      = {k: v.get("mtime", 0.0) for k,v in files.items()}
     firstmsg   = {k: v.get("firstmsg","") for k,v in files.items()}
     global_uuid = defaultdict(set)
-    for k in fps:
+    for k in fingerprints:
         for u in owned[k]:
             global_uuid[u].add(k)
-    return dict(fps=fps, fps_prose=fps_prose, owned=owned, lref=lref, bnd=bnd,
+    return dict(fingerprints=fingerprints, fingerprints_prose=fingerprints_prose, owned=owned, lref=lref, bnd=bnd,
                 nmsg=nmsg, lts=lts, mtime=mtime, firstmsg=firstmsg,
                 global_uuid=global_uuid)
 
 def run(W, live_keys, now=None, RECENT_HOURS=12, DEBRIS_MAX=11, CEILING=50):
-    fps=W["fps"]; fps_prose=W["fps_prose"]; owned=W["owned"]; lref=W["lref"]
+    fingerprints=W["fingerprints"]; fingerprints_prose=W["fingerprints_prose"]; owned=W["owned"]; lref=W["lref"]
     bnd=W["bnd"]; nmsg=W["nmsg"]; lts=W["lts"]; mtime=W["mtime"]
     global_uuid=W["global_uuid"]
     if now is None: now=time.time()
@@ -45,30 +45,30 @@ def run(W, live_keys, now=None, RECENT_HOURS=12, DEBRIS_MAX=11, CEILING=50):
     def needs(k):
         return {lp for (lp,par,nb) in bnd[k] if lp in phantom and par is None and nb==0}
 
-    parent={k:k for k in fps}
+    parent={k:k for k in fingerprints}
     def find(x):
         while parent[x]!=x: parent[x]=parent[parent[x]]; x=parent[x]
         return x
     bylpu=defaultdict(list)
-    for k in fps:
+    for k in fingerprints:
         for lp in lref[k]: bylpu[lp].append(k)
     for ks in bylpu.values():
         for k in ks[1:]: parent[find(k)]=find(ks[0])
-    dep={(a,b) for a in fps for lp in lref[a] for b in global_uuid.get(lp,()) if b!=a}
+    dep={(a,b) for a in fingerprints for lp in lref[a] for b in global_uuid.get(lp,()) if b!=a}
     for a,b in dep: parent[find(a)]=find(b)
     trees=defaultdict(list)
-    for k in fps: trees[find(k)].append(k)
+    for k in fingerprints: trees[find(k)].append(k)
 
     def is_debris(k): return nmsg[k] <= DEBRIS_MAX
     def canonical(ks):
         cand=[k for k in ks if not is_debris(k)] or ks
-        return max(cand, key=lambda k:(len(set(fps[k])), lts[k]))
+        return max(cand, key=lambda k:(len(set(fingerprints[k])), lts[k]))
 
     live=set(live_keys)
 
     seed={canonical(ks) for ks in trees.values() if len(ks)>1}
-    seed|={k for k in fps if k in live}
-    seed|={k for k in fps if (now-mtime[k]) < RECENT_HOURS*3600}
+    seed|={k for k in fingerprints if k in live}
+    seed|={k for k in fingerprints if (now-mtime[k]) < RECENT_HOURS*3600}
 
     unsatisfiable={}
     def locked_closure(seed):
@@ -80,11 +80,11 @@ def run(W, live_keys, now=None, RECENT_HOURS=12, DEBRIS_MAX=11, CEILING=50):
                     for b in global_uuid.get(lp,()):
                         if b not in locked: locked.add(b); changed=True
                 for P in needs(k):
-                    srcs=[s for s in fps if P in sources(s)]
+                    srcs=[s for s in fingerprints if P in sources(s)]
                     if not srcs:
                         unsatisfiable.setdefault(k,set()).add(P); continue
                     if not (set(srcs)&locked):
-                        best=max(srcs, key=lambda s:len(set(fps[s])))
+                        best=max(srcs, key=lambda s:len(set(fingerprints[s])))
                         locked.add(best); changed=True
         return locked
     locked=locked_closure(seed)
@@ -95,9 +95,9 @@ def run(W, live_keys, now=None, RECENT_HOURS=12, DEBRIS_MAX=11, CEILING=50):
     for ks in trees.values():
         if len(ks)==1: continue
         canon=canonical(ks); keep=set(ks)&locked | {canon}
-        kept_fp=set().union(*(set(fps[k]) for k in keep)) if keep else set()
+        kept_fp=set().union(*(set(fingerprints[k]) for k in keep)) if keep else set()
         for k in [x for x in ks if x not in keep]:
-            uniq=set(fps[k])-kept_fp
+            uniq=set(fingerprints[k])-kept_fp
             if len(uniq)>=CEIL:
                 kept_unique_forks.add(k)
             else:
@@ -109,13 +109,13 @@ def run(W, live_keys, now=None, RECENT_HOURS=12, DEBRIS_MAX=11, CEILING=50):
     consumers = KEPT | live
     loadbearing  = {b for a in consumers for lp in lref[a] for b in global_uuid.get(lp,()) if b!=a}
     needed       = set().union(*(needs(a) for a in consumers)) if consumers else set()
-    loadbearing |= {s for s in fps if sources(s) & needed}
+    loadbearing |= {s for s in fingerprints if sources(s) & needed}
 
     marked={}
     for k in sorted(KEPT - canonicals - live):
-        head=max(canonicals, key=lambda h: len(set(fps_prose[k]) & set(fps_prose[h])), default=None)
-        ov=(len(set(fps_prose[k]) & set(fps_prose[head]))/max(1,len(set(fps_prose[k])))) if head else 0.0
-        residue=set(fps[k]) - set().union(*(set(fps[j]) for j in KEPT if j!=k)) if any(j!=k for j in KEPT) else set(fps[k])
+        head=max(canonicals, key=lambda h: len(set(fingerprints_prose[k]) & set(fingerprints_prose[h])), default=None)
+        ov=(len(set(fingerprints_prose[k]) & set(fingerprints_prose[head]))/max(1,len(set(fingerprints_prose[k])))) if head else 0.0
+        residue=set(fingerprints[k]) - set().union(*(set(fingerprints[j]) for j in KEPT if j!=k)) if any(j!=k for j in KEPT) else set(fingerprints[k])
         marked[k]=dict(head=head, ov=ov, residue=residue)
 
     return dict(trees=dict(trees), phantom=phantom, seed=seed, locked=locked,

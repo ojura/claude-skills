@@ -79,7 +79,7 @@ theorem live_subset_keptC5
   simultaneously `~0 residue` AND `not load-bearing` - the branch deleted from the marker tree is
   unreachable, so the tree is exhaustive over its range.
 
-  `residue x` abstracts the committed `residue = set(fps[k]) - ⋃_{j∈KEPT, j≠k} fps[j]` as the set of
+  `residue x` abstracts the committed `residue = set(fingerprints[k]) - ⋃_{j∈KEPT, j≠k} fingerprints[j]` as the set of
   globally-unique messages of `x`; "nonzero residue" is `∃ m, residue x m`.
 
   Hypotheses (each a committed-code fact):
@@ -119,6 +119,21 @@ theorem marker_no_hole {Msg : Type}
       · exact C5_survivor x hk hnotdem
   | cross hk e    => exact Or.inl (cross_lb _ _ hk e)
   | phan hf hn he => exact Or.inl (phan_lb _ _ hf hn he)
+
+/--
+  MARKER NO-HOLE carries to the DEBRIS-inclusive picker, for FREE. Debris nomination removes only files
+  in singleton trees, and a singleton tree's canonical is its member (`Family.singleton_canonicalPick`),
+  so `debris ⊆ canonicals` (`debris_sub_canon`, discharged by `Family.debris_nominated_canonical`, NOT
+  assumed). The marker loop ranges over `¬ canonicals`, hence over `¬ debris`: NO debris file is ever in
+  the marker range, so removing debris leaves both the range and `marker_no_hole` over it unchanged. In
+  other words, every file the marker loop processes is automatically not debris, so the debris removal
+  (the second non-loadbearing demotion, see `FixProto.no_orphan_from_closed_debris`) does not perturb the
+  marker theorems at all. -/
+theorem marker_range_excludes_debris
+    (canonicals debris : FSet File)
+    (debris_sub_canon : ∀ x, debris x → canonicals x)
+    {x : File} (hncanon : ¬ canonicals x) : ¬ debris x :=
+  fun hd => hncanon (debris_sub_canon x hd)
 
 /-
   ============================================================================================

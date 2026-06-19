@@ -16,7 +16,7 @@ It **complements** the Lean proof in `../proofs/`, it does not replace it:
 ## What it does and does not establish
 
 These models are faithful Python re-implementations of the Step 2 set algebra: the post-parse fields
-(`fps`, `fps_prose`, `lref`, `owned`, boundaries, `live`) are generated directly, then the exact
+(`fingerprints`, `fingerprints_prose`, `lref`, `owned`, boundaries, `live`) are generated directly, then the exact
 pipeline is run (`seed` -> `locked_closure` -> per-tree judge -> `KEPT` -> re-close -> `loadbearing`
 -> C5 demotion -> C6 deferred archive -> recall pass -> marker loop), and the safety properties are
 checked on the result. The operator `judge`, the recall `SONNET_CONFIRM`, and the marker

@@ -13,19 +13,19 @@ We expose all intermediate sets and a 'judge' policy hook so probes can drive th
 from collections import defaultdict
 
 def build_world(files):
-    fps        = {k: v["fps"] for k,v in files.items()}
-    fps_prose  = {k: v.get("fps_prose", v["fps"]) for k,v in files.items()}
+    fingerprints        = {k: v["fingerprints"] for k,v in files.items()}
+    fingerprints_prose  = {k: v.get("fingerprints_prose", v["fingerprints"]) for k,v in files.items()}
     owned      = {k: set(v["owned"]) for k,v in files.items()}
     lref       = {k: set(v["lref"]) for k,v in files.items()}
     bnd        = {k: list(v["bnd"]) for k,v in files.items()}
-    nmsg       = {k: len(v["fps"]) for k,v in files.items()}
+    nmsg       = {k: len(v["fingerprints"]) for k,v in files.items()}
     lts        = {k: v.get("lts","") for k,v in files.items()}
     firstmsg   = {k: v.get("firstmsg","") for k,v in files.items()}
     global_uuid = defaultdict(set)
-    for k in fps:
+    for k in fingerprints:
         for u in owned[k]:
             global_uuid[u].add(k)
-    return dict(fps=fps, fps_prose=fps_prose, owned=owned, lref=lref, bnd=bnd,
+    return dict(fingerprints=fingerprints, fingerprints_prose=fingerprints_prose, owned=owned, lref=lref, bnd=bnd,
                 nmsg=nmsg, lts=lts, firstmsg=firstmsg, global_uuid=global_uuid)
 
 def run_patched(W, live_keys, DEBRIS_MAX=11, CEILING=50, judge_keep=None):
@@ -33,7 +33,7 @@ def run_patched(W, live_keys, DEBRIS_MAX=11, CEILING=50, judge_keep=None):
     Default: archive (return False) i.e. the operator judged it worthless."""
     if judge_keep is None:
         judge_keep = lambda k,uniq: False
-    fps=W["fps"]; fps_prose=W["fps_prose"]; owned=W["owned"]; lref=W["lref"]
+    fingerprints=W["fingerprints"]; fingerprints_prose=W["fingerprints_prose"]; owned=W["owned"]; lref=W["lref"]
     bnd=W["bnd"]; nmsg=W["nmsg"]; lts=W["lts"]; global_uuid=W["global_uuid"]
 
     all_lpus={lp for k in bnd for (lp,_,_) in bnd[k] if lp}
@@ -43,24 +43,24 @@ def run_patched(W, live_keys, DEBRIS_MAX=11, CEILING=50, judge_keep=None):
     def needs(k):
         return {lp for (lp,par,nb) in bnd[k] if lp in phantom and par is None and nb==0}
 
-    parent={k:k for k in fps}
+    parent={k:k for k in fingerprints}
     def find(x):
         while parent[x]!=x: parent[x]=parent[parent[x]]; x=parent[x]
         return x
     bylpu=defaultdict(list)
-    for k in fps:
+    for k in fingerprints:
         for lp in lref[k]: bylpu[lp].append(k)
     for ks in bylpu.values():
         for k in ks[1:]: parent[find(k)]=find(ks[0])
-    dep={(a,b) for a in fps for lp in lref[a] for b in global_uuid.get(lp,()) if b!=a}
+    dep={(a,b) for a in fingerprints for lp in lref[a] for b in global_uuid.get(lp,()) if b!=a}
     for a,b in dep: parent[find(a)]=find(b)
     trees=defaultdict(list)
-    for k in fps: trees[find(k)].append(k)
+    for k in fingerprints: trees[find(k)].append(k)
 
     def is_debris(k): return nmsg[k] <= DEBRIS_MAX
     def canonical(ks):
         cand=[k for k in ks if not is_debris(k)] or ks
-        return max(cand, key=lambda k:(len(set(fps[k])), lts[k]))
+        return max(cand, key=lambda k:(len(set(fingerprints[k])), lts[k]))
 
     live=set(live_keys)
 
@@ -78,11 +78,11 @@ def run_patched(W, live_keys, DEBRIS_MAX=11, CEILING=50, judge_keep=None):
                     for b in global_uuid.get(lp,()):
                         if b not in locked: locked.add(b); changed=True
                 for P in needs(k):
-                    srcs=[s for s in fps if P in sources(s)]
+                    srcs=[s for s in fingerprints if P in sources(s)]
                     if not srcs:
                         unsatisfiable.setdefault(k,set()).add(P); continue
                     if not (set(srcs)&locked):
-                        best=max(srcs, key=lambda s:len(set(fps[s])))
+                        best=max(srcs, key=lambda s:len(set(fingerprints[s])))
                         locked.add(best); changed=True
         return locked
 
@@ -93,9 +93,9 @@ def run_patched(W, live_keys, DEBRIS_MAX=11, CEILING=50, judge_keep=None):
     for ks in trees.values():
         if len(ks)==1: continue
         canon=canonical(ks); keep=set(ks)&locked | {canon}
-        kept_fp=set().union(*(set(fps[k]) for k in keep)) if keep else set()
+        kept_fp=set().union(*(set(fingerprints[k]) for k in keep)) if keep else set()
         for k in [x for x in ks if x not in keep]:
-            uniq=set(fps[k])-kept_fp
+            uniq=set(fingerprints[k])-kept_fp
             if len(uniq)>=CEILING: kept_unique_forks.add(k)
             else:
                 if judge_keep(k,uniq): kept_unique_forks.add(k)
@@ -110,13 +110,13 @@ def run_patched(W, live_keys, DEBRIS_MAX=11, CEILING=50, judge_keep=None):
     consumers = KEPT | live
     loadbearing  = {b for a in consumers for lp in lref[a] for b in global_uuid.get(lp,()) if b!=a}
     needed       = set().union(*(needs(a) for a in consumers)) if consumers else set()
-    loadbearing |= {s for s in fps if sources(s) & needed}
+    loadbearing |= {s for s in fingerprints if sources(s) & needed}
 
     # C5 demotion: drop exactly-0-global-residue, non-loadbearing kept_unique_forks
     demoted=set()
     for k in sorted(kept_unique_forks):
         if k in loadbearing: continue
-        resid = set(fps[k]) - set().union(*(set(fps[j]) for j in KEPT if j!=k)) if any(j!=k for j in KEPT) else set(fps[k])
+        resid = set(fingerprints[k]) - set().union(*(set(fingerprints[j]) for j in KEPT if j!=k)) if any(j!=k for j in KEPT) else set(fingerprints[k])
         if not resid:
             KEPT.discard(k); kept_unique_forks.discard(k); demoted.add(k)
     # NOTE: plan recomputes loadbearing? It does NOT re-derive loadbearing/consumers after C5.
@@ -130,12 +130,12 @@ def run_patched(W, live_keys, DEBRIS_MAX=11, CEILING=50, judge_keep=None):
             if not ok: c6_assert_fires.append((k,P))
         c6_archived.add(k)
 
-    # C8 recall pass over fps - KEPT - live (canon_all subset KEPT so drop it)
-    keptset={k:set(fps[k]) for k in KEPT}
+    # C8 recall pass over fingerprints - KEPT - live (canon_all subset KEPT so drop it)
+    keptset={k:set(fingerprints[k]) for k in KEPT}
     kept_union=set().union(*keptset.values()) if keptset else set()
     recall_archived=set(); recall_judgment=set()
-    for A in [a for a in fps if a not in KEPT and a not in live]:
-        missing=set(fps[A])-kept_union
+    for A in [a for a in fingerprints if a not in KEPT and a not in live]:
+        missing=set(fingerprints[A])-kept_union
         if not missing: recall_archived.add(A)
         elif len(missing)<CEILING: recall_judgment.add(A)
         # else keep
@@ -143,9 +143,9 @@ def run_patched(W, live_keys, DEBRIS_MAX=11, CEILING=50, judge_keep=None):
     # C7 marker loop
     marked={}
     for k in sorted(KEPT - canonicals - live):
-        head=max(canonicals, key=lambda h: len(set(fps_prose[k]) & set(fps_prose[h])), default=None)
-        ov=(len(set(fps_prose[k]) & set(fps_prose[head]))/max(1,len(set(fps_prose[k])))) if head else 0.0
-        residue=set(fps[k]) - set().union(*(set(fps[j]) for j in KEPT if j!=k)) if any(j!=k for j in KEPT) else set(fps[k])
+        head=max(canonicals, key=lambda h: len(set(fingerprints_prose[k]) & set(fingerprints_prose[h])), default=None)
+        ov=(len(set(fingerprints_prose[k]) & set(fingerprints_prose[head]))/max(1,len(set(fingerprints_prose[k])))) if head else 0.0
+        residue=set(fingerprints[k]) - set().union(*(set(fingerprints[j]) for j in KEPT if j!=k)) if any(j!=k for j in KEPT) else set(fingerprints[k])
         lb = k in loadbearing
         # plan C7 decision tree:
         if lb and len(residue)==0:

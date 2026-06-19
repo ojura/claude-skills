@@ -101,6 +101,47 @@ theorem content_not_a_generator
 
 /-
   ============================================================================================
+  BRIDGE LEMMAS for the loadbearing-stability fact (`FixProto.loadbearing_stable`). A SINGLETON-tree
+  file `d` (the committed `len(ks)==1` guard, i.e. `∀ y≠d, ¬ SameTree d y`) satisfies the two non-coupling
+  hypotheses `loadbearing_stable` needs, because the very edges that would couple `loadbearing` to `d` - a
+  cross-uuid reference, or a needer and a source sharing a phantom lpu - are exactly the edges union-find
+  merges on, so a singleton has none. `noEdges_sameTree_eq` is NOT used: this is a LOCAL fact about `d`.
+  ============================================================================================
+-/
+
+/-- The real guard supplies the STRONGER `¬ SameTree`; that implies the weaker `¬ Edge` the stability
+    proof needs, via `SameTree.base`. -/
+theorem notSameTree_notEdge {a b : File}
+    (h : ¬ SameTree lref owns refUuid a b) : ¬ Edge lref owns refUuid a b :=
+  fun he => h (SameTree.base he)
+
+/-- Cross half: a singleton `d` is no OTHER file's cross-target source. A `crossF d b` edge is a dep edge
+    (`refUuid d u ∧ owns b u`, the middle `Edge` disjunct), so it would put `d` and `b` in one tree,
+    contradicting the singleton guard. -/
+theorem singleton_d_no_cross
+    {crossF : File → File → Prop} {d : File}
+    (cross_is_dep : ∀ a b, crossF a b → ∃ u, refUuid a u ∧ owns b u)
+    (hsingleton : ∀ y, y ≠ d → ¬ SameTree lref owns refUuid d y) :
+    ∀ b, b ≠ d → ¬ crossF d b := by
+  intro b hbd hcr
+  obtain ⟨u, hru, hou⟩ := cross_is_dep d b hcr
+  exact (hsingleton b hbd) (SameTree.base (Or.inr (Or.inl ⟨u, hru, hou⟩)))
+
+/-- Phantom half: a singleton `d` shares no needed phantom with any other file. If `d` needs `P` and
+    `s ≠ d` sources `P`, both carry `P` in `lref`, so `needer_source_coTree` puts them in one tree,
+    contradicting the singleton guard. -/
+theorem singleton_d_no_share
+    {needsF sourcesF : File → Lpu → Prop} {d : File}
+    (needs_refs : ∀ f P, needsF f P → lref f P)
+    (src_refs   : ∀ f P, sourcesF f P → lref f P)
+    (hsingleton : ∀ y, y ≠ d → ¬ SameTree lref owns refUuid d y) :
+    ∀ P, needsF d P → ∀ s, s ≠ d → ¬ sourcesF s P := by
+  intro P hneed s hsd hsrc
+  exact (hsingleton s hsd)
+    (needer_source_coTree lref owns refUuid (needs_refs d P hneed) (src_refs s P hsrc))
+
+/-
+  ============================================================================================
   canonical() selection. The committed code:
     cand = [k for k in ks if not is_debris(k)] or ks
     return max(cand, key=lambda k:(distinct(k), lts(k), k))
@@ -165,6 +206,30 @@ theorem canonical_nondebris (ks : List File) {c : File}
       -- filter keeps only `decide (¬ debris ·) = true`, i.e. ¬ debris c.
       have hkeep := (List.mem_filter.mp hsub).2
       simpa using hkeep
+
+/--
+  DEBRIS ⊆ CANONICALS - the structural fact the debris-demotion safety rests on, PROVED not assumed.
+  `nominate_debris` runs only inside `for ks in trees.values(): if len(ks)!=1: continue; k=ks[0]`, so a
+  nominated file is the SOLE member of its tree. The canonical of a singleton tree is that member,
+  whether or not it is `is_debris`: if `is_debris k` the floored `cand` filter is empty and falls back
+  to `ks=[k]` (the `[] => ks` arm); if not, `[k]` already passes the floor - either way
+  `canonicalPick debris [k] = some k`. So every debris-nominated file is its own tree's canonical, hence
+  in `canonicals = {canonical(ks) | ks ∈ trees}`. (The marker carry-over in `Markers.lean` rests on
+  exactly this; here it is discharged off `canonicalPick`, not taken as a hypothesis.)
+-/
+theorem singleton_canonicalPick (k : File) : canonicalPick debris [k] = some k := by
+  unfold canonicalPick cand
+  by_cases h : debris k <;> simp [List.filter, List.head?, h]
+
+/--
+  `canonicals x := canonicalPick debris (treeOf x) = some x` is exactly the committed
+  `canonicals = {canonical(ks) | ks ∈ trees}` (x is canonical iff it is its own tree's canonical). For a
+  debris-nominated file the tree is the singleton `[k]` (the `len(ks)==1` guard), so its tree-canonical
+  is itself: `debris ⊆ canonicals`. -/
+theorem debris_nominated_canonical (treeOf : File → List File) {k : File}
+    (hsingleton : treeOf k = [k]) :
+    canonicalPick debris (treeOf k) = some k := by
+  rw [hsingleton]; exact singleton_canonicalPick debris k
 
 
 /-

@@ -29,15 +29,15 @@ def build_reclose_trap(rng):
     S.lts = {'C': 0.9, 'FORK': 0.5, 'SRC': 0.3, 'NOISE': 0.1}
     # C: big distinct content; canonical
     cmsgs = set(range(0, 60))
-    S.fps['C'] = set(cmsgs)
+    S.fingerprints['C'] = set(cmsgs)
     # FORK: mostly contained in C but with >=CEILING tree-local unique to force kept_unique_fork.
     fork_unique = set(range(100, 100 + 60))   # 60 unique -> >= CEILING=50, auto-kept
-    S.fps['FORK'] = set(range(0, 10)) | fork_unique
+    S.fingerprints['FORK'] = set(range(0, 10)) | fork_unique
     # SRC: content fully duplicated in C (so recall sees 0 unique) -> would be archived w/o protection
-    S.fps['SRC'] = set(range(0, 20))          # subset of C's messages
-    S.fps['NOISE'] = set(range(200, 205))
+    S.fingerprints['SRC'] = set(range(0, 20))          # subset of C's messages
+    S.fingerprints['NOISE'] = set(range(200, 205))
     for k in S.files:
-        S.fps_prose[k] = set(list(S.fps[k])[: max(1, len(S.fps[k])//2)])
+        S.fingerprints_prose[k] = set(list(S.fingerprints[k])[: max(1, len(S.fingerprints[k])//2)])
     # owned uuids: C owns some; FORK shares an lpu with C via lref to force same tree.
     S.owned = {'C': {'cu1','cu2'}, 'FORK': set(), 'SRC': set(), 'NOISE': set()}
     # lref: C and FORK share lpu 'Lshared' -> same tree. FORK and SRC share phantom 'P' (boundary).
@@ -51,7 +51,7 @@ def build_reclose_trap(rng):
     # randomize: maybe add a SECOND source SRC2 (then SRC archivable), maybe make C live, etc.
     if rng.random() < 0.5:
         S.files.append('SRC2'); S.lts['SRC2'] = 0.2
-        S.fps['SRC2'] = set(range(0, 25)); S.fps_prose['SRC2'] = set(range(0,5))
+        S.fingerprints['SRC2'] = set(range(0, 25)); S.fingerprints_prose['SRC2'] = set(range(0,5))
         S.owned['SRC2'] = set(); S.lref['SRC2'] = {'P'}
         S.bnd['SRC2'] = [('P', False, 3)]      # also sources P, richer
     if rng.random() < 0.3:

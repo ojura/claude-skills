@@ -33,11 +33,11 @@ seed={CANON}. Does closure reach NEEDER and walk needs(PH)?
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import trace as T   # the local trace.py (pre-fix model) in this dir, not the stdlib trace module
-def mkfile(fps, owned, bnds, extra_lref=(), mtime=0.0):
+def mkfile(fingerprints, owned, bnds, extra_lref=(), mtime=0.0):
     lref=set(extra_lref)
     for (lp,par,nb) in bnds:
         if lp: lref.add(lp)
-    return dict(fps=fps, owned=owned, lref=lref, bnd=bnds, mtime=mtime)
+    return dict(fingerprints=fingerprints, owned=owned, lref=lref, bnd=bnds, mtime=mtime)
 
 files = {
   # CANON: big, owns SH-target uuid 'uSH'. references nothing phantom. Tree canonical.
@@ -69,12 +69,12 @@ print("   The dep edge is needer->canon (needer refs uSH which canon owns). That
 print("   (tree) but does NOT put NEEDER into locked: closure adds CROSS-FILE TARGETS of locked")
 print("   files (b in global_uuid[lp] for lp in lref[locked]). CANON's lref has no uSH.")
 print("   So closure never adds NEEDER. needs(NEEDER) never walked. SOURCE never locked.")
-trees=R["trees"]; fps=W["fps"]; locked=R["locked"]; canonical=R["canonical"]; CEILING=50
+trees=R["trees"]; fingerprints=W["fingerprints"]; locked=R["locked"]; canonical=R["canonical"]; CEILING=50
 for root,ks in trees.items():
     if len(ks)==1: continue
     canon=canonical(ks); keep=set(ks)&locked | {canon}
-    kept_fp=set().union(*(set(fps[k]) for k in keep)) if keep else set()
+    kept_fp=set().union(*(set(fingerprints[k]) for k in keep)) if keep else set()
     print(f"tree {root}: canon={canon} keep={keep}")
     for k in [x for x in ks if x not in keep]:
-        uniq=set(fps[k])-kept_fp
+        uniq=set(fingerprints[k])-kept_fp
         print(f"   fork {k}: uniq={len(uniq)} -> {'AUTO-KEEP(kept_unique_fork)' if len(uniq)>=CEILING else 'JUDGMENT'}")

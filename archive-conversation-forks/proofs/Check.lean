@@ -452,3 +452,324 @@ theorem concrete_no_orphan_from_closed_bnd :
   intro hd; exact hd.1     -- ¬ demoted f0: demoted needs kufB f0 = False
 
 #print axioms concrete_no_orphan_from_closed_bnd
+
+/- VERIFY-OUTCOME 11: the DEBRIS demotion (Step-2 `nominate_debris`, guarded on `loadbearing`), checked
+   inside the proof. Three checks:
+   (a) `debris ⊆ canonicals` is REAL: a singleton tree's canonical is its member, so a debris-nominated
+       file is its own tree's canonical (off `canonicalPick`, NOT assumed);
+   (b) no-orphan SURVIVES debris removal (a second non-load-bearing demotion) - a genuinely non-vacuous
+       3-file store where a debris file `d` is removed yet the kept needer `a`'s source `b` survives;
+   (c) the marker range EXCLUDES debris, composing (a) with the carry-over lemma. -/
+#print axioms Family.singleton_canonicalPick
+#print axioms Family.debris_nominated_canonical
+#print axioms FixProto.no_orphan_from_closed_debris
+#print axioms marker_range_excludes_debris
+
+-- (a) debris ⊆ canonicals, concretely. `debrisC` marks f0 as is_debris; its tree is the singleton
+-- [f0]; so its tree-canonical is f0 itself (whether or not f0 is is_debris - the `cand` floor falls back).
+-- `treeOfC` is partition-faithful (each file is its own singleton tree: `f ∈ treeOfC f`).
+def debrisC : Fil → Prop := fun f => f = f0
+instance : DecidablePred debrisC := fun f => (inferInstance : Decidable (f = f0))
+def treeOfC : Fil → List Fil := fun f => [f]
+
+theorem concrete_singleton_canonical : Family.canonicalPick debrisC [f0] = some f0 :=
+  Family.singleton_canonicalPick debrisC f0
+
+theorem concrete_debris_canonical : Family.canonicalPick debrisC (treeOfC f0) = some f0 :=
+  Family.debris_nominated_canonical debrisC treeOfC (k := f0) rfl
+
+-- canonicals modelled as the committed "{canonical(ks)}": x is canonical iff its own tree's canonical.
+def canonicalsC : FSet Fil := fun x => Family.canonicalPick debrisC (treeOfC x) = some x
+theorem debrisC_sub_canon : ∀ x, debrisC x → canonicalsC x := by
+  intro x hx; unfold canonicalsC; subst hx; exact concrete_debris_canonical
+
+#print axioms concrete_singleton_canonical
+#print axioms concrete_debris_canonical
+
+-- (b) no-orphan survives debris removal. 3 files: `dNeed` needs p0, `dSrc` sources p0 (load-bearing),
+-- `dJunk` is a non-load-bearing debris file removed from the picker. The surviving source is `dSrc`,
+-- provably ¬debris. (Fresh store `FilD` to avoid the `Fil3`/`debris3` already used above.)
+inductive FilD | dNeed | dSrc | dJunk
+deriving DecidableEq
+open FilD
+
+def crossD : FilD → FilD → Prop := fun _ _ => False
+def needsD : FilD → Pha → Prop := fun f _ => f = dNeed
+def srcD   : FilD → Pha → Prop := fun f _ => f = dSrc
+def lockedD : FSet FilD := fun _ => True
+def kufD : FSet FilD := fun _ => False
+def consumersD : FSet FilD := fun _ => True
+def residueD : FSet FilD := fun _ => True
+def debrisD : FSet FilD := fun f => f = dJunk
+
+theorem lockedD_closed : FixProto.IsClosed crossD needsD srcD lockedD where
+  cross_closed := by intro _ _ _ e; cases e
+  phan_closed  := by intro _ _ _ _ _; exact ⟨dSrc, trivial, rfl⟩
+
+-- debris_guard: dJunk is debris and NOT load-bearing (no cross edge to it; it sources nothing).
+theorem debrisD_guard : ∀ k, debrisD k → ¬ FixProto.loadbearing needsD srcD crossD consumersD k := by
+  intro k hk; subst hk
+  unfold FixProto.loadbearing crossD srcD
+  rintro (⟨x, _, hc⟩ | ⟨P, hs, _⟩)
+  · exact hc
+  · exact absurd hs (by decide)
+
+theorem concrete_no_orphan_debris :
+    ∃ s, (lockedD s ∧ ¬ FixProto.demoted needsD srcD crossD kufD consumersD residueD s)
+          ∧ ¬ debrisD s ∧ srcD s p0 := by
+  refine FixProto.no_orphan_from_closed_debris crossD needsD srcD lockedD_closed
+    (fun _ _ => trivial) debrisD_guard (f := dNeed) (P := p0) ⟨⟨trivial, ?_⟩, ?_⟩ rfl ⟨dSrc, rfl⟩
+  · intro hd; exact hd.1          -- ¬ demoted dNeed (kufD dNeed = False)
+  · simp only [debrisD]; decide   -- ¬ debrisD dNeed : (dNeed = dJunk) is false
+
+#print axioms concrete_no_orphan_debris
+
+-- (c) the marker range excludes debris, on a partition-faithful store. Three files: `mDeb` is a singleton
+-- debris tree; `mCanon`/`mNon` form a genuine 2-file tree whose canonical (the head of the floored
+-- candidates) is `mCanon`, so `mNon` is genuinely NON-canonical. marker_range_excludes_debris then shows
+-- the non-canonical `mNon` is non-debris, non-vacuously.
+inductive FilM | mDeb | mCanon | mNon
+deriving DecidableEq
+open FilM
+
+def debrisM : FilM → Prop := fun f => f = mDeb
+instance : DecidablePred debrisM := fun f => (inferInstance : Decidable (f = mDeb))
+def treeOfM : FilM → List FilM := fun f => match f with
+  | mDeb   => [mDeb]                 -- singleton debris tree
+  | mCanon => [mCanon, mNon]         -- a genuine 2-file tree; head-of-cand canonical is mCanon
+  | mNon   => [mCanon, mNon]         -- mNon is the non-head member -> not its tree's canonical
+def canonicalsM : FSet FilM := fun x => Family.canonicalPick debrisM (treeOfM x) = some x
+
+theorem debrisM_sub_canon : ∀ x, debrisM x → canonicalsM x := by
+  intro x hx; unfold canonicalsM; subst hx
+  exact Family.singleton_canonicalPick debrisM mDeb
+
+theorem mNon_non_canonical : ¬ canonicalsM mNon := by
+  unfold canonicalsM treeOfM; decide
+
+theorem concrete_marker_excludes_debris : ¬ debrisM mNon :=
+  marker_range_excludes_debris canonicalsM debrisM debrisM_sub_canon (x := mNon) mNon_non_canonical
+
+#print axioms debrisM_sub_canon
+#print axioms concrete_marker_excludes_debris
+
+/- ============================================================================================
+   CONTENT SAFETY UNDER DEBRIS REMOVAL - the forced witnesses. Each store is namespaced so the constructor
+   names don't collide; only the fingerprint relations are
+   renamed to the committed `fingerprints` convention. Generic lemmas live in Orphan.lean
+   (`content_safe_post_debris`, `c5_demote_no_loss`, `residue_grows_on_shrink`); these are the non-vacuity
+   instances, same architecture as `no_orphan_from_closed_debris` / `concrete_no_orphan_debris`.
+   ============================================================================================ -/
+
+/- (d) RECALL discrimination: discarding debris CHANGES the recall outcome. {A, d, kK}, one message m0;
+    m0 lives only in A and the debris d; kK carries nothing, forcing `missing`-nonempty for a REAL reason.
+    Over KEPT-with-debris the recall test wrongly passes (A's only container is debris d); over
+    KEPT-minus-debris it fails (A correctly kept). The two conjuncts in tension foreclose vacuity. -/
+namespace RecallDebrisWitness
+inductive CFil | A | d | kK
+deriving DecidableEq
+inductive CMsg | m0
+deriving DecidableEq
+open CFil CMsg
+
+def cfingerprints : CFil → CMsg → Prop := fun f _ => f = A ∨ f = d
+def cdebris : FSet CFil := fun f => f = d
+def keptWith : FSet CFil := fun f => f = d ∨ f = kK
+def keptMinus : FSet CFil := fun f => keptWith f ∧ ¬ cdebris f          -- = {kK}
+
+instance : ∀ m, Decidable (∃ b, keptWith b ∧ cfingerprints b m) := fun _ =>
+  isTrue ⟨d, Or.inl rfl, Or.inr rfl⟩
+instance : ∀ m, Decidable (∃ b, keptMinus b ∧ cfingerprints b m) := fun _ =>
+  isFalse (by
+    rintro ⟨b, ⟨hk, hnd⟩, hf⟩
+    rcases hk with h | h
+    · exact hnd h
+    · subst h; rcases hf with h2 | h2 <;> cases h2)
+
+theorem buggy_missing_empty : ∀ m, ¬ missing cfingerprints keptWith A m := by
+  intro _ h; exact h.2 ⟨d, Or.inl rfl, Or.inr rfl⟩
+theorem buggy_certifies_archive : preserved cfingerprints keptWith A :=
+  recall_no_loss cfingerprints keptWith A buggy_missing_empty
+theorem buggy_witness_is_debris : ¬ ∃ b, keptWith b ∧ ¬ cdebris b ∧ cfingerprints b m0 := by
+  rintro ⟨b, hk, hnd, hf⟩
+  rcases hk with h | h
+  · subst h; exact hnd rfl
+  · subst h; rcases hf with h2 | h2 <;> cases h2
+theorem fixed_missing_nonempty : missing cfingerprints keptMinus A m0 := by
+  refine ⟨Or.inl rfl, ?_⟩
+  rintro ⟨b, ⟨hk, hnd⟩, hf⟩
+  rcases hk with h | h
+  · exact hnd h
+  · subst h; rcases hf with h2 | h2 <;> cases h2
+theorem discard_changes_outcome :
+    (∀ m, ¬ missing cfingerprints keptWith A m) ∧ (∃ m, missing cfingerprints keptMinus A m) :=
+  ⟨buggy_missing_empty, ⟨m0, fixed_missing_nonempty⟩⟩
+
+#print axioms buggy_certifies_archive
+#print axioms discard_changes_outcome
+end RecallDebrisWitness
+
+/- (e) C5 discrimination (residue-keyed). The demoted file `kFork` is IN the kept set (a kuf). Over
+    KEPT-with-debris kFork reads 0-residue (m0 also in debris d) -> would be demoted; over KEPT-minus-debris
+    it has residue -> NOT demoted. kFork flips demote->keep purely because d left. -/
+namespace C5DebrisWitness
+inductive C5Fil | kFork | d | kK
+deriving DecidableEq
+inductive C5Msg | m0
+deriving DecidableEq
+open C5Fil C5Msg
+
+def c5fingerprints : C5Fil → C5Msg → Prop := fun f _ => f = kFork ∨ f = d
+def c5debris : FSet C5Fil := fun f => f = d
+def keptWith : FSet C5Fil := fun f => f = kFork ∨ f = d ∨ f = kK
+def keptMinus : FSet C5Fil := fun f => keptWith f ∧ ¬ c5debris f
+def demotedOver (KEPT : FSet C5Fil) (k : C5Fil) : Prop :=
+  ∀ m, c5fingerprints k m → ∃ j, KEPT j ∧ j ≠ k ∧ c5fingerprints j m
+
+theorem buggy_demotes : demotedOver keptWith kFork := by
+  intro m _; exact ⟨d, Or.inr (Or.inl rfl), by decide, Or.inr rfl⟩
+theorem buggy_other_is_debris :
+    ¬ ∃ j, (keptWith j ∧ ¬ c5debris j) ∧ j ≠ kFork ∧ c5fingerprints j m0 := by
+  rintro ⟨j, ⟨hk, hnd⟩, hne, hf⟩
+  rcases hk with h | h | h
+  · exact hne h
+  · subst h; exact hnd rfl
+  · subst h; rcases hf with h2 | h2 <;> cases h2
+theorem fixed_not_demoted : ¬ demotedOver keptMinus kFork := by
+  intro hdem
+  obtain ⟨j, ⟨hmem, hnd⟩, hne, hf⟩ := hdem m0 (Or.inl rfl)
+  rcases hmem with hh | hh | hh
+  · exact hne hh
+  · subst hh; exact hnd rfl
+  · subst hh; rcases hf with h2 | h2 <;> cases h2
+theorem c5_discard_changes_outcome :
+    demotedOver keptWith kFork ∧ ¬ demotedOver keptMinus kFork :=
+  ⟨buggy_demotes, fixed_not_demoted⟩
+
+#print axioms c5_discard_changes_outcome
+end C5DebrisWitness
+
+/- (f) JOINT non-vacuity: ONE store, ONE shared post-debris KEPT, where BOTH paths fire
+    AND both positive capstones discharge - so the pipeline composes (three separate stores would not).
+    {jA, jB, jFork, jd, jK}, msgs {mA, mB, mF}; the single debris `jd` is the false container for BOTH
+    mA (recall) and mF (C5); jB and jK are the genuine non-debris homes that make the positives non-vacuous. -/
+namespace JointDebrisWitness
+inductive JFil | jA | jB | jFork | jd | jK
+deriving DecidableEq
+inductive JMsg | mA | mB | mF
+deriving DecidableEq
+open JFil JMsg
+
+def jfingerprints : JFil → JMsg → Prop := fun f m =>
+  match f, m with
+  | jA, mA => True | jB, mB => True | jFork, mF => True
+  | jd, mA => True | jd, mF => True | jK, mB => True
+  | _, _ => False
+def jdebris : FSet JFil := fun f => f = jd
+def keptWith : FSet JFil := fun f => f = jB ∨ f = jFork ∨ f = jd ∨ f = jK
+def keptMinus : FSet JFil := fun f => keptWith f ∧ ¬ jdebris f          -- {jB, jFork, jK}
+
+instance : ∀ f m, Decidable (jfingerprints f m) := fun f m => by
+  unfold jfingerprints; cases f <;> cases m <;> infer_instance
+instance : DecidablePred jdebris := fun f => by unfold jdebris; infer_instance
+
+instance : ∀ m, Decidable (∃ b, keptMinus b ∧ jfingerprints b m) := fun m =>
+  match m with
+  | mA => isFalse (by rintro ⟨b, ⟨hk, hnd⟩, hf⟩; rcases hk with h|h|h|h <;>
+            (subst h; first | exact hnd rfl | exact (by cases hf)))
+  | mB => isTrue ⟨jK, ⟨Or.inr (Or.inr (Or.inr rfl)), by decide⟩, by decide⟩
+  | mF => isTrue ⟨jFork, ⟨Or.inr (Or.inl rfl), by decide⟩, by decide⟩
+
+theorem recall_A_missing : missing jfingerprints keptMinus jA mA := by
+  refine ⟨trivial, ?_⟩
+  rintro ⟨b, ⟨hk, hnd⟩, hf⟩
+  rcases hk with h|h|h|h
+  · subst h; cases hf
+  · subst h; cases hf
+  · subst h; exact hnd rfl
+  · subst h; cases hf
+theorem recall_B_missing_empty : ∀ m, ¬ missing jfingerprints keptMinus jB m := by
+  intro m
+  rcases m with _ | _ | _
+  · intro h; cases h.1
+  · intro h; exact h.2 ⟨jK, ⟨Or.inr (Or.inr (Or.inr rfl)), by decide⟩, by decide⟩
+  · intro h; cases h.1
+theorem recall_B_preserved : preserved jfingerprints keptMinus jB :=
+  recall_no_loss jfingerprints keptMinus jB recall_B_missing_empty
+
+def demotedOver (KEPT : FSet JFil) (k : JFil) : Prop :=
+  ∀ m, jfingerprints k m → ∃ j, KEPT j ∧ j ≠ k ∧ jfingerprints j m
+theorem c5_buggy_demotes : demotedOver keptWith jFork := by
+  intro m hm
+  match m, hm with
+  | mF, _ => exact ⟨jd, Or.inr (Or.inr (Or.inl rfl)), by decide, by decide⟩
+theorem c5_fixed_not_demoted : ¬ demotedOver keptMinus jFork := by
+  intro hdem
+  obtain ⟨j, ⟨hmem, hnd⟩, hne, hf⟩ := hdem mF trivial
+  rcases hmem with h|h|h|h
+  · subst h; cases hf
+  · exact hne h
+  · subst h; exact hnd rfl
+  · subst h; cases hf
+theorem c5_K_demote_no_loss :
+    ∀ m, jfingerprints jK m → ∃ j, (keptMinus j ∧ ¬ jdebris j) ∧ jfingerprints j m :=
+  c5_demote_no_loss jfingerprints keptMinus jdebris jK
+    (by
+      intro m hm
+      match m, hm with
+      | mB, _ => exact ⟨jB, ⟨⟨Or.inl rfl, by decide⟩, by decide⟩, by decide, by decide⟩)
+
+theorem joint_pipeline_non_vacuous :
+    missing jfingerprints keptMinus jA mA
+  ∧ preserved jfingerprints keptMinus jB
+  ∧ (demotedOver keptWith jFork ∧ ¬ demotedOver keptMinus jFork)
+  ∧ (∀ m, jfingerprints jK m → ∃ j, (keptMinus j ∧ ¬ jdebris j) ∧ jfingerprints j m) :=
+  ⟨recall_A_missing, recall_B_preserved,
+   ⟨c5_buggy_demotes, c5_fixed_not_demoted⟩, c5_K_demote_no_loss⟩
+
+#print axioms recall_B_preserved
+#print axioms joint_pipeline_non_vacuous
+end JointDebrisWitness
+
+/- (g) LOADBEARING STABILITY non-vacuity. `dJunk` is a singleton debris (no cross edge, sources
+    nothing); `c0` is loadbearing via a phantom it sources that the consumer `n0` needs. Removing `dJunk`
+    from consumers leaves `c0` loadbearing both before and after - a genuine ↔ over the real
+    `FixProto.loadbearing`, not a vacuous biconditional between two falses. -/
+namespace LoadbearingStableWitness
+inductive F3 | lbN | lbSrc | lbDeb
+deriving DecidableEq
+inductive P1 | lbP
+open F3 P1
+
+def crossC  : F3 → F3 → Prop := fun _ _ => False
+def needsC  : F3 → P1 → Prop := fun f _ => f = lbN
+def sourcesC : F3 → P1 → Prop := fun f _ => f = lbSrc
+def consumersC : FSet F3 := fun _ => True
+
+theorem dJunk_no_cross : ∀ b, b ≠ lbDeb → ¬ crossC lbDeb b := by
+  intro b _ h; exact h
+theorem dJunk_no_share : ∀ P, needsC lbDeb P → ∀ s, s ≠ lbDeb → ¬ sourcesC s P := by
+  intro P hneed s _ _
+  exact absurd (show lbDeb = lbN from hneed) (by decide)
+
+theorem concrete_loadbearing_stable :
+    FixProto.loadbearing needsC sourcesC crossC consumersC lbSrc
+      ↔ FixProto.loadbearing needsC sourcesC crossC (FixProto.without consumersC lbDeb) lbSrc :=
+  FixProto.loadbearing_stable needsC sourcesC crossC consumersC
+    dJunk_no_cross dJunk_no_share (b := lbSrc) (by decide)
+
+theorem concrete_c0_loadbearing : FixProto.loadbearing needsC sourcesC crossC consumersC lbSrc :=
+  Or.inr ⟨lbP, rfl, ⟨lbN, trivial, rfl⟩⟩
+
+#print axioms concrete_loadbearing_stable
+#print axioms concrete_c0_loadbearing
+end LoadbearingStableWitness
+
+-- Generic content-safety + monotonicity + stability lemmas (the theorems the witnesses instantiate):
+#print axioms Orphan.content_safe_post_debris
+#print axioms Orphan.c5_demote_no_loss
+#print axioms Orphan.residue_grows_on_shrink
+#print axioms Orphan.nonzero_residue_survives_shrink
+#print axioms FixProto.loadbearing_stable
+#print axioms Family.singleton_d_no_cross
+#print axioms Family.singleton_d_no_share

@@ -25,7 +25,7 @@ abbrev FSet (File : Type) := File → Prop
   * `needs f P`     : file `f` has a root phantom boundary for phantom `P` (relies on a sibling).
   * `sources s P`   : file `s` can backfill phantom `P` (has pre-content before that boundary).
   * `pick P`        : the source the closure REALISES for phantom `P`. NOT necessarily the literal
-                      `max(srcs, key=len(set(fps[s])))` richest source: the committed `locked_closure`
+                      `max(srcs, key=len(set(fingerprints[s])))` richest source: the committed `locked_closure`
                       adds `best=richest` only via `if not (set(srcs)&locked)`, i.e. only when no source
                       of `P` is already locked (e.g. via a cross-file edge). So the realised kept source
                       can be a DIFFERENT source than the richest. `pick P` abstracts the witness the closure instantiates:
@@ -191,21 +191,21 @@ theorem no_orphan
   `no_orphan` above guarantees the STRUCTURAL safety of archiving: a kept session's needed
   phantom always keeps a source. The recall pass archives on a DIFFERENT criterion - exact
   content redundancy - so it needs its own safety theorem: archiving a 0-unique candidate
-  loses no message. Messages are opaque here (`fps f m` = "file `f` carries message-fingerprint
+  loses no message. Messages are opaque here (`fingerprints f m` = "file `f` carries message-fingerprint
   `m`"); this is a separate, content-level layer from the structural closure above.
   ============================================================================================
 -/
 
 /-- "Every message of `A` lives in some kept file" - `A`'s content is fully preserved by `KEPT`. -/
-def preserved {Msg : Type} (fps : File → Msg → Prop) (KEPT : FSet File) (A : File) : Prop :=
-  ∀ m, fps A m → ∃ b, KEPT b ∧ fps b m
+def preserved {Msg : Type} (fingerprints : File → Msg → Prop) (KEPT : FSet File) (A : File) : Prop :=
+  ∀ m, fingerprints A m → ∃ b, KEPT b ∧ fingerprints b m
 
 /--
   The recall pass's `missing` set: messages of `A` not found in any kept file. The committed code
-  computes `missing = set(fps[A]) - kept_union` and archives `A` iff `missing` is empty.
+  computes `missing = set(fingerprints[A]) - kept_union` and archives `A` iff `missing` is empty.
 -/
-def missing {Msg : Type} (fps : File → Msg → Prop) (KEPT : FSet File) (A : File) : Msg → Prop :=
-  fun m => fps A m ∧ ¬ ∃ b, KEPT b ∧ fps b m
+def missing {Msg : Type} (fingerprints : File → Msg → Prop) (KEPT : FSet File) (A : File) : Msg → Prop :=
+  fun m => fingerprints A m ∧ ¬ ∃ b, KEPT b ∧ fingerprints b m
 
 /--
   RECALL NO-LOSS. If the recall test passes (`missing A` is empty: every message of `A` is in some
@@ -221,14 +221,79 @@ def missing {Msg : Type} (fps : File → Msg → Prop) (KEPT : FSet File) (A : F
   theorem depends on NO axioms. The decidability instance is the faithful counterpart of the set
   membership the code actually evaluates.
 -/
-theorem recall_no_loss {Msg : Type} (fps : File → Msg → Prop) (KEPT : FSet File) (A : File)
-    [∀ m, Decidable (∃ b, KEPT b ∧ fps b m)]
-    (hempty : ∀ m, ¬ missing fps KEPT A m) :
-    preserved fps KEPT A := by
+theorem recall_no_loss {Msg : Type} (fingerprints : File → Msg → Prop) (KEPT : FSet File) (A : File)
+    [∀ m, Decidable (∃ b, KEPT b ∧ fingerprints b m)]
+    (hempty : ∀ m, ¬ missing fingerprints KEPT A m) :
+    preserved fingerprints KEPT A := by
   intro m hm
   -- Decidable (not classical) case-split on the kept-union membership the code computes.
-  cases (inferInstance : Decidable (∃ b, KEPT b ∧ fps b m)) with
+  cases (inferInstance : Decidable (∃ b, KEPT b ∧ fingerprints b m)) with
   | isTrue h  => exact h
   | isFalse h => exact absurd ⟨hm, h⟩ (hempty m)
+
+/-
+  ============================================================================================
+  CONTENT SAFETY UNDER DEBRIS REMOVAL (the recall∘debris / C5∘debris fix, made first-class).
+
+  `recall_no_loss` above is stated over a FIXED `KEPT`. The committed pipeline removes files from
+  the picker on FOUR paths, and the Step-2 DEBRIS nomination is the fourth: it discards files from
+  KEPT. If a content pass (the recall pass, or C5 demotion) measured containment against a KEPT that
+  STILL held debris, a debris shell could be the sole container that makes another file read
+  "redundant"; archiving both then strands a message. The fix is a USAGE-SITE one: discard debris
+  from KEPT BEFORE the content passes measure containment, i.e. apply these theorems at the
+  post-debris kept set. The theorems below make that ordering explicit and give the C5 path its own
+  content guarantee, so the composition is checked, not assumed.
+  ============================================================================================
+-/
+
+/-- RESIDUE as the committed set-difference: `residueOf x m` holds iff `x` carries `m` and NO OTHER kept
+    file does (`fingerprints[x] - ⋃_{j∈KEPT, j≠x} fingerprints[j]`). This is what the marker loop and the
+    C5 demotion measure. (Named `residueOf`, not `residue`, to avoid shadowing the abstract `residue`
+    parameter that `Markers.marker_no_hole` quantifies over.) -/
+def residueOf {Msg : Type} (fingerprints : File → Msg → Prop) (KEPT : FSet File) (x : File) : Msg → Prop :=
+  fun m => fingerprints x m ∧ ¬ ∃ j, KEPT j ∧ j ≠ x ∧ fingerprints j m
+
+/-- RESIDUE MONOTONICITY - the debris-discard direction, which refutes the "shrink the residue" worry.
+    Removing files from KEPT (discarding debris) drops them from the SUBTRACTED union, so residue can only
+    GROW: a residue message against the larger KEPT is still a residue message against any subset KEPT'.
+    Fully constructive. -/
+theorem residue_grows_on_shrink {Msg : Type} (fingerprints : File → Msg → Prop)
+    (KEPT KEPT' : FSet File) (hsub : ∀ y, KEPT' y → KEPT y)
+    {x : File} {m : Msg} (h : residueOf fingerprints KEPT x m) : residueOf fingerprints KEPT' x m := by
+  obtain ⟨hx, hno⟩ := h
+  exact ⟨hx, fun ⟨j, hj', hne, hfj⟩ => hno ⟨j, hsub j hj', hne, hfj⟩⟩
+
+/-- Corollary for marker faithfulness: a file with NONZERO residue against the larger (with-debris) KEPT
+    still has nonzero residue against KEPT∖debris. So the marker loop's `loadbearing ∨ ∃ residue` disjunct,
+    measured over the post-debris KEPT, is implied by the same fact over the with-debris KEPT - discarding
+    debris before the marker loop cannot reopen the `~0-residue ∧ ¬loadbearing` hole `marker_no_hole` closes. -/
+theorem nonzero_residue_survives_shrink {Msg : Type} (fingerprints : File → Msg → Prop)
+    (KEPT KEPT' : FSet File) (hsub : ∀ y, KEPT' y → KEPT y)
+    {x : File} (h : ∃ m, residueOf fingerprints KEPT x m) : ∃ m, residueOf fingerprints KEPT' x m := by
+  obtain ⟨m, hm⟩ := h
+  exact ⟨m, residue_grows_on_shrink fingerprints KEPT KEPT' hsub hm⟩
+
+/-- RECALL no-loss over the FINAL (post-debris) picker. The recall pass must compute `missing` over KEPT
+    AFTER debris is discarded; then a passing (`missing = ∅`) test guarantees every message of the archived
+    candidate lives in a kept file that SURVIVES debris removal, so a later debris move cannot strand it.
+    This is `recall_no_loss` applied at the post-debris kept set - the bug was a usage-site error (measuring
+    over a KEPT that still held debris), not a flaw in `recall_no_loss`. -/
+theorem content_safe_post_debris {Msg : Type} (fingerprints : File → Msg → Prop) (keptFinal : FSet File)
+    (A : File) [∀ m, Decidable (∃ b, keptFinal b ∧ fingerprints b m)]
+    (hempty : ∀ m, ¬ missing fingerprints keptFinal A m) :
+    preserved fingerprints keptFinal A :=
+  recall_no_loss fingerprints keptFinal A hempty
+
+/-- C5∘debris content safety. If a kept-unique fork `k`'s residue over KEPT∖debris (excluding `k`) is empty
+    - every message of `k` is carried by some kept NON-debris file other than `k` - then C5-demoting `k` AND
+    moving debris loses nothing of `k`'s content. The C5-path analogue of `content_safe_post_debris`. Constructive:
+    the witness comes straight from the (decidable) emptiness hypothesis. -/
+theorem c5_demote_no_loss {Msg : Type} (fingerprints : File → Msg → Prop)
+    (KEPT debris : FSet File) (k : File)
+    (hempty : ∀ m, fingerprints k m → ∃ j, (KEPT j ∧ ¬ debris j) ∧ j ≠ k ∧ fingerprints j m) :
+    ∀ m, fingerprints k m → ∃ j, (KEPT j ∧ ¬ debris j) ∧ fingerprints j m := by
+  intro m hm
+  obtain ⟨j, hj, _, hjm⟩ := hempty m hm
+  exact ⟨j, hj, hjm⟩
 
 end Orphan
