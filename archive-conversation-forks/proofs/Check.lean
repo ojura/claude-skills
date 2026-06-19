@@ -7,9 +7,12 @@ import Termination
 open Orphan
 
 /- VERIFY-OUTCOME 1: no hidden axioms / sorry. Every theorem here is fully constructive ("does not
-   depend on any axioms") EXCEPT `canonical_mem` / `canonical_nondebris` (and their concrete
-   witnesses), which list only `propext` (from `List.filter` reasoning). The crucial checks: NONE
-   lists `sorryAx`, `Classical.choice`, or `Lean.ofReduceBool`. -/
+   depend on any axioms") EXCEPT two named, non-safety declarations: `canonical_mem` /
+   `canonical_nondebris` (and their concrete witnesses) list only `propext` (from `List.filter`
+   reasoning); and `witness_is_f1` lists `Classical.choice`, because it reads the witness off
+   `concrete_no_orphan` via `Classical.choose` purely to ILLUSTRATE non-vacuity - it is on no safety
+   path (the safety theorems supply their witnesses constructively). The crucial check, which holds for
+   every SAFETY theorem: NONE lists `sorryAx`, `Classical.choice`, or `Lean.ofReduceBool`. -/
 #print axioms no_orphan
 #print axioms closure_closed_under_needs
 #print axioms final_closed_under_needs
@@ -127,6 +130,7 @@ theorem witness_is_f1 : (Classical.choose concrete_no_orphan) = f1 := by
   exact h.2
 
 #print axioms concrete_no_orphan
+#print axioms witness_is_f1   -- lists Classical.choice (Classical.choose); illustrative non-vacuity, on no safety path
 
 /- VERIFY-OUTCOME 3: the RECALL no-loss theorem is non-vacuous. A concrete store with one message
    carried by both the archive candidate `f0` and a kept file `f1`: the recall test passes
@@ -148,6 +152,14 @@ theorem concrete_recall_no_loss : preserved msgFps keptB f0 :=
   recall_no_loss msgFps keptB f0 recall_missing_empty
 
 #print axioms concrete_recall_no_loss
+
+-- LEAN-2: the STRENGTHENED archive-path theorem (A∉KEPT ⇒ content survives in a kept file b ≠ A),
+-- non-vacuous here: f0 is archived (∉ keptB = {f1}), and its content lives in f1 ≠ f0.
+theorem concrete_content_safe :
+    ∀ m, msgFps f0 m → ∃ b, keptB b ∧ b ≠ f0 ∧ msgFps b m :=
+  content_safe_post_debris msgFps keptB f0 (by show ¬ (f0 = f1); decide) recall_missing_empty
+
+#print axioms concrete_content_safe
 
 /- VERIFY-OUTCOME 4: MARKER no-hole is non-vacuous. Enriched store where a kept-unique fork `g0`
    is non-canonical, non-live, survives C5, is NOT load-bearing, and HAS nonzero residue - so it
@@ -213,7 +225,7 @@ instance : ∀ y, Decidable (FixProto.loadbearing needs2 src2 cross2 consum2 y) 
 -- ∃ m, resid2 y m is decidable for every y (resid2 y p0 = (y = g0)).
 instance : ∀ y, Decidable (∃ m, resid2 y m) := fun y =>
   if h : y = g0 then isTrue ⟨p0, h⟩
-  else isFalse (by rintro ⟨m, hm⟩; exact h hm)
+  else isFalse (by rintro ⟨_, hm⟩; exact h hm)
 
 -- g0 ∈ KEPT_C5 over the DEFINED demoted: in the seed (kuf), and not demoted (it has residue).
 theorem g0_keptC5_wired :
@@ -226,7 +238,7 @@ theorem concrete_marker_no_hole_wired :
     FixProto.loadbearing needs2 src2 cross2 consum2 g0 ∨ ∃ m, resid2 g0 m :=
   marker_no_hole_wired cross2 needs2 src2 pick2 canon2 live2 kuf2 consum2 resid2
     (fun _ _ => trivial)                       -- closure ⊆ consumers (consumers = ⊤)
-    (fun _ he => he.elim (fun s hs => hs.elim))  -- hpick: vacuous (no sources)
+    (fun _ he => he.elim (fun _ hs => hs.elim))  -- hpick: vacuous (no sources)
     g0_keptC5_wired g0_not_canon g0_not_live
 
 -- live = {c0}, disjoint from kuf2 = {g0}; c0 survives C5.
@@ -773,3 +785,131 @@ end LoadbearingStableWitness
 #print axioms FixProto.loadbearing_stable
 #print axioms Family.singleton_d_no_cross
 #print axioms Family.singleton_d_no_share
+-- LEAN-5 faithful fix: no-orphan over the oracle-free BOUNDED `ClosedB` (no unbounded `IsClosed`, no
+-- `expand` oracle); and the LEAN-3 bridge naming the residue-empty guard as the C5 hypothesis.
+#print axioms TermList.no_orphan_from_closedB
+#print axioms Orphan.c5_guard_discharges_hempty
+
+/- VERIFY-OUTCOME (LEAN-3 non-vacuity): the C5 guard→no-loss chain on a concrete store. `gk`'s message
+   `gm` is duplicated in the kept non-debris `gj ≠ gk`, so `residueOf (KEPT∖debris) gk` is empty;
+   `c5_guard_discharges_hempty` turns that residue-empty guard into the per-message survivor hypothesis,
+   and `c5_demote_no_loss` yields no content loss on demotion. Composed end-to-end, non-vacuously. -/
+namespace C5GuardWitness
+inductive GFil | gk | gj
+deriving DecidableEq
+inductive GMsg | gm
+open GFil GMsg
+
+def gfp : GFil → GMsg → Prop := fun _ _ => True       -- both files carry the (single) message
+def gKEPT : GFil → Prop := fun _ => True
+def gdebris : GFil → Prop := fun _ => False
+
+instance : ∀ m, Decidable (∃ j, (gKEPT j ∧ ¬ gdebris j) ∧ j ≠ gk ∧ gfp j m) := fun _ =>
+  isTrue ⟨gj, ⟨trivial, fun h => h⟩, by decide, trivial⟩
+
+theorem g_res_empty : ∀ m, ¬ Orphan.residueOf gfp (fun j => gKEPT j ∧ ¬ gdebris j) gk m := by
+  intro m h
+  exact h.2 ⟨gj, ⟨trivial, fun h => h⟩, by decide, trivial⟩
+
+theorem g_no_loss : ∀ m, gfp gk m → ∃ j, (gKEPT j ∧ ¬ gdebris j) ∧ gfp j m :=
+  Orphan.c5_demote_no_loss gfp gKEPT gdebris gk
+    (Orphan.c5_guard_discharges_hempty gfp gKEPT gdebris gk g_res_empty)
+
+end C5GuardWitness
+#print axioms C5GuardWitness.g_no_loss
+
+/- VERIFY-OUTCOME 8c (LEAN-5): the oracle-free achievability chain is NON-VACUOUS on REAL structure.
+   The existing termination witnesses are edgeless (all relations ≡ False), so achievability was shown
+   only trivially. This store has a REAL cross edge (ra→rb) AND a REAL phantom (ra needs rp, rs sources
+   rp): the constructed `ClosedB` (NO `expand` oracle) force-adds both rb and rs, and feeds
+   `no_orphan_from_closedB` directly to yield a surviving source (rs). So the whole chain
+   `closed_superset_exists_constructed` → `no_orphan_from_closedB` is oracle-free AND non-vacuous. -/
+namespace D1WitnessReal
+
+open TermList
+
+inductive FilR | ra | rb | rs
+deriving DecidableEq
+inductive PhaR | rp
+deriving DecidableEq
+
+open FilR PhaR
+
+-- ra references a uuid rb owns (cross edge); ra needs phantom rp; rs sources rp. rs ≠ ra.
+def crossR : FilR → FilR → Prop := fun a b => a = ra ∧ b = rb
+def needsR : FilR → PhaR → Prop := fun f _ => f = ra
+def srcR   : FilR → PhaR → Prop := fun f _ => f = rs
+
+-- Decidable instances so `closed_superset_exists_constructed` / `expand` compute (no native_decide).
+instance : DecidableRel crossR := fun a b => by
+  unfold crossR; exact inferInstanceAs (Decidable (_ ∧ _))
+instance : ∀ a p, Decidable (needsR a p) := fun a _ => by
+  unfold needsR; exact inferInstanceAs (Decidable (a = ra))
+instance : ∀ a p, Decidable (srcR a p) := fun a _ => by
+  unfold srcR; exact inferInstanceAs (Decidable (a = rs))
+
+def UR : List FilR := [ra, rb, rs]
+def PsR : List PhaR := [rp]
+
+-- the two completeness facts, REAL (non-vacuous): needsR/srcR actually hold, and their targets land in Ps / U.
+theorem hPsR : ∀ k P, needsR k P → P ∈ PsR := by
+  intro k P _; cases P; exact List.mem_cons_self _ _
+theorem hUsrcR : ∀ s P, srcR s P → s ∈ UR := by
+  intro s P hs
+  simp only [srcR] at hs; subst hs
+  unfold UR; simp
+
+-- obtain a constructed ClosedB superset of [ra] — NO oracle argument.
+theorem hexM :
+    ∃ M : List FilR, (∀ y, y ∈ ([ra] : List FilR) → y ∈ M)
+      ∧ ClosedB crossR needsR srcR UR PsR M :=
+  closed_superset_exists_constructed crossR needsR srcR UR PsR [ra]
+
+-- demotion parameters: nothing demoted, everyone a consumer.
+def kufR : FilR → Prop := fun _ => False
+def consumersR : FilR → Prop := fun _ => True
+def residueR : FilR → Prop := fun _ => True
+
+-- CAPSTONE: feed the constructed ClosedB into no_orphan_from_closedB on the REAL needer ra / phantom
+-- rp, and read the surviving source off the conclusion. It must be rs (the only srcR of rp).
+theorem concrete_no_orphan_real_edge :
+    ∃ M : List FilR, ∃ s,
+      ((s ∈ M) ∧ ¬ FixProto.demoted needsR srcR crossR kufR consumersR residueR s)
+        ∧ srcR s rp ∧ s = rs := by
+  obtain ⟨M, hsub, hcb⟩ := hexM
+  have hraM : ra ∈ M := hsub ra (List.mem_cons_self _ _)
+  have hnotdem_ra : ¬ FixProto.demoted needsR srcR crossR kufR consumersR residueR ra := by
+    intro hd; exact hd.1     -- demoted = kuf ∧ … ; kufR ra = False
+  obtain ⟨s, hs_keptB, hssrc⟩ :=
+    no_orphan_from_closedB crossR needsR srcR hcb hPsR hUsrcR
+      (fun _ _ => trivial)                 -- locked_subset_consumers : consumersR ≡ True
+      (f := ra) (P := rp) ⟨hraM, hnotdem_ra⟩ rfl ⟨rs, rfl⟩
+  refine ⟨M, s, hs_keptB, hssrc, ?_⟩
+  simpa only [srcR] using hssrc
+
+-- The witness is rs, retained in M — i.e. the construction genuinely force-added the phantom source.
+theorem witness_is_rs :
+    ∃ M : List FilR, rs ∈ M ∧ ¬ FixProto.demoted needsR srcR crossR kufR consumersR residueR rs := by
+  obtain ⟨M, s, hkept, _, hsrs⟩ := concrete_no_orphan_real_edge
+  exact ⟨M, hsrs ▸ hkept.1, hsrs ▸ hkept.2⟩
+
+/-- NON-TRIVIALITY OF THE CONSTRUCTION (the part `no_orphan_from_closedB` doesn't exercise, since the
+    safety proof uses only `phan_closed`): the closed superset M force-adds BOTH real edges. From
+    `ClosedB.cross_closed` with the real cross edge `ra→rb` we get `rb ∈ M`; from `phan_closed` we get
+    `rs ∈ M`. So M genuinely closes the cross edge AND the phantom rule — NOT the trivial closure. -/
+theorem M_closes_both_real_edges :
+    ∃ M : List FilR, ra ∈ M ∧ rb ∈ M ∧ rs ∈ M := by
+  obtain ⟨M, hsub, hcb⟩ := hexM
+  have hraM : ra ∈ M := hsub ra (List.mem_cons_self _ _)
+  have hrbU : rb ∈ UR := by unfold UR; simp
+  have hrbM : rb ∈ M := hcb.cross_closed ra hraM rb hrbU (And.intro rfl rfl)
+  have hsrcU : ∃ s ∈ UR, srcR s rp := ⟨rs, hUsrcR rs rp rfl, rfl⟩
+  obtain ⟨s, hsM, hssrc⟩ := hcb.phan_closed ra hraM rp (hPsR ra rp rfl) rfl hsrcU
+  have : s = rs := by simpa only [srcR] using hssrc
+  exact ⟨M, hraM, hrbM, this ▸ hsM⟩
+
+end D1WitnessReal
+
+#print axioms D1WitnessReal.concrete_no_orphan_real_edge
+#print axioms D1WitnessReal.witness_is_rs
+#print axioms D1WitnessReal.M_closes_both_real_edges

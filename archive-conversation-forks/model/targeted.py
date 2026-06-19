@@ -30,9 +30,12 @@ def build_reclose_trap(rng):
     # C: big distinct content; canonical
     cmsgs = set(range(0, 60))
     S.fingerprints['C'] = set(cmsgs)
-    # FORK: mostly contained in C but with >=CEILING tree-local unique to force kept_unique_fork.
-    fork_unique = set(range(100, 100 + 60))   # 60 unique -> >= CEILING=50, auto-kept
-    S.fingerprints['FORK'] = set(range(0, 10)) | fork_unique
+    # FORK: mostly contained in C but with exactly CEILING tree-local unique to force kept_unique_fork.
+    # CRITICAL: keep FORK's DISTINCT count below C's (60) so C stays canonical - else FORK wins canonical
+    # and the C4 trap (a kept NON-canonical fork whose phantom source is protected only by the re-close)
+    # is never built. 50 unique (>= CEILING=50, auto-kept) + 9 shared = 59 distinct < C's 60.
+    fork_unique = set(range(100, 100 + 50))   # exactly CEILING=50 unique -> auto-kept
+    S.fingerprints['FORK'] = set(range(0, 9)) | fork_unique
     # SRC: content fully duplicated in C (so recall sees 0 unique) -> would be archived w/o protection
     S.fingerprints['SRC'] = set(range(0, 20))          # subset of C's messages
     S.fingerprints['NOISE'] = set(range(200, 205))

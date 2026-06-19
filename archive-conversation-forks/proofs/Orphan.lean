@@ -276,13 +276,23 @@ theorem nonzero_residue_survives_shrink {Msg : Type} (fingerprints : File → Ms
 /-- RECALL no-loss over the FINAL (post-debris) picker. The recall pass must compute `missing` over KEPT
     AFTER debris is discarded; then a passing (`missing = ∅`) test guarantees every message of the archived
     candidate lives in a kept file that SURVIVES debris removal, so a later debris move cannot strand it.
-    This is `recall_no_loss` applied at the post-debris kept set - the bug was a usage-site error (measuring
-    over a KEPT that still held debris), not a flaw in `recall_no_loss`. -/
+    Built on `recall_no_loss` applied at the post-debris kept set - the bug was a usage-site error (measuring
+    over a KEPT that still held debris), not a flaw in `recall_no_loss`.
+
+    Like its C5 sibling `c5_demote_no_loss` (whose witness is `j ≠ k`), this carries the archive
+    precondition `hA : ¬ keptFinal A` - the recall pass only archives a file it has DISCARDED from KEPT -
+    and so concludes the content survives in a kept file OTHER THAN `A` (`b ≠ A`). That forecloses the
+    self-witness the bare `preserved` would otherwise permit, matching the C5 contract exactly. The
+    general `recall_no_loss`/`preserved` stay un-strengthened on purpose: they are also used in
+    kept-mode (a retained file's content is preserved by itself), where `A ∈ KEPT` legitimately holds. -/
 theorem content_safe_post_debris {Msg : Type} (fingerprints : File → Msg → Prop) (keptFinal : FSet File)
     (A : File) [∀ m, Decidable (∃ b, keptFinal b ∧ fingerprints b m)]
+    (hA : ¬ keptFinal A)
     (hempty : ∀ m, ¬ missing fingerprints keptFinal A m) :
-    preserved fingerprints keptFinal A :=
-  recall_no_loss fingerprints keptFinal A hempty
+    ∀ m, fingerprints A m → ∃ b, keptFinal b ∧ b ≠ A ∧ fingerprints b m := by
+  intro m hm
+  obtain ⟨b, hKb, hbm⟩ := recall_no_loss fingerprints keptFinal A hempty m hm
+  exact ⟨b, hKb, (fun heq => hA (heq ▸ hKb)), hbm⟩
 
 /-- C5∘debris content safety. If a kept-unique fork `k`'s residue over KEPT∖debris (excluding `k`) is empty
     - every message of `k` is carried by some kept NON-debris file other than `k` - then C5-demoting `k` AND
@@ -295,5 +305,23 @@ theorem c5_demote_no_loss {Msg : Type} (fingerprints : File → Msg → Prop)
   intro m hm
   obtain ⟨j, hj, _, hjm⟩ := hempty m hm
   exact ⟨j, hj, hjm⟩
+
+/-- LEAN-3 bridge: the C5 demotion guard, stated as residue-EMPTINESS over the post-debris kept set,
+    IS exactly `c5_demote_no_loss`'s per-message survivor hypothesis. The committed C5 step demotes `k`
+    iff `residueOf (KEPT∖debris) k` is empty (the Python `if not residue: discard`); this lemma proves
+    that residue-empty test discharges the hypothesis, so the two are PROVED equal, not eyeballed. The
+    `Decidable` binder is the faithful counterpart of the set membership the code evaluates - keeping it
+    constructive. Compose with `c5_demote_no_loss` to drive the no-loss conclusion straight from the guard. -/
+theorem c5_guard_discharges_hempty {Msg : Type} (fingerprints : File → Msg → Prop)
+    (KEPT debris : FSet File) (k : File)
+    [∀ m, Decidable (∃ j, (KEPT j ∧ ¬ debris j) ∧ j ≠ k ∧ fingerprints j m)]
+    (hres : ∀ m, ¬ residueOf fingerprints (fun j => KEPT j ∧ ¬ debris j) k m) :
+    ∀ m, fingerprints k m → ∃ j, (KEPT j ∧ ¬ debris j) ∧ j ≠ k ∧ fingerprints j m := by
+  intro m hm
+  cases (inferInstance : Decidable (∃ j, (KEPT j ∧ ¬ debris j) ∧ j ≠ k ∧ fingerprints j m)) with
+  | isTrue h => exact h
+  | isFalse h =>
+      exact absurd
+        (show residueOf fingerprints (fun j => KEPT j ∧ ¬ debris j) k m from ⟨hm, h⟩) (hres m)
 
 end Orphan

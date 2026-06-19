@@ -278,4 +278,35 @@ theorem closed_superset_exists_constructed (U : List File) (Ps : List Phantom) :
         obtain ⟨M, hM1, hM2⟩ := ih (gap U (x :: L)) hdrop (x :: L) rfl
         exact ⟨M, fun y hy => hM1 y (List.mem_cons_of_mem x hy), hM2⟩
 
+/--
+  FAITHFUL no-orphan over the BOUNDED, oracle-free-achievable `ClosedB` - the fixpoint the committed
+  loop actually computes - with NO inflation to the unbounded `FixProto.IsClosed`. The safety argument
+  uses closedness ONLY through `phan_closed` (it never touches `cross_closed`), so this needs just the
+  bounded phantom rule plus two completeness facts that hold of the committed store: every needed
+  phantom is listed in `Ps`, every source is listed in `U`. `closed_superset_exists_constructed`
+  produces exactly this `ClosedB` with NO `expand` oracle, so achievability is oracle-free end-to-end:
+  `closed_superset_exists_constructed` (gives `ClosedB`) → `no_orphan_from_closedB` → no orphan. The
+  unbounded `IsClosed` and its `expand` oracle are never needed for the safety conclusion. -/
+theorem no_orphan_from_closedB
+    {U : List File} {Ps : List Phantom} {L : List File}
+    {kuf consumers residue : File → Prop}
+    (hcl : ClosedB cross needs sources U Ps L)
+    (hPs : ∀ k P, needs k P → P ∈ Ps)
+    (hUsrc : ∀ s P, sources s P → s ∈ U)
+    (locked_subset_consumers : ∀ x, x ∈ L → consumers x)
+    {f : File} {P : Phantom}
+    (hf : (f ∈ L) ∧ ¬ FixProto.demoted needs sources cross kuf consumers residue f)
+    (hneed : needs f P)
+    (hsrc : ∃ s, sources s P) :
+    ∃ s, ((s ∈ L) ∧ ¬ FixProto.demoted needs sources cross kuf consumers residue s) ∧ sources s P := by
+  obtain ⟨s0, hs0⟩ := hsrc
+  have hsrcU : ∃ s ∈ U, sources s P := ⟨s0, hUsrc s0 P hs0, hs0⟩
+  obtain ⟨s, hsL, hssrc⟩ := hcl.phan_closed f hf.1 P (hPs f P hneed) hneed hsrcU
+  have hcons_needs : ∃ g, consumers g ∧ needs g P := ⟨f, locked_subset_consumers f hf.1, hneed⟩
+  have hslb : FixProto.loadbearing needs sources cross consumers s :=
+    FixProto.source_lb_from_def needs sources cross consumers hssrc hcons_needs
+  have hsnotdem : ¬ FixProto.demoted needs sources cross kuf consumers residue s := by
+    intro hd; exact (FixProto.demoted_guard_from_def needs sources cross kuf consumers residue hd) hslb
+  exact ⟨s, ⟨hsL, hsnotdem⟩, hssrc⟩
+
 end TermList

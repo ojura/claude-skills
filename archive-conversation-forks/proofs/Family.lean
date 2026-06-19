@@ -222,10 +222,13 @@ theorem singleton_canonicalPick (k : File) : canonicalPick debris [k] = some k :
   by_cases h : debris k <;> simp [List.filter, List.head?, h]
 
 /--
-  `canonicals x := canonicalPick debris (treeOf x) = some x` is exactly the committed
-  `canonicals = {canonical(ks) | ks ∈ trees}` (x is canonical iff it is its own tree's canonical). For a
-  debris-nominated file the tree is the singleton `[k]` (the `len(ks)==1` guard), so its tree-canonical
-  is itself: `debris ⊆ canonicals`. -/
+  On a SINGLETON tree `[k]`, `canonicalPick debris [k] = some k` matches the committed `canonical([k]) =
+  k` exactly - which is all `debris_nominated_canonical` needs: a debris-nominated file's tree is the
+  singleton `[k]` (the `len(ks)==1` guard), so its tree-canonical is itself, giving `debris ⊆ canonicals`.
+  NOTE the scope: `canonicalPick` takes the HEAD of the floored candidates, not the max-key element. On a
+  MULTI-file tree the committed `canonical(ks) = max(cand, key=...)` is modelled by
+  `Family.Canon.canonicalByKey` (proved to select a maximal key), NOT by `canonicalPick`; head and max
+  coincide only on singletons, which is the case this lemma is scoped to. -/
 theorem debris_nominated_canonical (treeOf : File → List File) {k : File}
     (hsingleton : treeOf k = [k]) :
     canonicalPick debris (treeOf k) = some k := by

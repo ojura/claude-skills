@@ -8,7 +8,7 @@ proved alongside it.
 
 ## What is proved
 
-**`FixProto.no_orphan_from_closed` (the main result, unconditional).**
+**`FixProto.no_orphan_from_closed` (the structural safety lemma) and `TermList.no_orphan_from_closedB` (its oracle-free, end-to-end form).**
 
 > For every store and every operator `judge` policy, every needed phantom `P` of a
 > finally-kept file `f`, if `P` has **any** source anywhere in the store, retains a
@@ -18,14 +18,28 @@ In plain terms: the cleanup never archives the last phantom-backfill source of a
 keeps, so a kept session's deep origin can never be orphaned by the move. ("Phantom",
 "source", "needs", and the keep-locked closure are defined in `../SKILL.md`.)
 
-There are two forms of this result, and the unconditional one is the main result.
-`Orphan.no_orphan` is the **conditional core**: it takes the three bridge facts (`hpick` /
-`source_lb` / `demoted_guard`) as hypotheses, so on its own it proves no-orphan *given* them.
-`FixProto.no_orphan_from_closed` is the **unconditional** result: it discharges all three from
-`IsClosed locked` (the loop reached its fixpoint) plus the set definitions of `loadbearing` /
-`demoted`, and `IsClosed` is itself discharged by the termination proof (`closed_superset_exists`).
-So `no_orphan_from_closed` assumes nothing the code does not establish; that is THE result a reader
-should land on. `no_orphan` is the reusable lemma it is built from.
+The safety guarantee is a CHAIN of discharged lemmas, not one monolithic theorem. `Orphan.no_orphan`
+is the **conditional core**: it takes the three bridge facts (`hpick` / `source_lb` / `demoted_guard`)
+as hypotheses. `FixProto.no_orphan_from_closed` discharges all three from a single closedness
+hypothesis plus the set definitions of `loadbearing` / `demoted` - but it remains *conditional on that
+closedness*: it takes `IsClosed locked` (the loop reached its fixpoint). The honest question is what
+discharges the closedness, and at which strength.
+
+`TermList.no_orphan_from_closedB` is the form a reader should land on, because it is achievable
+**oracle-free and end-to-end**. It consumes the BOUNDED closedness `ClosedB` - the finite fixpoint the
+committed loop actually computes (quantifiers over the present files `U` and phantoms `Ps`) - plus two
+completeness facts that hold of the store (every needed phantom is in `Ps`, every source is in `U`).
+The safety argument needs closedness only through the phantom rule (`phan_closed`); it never uses
+`cross_closed`. And `TermList.closed_superset_exists_constructed` produces exactly this `ClosedB` with
+NO `expand` oracle. So the chain `closed_superset_exists_constructed` (bounded closure, oracle-free) →
+`no_orphan_from_closedB` (no orphan) assumes nothing the code does not compute. The real-edge witness
+`D1WitnessReal` (Check.lean) shows this is non-vacuous on a store with a genuine cross edge AND a genuine
+phantom, not the trivial edgeless case.
+
+The unbounded `FixProto.IsClosed` and `closed_superset_exists` remain as the abstract generic form
+(`IsClosed → no-orphan`, with achievability *relative to* the `expand` oracle), useful for reasoning;
+but the oracle-free, end-to-end safety goes through the bounded `ClosedB`. `Orphan.no_orphan` is the
+reusable lemma all of these are built from.
 
 **`Orphan.recall_no_loss` (the recall pass's content-level safety).** The recall pass archives
 a candidate `A` when its message set is fully contained in the union of the kept files
@@ -167,24 +181,31 @@ per-record source/need test is a TOTAL, MUTUALLY-EXCLUSIVE partition (`rec_excl`
 (`bit_partition`, the same technique as `classify_exhaustive`); and the historical bug is exhibited as
 a machine-checked DIVERGENCE (`lazy_flips_source_to_need`: on a null-parent-but-real-pre-content record
 the committed test says SOURCE while the lazy par-only test says NEED). `no_orphan_from_closed_bnd`
-restates the unconditional no-orphan over the DEFINED relations - instantiation, since the algebra was
+restates the no-orphan over the DEFINED relations - instantiation, since the algebra was
 always generic over needs/sources - so the guarantee lands on the relations the skill actually
 computes, not on opaque stand-ins. All `Boundary` results are **fully axiom-free**. SCOPE: this proves
 the LOGIC of needs/sources GIVEN the `(lpu, par, nb)` records; the JSONL→records parse stays
 fuzz-checked (see Honest scope), so the gap on needs/sources shrinks from "all of the par/nb layer" to
 "only the triple extraction".
 
-**`TermList.*` (`IsClosed` is achievable, with the oracle constructed).** `closed_superset_exists`
-proves that over a finite universe a closed `locked ⊇ seed` exists, so `IsClosed` - the one fact
-`hpick` rested on - is discharged rather than assumed. This is the committed loop's termination: each
-changing iteration adds a universe element, a monotone fixpoint over a finite set. The decreasing
-measure (`gap`, the count of not-yet-included universe elements) and its strict-drop lemma (`gap_lt`)
-are hand-rolled in core Lean (no mathlib) and closed by `Nat.strongInductionOn`. The loop-body oracle
-is **constructed, not assumed**: for a finite store with decidable relations, `expand` is a decidable
-finite search (`crossViol` / `phanViol` / `phanSrc`) that returns a forced new element or certifies
-bounded closedness (`closed_of_none`), and `closed_superset_exists_constructed` runs the whole loop
-with it - no oracle parameter. Bounded closedness (`ClosedB`) coincides with the committed loop's
-fixpoint condition over a finite store.
+**`TermList.*` (closedness is ACHIEVED oracle-free at the bounded level `ClosedB`).** There are two
+results, at two strengths, and the distinction matters. `closed_superset_exists` yields the UNBOUNDED
+`FixProto.IsClosed`, but it takes the loop-body oracle `expand` as a hypothesis - so it RELOCATES the
+termination burden rather than discharging it oracle-free. `closed_superset_exists_constructed`
+CONSTRUCTS that oracle (for a finite store with decidable relations, `expand` is a decidable finite
+search - `crossViol` / `phanViol` / `phanSrc` - returning a forced new element or certifying closure via
+`closed_of_none`) and runs the whole loop with NO oracle parameter; what it achieves is BOUNDED
+closedness `ClosedB` (quantifiers over the present files `U` / phantoms `Ps`), the exact finite fixpoint
+the committed loop computes. This is the committed loop's termination: each changing iteration adds a
+universe element, a monotone fixpoint over a finite set, with decreasing measure `gap` (not-yet-included
+universe elements) and strict-drop lemma `gap_lt`, hand-rolled in core Lean (no mathlib) and closed by
+`Nat.strongInductionOn`.
+
+The safety conclusion consumes this bounded `ClosedB` DIRECTLY, via `no_orphan_from_closedB` (which uses
+closedness only through `phan_closed`, never `cross_closed`), so the oracle-free chain is end-to-end with
+no step that inflates `ClosedB` to the unbounded `IsClosed`. We do NOT rest on a bare "`ClosedB`
+coincides with the unbounded fixpoint" assertion: the safety theorem needs only the bounded form, and
+`D1WitnessReal` exercises the whole chain on a store with a real cross edge and a real phantom.
 
 Properties of the proofs:
 
@@ -292,11 +313,13 @@ the shortcut. (Mirrors the `sources()`/`needs()` DISCIPLINE note in `../SKILL.md
   `source_lb`, `cross_lb`, `phan_lb`, `demoted_guard`, `live_not_demoted`, and `C5_survivor` all
   follow from the set definitions of `loadbearing` (now the actual UNION of the cross-target and
   phantom-source halves) and `demoted` (the actual three-conjunct C5 guard `kuf ∧ ¬loadbearing ∧
-  ¬residue`); `hpick` follows from `IsClosed locked`; and `IsClosed` itself is no longer assumed - it
-  is *proven achievable* (`closed_superset_exists`: a closed `locked ⊇ seed` exists over a finite
-  universe). The loop-body oracle that drives it is itself *constructed*, not assumed (see below). So
-  the only thing not formalised is whether the Python *implements* the abstract relations (the JSONL
-  parse, the actual union-find, `canonical()`, the loop body) - checked by the property-based fuzz.
+  ¬residue`); `hpick` follows from closedness; and closedness itself is **achieved oracle-free at the
+  BOUNDED level**: `closed_superset_exists_constructed` yields `ClosedB` (the finite fixpoint the loop
+  actually computes) with the loop-body oracle *constructed*, not assumed (see below). The safety
+  conclusion consumes that bounded `ClosedB` directly via `no_orphan_from_closedB`; the unbounded
+  `IsClosed` (`closed_superset_exists`) is reached only *relative to* the `expand` oracle and is not
+  needed for safety. So the only thing not formalised is whether the Python *implements* the abstract
+  relations (the JSONL parse, the actual union-find, `canonical()`, the loop body) - checked by the fuzz.
 - The termination proof (`Termination.lean`) is **mathlib-free, in core Lean**. Core Lean 4.10's
   `List` lacks `Sublist` and `countP`, so the decreasing-measure lemma (`gap_lt`: adding a forced
   element strictly shrinks the count of not-yet-included universe elements) and its monotonicity
@@ -362,7 +385,7 @@ the shortcut. (Mirrors the `sources()`/`needs()` DISCIPLINE note in `../SKILL.md
 - `Markers.lean` - the closure-inversion lemma, `live_subset_keptC5`, `marker_no_hole`, `marker_range_excludes_debris` (the marker range omits debris), the wired capstones, and the marker classification (`classify` + total/exclusive/exhaustive lemmas).
 - `Family.lean` - union-find as an equivalence (co-tree and false-family lemmas), `canonical()` membership + floor + max-key selection (`Family.Canon`, core lex order), `singleton_canonicalPick` / `debris_nominated_canonical` (`debris ⊆ canonicals`), the loadbearing-stability bridges (`singleton_d_no_cross` / `singleton_d_no_share`, discharging the singleton guard into the stability hypotheses), and `find` path-compression correctness (`Family.Compress`).
 - `Fixpoint.lean` - `IsClosed`, the seven bridge facts derived (`hpick_from_closed`, `source_lb_from_def`, `cross_lb_from_def`, `demoted_guard_from_def`, `live_not_demoted_from_def`, `C5_survivor_from_def`), `no_orphan_from_closed`, `no_orphan_from_closed_debris` (no-orphan survives the debris demotion), and `loadbearing_stable` (discarding a singleton debris file changes no other file's load-bearing status).
-- `Boundary.lean` - the par/nb layer: `needs` / `sources` DEFINED as the committed set-builder over `(lpu, par, nb)` records (`sourcesOf` / `needsOf`), the per-record source/need partition (`rec_excl` / `rec_total` / `rec_iff`, 2-bit cube `bit_partition`), the `par is not None`-only bug as a checked divergence (`lazy_flips_source_to_need`), and `no_orphan_from_closed_bnd` (the unconditional no-orphan over the defined relations). Axiom-free.
-- `Termination.lean` - `gap_lt` + `closed_superset_exists` (a closed set exists over a finite universe, discharging `IsClosed`), and the constructed loop-body oracle (`expand` / `closed_of_none` / `closed_superset_exists_constructed`). Core Lean, hand-rolled (no mathlib).
+- `Boundary.lean` - the par/nb layer: `needs` / `sources` DEFINED as the committed set-builder over `(lpu, par, nb)` records (`sourcesOf` / `needsOf`), the per-record source/need partition (`rec_excl` / `rec_total` / `rec_iff`, 2-bit cube `bit_partition`), the `par is not None`-only bug as a checked divergence (`lazy_flips_source_to_need`), and `no_orphan_from_closed_bnd` (the no-orphan over the defined relations). Axiom-free.
+- `Termination.lean` - `gap_lt`; `closed_superset_exists` (yields the unbounded `IsClosed` GIVEN the `expand` oracle); the constructed, oracle-free `closed_superset_exists_constructed` (builds `expand` via `closed_of_none`, yields the BOUNDED `ClosedB` - the finite fixpoint the loop computes); and `no_orphan_from_closedB` (the safety conclusion over `ClosedB`, the oracle-free end-to-end form, fed directly by the constructed achiever). Core Lean, hand-rolled (no mathlib).
 - `Check.lean` - the axiom audit (`#print axioms`) and concrete non-vacuity models for all theorems.
 - `lakefile.toml`, `lean-toolchain` - build configuration (Lean 4.10.0, no dependencies).

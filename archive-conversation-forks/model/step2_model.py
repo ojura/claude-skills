@@ -207,7 +207,7 @@ def run_pipeline(S, judge_oracle, recall_oracle, marker_substantive_oracle, bugg
     keptset = {k: set(fingerprints[k]) for k in KEPT}
     kept_union = set().union(*keptset.values()) if keptset else set()
     recall_archived = []
-    for A in [a for a in fingerprints if a not in KEPT and a not in live]:
+    for A in [a for a in fingerprints if a not in KEPT and a not in live and a not in debris]:
         missing = set(fingerprints[A]) - kept_union
         best = min(KEPT, key=lambda b: len(set(fingerprints[A]) - keptset[b]), default=None)
         if not missing:

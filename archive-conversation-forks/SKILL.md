@@ -314,26 +314,42 @@ def is_debris(k): return len(set(fingerprints[k])) <= DEBRIS_MAX
 def canonical(ks):
     cand=[k for k in ks if not is_debris(k)] or ks
     # final `, k` tiebreak: when distinct-count AND last-ts tie (e.g. byte-identical duplicate forks),
-    # pick the lexically-first filename - deterministic, instead of max()'s accidental dict-insertion order.
+    # `max` resolves on `k`, picking the lexically-LAST filename - arbitrary but DETERMINISTIC (not glob/
+    # dict iteration order), which is all the tiebreak needs once content and recency are equal.
     return max(cand, key=lambda k:(len(set(fingerprints[k])), lts[k], k))
 
 # keep-locked closure: seed (canonicals + live) + transitive load-bearing over BOTH edge types.
 # AUTHORITATIVE never-touch: live sessionIds from ~/.claude/sessions/*.json (Step 0). NO mtime term -
 # recent-mtime is NOT a liveness signal (opening a chat to inspect it bumps its mtime; the registry,
-# not mtime, says what is live). Consult status AND liveness: a crashed process can leave a stale
-# <pid>.json with status "running", so drop the dead (os.kill below) - over-protection is benign.
+# not mtime, says what is live). Liveness is "the process that owns this entry is still alive", which is
+# NOT the `status` string: an open session sits in status "idle" (awaiting input) or "busy" (generating)
+# and is essentially NEVER "running" in current Claude Code (verified on a live 2.1.x registry: entries
+# carry idle/busy, not running). So do NOT gate on `status` - that silently drops EVERY live session.
+# Gate on the PID being alive AND its /proc start-time matching the recorded `procStart` (which pins the
+# entry to that exact process, so a reused PID cannot masquerade as the dead session it replaced). Both
+# checks only ever OVER-protect (keep a stale entry), never under-protect, so the direction is always safe.
 live=set(); registry_unreadable=False
+def proc_starttime(pid):                                 # /proc/<pid>/stat field 22 (ticks since boot); the
+    try:                                                 # registry's `procStart` is exactly this value. `comm`
+        s=open(f"/proc/{pid}/stat").read()               # can contain spaces/parens, so split AFTER the final ")".
+        return s[s.rindex(")")+1:].split()[19]
+    except OSError: return None                          # non-Linux / process gone: fall back to os.kill alone
 for sp in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
     try:
         d=json.load(open(sp))
     except (OSError, ValueError):
-        registry_unreadable=True; continue   # a CORRUPT <pid>.json may HIDE a running session -> HALT after
+        registry_unreadable=True; continue   # a CORRUPT <pid>.json may HIDE a live session -> HALT after
                                               # the loop, never silently skip (the prose promises STOP-on-unreadable)
-    if d.get("status")!="running": continue             # not live per the registry's own field
-    # os.kill(pid,0) proves the PID is OCCUPIED, not that it is YOUR session (PIDs get reused). That only ever
-    # OVER-protects (a reused-PID stale entry is kept), never under-protects, so it is safe in this direction.
-    try: os.kill(int(d["pid"]),0)                        # ProcessLookupError => process gone => stale entry
-    except (ProcessLookupError, ValueError, KeyError): continue   # (own-user sessions never raise EPERM)
+    try: pid=int(d["pid"])
+    except (KeyError, ValueError, TypeError):
+        registry_unreadable=True; continue   # a malformed entry may HIDE a live session -> fail closed, HALT after
+    # os.kill(pid,0) proves the PID is OCCUPIED, not that it is YOUR session (PIDs get reused); the procStart
+    # match below proves it is the SAME process. EPERM = alive but another user = still live (keep).
+    try: os.kill(pid,0)                                  # ProcessLookupError => process gone => stale entry
+    except ProcessLookupError: continue
+    except PermissionError: pass
+    ps=str(d.get("procStart","")); st=proc_starttime(pid)
+    if ps and st is not None and ps!=st: continue        # PID reused by an unrelated process => stale entry, skip
     sid=d.get("sessionId","")[:8]
     # The registry is GLOBAL (every running Claude process, all projects). A session running in ANOTHER
     # project has no file in THIS store, so `sid not in fingerprints` does NOT by itself mean an inconsistency.
@@ -557,7 +573,7 @@ for A in [a for a in fingerprints if a not in KEPT and a not in live and a not i
 
 Two rules learned the hard way:
 
-- **`0 unique` is exact set-containment, not a heuristic.** Every (type, content) message of A is byte-identical to one in `best`, so archiving A loses nothing. Safe without a Sonnet.
+- **`0 unique` is exact set-containment against the kept set as a whole, not a heuristic.** Every (type, content) message of A has an identical fingerprint somewhere in the kept *union* - possibly split across several kept files, NOT necessarily in `best` (which is only the single closest file, reported for the operator, and need not individually contain A). So archiving A loses nothing. Safe without a Sonnet. (The fingerprint is a 12-hex-char, i.e. 48-bit, MD5 prefix: read "identical" as "identical fingerprint", which is containment for any realistic store, not a literal byte-compare. If you want byte-certainty, compare the raw messages of A against its union cover before the move.)
 - **Any NONZERO unique is a `likely`-style claim and MUST be confirmed by a Sonnet that READS the unique messages.** A keyword/mention count in the container (e.g. "BodyFrameId appears 2174 times") does NOT prove the specific exchange is preserved. The Sonnet reads each unique message and either confirms it is trivial or genuinely preserved elsewhere (archive) or flags it as unique work (keep). The zero-unique archive is the **recall** gate; the Sonnet read is the **precision** gate. Both are required: maximum cleanup, zero loss.
 
 Never archive a canonical even when it is highly contained in one of its own forks (forks
@@ -596,7 +612,7 @@ balloons `locked` to ~ALL files (`locked = locked_closure(KEPT)` with `KEPT ⊇ 
 single-file-tree member). `if k in locked` then skips EVERY debris candidate and nominates nothing,
 silently. (Real run: 9 empty stubs + 11 command-only shells were all suppressed this way and only
 surfaced late, mid-titling.) Guard on the genuinely **load-bearing** set instead - cross-file lpu
-targets plus phantom sources - and the line-555 guard excludes a file the moment it is load-bearing (a
+targets plus phantom sources - and the `if k in loadbearing: continue` guard excludes a file the moment it is load-bearing (a
 0-message stub can still own a `compact_boundary` uuid, so do not infer non-load-bearing from a zero
 message count; the guard tests membership directly). Archiving a non-load-bearing file (the debris path is
 a SECOND non-load-bearing demotion alongside C5) is proved in `proofs/` not to orphan any kept session
