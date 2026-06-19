@@ -153,7 +153,7 @@ def send_frame(sock, tag, payload):
 
 def read_request_line(sock):
     # The request is one newline-terminated line; read only up to the newline so we
-    # never depend on the client closing its write side (no half-close timeout games).
+    # never depend on the client closing its write side.
     # If the line passes the cap before a newline arrives, say so (request-too-long)
     # rather than silently truncating and later failing the HMAC as a misleading
     # "auth-failed".

@@ -15,13 +15,13 @@ prompts.
 
 ## Prerequisites
 
-- Chrome running with remote debugging enabled on its **main/default profile**.
-  Important: `--remote-debugging-port` does **NOT** work for the default/main
-  user profile - Chrome 136+ ignores the flag there as a security measure. So do
-  not rely on that flag. Remote debugging is instead enabled at runtime by opening
-  `chrome://inspect` in the target Chrome, which opens the local DevTools endpoint
-  on the running profile and raises the "Allow remote debugging?" consent prompt -
-  which this daemon auto-presses. The daemon does not assume a fixed port: it discovers the live
+- Chrome running with remote debugging enabled on the profile you want to drive (normally your
+  **main/default** one). The `--remote-debugging-port` flag can't get you there: Chrome 136+
+  ignores it on the default/main profile as a security measure. Enable it instead, persistently,
+  by opening `chrome://inspect` in the target Chrome, which turns on the local DevTools endpoint
+  on the running profile. The daemon
+  can then connect at all, and that first connection raises the "Allow remote
+  debugging?" consent modal - which this daemon auto-presses. It discovers the live
   endpoint (port + UUID WebSocket path) from
   `~/.config/google-chrome/DevToolsActivePort`, falling back to
   `127.0.0.1:43809` only if that file is missing.

@@ -1,9 +1,9 @@
 # sudo-listener
 
-A self-contained, authenticated **root command channel** over loopback, in a single Python file
+An authenticated **root command channel** over loopback, in a single Python file
 that is both the server and the client. The server runs as root and binds `127.0.0.1:9999`; an
 unprivileged client signs a command with a shared key, sends it, and gets the command's
-stdout/stderr/exit code streamed back. It is a deliberate, **auditable alternative to passwordless
+stdout/stderr/exit code streamed back. It is an **auditable alternative to passwordless
 (`NOPASSWD`) sudo** for letting a local non-root process - for example an AI coding agent - run
 controlled root commands.
 
@@ -77,12 +77,13 @@ This is a **root-execution channel by design**. Its safety rests on two things:
 1. **The PSK file is `0600`** (owner + root only). Anyone who can read it can run any command as
    root through the socket, so treat the key as a root credential. Rotate it by deleting the file
    (the server regenerates it on next start).
-2. **The bind is `127.0.0.1` only.** Off-box hosts cannot reach it. A local attacker would need
-   the PSK to forge a request; capturing a valid request off the loopback interface already
-   requires root, and the signed line is never written to the log.
+2. **The bind is `127.0.0.1` only.** Off-box hosts cannot reach it. A local attacker has two ways
+   in, and both are closed: forging a fresh request needs the PSK (a root-equivalent credential),
+   and replaying a captured one needs a copy of a valid request - but capturing it off the loopback
+   interface already requires root, and the signed line is never written to the log.
 
 Do not widen the bind address or loosen the key permissions. Only deploy it where granting the
-PSK holder passwordless-sudo-equivalent power is acceptable.
+PSK holder power equivalent to passwordless sudo is acceptable.
 
 ## Notes & limitations
 
