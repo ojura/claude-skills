@@ -22,8 +22,9 @@ was reproduced by independent re-measurement except where a ⚠ correction is no
 **Signatures are export-exclusive** — present only in the account export and local
 CC JSONL; never on any load-API rendering mode, never in the live stream. ⚠ But
 **16% of export thinking blocks are unsigned** (`signature: null`, 856/5337 across
-16 conversations) — those teleport only as *unsigned* thinking. The fetcher
-(`rendering_mode=messages`) cannot obtain signatures.
+16 conversations) — those teleport only as *unsigned* thinking. The fetcher's load-API path
+(`rendering_mode=messages`) can't see signatures — but its `export_account`
+pipeline (§ Programmatic account export) can: the export is the source.
 
 ## 2. claude.ai load-API fetch modes (two orthogonal axes)
 
@@ -128,7 +129,8 @@ Not a bijection obstacle — the API accepts arbitrary historical tool names; to
 
 **Verdict:** clean tree/forest isomorphism on the native core; metadata = symmetric escrow; irreducible losses = a few claude.ai-only content types + CC tool-execution richness.
 
-**"Super-complete dump"** = merge **export** (signatures + raw thinking + full block metadata + forest) with one **live fetch** (active-leaf + backend object), keyed on message uuid. The fetcher alone cannot supply signatures.
+**"Super-complete dump"** = merge **export** (signatures + raw thinking + full block metadata + forest) with one **live fetch** (active-leaf + backend object), keyed on message uuid — **both halves are now scriptable from the fetcher**:
+`export_account` (signatures) ⊕ `get_conversation` (active-leaf/backend object).
 
 ---
 
