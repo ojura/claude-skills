@@ -43,6 +43,10 @@ On connect it spawns `clear_modals.py --wait`, which polls the AT-SPI tree for
 Chrome's Allow button(s) and presses every match (Chrome exposes two
 push-button nodes under the same alert; pressing only the first is unreliable).
 
+The daemon is long-lived: after editing `cdp_daemon.py`, restart it (`POST
+/shutdown`, or `pkill -f cdp_daemon.py`, then relaunch) - an already-running
+instance keeps executing the old code in memory.
+
 If Chrome renderer accessibility is OFF, the Allow dialog is invisible to AT-SPI
 and cannot be auto-pressed. In that case the daemon does **not** spam dialogs:
 each fresh CDP connection attempt pops its own Allow dialog, so instead of
@@ -58,8 +62,8 @@ that exact pending request the instant you click Allow once), then goes idle.
 |--------|------|------|---------|
 | GET  | `/targets` | | `Target.getTargets` targetInfos array |
 | POST | `/attach` | `{targetId}` | `{sessionId}` |
-| POST | `/eval` | `{sessionId, expression, [returnByValue=true], [awaitPromise=false]}` | `Runtime.evaluate` result |
-| POST | `/cdp` | `{method, [params], [sessionId], [timeout]}` | raw CDP response |
+| POST | `/eval` | `{sessionId, expression, [returnByValue=true], [awaitPromise=false], [timeout_seconds=15]}` | `Runtime.evaluate` result |
+| POST | `/cdp` | `{method, [params], [sessionId], [timeout_seconds=15]}` | raw CDP response (200); a CDP protocol error → 500 `{"error":{code,message,...}}` (vs a transport/timeout failure → 500 `{"error":"<string>"}`) |
 | GET  | `/events` | `?since=N&method=substr&limit=N` | buffered CDP events |
 | GET  | `/status` | | `{connected, pending, events_buffered, log_tail, ...}` |
 | POST | `/reconnect` | | force a fresh CDP connect (use if the socket wedges) |
@@ -118,6 +122,22 @@ soon as it appears, rather than wrapping inline.
   their full timeout (the same calls return in ms on a responsive worker), and a
   batch of such timeouts starves the single CDP socket. The auto-hook only fires
   on `waitingForDebugger:true` targets for this reason; never `/eval` a busy worker.
+- **A Memory-Saver-frozen page hangs eval the same way a busy worker does.** Chrome
+  freezes background tabs: the target still lists and `/attach` still returns a
+  `sessionId`, but the renderer's task queue is suspended, so `Runtime.evaluate`
+  never runs and hangs to the full `timeout_seconds`. This is NOT a debugger pause -
+  `Runtime.runIfWaitingForDebugger` does nothing for it. Eval against a foregrounded
+  or freshly-created tab; never trust a stale background tab (with 100s of targets,
+  expect several frozen). To revive one specific frozen tab, `POST /cdp
+  Target.activateTarget {targetId}` first, then poll/retry the eval - the resume is
+  async, and a fully *discarded* tab reloads rather than resuming instantly. Two
+  corollaries that cost real debugging time here: (1) make eval **self-reporting** -
+  classify each call as value / JS-exception / daemon-timeout, because a parser that
+  reads only `.result.value` collapses timeout, exception, and empty-result into one
+  indistinguishable blank; (2) `timeout_seconds` is SECONDS (passed to `ev.wait`),
+  accepted by both `/cdp` and `/eval` - keep the HTTP client's read timeout *above*
+  it, or the client aborts first and you never see the daemon's own 500
+  timeout/diagnosis.
 - **No browser-handshake calls in a paused-start injection.** `new BroadcastChannel(...)`
   (and similar) blocks forever when constructed in a worker paused at start: the
   constructor needs a browser-process handshake the suspended task loop cannot

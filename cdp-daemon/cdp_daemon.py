@@ -5,9 +5,9 @@ on connect), exposes a local HTTP API on 127.0.0.1:7799 for CDP calls.
 Endpoints:
   GET  /targets                                → Target.getTargets
   POST /attach        {targetId}               → returns sessionId
-  POST /eval          {sessionId, expression, [returnByValue=true], [awaitPromise=false]}
+  POST /eval          {sessionId, expression, [returnByValue=true], [awaitPromise=false], [timeout_seconds=15]}
                                                 → Runtime.evaluate
-  POST /cdp           {method, [params], [sessionId]}  → arbitrary CDP method
+  POST /cdp           {method, [params], [sessionId], [timeout_seconds=15]}  → arbitrary CDP method
   GET  /events?since=N&method=substr&limit=N   → buffered CDP events (Network.*, Runtime.*, etc.)
   GET  /status                                 → daemon status (state, diag, connected, log_tail)
   POST /reconnect                              → force a fresh connect attempt
@@ -339,12 +339,12 @@ def _run_autohook(sid, url, script):
     res = None
     try:
         r = cdp_call("Runtime.evaluate", {"expression": script, "returnByValue": True},
-                     sessionId=sid, timeout=10)
+                     sessionId=sid, timeout_seconds=10)
         res = ((r.get("result", {}) or {}).get("result", {}) or {}).get("value")
     except Exception as e:
         res = f"inject-err:{e}"
     try:
-        cdp_call("Runtime.runIfWaitingForDebugger", {}, sessionId=sid, timeout=5)
+        cdp_call("Runtime.runIfWaitingForDebugger", {}, sessionId=sid, timeout_seconds=5)
     except Exception:
         pass
     autohooked.append({"sid": sid, "url": (url or "")[:90], "result": res})
@@ -372,9 +372,12 @@ def _on_attached(params):
                 matched = True
                 threading.Thread(target=_run_autohook, args=(sid, url, h["script"]), daemon=True).start()
         if not matched:
-            threading.Thread(
-                target=lambda: cdp_call("Runtime.runIfWaitingForDebugger", {}, sessionId=sid, timeout=5),
-                daemon=True).start()
+            def _resume():
+                try:
+                    cdp_call("Runtime.runIfWaitingForDebugger", {}, sessionId=sid, timeout_seconds=5)
+                except Exception:
+                    pass   # best-effort resume of an unrelated paused target; ignore if it vanished
+            threading.Thread(target=_resume, daemon=True).start()
     except Exception as e:
         log(f"_on_attached err: {e}")
 
@@ -422,7 +425,17 @@ def reader_thread():
         disconnected.set()
 
 
-def cdp_call(method, params=None, sessionId=None, timeout=15):
+class CDPError(Exception):
+    """A CDP command returned a protocol-level `error` (JSON-RPC style): Chrome
+    answered but rejected the command (stale/unknown sessionId, detached target,
+    bad method/params). Distinct from a transport failure (TimeoutError / socket
+    drop). Carries the raw error object so callers can read code/message/data."""
+    def __init__(self, error):
+        self.error = error
+        super().__init__(f"CDP error {error.get('code')}: {error.get('message')}")
+
+
+def cdp_call(method, params=None, sessionId=None, timeout_seconds=15):
     if cdp_sock is None:
         raise RuntimeError(f"CDP not connected (state={cdp_state}): {cdp_diag or 'connecting'}")
     ev = threading.Event()
@@ -434,12 +447,14 @@ def cdp_call(method, params=None, sessionId=None, timeout=15):
     msg = {"id": mid, "method": method, "params": params or {}}
     if sessionId: msg["sessionId"] = sessionId
     ws_send(json.dumps(msg))
-    if not ev.wait(timeout):
+    if not ev.wait(timeout_seconds):
         pending.pop(mid, None)
-        raise TimeoutError(f"{method} timed out after {timeout}s")
+        raise TimeoutError(f"{method} timed out after {timeout_seconds}s")
     pending.pop(mid, None)
     if ev.response is None:
         raise RuntimeError(f"{method} failed: CDP socket dropped mid-call (state={cdp_state})")
+    if ev.response.get("error"):  # Chrome rejected the command (vs transport failure above)
+        raise CDPError(ev.response["error"])
     return ev.response
 
 
@@ -486,8 +501,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, list(autohooked))
             else:
                 self._send(404, {"error": "not found"})
+        except CDPError as e:
+            self._send(500, {"error": e.error})   # structured CDP error object preserved
         except Exception as e:
-            self._send(500, {"error": str(e)})
+            self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
     def do_POST(self):
         try:
@@ -502,12 +519,13 @@ class Handler(BaseHTTPRequestHandler):
                     "returnByValue": body.get("returnByValue", True),
                     "awaitPromise": body.get("awaitPromise", False),
                 }
-                r = cdp_call("Runtime.evaluate", params, sessionId=body["sessionId"])
+                r = cdp_call("Runtime.evaluate", params, sessionId=body["sessionId"],
+                             timeout_seconds=body.get("timeout_seconds", 15))
                 self._send(200, r.get("result", {}))
             elif self.path == "/cdp":
                 r = cdp_call(body["method"], body.get("params"),
                              sessionId=body.get("sessionId"),
-                             timeout=body.get("timeout", 15))
+                             timeout_seconds=body.get("timeout_seconds", 15))
                 self._send(200, r)
             elif self.path == "/reconnect":
                 reconnect_now.set()
@@ -532,6 +550,8 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=lambda: (time.sleep(0.1), os._exit(0))).start()
             else:
                 self._send(404, {"error": "not found"})
+        except CDPError as e:
+            self._send(500, {"error": e.error})   # structured CDP error object preserved
         except Exception as e:
             self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
