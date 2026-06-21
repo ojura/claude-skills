@@ -10,7 +10,7 @@ was reproduced by independent re-measurement except where a ⚠ correction is no
 
 ## 1. Where thinking text + signatures live (by surface / fetch mode)
 
-| Surface | Access | plaintext thinking (=summary) | **signature** (=encrypted RAW thinking) | content blocks | tree | backend conv object |
+| Surface | Access | plaintext thinking (=summarized) | **signature** (=encrypted RAW thinking) | content blocks | tree | backend conv object |
 |---|---|:--:|:--:|:--:|:--:|:--:|
 | **Account export** `conversations.json` | Settings → Export | ✅ | ✅ key 100%, **non-empty 84%** (4481/5337) | ✅ full | ✅ full forest | ❌ (7-key projection) |
 | Load API `rendering_mode=messages` | fetcher `get_conversation` | ✅ | ❌ **no `signature` key** | ✅ | ✅ w/ `tree=True` | ✅ (top-level) |
@@ -26,14 +26,18 @@ CC JSONL; never on any load-API rendering mode, never in the live stream. ⚠ Bu
 (`rendering_mode=messages`) can't see signatures — but its `export_account`
 pipeline (§ Programmatic account export) can: the export is the source.
 
-**The `signature` IS the raw thinking, encrypted — not a fixed signature.** The plaintext
-`thinking` field is the *summarized / display* form; the full reasoning rides **encrypted
-inside `signature`**, a variable-length ciphertext envelope: signature length tracks content
-at **r=0.956**, median **2.6×** the plaintext, **1699 distinct lengths** (192 B → 110 KB) —
-a true fixed signature would be one constant size. So every non-export surface (load API,
-live `thinking_delta`) yields only the **summary**; the recoverable **raw** reasoning exists
-solely as the encrypted `signature` (export + CC JSONL). The 856 `null`-signature blocks
-carry no envelope → summary-only, no recoverable raw.
+**Terminology (Claude API / Claude Code) — `signature` is the encrypted RAW thinking, not a
+fixed signature.** Per block: (1) `signature` = the **encrypted full raw** reasoning, a
+variable-length ciphertext envelope (length tracks content at **r=0.956**, median **2.6×**
+plaintext, 1699 distinct lengths 192 B→110 KB — a true fixed signature is one constant size);
+(2) plaintext `thinking` = **summarized** thinking (the API/CC term) — the raw after a
+**1st-person rewrite + summarization pass** (median **413 B**); (3) claude.ai's separate
+`summaries[].summary` field = minor UI **title chunks** (median **139 B**, export-only; ≠
+plaintext in 0/4675) — *not* what "summarized" means here; de-emphasized. So non-export
+surfaces (load API, live `thinking_delta`) carry the **summarized** thinking but **never the
+encrypted raw**; recoverable raw exists solely as `signature` (export + CC JSONL). The 856
+`null`-signature blocks have no envelope → summarized-only, no recoverable raw. (Export emits
+`signature: null`; CC emits `signature: ""` — coerce on merge.)
 
 ## 2. claude.ai load-API fetch modes (two orthogonal axes)
 
@@ -138,8 +142,28 @@ Not a bijection obstacle — the API accepts arbitrary historical tool names; to
 
 **Verdict:** clean tree/forest isomorphism on the native core; metadata = symmetric escrow; irreducible losses = a few claude.ai-only content types + CC tool-execution richness.
 
-**"Super-complete dump"** = merge **export** (`signature`s = encrypted raw thinking, + summary thinking + full block metadata + forest) with one **live fetch** (active-leaf + backend object), keyed on message uuid — **both halves are now scriptable from the fetcher**:
+**"Super-complete dump"** = merge **export** (`signature`s = encrypted raw thinking, + summarized thinking + full block metadata + forest) with one **live fetch** (active-leaf + backend object), keyed on message uuid — **both halves are now scriptable from the fetcher**:
 `export_account` (signatures) ⊕ `get_conversation` (active-leaf/backend object).
+
+### Bijection — council-ratified corrections (10/10 RATIFY, 2026-06-22)
+
+A 10-seat Opus council (resumed in-process via the subagent-symlink method, to consensus) unanimously **RATIFIED** the following refinements to §9:
+
+- **Subtree isomorphism + ESCROWED grouping, not a clean node bijection.** The chat_message↔CC-line-group boundary, the tool_result re-merge, within-node block ORDER, and sibling order are all reconstructed from escrow, not from role+parent-tree. Two grouping keys: (i) node boundary = `message.id`; (ii) within-node block order = an explicit **ordinal** — intra-node `parentUuid` is **non-linear/star** (measured 2/N within-group edges on size 12–17 groups; 762 nodes >1 tool_use), so it cannot carry block order.
+- **Four ledger omissions** (export→CC→export is NOT identity without them):
+  - top-level `text` — a non-derivable assistant **summarized digest**, ≠ concat(content-text) in **2271/5954 (38%, all-assistant)**, `top==first-text-block` 0/2271. **ESCROW-NON-DERIVABLE and a round-trip CORRECTNESS GATE** (success requires top-level `text` equality, not just block-concat).
+  - `files` (553 msgs) — escrow.
+  - `attachments`+`extracted_content` (227 attachments / 194 msgs) — **content-bearing user-upload text**; flatten `extracted_content`→text.
+  - sibling-order — `created_at` (export `index` is `None`); escrow.
+- **Escrow lane is LINE-LEVEL** (`exportEscrow` on the CC line envelope), NEVER inside `message.content` blocks — the dev API rejects unknown keys in content → resume blocker.
+- **Per-block uuids must be DETERMINISTIC.** Only `tool_use` carries an id (4493); text/thinking/tool_result have none → synthesize (export v7, CC v4). The merge keys on uuid, so random minting is non-invertible. Escrow persists per node: ordered line-uuid list, `message.id`, and the exact `parentUuid` of EACH line (head+tail insufficient under star threading).
+- **Normalize, don't carry, asymmetric fields:** `is_error` (export always-written incl. false; CC absent≡false 42% → synthesize on CC→export, strip `false` on export→CC); `signature` null↔"".
+- **Content-bearing gaps flatten to text** (lossy-by-design — citation/url/link structure drops): `knowledge`→text (201 / 34 convs) and `attachment.extracted_content`→text. `local_resource`/`rag_reference`/`flag` stay near-zero-value drops. `display_content` is **recomputed, not escrowed** (63% of escrow, derived).
+- **Replay split:** D1 cross-surface signature **acceptance** (dev-API verifies a claude.ai-minted envelope — unproven, likely org/model-bound; test-or-strip) vs D2 the **16% unsigned rejection** (deterministic; forces thinking-strip — always strippable).
+- **Acceptance test:** round-trip identity at the `parentUuid` **edge-set** level (every (child,parent) pair) **and** top-level `text` equality — node/concat equality passes while tree wiring silently degrades.
+- **Thinking — two tiers, BOTH round-trip losslessly for signed blocks** (Claude API/CC terms): plaintext `thinking` = **summarized** (1st-person rewrite + summarization of raw); `signature` = **encrypted raw**; claude.ai `summaries[]` = minor UI title chunks (de-emphasized). The bijection carries *both* tiers verbatim — a strength, not a gap. Irreducible thinking-axis loss is only: (a) the 856 `null`/`""`-signature blocks lose the raw tier (summarized survives); (b) `cut_off`/`truncated`/`alternative_display_type`/`summaries[]` → escrow-or-drop.
+
+**Verdict: bijection-with-escrow, unanimous (10/10).** Buildable and useful for the dominant export→CC teleport; irreducible losses = CC-internal `toolUseResult` diff scaffolding (non-dominant direction) + cross-surface signature acceptance.
 
 ---
 
