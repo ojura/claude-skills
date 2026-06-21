@@ -1,15 +1,20 @@
 """
 Claude.ai web session client.
 
-Fetches conversations, files (user-uploaded and sandbox-generated),
-and Claude Code-web (epitaxy) sessions.
+Fetches conversations, files (user-uploaded and sandbox-generated), Claude
+Code-web (epitaxy) sessions, and triggers account data exports (the only surface
+that preserves thinking-block signatures).
 
-All HTTP requests go through a patchright browser context. This solves
-Cloudflare and avoids TLS fingerprint mismatches.
+By DEFAULT it drives the user's real logged-in Chrome via the cdp-daemon
+(127.0.0.1:7799, see the cdp-daemon skill): no Cloudflare friction, no
+session_key needed. Pass backend='patchright' for the headless fallback, which
+launches its own browser and needs a session_key (Cloudflare-prone).
 """
 
 import json
 import urllib.parse
+import urllib.request
+import urllib.error
 import zipfile
 import io
 import base64
@@ -30,21 +35,74 @@ class FileRef:
     size: int = 0
 
 
-class ClaudeWeb:
-    def __init__(self, session_key: str):
-        from patchright.sync_api import sync_playwright
+def _to_iso(d: str) -> str:
+    """'YYYY-MM-DD' -> midnight-UTC ISO8601; pass full ISO through unchanged."""
+    return d + "T00:00:00.000Z" if isinstance(d, str) and len(d) == 10 else d
 
+
+def _find_gcs_url(obj):
+    """Recursively find a storage.googleapis.com URL in a parsed JSON response."""
+    if isinstance(obj, str):
+        return obj if obj.startswith("https://") and "storage.googleapis.com" in obj else None
+    if isinstance(obj, dict):
+        for v in obj.values():
+            u = _find_gcs_url(v)
+            if u:
+                return u
+    elif isinstance(obj, list):
+        for v in obj:
+            u = _find_gcs_url(v)
+            if u:
+                return u
+    return None
+
+
+def _deep_find(obj, key):
+    """First non-container value for `key` anywhere in a nested dict/list."""
+    if isinstance(obj, dict):
+        if key in obj and not isinstance(obj[key], (dict, list)):
+            return obj[key]
+        for v in obj.values():
+            r = _deep_find(v, key)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _deep_find(v, key)
+            if r is not None:
+                return r
+    return None
+
+
+class ClaudeWeb:
+    DAEMON = "http://127.0.0.1:7799"
+
+    def __init__(self, session_key: str | None = None, backend: str = "cdp",
+                 daemon: str | None = None):
+        """backend='cdp' (default): drive the user's real logged-in Chrome via the
+        cdp-daemon (auto-started if not already running). backend='patchright':
+        headless fallback, needs a session_key."""
+        self.backend = backend
+        if backend == "cdp":
+            self.daemon = daemon or self.DAEMON
+            self._ccr_headers = {}
+            self._cdp_sid = self._cdp_attach()
+        elif backend == "patchright":
+            self._init_patchright(session_key)
+        else:
+            raise ValueError("backend must be 'cdp' or 'patchright'")
+        self.org_id = self._ccr_headers.get("x-organization-uuid") or self._discover_org()
+
+    def _init_patchright(self, session_key):
+        from patchright.sync_api import sync_playwright
+        if not session_key:
+            raise ValueError("the patchright backend requires a session_key")
         self._pw = sync_playwright().start()
         self._browser = self._pw.chromium.launch(headless=True)
         self._context = self._browser.new_context()
         self._context.add_cookies([{
-            "name": "sessionKey",
-            "value": session_key,
-            "domain": ".claude.ai",
-            "path": "/",
-            "httpOnly": True,
-            "secure": True,
-            "sameSite": "Lax",
+            "name": "sessionKey", "value": session_key, "domain": ".claude.ai",
+            "path": "/", "httpOnly": True, "secure": True, "sameSite": "Lax",
         }])
         self._page = self._context.new_page()
         with self._page.expect_response(
@@ -57,11 +115,124 @@ class ClaudeWeb:
             k: v for k, v in req.all_headers().items()
             if k.startswith("anthropic-") or k == "x-organization-uuid"
         }
-        self.org_id = self._ccr_headers.get("x-organization-uuid") or self._discover_org()
+
+    # --- CDP backend: talk to the cdp-daemon, drive a real claude.ai tab ---
+
+    def _daemon(self, path, payload=None, timeout=90):
+        if payload is None:
+            req = urllib.request.Request(self.daemon + path)
+        else:
+            req = urllib.request.Request(
+                self.daemon + path, data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            try:
+                body = json.loads(e.read() or b"{}")
+            except Exception:
+                body = {}
+            if isinstance(body, dict) and body.get("error"):
+                # daemon's fail-loud envelope (CDP/timeout error) — surface it
+                raise RuntimeError(f"cdp-daemon {path} HTTP {e.code}: {body['error']}")
+            return body
+        except OSError as e:
+            raise ConnectionError(str(e))
+
+    def _cdp(self, method, params=None, sid=None, timeout=60):
+        body = {"method": method, "timeout_seconds": timeout}
+        if params is not None:
+            body["params"] = params
+        if sid:
+            body["sessionId"] = sid
+        return self._daemon("/cdp", body, timeout + 10)
+
+    def _cdp_eval(self, sid, js, await_promise=True, timeout=90):
+        r = self._cdp("Runtime.evaluate",
+                      {"expression": js, "returnByValue": True, "awaitPromise": await_promise},
+                      sid=sid, timeout=timeout)
+        res = (r or {}).get("result", {})
+        if "exceptionDetails" in res:
+            raise RuntimeError("CDP eval exception: " + json.dumps(res["exceptionDetails"])[:300])
+        return res.get("result", {}).get("value")
+
+    def _ensure_daemon(self, wait=60):
+        """Return /status once the daemon is connected, auto-starting cdp_daemon.py
+        if it isn't running. The daemon self-manages the Chrome connection (and
+        auto-presses 'Allow remote debugging?' when accessibility is on)."""
+        import time, os, subprocess
+        try:
+            st = self._daemon("/status")
+            if st.get("connected"):
+                return st
+        except ConnectionError:
+            script = os.path.expanduser("~/.claude/skills/cdp-daemon/cdp_daemon.py")
+            if os.path.exists(script):
+                subprocess.Popen(["python3", script], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+        deadline = time.time() + wait
+        st = None
+        while time.time() < deadline:
+            try:
+                st = self._daemon("/status")
+                if st.get("connected"):
+                    return st
+            except ConnectionError:
+                pass
+            time.sleep(1)
+        raise RuntimeError(
+            "cdp-daemon started but not connected (state=%s). If Chrome is showing the "
+            "'Allow remote debugging?' dialog, click Allow once." % (st.get("state") if st else "?"))
+
+    def _cdp_attach(self):
+        import time
+        self._ensure_daemon()
+        targets = self._daemon("/targets")
+        pages = [t for t in (targets or [])
+                 if t.get("type") == "page" and "claude.ai" in t.get("url", "")]
+        for t in pages:
+            sid = (self._daemon("/attach", {"targetId": t["targetId"]}) or {}).get("sessionId")
+            if not sid:
+                continue
+            try:
+                self._cdp("Target.activateTarget", {"targetId": t["targetId"]}, timeout=8)
+                if self._cdp_eval(sid, "location.origin", await_promise=False, timeout=8) == BASE:
+                    return sid
+            except Exception:
+                continue  # frozen/slow tab — try the next one
+        # no live claude.ai tab — open one
+        r = self._cdp("Target.createTarget", {"url": f"{BASE}/new"}, timeout=15)
+        tid = _deep_find(r, "targetId")
+        if not tid:
+            raise RuntimeError("could not open a claude.ai tab via the cdp-daemon")
+        sid = (self._daemon("/attach", {"targetId": tid}) or {}).get("sessionId")
+        if not sid:
+            raise RuntimeError("could not attach to the opened claude.ai tab")
+        try:
+            self._cdp("Target.activateTarget", {"targetId": tid}, timeout=8)
+        except Exception:
+            pass
+        for _ in range(20):
+            try:
+                if self._cdp_eval(sid, "location.origin", await_promise=False, timeout=6) == BASE:
+                    return sid
+            except Exception:
+                pass
+            time.sleep(0.5)
+        raise RuntimeError(f"opened a claude.ai tab but it never reached {BASE}")
+
+    def _evaluate(self, js, timeout=90):
+        """Run an invoked-IIFE JS string in a claude.ai page context; return its value."""
+        if self.backend == "cdp":
+            return self._cdp_eval(self._cdp_sid, js, await_promise=True, timeout=timeout)
+        return self._page.evaluate(js)
 
     def close(self):
-        self._browser.close()
-        self._pw.stop()
+        if self.backend == "patchright":
+            self._browser.close()
+            self._pw.stop()
+        # cdp backend drives the user's real Chrome — nothing to tear down
 
     def __enter__(self):
         return self
@@ -85,19 +256,31 @@ class ClaudeWeb:
     def _get(self, path: str, headers: dict | None = None) -> bytes:
         url = f"{BASE}{path}" if path.startswith("/") else path
         hdrs = json.dumps(headers or {})
-        b64 = self._page.evaluate(f"""async () => {{
+        b64 = self._evaluate(f"""(async () => {{
             const r = await fetch({json.dumps(url)}, {{ headers: {hdrs} }});
             if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + (await r.text()).slice(0,500));
             const buf = await r.arrayBuffer();
             const bytes = new Uint8Array(buf);
             let binary = '';
-            for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+            const CH = 0x8000;
+            for (let i = 0; i < bytes.length; i += CH) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
             return btoa(binary);
-        }}""")
+        }})()""")
         return base64.b64decode(b64)
 
     def _get_json(self, path: str, headers: dict | None = None):
         return json.loads(self._get(path, headers))
+
+    def _post(self, path: str, body: dict | None = None, headers: dict | None = None) -> dict:
+        """POST JSON via the browser context. Returns {'status': int, 'body': str}."""
+        url = f"{BASE}{path}" if path.startswith("/") else path
+        hdrs = json.dumps({**(headers or {}), "Content-Type": "application/json"})
+        body_js = json.dumps(json.dumps(body or {}))
+        res = self._evaluate(f"""(async () => {{
+            const r = await fetch({json.dumps(url)}, {{ method: 'POST', headers: {hdrs}, body: {body_js} }});
+            return JSON.stringify({{ status: r.status, body: await r.text() }});
+        }})()""")
+        return json.loads(res)
 
     # --- Conversations ---
 
@@ -114,17 +297,25 @@ class ClaudeWeb:
 
     # --- Code-web sessions ---
 
+    def _ccr(self):
+        """CCR gating headers for /v1/sessions; captured only under patchright."""
+        if not self._ccr_headers:
+            raise RuntimeError(
+                "Code-web /v1/sessions needs the CCR gating headers, captured only under "
+                "backend='patchright'. Re-instantiate ClaudeWeb(backend='patchright').")
+        return self._ccr_headers
+
     def list_sessions(self):
-        return self._get_json("/v1/sessions", self._ccr_headers).get("data", [])
+        return self._get_json("/v1/sessions", self._ccr()).get("data", [])
 
     def get_session(self, session_id: str):
-        return self._get_json(f"/v1/sessions/{session_id}", self._ccr_headers)
+        return self._get_json(f"/v1/sessions/{session_id}", self._ccr())
 
     def get_session_events(self, session_id: str, limit=1000, after_id: str | None = None):
         params = f"?limit={limit}"
         if after_id:
             params += f"&after_id={urllib.parse.quote(after_id)}"
-        return self._get_json(f"/v1/sessions/{session_id}/events{params}", self._ccr_headers)
+        return self._get_json(f"/v1/sessions/{session_id}/events{params}", self._ccr())
 
     # --- Files ---
 
@@ -187,6 +378,74 @@ class ClaudeWeb:
     def download_file_to(self, ref: FileRef, dest: Path) -> Path:
         dest.write_bytes(self.download_file(ref))
         return dest
+
+    # --- Account data export (the ONLY surface that carries thinking signatures) ---
+
+    def trigger_export(self, start_date=None, end_date=None, skip_file_content=True) -> str:
+        """Start an account data export. start/end are 'YYYY-MM-DD' (or full ISO); omit
+        both to export everything. Returns a one-time `nonce`.
+        Endpoint: POST /api/organizations/{org}/export_data."""
+        body: dict = {}
+        if skip_file_content:
+            body["skip_file_content"] = True
+        if start_date:
+            body["conversations_start_date"] = _to_iso(start_date)
+        if end_date:
+            body["conversations_end_date"] = _to_iso(end_date)
+        r = self._post(f"/api/organizations/{self.org_id}/export_data", body)
+        if r["status"] not in (200, 202):
+            raise RuntimeError(f"export_data failed: HTTP {r['status']}: {r['body'][:300]}")
+        try:
+            nonce = json.loads(r["body"]).get("nonce")
+        except Exception:
+            nonce = None
+        if not nonce:
+            raise RuntimeError(f"export_data: no nonce in HTTP {r['status']}: {r['body'][:300]}")
+        return nonce
+
+    def export_signed_url(self, nonce: str) -> str | None:
+        """POST for the signed download URL. Returns the GCS url, or None if not ready
+        yet (non-200). A 200 is the SINGLE-USE success that consumes the link, so it is
+        terminal: a 200 carrying no URL raises (never re-poll a consumed link).
+        Endpoint: POST /api/organizations/{org}/export_signed_url/{nonce}."""
+        r = self._post(f"/api/organizations/{self.org_id}/export_signed_url/{nonce}")
+        if r["status"] != 200:
+            return None  # still processing
+        try:
+            url = _find_gcs_url(json.loads(r["body"]))
+        except Exception:
+            url = None
+        if not url:
+            raise RuntimeError(
+                f"export ready (HTTP 200) but no download URL in body: {r['body'][:300]}")
+        return url
+
+    def poll_export(self, nonce: str, timeout=900, interval=5) -> str:
+        """Poll export_signed_url until ready; returns the single-use download url."""
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            url = self.export_signed_url(nonce)
+            if url:
+                return url
+            time.sleep(interval)
+        raise TimeoutError(f"export {nonce} not ready within {timeout}s")
+
+    def download_export(self, signed_url: str, dest) -> Path:
+        """Download the signed GCS url (public, no auth/Cloudflare) with plain urllib,
+        streamed to disk (full-content exports can be large)."""
+        import shutil
+        dest = Path(dest)
+        with urllib.request.urlopen(signed_url, timeout=300) as r, open(dest, "wb") as f:
+            shutil.copyfileobj(r, f)
+        return dest
+
+    def export_account(self, dest, start_date=None, end_date=None, skip_files=True,
+                       timeout=900) -> Path:
+        """Headless end-to-end: trigger -> poll signed url -> download the zip to `dest`.
+        The zip's conversations.json carries thinking-block signatures (export-only)."""
+        nonce = self.trigger_export(start_date, end_date, skip_file_content=skip_files)
+        return self.download_export(self.poll_export(nonce, timeout=timeout), dest)
 
 
 # --- Session key acquisition ---

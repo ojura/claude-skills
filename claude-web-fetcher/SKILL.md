@@ -1,102 +1,128 @@
 ---
 name: claude-web-fetcher
-description: Fetch conversations, files, artifacts, and Claude Code-web sessions from claude.ai. Lists conversations, finds uploaded files and sandbox-generated artifacts (wiggle files), lists/reads Code-web (epitaxy) sessions and their events, and downloads files. Uses patchright to solve Cloudflare; only needs a sessionKey. Use when the user wants to retrieve a file, conversation, or Code-web session from their claude.ai history.
+description: Fetch conversations, files, artifacts, Claude Code-web sessions, and account data exports (the only surface carrying thinking-block signatures) from claude.ai. Lists/reads conversations and Code-web (epitaxy) sessions, finds uploaded files and sandbox artifacts (wiggle files), triggers + downloads data exports. By default drives the user's real logged-in Chrome via the cdp-daemon (no Cloudflare, no sessionKey); headless patchright fallback available. Use when the user wants to retrieve a file, conversation, Code-web session, or signed-thinking export from their claude.ai history.
 ---
 
 # Claude.ai Web Fetcher
 
-Retrieves conversations, files, and Claude Code-web sessions from claude.ai
-using the session cookie.
+Retrieves conversations, files, Claude Code-web sessions, and account data
+exports from claude.ai.
 
-## Session key acquisition
+## Backends
 
-Use `acquire_session_key()` which tries all sources automatically:
+- **`backend="cdp"` (default)** — drives the user's real, logged-in Chrome via the
+  **cdp-daemon** (`127.0.0.1:7799`; see the cdp-daemon skill). No Cloudflare
+  friction, no `session_key` needed. The daemon is **auto-started** if it isn't
+  running (`_ensure_daemon()`); it self-manages the Chrome connection and presses
+  Chrome's "Allow remote debugging?" dialog when renderer accessibility is on
+  (otherwise: one manual Allow click, once).
+- **`backend="patchright"`** — headless fallback that launches its own browser and
+  needs a `session_key`. Cloudflare-prone (patchright currently flaky); use only if
+  the real-Chrome path is unavailable.
 
 ```python
 import sys, os
 sys.path.insert(0, os.path.expanduser("~/.claude/skills/claude-web-fetcher"))
+from claude_web import ClaudeWeb
+
+# Default: real Chrome via the cdp-daemon — no session key.
+with ClaudeWeb() as c:
+    convos = c.list_conversations(limit=10)
+
+# Fallback: headless patchright (needs a session key).
 from claude_web import acquire_session_key
-
-session_key = acquire_session_key()  # tries file, Desktop, Firefox in order
+with ClaudeWeb(acquire_session_key(), backend="patchright") as c:
+    ...
 ```
-
-Sources tried (in order):
-1. `~/claude_desktop_login` file (if previously saved)
-2. Claude Desktop's Cookies SQLite (`~/.config/Claude/Cookies`, unencrypted)
-3. Firefox cookies (`~/.mozilla/firefox/*/cookies.sqlite`, unencrypted)
-4. Chrome via CDP (`DevToolsActivePort`, needs claude.ai tab open + `websocket-client`)
-5. Raises with instructions to paste from Chrome DevTools
-
-A standalone extractor script is also available at `extract_from_chrome.py` for manual one-time use (keeps the value out of conversation context).
 
 ## Usage
 
 ```python
-import sys, os
-sys.path.insert(0, os.path.expanduser("~/.claude/skills/claude-web-fetcher"))
-from claude_web import ClaudeWeb, acquire_session_key
-from pathlib import Path
+with ClaudeWeb() as c:
+    convos = c.list_conversations(limit=10)
 
-with ClaudeWeb(acquire_session_key()) as client:
-    # List conversations
-    convos = client.list_conversations(limit=10)
+    # Full conversation tree (forest; thinking present but signature-STRIPPED on reads)
+    full = c.get_conversation(convos[0]["uuid"])
 
-    # Find files in a conversation (deduped)
-    files = client.find_files(convos[0]["uuid"])
+    # Files in a conversation (deduped)
+    for f in c.find_files(convos[0]["uuid"]):
+        c.download_file_to(f, "/tmp/" + f.name)
 
-    # Download a file
-    for f in files:
-        if "something" in f.name:
-            client.download_file_to(f, Path.home() / f.name)
-
-    # List Claude Code-web sessions
-    sessions = client.list_sessions()
-
-    # Get session events (messages/tool calls)
-    events = client.get_session_events(sessions[0]["id"], limit=100)
+    # Account data export — the ONLY surface that preserves thinking signatures.
+    # Scriptable: trigger -> poll signed url -> download zip (download is browserless). Date-scope to cut size.
+    c.export_account("/tmp/export.zip", start_date="2026-06-14",
+                     end_date="2026-06-22", skip_files=True)
 ```
 
 ## API summary
 
-### Conversations (claude.ai chats)
+### Client
+- `ClaudeWeb(session_key=None, backend="cdp", daemon=None)` — context manager.
+  `session_key` is only needed for `backend="patchright"`.
+- `verify()` — org name/uuid/billing_type/capabilities/rate_limit_tier
 
-- `ClaudeWeb(session_key: str)` - creates client (context manager supported)
-- `client.verify()` - checks session validity, returns org name/plan/capabilities
-- `client.list_conversations(limit=60)` - returns list of conversation dicts
-- `client.get_conversation(uuid, full=True)` - returns full conversation with messages
-- `client.find_files(conversation_uuid)` - returns deduplicated list of `FileRef` objects
-- `client.download_file(ref)` - returns file bytes
-- `client.download_file_to(ref, dest_path)` - saves to disk
+### Conversations
+- `list_conversations(limit=60)`
+- `get_conversation(uuid, full=True)` — full message tree
+- `find_files(conversation_uuid)` → `[FileRef]`
+- `download_file(ref)` / `download_file_to(ref, dest)`
+
+### Account data export (only surface with thinking-block signatures)
+- `trigger_export(start_date=None, end_date=None, skip_file_content=True)` → `nonce`
+  (dates `YYYY-MM-DD` or ISO; omit both to export everything)
+- `export_signed_url(nonce)` → signed GCS url or `None` — **SINGLE-USE**
+- `poll_export(nonce, timeout=900, interval=5)` → url (blocks until ready)
+- `download_export(signed_url, dest)` → downloads the zip (plain `urllib`; the signed
+  GCS URL needs no browser/cookies)
+- `export_account(dest, start_date=None, end_date=None, skip_files=True, timeout=900)` — one-shot
+  trigger→poll→download; the zip's `conversations.json` carries signatures.
+
+  Flow: `POST /api/organizations/{org}/export_data` → `POST .../export_signed_url/{nonce}`
+  → GET the signed `storage.googleapis.com` url. See `claude_ai_vs_cc_format.md`.
 
 ### Claude Code-web sessions (epitaxy / cowork)
+- `list_sessions()` / `get_session(id)` / `get_session_events(id, limit=1000, after_id=None)`
+- **Caveat:** these need the SPA's CCR gating headers (`anthropic-client-feature`,
+  `anthropic-beta`), captured only under `backend="patchright"`. Under the default
+  CDP backend `_ccr_headers` is empty, so `/v1/sessions` may 404 — use
+  `backend="patchright"` for Code-web sessions.
 
-- `client.list_sessions()` - returns list of session dicts (id, title, status, env, repo info)
-- `client.get_session(session_id)` - returns full session metadata
-- `client.get_session_events(session_id, limit=1000, after_id=None)` - returns session events (messages, tool calls, env logs). Paginate with `after_id`.
-
-Session events have `type` field: `user` (user message), `assistant` (model response), `tool_use`, `tool_result`, `env_manager_log`, `control_request`, etc.
+Session events have a `type` field: `user`, `assistant`, `tool_use`, `tool_result`,
+`env_manager_log`, `control_request`, etc.
 
 ## FileRef kinds
+- `kind="upload"`: user-uploaded files — `/api/{org}/files/{uuid}/preview`.
+- `kind="wiggle"`: sandbox `present_files` outputs (zip-wrapped; single-file zips auto-unwrapped).
 
-- `kind="upload"`: user-uploaded files (pdfs, zips, images). Downloaded via `/api/{org}/files/{uuid}/preview`.
-- `kind="wiggle"`: sandbox-generated files from `present_files` tool results. Server returns a zip wrapper; the client unwraps single-file zips automatically.
+## Session key acquisition (patchright backend only)
+
+`acquire_session_key()` tries, in order: `~/claude_desktop_login`, Claude Desktop
+Cookies SQLite, Firefox cookies, Chrome via CDP; else raises with paste
+instructions. Standalone `extract_from_chrome.py` for manual one-time use (keeps
+the value out of conversation context).
 
 ## Architecture
 
-All HTTP requests go through the patchright browser context via `page.evaluate(fetch(...))`. This solves:
-1. Cloudflare JS challenge (cf_clearance obtained during page load)
-2. TLS fingerprint matching (avoids 401s from fingerprint mismatch)
-
-On init, the client navigates to `claude.ai/code` and uses `page.expect_response` to capture the CCR (Claude Code Remote) feature-gating headers from the SPA's first `/v1/sessions` request. These headers are then reused for all subsequent session API calls. No hardcoded header values.
-
-The `/v1/sessions` endpoint is gated behind headers that the SPA adds to requests (`anthropic-client-feature`, `anthropic-beta`, etc.). Without them the endpoint returns 404. The client captures these dynamically so it stays compatible across deploys.
+- **CDP (default):** every API call is a `fetch(...)` run inside a real claude.ai tab
+  via the cdp-daemon (`Runtime.evaluate`; `_evaluate()` dispatches `_get`/`_post`).
+  The real session already holds `cf_clearance` + cookies, so Cloudflare and
+  TLS-fingerprint issues vanish and no key handling is needed. `_cdp_attach()` finds
+  (or opens) a live `claude.ai` tab and `Target.activateTarget`s it (un-freezing
+  Memory-Saver tabs). `download_export` bypasses the browser entirely (the signed GCS
+  URL is public).
+- **patchright (fallback):** requests go through a headless browser context;
+  Cloudflare solved on page load. On init it navigates to `/code` and captures the
+  CCR headers from the first `/v1/sessions` request, reused for Code-web calls.
 
 ## Dependencies
-
-- `patchright` (pip install patchright && python3 -m patchright install chromium)
+- Default (CDP): the **cdp-daemon** skill + a Chrome with remote debugging (the
+  daemon handles it). No Python deps beyond the stdlib.
+- Fallback: `patchright` (`pip install patchright && python3 -m patchright install chromium`).
 
 ## Notes
-
-- Patchright launch adds ~5-8s cold start (Cloudflare solving + SPA load on `/code`). Use context manager (`with ClaudeWeb(...) as c:`) to ensure cleanup.
-- The sessionKey has the same scope as the logged-in user on claude.ai. It can list/read all conversations and Code-web sessions in the active org.
-- Do NOT use `add_init_script` with patchright on claude.ai. It breaks DNS resolution.
+- The export is async; `poll_export` waits for the signed URL. `export_signed_url` is
+  **single-use** — a successful call consumes the link (re-POST → 404 `export_link_used`).
+- Signatures live ONLY in the export (and in local Claude Code JSONL); every live read
+  surface strips them. Full format/signature map: `claude_ai_vs_cc_format.md`.
+- Reads have the same scope as the logged-in user on claude.ai.
+- patchright caveat: do NOT use `add_init_script` on claude.ai (breaks DNS resolution).
