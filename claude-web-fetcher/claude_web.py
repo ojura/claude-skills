@@ -207,23 +207,27 @@ class ClaudeWeb:
                     return sid
             except Exception:
                 continue  # stale/frozen/slow tab — try the next one
-        # none responded instantly: reuse an existing tab, polling its async un-freeze/
-        # reload, BEFORE opening a duplicate (a discarded tab reloads, not instant).
-        for tid in ([pages[0]["targetId"]] if pages else []):
+        # none responded instantly: reuse existing tabs, polling their async un-freeze/
+        # reload round-robin BEFORE opening a duplicate (a discarded tab reloads, not
+        # instant). Poll ALL claude.ai tabs, not just the first — the one un-freezing
+        # may not be pages[0].
+        sids = []
+        for t in pages:
             try:
-                sid = (self._daemon("/attach", {"targetId": tid}) or {}).get("sessionId")
-                if not sid:
-                    break
-                self._cdp("Target.activateTarget", {"targetId": tid}, timeout=8)
-                for _ in range(20):
-                    try:
-                        if self._cdp_eval(sid, "location.origin", await_promise=False, timeout=6) == BASE:
-                            return sid
-                    except Exception:
-                        pass
-                    time.sleep(0.5)
+                sid = (self._daemon("/attach", {"targetId": t["targetId"]}) or {}).get("sessionId")
+                if sid:
+                    self._cdp("Target.activateTarget", {"targetId": t["targetId"]}, timeout=8)
+                    sids.append(sid)
             except Exception:
-                pass  # fall through to opening a fresh tab
+                continue
+        for _ in range(20):
+            for sid in sids:
+                try:
+                    if self._cdp_eval(sid, "location.origin", await_promise=False, timeout=6) == BASE:
+                        return sid
+                except Exception:
+                    pass
+            time.sleep(0.5)
         # last resort: open a new tab
         r = self._cdp("Target.createTarget", {"url": f"{BASE}/new"}, timeout=15)
         tid = _deep_find(r, "targetId")
@@ -434,10 +438,16 @@ class ClaudeWeb:
         terminal: a 200 carrying no URL raises (never re-poll a consumed link).
         Endpoint: POST /api/organizations/{org}/export_signed_url/{nonce}."""
         r = self._post(f"/api/organizations/{self.org_id}/export_signed_url/{nonce}")
-        if r["status"] != 200:
-            if "export_link_used" in (r.get("body") or ""):
-                raise RuntimeError(f"export link already spent (nonce used): {r['body'][:200]}")
-            return None  # still processing
+        st = r["status"]
+        if st != 200:
+            body = r.get("body") or ""
+            if "export_link_used" in body:
+                raise RuntimeError(f"export link already spent (nonce used): {body[:200]}")
+            # terminal failures won't resolve by polling — fail fast instead of
+            # spinning until poll_export's timeout.
+            if st in (400, 401, 403) or st >= 500:
+                raise RuntimeError(f"export_signed_url HTTP {st}: {body[:300]}")
+            return None  # still processing (e.g. 404/202 while the export builds)
         try:
             url = _find_gcs_url(json.loads(r["body"]))
         except Exception:
@@ -488,8 +498,10 @@ def acquire_session_key(save_to: str = "~/claude_desktop_login") -> str:
         try:
             key = loader()
             if key:
-                save_path.write_text(f"sessionKey={key}\n")
+                # create/tighten to 0600 BEFORE writing the secret (no world-readable window)
+                save_path.touch(mode=0o600, exist_ok=True)
                 save_path.chmod(0o600)
+                save_path.write_text(f"sessionKey={key}\n")
                 return key
         except Exception:
             continue
