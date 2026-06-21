@@ -10,7 +10,7 @@ was reproduced by independent re-measurement except where a ⚠ correction is no
 
 ## 1. Where thinking text + signatures live (by surface / fetch mode)
 
-| Surface | Access | raw thinking | **signature** | content blocks | tree | backend conv object |
+| Surface | Access | plaintext thinking (=summary) | **signature** (=encrypted RAW thinking) | content blocks | tree | backend conv object |
 |---|---|:--:|:--:|:--:|:--:|:--:|
 | **Account export** `conversations.json` | Settings → Export | ✅ | ✅ key 100%, **non-empty 84%** (4481/5337) | ✅ full | ✅ full forest | ❌ (7-key projection) |
 | Load API `rendering_mode=messages` | fetcher `get_conversation` | ✅ | ❌ **no `signature` key** | ✅ | ✅ w/ `tree=True` | ✅ (top-level) |
@@ -25,6 +25,15 @@ CC JSONL; never on any load-API rendering mode, never in the live stream. ⚠ Bu
 16 conversations) — those teleport only as *unsigned* thinking. The fetcher's load-API path
 (`rendering_mode=messages`) can't see signatures — but its `export_account`
 pipeline (§ Programmatic account export) can: the export is the source.
+
+**The `signature` IS the raw thinking, encrypted — not a fixed signature.** The plaintext
+`thinking` field is the *summarized / display* form; the full reasoning rides **encrypted
+inside `signature`**, a variable-length ciphertext envelope: signature length tracks content
+at **r=0.956**, median **2.6×** the plaintext, **1699 distinct lengths** (192 B → 110 KB) —
+a true fixed signature would be one constant size. So every non-export surface (load API,
+live `thinking_delta`) yields only the **summary**; the recoverable **raw** reasoning exists
+solely as the encrypted `signature` (export + CC JSONL). The 856 `null`-signature blocks
+carry no envelope → summary-only, no recoverable raw.
 
 ## 2. claude.ai load-API fetch modes (two orthogonal axes)
 
@@ -129,7 +138,7 @@ Not a bijection obstacle — the API accepts arbitrary historical tool names; to
 
 **Verdict:** clean tree/forest isomorphism on the native core; metadata = symmetric escrow; irreducible losses = a few claude.ai-only content types + CC tool-execution richness.
 
-**"Super-complete dump"** = merge **export** (signatures + raw thinking + full block metadata + forest) with one **live fetch** (active-leaf + backend object), keyed on message uuid — **both halves are now scriptable from the fetcher**:
+**"Super-complete dump"** = merge **export** (`signature`s = encrypted raw thinking, + summary thinking + full block metadata + forest) with one **live fetch** (active-leaf + backend object), keyed on message uuid — **both halves are now scriptable from the fetcher**:
 `export_account` (signatures) ⊕ `get_conversation` (active-leaf/backend object).
 
 ---
