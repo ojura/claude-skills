@@ -71,7 +71,7 @@ with ClaudeWeb() as c:
 - `trigger_export(start_date=None, end_date=None, skip_file_content=True)` → `nonce`
   (dates `YYYY-MM-DD` or ISO; omit both to export everything)
 - `export_signed_url(nonce)` → signed GCS url or `None` — **SINGLE-USE**
-- `poll_export(nonce, timeout=900, interval=5)` → url (blocks until ready)
+- `poll_export(nonce, timeout=900, interval=5)` → url (blocks until ready; raises TimeoutError after `timeout`s, or RuntimeError if the link is spent)
 - `download_export(signed_url, dest)` → downloads the zip (plain `urllib`; the signed
   GCS URL needs no browser/cookies)
 - `export_account(dest, start_date=None, end_date=None, skip_files=True, timeout=900)` — one-shot
@@ -84,8 +84,8 @@ with ClaudeWeb() as c:
 - `list_sessions()` / `get_session(id)` / `get_session_events(id, limit=1000, after_id=None)`
 - **Caveat:** these need the SPA's CCR gating headers (`anthropic-client-feature`,
   `anthropic-beta`), captured only under `backend="patchright"`. Under the default
-  CDP backend `_ccr_headers` is empty, so `/v1/sessions` may 404 — use
-  `backend="patchright"` for Code-web sessions.
+  CDP backend `_ccr_headers` is empty, so these methods **raise a clear RuntimeError
+  before sending any request** — use `backend="patchright"` for Code-web sessions.
 
 Session events have a `type` field: `user`, `assistant`, `tool_use`, `tool_result`,
 `env_manager_log`, `control_request`, etc.

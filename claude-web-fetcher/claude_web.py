@@ -35,9 +35,14 @@ class FileRef:
     size: int = 0
 
 
-def _to_iso(d: str) -> str:
-    """'YYYY-MM-DD' -> midnight-UTC ISO8601; pass full ISO through unchanged."""
-    return d + "T00:00:00.000Z" if isinstance(d, str) and len(d) == 10 else d
+def _to_iso(d, end=False):
+    """'YYYY-MM-DD' -> midnight-UTC ISO8601; for an end date, advance one day so the
+    end day is inclusive (mirrors claude.ai's export UI). Full ISO passes through."""
+    if isinstance(d, str) and len(d) == 10 and d[4] == "-" and d[7] == "-":
+        import datetime
+        day = datetime.date.fromisoformat(d) + (datetime.timedelta(days=1) if end else datetime.timedelta())
+        return day.isoformat() + "T00:00:00.000Z"
+    return d
 
 
 def _find_gcs_url(obj):
@@ -192,15 +197,15 @@ class ClaudeWeb:
         pages = [t for t in (targets or [])
                  if t.get("type") == "page" and "claude.ai" in t.get("url", "")]
         for t in pages:
-            sid = (self._daemon("/attach", {"targetId": t["targetId"]}) or {}).get("sessionId")
-            if not sid:
-                continue
             try:
+                sid = (self._daemon("/attach", {"targetId": t["targetId"]}) or {}).get("sessionId")
+                if not sid:
+                    continue
                 self._cdp("Target.activateTarget", {"targetId": t["targetId"]}, timeout=8)
                 if self._cdp_eval(sid, "location.origin", await_promise=False, timeout=8) == BASE:
                     return sid
             except Exception:
-                continue  # frozen/slow tab — try the next one
+                continue  # stale/frozen/slow tab — try the next one
         # no live claude.ai tab — open one
         r = self._cdp("Target.createTarget", {"url": f"{BASE}/new"}, timeout=15)
         tid = _deep_find(r, "targetId")
@@ -375,7 +380,8 @@ class ClaudeWeb:
             return zf.read(names[0]) if len(names) == 1 else zip_bytes
         return self._get(f"/api/{self.org_id}/files/{ref.path}/preview")
 
-    def download_file_to(self, ref: FileRef, dest: Path) -> Path:
+    def download_file_to(self, ref: FileRef, dest) -> Path:
+        dest = Path(dest)
         dest.write_bytes(self.download_file(ref))
         return dest
 
@@ -383,15 +389,15 @@ class ClaudeWeb:
 
     def trigger_export(self, start_date=None, end_date=None, skip_file_content=True) -> str:
         """Start an account data export. start/end are 'YYYY-MM-DD' (or full ISO); omit
-        both to export everything. Returns a one-time `nonce`.
-        Endpoint: POST /api/organizations/{org}/export_data."""
+        both to export everything. end_date is inclusive of the whole end day. Returns a
+        one-time `nonce`. Endpoint: POST /api/organizations/{org}/export_data."""
         body: dict = {}
         if skip_file_content:
             body["skip_file_content"] = True
         if start_date:
             body["conversations_start_date"] = _to_iso(start_date)
         if end_date:
-            body["conversations_end_date"] = _to_iso(end_date)
+            body["conversations_end_date"] = _to_iso(end_date, end=True)
         r = self._post(f"/api/organizations/{self.org_id}/export_data", body)
         if r["status"] not in (200, 202):
             raise RuntimeError(f"export_data failed: HTTP {r['status']}: {r['body'][:300]}")
@@ -410,6 +416,8 @@ class ClaudeWeb:
         Endpoint: POST /api/organizations/{org}/export_signed_url/{nonce}."""
         r = self._post(f"/api/organizations/{self.org_id}/export_signed_url/{nonce}")
         if r["status"] != 200:
+            if "export_link_used" in (r.get("body") or ""):
+                raise RuntimeError(f"export link already spent (nonce used): {r['body'][:200]}")
             return None  # still processing
         try:
             url = _find_gcs_url(json.loads(r["body"]))
@@ -442,7 +450,8 @@ class ClaudeWeb:
 
     def export_account(self, dest, start_date=None, end_date=None, skip_files=True,
                        timeout=900) -> Path:
-        """Headless end-to-end: trigger -> poll signed url -> download the zip to `dest`.
+        """Scriptable end-to-end: trigger -> poll signed url -> download the zip to `dest`
+        (trigger/poll run in the real tab under CDP; only the download is browserless).
         The zip's conversations.json carries thinking-block signatures (export-only)."""
         nonce = self.trigger_export(start_date, end_date, skip_file_content=skip_files)
         return self.download_export(self.poll_export(nonce, timeout=timeout), dest)
