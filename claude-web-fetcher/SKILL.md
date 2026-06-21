@@ -69,8 +69,8 @@ with ClaudeWeb() as c:
 
 ### Account data export (only surface with thinking-block signatures)
 - `trigger_export(start_date=None, end_date=None, skip_file_content=True)` → `nonce`
-  (dates `YYYY-MM-DD` or ISO; omit both to export everything)
-- `export_signed_url(nonce)` → signed GCS url or `None` — **SINGLE-USE**
+  (dates `YYYY-MM-DD` or ISO; omit both to export everything; a date-only `end_date` is end-day-inclusive)
+- `export_signed_url(nonce)` → signed GCS url, or `None` if not ready — **SINGLE-USE** (a ready 200 with no url, or a spent link, raises)
 - `poll_export(nonce, timeout=900, interval=5)` → url (blocks until ready; raises TimeoutError after `timeout`s, or RuntimeError if the link is spent)
 - `download_export(signed_url, dest)` → downloads the zip (plain `urllib`; the signed
   GCS URL needs no browser/cookies)

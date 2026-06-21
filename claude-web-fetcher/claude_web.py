@@ -48,7 +48,7 @@ def _to_iso(d, end=False):
 def _find_gcs_url(obj):
     """Recursively find a storage.googleapis.com URL in a parsed JSON response."""
     if isinstance(obj, str):
-        return obj if obj.startswith("https://") and "storage.googleapis.com" in obj else None
+        return obj if obj.startswith("https://") and urllib.parse.urlparse(obj).netloc.endswith("storage.googleapis.com") else None
     if isinstance(obj, dict):
         for v in obj.values():
             u = _find_gcs_url(v)
@@ -138,10 +138,10 @@ class ClaudeWeb:
                 body = json.loads(e.read() or b"{}")
             except Exception:
                 body = {}
-            if isinstance(body, dict) and body.get("error"):
-                # daemon's fail-loud envelope (CDP/timeout error) — surface it
-                raise RuntimeError(f"cdp-daemon {path} HTTP {e.code}: {body['error']}")
-            return body
+            # any daemon non-2xx is a failure — surface it (never return a value-bearing
+            # body that would degrade to a silent None downstream)
+            err = body.get("error") if isinstance(body, dict) else None
+            raise RuntimeError(f"cdp-daemon {path} HTTP {e.code}: {err or str(body)[:200]}")
         except OSError as e:
             raise ConnectionError(str(e))
 
@@ -196,17 +196,35 @@ class ClaudeWeb:
         targets = self._daemon("/targets")
         pages = [t for t in (targets or [])
                  if t.get("type") == "page" and "claude.ai" in t.get("url", "")]
+        # fast path: first tab already live at the claude.ai origin
         for t in pages:
             try:
                 sid = (self._daemon("/attach", {"targetId": t["targetId"]}) or {}).get("sessionId")
                 if not sid:
                     continue
                 self._cdp("Target.activateTarget", {"targetId": t["targetId"]}, timeout=8)
-                if self._cdp_eval(sid, "location.origin", await_promise=False, timeout=8) == BASE:
+                if self._cdp_eval(sid, "location.origin", await_promise=False, timeout=6) == BASE:
                     return sid
             except Exception:
                 continue  # stale/frozen/slow tab — try the next one
-        # no live claude.ai tab — open one
+        # none responded instantly: reuse an existing tab, polling its async un-freeze/
+        # reload, BEFORE opening a duplicate (a discarded tab reloads, not instant).
+        for tid in ([pages[0]["targetId"]] if pages else []):
+            try:
+                sid = (self._daemon("/attach", {"targetId": tid}) or {}).get("sessionId")
+                if not sid:
+                    break
+                self._cdp("Target.activateTarget", {"targetId": tid}, timeout=8)
+                for _ in range(20):
+                    try:
+                        if self._cdp_eval(sid, "location.origin", await_promise=False, timeout=6) == BASE:
+                            return sid
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+            except Exception:
+                pass  # fall through to opening a fresh tab
+        # last resort: open a new tab
         r = self._cdp("Target.createTarget", {"url": f"{BASE}/new"}, timeout=15)
         tid = _deep_find(r, "targetId")
         if not tid:
@@ -225,7 +243,7 @@ class ClaudeWeb:
             except Exception:
                 pass
             time.sleep(0.5)
-        raise RuntimeError(f"opened a claude.ai tab but it never reached {BASE}")
+        raise RuntimeError(f"claude.ai tab never reached {BASE}")
 
     def _evaluate(self, js, timeout=90):
         """Run an invoked-IIFE JS string in a claude.ai page context; return its value."""
@@ -389,8 +407,9 @@ class ClaudeWeb:
 
     def trigger_export(self, start_date=None, end_date=None, skip_file_content=True) -> str:
         """Start an account data export. start/end are 'YYYY-MM-DD' (or full ISO); omit
-        both to export everything. end_date is inclusive of the whole end day. Returns a
-        one-time `nonce`. Endpoint: POST /api/organizations/{org}/export_data."""
+        both to export everything. A date-only end_date is made inclusive of the whole end
+        day (+1 day); a full-ISO end_date is sent verbatim. Returns a one-time `nonce`.
+        Endpoint: POST /api/organizations/{org}/export_data."""
         body: dict = {}
         if skip_file_content:
             body["skip_file_content"] = True
@@ -443,6 +462,8 @@ class ClaudeWeb:
         """Download the signed GCS url (public, no auth/Cloudflare) with plain urllib,
         streamed to disk (full-content exports can be large)."""
         import shutil
+        if not signed_url.startswith("https://"):
+            raise ValueError(f"refusing non-https download url: {signed_url[:80]}")
         dest = Path(dest)
         with urllib.request.urlopen(signed_url, timeout=300) as r, open(dest, "wb") as f:
             shutil.copyfileobj(r, f)
