@@ -24,9 +24,9 @@ Four independent pieces, each through its own channel.
 
 ## 3. `/mnt/user-data` — inputs and presented outputs
 
-- `find_files(conv)` enumerates `/mnt/user-data` (uploads + presented "wiggle" outputs); `download_file(ref)` / `download-files` pull bytes. Match `local_resource.file_path` ↔ `FileRef.path` (FileRef has no uuid). `download-file` 404s on `/mnt/user-data` — that side comes through `find_files`.
-- Uploaded-document text is the `convert_document` output (or it's already in the export's attachment `extracted_content`).
-- **User uploads are often purged server-side** — `/files/{uuid}/preview` 404s on uploads weeks later, and a `skip_files=True` export carries no bytes either. Tool-result *images* survive (different asset class); user uploads don't. The source files usually still live in the `/home/claude` tree (the model copies them in to work) or on the user's local disk. To capture upload bytes from claude.ai *while they exist*, export with `skip_files=False`.
+- **Bytes — `download-file?path=/mnt/user-data/…` reads the whole mount**, uploads *and* presented outputs, straight off the live VM (verified `200` + raw bytes — the same mechanism as any rootfs path). `find_files(conv)` is the **index**: it enumerates `/mnt/user-data`; then `download-file` each by its path. Wiggle outputs: `FileRef.path` is already `/mnt/user-data/outputs/…`. Uploads: `FileRef.path` is a uuid, but the file sits at `/mnt/user-data/uploads/<FileRef.name>`.
+- **Do NOT use `/files/{uuid}/preview` for uploads.** That *asset-store* endpoint purges (404s weeks later), and a `skip_files=True` export carries no bytes — but the **VM mount persists**, so `download-file` still returns them. (Tool-result *images* are the exception: they aren't files in the mount, so they come via `/files/{uuid}/preview`.)
+- Uploaded-document text is also the `convert_document` output, or the export's attachment `extracted_content`.
 
 ## 4. Base environment
 

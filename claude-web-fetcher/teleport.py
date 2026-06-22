@@ -24,7 +24,7 @@ Enumeration caveat (TELEPORT_RECIPE.md §2): there is no client-side listing of 
 and the export's own tool_results name only a fraction of the tree (HRZZ: ~5%), so the home
 grab itself is model-assisted (a live `tar`/`find`) — supply the result as `home_src`.
 """
-import os, re, json, uuid, base64, shutil, tarfile, subprocess
+import os, re, json, uuid, base64, shutil, tarfile, subprocess, urllib.parse
 import bijection as B
 
 DEFAULT_BASE = "~/.claude/teleports"
@@ -125,33 +125,34 @@ def hydrate_home(home_src, dest_home, force=False):
             raise ValueError(f"home_src is neither a dir nor a tarball: {home_src}")
     return sum(len(f) for _, _, f in os.walk(dest_home))
 
+def _download_vm_path(client, org, conv, path):
+    """download-file?path= reads ANY path on the conversation's VM (incl. the /mnt/user-data
+    fuse mount) as raw bytes — uploads and outputs alike. Returns {status, ct, b64}."""
+    url = (f"https://claude.ai/api/organizations/{org}/conversations/{conv}"
+           f"/wiggle/download-file?path={urllib.parse.quote(path, safe='')}")
+    return _fetch_bytes_b64(client, url)
+
 def hydrate_mnt(client, conv_uuid, dest_home, org, skip_names=("claude_home.tar.gz",)):
-    """Pull /mnt/user-data into dest_home/mnt/user-data. Outputs (wiggle) via the client;
-    uploads via the preview endpoint (frequently 404 — purged server-side). Best-effort;
-    returns (ok, fail, skipped)."""
+    """Pull /mnt/user-data into dest_home/mnt/user-data via download-file, which reads the live
+    VM mount directly — uploads AND outputs. (The /files/{uuid}/preview asset store purges user
+    uploads; the mount does not, so download-file still returns them.) find_files() supplies the
+    index. Best-effort; returns (ok, fail, skipped)."""
     ok = fail = skipped = 0
     for r in client.find_files(conv_uuid):
-        if r.kind == "wiggle":
-            if os.path.basename(r.path) in skip_names:
-                skipped += 1; continue
-            dest = dest_home + r.path                       # r.path == /mnt/user-data/outputs/…
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            try:
-                client.download_file_to(r, dest); ok += 1
-            except Exception:
+        # wiggle FileRef.path is already the /mnt path; upload FileRef.path is a uuid -> name it
+        mnt = r.path if r.kind == "wiggle" else "/mnt/user-data/uploads/" + (getattr(r, "name", None) or r.path)
+        if os.path.basename(mnt) in skip_names:
+            skipped += 1; continue
+        dest = dest_home + mnt
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        try:
+            res = _download_vm_path(client, org, conv_uuid, mnt)
+            if res.get("status") == 200 and res.get("b64") is not None:
+                open(dest, "wb").write(base64.b64decode(res["b64"])); ok += 1
+            else:
                 fail += 1
-        else:                                               # upload: by friendly name
-            name = getattr(r, "name", None) or r.path
-            dest = os.path.join(dest_home, "mnt/user-data/uploads", name)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            try:
-                res = _fetch_bytes_b64(client, f"https://claude.ai/api/{org}/files/{r.path}/preview")
-                if res.get("status") == 200 and res.get("b64"):
-                    open(dest, "wb").write(base64.b64decode(res["b64"])); ok += 1
-                else:
-                    fail += 1                               # 404 => upload asset purged
-            except Exception:
-                fail += 1
+        except Exception:
+            fail += 1
     return ok, fail, skipped
 
 
