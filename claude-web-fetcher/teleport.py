@@ -136,22 +136,35 @@ def hydrate_mnt(client, conv_uuid, dest_home, org, skip_names=("claude_home.tar.
     """Pull /mnt/user-data into dest_home/mnt/user-data via download-file, which reads the live
     VM mount directly — uploads AND outputs. (The /files/{uuid}/preview asset store purges user
     uploads; the mount does not, so download-file still returns them.) find_files() supplies the
-    index. Best-effort; returns (ok, fail, skipped)."""
+    index. Best-effort; returns (ok, fail, skipped).
+
+    Two name mismatches to absorb: (1) uploads — claude.ai sanitizes the on-mount filename
+    (e.g. spaces -> underscores) while find_files reports the original, so try both; (2) some
+    listed output names are historical/superseded (renamed during the run) and no longer exist
+    on the current mount — those legitimately 404 and count as fail."""
     ok = fail = skipped = 0
     for r in client.find_files(conv_uuid):
-        # wiggle FileRef.path is already the /mnt path; upload FileRef.path is a uuid -> name it
-        mnt = r.path if r.kind == "wiggle" else "/mnt/user-data/uploads/" + (getattr(r, "name", None) or r.path)
-        if os.path.basename(mnt) in skip_names:
+        if r.kind == "wiggle":
+            cands = [r.path]                                 # already the /mnt/user-data/outputs/… path
+        else:
+            nm = getattr(r, "name", None) or r.path          # upload: FileRef.path is a uuid
+            names = list(dict.fromkeys([nm, nm.replace(" ", "_")]))   # mount name is sanitized
+            cands = ["/mnt/user-data/uploads/" + n for n in names]
+        if os.path.basename(cands[0]) in skip_names:
             skipped += 1; continue
-        dest = dest_home + mnt
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        try:
-            res = _download_vm_path(client, org, conv_uuid, mnt)
+        got = False
+        for mnt in cands:
+            try:
+                res = _download_vm_path(client, org, conv_uuid, mnt)
+            except Exception:
+                continue
             if res.get("status") == 200 and res.get("b64") is not None:
-                open(dest, "wb").write(base64.b64decode(res["b64"])); ok += 1
-            else:
-                fail += 1
-        except Exception:
+                dest = dest_home + mnt
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                open(dest, "wb").write(base64.b64decode(res["b64"]))
+                ok += 1; got = True
+                break
+        if not got:
             fail += 1
     return ok, fail, skipped
 
