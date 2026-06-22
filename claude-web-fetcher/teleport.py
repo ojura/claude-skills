@@ -120,7 +120,9 @@ def hydrate_home(home_src, dest_home, force=False):
                     shutil.copy2(s, d)
         elif tarfile.is_tarfile(home_src):
             with tarfile.open(home_src) as t:
-                t.extractall(dest_home)
+                # the home tarball is produced inside the untrusted sandbox; filter='data'
+                # rejects ../, absolute paths, and escaping links (tar-slip / CVE-2007-4559)
+                t.extractall(dest_home, filter="data")
         else:
             raise ValueError(f"home_src is neither a dir nor a tarball: {home_src}")
     return sum(len(f) for _, _, f in os.walk(dest_home))
@@ -160,6 +162,9 @@ def hydrate_mnt(client, conv_uuid, dest_home, org, skip_names=("claude_home.tar.
                 continue
             if res.get("status") == 200 and res.get("b64") is not None:
                 dest = dest_home + mnt
+                base = os.path.abspath(dest_home)
+                if os.path.commonpath([os.path.abspath(dest), base]) != base:
+                    fail += 1; got = True; break          # a ../ in a claude.ai filename -> refuse to escape home
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 open(dest, "wb").write(base64.b64decode(res["b64"]))
                 ok += 1; got = True
