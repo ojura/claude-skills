@@ -108,6 +108,8 @@ Export `content` is **always a list** (4460/4460); partition (✓ exact, sums to
 | Shape | **forest** — root sentinel `00000000-0000-4000-8000-000000000000` (sole out-of-set parent, 261×); 69/145 (48%) branch; HRZZ = 15 branch pts/max 4/1 root; 39 multi-root | tree; branches via regen |
 | Line types (12) | — | `user, assistant, attachment, system, file-history-snapshot, custom-title, queue-operation, last-prompt, ai-title, agent-name, mode, permission-mode` |
 
+**Forest → tree (the SENTINEL roots are first-message edits).** The 39 multi-root convos each have several SENTINEL-parented branches — verified to be **edits/retries of the first message** (all 158 roots are `human`; e.g. one convo re-sends the opening 17×). CC wants a single-root tree, so `to_cc` emits **one virtual null root node** (`isVirtualRoot`, content `"."`, `parentUuid:null`) and parents every SENTINEL branch off it → the forest becomes one connected tree (single-root convos add no virtual node). It carries no `exportEscrow`, so `to_export` drops it and the reverse is exact. Without it, CC sees N `parentUuid:null` roots and the active-leaf walk can't reach the non-active branches.
+
 ## 7. Tool vocabulary (names disjoint, capabilities overlap)
 
 claude.ai (20 names) ∩ CC (44 names) = **∅** (✓).

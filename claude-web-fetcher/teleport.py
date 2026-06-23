@@ -106,17 +106,22 @@ def fetch_images(client, org, uuids):
 # ---- filesystem hydration ----
 
 def hydrate_home(home_src, dest_home, force=False):
-    """Populate dest_home from a directory or a tarball. Idempotent: skips if dest is
-    already populated unless force=True. Returns the file count under dest_home."""
+    """Populate dest_home from a directory or a tarball. Idempotent via a completion sentinel:
+    a partial/interrupted copy is NOT mistaken for 'done' (only a fully-written run drops the
+    marker), so a re-run finishes it. Returns the file count under dest_home."""
     os.makedirs(dest_home, exist_ok=True)
-    populated = any(os.scandir(dest_home))
-    if home_src and (force or not populated):
+    sentinel = os.path.join(dest_home, ".teleport_hydrated")
+    if home_src and (force or not os.path.exists(sentinel)):
         if os.path.isdir(home_src):
             for name in os.listdir(home_src):
                 s, d = os.path.join(home_src, name), os.path.join(dest_home, name)
                 if os.path.isdir(s):
+                    if os.path.exists(d) and not os.path.isdir(d):
+                        os.remove(d)                     # dest holds a file where source has a dir
                     shutil.copytree(s, d, dirs_exist_ok=True)
                 else:
+                    if os.path.isdir(d):
+                        shutil.rmtree(d)                 # dest holds a dir where source has a file
                     shutil.copy2(s, d)
         elif tarfile.is_tarfile(home_src):
             with tarfile.open(home_src) as t:
@@ -125,6 +130,8 @@ def hydrate_home(home_src, dest_home, force=False):
                 t.extractall(dest_home, filter="data")
         else:
             raise ValueError(f"home_src is neither a dir nor a tarball: {home_src}")
+        with open(sentinel, "w") as f:                   # mark complete only after a full copy/extract
+            f.write(os.path.abspath(home_src) + "\n")
     return sum(len(f) for _, _, f in os.walk(dest_home))
 
 def _download_vm_path(client, org, conv, path):

@@ -400,7 +400,26 @@ class ClaudeWeb:
             zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
             names = zf.namelist()
             return zf.read(names[0]) if len(names) == 1 else zip_bytes
-        return self._get(f"/api/{self.org_id}/files/{ref.path}/preview")
+        # upload: prefer the files asset endpoint; fall back to the live VM mount if it purged.
+        # The /files/{uuid}/preview asset store drops user uploads after a while (404); the
+        # /mnt/user-data mount persists, so download-file still reads them (claude.ai sanitizes
+        # the on-mount filename, spaces -> underscores).
+        try:
+            return self._get(f"/api/{self.org_id}/files/{ref.path}/preview")
+        except Exception as e:
+            if "404" not in str(e):
+                raise
+        last = None
+        for nm in dict.fromkeys(n for n in (ref.name, (ref.name or "").replace(" ", "_")) if n):
+            p = urllib.parse.quote(f"/mnt/user-data/uploads/{nm}", safe="")
+            try:
+                return self._get(
+                    f"/api/organizations/{self.org_id}/conversations/"
+                    f"{ref.conversation_uuid}/wiggle/download-file?path={p}"
+                )
+            except Exception as e:
+                last = e
+        raise RuntimeError(f"upload {ref.name!r}: preview 404 and mount fallback failed: {last}")
 
     def download_file_to(self, ref: FileRef, dest) -> Path:
         dest = Path(dest)

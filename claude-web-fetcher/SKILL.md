@@ -91,7 +91,7 @@ Session events have a `type` field: `user`, `assistant`, `tool_use`, `tool_resul
 `env_manager_log`, `control_request`, etc.
 
 ## FileRef kinds
-- `kind="upload"`: user-uploaded files — `/api/{org}/files/{uuid}/preview`.
+- `kind="upload"`: user-uploaded files — `/api/{org}/files/{uuid}/preview`, falling back to the VM mount (`wiggle/download-file?path=/mnt/user-data/uploads/<name>`) when that asset endpoint has purged the upload.
 - `kind="wiggle"`: sandbox `present_files` outputs (zip-wrapped; single-file zips auto-unwrapped).
 
 ## Session key acquisition (patchright backend only)

@@ -182,8 +182,14 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
                 "sessionId": sid, "cwd": ctx["cwd"], "version": ctx["version"],
                 "gitBranch": ctx["gitBranch"], "userType": ctx["userType"], "entrypoint": ctx["entrypoint"]}
 
+    node_tail = {}   # node_uuid -> uuid of its last ACTUALLY-EMITTED line. Skip-aware: under
+                     # thinking='strip' a stripped trailing block must not stay a parent target
+                     # (else children dangle); a node that emits nothing maps to its own prev (pass-through).
+
     def tail(node_uuid):
-        n = nblk.get(node_uuid, 0)
+        if node_uuid in node_tail:
+            return node_tail[node_uuid]
+        n = nblk.get(node_uuid, 0)               # fallback before the node is emitted (parents precede children)
         return _uid(node_uuid, n - 1) if n else _uid(node_uuid, "empty")
 
     lines = []
@@ -195,6 +201,21 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
     lines += [title, {"type": "mode", "mode": "normal", "sessionId": sid},
               {"type": "permission-mode", "permissionMode": "default", "sessionId": sid}]
 
+    # forest -> tree (deliberated): claude.ai exports a FOREST — each branch's root parents off the
+    # SENTINEL, and editing the first message spawns multiple SENTINEL-rooted branches (39/145
+    # convos). CC wants a single-root tree, so when there are 2+ roots we emit ONE virtual null root
+    # node and parent every branch off it — the whole forest becomes one connected tree (a 1-root
+    # convo is already a tree; no virtual node added). to_export drops it (no escrow), so reverse is exact.
+    roots0 = [m for m in msgs if (m.get("parent_message_uuid") in (SENTINEL, None))
+              or (m.get("parent_message_uuid") not in nblk)]
+    vroot = None
+    if len(roots0) > 1:
+        vroot = _uid(SENTINEL, "vroot")
+        ts0 = (msgs[0].get("created_at") if msgs else None) or "1970-01-01T00:00:00.000Z"
+        lines.append({**base(vroot, None, ts0), "type": "user", "isVirtualRoot": True,
+                      "message": {"role": "user", "content": [{"type": "text", "text": "."}]}})
+        node_tail[vroot] = vroot
+
     for ni, m in enumerate(msgs):
         nu = m["uuid"]; sender = m.get("sender"); blocks = m.get("content") or []
         # council guards: ≤1 None-id tool_use per node (the last_synth_id pairing relies on it),
@@ -204,9 +225,10 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
         assert not any(isinstance(b.get("id"), str) and b["id"].startswith("toolu_synth_") for b in _tu), f"node {nu}: real tool_use id in synth namespace"
         ts = m.get("created_at") or "1970-01-01T00:00:00.000Z"
         pmu = m.get("parent_message_uuid")
-        prev = tail(pmu) if (pmu in nblk and pmu != SENTINEL) else None
+        prev = tail(pmu) if (pmu in nblk and pmu != SENTINEL) else vroot   # roots hang off the virtual node (tree), else None
         tu_uid = {}                                       # tool_use id -> emitted line uuid (for sourceToolAssistantUUID)
         last_synth_id = None                              # most recent synthesized tool_use id (for None-id pairing)
+        last_tool_id = None                               # most recent emitted tool_use id, real OR synth (for None-tuid pairing)
         first_emitted = True
 
         node_esc = {"sender": sender, "node_index": ni,
@@ -222,13 +244,20 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
                 e["block"] = residue
             line["exportEscrow"] = e
 
-        if not blocks:                                    # empty node: one carrier user line
+        if not blocks:                                    # empty node: one carrier line in the node's OWN role
             u = _uid(nu, "empty")
-            ln = {**base(u, prev, ts), "type": "user", "message": {"role": "user", "content": ""}}
+            role = "user" if sender == "human" else "assistant"
+            msg = {"role": role, "content": [{"type": "text", "text": "."}]}   # API rejects empty content
+            if role == "assistant":
+                msg.update(id=_mid(nu, 0), model=ctx["model"], type="message",
+                           stop_reason="end_turn", stop_sequence=None, usage=dict(USAGE))
+            ln = {**base(u, prev, ts), "type": role, "message": msg}
+            if role == "assistant":
+                ln["requestId"] = _rid(nu, 0)
             attach_escrow(ln, "empty", None)
             if escrow:
                 ln["exportEscrow"].update(node_esc); ln["exportEscrow"]["empty_node"] = True
-            lines.append(ln); continue
+            lines.append(ln); node_tail[nu] = u; continue
 
         for ridx, rnd in enumerate(_rounds(blocks)):
             mid = _mid(nu, ridx)
@@ -244,7 +273,10 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
                 if t == "tool_use" and not (isinstance(nat.get("id"), str) and nat["id"]):
                     last_synth_id = _toolid(nu, bi); residue["_orig_id"] = nat["id"]; nat["id"] = last_synth_id
                 elif t == "tool_result" and not (isinstance(nat.get("tool_use_id"), str) and nat["tool_use_id"]):
-                    residue["_orig_tuid"] = nat["tool_use_id"]; nat["tool_use_id"] = last_synth_id or _toolid(nu, bi)
+                    # pair a None tool_use_id to the most recent emitted tool_use id (real OR synth), not just synth
+                    residue["_orig_tuid"] = nat["tool_use_id"]; nat["tool_use_id"] = last_tool_id or _toolid(nu, bi)
+                if t == "tool_use":
+                    last_tool_id = nat["id"]
                 if t == "tool_result":
                     ln = {**base(u, prev, ts), "type": "user",
                           "message": {"role": "user", "content": [nat] if nat else []},
@@ -253,7 +285,7 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
                 else:
                     role = "user" if sender == "human" else "assistant"
                     content = [nat] if nat else []
-                    if role == "user" and not content:        # API: user msg must be non-empty (orig in _raw escrow)
+                    if not content:                            # API rejects empty content for BOTH roles (orig in escrow)
                         content = [{"type": "text", "text": "."}]
                     msg = {"role": role, "content": content}
                     if role == "assistant":
@@ -269,6 +301,7 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
                     ln["exportEscrow"].update(node_esc); first_emitted = False
                 lines.append(ln)
                 prev = u
+        node_tail[nu] = prev          # node's emitted tail (skip-aware) — children chain off this
 
     # active-leaf pointer: resume reads the last last-prompt's leafUuid, then walks
     # parentUuid to root. Without it CC can't find the conversation (measured: 103/107
@@ -347,7 +380,9 @@ def audit(convo):
     cc = to_cc(convo, thinking="carry", escrow=True)
     back = to_export(cc)
     probs, roots = conformance(cc)
+    strip_probs, _ = conformance(to_cc(convo, thinking="strip", escrow=True))   # strip is the 'guaranteed resume' mode; test it
     return {"roundtrip": _diff(convo, back), "conformance": probs, "roots": roots,
+            "strip_conformance": strip_probs,
             "lines": len(cc), "msgs": len(convo.get("chat_messages", []))}
 
 
@@ -391,11 +426,12 @@ if __name__ == "__main__":
     for u, lab in TARGETS.items():
         if u not in found: print(f"  {u} {lab}: NOT FOUND"); continue
         r = audit(found[u])
-        ok = not r["conformance"] and r["roundtrip"] is None
+        ok = not r["conformance"] and not r["strip_conformance"] and r["roundtrip"] is None
         ok_all &= ok
         print(f"  {u} {lab:22s} {'PASS' if ok else 'FAIL'}  msgs={r['msgs']:4d} lines={r['lines']:5d} "
-              f"roots={r['roots']} conformance_violations={len(r['conformance'])} roundtrip={'ok' if r['roundtrip'] is None else 'BROKEN'}")
+              f"roots={r['roots']} conformance_violations={len(r['conformance'])} strip_violations={len(r['strip_conformance'])} roundtrip={'ok' if r['roundtrip'] is None else 'BROKEN'}")
         if r["conformance"]: print("      conformance:", r["conformance"][:3])
+        if r["strip_conformance"]: print("      strip conformance:", r["strip_conformance"][:3])
         if r["roundtrip"]: print("      roundtrip diff:", r["roundtrip"])
     # Check every conversation, so a future edit that breaks reversibility on an
     # unusual one fails the test instead of slipping through.
@@ -407,10 +443,10 @@ if __name__ == "__main__":
             r = audit(o)
         except Exception as e:
             fails.append((u, f"raised {type(e).__name__}: {e}")); continue
-        if not r["conformance"] and r["roundtrip"] is None:
+        if not r["conformance"] and not r["strip_conformance"] and r["roundtrip"] is None:
             npass += 1
         else:
-            fails.append((u, f"roundtrip={r['roundtrip']} conformance={r['conformance'][:2]}"))
+            fails.append((u, f"roundtrip={r['roundtrip']} conformance={r['conformance'][:2]} strip={r['strip_conformance'][:2]}"))
     print(f"  {npass}/{len(convos)} PASS (round-trip + conformance)")
     for u, why in fails[:10]:
         print(f"  FAIL {u}: {why}")
