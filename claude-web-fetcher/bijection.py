@@ -117,6 +117,8 @@ def _block_native(b, images=None):
         consumed = {"type", "text"}
         nat = {"type": "text", "text": b.get("text", "")}
     elif t == "thinking":
+        if not (b.get("thinking") or "").strip():
+            return (None, {"_raw": b})   # empty thinking: API 400s "each thinking block must contain thinking"
         consumed = {"type", "thinking", "signature"}
         nat = {"type": "thinking", "thinking": b.get("thinking", ""), "signature": b.get("signature") or ""}
     elif t == "tool_use":
@@ -418,9 +420,11 @@ def conformance(lines):
             roots += 1
         elif p not in uids:
             probs.append((l.get("uuid", "?")[:8], f"dangling parentUuid {str(p)[:8]}"))
-        for b in m.get("content") or []:                  # empty inner tool_result content -> API 400 on replay
+        for b in m.get("content") or []:                  # empty inner content -> API 400 on replay
             if isinstance(b, dict) and b.get("type") == "tool_result" and not b.get("content"):
                 probs.append((l.get("uuid", "?")[:8], "empty tool_result content"))
+            elif isinstance(b, dict) and b.get("type") == "thinking" and not (b.get("thinking") or "").strip():
+                probs.append((l.get("uuid", "?")[:8], "empty thinking block"))
 
     # tool_use <-> tool_result pairing on the ACTIVE-LEAF PATH (what `--resume` replays to the API).
     # An assistant tool_use whose id is not answered by a tool_result later on the path 400s the
