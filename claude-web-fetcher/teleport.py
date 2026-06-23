@@ -159,7 +159,7 @@ def hydrate_home(home_src, dest_home, force=False):
             raise ValueError(f"home_src is neither a dir nor a tarball: {home_src}")
         with open(sentinel, "w") as f:                   # mark complete only after a full copy/extract
             f.write(os.path.abspath(home_src) + "\n")
-    return sum(len(f) for _, _, f in os.walk(dest_home))
+    return sum(len(f) for _, _, f in os.walk(dest_home)) - (1 if os.path.exists(sentinel) else 0)  # don't count the sentinel
 
 def _download_vm_path(client, org, conv, path):
     """download-file?path= reads ANY path on the conversation's VM (incl. the /mnt/user-data
