@@ -153,7 +153,7 @@ A 10-seat Opus council (resumed in-process via the subagent-symlink method, to c
 
 - **Subtree isomorphism + ESCROWED grouping, not a clean node bijection.** The chat_message↔CC-line-group boundary, the tool_result re-merge, within-node block ORDER, and sibling order are all reconstructed from escrow, not from role+parent-tree. Two grouping keys: (i) node boundary = `message.id`; (ii) within-node block order = an explicit **ordinal** — intra-node `parentUuid` is **non-linear/star** (measured 2/N within-group edges on size 12–17 groups; 762 nodes >1 tool_use), so it cannot carry block order.
 - **Four ledger omissions** (export→CC→export is NOT identity without them):
-  - top-level `text` — a non-derivable assistant **summarized digest**, ≠ concat(content-text) in **2271/5954 (38%, all-assistant)**, `top==first-text-block` 0/2271. **ESCROW-NON-DERIVABLE and a round-trip CORRECTNESS GATE** (success requires top-level `text` equality, not just block-concat).
+  - top-level `text` — a non-derivable assistant **summarized digest**, ≠ concat(content-text) in **2271/3017 assistant messages (75%)** (= 38% of all 5954 messages; human side never mismatches), `top==first-text-block` 0/2271. **ESCROW-NON-DERIVABLE and a round-trip CORRECTNESS GATE** (success requires top-level `text` equality, not just block-concat).
   - `files` (553 msgs) — escrow.
   - `attachments`+`extracted_content` (227 attachments / 194 msgs) — **content-bearing user-upload text**; flatten `extracted_content`→text.
   - sibling-order — `created_at` (export `index` is `None`); escrow.

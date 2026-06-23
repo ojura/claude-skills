@@ -33,9 +33,16 @@ DEFAULT_BASE = "~/.claude/teleports"
 # ---- helpers ----
 
 def cc_project_slug(cwd):
-    """CC maps an absolute cwd to its ~/.claude/projects dir by replacing every
-    non-alphanumeric character with '-'. (e.g. /home/x/.claude -> -home-x--claude)."""
-    return re.sub(r"[^a-zA-Z0-9]", "-", os.path.abspath(cwd))
+    """CC maps an absolute cwd to its ~/.claude/projects dir by replacing every non-alphanumeric
+    character with '-'. CC (Node/JS) iterates UTF-16 CODE UNITS, so a non-BMP char (emoji, astral
+    CJK) becomes TWO dashes — its surrogate pair — not one; we match that so the slug can't diverge
+    and lose the session on --resume. ASCII paths (the normal case) are unaffected."""
+    b = os.path.abspath(cwd).encode("utf-16-le")
+    out = []
+    for i in range(0, len(b), 2):
+        cu = b[i] | (b[i + 1] << 8)               # one UTF-16 code unit
+        out.append(chr(cu) if (48 <= cu <= 57 or 65 <= cu <= 90 or 97 <= cu <= 122) else "-")
+    return "".join(out)
 
 def session_id(conv_uuid):
     """Deterministic session id for a conversation -> idempotent re-runs overwrite."""
@@ -53,9 +60,11 @@ def git_branch(home, default="main"):
     head = os.path.join(home, ".git", "HEAD")
     try:
         ref = open(head).read().strip()
-        return ref.rsplit("/", 1)[-1] if ref.startswith("ref:") else default
     except Exception:
-        return default
+        return default                                   # no .git -> default
+    if not ref.startswith("ref:"):
+        return "HEAD"                                    # detached HEAD (raw sha) -> CC records literal "HEAD"
+    return ref.split("refs/heads/", 1)[1] if "refs/heads/" in ref else ref.split("/", 1)[-1]  # keep full slash branch
 
 def load_convo(export_json, conv_uuid):
     data = json.load(open(export_json))
@@ -203,17 +212,26 @@ the old sandbox, which is gone.
 ## Tools
 
 The claude.ai sandbox tools map onto Claude Code's: `bash_tool`->`Bash`, `view`->`Read`,
-`str_replace`->`Edit`, `create_file`->`Write`, `present_files`->just write into the cwd.
-Use the Claude Code tools.
+`str_replace`->`Edit`, `create_file`->`Write`, `web_search`->`WebSearch`, `web_fetch`->`WebFetch`,
+`present_files`->just write into the cwd. Any other historical sandbox tool in the transcript
+(`conversation_search`, `message_compose_v1`, …) has no Claude Code equivalent — use your own tools.
 """
 
 def write_claude_md(dest_home, conv_uuid, conv_name):
+    """Write the orientation CLAUDE.md. If the hydrated tree shipped its OWN CLAUDE.md (a sandbox
+    /home/claude/CLAUDE.md with now-dead absolute paths), PREPEND the orientation instead of
+    silently skipping — else the model gets dead-path guidance, the exact flailing this prevents.
+    Prepend (not append) so the path remap is read first. A sentinel marker keeps re-runs from
+    re-prepending. Returns 'written'/'prepended'/'present'."""
     path = os.path.join(dest_home, "CLAUDE.md")
-    if os.path.exists(path):                                 # don't clobber a real project CLAUDE.md
-        return False
-    open(path, "w").write(CLAUDE_MD.format(name=conv_name or "(untitled)",
-                                           conv=conv_uuid, home=dest_home))
-    return True
+    mark = "<!-- teleport-orientation -->"
+    body = mark + "\n" + CLAUDE_MD.format(name=conv_name or "(untitled)", conv=conv_uuid, home=dest_home)
+    if not os.path.exists(path):
+        open(path, "w").write(body); return "written"
+    existing = open(path).read()
+    if mark in existing:
+        return "present"                                    # our orientation already there (re-run)
+    open(path, "w").write(body + "\n\n" + existing); return "prepended"  # foreign CLAUDE.md -> prepend, read first
 
 
 # ---- orchestration ----
@@ -225,6 +243,8 @@ def teleport(conv_uuid, export_json, home_src=None, base=DEFAULT_BASE, *,
     sessionId, cwd, project jsonl path, and the `claude --resume` command."""
     base = os.path.expanduser(base)
     convo = load_convo(export_json, conv_uuid)
+    if not (convo.get("chat_messages") or []):
+        raise ValueError(f"conversation {conv_uuid} has no messages — nothing to teleport (would be a leafless husk)")
     cid = convo["uuid"]
     short = cid[:8]
     home = os.path.join(base, short, "home")

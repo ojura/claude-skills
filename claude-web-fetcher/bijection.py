@@ -90,15 +90,18 @@ def _api_tool_result_content(content, images=None):
             src = it.get("source")
             if isinstance(src, dict) and ((src.get("type") == "base64" and src.get("data"))
                                           or (src.get("type") == "url" and src.get("url"))):
-                out.append({"type": "image", "source": src})           # already API-valid
+                src = {k: v for k, v in src.items() if k in ("type", "media_type", "data", "url")}  # shed non-API keys
+                out.append({"type": "image", "source": src})           # already API-valid (whitelisted)
             elif images and it.get("file_uuid") in images:
                 r = images[it["file_uuid"]]
                 out.append({"type": "image", "source": {"type": "base64",
                             "media_type": r["media_type"], "data": r["data"]}})
             else:                                                      # no bytes -> valid text placeholder
                 out.append({"type": "text", "text": f"[image omitted from teleport: {it.get('file_uuid', '?')}]"})
+        elif t == "document" and not it.get("source") and it.get("file_uuid"):
+            out.append({"type": "text", "text": f"[document omitted from teleport: {it['file_uuid']}]"})  # bare file_uuid -> API can't resolve
         elif t in VALID:
-            out.append(it)                                             # document/search_result/etc. pass verbatim
+            out.append(it)                                             # search_result/tool_reference/resolvable document pass verbatim
         else:                                                          # unknown type -> minimal valid text
             out.append({"type": "text", "text": it.get("text") or f"[{t}]"})
     return out
@@ -125,6 +128,11 @@ def _block_native(b, images=None):
                "content": _api_tool_result_content(b.get("content"), images)}
         if "is_error" in b:
             nat["is_error"] = b["is_error"]
+    elif t in ("image", "document"):
+        # top-level image/document (NOT nested in a tool_result): route through the same resolver
+        # so it emits a native source/text block instead of being escrow-only (invisible on resume).
+        items = _api_tool_result_content([b], images)
+        return (items[0] if items else None, {"_raw": b})
     else:
         return (None, {"_raw": b})                       # flag/unknown: no CC home -> escrow whole
     esc = {k: v for k, v in b.items() if k not in consumed}
@@ -218,7 +226,7 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
 
     for ni, m in enumerate(msgs):
         nu = m["uuid"]; sender = m.get("sender"); blocks = m.get("content") or []
-        # council guards: ≤1 None-id tool_use per node (the last_synth_id pairing relies on it),
+        # council guards: ≤1 None-id tool_use per node (the None-tuid pairing relies on it),
         # and real tool ids must stay disjoint from the synth sentinel namespace (no silent cross-wire)
         _tu = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
         assert sum(1 for b in _tu if not (isinstance(b.get("id"), str) and b.get("id"))) <= 1, f"node {nu}: >1 None-id tool_use"
@@ -227,7 +235,6 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
         pmu = m.get("parent_message_uuid")
         prev = tail(pmu) if (pmu in nblk and pmu != SENTINEL) else vroot   # roots hang off the virtual node (tree), else None
         tu_uid = {}                                       # tool_use id -> emitted line uuid (for sourceToolAssistantUUID)
-        last_synth_id = None                              # most recent synthesized tool_use id (for None-id pairing)
         last_tool_id = None                               # most recent emitted tool_use id, real OR synth (for None-tuid pairing)
         first_emitted = True
 
@@ -271,10 +278,13 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
                 # API requires tool_use.id / tool_result.tool_use_id to be valid strings;
                 # claude.ai emits id=None on degenerate blocks. Synthesize + pair, escrow originals.
                 if t == "tool_use" and not (isinstance(nat.get("id"), str) and nat["id"]):
-                    last_synth_id = _toolid(nu, bi); residue["_orig_id"] = nat["id"]; nat["id"] = last_synth_id
+                    residue["_orig_id"] = nat["id"]; nat["id"] = _toolid(nu, bi)
                 elif t == "tool_result" and not (isinstance(nat.get("tool_use_id"), str) and nat["tool_use_id"]):
-                    # pair a None tool_use_id to the most recent emitted tool_use id (real OR synth), not just synth
+                    # pair a None tool_use_id to the most recent emitted tool_use id (real OR synth), then
+                    # CLEAR it — a tool_use takes exactly ONE result, so a 2nd orphan can't re-grab the same
+                    # id (that produced a duplicate tool_use_id -> API 400). Reverse stays exact via _orig_tuid.
                     residue["_orig_tuid"] = nat["tool_use_id"]; nat["tool_use_id"] = last_tool_id or _toolid(nu, bi)
+                    last_tool_id = None
                 if t == "tool_use":
                     last_tool_id = nat["id"]
                 if t == "tool_result":
@@ -426,7 +436,7 @@ if __name__ == "__main__":
     for u, lab in TARGETS.items():
         if u not in found: print(f"  {u} {lab}: NOT FOUND"); continue
         r = audit(found[u])
-        ok = not r["conformance"] and not r["strip_conformance"] and r["roundtrip"] is None
+        ok = not r["conformance"] and not r["strip_conformance"] and r["roundtrip"] is None and r["roots"] <= 1
         ok_all &= ok
         print(f"  {u} {lab:22s} {'PASS' if ok else 'FAIL'}  msgs={r['msgs']:4d} lines={r['lines']:5d} "
               f"roots={r['roots']} conformance_violations={len(r['conformance'])} strip_violations={len(r['strip_conformance'])} roundtrip={'ok' if r['roundtrip'] is None else 'BROKEN'}")
@@ -443,10 +453,10 @@ if __name__ == "__main__":
             r = audit(o)
         except Exception as e:
             fails.append((u, f"raised {type(e).__name__}: {e}")); continue
-        if not r["conformance"] and not r["strip_conformance"] and r["roundtrip"] is None:
+        if not r["conformance"] and not r["strip_conformance"] and r["roundtrip"] is None and r["roots"] <= 1:
             npass += 1
         else:
-            fails.append((u, f"roundtrip={r['roundtrip']} conformance={r['conformance'][:2]} strip={r['strip_conformance'][:2]}"))
+            fails.append((u, f"roundtrip={r['roundtrip']} conformance={r['conformance'][:2]} strip={r['strip_conformance'][:2]} roots={r['roots']}"))
     print(f"  {npass}/{len(convos)} PASS (round-trip + conformance)")
     for u, why in fails[:10]:
         print(f"  FAIL {u}: {why}")
