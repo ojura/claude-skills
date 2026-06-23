@@ -47,7 +47,7 @@ Four independent pieces, each through its own channel.
 
 ## Reverse direction (seeding a conversation)
 
-- `upload-file` (binary blob → `/mnt/user-data/uploads`) and `convert_document` (document → `extracted_content`) let you push files into a *fresh* conversation's sandbox.
+- `upload-file` (binary blob → `/mnt/user-data/uploads`) and `convert_document` (document → `extracted_content`) are the claude.ai surface for pushing files into a *fresh* conversation's sandbox — **not yet implemented in this client** (only `download-file`/`download-files`/`find_files` and the export methods are); a seeding caller must add them.
 - You **cannot** inject messages or signatures: claude.ai is server-authoritative — there is no client write that adds an assistant turn, and the signature is minted server-side and never accepted from a client (verified by probe: every injection route 400s/404s).
 
 ## What needs the model, and what doesn't
@@ -57,12 +57,17 @@ Four independent pieces, each through its own channel.
 
 ## Notes on the file API (reference)
 
-| op | client | |
-|---|---|---|
-| `download-file` / `download-files` | ✅ | reads any absolute path, file-only |
-| `list-files` | ✅ | `/mnt/user-data` only |
-| `upload-file` | ✅ | blob → `/mnt/user-data/uploads` |
-| `delete-file` | ✅ | `POST {file_uuid}` |
-| `convert_document` | ✅ | document text extraction |
-| `write-file` | ❌ | backend-only (403 to clients) |
+"reachable" = exists on claude.ai's client-facing API surface (a client *could* call it).
+"impl here" = a method exists in *this* repo's `claude_web.py`. Today only `download-file`/
+`download-files` (via `download_file`/`find_files`) and the export methods are implemented;
+`list-files`/`upload-file`/`delete-file`/`convert_document` are reachable but unimplemented.
+
+| op | reachable | impl here | |
+|---|---|---|---|
+| `download-file` / `download-files` | ✅ | ✅ | reads any absolute path, file-only |
+| `list-files` | ✅ | ❌ | `/mnt/user-data` only |
+| `upload-file` | ✅ | ❌ | blob → `/mnt/user-data/uploads` |
+| `delete-file` | ✅ | ❌ | `POST {file_uuid}` |
+| `convert_document` | ✅ | ❌ | document text extraction |
+| `write-file` | ❌ | ❌ | backend-only (403 to clients) |
 

@@ -92,7 +92,7 @@ def _api_tool_result_content(content, images=None):
                                           or (src.get("type") == "url" and src.get("url"))):
                 src = {k: v for k, v in src.items() if k in ("type", "media_type", "data", "url")}  # shed non-API keys
                 out.append({"type": "image", "source": src})           # already API-valid (whitelisted)
-            elif images and it.get("file_uuid") in images:
+            elif images and images.get(it.get("file_uuid"), {}).get("data"):   # empty bytes -> fall through to placeholder
                 r = images[it["file_uuid"]]
                 out.append({"type": "image", "source": {"type": "base64",
                             "media_type": r["media_type"], "data": r["data"]}})
@@ -185,6 +185,19 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
     nblk = {m["uuid"]: len(m.get("content") or []) for m in msgs}
     sid = ctx["sessionId"]
 
+    # ORPHAN tool_use (bj-tree, measured): claude.ai assistant turns sometimes end on a tool_use
+    # that the source never answers (interrupted/abandoned call — measured shape is uniformly
+    # [..., tool_use, text], the orphan in the node's last round). The dev API rejects an
+    # assistant tool_use not answered by a tool_result in the next user message (400). On the
+    # active-leaf path this 400s resume in 9/145 convos (carry AND strip). We answer every
+    # convo-wide-unanswered tool_use with a synthetic role:user tool_result stub on the spine,
+    # marked synthetic so to_export DROPS it (the export never had it → reverse stays exact).
+    answered = set()
+    for m in msgs:
+        for b in m.get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id"):
+                answered.add(b["tool_use_id"])
+
     def base(uid, parent, ts):
         return {"parentUuid": parent, "isSidechain": False, "uuid": uid, "timestamp": ts,
                 "sessionId": sid, "cwd": ctx["cwd"], "version": ctx["version"],
@@ -236,6 +249,7 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
         prev = tail(pmu) if (pmu in nblk and pmu != SENTINEL) else vroot   # roots hang off the virtual node (tree), else None
         tu_uid = {}                                       # tool_use id -> emitted line uuid (for sourceToolAssistantUUID)
         last_tool_id = None                               # most recent emitted tool_use id, real OR synth (for None-tuid pairing)
+        node_unanswered = []                              # (emitted_id, line_uuid) for this node's tool_use never answered convo-wide
         first_emitted = True
 
         node_esc = {"sender": sender, "node_index": ni,
@@ -288,6 +302,8 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
                 if t == "tool_use":
                     last_tool_id = nat["id"]
                 if t == "tool_result":
+                    if nat and not nat.get("content"):          # API 400s on empty tool_result content (orig in _orig_content escrow)
+                        nat["content"] = [{"type": "text", "text": "[empty result]"}]
                     ln = {**base(u, prev, ts), "type": "user",
                           "message": {"role": "user", "content": [nat] if nat else []},
                           "toolUseResult": (b.get("structured_content") or {"content": b.get("content")}),
@@ -306,11 +322,30 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
                         ln["requestId"] = _rid(nu, ridx)
                     if t == "tool_use":
                         tu_uid[b.get("id")] = u
+                        if b.get("id") not in answered:    # never answered convo-wide (None-id synths are never answered)
+                            node_unanswered.append((nat["id"], u))
                 attach_escrow(ln, bi, residue)
                 if first_emitted and escrow:
                     ln["exportEscrow"].update(node_esc); first_emitted = False
                 lines.append(ln)
                 prev = u
+
+        # answer any orphan tool_use of this node with a synthetic tool_result stub on the spine
+        # (immediately after the owning assistant turn → satisfies the API's next-user-message rule).
+        # exportEscrow={_synthetic_stub:True} but NO node_uuid → to_export never sees it (reverse exact).
+        for oidx, (oid, osrc) in enumerate(node_unanswered):
+            su = _uid(nu, "stub", oidx)
+            stub = {**base(su, prev, ts), "type": "user",
+                    "message": {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": oid,
+                         "content": "[no result: tool call was not completed in the source conversation]",
+                         "is_error": True}]},
+                    "toolUseResult": {"content": "[no result: tool call was not completed in the source conversation]"},
+                    "sourceToolAssistantUUID": osrc}
+            if escrow:
+                stub["exportEscrow"] = {"_synthetic_stub": True}
+            lines.append(stub)
+            prev = su
         node_tail[nu] = prev          # node's emitted tail (skip-aware) — children chain off this
 
     # active-leaf pointer: resume reads the last last-prompt's leafUuid, then walks
@@ -383,6 +418,32 @@ def conformance(lines):
             roots += 1
         elif p not in uids:
             probs.append((l.get("uuid", "?")[:8], f"dangling parentUuid {str(p)[:8]}"))
+        for b in m.get("content") or []:                  # empty inner tool_result content -> API 400 on replay
+            if isinstance(b, dict) and b.get("type") == "tool_result" and not b.get("content"):
+                probs.append((l.get("uuid", "?")[:8], "empty tool_result content"))
+
+    # tool_use <-> tool_result pairing on the ACTIVE-LEAF PATH (what `--resume` replays to the API).
+    # An assistant tool_use whose id is not answered by a tool_result later on the path 400s the
+    # Messages API on the first new turn. Walk leaf->root, then check pairing in path order.
+    by_uuid = {l["uuid"]: l for l in lines if "uuid" in l}
+    leaf = next((l.get("leafUuid") for l in reversed(lines) if l.get("type") == "last-prompt"), None)
+    if leaf is not None:
+        path, cur, seen = [], leaf, set()
+        while cur is not None and cur in by_uuid and cur not in seen:
+            seen.add(cur); l = by_uuid[cur]
+            if l.get("type") in ("user", "assistant"):
+                path.append(l)
+            cur = l.get("parentUuid")
+        path.reverse()
+        answered_on_path = set()
+        for l in path:
+            for b in (l.get("message") or {}).get("content") or []:
+                if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id"):
+                    answered_on_path.add(b["tool_use_id"])
+        for l in path:
+            for b in (l.get("message") or {}).get("content") or []:
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id") not in answered_on_path:
+                    probs.append((l.get("uuid", "?")[:8], f"unanswered tool_use {str(b.get('id'))[:14]} on active path"))
     return probs, roots
 
 

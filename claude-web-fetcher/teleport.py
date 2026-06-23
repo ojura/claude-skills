@@ -57,7 +57,15 @@ def cc_version(default="2.1.185"):
         return default
 
 def git_branch(home, default="main"):
-    head = os.path.join(home, ".git", "HEAD")
+    git = os.path.join(home, ".git")
+    if os.path.isfile(git):                              # worktree/submodule: .git is a "gitdir: <path>" pointer
+        try:
+            gd = open(git).read().split("gitdir:", 1)[1].strip()
+            head = os.path.join(gd if os.path.isabs(gd) else os.path.join(home, gd), "HEAD")
+        except Exception:
+            return default
+    else:
+        head = os.path.join(git, "HEAD")
     try:
         ref = open(head).read().strip()
     except Exception:
@@ -115,23 +123,33 @@ def fetch_images(client, org, uuids):
 # ---- filesystem hydration ----
 
 def hydrate_home(home_src, dest_home, force=False):
-    """Populate dest_home from a directory or a tarball. Idempotent via a completion sentinel:
-    a partial/interrupted copy is NOT mistaken for 'done' (only a fully-written run drops the
-    marker), so a re-run finishes it. Returns the file count under dest_home."""
+    """Populate dest_home from a directory or a tarball. The completion sentinel records the source
+    path, so a partial/interrupted copy is not mistaken for done AND re-running with a different
+    (e.g. more complete) home_src re-hydrates instead of silently skipping. home_src is untrusted
+    (sandbox-produced), so the dir branch keeps symlinks AS links and prunes any whose target
+    escapes the tree — the same guarantee filter='data' gives the tarball branch. Returns the file
+    count under dest_home."""
     os.makedirs(dest_home, exist_ok=True)
     sentinel = os.path.join(dest_home, ".teleport_hydrated")
-    if home_src and (force or not os.path.exists(sentinel)):
+    recorded = open(sentinel).read().strip() if os.path.exists(sentinel) else None
+    if home_src and (force or recorded != os.path.abspath(home_src)):
         if os.path.isdir(home_src):
             for name in os.listdir(home_src):
                 s, d = os.path.join(home_src, name), os.path.join(dest_home, name)
-                if os.path.isdir(s):
-                    if os.path.exists(d) and not os.path.isdir(d):
-                        os.remove(d)                     # dest holds a file where source has a dir
-                    shutil.copytree(s, d, dirs_exist_ok=True)
+                if os.path.lexists(d):
+                    (shutil.rmtree if os.path.isdir(d) and not os.path.islink(d) else os.remove)(d)
+                if os.path.islink(s):
+                    shutil.copy2(s, d, follow_symlinks=False)   # copy the link AS a link, don't deref
+                elif os.path.isdir(s):
+                    shutil.copytree(s, d, dirs_exist_ok=True, symlinks=True)   # symlinks=True: don't deref host files in
                 else:
-                    if os.path.isdir(d):
-                        shutil.rmtree(d)                 # dest holds a dir where source has a file
                     shutil.copy2(s, d)
+            droot = os.path.realpath(dest_home)           # prune symlinks whose target escapes the tree (untrusted source)
+            for r, dirs, files in os.walk(dest_home):
+                for n in dirs + files:
+                    p = os.path.join(r, n)
+                    if os.path.islink(p) and not (os.path.realpath(p) + os.sep).startswith(droot + os.sep):
+                        os.remove(p)
         elif tarfile.is_tarfile(home_src):
             with tarfile.open(home_src) as t:
                 # the home tarball is produced inside the untrusted sandbox; filter='data'

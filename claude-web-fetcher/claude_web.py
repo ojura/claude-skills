@@ -355,7 +355,9 @@ class ClaudeWeb:
             msg_uuid = msg.get("uuid", "")
 
             for f in msg.get("files", []):
-                if f.get("file_kind") in ("blob", "document"):
+                # live convos tag uploads file_kind in {blob,document}; export-shaped files[] omit
+                # file_kind entirely (just {file_uuid,file_name}) -> treat a kind-less entry as an upload
+                if f.get("file_kind") in ("blob", "document") or ("file_kind" not in f and f.get("file_uuid")):
                     fid = f.get("file_uuid") or f.get("uuid", "")
                     if ("upload", fid) in seen:
                         continue
