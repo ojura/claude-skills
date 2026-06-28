@@ -14,6 +14,17 @@ forwards and caches state across sessions. All host/user/secret details live in
 a gitignored `config.sh`; nothing machine-specific is committed. Pairs with
 `cdp-daemon` for driving your real logged-in browser remotely.
 
+
+### open-thinking
+
+Produce reasoning in the visible output channel instead of the hidden thinking
+block, so it persists in Claude's own context across turns and reaches the user
+unsummarized. Covers the dot-starve technique for the forced initial block,
+backtick-quoted stance markers, failure modes (execution-planning drops, dot
+ritualization, performative thinking), tool-call boundaries, and recovery. Seeded
+with real artifacts from the session where the technique was developed - including
+the DASH backronym, the Habsburg camel solicitor, and the Zagreb ATM ferrets.
+
 ### claude-html-pdf-polisher
 
 Renders HTML into magazine-quality PDFs with embedded fonts and deterministic,
