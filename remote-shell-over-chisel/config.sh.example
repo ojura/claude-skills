@@ -1,0 +1,44 @@
+# ---------------------------------------------------------------------------
+# remote-shell-over-chisel configuration
+#
+# Copy this file to `config.sh` and fill in your values:
+#     cp config.sh.example config.sh
+# `config.sh` is gitignored. It is sourced as plain shell by connect.sh, so you
+# can use $HOME and other expansions. See README.md for the full setup.
+# ---------------------------------------------------------------------------
+
+# HTTPS URL where your chisel SERVER is reachable. The sandbox egress only
+# passes valid HTTPS, so this MUST be an https:// URL fronted by a reverse proxy
+# (e.g. nginx) that forwards to a `chisel server --reverse` instance. The path
+# ("/chisel" here) is whatever your proxy maps to chisel.
+CHISEL_SERVER="https://your-host.example.com/chisel"
+
+# SSH user on the remote machine.
+REMOTE_USER="youruser"
+
+# Path to the SSH PRIVATE KEY authorized on the remote machine. KEEP THIS
+# OUTSIDE THE REPO. Generate a dedicated key for this (see README), don't reuse
+# a personal one.
+SSH_KEY="$HOME/.ssh/id_remote_shell"
+
+# Chisel shared secret (PSK) in `user:secret` form, matching the server's
+# `--auth`. Prefer pointing at a file outside the repo:
+CHISEL_TOKEN_FILE="$HOME/.config/chisel-remote/token"
+# ...or set it inline instead (less safe; ends up in this file):
+# CHISEL_TOKEN="user:secret"
+
+# Cosmetic: friendly name used in log lines, e.g. "[bigbox] tunnel up".
+REMOTE_NAME="remote"
+
+# Port forwards (defaults are fine for most setups).
+SSH_LOCAL_PORT=2222       # local port that maps to the remote's sshd
+SSH_REMOTE_PORT=22
+CDP_LOCAL_PORT=7799       # pairs with the cdp-daemon skill; set empty ("") to disable CDP forwarding
+CDP_REMOTE_PORT=7799
+
+# Where tunnel state lives (chisel binary cache, staged key copy, env file).
+# Put it on a persistent disk so it survives across sessions.
+STATE_DIR="$HOME/.chisel-remote"
+
+# Chisel version fetched if the binary isn't already cached in STATE_DIR.
+CHISEL_VERSION="1.10.1"

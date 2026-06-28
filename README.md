@@ -4,6 +4,16 @@ A collection of Claude Code skills.
 
 ## Skills
 
+### remote-shell-over-chisel
+
+Gives Claude a shell (and optional Chrome/CDP control) on a machine you own from
+a sandbox whose egress only allows HTTPS - the kind of TLS-MITM L7 proxy that
+rejects raw SSH on any port. Tunnels SSH and the cdp-daemon port inside an HTTPS
+WebSocket via chisel, with a self-healing connect script that detects stale
+forwards and caches state across sessions. All host/user/secret details live in
+a gitignored `config.sh`; nothing machine-specific is committed. Pairs with
+`cdp-daemon` for driving your real logged-in browser remotely.
+
 ### claude-html-pdf-polisher
 
 Renders HTML into magazine-quality PDFs with embedded fonts and deterministic,
