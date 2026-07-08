@@ -164,8 +164,13 @@ class ClaudeWeb:
 
     def _ensure_daemon(self, wait=60):
         """Return /status once the daemon is connected, auto-starting cdp_daemon.py
-        if it isn't running. The daemon self-manages the Chrome connection (and
-        auto-presses 'Allow remote debugging?' when accessibility is on)."""
+        if it isn't running and kicking a parked daemon back into a connect attempt.
+
+        The daemon parks itself (state 'failed') when a connect attempt expires
+        un-Allowed - e.g. after overnight socket drops with the screen locked.
+        One POST /reconnect revives it: the daemon's in-process presser presses
+        the Allow dialog as soon as AT-SPI can see Chrome, so this normally
+        completes hands-free within a few seconds."""
         import time, os, subprocess
         try:
             st = self._daemon("/status")
@@ -177,18 +182,27 @@ class ClaudeWeb:
                 subprocess.Popen(["python3", script], stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, start_new_session=True)
         deadline = time.time() + wait
-        st = None
+        st, kicked = None, False
         while time.time() < deadline:
             try:
                 st = self._daemon("/status")
                 if st.get("connected"):
                     return st
+                # Parked after a failed/expired attempt: kick ONE reconnect and let
+                # the daemon's presser handle the dialog. Never kick repeatedly -
+                # each kick is a fresh connect attempt (= potentially a dialog).
+                if not kicked and st.get("state") in ("failed", "disconnected", "no_chrome"):
+                    self._daemon("/reconnect", {})
+                    kicked = True
             except ConnectionError:
                 pass
             time.sleep(1)
+        state = st.get("state") if st else "?"
+        diag = (st or {}).get("diag") or ""
         raise RuntimeError(
-            "cdp-daemon started but not connected (state=%s). If Chrome is showing the "
-            "'Allow remote debugging?' dialog, click Allow once." % (st.get("state") if st else "?"))
+            f"cdp-daemon not connected after {wait}s (state={state}). {diag} "
+            "If the Allow dialog is visible in Chrome, clicking it completes the "
+            "still-held connect attempt - then just retry.")
 
     def _cdp_attach(self):
         import time

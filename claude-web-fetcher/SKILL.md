@@ -13,9 +13,11 @@ exports from claude.ai.
 - **`backend="cdp"` (default)** — drives the user's real, logged-in Chrome via the
   **cdp-daemon** (`127.0.0.1:7799`; see the cdp-daemon skill). No Cloudflare
   friction, no `session_key` needed. The daemon is **auto-started** if it isn't
-  running (`_ensure_daemon()`); it self-manages the Chrome connection and presses
-  Chrome's "Allow remote debugging?" dialog when renderer accessibility is on
-  (otherwise: one manual Allow click, once).
+  running, and a parked one (a connect attempt expired un-Allowed, e.g. after
+  overnight socket drops) is **auto-revived** with one `/reconnect` kick
+  (`_ensure_daemon()`). The daemon's in-process presser handles Chrome's "Allow
+  remote debugging?" dialog itself; a manual Allow click is only ever needed if
+  AT-SPI genuinely cannot see Chrome.
 - **`backend="patchright"`** — headless fallback that launches its own browser and
   needs a `session_key`. Cloudflare-prone (patchright currently flaky); use only if
   the real-Chrome path is unavailable.
