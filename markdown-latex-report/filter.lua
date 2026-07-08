@@ -11,10 +11,14 @@
 --
 --   (2) Rewrites every \texttt{...} cell content (and inline Code nodes
 --       in body prose, and \href{}{display} link text) to allow line
---       breaks at identifier boundaries: camelCase humps, ::, _, ., -, /,
---       before (/[/<, after )/]/>. Long all-alphabetic runs (>=14 chars)
---       get last-resort letter-by-letter break opportunities at a high
---       penalty.
+--       breaks at identifier boundaries: ::, ., /, camelCase humps,
+--       before (/[/<, after )/]/>, and within snake_case/kebab-case at
+--       _/-. These break points are RANKED by penalty (see the ladder at
+--       WORD_BREAK below) so the engine wraps at a "/" or a space in
+--       preference to splitting an identifier at "_", and only splits at
+--       "_" when the name does not fit whole on the next line. Long
+--       all-alphabetic runs (>=14 chars) get a last-resort
+--       letter-by-letter break at the highest penalty.
 --
 --   (3) Discourages line breaks inside bracketed units ((..), [..], <..>):
 --       LaTeX prefers the break-before-opener we already provide. Same
@@ -34,7 +38,15 @@ local function inline_text(inl)
   if t == "Str" then return inl.text or "" end
   if t == "Space" or t == "SoftBreak" or t == "LineBreak" then return " " end
   if t == "Code" then return inl.text or "" end
-  if t == "RawInline" then return inl.text or "" end
+  if t == "RawInline" then
+    -- Dash glyph macros (see Str below) are 1-glyph wide; counting their
+    -- macro-name characters would over-allocate range columns like "12-16".
+    local txt = inl.text or ""
+    txt = txt:gsub("\\textendash{}\\allowbreak{}", "-")
+             :gsub("\\textemdash{}\\allowbreak{}", "--")
+             :gsub("\\textendash{}", "-"):gsub("\\textemdash{}", "--")
+    return txt
+  end
   if inl.content then
     local s = ""
     for _, child in ipairs(inl.content) do s = s .. inline_text(child) end
@@ -63,8 +75,32 @@ local function blocks_text(blocks)
 end
 
 -- ----- helpers: insert break opportunities inside \texttt{} content -----
--- Long identifiers won't break to fit narrow columns by default; insert
--- \allowbreak{} at camelCase boundaries and after ::, _, ., -, /, (, <, >.
+-- Long identifiers won't break to fit narrow columns by default, so we
+-- insert break opportunities. The PENALTY of each opportunity encodes a
+-- readability hierarchy. This matters because the cells are \raggedright:
+-- with \rightskip=0pt plus 1fil every line has badness 0, so a break's
+-- penalty is the ONLY thing that ranks it above another. If every
+-- separator were \allowbreak (penalty 0) -- as they once were -- TeX sees
+-- a flat tie and just fills each line greedily, landing the break on
+-- whatever separator happens to sit nearest the line edge (typically an
+-- "_" mid-identifier). The ladder, lowest = most preferred:
+--
+--   penalty 0   (\allowbreak)  spaces*, "/", "::", ".", and before "(" "["
+--                              "<" / after ")" "]" ">": boundaries BETWEEN
+--                              distinct named units -- the cleanest wraps.
+--   penalty 250 (WORD_BREAK)   "_" and "-": a word separator WITHIN one
+--                              identifier. Above the structural tier so a
+--                              nearby space or "/" wins; an identifier is
+--                              split at "_" only when it does not fit whole
+--                              on the next line.
+--   penalty 300 (camelCase)    a hump with no visible separator -- a worse
+--                              wrap than a visible "_", so just above it.
+--   penalty 5000 (bracket sp)  a space inside a PROSE (..) (see
+--                              tie_bracket_spaces; a no-op for code, which
+--                              lives inside \texttt{}).
+--   penalty 9999 (LONG_RUN)    last-resort letter-by-letter split (below).
+-- (*real interword spaces are glue, not penalty nodes, but rank with 0.)
+local WORD_BREAK = "\\penalty 250 "
 
 -- Last-resort: insert a high-penalty break opportunity between letters
 -- in any alphabetic run of >=14 chars with no internal separator.
@@ -119,8 +155,11 @@ local function tt_insert_breaks(body)
     local c = body:sub(i, i)
     -- detect multi-char escapes that are atomic markers
     if c == "\\" and body:sub(i, i+1) == "\\_" then
+      -- Underscore: within-identifier word separator (snake_case). Break
+      -- AFTER it, at WORD_BREAK so a "/" or space is preferred and the
+      -- identifier stays whole when it fits on the next line.
       flush_run()
-      table.insert(out, "\\_\\allowbreak{}")
+      table.insert(out, "\\_" .. WORD_BREAK)
       i = i + 2
       prev_is_lower = false
     elseif body:sub(i, i+8) == "\\textless" then
@@ -168,8 +207,10 @@ local function tt_insert_breaks(body)
       table.insert(out, "::\\allowbreak{}")
       i = i + 2
       prev_is_lower = false
-    elseif c == "." or c == "-" or c == "/" then
-      -- Mid-text separators: break AFTER (separator stays on prev line).
+    elseif c == "." or c == "/" then
+      -- Structural separators (path "/", member/segment "."): break AFTER,
+      -- at penalty 0 -- they sit between distinct named units, so they are
+      -- the preferred place to wrap (above the WORD_BREAK "_"/"-" tier).
       flush_run()
       -- Exception: don't break after `.` when the trailing run looks like a
       -- file extension (1-5 alpha chars to end-of-string or non-alphanumeric).
@@ -192,6 +233,14 @@ local function tt_insert_breaks(body)
       else
         table.insert(out, c .. "\\allowbreak{}")
       end
+      i = i + 1
+      prev_is_lower = false
+    elseif c == "-" then
+      -- Hyphen: within-identifier word separator (kebab-case, CLI flags).
+      -- Break AFTER, at WORD_BREAK so "/" and spaces are preferred over
+      -- splitting a hyphenated name (e.g. keep "--pdf-engine" together).
+      flush_run()
+      table.insert(out, c .. WORD_BREAK)
       i = i + 1
       prev_is_lower = false
     elseif c == "(" or c == "[" then
@@ -321,7 +370,19 @@ local function add_breaks_to_latex(s)
         end
         if depth == 0 then
           local body = s:sub(j+1, k-2)
-          table.insert(result, "\\texttt{" .. tt_insert_breaks(body) .. "}")
+          -- Idempotency guard. pandoc visits an inline Code node inside a
+          -- table cell (handled by Code() -> a \texttt{} with breaks already
+          -- inserted) BEFORE the Table filter renders the cell and re-runs
+          -- this pass over the same \texttt{}. Without the guard the breaks
+          -- get inserted twice (doubled \penalty/\allowbreak nodes). If the
+          -- body already carries break markers, pass it through untouched;
+          -- otherwise insert them. This is also order-independent: whichever
+          -- pass reaches a still-unbroken body does the work.
+          if body:find("\\penalty", 1, true) or body:find("\\allowbreak", 1, true) then
+            table.insert(result, "\\texttt{" .. body .. "}")
+          else
+            table.insert(result, "\\texttt{" .. tt_insert_breaks(body) .. "}")
+          end
           i = k
         else
           table.insert(result, c)
@@ -471,6 +532,21 @@ local function compute_widths(header_cells, body_rows, n_cols)
       end
     end
   end
+  -- Inter-column glue budget. The p{...} widths above are normalized to sum
+  -- to TOTAL_WIDTH of \textwidth, but even with @{} killing the OUTER padding
+  -- each pair of adjacent columns still contributes 2*\tabcolsep (= 6pt at
+  -- header.tex's 3pt) of glue, so an n-column table was typeset at
+  -- TOTAL_WIDTH*\textwidth + (n-1)*6pt: a deterministic overfull once n >= 6
+  -- (7 columns: 11.79pt too wide). Rescale the column widths by the glue
+  -- share, expressed as a fraction of \textwidth (6pt / ~484pt text width at
+  -- header.tex's 0.9in letter margins; 0.0125 is marginally conservative so
+  -- narrower text widths still fit).
+  local COLSEP_FRAC = 0.0125
+  local glue = (n_cols - 1) * COLSEP_FRAC
+  if glue > 0 and glue < TOTAL_WIDTH then
+    local shrink = (TOTAL_WIDTH - glue) / TOTAL_WIDTH
+    for i = 1, n_cols do widths[i] = widths[i] * shrink end
+  end
   return widths
 end
 
@@ -585,6 +661,48 @@ function Table(t)
   table.insert(out, "\\end{longtable}")
   table.insert(out, "\\end{small}")
   return pandoc.RawBlock("latex", table.concat(out, "\n"))
+end
+
+-- ----- unicode dashes: ligature-independent glyph macros -----------------
+-- The LaTeX writer's `smart` extension (a WRITER default, active even when
+-- the reader parses with -smart) turns U+2013/U+2014 in body text into the
+-- TeX ligature sequences "--"/"---". The Makefile disables font ligatures
+-- (RawFeature=-tlig on main/sans), so those sequences rendered as literal
+-- hyphen runs -- every en/em dash in the document silently degraded. Emit
+-- \textendash{}/\textemdash{} instead: real dash glyphs regardless of
+-- ligature settings, in prose AND in table cells (this filter runs on cell
+-- content before the Table renderer stringifies it). A trailing \allowbreak
+-- restores TeX's native break-after-dash opportunity, which the bare macro
+-- would otherwise remove (e.g. inside "pp. 629--635"-style ranges).
+-- Metadata (title/subtitle) is not affected: pandoc renders template
+-- variables through a path that keeps the unicode characters, which the
+-- fonts cover natively.
+local EN_DASH = "\226\128\147"   -- U+2013 as UTF-8 bytes
+local EM_DASH = "\226\128\148"   -- U+2014
+function Str(el)
+  if not FORMAT:match("latex") then return nil end
+  local t = el.text
+  if not (t:find(EN_DASH, 1, true) or t:find(EM_DASH, 1, true)) then return nil end
+  local out = {}
+  local buf = {}
+  local i = 1
+  local n = #t
+  local function flush()
+    if #buf > 0 then out[#out+1] = pandoc.Str(table.concat(buf)); buf = {} end
+  end
+  while i <= n do
+    if t:sub(i, i + 2) == EN_DASH then
+      flush(); out[#out+1] = pandoc.RawInline("latex", "\\textendash{}\\allowbreak{}")
+      i = i + 3
+    elseif t:sub(i, i + 2) == EM_DASH then
+      flush(); out[#out+1] = pandoc.RawInline("latex", "\\textemdash{}\\allowbreak{}")
+      i = i + 3
+    else
+      buf[#buf+1] = t:sub(i, i); i = i + 1
+    end
+  end
+  flush()
+  return out
 end
 
 -- ----- inline Code, RawBlock, RawInline: apply the same break rules ----

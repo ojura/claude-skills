@@ -95,16 +95,28 @@
             allbordercolors={1 1 1}]{hyperref}
 
 % ---- Heading styles via plain \makeatletter overrides (no titlesec) ----
+% Orphaned-heading control: LaTeX's \@afterheading nobreak only protects the
+% heading from a break before a normal PARAGRAPH; blocks that open with their
+% own breakable glue (longtable's \LTpre, fancyvrb frames, [H] floats) let the
+% page break right after a heading, stranding it at the page bottom. needspace
+% (bundled locally, see Makefile) reserves room ahead of each heading: enough
+% for the heading itself plus what can follow it: a stacked subordinate
+% heading (deepest observed stack is 2) INCLUDING that child's own needspace
+% reserve (else the child's break orphans the parent), or a longtable's
+% caption+header+first-row chunk. Sized cascade-proof (12/9/6 baselines: each level covers its possible child's own reserve):
+% headings low on a page look poor even when technically non-orphaned, and
+% the only cost is a page occasionally ending a few lines early.
+\usepackage{needspace}
 \makeatletter
-\renewcommand\section{\@startsection{section}{1}{\z@}%
+\renewcommand\section{\needspace{12\baselineskip}\@startsection{section}{1}{\z@}%
   {-3.5ex plus -1ex minus -.2ex}%
   {2.0ex plus .2ex}%
   {\normalfont\Large\bfseries\color{accent}}}
-\renewcommand\subsection{\@startsection{subsection}{2}{\z@}%
+\renewcommand\subsection{\needspace{9\baselineskip}\@startsection{subsection}{2}{\z@}%
   {-2.5ex plus -1ex minus -.2ex}%
   {1.2ex plus .2ex}%
   {\normalfont\large\bfseries\color{accent}}}
-\renewcommand\subsubsection{\@startsection{subsubsection}{3}{\z@}%
+\renewcommand\subsubsection{\needspace{6\baselineskip}\@startsection{subsubsection}{3}{\z@}%
   {-2.0ex plus -.7ex minus -.2ex}%
   {.8ex plus .2ex}%
   {\normalfont\normalsize\bfseries\color{accent!75!black}}}
@@ -183,11 +195,14 @@
 
 % ---- Breakable \texttt for table cells ----
 % Long identifiers like applyCorrectionsPolarAndConvertToCartesian are
-% atomic tokens that won't break to fit narrow columns. Workaround: a
-% pandoc Lua filter (filter-codebreaks.lua) rewrites \texttt{...} content
-% to insert \allowbreak{} at separators (::, _, ., -, /, () and camelCase
-% boundaries. Identifiers without any natural break may still bleed a
-% few points; that's the cost of all-lowercase compound names.
+% atomic tokens that won't break to fit narrow columns. Workaround: the
+% pandoc Lua filter (filter.lua) rewrites \texttt{...} content to insert
+% break opportunities at separators (::, ., /, () and camelCase / _ / -
+% boundaries. These carry a RANKED penalty (see the ladder at WORD_BREAK
+% in filter.lua): "/" and spaces outrank a within-identifier "_", so a
+% path or compound name wraps at its segment boundary and stays whole on
+% the next line when it fits. Identifiers without any natural break may
+% still bleed a few points; that's the cost of all-lowercase compound names.
 
 % ---- Margins ----
 \usepackage[margin=0.9in,top=0.85in,bottom=1.0in]{geometry}
