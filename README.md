@@ -1,57 +1,43 @@
 # claude-skills
 
-A collection of Claude Code skills.
+Skills I built for Claude Code and use myself: tidy and recover your
+conversations, pull your own data out of Claude and ChatGPT, turn Markdown or HTML
+into print-quality PDFs, and drive your real browser or let Claude run admin
+commands on your machine, safely. Each one lives in its own folder with its own
+README.
 
-## Skills
+## Working with your conversations
 
-### claude-html-pdf-polisher
+### archive-conversation-forks
+Declutters your Claude Code conversation picker. It sorts a project's sessions
+into topics, keeps the fullest version of each, and archives the redundant forks,
+moved to `~/claude-archive`, never deleted. [Read more](archive-conversation-forks).
 
-Renders HTML into magazine-quality PDFs with embedded fonts and deterministic,
-print-correct layout. A fixed Playwright pipeline, strict font discipline (no
-silent substitution), timing instrumentation, and a layout-review checklist.
-Built through a cross-environment iteration between an OpenAI model, an
-Anthropic model, and the author. Especially useful for getting ChatGPT to
-iterate fast on non-trivial HTML renders: it pins the rendering engine and
-forces deterministic font embedding, so a one-line edit does not turn into an
-engine switch or a silent font substitution. See its SKILL.md and README for
-usage.
+### recover-deleted-sessions-ext4
+Gets back Claude Code conversations you have already lost, whether to an
+accidental delete or Claude Code's own automatic cleanup. It looks everywhere a
+trace might still survive, from the easy wins (a backup, the filesystem's journal)
+down to reading the raw disk when nothing else is left, then repairs and restores
+what it finds. Bundles the scripts from a real recovery that brought back 60 of 66
+sessions. [Read more](recover-deleted-sessions-ext4).
 
 ### claude-web-fetcher
-
-Fetches conversations, files, and Claude Code-web sessions from claude.ai
-using the session cookie. Solves Cloudflare transparently via patchright,
-captures feature-gating headers from the SPA, and provides a clean Python API
-for listing conversations, downloading file attachments, and reading Code-web
-session event streams. Only needs the sessionKey cookie.
-
-### cdp-daemon
-
-Drives an already-running Chrome over the DevTools Protocol from scripts without
-triggering a permission modal on every call. Holds one persistent CDP
-WebSocket, auto-presses Chrome's "Allow remote debugging?" dialog via AT-SPI,
-and exposes a small local HTTP API for targets, attach, eval, arbitrary CDP
-calls, and a buffered event stream. Useful for reading cookies, evaluating JS,
-navigating, or watching network traffic in the user's real logged-in browser.
+Pulls your own data off claude.ai with nothing but your session cookie:
+conversations, file attachments, and Claude-Code-web sessions. It clears the
+Cloudflare check for you. [Read more](claude-web-fetcher).
 
 ### chatgpt-archive-toolkit
+Backs up a logged-in ChatGPT account, conversations, branch variants, files and
+all, and comes with a dark, local reader so you can browse the whole archive
+offline. [Read more](chatgpt-archive-toolkit).
 
-Archives a logged-in ChatGPT account/workspace through `cdp-daemon`, preserving
-raw conversation JSON, branch variants, reasoning/tool metadata returned by the
-backend, file/media references, Library nodes, endpoint snapshots, and signed
-downloads. Installs a static dark local browser for reading conversations,
-collapsing noisy technical payloads, browsing files/artifacts/raw API captures,
-and validating archive coverage.
+## Turning documents into PDFs
 
 ### markdown-latex-report
-
-Turns a single Markdown file into a polished, book-quality PDF via pandoc and
-lualatex. A Lua filter auto-sizes table columns (wide tables never overflow) and
-breaks long identifiers in inline code; the preamble adds code listings that wrap
-long lines, a table of contents, running headers, and widow/orphan control.
-Bundles the needed LaTeX packages locally, so no full texlive install. Ships a
-self-contained test fixture that doubles as the smoke test.
-
-Sample pages from that fixture (full PDF: [`markdown-latex-report/docs/sample-report.pdf`](markdown-latex-report/docs/sample-report.pdf)):
+Turns a single Markdown file into a book-quality PDF with pandoc and lualatex.
+Wide tables size their own columns, long code lines wrap instead of running off
+the page, and you get a table of contents and running headers, with no full TeX
+install. [Read more](markdown-latex-report).
 
 <p align="center">
   <a href="markdown-latex-report/docs/sample-report.pdf"><img src="markdown-latex-report/docs/preview/01-title-toc.png" width="270" alt="title and contents"></a>
@@ -60,46 +46,33 @@ Sample pages from that fixture (full PDF: [`markdown-latex-report/docs/sample-re
 </p>
 <p align="center"><em>Title and contents &middot; code with line wrapping &middot; a generated chart with a column-sized table.<br>Click any page for the full PDF.</em></p>
 
-### archive-conversation-forks
+### claude-html-pdf-polisher
+Turns HTML into a magazine-quality PDF with the layout and fonts pinned, so the
+same input renders the same way every time and no font is silently swapped.
+Especially handy for getting ChatGPT to iterate on a tricky render without it
+switching the engine under you. [Read more](claude-html-pdf-polisher).
 
-Declutters the Claude Code session picker by grouping a project's session JSONLs
-into fork families, keeping the canonical (most complete) session per family, and
-moving redundant forks out to `~/claude-archive` with a restore manifest - moved,
-never deleted. Builds raw and prose distinct-content fingerprints to tell true
-forks from sessions that merely share tool-edits, protects every cross-file and
-phantom `logicalParentUuid` ancestor a kept session needs for scrollback, and
-archives only what is provably redundant or read-and-confirmed disposable (a
-single message is never dropped on count alone). Optionally titles retained
-sessions for a themed, chronological picker, mtime-neutrally so none are exposed
-to the mtime-keyed retention sweep.
+## Driving your browser and system
 
-### recover-deleted-sessions-ext4
-
-Recovers Claude Code session transcripts deleted by `rm`, `find -delete`, or a
-retention sweep. Volatility-ordered triage: stop writes to the affected
-filesystem, grab the volatile sources first (open fds, live `claude --resume`
-process memory, the webview renderer's in-memory session state over CDP), take
-the cheap byte-perfect wins (out-of-tree backups, the ext4 journal), then carve
-the raw block device by content pattern and recover the id-less records via ext4
-journal inode extents. Merges, dedupes, validates, repairs app-truncated
-survivors, and restores only on explicit OK. Bundles the proven (scrubbed)
-forensic scripts from a real 60/66-session recovery.
+### cdp-daemon
+Lets Claude, or any script, drive the real Chrome you already have open and logged
+in, so it can get things done on websites for you without a permission popup
+interrupting every step. Under the hood, it speaks Chrome's DevTools Protocol over
+one held-open connection, so you can also read cookies, run JavaScript, or watch
+network traffic. [Read more](cdp-daemon).
 
 ### sudo-listener
+Lets Claude run the commands on your machine that normally need an administrator
+password, without you handing over blanket access or leaving a password lying
+around, and with a log of everything it ran. For the technically minded, it is one
+dependency-free Python file: each request is signed and accepted only from your own
+machine, a safer alternative to passwordless (`NOPASSWD`) sudo.
+[Read more](sudo-listener).
 
-A self-contained, PSK-authenticated root command channel over loopback, in one Python file that
-is both server and client. The server runs as root, binds `127.0.0.1`, and for each request
-checks an HMAC-SHA256 signature made with a `0600` pre-shared key (auto-generated, never sent over
-the socket); it rejects replays by requiring each request's timestamp to be newer than the last
-one it ran, then runs the command as root and streams stdout, stderr, and the exit code back,
-logging every request and its output. A deliberate, auditable alternative to passwordless
-(`NOPASSWD`) sudo for letting a local non-root process or AI agent run controlled root commands;
-its safety rests on the key file's `0600` permissions plus the loopback-only bind. No dependencies.
+## Installing a skill
 
-## Installation
-
-Copy a skill directory into your Claude Code skills location, or install the
-packaged .skill from its release.
+Copy any skill's directory into your Claude Code skills folder
+(`~/.claude/skills/`), or install the packaged `.skill` from its release.
 
 ## License
 
