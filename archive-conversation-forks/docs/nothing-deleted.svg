@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 320" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <rect width="900" height="320" fill="#11111b"/>
+
+  <text x="40" y="40" fill="#cdd6f4" font-size="20" font-weight="bold">Archiving moves, never deletes</text>
+  <text x="40" y="64" fill="#6c7086" font-size="13">every redundant fork goes to the archive with a manifest that maps it back to where it came from</text>
+
+  <!-- LEFT: project dir -->
+  <rect x="40" y="90" width="300" height="150" rx="10" fill="#181825" stroke="#313244"/>
+  <text x="60" y="118" fill="#a6adc8" font-size="12">~/.claude/projects/your-project</text>
+  <rect x="60" y="132" width="260" height="26" rx="6" fill="#2a2616" stroke="#f9e2af"/><text x="74" y="150" fill="#f9e2af" font-size="12">✦ Auth bug fix</text>
+  <rect x="60" y="164" width="260" height="26" rx="6" fill="#2a2616" stroke="#f9e2af"/><text x="74" y="182" fill="#f9e2af" font-size="12">✦ Parser refactor</text>
+  <rect x="60" y="196" width="260" height="26" rx="6" fill="#181825" stroke="#89b4fa" stroke-dasharray="3 2"/><text x="74" y="214" fill="#a6adc8" font-size="12">↳ kept for scrollback</text>
+
+  <!-- ARROWS -->
+  <g font-size="12">
+    <path d="M348 138 h200" stroke="#89b4fa" stroke-width="2.5" fill="none"/>
+    <path d="M544 131 l12 7 l-12 7 z" fill="#89b4fa"/>
+    <text x="448" y="128" fill="#89b4fa" text-anchor="middle">move</text>
+
+    <path d="M548 196 h-200" stroke="#a6e3a1" stroke-width="2.5" fill="none" stroke-dasharray="6 4"/>
+    <path d="M352 189 l-12 7 l12 7 z" fill="#a6e3a1"/>
+    <text x="448" y="214" fill="#a6e3a1" text-anchor="middle">restore</text>
+    <text x="448" y="230" fill="#6c7086" font-size="10.5" text-anchor="middle">(manually, if needed)</text>
+  </g>
+
+  <!-- RIGHT: archive -->
+  <rect x="556" y="90" width="304" height="150" rx="10" fill="#181825" stroke="#313244"/>
+  <text x="576" y="118" fill="#a6adc8" font-size="12">~/claude-archive</text>
+  <rect x="576" y="132" width="264" height="20" rx="5" fill="#1e1e2e" stroke="#45475a"/><text x="588" y="146" fill="#7f849c" font-size="11">fix-auth · 312    parser · 289</text>
+  <rect x="576" y="156" width="264" height="20" rx="5" fill="#1e1e2e" stroke="#45475a"/><text x="588" y="170" fill="#7f849c" font-size="11">parser · 290     (untitled) · 47</text>
+  <rect x="576" y="180" width="264" height="20" rx="5" fill="#1e1e2e" stroke="#45475a"/><text x="588" y="194" fill="#7f849c" font-size="11">debris · 8 · 3 · 2</text>
+  <rect x="576" y="208" width="264" height="22" rx="5" fill="#1b2a1b" stroke="#a6e3a1"/><text x="588" y="223" fill="#a6e3a1" font-size="11">manifest.json restores every path</text>
+
+  <!-- GUARDS -->
+  <g font-size="12">
+    <rect x="40" y="266" width="400" height="34" rx="8" fill="#181825" stroke="#313244"/>
+    <text x="58" y="288" fill="#a6e3a1">●</text><text x="76" y="288" fill="#a6adc8">live sessions are read first, never touched</text>
+    <rect x="460" y="266" width="400" height="34" rx="8" fill="#181825" stroke="#313244"/>
+    <text x="478" y="288" fill="#a6e3a1">●</text><text x="496" y="288" fill="#a6adc8">your whole history is copied somewhere safe first</text>
+  </g>
+</svg>

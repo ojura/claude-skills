@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 446" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <rect width="900" height="446" fill="#11111b"/>
+
+  <text x="40" y="40" fill="#cdd6f4" font-size="20" font-weight="bold">Inside one topic</text>
+  <text x="40" y="64" fill="#6c7086" font-size="13">a family is everything about one topic: a main thread, the side branches off it, and the throwaways</text>
+  <text x="40" y="84" fill="#6c7086" font-size="13">what a branch uniquely adds decides whether it stays, and close calls are kept</text>
+
+  <!-- family box -->
+  <rect x="40" y="104" width="820" height="318" rx="12" fill="#181825" stroke="#313244"/>
+
+  <!-- rows: gold bar = kept, grey bar = moved. family shown the faithful way: the "auth:" colon label on each title -->
+  <g font-size="13">
+    <!-- main -->
+    <rect x="60" y="131" width="3" height="40" fill="#f9e2af"/>
+    <text x="76" y="149" fill="#f9e2af">[main]</text>
+    <text x="132" y="149" fill="#cdd6f4">auth: the widest thread on the login-token bug, fixed end to end</text>
+    <text x="76" y="165" fill="#6c7086" font-size="11.5">the conversation that contains all the others</text>
+    <text x="840" y="149" fill="#a6e3a1" font-size="12" text-anchor="end">kept</text>
+
+    <!-- fork -->
+    <rect x="60" y="187" width="3" height="40" fill="#f9e2af"/>
+    <text x="76" y="205" fill="#a6e3a1">[fork]</text>
+    <text x="130" y="205" fill="#cdd6f4">auth: a side investigation off the main thread</text>
+    <text x="76" y="221" fill="#6c7086" font-size="11.5">unique to it: the retry-race repro and the backoff tweak, worth keeping</text>
+    <text x="840" y="205" fill="#a6e3a1" font-size="12" text-anchor="end">kept</text>
+
+    <!-- duplicate (moved: no kept title) -->
+    <rect x="60" y="243" width="3" height="40" fill="#585b70"/>
+    <text x="76" y="261" fill="#7f849c">duplicate</text>
+    <text x="156" y="261" fill="#a6adc8">the same conversation, one screen shorter</text>
+    <text x="76" y="277" fill="#6c7086" font-size="11.5">nothing the main thread does not already have</text>
+    <text x="840" y="261" fill="#6c7086" font-size="12" text-anchor="end">archived</text>
+
+    <!-- scroll-dep -->
+    <rect x="60" y="299" width="3" height="40" fill="#f9e2af"/>
+    <text x="76" y="317" fill="#89b4fa">[scroll-dep]</text>
+    <text x="176" y="317" fill="#a6adc8">auth: the early scrollback the main thread needs</text>
+    <text x="76" y="333" fill="#6c7086" font-size="11.5">kept even though it is almost empty on its own</text>
+    <text x="840" y="317" fill="#a6e3a1" font-size="12" text-anchor="end">kept</text>
+
+    <!-- debris (moved: no kept title) -->
+    <rect x="60" y="355" width="3" height="40" fill="#585b70"/>
+    <text x="76" y="373" fill="#7f849c">debris</text>
+    <text x="136" y="373" fill="#a6adc8">a stray cd and an empty prompt</text>
+    <text x="76" y="389" fill="#6c7086" font-size="11.5">a throwaway session, no real content</text>
+    <text x="840" y="373" fill="#6c7086" font-size="12" text-anchor="end">archived</text>
+  </g>
+</svg>
