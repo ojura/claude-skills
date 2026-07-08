@@ -39,22 +39,29 @@ python3 cdp_daemon.py & disown
 curl 127.0.0.1:7799/status        # confirm connected
 ```
 
-On connect it spawns `clear_modals.py --wait`, which polls the AT-SPI tree for
-Chrome's Allow button(s) and presses every match (Chrome exposes two
-push-button nodes under the same alert; pressing only the first is unreliable).
+The Allow press runs **in-process**: one dedicated presser thread (all AT-SPI
+calls stay on it) imports `clear_modals` as a library and, for the whole of each
+connect attempt, polls the AT-SPI tree for Chrome's Allow button(s) and presses
+every match (Chrome exposes two push-button nodes under the same alert; pressing
+only the first is unreliable). Its findings — presses, "Chrome not visible via
+AT-SPI", "renderer accessibility looks OFF" — stream into the daemon log
+(`/status` `log_tail`) as live diagnostics; they are never an up-front reason to
+skip pressing, since AT-SPI visibility is transient and a one-shot health check
+proved unreliable.
 
 The daemon is long-lived: after editing `cdp_daemon.py`, restart it (`POST
 /shutdown`, or `pkill -f cdp_daemon.py`, then relaunch) - an already-running
 instance keeps executing the old code in memory.
 
-If Chrome renderer accessibility is OFF, the Allow dialog is invisible to AT-SPI
-and cannot be auto-pressed. In that case the daemon does **not** spam dialogs:
-each fresh CDP connection attempt pops its own Allow dialog, so instead of
-retrying on a timer it opens **one** connection and holds it (Chrome completes
-that exact pending request the instant you click Allow once), then goes idle.
-`POST /reconnect` to try again after enabling accessibility or clicking Allow;
-`POST /shutdown` to stop. `/shutdown` always terminates the process (it
-`os._exit`s from the HTTP thread), even while a connect is mid-flight.
+Every connect attempt opens **one** WebSocket upgrade and holds it for the whole
+budget (~150s): one pending upgrade = at most one Allow dialog, and Chrome
+completes that exact pending request the instant the dialog is pressed — by the
+presser or by a human click. The daemon never retries on a timer (that is what
+used to spam dialogs); an attempt that expires un-Allowed parks the daemon
+(state `failed`) until `POST /reconnect` re-arms it. `claude_web`'s
+`_ensure_daemon` sends that kick automatically, so a parked daemon self-heals on
+the next client call. `POST /shutdown` to stop; it always terminates the process
+(it `os._exit`s from the HTTP thread), even while a connect is mid-flight.
 
 ## HTTP API
 
@@ -190,10 +197,12 @@ hookable in-page boundary (it may travel via shared memory the page reads instea
 - `cdp_daemon.py` - the daemon. Hand-rolled WebSocket framing (no external WS
   library), single reader thread demultiplexing responses by id and buffering
   events, HTTP server for the API.
-- `clear_modals.py` - AT-SPI presser for Chrome's Allow dialog. Runnable
-  standalone: bare invocation does a single scan-and-press, `--wait` polls until
-  it presses at least one button or hits a 60s deadline. The daemon depends on
-  it living alongside; if you relocate it, update `PRESSER` in `cdp_daemon.py`.
+- `clear_modals.py` - AT-SPI presser library for Chrome's Allow dialog. The
+  daemon imports its `scan_and_press`/`chrome_accessibility_health` in-process
+  (it must live alongside; if you relocate it, update `PRESSER` in
+  `cdp_daemon.py`). Also runnable standalone for manual/debug use: bare
+  invocation does a single scan-and-press, `--wait` polls until it presses at
+  least one button or hits a 60s deadline.
 
 ## Notes
 

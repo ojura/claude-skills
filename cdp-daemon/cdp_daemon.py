@@ -29,16 +29,22 @@ Test:   curl 127.0.0.1:7799/status | jq
 
 Connection is self-complete and fails loudly: the HTTP API comes up FIRST, so
 /status is always answerable even while (re)connecting or after a failure. The
-connect path diagnoses *why* the auto-press can't click Chrome's "Allow remote
-debugging?" dialog (almost always: renderer accessibility is OFF, so the dialog
-is invisible to AT-SPI), tells the user exactly what to do, and keeps
-re-pressing + retrying so a manual Allow (or flipping on accessibility mid-wait)
-also lands. It never exits with a bare traceback.
+Allow press runs IN-PROCESS: one dedicated thread (all AT-SPI stays on it)
+imports clear_modals as a library and keeps scanning/pressing for the whole
+connect attempt, streaming its findings into this log. Accessibility health is
+a live diagnostic inside that loop - logged when it changes, never a reason to
+stop scanning (AT-SPI visibility is transient; a one-shot check must not latch
+the outcome). Each attempt holds exactly ONE WebSocket upgrade open for the
+whole budget - one pending upgrade = at most one Allow dialog (no spam) - and
+Chrome completes that same upgrade the instant the dialog is pressed, by the
+presser or by a human. A failed attempt parks the daemon (no timer retries)
+until POST /reconnect, which claude_web's _ensure_daemon sends automatically.
+It never exits with a bare traceback.
 
-Depends on clear_modals.py (alongside) for the AT-SPI Allow press + the
-accessibility self-check.
+clear_modals.py (alongside) stays a standalone CLI for manual/debug pressing;
+the daemon imports its scan_and_press / chrome_accessibility_health directly.
 """
-import socket, struct, json, sys, subprocess, secrets, threading, time, collections, os
+import socket, struct, json, sys, secrets, threading, time, collections, os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = "127.0.0.1"
@@ -94,17 +100,21 @@ autohooks = []                              # [{"urlSubstr": str, "script": str}
 autohook_lock = threading.Lock()
 autohooked = collections.deque(maxlen=80)   # recent {sid, url, result} for observability
 
-# Pre-built WebSocket upgrade request to Chrome's browser-level DevTools endpoint.
-WS_REQ = (
-    f"GET {PATH} HTTP/1.1\r\n"
-    "Host: localhost\r\n"
-    "User-Agent: curl/8.5.0\r\n"
-    "Accept: */*\r\n"
-    "Connection: Upgrade\r\n"
-    "Upgrade: websocket\r\n"
-    "Sec-WebSocket-Version: 13\r\n"
-    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
-).encode()
+def _ws_req():
+    """WebSocket upgrade request for Chrome's CURRENT browser-level endpoint.
+
+    Built per call (not at import) because connect_once re-reads
+    DevToolsActivePort on every attempt - Chrome rewrites port+path on restart."""
+    return (
+        f"GET {PATH} HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "User-Agent: curl/8.5.0\r\n"
+        "Accept: */*\r\n"
+        "Connection: Upgrade\r\n"
+        "Upgrade: websocket\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    ).encode()
 
 
 def log(msg):
@@ -124,24 +134,54 @@ def set_state(state, diag=""):
 
 
 # === Connect + Allow flow ===
-def press_allow_once():
-    """Spawn the AT-SPI presser (clear_modals.py --wait). Returns the Popen."""
-    return subprocess.Popen(["/usr/bin/python3", PRESSER, "--wait"],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+# In-process presser: ONE dedicated thread owns every AT-SPI call for the
+# daemon's lifetime (clear_modals imported as a library, not subprocessed, so
+# its findings land in this log). It parks on press_wanted between connect
+# attempts; while armed it scans/presses Chrome's Allow/Restore dialogs and
+# logs its diagnosis on change. Accessibility health is a live diagnostic
+# INSIDE the loop - never an up-front reason to skip pressing, because AT-SPI
+# visibility is transient (a one-shot check used to latch "not visible" here
+# and disable auto-press for the whole attempt).
+press_wanted = threading.Event()
+presser_beat = [0.0]   # wall time of the presser's last live lap (hang detection)
 
 
-def accessibility_health():
-    """(chrome_found, renderer_a11y) via clear_modals, or (None, None) if unavailable.
-
-    Lets the daemon explain *why* the auto-press will fail up front instead of
-    silently waiting out a timeout."""
+def presser_main():
     try:
         sys.path.insert(0, os.path.dirname(PRESSER))
         import clear_modals
-        return clear_modals.chrome_accessibility_health()
     except Exception as e:
-        log(f"(accessibility self-check unavailable: {e})")
-        return (None, None)
+        log(f"presser: AT-SPI unavailable ({type(e).__name__}: {e}) - auto-press disabled; "
+            "click Allow manually when the dialog appears")
+        return
+    last_diag, laps = None, 0
+    while True:
+        if not press_wanted.is_set():
+            last_diag, laps = None, 0
+            press_wanted.wait()
+        presser_beat[0] = time.time()
+        try:
+            n = clear_modals.scan_and_press()
+            if n:
+                log(f"presser: pressed {n} button(s)")
+                time.sleep(0.5)   # brief lap gap; loop again for straggler dialogs
+                continue
+            if laps % 10 == 0:    # diagnose every ~5s, log only when the diagnosis changes
+                found, renderer = clear_modals.chrome_accessibility_health()
+                diag = ("watching for the Allow dialog" if (found and renderer) else
+                        "Chrome not visible via AT-SPI right now (locked screen / a11y "
+                        "bridge asleep?) - still scanning; a manual Allow also lands"
+                        if not found else
+                        "Chrome renderer accessibility looks OFF - the dialog may be "
+                        "invisible to AT-SPI; enable chrome://accessibility or click "
+                        "Allow manually")
+                if diag != last_diag:
+                    log("presser: " + diag)
+                    last_diag = diag
+        except Exception as e:
+            log(f"presser: {type(e).__name__}: {e}")
+        laps += 1
+        time.sleep(0.5)
 
 
 def ws_upgrade(timeout):
@@ -160,7 +200,7 @@ def ws_upgrade(timeout):
         return ("noport", str(e))
     s.settimeout(timeout)
     try:
-        s.sendall(WS_REQ)
+        s.sendall(_ws_req())
         buf = b""
         while b"\r\n\r\n" not in buf:
             ch = s.recv(4096)
@@ -183,67 +223,26 @@ def ws_upgrade(timeout):
 
 
 def connect_once(budget=150):
-    """Drive the connect + Allow flow to completion. Returns True if connected.
+    """Drive one connect attempt to completion. Returns True if connected.
 
-    Self-complete: diagnoses an auto-press failure up front, keeps re-pressing and
-    retrying so a *manual* Allow (or enabling accessibility mid-wait) also lands,
-    and on giving up records a clear reason in /status instead of crashing."""
-    global cdp_sock, cdp_leftover
+    Exactly ONE WebSocket upgrade is held open for the whole budget: one
+    pending upgrade = at most one Allow dialog (the anti-spam mechanism), and
+    Chrome completes that same upgrade the instant the dialog is pressed -
+    whether by the in-process presser (armed for the duration) or a human
+    click. No branching on a health snapshot: the presser scans regardless
+    and reports what it actually sees through the log."""
+    global cdp_sock, cdp_leftover, PORT, PATH
+    PORT, PATH = _discover_endpoint()   # re-read: Chrome rewrites these on restart
     set_state("connecting", "opening CDP...")
-    found, renderer = accessibility_health()
-    auto = bool(renderer) and found is not False
-
-    if auto:
-        # Accessibility is on: the presser clicks Chrome's Allow dialog within ~1-2s,
-        # so short connect retries pop at most a dialog or two before it lands.
-        presser = press_allow_once()
-        log(f"presser pid={presser.pid}; accessibility OK - auto-pressing Allow.")
-        set_state("waiting_for_allow", "auto-pressing Chrome's 'Allow remote debugging?' dialog...")
-        deadline = time.time() + budget
-        next_press = time.time() + 8
-        while time.time() < deadline:
-            if time.time() >= next_press:
-                if presser.poll() is not None:
-                    presser = press_allow_once()
-                next_press = time.time() + 8
-            kind, *rest = ws_upgrade(timeout=min(15, max(2, deadline - time.time())))
-            if kind == "ok":
-                sock, leftover = rest
-                sock.settimeout(None)
-                cdp_sock, cdp_leftover = sock, leftover
-                try:
-                    out, _ = presser.communicate(timeout=1)
-                    if out: log(f"presser: {out.strip()[:200]}")
-                except Exception:
-                    try: presser.terminate()
-                    except Exception: pass
-                set_state("connected", "CDP connected.")
-                return True
-            if kind == "noport":
-                set_state("no_chrome",
-                          f"ALERT: cannot reach Chrome DevTools at {HOST}:{PORT} ({rest[0]}). "
-                          f"Enable remote debugging in the already-running Chrome via its 'Allow remote debugging?' prompt; --remote-debugging-port does not work for the default/main user profile.")
-                try: presser.terminate()
-                except Exception: pass
-                return False
-            time.sleep(2)
-        try: presser.terminate()
-        except Exception: pass
-        set_state("failed",
-                  "ALERT: gave up after %ds - auto-press did not land the Allow. "
-                  "POST /reconnect to retry." % budget)
-        return False
-
-    # No auto-press (renderer accessibility OFF, or Chrome not visible to AT-SPI).
-    # Avoid dialog spam: open exactly ONE connection and HOLD it. Chrome completes
-    # this same pending request the instant the user clicks Allow, so no repeated
-    # dialogs appear; if the user never clicks, we time out once and go idle.
-    why = "Chrome is not visible via AT-SPI" if found is False else "Chrome renderer accessibility is OFF"
     set_state("waiting_for_allow",
-              "ACTION REQUIRED: click Allow ONCE in Chrome's 'Allow remote debugging?' dialog "
-              "(auto-press unavailable: %s). A single connection is held open waiting for your "
-              "click - the daemon will NOT pop repeated dialogs. To stop waiting: POST /shutdown." % why)
-    kind, *rest = ws_upgrade(timeout=max(5, budget))   # one long-held attempt = one dialog
+              f"holding ONE CDP upgrade open (= at most one Allow dialog) for up to {budget}s; "
+              "the in-process presser is scanning for the dialog, and a manual Allow click "
+              "lands on this same upgrade. Presser diagnostics stream into the log.")
+    press_wanted.set()
+    try:
+        kind, *rest = ws_upgrade(timeout=max(5, budget))   # one held attempt = one dialog
+    finally:
+        press_wanted.clear()
     if kind == "ok":
         sock, leftover = rest
         sock.settimeout(None)
@@ -255,10 +254,12 @@ def connect_once(budget=150):
                   f"ALERT: cannot reach Chrome DevTools at {HOST}:{PORT} ({rest[0]}). "
                   f"Enable remote debugging in the already-running Chrome via its 'Allow remote debugging?' prompt; --remote-debugging-port does not work for the default/main user profile.")
         return False
+    hung = (" NOTE: the presser thread looks inactive (AT-SPI hang?) - see log."
+            if time.time() - presser_beat[0] > min(60, budget) else "")
     set_state("failed",
-              "Remote debugging was not allowed (%s). Click Allow in Chrome, then POST /reconnect. "
-              "The daemon is now idle and will not pop further dialogs until you do."
-              % (rest[0] if rest else kind))
+              f"Remote debugging was not allowed ({rest[0] if rest else kind}).{hung} "
+              "POST /reconnect to retry (claude_web's _ensure_daemon does this automatically); "
+              "the presser re-arms on retry, and a manual Allow also lands.")
     return False
 
 
@@ -270,6 +271,10 @@ def connection_manager():
     Allow later self-heals without a restart."""
     while True:
         if connect_once():
+            # A /reconnect kick issued before or during this attempt is satisfied
+            # by it - clearing here stops a stale flag from tearing down the fresh
+            # socket and popping a surplus Allow dialog.
+            reconnect_now.clear()
             disconnected.clear()
             threading.Thread(target=reader_thread, daemon=True).start()
             # Block until the socket drops or a manual /reconnect is requested.
@@ -563,5 +568,7 @@ if __name__ == "__main__":
         target=lambda: ThreadingHTTPServer(("127.0.0.1", DAEMON_PORT), Handler).serve_forever(),
         daemon=True).start()
     log(f"HTTP API on http://127.0.0.1:{DAEMON_PORT}")
+    # In-process presser: parks between connect attempts, armed by connect_once.
+    threading.Thread(target=presser_main, daemon=True).start()
     # Connection manager owns the single CDP socket and reconnects on drop.
     connection_manager()

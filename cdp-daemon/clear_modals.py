@@ -16,7 +16,10 @@ EVERY match. Pressing only the first is unreliable.
 Usage:
   clear_modals.py           single-shot scan (exits 0 immediately)
   clear_modals.py --wait    poll until at least one button is pressed
-                            (or 60s deadline). Use this from the daemon.
+                            (or 60s deadline)
+The daemon no longer subprocesses this; it imports scan_and_press /
+chrome_accessibility_health directly (in-process presser thread). The CLI
+remains for manual/debug use.
 """
 import sys, time
 import gi

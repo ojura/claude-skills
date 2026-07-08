@@ -17,7 +17,8 @@ local HTTP API. One modal, then silence.
 
 - Holds one long-lived CDP WebSocket to Chrome, at the endpoint auto-discovered
   from Chrome's `DevToolsActivePort` file (host/port not hardcoded).
-- Auto-presses the Allow dialog via AT-SPI on connect (`clear_modals.py`).
+- Auto-presses the Allow dialog via AT-SPI on connect (in-process presser
+  thread; `clear_modals.py` imported as a library, findings in the daemon log).
 - Exposes `127.0.0.1:7799` with endpoints for `getTargets`, `attachToTarget`,
   `Runtime.evaluate`, arbitrary CDP methods, a rolling event buffer, and status.
 - Demultiplexes responses by request id and buffers all id-less CDP events
@@ -49,8 +50,9 @@ does NOT work for Chrome's default/main user profile; enable debugging via
 
 - `cdp_daemon.py` - the daemon (hand-rolled WebSocket framing, reader thread,
   HTTP API). No third-party dependencies.
-- `clear_modals.py` - AT-SPI presser for Chrome's Allow dialog. Needs
-  `python3-gi` with the Atspi bindings. Also runnable standalone.
+- `clear_modals.py` - AT-SPI presser library for Chrome's Allow dialog (the
+  daemon imports it in-process). Needs `python3-gi` with the Atspi bindings.
+  Also runnable standalone.
 
 ## Scope
 
