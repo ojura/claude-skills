@@ -1,0 +1,14 @@
+# Local config holds your server URL and secret paths. Never commit it.
+config.sh
+
+# Never commit keys or tokens if you stage them inside the skill dir.
+*.pem
+*.key
+id_*
+!id_*.pub
+token
+secrets/
+
+# Runtime state, if STATE_DIR is ever pointed inside the repo.
+.chisel-remote/
+*.log
