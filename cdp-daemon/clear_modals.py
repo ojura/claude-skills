@@ -24,7 +24,24 @@ remains for manual/debug use.
 import sys, time
 import gi
 gi.require_version('Atspi', '2.0')
-from gi.repository import Atspi
+from gi.repository import Atspi, GLib
+
+
+def _pump_glib(seconds=0.2):
+    """Drain pending GLib main-context events so libatspi processes its
+    D-Bus cache/registry signals (app register/deregister, children-changed).
+
+    The daemon's presser thread only polls scan_and_press() on a sleep loop
+    and never runs a GLib main loop, so without this the thread's AT-SPI cache
+    goes stale: after Chrome relaunches, the cached desktop still points at the
+    dead Chrome app object and no live Allow dialog is ever found. Pumping the
+    thread's default context (Atspi is implicitly init'd on this thread by the
+    first get_desktop call) keeps the desktop view current. Bounded by
+    `seconds` so a signal storm can't wedge the scan."""
+    ctx = GLib.MainContext.default()
+    end = time.time() + seconds
+    while time.time() < end and ctx.pending():
+        ctx.iteration(False)
 
 # Modal buttons we press. "Allow" clears the remote-debugging consent dialog
 # that pops on every fresh CDP WebSocket; "Restore" clears Chrome's crash
@@ -63,6 +80,7 @@ def press_button(btn):
 
 def scan_and_press():
     """Scan AT-SPI desktop for Chrome's Allow/Restore buttons; press all found."""
+    _pump_glib()
     desk = Atspi.get_desktop(0)
     pressed = 0
     for i in range(desk.get_child_count()):
@@ -98,6 +116,7 @@ def chrome_accessibility_health():
     RENDERER_ROLES = {'document web', 'document frame', 'document',
                       'web view', 'heading', 'paragraph', 'link',
                       'text container'}
+    _pump_glib()
     desk = Atspi.get_desktop(0)
     found = False
     has_renderer = False
