@@ -24,9 +24,9 @@ so the order of operations is the whole game.
 are forensic one-offs, not a turnkey CLI: read the matching step in `SKILL.md`, set the config,
 then run.
 
-## The rule that matters most
+## Never write to the affected filesystem
 
-Never write to the affected filesystem - not scratch, not dumps, not the recovered output. Use
+Not scratch, not dumps, not the recovered output. Use
 `/dev/shm` or a separate disk, and dump the volatile sources (process memory, webview) before the
 long disk carve, not after.
 

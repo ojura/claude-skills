@@ -35,7 +35,7 @@ nothing new is redundant and is archived. Close calls are kept. The
 whole decision leans non-destructive, so a borderline conversation stays in your
 list rather than being archived on a guess.
 
-## A label on everything you keep
+## What the tags mean
 
 Each conversation that stays gets a tag at the front of its title, so the picker
 tells you what each one is at a glance:
@@ -55,7 +55,7 @@ plain title that says what the conversation was for. A real one reads like this:
 > Unique to this fork: the jitter-calculation discussion and the TTL-expiry bug
 > fix, both now in client.go.
 
-## It won't break another conversation's history
+## Sessions another conversation needs
 
 A short, old, forgettable-looking session is sometimes the hidden start of a
 longer one: Claude Code stitches a conversation's earlier scrollback together
@@ -65,7 +65,7 @@ way, keeps it, and tags it `[scroll-dep]`, so you can see why a near-empty
 conversation is still in the list. (That is the indented entry in the pictures:
 it looks droppable, but a kept conversation needs it.)
 
-## Archiving moves, never deletes
+## Archiving moves files to ~/claude-archive
 
 ![Archived sessions move to ~/claude-archive with a manifest that restores any of them to where it came from.](docs/nothing-deleted.svg)
 
@@ -76,12 +76,11 @@ right now are read first and never touched. And before anything is archived, the
 skill makes a full copy of your conversation history somewhere safe, so even an
 unrelated mistake is recoverable.
 
-## The safety is formally proved
+## Machine-checked safety proofs
 
-The two promises that matter most, that a kept conversation never loses its
-history and that no message is ever dropped, are backed by machine-checked proofs
-in [`proofs/`](proofs/), written in Lean with a clean audit (no shortcuts, no
-unproven steps). The same logic also runs as a small [Python model](model/) you
+Two properties are proved rather than tested: a kept conversation never loses its
+history, and no message is ever dropped. The proofs are in [`proofs/`](proofs/),
+written in Lean with a clean audit (no shortcuts, no unproven steps). The same logic also runs as a small [Python model](model/) you
 can read and step through.
 
 ## Readable titles
