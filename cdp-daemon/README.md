@@ -11,7 +11,7 @@ CDP call, you get a fresh modal every time, which makes scripted automation
 against a real logged-in browser unusable. This daemon connects to Chrome
 exactly once, auto-presses Allow through the accessibility tree, and then serves
 all further CDP calls over that single persistent connection through a small
-local HTTP API. One modal, then silence.
+local HTTP API.
 
 ## What it does
 
