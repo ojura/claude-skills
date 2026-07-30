@@ -1237,6 +1237,29 @@ def flatten_cwd(cwd):
 
 
 
+def enter_agent_cwd(ctx, prefix=""):
+    """Move this process into the agent's directory before exec, and say so.
+
+    Every path that execs rather than spawning a pane comes through here: the
+    lead taking the foreground, and a member run in the pane you are already
+    standing in. The pane paths carry the same answer as tmux's -c, so
+    agent_cwd() decides the directory once and only the mechanism differs.
+
+    Unifying it is what keeps the two from drifting: they had different answers
+    to entering failing, to announcing the move, and to there being no recorded
+    directory at all, none of which is a property of the mechanism.
+    """
+    where = agent_cwd(ctx)
+    if not where or os.path.realpath(where) == os.path.realpath(os.getcwd()):
+        return where
+    print(f"{prefix}cd       {where}")
+    try:
+        os.chdir(where)
+    except OSError as exc:
+        die(f"cannot enter {where}: {exc}")
+    return where
+
+
 def agent_cwd(ctx):
     """Working dir for the revived process, or None. Never a guess.
 
@@ -1268,8 +1291,9 @@ def agent_cwd(ctx):
         return candidates[-1]
     fallback = merged.pick("cwd")[0]
     if not fallback:
-        warn("no cwd recorded in roster or transcript; launching without -c "
-             "(the pane inherits the tmux server's cwd, which may break --resume lookup)")
+        warn("no cwd recorded in roster or transcript; the agent starts in whatever "
+             "directory it inherits, and --resume looks a transcript up under the project "
+             "dir of that directory, so it may not find its own conversation")
     return fallback or None
 
 
@@ -2626,10 +2650,15 @@ def run_one(args, passthrough, table, prefix=""):
         if owner and owner[2] and not args.force:
             warn(f"already live as pid {owner[0]}{state_note(owner[0])}; pass --force to run a second copy")
             return "noop", None
-        # Only now: the masquerade reads the roster on boot, so the team dir has to
-        # exist before the exec, and a lead whose team was reaped is the ordinary
-        # case here rather than an edge one. Forging above this guard meant a run
-        # that then declined to launch had already written a team dir.
+        # Check what we are about to become before writing anything. Forging first
+        # and discovering the binary is unusable second leaves a team dir behind for
+        # a run that never launched, which is the same mutation-on-a-run-that-does-
+        # not-happen the guard above prevents.
+        if not args.dry_run and not shutil.which(command[0]):
+            die(f"cannot exec {command[0]}: not found or not executable")
+        # The masquerade reads the roster on boot, so the team dir has to exist
+        # before the exec, and a lead whose team was reaped is the ordinary case
+        # here rather than an edge one.
         forge_team(ctx, args.dry_run)
         # The lead runs last, after every member is already in its pane, so there is
         # nothing left for this process to stay alive for. A lead is an interactive
@@ -2638,15 +2667,15 @@ def run_one(args, passthrough, table, prefix=""):
         # own conversation, since --resume looks the transcript up under the project
         # dir of wherever it starts.
         if sys.stdout.isatty() and not args.dry_run:
-            where = agent_cwd(ctx)
-            if where and os.path.realpath(where) != os.path.realpath(os.getcwd()):
-                print(f"{prefix}cd       {where}")
-                try:
-                    os.chdir(where)
-                except OSError as exc:
-                    die(f"cannot enter {where}: {exc}")
+            enter_agent_cwd(ctx, prefix)
             print(f"{prefix}exec     taking over this terminal")
-            os.execvp(command[0], command)
+            try:
+                os.execvp(command[0], command)
+            except OSError as exc:
+                # exec either replaces this process or does not happen, so reaching
+                # here means the lead never started; say so rather than unwinding a
+                # traceback through a tool that has already moved the cwd.
+                die(f"cannot exec {command[0]}: {exc}")
         print(f"{prefix}run this in your terminal (leads are not spawned into tmux):")
         print(f"{prefix}  {' '.join(shlex.quote(c) for c in command)}")
         return "manual", None
@@ -2781,11 +2810,7 @@ def run_one(args, passthrough, table, prefix=""):
             environ.update(dict(pair.split("=", 1) for pair in TEAM_ENV))
             if not args.no_color:
                 tint_pane(socket, in_pane, merged.pick("color")[0], merged.pick("agentName")[0], False)
-            if cwd:
-                try:
-                    os.chdir(cwd)
-                except OSError as exc:
-                    die(f"cannot enter {cwd}: {exc}")
+            enter_agent_cwd(ctx, prefix)
             try:
                 os.execvpe(command[0], command, environ)
             except OSError as exc:
@@ -3392,7 +3417,7 @@ def team_socket(data, args, table):
     return None, "unresolved"
 
 
-def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
+def run_agents(args, passthrough, table, jobs, socket=None, prefix="", includes_lead=False):
     """Run each prepared invocation, then finish the run once.
 
     A single agent is a team of one, and both entry points come through here so
@@ -3419,10 +3444,13 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
         print("\nsummary")
         for label, status in results:
             print(f"  {label:<24} {status}")
-    if any(status == "manual" for _, status in results):
-        # The lead is the foreground of this run: either we became it, or we could
-        # not and printed its command. Either way the thing to look at is the lead,
-        # not the swarm, so attaching would put the wrong window in front of you.
+    if includes_lead:
+        # A run that includes the lead ends at the lead: either this process became
+        # it, or it was already up, or we printed its command. In every one of those
+        # the thing to look at is the lead, so attaching would put the swarm in front
+        # of you instead. Keyed on the lead being in the run rather than on how it
+        # turned out, because "already live" is the case that most looks like a
+        # reason to attach and is not one.
         return 1 if any(s == "failed" for _, s in results) else 0
     if not args.dry_run and socket and any(s in ("launched", "noop") for _, s in results):
         print()
@@ -3466,7 +3494,9 @@ def run_team(args, passthrough, table):
         one.socket_reason = "team socket" if not args.socket else "--socket"
         one.in_team = True  # never exec the lead mid-loop; the members need us alive
         jobs.append((name, one))
-    return run_agents(args, passthrough, table, jobs, socket=socket, prefix="  ")
+    return run_agents(args, passthrough, table, jobs, socket=socket, prefix="  ",
+                      includes_lead=any(m.get("agentId") == lead_id for m in ordered
+                                        if not (args.no_lead and m.get("agentId") == lead_id)))
 
 
 def set_tmux_target(session, window):
