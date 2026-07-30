@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 400" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <rect width="900" height="400" fill="#11111b"/>
+  <text x="44" y="46" fill="#cdd6f4" font-size="20" font-weight="bold">The status line</text>
+  <text x="44" y="70" fill="#6c7086" font-size="14">The line shows the model, context window, cache, session cost, and both usage windows.</text>
+  <rect x="40" y="140" width="820" height="96" rx="10" fill="#181825" stroke="#313244" stroke-width="1"/>
+  <text x="60" y="182" font-size="12.5" xml:space="preserve"><tspan fill="#cdd6f4">Fable 5</tspan><tspan fill="#6c7086">  ·  </tspan><tspan fill="#cdd6f4">effort:max</tspan><tspan fill="#6c7086">  ·  </tspan><tspan fill="#cdd6f4">ctx </tspan><tspan fill="#cedba5">████</tspan><tspan fill="#45475a">░░░░░░</tspan><tspan fill="#cdd6f4"> 39%</tspan><tspan fill="#6c7086">  ·  </tspan><tspan fill="#cdd6f4">cache </tspan><tspan fill="#6c7086">1h </tspan><tspan fill="#2e9afc">█████████</tspan><tspan fill="#45475a">░</tspan><tspan fill="#cdd6f4"> 92%</tspan><tspan fill="#6c7086"> → 03:41 (57:12)</tspan></text>
+  <text x="60" y="220" font-size="12.5" xml:space="preserve"><tspan fill="#cdd6f4">recached </tspan><tspan fill="#2e9afc">0.08x</tspan><tspan fill="#6c7086">  ·  </tspan><tspan fill="#cdd6f4">$12.40</tspan><tspan fill="#6c7086">  ·  </tspan><tspan fill="#cdd6f4">5h </tspan><tspan fill="#88b8df">██</tspan><tspan fill="#45475a">░░░░░░░░</tspan><tspan fill="#cdd6f4"> 23%</tspan><tspan fill="#6c7086"> → 10:43 (4:59:58)</tspan><tspan fill="#6c7086">  ·  </tspan><tspan fill="#cdd6f4">7d </tspan><tspan fill="#d7de9b">████</tspan><tspan fill="#45475a">░░░░░░</tspan><tspan fill="#cdd6f4"> 41%</tspan><tspan fill="#6c7086"> → pet 31.7. 12:00</tspan></text>
+  <path d="M594.275 170 V146 H210 V122" stroke="#45475a" stroke-width="1" fill="none"/>
+  <circle cx="594.275" cy="170" r="2" fill="#45475a"/>
+  <text x="60" y="116" fill="#a6adc8" font-size="13" text-anchor="start">how much of this conversation is still cached</text>
+  <path d="M669.525 170 V146 H700 V122" stroke="#45475a" stroke-width="1" fill="none"/>
+  <circle cx="669.525" cy="170" r="2" fill="#45475a"/>
+  <text x="856" y="116" fill="#a6adc8" font-size="13" text-anchor="end">when it expires, and how long is left</text>
+  <path d="M146.537 228 V265 H120 V302" stroke="#45475a" stroke-width="1" fill="none"/>
+  <circle cx="146.537" cy="228" r="2" fill="#45475a"/>
+  <text x="60" y="320" fill="#a6adc8" font-size="13" text-anchor="start">how many times over it has been re-cached</text>
+  <path d="M481.4 228 V245 H631.9 V262" stroke="#45475a" stroke-width="1" fill="none"/>
+  <circle cx="481.4" cy="228" r="2" fill="#45475a"/>
+  <text x="631.9" y="280" fill="#a6adc8" font-size="13" text-anchor="middle">when each usage window renews</text>
+  <path d="M782.4 228 V245 H631.9 V262" stroke="#45475a" stroke-width="1" fill="none"/>
+  <circle cx="782.4" cy="228" r="2" fill="#45475a"/>
+  <text x="60" y="378" fill="#6c7086" font-size="13">The countdowns update once a second.</text>
+  </svg>

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 348" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <rect width="900" height="348" fill="#11111b"/>
+  <text x="44" y="46" fill="#cdd6f4" font-size="20" font-weight="bold">A cache miss in the middle of a session</text>
+  <text x="44" y="70" fill="#6c7086" font-size="14">These two renders are consecutive, one ordinary batch of tool calls apart.</text>
+  <rect x="40" y="96" width="820" height="44" rx="8" fill="#181825" stroke="#313244" stroke-width="1"/>
+  <text x="70" y="122" font-size="13" xml:space="preserve"><tspan fill="#cdd6f4">cache </tspan><tspan fill="#6c7086">1h </tspan><tspan fill="#0096ff">██████████</tspan><tspan fill="#45475a"></tspan><tspan fill="#cdd6f4"> 100%</tspan><tspan fill="#6c7086"> → 03:41 (59:12)</tspan><tspan fill="#6c7086">  ·  </tspan><tspan fill="#cdd6f4">recached </tspan><tspan fill="#0096ff">0.00x</tspan></text>
+  <path d="M92 154 v46" stroke="#f38ba8" stroke-width="2" fill="none"/>
+  <path d="M85 196 l7 12 l7 -12 z" fill="#f38ba8"/>
+  <text x="116" y="172" fill="#f38ba8" font-size="13">This turn made ten tool calls, which appended 22 blocks:</text>
+  <text x="116" y="192" fill="#f38ba8" font-size="13">two more than a cache read is willing to walk back.</text>
+  <rect x="40" y="228" width="820" height="44" rx="8" fill="#181825" stroke="#313244" stroke-width="1"/>
+  <text x="70" y="254" font-size="13" xml:space="preserve"><tspan fill="#cdd6f4">cache </tspan><tspan fill="#6c7086">1h </tspan><tspan fill="#f28972">█</tspan><tspan fill="#45475a">░░░░░░░░░</tspan><tspan fill="#cdd6f4"> 6%</tspan><tspan fill="#6c7086"> → 04:02 (59:58)</tspan><tspan fill="#6c7086">  ·  </tspan><tspan fill="#cdd6f4">recached </tspan><tspan fill="#f39370">0.89x</tspan></text>
+  <text x="44" y="306" fill="#a6adc8" font-size="13">That miss re-wrote 315,884 tokens at double rate, which cost about $6.30.</text>
+  <text x="44" y="326" fill="#a6adc8" font-size="13">The reply came back normally; only these two numbers moved.</text>
+  </svg>

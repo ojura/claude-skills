@@ -1,0 +1,3 @@
+# Build artifact: install.sh compiles the client into ~/.claude.
+statusline-client
+*.o

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 512" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <rect width="900" height="512" fill="#11111b"/>
+  <text x="44" y="46" fill="#cdd6f4" font-size="20" font-weight="bold">Before and after the cache expires</text>
+  <text x="44" y="70" fill="#6c7086" font-size="14">Suppose a long conversation left open overnight and resumed in the morning.</text>
+  <text x="44" y="100" fill="#a6adc8" font-size="13">last night, 23:58</text>
+  <rect x="40" y="110" width="820" height="44" rx="8" fill="#181825" stroke="#313244" stroke-width="1"/>
+  <text x="70" y="136" font-size="13" xml:space="preserve"><tspan fill="#cdd6f4">ctx </tspan><tspan fill="#dcdf96">████</tspan><tspan fill="#45475a">░░░░░░</tspan><tspan fill="#cdd6f4"> 42%</tspan><tspan fill="#6c7086">  ·  </tspan><tspan fill="#cdd6f4">cache </tspan><tspan fill="#6c7086">1h </tspan><tspan fill="#0096ff">██████████</tspan><tspan fill="#45475a"></tspan><tspan fill="#cdd6f4"> 100%</tspan><tspan fill="#6c7086"> → </tspan><tspan fill="#6c7086">00:52 (54:00)</tspan><tspan fill="#6c7086">  ·  </tspan><tspan fill="#cdd6f4">recached </tspan><tspan fill="#0096ff">0.00x</tspan></text>
+  <text x="70" y="180" fill="#a6e3a1" font-size="13">the next message reads the cache back: about $0.42</text>
+  <path d="M92 194 v20" stroke="#45475a" stroke-width="1.5" fill="none" stroke-dasharray="4 4"/>
+  <path d="M85 210 l7 12 l7 -12 z" fill="#45475a"/>
+  <text x="116" y="210" fill="#6c7086" font-size="13">nine hours pass, and the cache expires at 00:52</text>
+  <text x="44" y="246" fill="#a6adc8" font-size="13">this morning, 09:20</text>
+  <rect x="40" y="256" width="820" height="44" rx="8" fill="#181825" stroke="#313244" stroke-width="1"/>
+  <text x="70" y="282" font-size="13" xml:space="preserve"><tspan fill="#cdd6f4">ctx </tspan><tspan fill="#dcdf96">████</tspan><tspan fill="#45475a">░░░░░░</tspan><tspan fill="#cdd6f4"> 42%</tspan><tspan fill="#6c7086">  ·  </tspan><tspan fill="#cdd6f4">cache </tspan><tspan fill="#6c7086">1h </tspan><tspan fill="#0096ff">██████████</tspan><tspan fill="#45475a"></tspan><tspan fill="#cdd6f4"> 100%</tspan><tspan fill="#6c7086"> → </tspan><tspan fill="#f07e75">00:52 (cold)</tspan><tspan fill="#6c7086">  ·  </tspan><tspan fill="#cdd6f4">recached </tspan><tspan fill="#0096ff">0.00x</tspan></text>
+  <text x="70" y="326" fill="#f38ba8" font-size="13">the next message re-writes all 420k tokens: about $8.40</text>
+  <path d="M92 340 v20" stroke="#45475a" stroke-width="1.5" fill="none" stroke-dasharray="4 4"/>
+  <path d="M85 356 l7 12 l7 -12 z" fill="#45475a"/>
+  <text x="116" y="356" fill="#6c7086" font-size="13">you send the message</text>
+  <text x="44" y="392" fill="#a6adc8" font-size="13">one message later</text>
+  <rect x="40" y="402" width="820" height="44" rx="8" fill="#181825" stroke="#313244" stroke-width="1"/>
+  <text x="70" y="428" font-size="13" xml:space="preserve"><tspan fill="#cdd6f4">ctx </tspan><tspan fill="#dcdf96">████</tspan><tspan fill="#45475a">░░░░░░</tspan><tspan fill="#cdd6f4"> 42%</tspan><tspan fill="#6c7086">  ·  </tspan><tspan fill="#cdd6f4">cache </tspan><tspan fill="#6c7086">1h </tspan><tspan fill="#f08075"></tspan><tspan fill="#45475a">░░░░░░░░░░</tspan><tspan fill="#cdd6f4"> 1%</tspan><tspan fill="#6c7086"> → </tspan><tspan fill="#6c7086">10:14 (60:00)</tspan><tspan fill="#6c7086">  ·  </tspan><tspan fill="#cdd6f4">recached </tspan><tspan fill="#f07e75">1.00x</tspan></text>
+  <text x="70" y="472" fill="#a6adc8" font-size="13">the health bar empties, and the multiplier says the conversation has now been bought twice</text>
+  <text x="44" y="500" fill="#a6adc8" font-size="12.5">Health reads 100% right up to the rewrite. Beforehand, the expiry stamp is the only warning.</text>
+  </svg>

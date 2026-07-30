@@ -1,10 +1,10 @@
 # claude-skills
 
 Skills I built for Claude Code and use myself: tidy and recover your
-conversations, pull your own data out of Claude and ChatGPT, turn Markdown or HTML
-into print-quality PDFs, and drive your real browser or let Claude run admin
-commands on your machine, safely. Each one lives in its own folder with its own
-README.
+conversations, see what your prompt cache is costing you, pull your own data out of
+Claude and ChatGPT, turn Markdown or HTML into print-quality PDFs, and drive your real
+browser or let Claude run admin commands on your machine, safely. Each one lives in its
+own folder with its own README.
 
 ## Working with your conversations
 
@@ -50,6 +50,15 @@ Cloudflare check for you. [Read more](claude-web-fetcher).
 Backs up a logged-in ChatGPT account, conversations, branch variants, files and
 all, and comes with a dark, local reader so you can browse the whole archive
 offline. [Read more](chatgpt-archive-toolkit).
+
+## Watching what a session costs
+
+### statusline-cachequota
+A status line showing what Claude Code's prompt cache is doing: how much of the
+conversation is still cached, how many times over it has been paid for, when that cache
+expires, and when your five-hour and weekly usage windows renew. Reopen a conversation the
+next morning and it tells you whether the first message costs pennies or re-buys the
+whole thing at double price. [Read more](statusline-cachequota).
 
 ## Turning documents into PDFs
 
