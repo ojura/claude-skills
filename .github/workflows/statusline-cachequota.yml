@@ -1,0 +1,38 @@
+name: Test statusline-cachequota
+
+on:
+  pull_request:
+    paths:
+      - "statusline-cachequota/**"
+      - ".github/workflows/statusline-cachequota.yml"
+  push:
+    branches: [main]
+    paths:
+      - "statusline-cachequota/**"
+      - ".github/workflows/statusline-cachequota.yml"
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Run renderer tests
+        run: python -m unittest discover -s statusline-cachequota/tests -v
+
+      - name: Smoke-test POSIX client
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          tmp=$(mktemp -d)
+          CLAUDE_CONFIG_DIR="$tmp" bash statusline-cachequota/install.sh
+          printf '{"model":{"display_name":"Claude"},"context_window":{"used_percentage":42}}' \
+            | CLAUDE_CONFIG_DIR="$tmp" "$tmp/statusline-client" \
+            | grep -q Claude
