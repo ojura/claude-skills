@@ -1,0 +1,3771 @@
+#!/usr/bin/env python3
+"""agent-resume: resurrect a Claude Code teammate into its swarm tmux session.
+
+Usage: agent-resume [<selector>] [options] [...forwarded to claude]
+
+The leading bare argument is classified by shape:
+    2a38de2d-bd34-...   session UUID       -> --resume
+    teammate@session-x  full agent id      -> --agent-id
+    session-a52cb2af    a dir under teams/ -> --team (whole roster, lead last)
+    teammate            bare agent name    -> resolved, or refused if several rosters claim it
+
+--to-team TEAM|live rebinds a member onto another team: it relaunches the agent
+with that team's identity, replaces whichever process still holds the
+transcript, registers it in the destination roster and retires the source entry.
+
+--install sets up the ~/.local/bin symlink and zsh tab completion.
+
+Or select explicitly with --agent-id (as claude spells it) and/or --resume <session-uuid>.
+Everything the harness needs to relaunch it (team, type, color, model, effort,
+permission mode, cwd, parent session, tmux socket + pane) is reconstructed from
+three on-disk sources plus the live process table; when they disagree, the most
+recent value wins.
+
+Any flag agent-resume does not recognise is forwarded verbatim to claude, and a
+forwarded flag overrides the value agent-resume would have derived.
+"""
+
+import argparse
+import collections
+import contextlib
+import copy
+import io
+import json
+import os
+import re
+import shlex
+import shutil
+import socket as socketlib
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+# The tool's name has exactly one source: this file. Renaming the file renames
+# the command, its completion, its install targets and its backup suffixes.
+TOOL = Path(__file__).resolve().name
+
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+TEAMS_DIR = CLAUDE_DIR / "teams"
+SESSIONS_DIR = CLAUDE_DIR / "sessions"
+PROJECTS_DIR = CLAUDE_DIR / "projects"
+
+TMUX_SESSION = "claude-swarm"
+TMUX_WINDOW = "swarm-view"
+SOCKET_PREFIX = "claude-swarm-"
+
+# New panes inherit the tmux server's environment, which is whatever started the
+# server; the harness's own spawn command re-exports these, so we do too.
+TEAM_ENV = ("CLAUDECODE=1", "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1", "CLAUDE_CODE_ENTRYPOINT=cli")
+
+# Recipe 1's API poison: placeholder spawns die at TCP connect, $0 billed, no
+# 5-hour window anchored. Server-level env reaches every new pane on the socket.
+POISON_URL = "http://127.0.0.1:9"
+
+# Title lookup reads the tail first (titles are rewritten every few turns, so the
+# current one is almost always there) and only falls back to the head.
+TITLE_TAIL_BYTES = 64 * 1024
+TITLE_HEAD_BYTES = 256 * 1024
+
+# A boot mints its implicit team a few hundred ms before the session file is
+# written (measured 281ms and 252ms on two 2.1.220 boots); this is the slack.
+TEAM_MINT_WINDOW_MS = 5000
+
+# What the skill's forge template uses when a transcript records no agent type.
+DEFAULT_AGENT_TYPE = "claude"
+
+# Window read from each end of a transcript when indexing stamps.
+INDEX_CHUNK = 8 * 1024
+STAMP_RE = re.compile(rb'"(agentName|teamName)":"([^"]*)"')
+
+
+# derived flag -> field name; a user-supplied flag of the same name wins
+DERIVED_FLAGS = {
+    "--agent-id": "agentId",
+    "--agent-name": "agentName",
+    "--team-name": "teamName",
+    "--agent-color": "color",
+    "--agent-type": "agentType",
+    "--parent-session-id": "parentSessionId",
+    "--model": "model",
+    "--effort": "effort",
+}
+
+
+def step(dry, would, did, indent="  "):
+    """Report an action once, in whichever tense actually applies.
+
+    Both strings sit at the call site, so a preview line always has a real
+    counterpart and a real run prints the same set of steps a dry run promised.
+    """
+    print(f"{indent}{would if dry else did}")
+
+
+def warn(msg):
+    sys.stdout.flush()  # keep warnings in order with the report block when piped
+    print(f"{TOOL}: {msg}", file=sys.stderr)
+    sys.stderr.flush()
+
+
+def die(msg, code=1):
+    warn(msg)
+    sys.exit(code)
+
+
+def iso_ms(value):
+    if not value:
+        return 0
+    try:
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
+def ms_str(ts):
+    if not ts:
+        return "-"
+    return datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------- process table
+
+class Resolver:
+    """Everything a resolution reads, loaded once per run and held together.
+
+    One field per source, filled on first use by the loader that owns it. The
+    point of collecting them is that the set becomes enumerable: an answer
+    derived from anything not in here is reaching past the evidence, and that is
+    visible rather than a matter of noticing.
+
+    A run is one process, so these were already per-run state as module
+    globals. What the object adds is a place for cache lifetime to be stated
+    (`refresh_procs`) instead of implied by a keyword argument.
+    """
+
+    def __init__(self):
+        self.procs = None       # pid -> row, from ps
+        self.stamps = None      # transcript stem -> (agentName, teamName)
+        self.spawns = {}        # transcript stem -> {name: last payload of that name}
+        self.spawn_log = {}     # transcript stem -> [(stamp, payload)] in file order
+        self.by_agent = None    # "name@team" -> payload, across every transcript
+        self.by_team = None     # team -> [(stamp, path)] of transcripts that led it
+        self.teams_dir = TEAMS_DIR   # overridable so a test engine can read a synthetic tree
+
+    def refresh_procs(self):
+        self.procs = None
+    def _grep_files(self, needle, scope, recursive):
+        """Files containing this literal."""
+        result = subprocess.run(self._searcher("files", needle, scope, recursive), capture_output=True, text=True)
+        if result.returncode > 1:
+            warn(f"search failed ({result.stderr.strip() or 'unknown'}); falling back to a full scan")
+            return None
+        return [Path(p) for p in result.stdout.splitlines() if p]
+
+    def _searcher(self, kind, needle, paths, recursive):
+        """argv for a literal search, preferring ripgrep when installed.
+
+        Same question either way; rg walks the tree in parallel, which is several
+        times faster on a transcript tree this size.
+        """
+        files = [str(p) for p in paths]
+        if shutil.which("rg"):
+            argv = ["rg", "--no-ignore", "-F", needle]
+            argv += ["-l"] if kind == "files" else ["-N", "-H"]
+            if recursive:
+                argv += ["--glob", "*.jsonl"]
+            return argv + files
+        argv = ["grep", "-F", needle, "-l" if kind == "files" else "-H"]
+        if recursive:
+            argv += ["-r", "--include=*.jsonl"]
+        return argv + files
+
+    def _stamped_candidates(self, name, team=None, verify=True):
+        """Transcripts whose own lines carry these stamps, newest first.
+
+        Narrow, then confirm. The stamp index narrows (one bounded read per file,
+        shared across every lookup in the process); the survivors are parsed to
+        check the stamps are *current*, since a rebound agent's file mentions two
+        teams. `verify=False` returns the narrowing alone, for callers that need a
+        path and nothing else.
+
+        The index reads only each file's ends, so it cannot see stamps that appear
+        solely mid-history. When it finds nothing, grep re-asks over whole files
+        before the answer is allowed to be "no transcript".
+        """
+        files = [p for p, (n, t) in self.stamp_index().items() if n == name and (not team or t == team)]
+
+        if not verify:
+            # The index is cached for the process, so a file may be gone by now.
+            stamped = []
+            for path in files:
+                try:
+                    stamped.append((path, {}, int(path.stat().st_mtime * 1000)))
+                except OSError:
+                    continue
+            stamped.sort(key=lambda item: item[2], reverse=True)
+            return stamped
+
+
+        def confirm(paths):
+            out = []
+            for path in paths:
+                fields, last_ts = self._scan_transcript(path)
+                if fields.get("agentName", (None,))[0] != name:
+                    continue
+                if team and fields.get("teamName", (None,))[0] != team:
+                    continue
+                out.append((path, fields, last_ts))
+            out.sort(key=lambda item: item[2], reverse=True)
+            return out
+
+        found = confirm(files)
+        if not found:
+            # The index can both miss (stamps only mid-history) and mislead (a stamp
+            # quoted inside message content). Either way the answer is not yet "no",
+            # so re-ask over whole files before saying so.
+            deep = self._grep_files(f'"agentName":"{name}"', [PROJECTS_DIR], True)
+            if deep is None:  # grep unavailable
+                deep = sorted(PROJECTS_DIR.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+            elif team and deep:
+                deep = self._grep_files(f'"teamName":"{team}"', deep, False) or []
+            seen = set(files)
+            found = confirm(p for p in deep if p not in seen)
+        return found
+
+    def _ingest_spawn_lines(self, paths):
+        """Parse the spawn payloads out of these transcripts into the caches.
+
+        grep pulls out the handful of matching lines; only those are parsed. A
+        payload is taken from the parsed structure, never from raw bytes, so a
+        transcript that merely discusses spawning cannot contribute a quoted
+        example as if it were real.
+        """
+        paths = [p for p in paths if p and p.stem not in self.spawns]
+        for path in paths:
+            self.spawns[path.stem], self.spawn_log[path.stem] = {}, []
+        if not paths:
+            return
+        result = subprocess.run(self._searcher("lines", SPAWN_MARKER, paths, False), capture_output=True, text=True)
+        if result.returncode > 1:
+            warn(f"search failed reading spawn records ({result.stderr.strip() or 'unknown'})")
+            return
+        for line in result.stdout.splitlines():
+            where, _, text = line.partition(":")
+            stem = Path(where).stem
+            if stem not in self.spawns:
+                continue
+            try:
+                record = json.loads(text)
+            except ValueError:
+                continue
+            stamp = iso_ms(record.get("timestamp"))
+            for payload in self._walk_spawn_payloads(record):
+                self.spawns[stem][payload["name"]] = payload  # last spawn of a name wins
+                self.spawn_log[stem].append((stamp, payload))
+
+    def lead_pid(self, parent_session=None, team=None):
+        """(pid, alive, how, exact) for the live process this agent's lead runs as.
+
+        The roster names that lead one of two ways, and only one of them is in the
+        session registry: a forged or explicit team carries a transcript id, an
+        implicit team's leadSessionId is a boot uuid that no registry entry records.
+        Socket resolution and credential inheritance both need this exact answer, so
+        they ask here rather than each handling half the cases.
+        """
+        if parent_session:
+            entry = self.lead_pid_for(parent_session)
+            if entry:
+                pid, _, alive = entry
+                return pid, alive, f"lead pid {pid}" + ("" if alive else " (dead)"), True
+        if team:
+            # A fresh lead's internal id IS its transcript id, so its implicit team
+            # is named after a session the registry knows: an exact join, preferred
+            # over the time window below. (16 of 37 team dirs here are that shape.)
+            block = re.fullmatch(r"session-([0-9a-f]{8})", team)
+            if block:
+                for data in self.session_registry():
+                    if str(data.get("sessionId", "")).startswith(block.group(1)):
+                        if pid_alive(data["pid"], data.get("procStart")):
+                            return data["pid"], True, f"pid {data['pid']}, whose session id names team {team}", True
+            # A masqueraded lead writes no sessions/<pid>.json at all (the registry
+            # is for unbound launches), so every rung above it is blind to one.
+            # It does advertise its identity in argv, which is exact evidence.
+            masquerade = next((e for e in self.live_sessions()
+                               if e["alive"] and e["agent"] == f"team-lead@{team}"), None)
+            if masquerade:
+                return masquerade["pid"], True, f"pid {masquerade['pid']}, masquerading as {masquerade['agent']}", True
+
+            pid = self._pid_running_team(team)
+            if pid:
+                return pid, True, f"pid {pid}, which spawned into team {team}", True
+            pid = self._pid_that_minted(team)
+            if pid:
+                return pid, True, f"pid {pid}, which is running as team {team}", False
+        return None, False, None, False
+
+    def lead_pid_for(self, session_id):
+        """(pid, updatedAt, alive) for whoever holds this transcript."""
+        best = None
+        for entry in self.live_sessions():
+            if entry["session"] != session_id:
+                continue
+            rank = (1 if entry["alive"] else 0, entry["updated"])
+            if best is None or rank > best[0]:
+                best = (rank, (entry["pid"], entry["updated"], entry["alive"]))
+        return best[1] if best else None
+
+    def _lead_transcript_for(self, team):
+        """(transcript, why) for the transcript that led this team, or (None, reason).
+
+        Several transcripts can claim one team: a fork carries the history it was
+        copied from, and a payload quoted verbatim into a conversation parses like
+        one the harness wrote. Ranked corroboration decides between them, all of it
+        already loaded: a live process running as this team, a roster naming the
+        transcript as its lead, the payload names matching the roster's members, and
+        the team-name block, which an implicit team takes from the session that
+        minted it.
+
+        Exactly one corroborated claimant is the answer. A sole claimant with no
+        corroboration is still taken, because the ordinary dead-team case is exactly
+        that and refusing would strand every legitimately orphaned lead; it says so
+        in its provenance instead. Anything else refuses and names what it refused
+        between: choosing without evidence buys a resumed stranger's conversation
+        wearing this team's lead identity.
+        """
+        hits = self.led_teams().get(team) or []
+        if not hits:
+            return None, f"no transcript records spawning into {team}"
+
+        rosters = [e for e in self.scan_teams() if e["team"] == team]
+        roster_members = {e["member"].get("name") for e in rosters}
+        roster_leads = {e.get("leadSessionId") for e in rosters}
+        live_here = {e.get("session") for e in self.live_sessions() if e.get("team") == team}
+        block = re.fullmatch(r"session-([0-9a-f]{8})", team)
+
+        def corroboration(path):
+            if path.stem in live_here:
+                return f"live process running as {team}"
+            if path.stem in roster_leads:
+                return "roster leadSessionId"
+            spawned = {payload.get("name") for payload in self.members_spawned_into(path.stem, team)}
+            if roster_members and spawned & roster_members:
+                return "member names"
+            if block and path.stem.startswith(block.group(1)):
+                return "team-name block"
+            return None
+
+        backed = [(path, why) for _, path in hits if (why := corroboration(path))]
+        if len(backed) == 1:
+            return backed[0][0], f"spawn payloads naming {team}, corroborated by {backed[0][1]}"
+        if len(hits) == 1:
+            warn(f"resuming the only transcript claiming {team}; nothing corroborates it. "
+                 f"If that is the wrong conversation, name the right one with --resume")
+            return hits[0][1], f"sole payload claimant for {team}, uncorroborated"
+        listed = ", ".join(path.stem[:8] for _, path in hits)
+        if len(backed) > 1:
+            return None, (f"{len(backed)} transcripts claim {team} with corroboration "
+                          f"({listed}); name one with --resume")
+        return None, (f"{len(hits)} transcripts claim {team} and nothing corroborates any of them "
+                      f"({listed}); name one with --resume")
+
+
+    def led_teams(self):
+        """{team: [(last spawn ts, transcript path), ...]} for every team a lead ran as.
+
+        A lead's own lines carry no stamps, so nothing in its transcript says who it
+        is. What it does carry is a spawn payload for each teammate it created, and
+        every payload names the team the lead was running as at the time. That makes
+        the payload the only identity a lead leaves on disk.
+
+        The roster cannot stand in for it. `leadSessionId` is the lead's internal
+        live session id, which is what the implicit team is named after; it is not a
+        transcript filename and usually has no file at all, so it can never equal the
+        uuid a user is able to supply. Without this index, a lead is reachable only
+        while its team dir still records a leadSessionId that happens to be a real
+        transcript, which is the masquerade case alone.
+
+        Built from the scan self._spawn_by_agent() already performs: containing a spawn
+        payload is what makes a transcript a lead's, so the same files answer both.
+        """
+        if self.by_team is not None:
+            return self.by_team
+        self.by_team = {}
+        leads = self._grep_files(SPAWN_MARKER, [PROJECTS_DIR], True) or []
+        self._ingest_spawn_lines(leads)
+        for path in leads:
+            newest = {}
+            for stamp, payload in self.spawn_log.get(path.stem, []):
+                team = payload.get("team_name")
+                if team:
+                    newest[team] = max(newest.get(team, 0), stamp or 0)
+            for team, stamp in newest.items():
+                self.by_team.setdefault(team, []).append((stamp, path))
+        for team in self.by_team:
+            self.by_team[team].sort(reverse=True)
+        return self.by_team
+
+    def live_agent_procs(self, agent_id, table):
+        return claude_procs(f"--agent-id {agent_id}", table)
+
+    def wearers(self, agent_id, table=None):
+        """(pid, transcript) for every live process wearing this agent-id.
+
+        A running process is the agent now. Identity is frozen in argv at exec and
+        a migration is kill-and-restart, so argv cannot be stale the way a roster
+        entry or a transcript stamp can: those record what was true when written.
+        The transcript is the process's own --resume value. A wearer without one
+        carries no transcript evidence and is reported with None rather than
+        dropped, so a caller can still see it is there.
+        """
+        out = []
+        for pid, args in self.live_agent_procs(agent_id, table or self.ps_table()):
+            held = next((pair.partition(" ")[2] for pair in _argv_pairs(args)
+                         if pair.startswith("--resume ")), None)
+            out.append((pid, held))
+        return out
+
+    def live_sessions(self):
+        """Every claude process and what it is: {pid, session, agent, team, ...}.
+
+        Two inputs, one answer. sessions/<pid>.json covers unbound launches and
+        remembers dead ones; a flag-bound launch (every teammate, and the lead
+        masquerade) never writes there but carries the same facts in its argv:
+        --resume names the transcript it holds, --agent-id the identity it wears.
+        Callers ask this, never an input, or the answer depends on which input the
+        caller happened to think of.
+        """
+        found = {}
+        for data in self.session_registry():
+            pid = data.get("pid")
+            if not pid:
+                continue
+            found[pid] = {
+                "pid": pid,
+                "session": data.get("sessionId"),
+                "agent": None,
+                "team": None,
+                "updated": data.get("updatedAt") or 0,
+                "started": data.get("startedAt") or 0,
+                "alive": pid_alive(pid, data.get("procStart")),
+            }
+        for pid, _, args in self.ps_table():
+            if not looks_like_claude(args):
+                continue
+            pairs = _argv_pairs(args)
+            held = next((v.split(" ", 1)[1] for v in pairs if v.startswith("--resume ")), None)
+            agent = next((v.split(" ", 1)[1] for v in pairs if v.startswith("--agent-id ")), None)
+            if not (held or agent):
+                continue
+            entry = found.setdefault(pid, {"pid": pid, "session": None, "agent": None,
+                                           "team": None, "updated": 0, "started": 0, "alive": True})
+            if not entry["alive"] and held:
+                # The registry entry failed its procStart check, so this pid was
+                # recycled: what argv says outranks what the registry remembers.
+                entry["session"] = held
+            entry["alive"] = True
+            entry["session"] = entry["session"] or held
+            if agent:
+                entry["agent"] = agent
+                entry["team"] = agent.split("@", 1)[1] if "@" in agent else None
+        return list(found.values())
+
+    def members_spawned_into(self, lead_session, team):
+        """The payloads for every teammate this lead spawned into this team.
+
+        A team-membership question, like team_minted_by's, not the per-agent payload
+        lookup spawn_payload owns: it asks who a roster should list, not what one
+        known agent was created with. A lead resumed several times spawns into a
+        fresh implicit team each life while appending to one transcript, so payloads
+        naming another team are skipped rather than adopted.
+        """
+        self._spawn_records(lead_session)  # fills the ordered log for this transcript
+        latest = {}
+        for _stamp, payload in self.spawn_log.get(lead_session) or []:
+            if payload.get("name") and payload.get("team_name") == team:
+                latest[payload["name"]] = payload  # last spawn of that name into this team
+        return list(latest.values())
+
+    def name_rosters(self, name):
+        """Teams whose roster carries this agent name. A name in more than one is
+        not an identity: every team has a "team-lead"."""
+        return {e["team"] for e in self.scan_teams() if e["member"].get("name") == name}
+
+    def _pid_running_team(self, team):
+        """The live process whose transcript records spawning into this team.
+
+        Exact evidence for the case the registry cannot answer: an abandoned team
+        whose leadSessionId is an internal id no file maps to a pid. The lead that
+        spawned into it wrote that team name into each spawn payload.
+        """
+        if not team:
+            return None
+        matches = []
+        for entry in self.live_sessions():
+            if not (entry["alive"] and entry["session"]):
+                continue
+            self._spawn_records(entry["session"])
+            # Any life's payload will do here: it is the same process either way.
+            if any(item.get("team_name") == team for _, item in self.spawn_log.get(entry["session"], [])):
+                matches.append((entry["updated"], entry["pid"]))
+        return max(matches)[1] if matches else None
+
+    def _pid_that_minted(self, team):
+        """Which live process is running as this implicit team.
+
+        The roster's leadSessionId is that boot uuid, so it matches no registry
+        entry; without this, every agent of a resumed lead's team has an
+        unresolvable socket.
+        """
+        return next((pid for name, pid, _ in boot_join() if name == team), None)
+
+    def procs_on_transcript(self, session_uuid, table):
+        """Whoever holds this transcript, under any identity. Two processes
+        appending to one JSONL is the thing to never allow, and a rebind changes the
+        agent-id, so identity is the wrong key here."""
+        return claude_procs(f"--resume {session_uuid}", table)
+
+    def ps_table(self, refresh=False):
+        """[(pid, ppid, args)] for every process we can see, snapshotted once.
+
+        One run judges liveness against one consistent picture, and a single
+        resolve was spawning ps three times.
+        """
+        if self.procs is not None and not refresh:
+            return self.procs
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,args="], capture_output=True, text=True
+        ).stdout
+        rows = []
+        for line in out.splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) == 3 and parts[0].isdigit():
+                rows.append((int(parts[0]), int(parts[1]), parts[2]))
+        self.procs = rows
+        return rows
+
+    def lead_session_for(self, team):
+        """The session id of this team's lead, or None.
+
+        Three places used to answer this differently: a roster read, a payload
+        lookup, and a glob over transcripts sharing the team name's block. They
+        disagree exactly when it matters, so they are one ladder here, strongest
+        first: what a roster records, what the payloads prove, and only then the
+        block, which is a guess about a name rather than evidence about a session.
+        """
+        for entry in self.scan_teams():
+            if entry["team"] == team and entry.get("leadSessionId"):
+                if self.transcript_path(entry["leadSessionId"]):
+                    return entry["leadSessionId"]
+        path, _why = self._lead_transcript_for(team)
+        if path:
+            return path.stem
+        block = re.fullmatch(r"session-([0-9a-f]{8})", team or "")
+        if not block:
+            return None
+        hits = sorted(self.transcripts_starting(block.group(1)),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        if len(hits) > 1:
+            warn(f"{len(hits)} transcripts start with {block.group(1)}; assuming {hits[0].stem}")
+        return hits[0].stem if hits else None
+
+    def roster_path(self, team):
+        """Where this team's roster lives. A path question, not a write: the class
+        answers where things are so writers never have to know the layout."""
+        return self.teams_dir / team / "config.json"
+
+    def inbox_path(self, team, name):
+        """Where this member's mailbox lives."""
+        return self.teams_dir / team / "inboxes" / f"{name}.json"
+
+    def team_dirs(self):
+        """Every team directory on disk, roster or not."""
+        return [d for d in self.teams_dir.glob("*") if d.is_dir()]
+
+    def transcripts_by_mtime(self):
+        """Every transcript, newest first."""
+        return sorted(PROJECTS_DIR.glob("*/*.jsonl"),
+                      key=lambda path: path.stat().st_mtime, reverse=True)
+
+    def transcripts_starting(self, block):
+        """Transcripts whose uuid opens with this block. A path question, so it
+        belongs to whoever owns the tree rather than to a caller globbing it."""
+        return list(PROJECTS_DIR.glob(f"*/{block}-*.jsonl"))
+
+    def resolve_transcript(self, session_uuid=None, lead_session=None, team=None, name=None,
+                           is_lead=False, quick=False):
+        """The only place a transcript is chosen. Evidence, strongest first:
+
+        1. an exact session uuid, given by the user or named by the roster as
+           leadSessionId
+        2. both stamps: agentName AND teamName written on the transcript's lines
+        3. agentName alone, refused when that name is in more than one roster
+        4. for a lead only: the transcript whose spawn payloads name this team
+
+        A lead writes no stamps, so rungs 2 and 3 can never reach one. Rung 1
+        reaches it only when leadSessionId happens to be a real transcript, which is
+        true of a masqueraded lead and false of every natively created one, whose
+        leadSessionId is an internal live id with no file. Rung 4 is what covers the
+        rest: see self.led_teams().
+
+        Rung 3 is why "team-lead" can never be resolved by name: it lives in every
+        team, so the name carries no identity and the engine returns nothing rather
+        than adopting a stranger's conversation.
+        """
+        if session_uuid:
+            path = self.transcript_path(session_uuid)
+            if path:
+                fields, last = ({}, 0) if quick else self._scan_transcript(path)
+                return Resolution(path, fields, last, via="session uuid", strength=EXACT)
+            return Resolution(reason=f"no transcript file for session {session_uuid}")
+
+        # A live process wearing this identity outranks anything recorded: argv is
+        # frozen at exec and a migration is kill-and-restart, so a roster entry or a
+        # stamp says what was true when it was written, while argv says what is true.
+        if name and team:
+            seen = self.wearers(f"{name}@{team}")
+            held = {transcript for _, transcript in seen if transcript}
+            if len(held) > 1:
+                return Resolution(reason=(
+                    f"{len(seen)} live processes wear {name}@{team} on different conversations "
+                    f"({', '.join(f'pid {pid} on {t[:8]}' for pid, t in seen if t)}); "
+                    "name the one you mean with --resume"))
+            if held:
+                path = self.transcript_path(held.pop())
+                if path:
+                    if len(seen) > 1:
+                        warn(f"{len(seen)} live processes wear {name}@{team} on this one "
+                             f"conversation (pids {', '.join(str(pid) for pid, _ in seen)})")
+                    fields, last = ({}, 0) if quick else self._scan_transcript(path)
+                    return Resolution(path, fields, last, strength=EXACT,
+                                      via=f"live pid {seen[0][0]} wearing {name}@{team}")
+
+        if lead_session or is_lead:
+            path = self.transcript_path(lead_session) if lead_session else None
+            if path:
+                fields, last = ({}, 0) if quick else self._scan_transcript(path)
+                return Resolution(path, fields, last, via="roster leadSessionId", strength=EXACT)
+            path, why = self._lead_transcript_for(team) if team else (None, "no team was named")
+            if path:
+                fields, last = ({}, 0) if quick else self._scan_transcript(path)
+                return Resolution(path, fields, last, via=why, strength=EXACT)
+            named = (f"roster names lead session {lead_session}, which has no transcript, and "
+                     if lead_session else "")
+            return Resolution(reason=f"{named}{why}")
+
+        if team and name:
+            hits = self._stamped_candidates(name, team, verify=not quick)
+            if hits:
+                return Resolution(*hits[0], via="agentName+teamName stamps", strength=STAMPS, others=hits[1:])
+
+        if name:
+            rosters = self.name_rosters(name)
+            if len(rosters) > 1:
+                return Resolution(reason=(
+                    f"no transcript stamped team={team} for {name!r}, and the bare name is in "
+                    f"{len(rosters)} rosters, so it identifies nobody"
+                ))
+            hits = self._stamped_candidates(name, None, verify=not quick)
+            if hits:
+                return Resolution(
+                    *hits[0], via="agentName only (unique across rosters)", strength=NAME_ONLY, others=hits[1:]
+                )
+        return Resolution(reason=f"no transcript found for {name or '?'}@{team or '?'}")
+
+    def scan_teams(self):
+        """Every member of every team config, newest-first metadata attached."""
+        entries = []
+        for cfg in (RESOLVER.roster_path(d.name) for d in RESOLVER.team_dirs()):
+            try:
+                data = json.loads(cfg.read_text())
+            except (OSError, ValueError):
+                continue
+            mtime = int(cfg.stat().st_mtime * 1000)
+            for member in data.get("members", []):
+                entries.append(
+                    {
+                        "cfg": cfg,
+                        "team": data.get("name") or cfg.parent.name,
+                        "leadSessionId": data.get("leadSessionId"),
+                        "leadAgentId": data.get("leadAgentId"),
+                        "member": member,
+                        "ts": member.get("joinedAt") or data.get("createdAt") or mtime,
+                    }
+                )
+        return entries
+
+    def _scan_transcript(self, path):
+        """(fields, last_activity_ms) from one session JSONL."""
+        fields = {}
+        try:
+            mtime = int(path.stat().st_mtime * 1000)
+        except OSError:
+            return {}, 0  # the harness rewrites this tree while we read it
+        last_ts = first_ts = 0
+        headers = []
+        cwds = []
+
+        def put(key, value, ts):
+            if value in (None, ""):
+                return
+            if key not in fields or ts >= fields[key][1]:
+                fields[key] = (value, ts)
+
+        try:
+            handle = path.open(errors="replace")
+        except OSError:
+            return {}, mtime
+        with handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                ts = iso_ms(rec.get("timestamp"))
+                if ts:
+                    last_ts = max(last_ts, ts)
+                    first_ts = first_ts or ts
+                kind = rec.get("type")
+                # header records carry no timestamp; stamp them with the first real one
+                if kind == "agent-setting":
+                    headers.append(("agentType", rec.get("agentSetting")))
+                elif kind == "permission-mode":
+                    headers.append(("permissionMode", rec.get("permissionMode")))
+                elif kind == "mode":
+                    headers.append(("mode", rec.get("mode")))
+                for key in ("teamName", "agentName", "cwd", "version", "gitBranch", "effort"):
+                    if rec.get(key) is not None:
+                        put(key, rec[key], ts or mtime)
+                if rec.get("cwd") and (not cwds or cwds[-1] != rec["cwd"]):
+                    cwds.append(rec["cwd"])  # /cd moves it mid-session; keep the trail
+                msg = rec.get("message")
+                model = msg.get("model") if kind == "assistant" and isinstance(msg, dict) else None
+                if model and not model.startswith("<"):
+                    put("model", model, ts or mtime)  # skip "<synthetic>" error stubs
+
+        for key, value in headers:
+            put(key, value, first_ts or mtime)
+        if cwds:
+            fields["_cwds"] = (cwds, last_ts or mtime)  # underscore keys stay out of the merge
+        return fields, (last_ts or mtime)
+
+    def self_holds_transcript(self, session_uuid, table):
+        """Are we ourselves the process holding this transcript?
+
+        procs_on_transcript excludes our own lineage, because our argv quotes what
+        we were asked to look for. That exclusion means an agent migrating itself
+        never sees itself, so nothing is replaced and the launch becomes a second
+        writer on one transcript, created by this tool.
+        """
+        mine = own_lineage(table)
+        return [pid for pid, _, args in table
+                if pid in mine and looks_like_claude(args)
+                and f"--resume {session_uuid}" in _argv_pairs(args)]
+
+    def session_registry(self):
+        """Every ~/.claude/sessions/<pid>.json, parsed once. The registry is the
+        only map from a transcript id to a live process, and two readers of it had
+        already grown different ideas about liveness."""
+        entries = []
+        for path in SESSIONS_DIR.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if data.get("pid"):
+                entries.append(data)
+        return entries
+
+    def _socket_from_pane_pid(self, pid, table):
+        """A pane process's parent is the tmux server; its cmdline carries -L <socket>."""
+        parents = {p: pp for p, pp, _ in table}
+        ppid = parents.get(pid)
+        if not ppid:
+            return None
+        match = re.search(r"-L\s+(\S+)", cmdline(ppid))
+        return match.group(1) if match else None
+
+    def socket_hosting(self, agent_ids, table):
+        """(socket, why) for the live server already hosting any of these agents.
+
+        The one rung in the socket ladder backed by a running process instead of a
+        name, which is why it comes first and why both callers have to be the same
+        code. Answered separately, a team can be sent to a socket derived from its
+        lead's pid while its members sit on another server entirely.
+        """
+        for agent_id in agent_ids:
+            if not agent_id:
+                continue
+            for pid, _ in self.live_agent_procs(agent_id, table):
+                sock = self._socket_from_pane_pid(pid, table)
+                if sock and socket_alive(sock):
+                    return sock, f"live pane of pid {pid}"
+                if sock:
+                    warn(f"pid {pid} looked like a pane on {sock}, but that server is gone")
+        return None, None
+
+    def _spawn_by_agent(self):
+        """{"name@team": payload} for every teammate any lead ever spawned.
+
+        A member's colour, agent type and full model live in the roster, and the
+        roster dies with its team. The lead that spawned it recorded all three, so
+        this is where they survive. Only the transcripts that mention a spawn are
+        read, which is a fraction of the tree.
+        """
+        if self.by_agent is not None:
+            return self.by_agent
+        self.by_agent = {}
+        leads = self._grep_files(SPAWN_MARKER, [PROJECTS_DIR], True) or []
+        self._ingest_spawn_lines(leads)
+        for path in leads:
+            for _, payload in self.spawn_log.get(path.stem, []):
+                name, team = payload.get("name"), payload.get("team_name")
+                if name and team:
+                    self.by_agent[f"{name}@{team}"] = payload
+        return self.by_agent
+
+    def spawn_payload(self, agent_id, lead_session=None):
+        """The harness's spawn record for an agent, wherever it survives.
+
+        The single lookup for both the merge and the completion display, so an
+        agent cannot be offered in one colour and launched in another. Cheap path
+        first, the lead transcript the roster names; then the cross-file index,
+        which is the only route once a team is named after a boot uuid whose
+        transcript does not exist.
+        """
+        if not agent_id:
+            return {}
+        # Keyed on name and team together: a lead that respawns a name into a later
+        # team holds a payload for each, and the name alone returns whichever came
+        # last, which is the wrong life's colour and model.
+        name, _, team = agent_id.partition("@")
+        if lead_session and team:
+            found = next((payload for payload in self.members_spawned_into(lead_session, team)
+                          if payload.get("name") == name), None)
+            if found:
+                return found
+        return self._spawn_by_agent().get(agent_id, {})
+
+    def _spawn_records(self, lead_session):
+        """{name: spawn payload} from the lead's transcript.
+
+        Spawning a teammate writes the harness's whole payload into the lead's
+        conversation: type, model with its [1m] suffix, color, pane id, prompt. That
+        makes it the last-resort source for anything the roster would have held,
+        and the only surviving one once a team dir is deleted, since no teammate
+        transcript records its own color.
+        """
+        if not lead_session:
+            return {}
+        if lead_session in self.spawns:
+            return self.spawns[lead_session]
+        path = self.transcript_path(lead_session)
+        self._ingest_spawn_lines([path] if path else [])
+        return self.spawns.setdefault(lead_session, {})
+
+    def stamp_index(self):
+        """{path: (agentName, teamName)} for every stamped transcript, built once.
+
+        Reads a bounded window of each file rather than grepping: every line carries
+        the stamps, so the tail answers it, and the tail is also the *current* pair
+        after a rebind. A file stamped only mid-history is missed here, which is why
+        this powers path-only lookups and never resolution (verify=True greps whole
+        files). Grep is the wrong tool for the index: -m1 exits early on stamped
+        files but scans every byte of the unstamped ones, and this tree holds 2GB of
+        those, which cost 1.7s per pass.
+        """
+        if self.stamps is not None:
+            return self.stamps
+        index = {}
+        for path in PROJECTS_DIR.glob("*/*.jsonl"):
+            try:
+                size = path.stat().st_size
+                with path.open("rb") as handle:
+                    tail_at = max(0, size - INDEX_CHUNK)
+                    if tail_at:
+                        handle.seek(tail_at)
+                    stamps = dict(STAMP_RE.findall(handle.read(INDEX_CHUNK)))
+                    if not stamps and tail_at:  # a session stamped only after a resume
+                        handle.seek(0)
+                        stamps = dict(STAMP_RE.findall(handle.read(INDEX_CHUNK)))
+            except OSError:
+                continue
+            if stamps:
+                index[path] = (
+                    (stamps.get(b"agentName") or b"").decode("utf-8", "replace") or None,
+                    (stamps.get(b"teamName") or b"").decode("utf-8", "replace") or None,
+                )
+        self.stamps = index
+        return self.stamps
+
+    def team_lead_session(self, team):
+        """The session id a team names as its lead's, via the roster reader."""
+        return next((e["leadSessionId"] for e in self.scan_teams() if e["team"] == team), None)
+
+    def team_minted_by(self, pid):
+        """(team, exact) for the implicit team this live process is running as.
+
+        `exact` is False when only the mint-window join could answer, which is a
+        heuristic and therefore never grounds for acting without being asked.
+
+        Exact evidence first, because the mint timing is not one thing: a team is
+        sometimes minted eagerly at boot (a few hundred ms before the session file)
+        and sometimes at the first spawn, minutes later and outside the window in
+        the wrong direction. Both shapes exist on this box, so the window join is
+        only ever a last resort.
+        """
+        entry = next((e for e in self.live_sessions() if e["pid"] == pid), None)
+        if entry and entry.get("team"):
+            # A flag-bound lead states the team it runs as, in its own argv.
+            return entry["team"], True
+        if entry and entry.get("session"):
+            # Every teammate this lead spawned wrote a payload naming the team it
+            # was running as. Only payloads from THIS life count: a resumed lead
+            # keeps appending to the same transcript, so an older life's payload
+            # names a team this process no longer runs as, and rebinding onto it
+            # would cause exactly the orphaning --to-team exists to prevent.
+            self._spawn_records(entry["session"])
+            started = entry.get("started")
+            for stamp, payload in reversed(self.spawn_log.get(entry["session"]) or []):
+                # Without a start time there is no way to tell this life's payloads
+                # from an earlier one's, so the rung declines rather than guessing.
+                if payload.get("team_name") and started and stamp >= started:
+                    return payload["team_name"], True
+        return next((team for team, owner, _ in boot_join() if owner == pid), None), False
+
+    def teams_led_by(self, session_stem):
+        """Teams this transcript led, newest first.
+
+        A lead resumed several times mints a fresh implicit team each life and keeps
+        appending to one transcript, so several teams can be named by one file. The
+        newest is the one it was running as when it stopped.
+        """
+        led = self.led_teams()
+        mine = [(stamp, team) for team, hits in led.items()
+                for stamp, path in hits if path.stem == session_stem]
+        mine.sort(reverse=True)
+        return [team for _, team in mine]
+
+    def transcript_path(self, session_uuid):
+        hits = sorted(PROJECTS_DIR.glob(f"*/{session_uuid}.jsonl"))
+        if not hits:
+            return None
+        if len(hits) > 1:
+            hits.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+            warn(f"{len(hits)} transcripts named {session_uuid}; using {hits[0]}")
+        return hits[0]
+
+    def _walk_spawn_payloads(self, node, depth=0):
+        """Yield genuine spawn payloads inside a parsed transcript line.
+
+        Structure, not text: a real payload is a dict the harness put there, so it
+        is reached by walking the record. Strings are also parsed one level, since
+        tool results carry their JSON as text, but prose that merely quotes a
+        payload never becomes a dict and so never matches.
+        """
+        if depth > 10:  # deepest real payload seen is 5; leave room for another wrapper
+            return
+        if isinstance(node, dict):
+            if node.get("status") == "teammate_spawned" and node.get("name"):
+                yield node
+            for value in node.values():
+                yield from self._walk_spawn_payloads(value, depth + 1)
+        elif isinstance(node, list):
+            for value in node:
+                yield from self._walk_spawn_payloads(value, depth + 1)
+        elif isinstance(node, str) and SPAWN_MARKER in node and node.lstrip()[:1] in "{[":
+            try:
+                yield from self._walk_spawn_payloads(json.loads(node), depth + 1)
+            except ValueError:
+                return
+
+
+
+RESOLVER = Resolver()
+
+
+
+
+def proc_stat(pid):
+    """(state, starttime) from /proc/pid/stat, fields 3 and 22."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None, None
+    try:
+        rest = stat[stat.rindex(")") + 2:].split()
+        return rest[0], rest[19]
+    except (ValueError, IndexError):
+        return None, None
+
+
+def pid_alive(pid, procstart=None):
+    """A zombie is not alive. A ctrl-z'd process is: it still owns its session
+    and will pick up where it left off; callers nudge instead of stepping on it."""
+    state, st = proc_stat(pid)
+    if st is None or state in ("Z", "X"):
+        return False
+    return procstart in (None, "", st)
+
+
+def state_note(pid):
+    """Suffix for a pid we are reporting as alive, when it needs a nudge."""
+    state = proc_stat(pid)[0]
+    if state in ("T", "t"):
+        return f", suspended; `kill -CONT {pid}` (or fg) to wake it"
+    return ""
+
+
+# What a revived pane needs from the lead's environment. The harness's swarm
+# server is started BY the leader, so its panes inherit these; a server we start
+# does not, because tool subprocesses have the credentials scrubbed. A new
+# server inherits them from us; topping up an existing one puts the value on a
+# transient tmux client argv, which is why that path only runs for variables the
+# server is actually missing.
+AUTH_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+INHERIT_ENV = AUTH_ENV + ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",)
+
+
+def proc_env(pid, names):
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return {}
+    found = {}
+    for item in raw.split(b"\0"):
+        if b"=" not in item:
+            continue
+        key, value = item.split(b"=", 1)
+        key = key.decode("utf-8", "replace")
+        if key in names:
+            found[key] = value.decode("utf-8", "replace")
+    return found
+
+
+
+
+
+
+def inherit_credentials(ctx):
+    """Adopt the lead's credentials into our own env, so a tmux server we spawn
+    passes them to its panes exactly as a harness-spawned server would.
+
+    The lead pid comes from the ~/.claude chain (roster -> leadSessionId ->
+    session registry), not from our process ancestry."""
+    merged = ctx["merged"]
+    pid, alive, _, _exact = RESOLVER.lead_pid(merged.pick("parentSessionId")[0], merged.pick("teamName")[0])
+    if not (pid and alive):
+        return []
+    adopted = []
+    for key, value in proc_env(pid, INHERIT_ENV).items():
+        if not os.environ.get(key):
+            os.environ[key] = value
+            adopted.append(key)
+    # Only shout when the revived agent would have no way to authenticate at
+    # all. The usual setup keeps credentials in a file, and the traffic flag is
+    # optional, so warning about either on every run trains you to ignore a tool
+    # that kills things.
+    if not any(os.environ.get(key) for key in AUTH_ENV) and not (CLAUDE_DIR / ".credentials.json").exists():
+        warn("no auth env var on this lead and no ~/.claude/.credentials.json; "
+             "the revived agent will have nothing to authenticate with")
+    return sorted(adopted)
+
+
+def cmdline(pid):
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+    except OSError:
+        return ""
+
+
+# ---------------------------------------------------------------- disk scanners
+
+
+
+
+
+TITLE_RE = re.compile(rb'"type":"(ai|custom)-title","(?:aiTitle|customTitle)":"((?:[^"\\]|\\.)*)"')
+TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9_-]*[^>]*>")
+
+# roster color -> ANSI SGR, for colorizing completion candidates
+COLOR_ANSI = {
+    "red": "31", "green": "32", "yellow": "33", "blue": "34", "purple": "35",
+    "magenta": "35", "cyan": "36", "orange": "38;5;208", "pink": "38;5;205",
+}
+
+# The harness's titler sometimes echoes a name instead of titling: a 559-line
+# session titled "claude" six times, a 16728-line one titled
+# "resume-background-agent" 1091 times. Real ai titles are natural language, so
+# any whitespace-free ai title is treated as absent; this set catches multiword
+# junk. Custom titles are exempt: the user typed those deliberately.
+JUNK_TITLES = {"new session"}
+
+
+def _json_str(raw):
+    try:
+        return json.loads('"' + raw.decode("utf-8", "replace") + '"')
+    except ValueError:
+        return raw.decode("utf-8", "replace")
+
+
+def _first_user_message(head_lines):
+    for line in head_lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("type") != "user" or rec.get("isMeta"):
+            continue
+        content = (rec.get("message") or {}).get("content")
+        if isinstance(content, list):
+            content = next((c.get("text") for c in content if isinstance(c, dict) and c.get("type") == "text"), None)
+        if not isinstance(content, str) or content.startswith("Caveat:"):
+            continue
+        if any(tag in content for tag in ("<command-name>", "<local-command-caveat>", "<local-command-stdout>")):
+            continue  # slash-command records wear a user hat but title nothing
+        text = TAG_RE.sub(" ", content).strip()  # unwrap teammate-message/command tags
+        if text:
+            return text
+    return None
+
+
+def session_title(path, limit=60):
+    """Newest custom title, else newest ai title, else the first real user message.
+
+    Titles are rewritten throughout the file, so the tail almost always holds
+    the current one; only title-less files pay for a head read.
+    """
+    def pick(found):
+        for kind in (b"custom", b"ai"):
+            raw = found.get(kind)
+            if not raw:
+                continue
+            text = " ".join(_json_str(raw).split())
+            if not text:
+                continue
+            if kind == b"ai" and (" " not in text or text.lower() in JUNK_TITLES):
+                continue  # name echo, not a title
+            return text
+        return None
+
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            fh.seek(max(0, size - TITLE_TAIL_BYTES))
+            found = {}
+            for match in TITLE_RE.finditer(fh.read()):
+                found[match.group(1)] = match.group(2)  # last of each kind wins
+            title = pick(found)
+            if not title:
+                had_records = bool(found)
+                fh.seek(0)
+                head = fh.read(TITLE_HEAD_BYTES).decode("utf-8", "replace")
+                if not had_records:  # a junk newest title makes older ones suspect too
+                    for match in TITLE_RE.finditer(head.encode()):
+                        found[match.group(1)] = match.group(2)
+                    title = pick(found)
+                if not title:
+                    title = _first_user_message(head.splitlines())
+    except OSError:
+        return None
+    if not title:
+        return None
+    title = " ".join(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", title).split())
+    return title[: limit - 3] + "..." if len(title) > limit else title
+
+
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+
+
+# ------------------------------------------------------- transcript resolution
+#
+# One engine. Every caller that needs "which transcript is this agent" goes
+# through RESOLVER.resolve_transcript(); nothing else may pick a file. Each rung records
+# how it concluded, and the strength of that evidence, so callers can report it
+# and verify_identity() can judge the conclusion without re-deriving it.
+
+EXACT, STAMPS, NAME_ONLY = 3, 2, 1
+
+
+class Resolution:
+    """A chosen transcript plus how it was chosen. `path` None means no evidence."""
+
+    def __init__(self, path=None, fields=None, last_ts=0, via="", strength=0, others=(), reason=""):
+        self.path, self.fields, self.last_ts = path, fields or {}, last_ts
+        self.via, self.strength, self.others, self.reason = via, strength, list(others), reason
+
+    def __bool__(self):
+        return self.path is not None
+
+    def stamped(self, key):
+        return self.fields.get(key, (None,))[0]
+
+
+def lead_title(team_entries, team, limit=60):
+    """Title for a team: its lead's session title, via the roster's leadSessionId."""
+    for entry in team_entries:
+        if entry["team"] == team and entry.get("leadSessionId"):
+            res = RESOLVER.resolve_transcript(lead_session=entry["leadSessionId"], team=entry.get("team"),
+                                     is_lead=True, quick=True)
+            return session_title(res.path, limit) if res else None
+    return None
+
+
+
+
+def flatten_cwd(cwd):
+    """A cwd's project dir name. Every non-alphanumeric becomes '-' (verified
+    against 70 of this machine's project dirs). Lossy, so it has no inverse."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def agent_cwd(ctx):
+    """Working dir for the revived process, or None. Never a guess.
+
+    /cd moves a session's cwd mid-life, so a transcript records several, and the
+    newest is not automatically right: --resume looks the session up under the
+    project dir, and that dir tracks only one of them (usually the first, but
+    not always: of 20 transcripts here that moved, most match their first cwd
+    and at least one matches its last). So prefer whichever recorded cwd
+    actually flattens to this transcript's own project dir, newest first, and
+    fall back to the newest with a warning.
+
+    The dir name itself is not a source: flattening maps every non-alphanumeric
+    to '-', so '_', '.', ' ', '-' and '/' all collapse together (verified across
+    70 project dirs), which leaves it with no inverse.
+    """
+    merged, path = ctx["merged"], ctx["transcript"][0]
+    trail = list(ctx["transcript"][1].get("_cwds", ([],))[0])
+    roster_cwd = (ctx.get("team_entry") or {}).get("member", {}).get("cwd")
+    candidates = trail + ([roster_cwd] if roster_cwd else [])
+    project = path.parent.name
+
+    consistent = [c for c in candidates if flatten_cwd(c) == project]
+    if consistent:
+        return consistent[-1]
+    if candidates:
+        if len(set(candidates)) > 1:
+            warn(f"cwd moved during this session ({' -> '.join(dict.fromkeys(candidates))}); "
+                 f"none flattens to project dir {project}, using the newest")
+        return candidates[-1]
+    fallback = merged.pick("cwd")[0]
+    if not fallback:
+        warn("no cwd recorded in roster or transcript; launching without -c "
+             "(the pane inherits the tmux server's cwd, which may break --resume lookup)")
+    return fallback or None
+
+
+
+
+def team_souls(team, entries=None):
+    """{name: Resolution} for everything in a team the resolver can still find.
+
+    "Is there anything here to resurrect" is the engine's own question, so it
+    is answered here once: the reaper uses it to decide what is cruft, and the
+    completion labels use it to mark teams that cannot come back. Answering it
+    anywhere else means a team could be advertised as revivable and deleted by
+    the same run.
+    """
+    if entries is None:
+        entries = [e for e in RESOLVER.scan_teams() if e["team"] == team]
+    souls = {}
+    lead_session = entries[0]["leadSessionId"] if entries else None
+    if lead_session:
+        found = RESOLVER.resolve_transcript(lead_session=lead_session, team=team, is_lead=True, quick=True)
+        if found:
+            souls["team-lead"] = found
+    for entry in entries:
+        name = entry["member"].get("name")
+        if name and name != "team-lead" and name not in souls:
+            found = RESOLVER.resolve_transcript(team=team, name=name, quick=True)
+            if found:
+                souls[name] = found
+    return souls
+
+
+def verify_identity(res, want_name, want_team, allow_team_change, force):
+    """Judge the conclusion, not the path that reached it.
+
+    Whatever rung resolution used, the transcript we are about to resume must
+    not belong to somebody else: a process launched with --agent-id X wearing
+    Y's conversation is the worst outcome this tool can produce.
+    """
+    stamped_name, stamped_team = res.stamped("agentName"), res.stamped("teamName")
+
+    if stamped_name is None:
+        # Unstamped means a lead transcript. Only an exact rung may claim one.
+        if res.strength < EXACT:
+            message = (f"{res.path.name} carries no agent stamps and was matched by {res.via}; "
+                       "only an exact session id may claim an unstamped transcript")
+            if not force:
+                die(f"{message} (--force to override)")
+            warn(f"--force: {message}")
+        return
+
+    if want_name and stamped_name != want_name:
+        message = (f"{res.path.name} is stamped agentName={stamped_name!r}, not {want_name!r} "
+                   f"(matched by {res.via})")
+        if not force:
+            die(f"{message}; refusing to resume another agent's conversation (--force to override)")
+        warn(f"--force: {message}; resuming another agent's conversation anyway")
+
+    if want_team and stamped_team and stamped_team != want_team:
+        # Legitimate when rebinding, when the name proved unique anyway, or when a
+        # live process wearing this identity is what identified the transcript. In
+        # that last case the stamps are the stale half by construction: they record
+        # the team the agent was in when those lines were written, argv records the
+        # team it is in now, and a rebind is exactly what puts the two out of step.
+        # Dying here would refuse to resume an agent that is running in front of us.
+        if allow_team_change or res.strength == NAME_ONLY or res.via.startswith("live pid "):
+            warn(f"{res.path.name} is stamped team={stamped_team}, resuming as {want_team}")
+        elif not force:
+            die(f"{res.path.name} is stamped team={stamped_team}, not {want_team} "
+                f"(matched by {res.via}); --force to override")
+        else:
+            warn(f"--force: {res.path.name} is stamped team={stamped_team}, resuming as {want_team}")
+
+
+def apply_selector(token, args, table):
+    """Turn the bare leading argument into --resume or --agent-id."""
+    if UUID_RE.match(token):
+        if args.resume and args.resume != token:
+            die(f"conflicting sessions: {token} and --resume {args.resume}")
+        args.resume = token
+        return
+    if "@" in token:
+        if args.agent_id and args.agent_id != token:
+            die(f"conflicting agents: {token} and --agent-id {args.agent_id}")
+        args.agent_id = token
+        return
+    if RESOLVER.roster_path(token).exists():
+        args.team = token
+        return
+
+    matches = [e for e in RESOLVER.scan_teams() if e["member"].get("name") == token]
+    matches.sort(key=lambda e: e["ts"], reverse=True)
+    if matches:
+        if len({e["team"] for e in matches}) > 1:
+            # Same rule the resolver applies: a name living in several rosters is
+            # not an identity. Choosing "newest" here would silently decide whose
+            # conversation gets resumed.
+            warn(f"{token!r} is in {len(matches)} rosters, so it names nobody; pick one:")
+            for entry in matches:
+                agent_id = entry["member"].get("agentId")
+                procs = RESOLVER.live_agent_procs(agent_id, table)
+                state = f"running{state_note(procs[0][0])}" if procs else "not running"
+                warn(f"    {agent_id:<44} joined {ms_str(entry['ts'])}  [{state}]")
+            die("pass one of those ids, or a session uuid")
+        args.agent_id = matches[0]["member"].get("agentId")
+        return
+
+    res = RESOLVER.resolve_transcript(name=token)
+    if not res:
+        die(f"no agent named {token!r} in any roster: {res.reason}")
+    warn(f"no team config lists {token!r}; matched by transcript ({res.via})")
+    if res.others:
+        warn(f"{len(res.others) + 1} transcripts for {token!r}:")
+        for path, fields, last_ts in [(res.path, res.fields, res.last_ts)] + res.others:
+            warn(f"    {path.name}  team={fields.get('teamName', (None,))[0]}  last active {ms_str(last_ts)}")
+        warn(f"  choosing the most recent: {res.path.name}")
+    args.resume = res.path.stem
+    if res.stamped("teamName"):
+        args.agent_id = args.agent_id or f"{token}@{res.stamped('teamName')}"
+
+
+
+
+def boot_join():
+    """[(team, pid, createdAt)] pairing each implicit team with the live process
+    that minted it, newest first.
+
+    A boot mints its implicit team named after its internal session id, while
+    sessions/<pid>.json keeps the *resumed transcript* id. The two diverge after
+    a resume (before one they are the same id, which lead_pid exploits as an
+    exact join), and nothing else records the post-resume internal id, so for
+    those teams time is a join of last resort: a
+    team dir is created a few hundred ms before the session file when a boot
+    mints it eagerly (measured 281, 252 and 402ms), but it can instead be
+    minted at the first spawn, minutes later, which this window does not cover.
+    That is why the exact rungs above it are tried first.
+    """
+    live = [
+        (data["pid"], data.get("startedAt") or 0)
+        for data in RESOLVER.session_registry()
+        if pid_alive(data["pid"], data.get("procStart"))
+    ]
+    pairs = []
+    for cfg in (RESOLVER.roster_path(d.name) for d in RESOLVER.team_dirs()):
+        try:
+            data = json.loads(cfg.read_text())
+        except (OSError, ValueError):
+            continue
+        created = data.get("createdAt") or 0
+        for pid, started in live:
+            if 0 <= started - created <= TEAM_MINT_WINDOW_MS:
+                pairs.append((data.get("name") or cfg.parent.name, pid, created))
+    pairs.sort(key=lambda item: item[2], reverse=True)
+    for team in {name for name, _, _ in pairs}:
+        owners = {pid for name, pid, _ in pairs if name == team}
+        if len(owners) > 1:
+            warn(f"{team} pairs with {len(owners)} processes started within "
+                 f"{TEAM_MINT_WINDOW_MS}ms ({', '.join(map(str, sorted(owners)))}); "
+                 "the pick between them is arbitrary")
+    return pairs
+
+
+
+
+
+
+def resolve_to_team(args, ctx):
+    """--to-team live -> the team this agent's own lead is currently running as.
+
+    Pure ~/.claude hops, no process tree: the agent's roster names its lead
+    session, the session registry maps that to a live pid, and that pid's boot
+    timestamp identifies the team it minted.
+    """
+    if args.to_team not in ("live", "auto"):
+        cfg = RESOLVER.roster_path(args.to_team)
+        if not cfg.exists():
+            die(f"no team config at {cfg}")
+        return args.to_team
+
+    merged = ctx["merged"]
+    source = merged.pick("teamName")[0]
+    pid, alive, how, _exact = RESOLVER.lead_pid(merged.pick("parentSessionId")[0], source)
+    if not (pid and alive):
+        die(f"no live lead for team {source}; pass --to-team <name> explicitly")
+    dest, _ = RESOLVER.team_minted_by(pid)
+    if not dest:
+        die(f"cannot tell which team pid {pid} runs as; pass --to-team <name> explicitly")
+    print(f"rebind   {how}, now running as team {dest}")
+    return dest
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------- tmux
+
+def tmux(socket, *args):
+    return subprocess.run(["tmux", "-L", socket, *args], capture_output=True, text=True)
+
+
+def socket_dir():
+    return Path(os.environ.get("TMUX_TMPDIR") or f"/tmp/tmux-{os.getuid()}")
+
+
+def socket_alive(socket):
+    """Is a tmux server listening on this socket?
+
+    One test, everywhere. A connect() answers it in microseconds; asking tmux
+    costs a process spawn each time, and having two tests meant a socket could
+    be 'dead' to the reaper and 'live' to the launcher.
+    """
+    path = socket if isinstance(socket, Path) else socket_dir() / socket
+    probe = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+    probe.settimeout(0.2)
+    try:
+        probe.connect(str(path))
+        return True
+    except (ConnectionRefusedError, FileNotFoundError):
+        return False
+    except OSError:
+        return True  # ambiguous: assume live rather than reap or clobber
+    finally:
+        probe.close()
+
+
+def swarm_sockets():
+    """Swarm socket files, newest first. The one place that directory is listed."""
+    return sorted(socket_dir().glob(f"{SOCKET_PREFIX}*"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def list_panes(socket):
+    res = tmux(socket, "list-panes", "-a", "-F", "#{session_name}\t#{window_id}\t#{pane_id}\t#{pane_pid}")
+    if res.returncode != 0:
+        return []
+    panes = []
+    for line in res.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 4 and parts[3].isdigit():
+            panes.append({"session": parts[0], "window": parts[1], "pane": parts[2], "pid": int(parts[3])})
+    return panes
+
+
+def descendants(root_pid, table):
+    kids = defaultdict(list)
+    for pid, ppid, _ in table:
+        kids[ppid].append(pid)
+    seen, stack = set(), [root_pid]
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        stack.extend(kids.get(pid, []))
+    return seen
+
+
+CLAUDE_PROC = re.compile(r"(^|/)claude$|/versions/[\d.]+$")
+
+
+def looks_like_claude(args):
+    """Match on argv[0] only. A tmux server's own cmdline embeds the whole
+    spawn command, so searching the full args counts the server as an agent."""
+    argv0 = args.split(None, 1)[0] if args.strip() else ""
+    return bool(CLAUDE_PROC.search(argv0))
+
+
+def pane_occupants(socket, pane_id, table):
+    """(pane_exists, [(pid, args)] of claude processes running in it)."""
+    by_pid = {pid: args for pid, _, args in table}
+    for pane in list_panes(socket):
+        if pane["pane"] != pane_id:
+            continue
+        procs = [(pid, by_pid.get(pid, "")) for pid in descendants(pane["pid"], table)]
+        return True, [(pid, args) for pid, args in procs if looks_like_claude(args)]
+    return False, []
+
+
+def own_lineage(table):
+    """Our own pid and ancestors, whose cmdlines quote the agent id we searched for."""
+    parents = {p: pp for p, pp, _ in table}
+    pid, chain = os.getpid(), set()
+    while pid and pid not in chain:
+        chain.add(pid)
+        pid = parents.get(pid)
+    return chain
+
+
+def _argv_pairs(args):
+    """{"--flag value"} for each flag/value pair in a cmdline, both spellings.
+
+    Substring matching would let `--agent-id alpha@team` match a process running
+    `--agent-id alpha@team2`, which for forged team names is a real collision.
+    """
+    tokens = args.split()
+    pairs = set()
+    for index, token in enumerate(tokens):
+        if not token.startswith("-"):
+            continue
+        if "=" in token:
+            flag, _, value = token.partition("=")
+            pairs.add(f"{flag} {value}")
+        elif index + 1 < len(tokens):
+            pairs.add(f"{token} {tokens[index + 1]}")
+    return pairs
+
+
+def claude_procs(needle, table):
+    """Live claude processes whose argv contains this exact flag/value pair,
+    excluding our own lineage (whose cmdline quotes what we searched for)."""
+    mine = own_lineage(table)
+    return [
+        (pid, args)
+        for pid, _, args in table
+        if needle in _argv_pairs(args) and pid not in mine and looks_like_claude(args)
+    ]
+
+
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------- resolution
+
+class Merged:
+    """Field values from many sources; most recent wins."""
+
+    def __init__(self):
+        self.cands = defaultdict(list)
+
+    def add(self, field, value, ts, source):
+        if value in (None, ""):
+            return
+        self.cands[field].append((value, ts or 0, source))
+
+    def pick(self, field, prefer_specific=False):
+        cands = self.cands.get(field)
+        if not cands:
+            return None, None, None
+        value, ts, source = max(cands, key=lambda c: c[1])
+        if prefer_specific and isinstance(value, str):
+            # e.g. jsonl records "claude-opus-5" but the team config kept
+            # "claude-opus-5[1m]", same model, one is simply lossier.
+            # Only a bracketed variant counts (claude-opus-5 -> claude-opus-5[1m]).
+            # Any longer string would let a stale roster silently revert a model
+            # the user changed mid-session.
+            richer = [c for c in cands if isinstance(c[0], str) and c[0].startswith(value + "[")]
+            if richer:
+                value, ts, source = max(richer, key=lambda c: len(c[0]))
+                source += " (more specific)"
+        return value, ts, source
+
+    def conflicts(self, field):
+        return {c[0] for c in self.cands.get(field, [])}
+
+
+def build(args):
+    merged = Merged()
+    team_entry = None
+    transcript = None
+    session_uuid = args.resume
+    others = []
+
+    if args.agent_id:
+        matches = [e for e in RESOLVER.scan_teams() if e["member"].get("agentId") == args.agent_id]
+        if matches:
+            matches.sort(key=lambda e: e["ts"], reverse=True)
+            team_entry = matches[0]
+            if len(matches) > 1:
+                warn(f"{len(matches)} team configs claim {args.agent_id}; using {team_entry['cfg']}")
+        else:
+            warn(f"no team config lists {args.agent_id}; falling back to name@team parsing")
+
+    team = name = None
+    if team_entry:
+        team, name = team_entry["team"], team_entry["member"].get("name")
+    elif args.agent_id and "@" in args.agent_id:
+        name, team = args.agent_id.split("@", 1)
+
+    worn_id = f"{name}@{team}" if name and team else None
+    is_lead_member = bool(team_entry) and team_entry["member"].get("agentId") == team_entry.get("leadAgentId")
+    res = RESOLVER.resolve_transcript(
+        session_uuid=session_uuid,
+        lead_session=team_entry.get("leadSessionId") if is_lead_member else None,
+        team=team,
+        name=name,
+        is_lead=is_lead_member,
+    )
+    if not res:
+        die(
+            f"{res.reason}; a truly in-process agent leaves only a sidechain under the lead's "
+            "subagents/ dir, which no CLI can resume"
+        )
+    verify_identity(res, name, team, allow_team_change=bool(args.to_team), force=args.force)
+    transcript = (res.path, res.fields, res.last_ts)
+    others = [(p, f, t) for p, f, t in res.others]
+    session_uuid = res.path.stem
+
+    if not team_entry:  # a uuid or a stranger's id: adopt the roster the transcript names
+        stamped_team, stamped_name = res.stamped("teamName"), res.stamped("agentName")
+        if stamped_team and stamped_name:
+            matches = [
+                e for e in RESOLVER.scan_teams()
+                if e["team"] == stamped_team and e["member"].get("name") == stamped_name
+            ]
+            matches.sort(key=lambda e: e["ts"], reverse=True)
+            team_entry = matches[0] if matches else None
+        elif not stamped_name and not stamped_team:
+            # Nothing stamped this transcript, so it is not a teammate's: only a
+            # lead writes an unstamped one. Ask the payloads it wrote which team
+            # it was running as, and adopt that team's lead entry. Without this
+            # the run falls through to the member path and dies asking for a
+            # tmux socket, which is several steps downstream of the real answer.
+            for led in RESOLVER.teams_led_by(session_uuid):
+                matches = [
+                    e for e in RESOLVER.scan_teams()
+                    if e["team"] == led and e["member"].get("agentId") == e.get("leadAgentId")
+                ]
+                matches.sort(key=lambda e: e["ts"], reverse=True)
+                if matches:
+                    team_entry = matches[0]
+                    break
+                # The team dir is gone, so state the identity the payloads prove
+                # and let forge_team rebuild the roster around it.
+                merged.add("teamName", led, res.last_ts, "spawn payloads in this transcript")
+                merged.add("agentName", "team-lead", res.last_ts, "spawn payloads in this transcript")
+                merged.add("agentId", f"team-lead@{led}", res.last_ts, "spawn payloads in this transcript")
+                break
+            else:
+                # Nothing stamped it and it spawned nobody, so it is neither a
+                # teammate's transcript nor a lead's. Say that, rather than
+                # continuing down the member path to fail on a missing socket,
+                # which describes a pane this transcript was never going to get.
+                if not args.agent_id:
+                    die(
+                        f"{res.path.name} carries no agent stamps, so it is not a teammate's, "
+                        "and records spawning no teammates, so it never led a team either. "
+                        "There is no agent identity to restore here: resume it with plain "
+                        "`claude --resume`, or pass --agent-id to give it one."
+                    )
+
+    # ---- team config contributions
+    if team_entry:
+        member, ts, src = team_entry["member"], team_entry["ts"], f"team:{team_entry['cfg']}"
+        merged.add("agentId", member.get("agentId"), ts, src)
+        merged.add("agentName", member.get("name"), ts, src)
+        merged.add("teamName", team_entry["team"], ts, src)
+        merged.add("color", member.get("color"), ts, src)
+        merged.add("agentType", member.get("agentType"), ts, src)
+        merged.add("model", member.get("model"), ts, src)
+        merged.add("cwd", member.get("cwd"), ts, src)
+        merged.add("tmuxPaneId", member.get("tmuxPaneId"), ts, src)
+        merged.add("backendType", member.get("backendType"), ts, src)
+        merged.add("parentSessionId", team_entry["leadSessionId"], ts, src)
+        if member.get("planModeRequired"):
+            merged.add("permissionMode", "plan", ts, src)
+
+    # ---- transcript contributions
+    path, fields, last_ts = transcript
+    src = f"jsonl:{path.name}"
+    for field, (value, ts) in fields.items():
+        if not field.startswith("_"):
+            merged.add(field, value, ts, src)
+    if not merged.cands.get("agentId"):
+        name = fields.get("agentName", (None,))[0]
+        team = fields.get("teamName", (None,))[0]
+        if name and team:
+            merged.add("agentId", f"{name}@{team}", last_ts, src + " (derived)")
+
+    # ---- a worn identity pins the identity triple
+    # When a live process is what identified this transcript, that process is
+    # wearing the identity now: its argv carries --agent-id and --team-name, so
+    # this is evidence already held rather than a derivation. Stamps are older
+    # lines on the same file and a rebind is exactly what puts them out of step,
+    # so per-field most-recent-wins can otherwise take the id from one source and
+    # the team from another, and emit a command wearing two different teams.
+    # Non-identity fields keep normal merge semantics.
+    if res.via.startswith("live pid ") and worn_id and "@" in worn_id:
+        worn_name, _, worn_team = worn_id.partition("@")
+        pinned = last_ts + 1  # outranks anything the transcript itself can say
+        merged.add("agentId", worn_id, pinned, "live argv")
+        merged.add("agentName", worn_name, pinned, "live argv")
+        merged.add("teamName", worn_team, pinned, "live argv")
+
+    # ---- last resort: the lead's record of spawning this member
+    # Timestamp 0 so it loses every tie: it is a snapshot from spawn time, and
+    # the roster or the transcript is newer whenever either has the field. Read
+    # lazily, since the lead transcript can be megabytes.
+    # Consulted unconditionally, not only when a field is missing: "present" is
+    # not "good". A roster can hold claude-opus-5 where the spawn record holds
+    # claude-opus-5[1m], and gating on absence would let that degraded value
+    # stick forever. One cached read of the lead transcript per process.
+    record = RESOLVER.spawn_payload(merged.pick("agentId")[0], merged.pick("parentSessionId")[0])
+    if record:
+        for key, field in SPAWN_FIELDS.items():
+            merged.add(field, record.get(key), 0, "lead transcript spawn record")
+        if record.get("plan_mode_required"):
+            merged.add("permissionMode", "plan", 0, "lead transcript spawn record")
+
+    # A dead team dir takes leadSessionId with it. Asking the engine rather than
+    # globbing here keeps one answer to "which session led this team": the glob is
+    # the engine's weakest rung, below the roster and the payloads, and reaching
+    # for it directly skipped both.
+    if not merged.cands.get("parentSessionId"):
+        lead = RESOLVER.lead_session_for(merged.pick("teamName")[0] or "")
+        if lead:
+            merged.add("parentSessionId", lead, transcript[2], "engine: lead session for team")
+
+    return {
+        "merged": merged,
+        "team_entry": team_entry,
+        "transcript": transcript,
+        "session_uuid": session_uuid,
+        "other_transcripts": others,
+        # A lead reached by rung 4 has no roster entry yet, so its own merged id
+        # is the answer: the payloads that named its team also make it the lead.
+        "lead_agent_id": (team_entry["leadAgentId"] if team_entry
+                          else (aid if (aid := merged.pick("agentId")[0])
+                                and merged.pick("agentName")[0] == "team-lead" else None)),
+        "via": res.via,
+    }
+
+
+
+
+def resolve_socket(ctx, args, table):
+    """--socket > socket hosting a live process for this agent > lead pid > invent."""
+    merged = ctx["merged"]
+    agent_id = merged.pick("agentId")[0]
+
+    if args.socket:
+        return args.socket, getattr(args, "socket_reason", "--socket")
+
+    sock, why = RESOLVER.socket_hosting([agent_id], table)
+    if sock:
+        return sock, why
+
+    # When rebinding, the member is being placed on the DESTINATION lead's
+    # server; asking about the source team fails outright when that team is dead,
+    # which is the usual reason for rebinding in the first place.
+    team = ctx.get("to_team") or merged.pick("teamName")[0]
+    parent = ctx.get("to_lead") if ctx.get("to_team") else merged.pick("parentSessionId")[0]
+    pid, alive, how, _exact = RESOLVER.lead_pid(parent, team)
+    if pid and not alive:
+        # A pid is only a socket name while its process exists. Pid numbers are
+        # recycled, so a server named after a dead one is either absent or, worse,
+        # a live stranger's, and members would silently join it. Fall through to
+        # the team's own server, which is what the rung below stands the team up on.
+        warn(f"the lead last ran as pid {pid}, which is gone; using the team's own server")
+        pid = None
+    if pid:
+        if not ctx.get("to_team"):
+            # The lead is up but has since minted a new implicit team. Reviving
+            # into the old roster still works, but the lead's SendMessage
+            # resolves against the team it runs as now, so mail to this member
+            # would land in an inbox directory nobody reads.
+            current, _ = RESOLVER.team_minted_by(pid)
+            if current and team and current != team and not ctx.get("stale_team_warned"):
+                warn(f"the lead is live but now runs as team {current}, not {team}; "
+                     f"without --to-team live this member will be mailbox-orphaned")
+        return f"{SOCKET_PREFIX}{pid}", how
+
+    # The team's lead is gone, so stand its own server back up rather than
+    # borrowing a live stranger's. The members keep their original identity, so
+    # they belong together on their own server, not scattered onto whichever
+    # session happens to be running. Named after the team, so every member of it
+    # lands on the same server across invocations, exactly as if the lead were
+    # still up and hosting them.
+    if team:
+        warn(f"no live lead for {team}; standing up that team's own server, as if its lead were up")
+        return f"{SOCKET_PREFIX}{team}", f"resurrected server for {team}"
+    return None, None
+
+
+def current_tmux():
+    """(socket name, pane id) of the pane we are running in, or (None, None).
+
+    $TMUX is "<socket path>,<server pid>,<session index>", so the socket we are
+    inside is knowable without asking tmux anything.
+    """
+    inside = os.environ.get("TMUX")
+    if not inside:
+        return None, None
+    return Path(inside.split(",")[0]).name, os.environ.get("TMUX_PANE")
+
+
+def swarm_session_live(socket):
+    """Is the swarm session actually up on this socket? Server plus session:
+    a live server with no claude-swarm session still needs one created."""
+    return bool(socket) and socket_alive(socket) and tmux(socket, "has-session", "-t", TMUX_SESSION).returncode == 0
+
+
+def socket_state(socket):
+    """What is actually true of this socket right now.
+
+    The `how` label only says where the name came from. Printing that alone
+    invites reading a derived name as a running server, which is how a socket
+    that had just been killed still read as live.
+    """
+    if not socket:
+        return "unresolved"
+    if not socket_alive(socket):
+        return "no server, will be created"
+    if not swarm_session_live(socket):
+        return f"server up, no {TMUX_SESSION} session, will be created"
+    clients = attached_clients(socket)
+    return f"live, {clients} client{'' if clients == 1 else 's'} attached"
+
+
+def attached_clients(socket):
+    result = tmux(socket, "list-clients", "-t", TMUX_SESSION)
+    return len([line for line in result.stdout.splitlines() if line]) if result.returncode == 0 else 0
+
+
+def maybe_attach(args, socket):
+    """Attach to the swarm unless something says not to, then say why not.
+
+    Reviving an agent you cannot see is half a job, so a session nobody is
+    watching gets attached. Three things veto it: CLAUDECODE, which means a
+    tool is driving and would have its shell replaced by a tmux client; no tty
+    to attach; and being inside tmux already, where attaching another server
+    nests clients.
+    """
+    if not socket or args.no_attach:
+        return
+    if not socket_alive(socket):
+        # Every veto below is about whether attaching is wanted. This one is
+        # about whether there is anything to attach to, so it comes first and
+        # suggests no command: a run where nothing launched leaves an empty
+        # socket, and printing "attach with ..." for it sends you at a server
+        # that was never stood up.
+        print(f"nothing to attach to: no server on {socket}")
+        return
+    reason = None
+    if os.environ.get("CLAUDECODE"):
+        reason = "a Claude Code tool is driving"
+    elif not sys.stdout.isatty():
+        reason = "not a terminal"
+    elif os.environ.get("TMUX"):
+        reason = "already inside tmux"
+    elif not args.attach and attached_clients(socket):
+        reason = "someone is already watching it"
+
+    if reason and not args.attach:
+        print(f"attach with: tmux -L {socket} attach -t {TMUX_SESSION}   ({reason})")
+        return
+    if reason and args.attach:
+        warn(f"--attach requested but {reason}; attach by hand: tmux -L {socket} attach -t {TMUX_SESSION}")
+        return
+    print(f"attaching to {socket}")
+    os.execvp("tmux", ["tmux", "-L", socket, "attach", "-t", TMUX_SESSION])
+
+
+# roster colour -> tmux colour, for the names where they differ (2.1.202 map)
+TMUX_COLORS = {"purple": "magenta", "orange": "colour208", "pink": "colour205"}
+
+
+LAUNCH_APPEAR_S = 10.0   # only ever waited out when nothing appears at all
+LAUNCH_SETTLE_S = 1.5    # then confirm it did not exit immediately
+
+
+def launch_present(socket, pane, agent_id):
+    fresh = RESOLVER.ps_table(refresh=True)
+    if agent_id and claude_procs(f"--agent-id {agent_id}", fresh):
+        return True
+    if pane:
+        _, occupants = pane_occupants(socket, pane, fresh)
+        if occupants:
+            return True
+    return False
+
+
+def launch_survived(socket, pane, agent_id, transcript=None, since=None):
+    """Did a claude come up and stay up? Asked before the roster is told it did.
+
+    Two different failures, so two waits. Appearing is near-instant: the pane
+    execs the binary and reads the transcript afterwards, so an 81MB session is
+    visible in under a tenth of a second, and this timeout is only ever waited
+    out when nothing appears at all. Dying immediately afterwards (bad auth, a
+    transcript it cannot load) is the one that would otherwise be recorded as a
+    live member, so a launch is also given a moment and re-checked.
+    """
+    deadline = time.monotonic() + LAUNCH_APPEAR_S
+    while not launch_present(socket, pane, agent_id):
+        if time.monotonic() > deadline:
+            return False, f"nothing appeared in {LAUNCH_APPEAR_S:.0f}s"
+        time.sleep(0.1)
+    # A booting agent writes its own transcript within seconds, which says more
+    # than "a process exists": it got far enough to load the session. Waiting
+    # for that beats waiting out the settle, so take it as soon as it lands.
+    settle_until = time.monotonic() + LAUNCH_SETTLE_S
+    while time.monotonic() < settle_until:
+        if transcript and since is not None:
+            try:
+                if transcript.stat().st_mtime > since:
+                    return True, "wrote to its transcript"
+            except OSError:
+                pass
+        time.sleep(0.1)
+    if not launch_present(socket, pane, agent_id):
+        return False, f"it started and exited within {LAUNCH_SETTLE_S:.1f}s"
+    return True, "running, no transcript write yet"
+
+
+def tint_pane(socket, pane, colour, name, dry):
+    """Tint a pane the way the harness tints its own.
+
+    A pane this tool creates gets no tint (only a real spawn applies one), so
+    without this a revived agent is the one grey pane in a coloured swarm. It
+    is three pane options plus the bold titled border, matching what the
+    harness does, so revived and spawned members look alike.
+    """
+    if not (colour or name) or (not pane and not dry):
+        return
+    tint = TMUX_COLORS.get(colour, colour)
+    actions = []
+    if tint:
+        actions += [
+            ("set-option", "-p", "-t", pane, "window-style", f"bg=default,fg={tint}"),
+            ("set-option", "-p", "-t", pane, "pane-border-style", f"fg={tint}"),
+            ("set-option", "-p", "-t", pane, "pane-active-border-style", f"fg={tint}"),
+        ]
+    if name:
+        actions.append(("select-pane", "-t", pane, "-T", name))
+        actions.append(("set-option", "-p", "-t", pane, "pane-border-format",
+                        f"#[fg={tint or 'default'},bold] #{{pane_title}} #[default]"))
+    where = f"{pane or '<new pane>'} {tint or '(no colour)'}, titled {name}"
+    if not dry:
+        for action in actions:
+            tmux(socket, *action)
+    step(dry, f"would tint {where}", f"tinted {where}")
+
+
+def pane_of_pid(socket, pid, table):
+    for pane in list_panes(socket):
+        if pid in descendants(pane["pid"], table):
+            return pane["pane"]
+    return None
+
+
+def launch(socket, want_pane, cwd, command, dry, replace_pane=None):
+    """Start the agent: reuse the socket/session if live, else rebuild it.
+
+    Never reuses an occupied pane: the caller has already decided that whatever
+    lives in the recorded pane is not this agent, so we always get our own pane.
+    """
+    session_live = swarm_session_live(socket)
+    # -u ANTHROPIC_BASE_URL: a real resume must never inherit a poison left on
+    # the server by an interrupted Recipe 1 run.
+    quoted = (
+        "exec env -u ANTHROPIC_BASE_URL "
+        + " ".join(TEAM_ENV) + " "
+        + " ".join(shlex.quote(c) for c in command)
+    )
+
+    if replace_pane and not session_live:
+        # The caller decided a specific pane must die. If the session is gone we
+        # cannot honor that, and silently downgrading would leave the old
+        # process alive while the report claimed it was replaced.
+        warn(f"cannot replace pane {replace_pane}: no live {TMUX_SESSION} session on {socket}")
+        replace_pane = None
+
+    if session_live and not dry:
+        # An existing server has whatever env it was born with. Top up only
+        # what is missing; a secret's value rides a transient client argv here,
+        # so skip it whenever the server already has the variable.
+        for key in INHERIT_ENV:
+            if os.environ.get(key) and tmux(socket, "show-environment", "-g", key).returncode != 0:
+                tmux(socket, "set-environment", "-g", key, os.environ[key])
+
+    if replace_pane and session_live:
+        # This pane holds a live process resuming the same transcript, so kill it
+        # in place rather than leave two processes appending to one JSONL.
+        argv = ["respawn-pane", "-k", "-t", replace_pane]
+        action = "respawn"
+    elif not session_live:
+        if not socket_alive(socket):
+            warn(f"socket {socket} is down, reestablishing")
+        else:
+            warn(f"session {TMUX_SESSION} missing on {socket}, recreating")
+        argv = ["new-session", "-d", "-s", TMUX_SESSION, "-n", TMUX_WINDOW, "-P", "-F", "#{pane_id}"]
+        action = "new-session"
+    elif want_pane and any(p["pane"] == want_pane for p in list_panes(socket)):
+        argv = ["split-window", "-t", want_pane, "-P", "-F", "#{pane_id}"]
+        action = "split"
+    else:
+        if want_pane:
+            warn(f"recorded pane {want_pane} no longer exists on {socket}")
+        panes = [p for p in list_panes(socket) if p["session"] == TMUX_SESSION]
+        if panes:
+            argv = ["split-window", "-t", panes[0]["pane"], "-P", "-F", "#{pane_id}"]
+            action = "split"
+        else:
+            argv = ["new-window", "-t", TMUX_SESSION, "-n", TMUX_WINDOW, "-P", "-F", "#{pane_id}"]
+            action = "new-window"
+    if cwd:
+        argv += ["-c", cwd]
+    argv.append(quoted)
+
+    rendered = f"tmux -L {socket} {' '.join(shlex.quote(a) for a in argv)}"
+    if dry:
+        step(True, f"would run: {rendered}", "")
+        return (replace_pane if action == "respawn" else None), action
+    res = tmux(socket, *argv)
+    if res.returncode != 0:
+        die(f"tmux {argv[0]} failed: {res.stderr.strip()}")
+    step(False, "", f"ran: {rendered}")
+    # respawn-pane takes no -P/-F, so it prints nothing: the pane is the one we
+    # aimed at. Everything else printed its new pane id.
+    return (replace_pane if action == "respawn" else res.stdout.strip()), action
+
+
+SPAWN_MARKER = "teammate_spawned"
+
+# spawn payload key -> the field name the merge uses
+SPAWN_FIELDS = {
+    "agent_id": "agentId",
+    "name": "agentName",
+    "team_name": "teamName",
+    "agent_type": "agentType",
+    "model": "model",
+    "color": "color",
+    "tmux_pane_id": "tmuxPaneId",
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def forge_team(ctx, dry):
+    """Recreate a team dir the graceful lead exit rm -rf'd, from merged fields.
+
+    The roster is scaffolding; the transcript is the identity. Everything the
+    config needs is already in the merge, so a missing team is not fatal."""
+    merged = ctx["merged"]
+    team = merged.pick("teamName")[0]
+    name = merged.pick("agentName")[0]
+    if not team or not name:
+        return
+    cfg = RESOLVER.roster_path(team)
+    if cfg.exists():
+        return
+    now = int(time.time() * 1000)
+    lead_sid = merged.pick("parentSessionId")[0] or ""
+    if name == "team-lead":
+        # Forging for the lead itself. Recording the resumed transcript as
+        # leadSessionId is what lets rung 1 find this lead again next time.
+        #
+        # The members come back too, from the lead's own spawn payloads. Writing
+        # a lead-only roster would unregister every teammate it ever created:
+        # their transcripts survive, but nothing lists them, so reviving one by
+        # name reports that no team config lists a member sitting right there.
+        # The payloads carry the colour, type and model the roster held, which is
+        # the same evidence RESOLVER.led_teams() uses to identify this lead at all.
+        members = [{
+            "agentId": f"team-lead@{team}",
+            "name": "team-lead",
+            "agentType": "team-lead",
+            "joinedAt": now,
+            "tmuxPaneId": "leader",
+            **({"cwd": cwd} if (cwd := agent_cwd(ctx)) else {}),
+            "subscriptions": [],
+            "backendType": "in-process",
+        }]
+        for payload in RESOLVER.members_spawned_into(ctx["session_uuid"], team):
+            entry = {
+                "agentId": payload.get("agent_id") or f"{payload['name']}@{team}",
+                "name": payload["name"],
+                "joinedAt": now,
+                "tmuxPaneId": payload.get("tmux_pane_id") or "",
+                "subscriptions": [],
+                "agentType": payload.get("agent_type") or DEFAULT_AGENT_TYPE,
+                "planModeRequired": bool(payload.get("plan_mode_required")),
+                "backendType": "tmux",
+                "isActive": False,
+            }
+            for key in ("color", "model"):
+                if payload.get(key):
+                    entry[key] = payload[key]
+            members.append(entry)
+        config = {
+            "name": team,
+            "createdAt": now,
+            "leadAgentId": f"team-lead@{team}",
+            "leadSessionId": ctx["session_uuid"],
+            "members": members,
+        }
+        rebuilt = ", ".join(m["name"] for m in members[1:]) or "no members recovered"
+        if dry:
+            step(True, f"would forge {cfg} (lead + {rebuilt}) and seed every inbox", "")
+            return
+        (cfg.parent / "inboxes").mkdir(parents=True, exist_ok=True)
+        edit_team_config(cfg, lambda _: config, f"forged for the lead being resumed ({rebuilt})",
+                         create=config)
+        for member in members:
+            ensure_inbox(team, member["name"], dry)
+        ctx["lead_agent_id"] = f"team-lead@{team}"
+        return
+    member = {
+        "agentId": merged.pick("agentId")[0] or f"{name}@{team}",
+        "name": name,
+        "joinedAt": now,
+        "tmuxPaneId": "",
+        "subscriptions": [],
+        "agentType": merged.pick("agentType")[0] or DEFAULT_AGENT_TYPE,
+        "planModeRequired": merged.pick("permissionMode")[0] == "plan",
+        **({"cwd": cwd} if (cwd := agent_cwd(ctx)) else {}),
+        "backendType": "tmux",
+        "isActive": False,
+    }
+    color = merged.pick("color")[0]
+    if color:
+        member["color"] = color
+    model = merged.pick("model", prefer_specific=True)[0]
+    if model:
+        member["model"] = model
+    config = {
+        "name": team,
+        "createdAt": now,
+        "leadAgentId": f"team-lead@{team}",
+        "leadSessionId": lead_sid,
+        "members": [
+            {
+                "agentId": f"team-lead@{team}",
+                "name": "team-lead",
+                "agentType": "team-lead",
+                "joinedAt": now,
+                "tmuxPaneId": "leader",
+                **({"cwd": cwd} if (cwd := agent_cwd(ctx)) else {}),
+                "subscriptions": [],
+                "backendType": "in-process",
+            },
+            member,
+        ],
+    }
+    if dry:
+        step(True, f"would forge {cfg} (lead + {name}) and seed both inboxes", "")
+        return
+    (cfg.parent / "inboxes").mkdir(parents=True, exist_ok=True)
+    edit_team_config(cfg, lambda _: config, "forged (a graceful lead exit had deleted)", create=config)
+    for inbox in ("team-lead", name):
+        ensure_inbox(team, inbox, dry)
+    # re-resolve so the roster patch after launch has an entry to patch
+    matches = [e for e in RESOLVER.scan_teams() if e["member"].get("agentId") == member["agentId"]]
+    if matches:
+        ctx["team_entry"] = matches[0]
+        ctx["lead_agent_id"] = matches[0].get("leadAgentId")
+
+
+@contextlib.contextmanager
+def team_lock(cfg, timeout=5.0):
+    """Hold the roster's config.json.lock, the same lockfile the harness's own
+    locked write helper uses (architecture.md). Without it, patching the roster
+    of a live lead races that lead's own spawn and shutdown writes, and one of
+    the two updates is simply lost."""
+    lock = cfg.with_name("config.json.lock")
+    deadline = time.time() + timeout
+    handle = None
+    while handle is None:
+        try:
+            handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if time.time() > deadline:
+                warn(f"{lock.name} held by someone else for {timeout}s; writing anyway")
+                break
+            time.sleep(0.05)
+        except OSError:
+            break  # unwritable dir: the write below will report the real error
+    try:
+        yield
+    finally:
+        if handle is not None:
+            os.close(handle)
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+
+
+_BACKED_UP = set()
+
+
+def edit_team_config(cfg, mutate, note, create=None):
+    """Read-modify-write a roster under the harness's lockfile.
+
+    The read happens inside the lock as well, so a harness write landing
+    between read and write cannot be overwritten. `mutate(data)` returns the
+    new data, or None to make the write a no-op.
+    """
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    with team_lock(cfg):
+        if cfg.exists():
+            try:
+                data = json.loads(cfg.read_text())
+            except ValueError as exc:
+                warn(f"{cfg} is not valid JSON ({exc}); leaving it alone")
+                return False
+        elif create is None:
+            warn(f"no roster at {cfg}")
+            return False
+        else:
+            data = create
+
+        data = mutate(data)
+        if data is None:
+            return False
+
+        suffix = ""
+        if cfg.exists():
+            # One backup per run: the pre-run state, not a mid-run write.
+            backup = cfg.with_suffix(f".json.bak-{TOOL}")
+            if str(cfg) not in _BACKED_UP:
+                backup.write_text(cfg.read_text())
+                _BACKED_UP.add(str(cfg))
+            suffix = f" (backup: {backup.name})"
+        tmp = cfg.with_suffix(f".json.tmp-{TOOL}")
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        os.replace(tmp, cfg)
+    print(f"  {note} {cfg}{suffix}")
+    return True
+
+
+def ensure_inbox(team, name, dry):
+    """A zero-byte inbox is a parse error that wedges both reader and writer."""
+    if not team or not name:
+        return
+    path = RESOLVER.inbox_path(team, name)
+    try:
+        if path.exists() and path.stat().st_size > 0:
+            return
+    except OSError:
+        pass
+    if dry:
+        step(True, f"would seed {path} with []", "")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("[]")
+    step(False, "", f"seeded {path} with []")
+
+
+def synced_fields(ctx):
+    """The member fields both roster writers keep in step with the launch."""
+    merged = ctx["merged"]
+    out = {}
+    for field in ("color", "model", "agentType"):
+        value = merged.pick(field, prefer_specific=(field == "model"))[0]
+        if value:
+            out[field] = value
+    return out
+
+
+def register_member(team, ctx, pane, dry, alive=True):
+    """Hand-register the rebound member in the destination roster (Recipe 1b).
+
+    SendMessage's roster fallback reads this file at send time, so the entry is
+    what makes the member addressable from the live lead."""
+    merged = ctx["merged"]
+    cfg = RESOLVER.roster_path(team)
+    name = merged.pick("agentName")[0]
+    agent_id = f"{name}@{team}"
+
+    def mutate(data):
+        if agent_id == data.get("leadAgentId"):
+            warn(f"refusing to register the lead {agent_id} as a pane-backed member")
+            return None
+        member = next((m for m in data.get("members", []) if m.get("agentId") == agent_id), None)
+        if member is None:
+            member = {
+                "agentId": agent_id,
+                "name": name,
+                "joinedAt": int(time.time() * 1000),
+                "subscriptions": [],
+                "agentType": merged.pick("agentType")[0] or DEFAULT_AGENT_TYPE,
+                "planModeRequired": merged.pick("permissionMode")[0] == "plan",
+                **({"cwd": member_cwd} if (member_cwd := agent_cwd(ctx)) else {}),
+            }
+            color = merged.pick("color")[0]
+            if color:
+                member["color"] = color
+            model = merged.pick("model", prefer_specific=True)[0]
+            if model:
+                member["model"] = model
+            data.setdefault("members", []).append(member)
+        member.update(synced_fields(ctx))
+        member.update({"tmuxPaneId": pane or "", "backendType": "tmux", "isActive": alive})
+        return data
+
+    if dry:
+        step(True, f"would register {agent_id} in {cfg}", "")
+        return
+    if edit_team_config(cfg, mutate, f"registered {agent_id} in"):
+        ensure_inbox(team, name, dry)
+
+
+def retire_member(ctx, dry):
+    """Mark the source-team entry inactive after a rebind, so the abandoned
+    roster stops claiming a live member."""
+    entry = ctx.get("team_entry")
+    if not entry:
+        return
+    cfg = entry["cfg"]
+    agent_id = entry["member"].get("agentId")
+
+    def mutate(data):
+        changed = False
+        for member in data.get("members", []):
+            if member.get("agentId") == agent_id and member.get("isActive"):
+                member["isActive"] = False
+                changed = True
+        return data if changed else None
+
+    if dry:
+        step(True, f"would retire {agent_id} in {cfg}", "")
+        return
+    edit_team_config(cfg, mutate, f"retired {agent_id} in")
+
+
+def update_team_config(ctx, pane, dry, alive=True):
+    entry = ctx["team_entry"]
+    if not entry:
+        return
+    cfg = entry["cfg"]
+    agent_id = entry["member"].get("agentId")
+
+    def mutate(data):
+        if agent_id and agent_id == data.get("leadAgentId"):
+            # A lead is never pane-backed. Writing tmux/%N onto its entry points
+            # the harness's exit reaper (which kills members with a pane-type
+            # backend) at a pane id that belongs to somebody else.
+            warn(f"refusing to write pane-backed fields onto the lead entry {agent_id}")
+            return None
+        changed = False
+        for member in data.get("members", []):
+            if member.get("agentId") != agent_id:
+                continue
+            # Sync the roster to the launch we just performed, rather than only
+            # filling blanks: a roster saying claude-opus-5 while the process
+            # runs claude-opus-5[1m] describes something that does not exist.
+            updates = [("tmuxPaneId", pane), ("backendType", "tmux"), ("isActive", alive)]
+            updates += list(synced_fields(ctx).items())
+            for key, value in updates:
+                if value is not None and member.get(key) != value:
+                    member[key] = value
+                    changed = True
+        return data if changed else None
+
+    if dry:
+        step(True, f"would update {cfg}", "")
+        return
+    edit_team_config(cfg, mutate, "updated")
+
+
+def claude_binary(args):
+    """Always the `claude` on PATH, never the pinned version the transcript was
+    written by, and never CLAUDE_CODE_EXECPATH, both of which can be stale."""
+    if args.claude_bin:
+        return args.claude_bin
+    from shutil import which
+
+    return which("claude") or "claude"
+
+
+def build_command(ctx, args, passthrough):
+    merged = ctx["merged"]
+    user_flags = {a.split("=", 1)[0] for a in passthrough if a.startswith("-")}
+    cmd = [claude_binary(args), "--resume", ctx["session_uuid"]]
+
+    dest = ctx.get("to_team")
+    for flag, field in DERIVED_FLAGS.items():
+        if flag in user_flags:
+            continue
+        value = merged.pick(field, prefer_specific=(field == "model"))[0]
+        if dest:  # rebinding onto a live lead's implicit team
+            if field == "teamName":
+                value = dest
+            elif field == "agentId":
+                value = f"{merged.pick('agentName')[0]}@{dest}"
+            elif field == "parentSessionId":
+                value = ctx.get("to_lead") or value
+        if not value:
+            continue
+        # The lead masquerade wears the teammate flags but not these two: there
+        # is no "team-lead" agent type to resolve, and a lead is its own parent.
+        if flag == "--agent-type" and value == "team-lead":
+            continue
+        if flag == "--parent-session-id" and value == ctx["session_uuid"]:
+            continue
+        cmd += [flag, str(value)]
+
+    mode = merged.pick("permissionMode")[0]
+    if mode and not user_flags & {"--permission-mode", "--dangerously-skip-permissions"}:
+        if mode == "bypassPermissions":
+            cmd.append("--dangerously-skip-permissions")
+        elif mode not in ("default", "normal"):
+            cmd += ["--permission-mode", mode]
+
+    return cmd + passthrough
+
+
+def explain(ctx):
+    merged = ctx["merged"]
+    print("resolved fields (most recent source wins):")
+    width = max((len(f) for f in merged.cands), default=8)
+    for field in sorted(merged.cands):
+        value, ts, source = merged.pick(field, prefer_specific=(field == "model"))
+        conflict = merged.conflicts(field)
+        mark = "  <- conflict: " + ", ".join(sorted(str(c) for c in conflict)) if len(conflict) > 1 else ""
+        print(f"  {field:<{width}}  {value}   [{source} @ {ms_str(ts)}]{mark}")
+    for path, _, last_ts in ctx["other_transcripts"]:
+        print(f"  (older transcript ignored: {path.name} @ {ms_str(last_ts)})")
+
+
+def check_substrate():
+    """SKILL.md says substrate choice is not ours to make, and this tool only
+    implements the tmux one. Say so rather than silently imposing panes."""
+    try:
+        mode = json.loads((CLAUDE_DIR / "settings.json").read_text()).get("teammateMode")
+    except (OSError, ValueError):
+        return
+    if mode and mode not in ("tmux", "auto"):
+        warn(f"teammateMode is {mode!r}, but this tool only revives into tmux panes")
+
+
+def build_command_agent_id(ctx):
+    """The agent id the launch wears, which a rebind changes."""
+    merged = ctx["merged"]
+    dest = ctx.get("to_team")
+    return f"{merged.pick('agentName')[0]}@{dest}" if dest else merged.pick("agentId")[0]
+
+
+def auto_redirect(ctx, args, table, prefix=""):
+    """Give a launch the identity of the team the lead actually runs as.
+
+    Two different operations hide behind "rebind". REDIRECT chooses the flags
+    for a launch that is happening anyway, and writes roster entries; it kills
+    nothing. MIGRATE changes a LIVE member's team, which is necessarily kill
+    and restart, because identity is frozen in argv at exec and two processes
+    must never append to one transcript.
+
+    The default may redirect. Only an explicit --to-team may migrate, so that
+    every killed process traces back to something the user actually asked for.
+    Redirect also requires exact evidence: the mint-window join is a heuristic,
+    and acting on a heuristic unasked is how "pick the newest" comes back.
+    """
+    merged = ctx["merged"]
+    agent_id, source = merged.pick("agentId")[0], merged.pick("teamName")[0]
+    if args.keep_team or not (agent_id and source):
+        return
+
+    pid, alive, _, exact_lead = RESOLVER.lead_pid(merged.pick("parentSessionId")[0], source)
+    if not (pid and alive and exact_lead):
+        return
+    dest, exact_team = RESOLVER.team_minted_by(pid)
+    if not (dest and exact_team) or dest == source:
+        return
+
+    # Setting to_team below suppresses the guards further down (they are for the
+    # explicit path), so this must ask every liveness question they would have.
+    # argv is not enough: a session resumed from the in-app picker runs as bare
+    # `claude` and is visible only to the registry.
+    owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
+    holders = RESOLVER.procs_on_transcript(ctx["session_uuid"], table) + RESOLVER.live_agent_procs(agent_id, table)
+    if holders or (owner and owner[2]):
+        # Alive: leave it to the liveness guards. Say what the move would cost
+        # rather than making it, since restarting throws away its current turn.
+        who = f"pid {holders[0][0]}" if holders else f"pid {owner[0]} (registry)"
+        warn(f"{agent_id} is running under stale team {source} as {who}; the lead now runs as {dest}. "
+             f"--to-team live migrates it (restarts the process, losing its in-flight turn)")
+        ctx["stale_team_warned"] = True
+        return
+
+    print(f"{prefix}redirect the lead now runs as {dest}, not {source}; "
+          f"launching with that identity (--keep-team to stay)")
+    ctx["to_team"], ctx["auto_redirect"] = dest, True
+    ctx["to_lead"] = RESOLVER.team_lead_session(dest)
+
+
+def run_one(args, passthrough, table, prefix=""):
+    """Resume one agent. Returns (status, socket), status being
+    'noop' | 'launched' | 'manual' | 'failed'.
+
+    The socket is whichever server this agent ended up on, or None when it never
+    reached one. Only this function knows which, and an agent that noops still
+    has a pane worth attaching to, so the caller is told rather than left to
+    read it off a field set partway through.
+    """
+    try:
+        ctx = build(args)
+    except SystemExit:
+        return "failed", None
+    merged = ctx["merged"]
+    agent_id = merged.pick("agentId")[0]
+
+    if args.explain:
+        explain(ctx)
+
+    # A lead belongs in your terminal, not a swarm pane: the masquerade is an
+    # interactive session you drive, and a pane-backed lead would be reaped by
+    # the next lead's exit anyway. No socket, no pane, no roster patch.
+    if agent_id and agent_id == ctx.get("lead_agent_id"):
+        command = build_command(ctx, args, passthrough)
+        print(f"{prefix}lead     {agent_id}")
+        print(f"{prefix}session  {ctx['session_uuid']}  ({ctx['transcript'][0]})")
+        print(f"{prefix}via      {ctx['via']}")
+        title = session_title(ctx["transcript"][0], limit=100)
+        if title:
+            print(f"{prefix}title    {title}")
+        print(f"{prefix}cwd      {merged.pick('cwd')[0] or '(inherit)'}")
+        owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
+        if owner and owner[2] and not args.force:
+            warn(f"already live as pid {owner[0]}{state_note(owner[0])}; pass --force to run a second copy")
+            return "noop", None
+        # Only now: the masquerade reads the roster on boot, so the team dir has to
+        # exist before the exec, and a lead whose team was reaped is the ordinary
+        # case here rather than an edge one. Forging above this guard meant a run
+        # that then declined to launch had already written a team dir.
+        forge_team(ctx, args.dry_run)
+        # In --team we must stay alive for the other members, so never exec there.
+        if sys.stdout.isatty() and not args.dry_run and not getattr(args, "in_team", False):
+            print(f"{prefix}exec     taking over this terminal")
+            os.execvp(command[0], command)
+        print(f"{prefix}run this in your terminal (leads are not spawned into tmux):")
+        print(f"{prefix}  {' '.join(shlex.quote(c) for c in command)}")
+        return "manual", None
+
+    if args.to_team:
+        dest = resolve_to_team(args, ctx)
+        ctx["to_team"] = dest
+        ctx["to_lead"] = RESOLVER.team_lead_session(dest)
+    else:
+        forge_team(ctx, args.dry_run)
+        auto_redirect(ctx, args, table, prefix)
+
+    socket, how = resolve_socket(ctx, args, table)
+    if not socket:
+        warn("could not determine a tmux socket; pass --socket claude-swarm-<lead-pid>")
+        return "failed", None
+
+    cwd = agent_cwd(ctx)
+    want_pane = merged.pick("tmuxPaneId")[0]
+    if want_pane and not re.fullmatch(r"%\d+", str(want_pane)):
+        want_pane = None  # e.g. the lead's "leader" placeholder
+
+    command = build_command(ctx, args, passthrough)
+    adopted = inherit_credentials(ctx)
+
+    print(f"{prefix}agent    {agent_id or '(unknown)'}")
+    print(f"{prefix}session  {ctx['session_uuid']}  ({ctx['transcript'][0]})")
+    print(f"{prefix}via      {ctx['via']}")
+    title = session_title(ctx["transcript"][0], limit=100)
+    if title:
+        print(f"{prefix}title    {title}")
+    print(f"{prefix}socket   {socket}  [{how}] ({socket_state(socket)})")
+    print(f"{prefix}pane     {want_pane or '(none recorded)'}")
+    print(f"{prefix}cwd      {cwd or '(inherit)'}")
+    if adopted:
+        print(f"{prefix}creds    inherited {', '.join(adopted)} from the lead")
+    print(f"{prefix}command  {' '.join(shlex.quote(c) for c in command)}")
+
+    # Same agent already in that pane -> nothing to do. Anything else in it -> new pane.
+    _, occupants = pane_occupants(socket, want_pane, table) if want_pane else (False, [])
+    here = [pid for pid, cmd in occupants if agent_id and f"--agent-id {agent_id}" in _argv_pairs(cmd)]
+    others = [pid for pid, _ in occupants if pid not in here]
+
+    held_by_us = RESOLVER.self_holds_transcript(ctx["session_uuid"], table)
+    if held_by_us and not args.force:
+        die(f"you are running this transcript yourself (pid {held_by_us[0]}); "
+            "nothing can replace a process from inside it. Exit first, or have "
+            "the lead run this")
+
+    replace_pane = None
+    if ctx.get("to_team") and not ctx.get("auto_redirect"):
+        # Explicit --to-team only: this is the migrate half, and it kills.
+        # A redirected launch never reaches here, so the default cannot kill.
+        # Never guess a pane here: pane ids are per-server, so a recorded id
+        # from another socket names an unrelated pane on this one, and killing
+        # it would take out a stranger while the old holder kept writing.
+        for index, (pid, _) in enumerate(RESOLVER.procs_on_transcript(ctx["session_uuid"], table)):
+            holder_pane = pane_of_pid(socket, pid, table)
+            if index == 0 and holder_pane:
+                replace_pane = holder_pane
+                print(f"{prefix}rebind   replacing pid {pid} in pane {holder_pane}")
+                continue
+            where = f"in pane {holder_pane}" if holder_pane else f"outside {socket}"
+            step(args.dry_run, f"would kill pid {pid}, which also holds this transcript {where}",
+                 f"killing pid {pid}, which also holds this transcript {where}")
+            if not args.dry_run:
+                killed = subprocess.run(["kill", str(pid)], capture_output=True)
+                # Two processes appending to one transcript is the state this
+                # prevents, so a kill that did not work has to be said out loud
+                # rather than reported as a clean rebind.
+                if killed.returncode != 0 or pid_alive(pid):
+                    warn(f"pid {pid} did not die ({(killed.stderr or b'').decode().strip() or 'still running'}); "
+                         "it is still appending to this transcript")
+    elif here and not args.force:
+        print(f"{prefix}noop     {agent_id} is already running in pane {want_pane} (pid {here[0]}{state_note(here[0])})")
+        if not args.no_color:
+            tint_pane(socket, want_pane, merged.pick("color")[0], merged.pick("agentName")[0], args.dry_run)
+        if not args.no_update_config:
+            update_team_config(ctx, want_pane, args.dry_run)
+        return "noop", socket
+    if others and not replace_pane:
+        warn(f"pane {want_pane} runs a different claude (pid {', '.join(map(str, others))}); using a new pane")
+
+    # An in-process lead runs as bare `claude` with no --agent-id to match, so
+    # ask the session registry who currently owns this transcript.
+    owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
+    if owner and owner[2] and not args.force and not ctx.get("to_team"):
+        warn(
+            f"session {ctx['session_uuid']} is live as pid {owner[0]}{state_note(owner[0])}; "
+            "pass --force to resume a second copy"
+        )
+        return "noop", socket
+
+    live = RESOLVER.live_agent_procs(agent_id, table) if agent_id else []
+    elsewhere = [pid for pid, _ in live if pid not in here]
+    if elsewhere and not args.force and not ctx.get("to_team"):
+        warn(
+            f"{agent_id} is already running outside pane {want_pane or '?'} "
+            f"(pid {', '.join(map(str, elsewhere))}); pass --force to start another instance"
+        )
+        return "noop", socket
+
+    # Already standing in the right place: run the agent in this pane instead of
+    # splitting a new one and leaving the shell we were invoked from idle beside
+    # it. Bookkeeping has to happen first, since exec never returns.
+    in_socket, in_pane = current_tmux()
+    # Never when a tool is driving (its shell would be swallowed), never inside
+    # --team (the loop would end), and never when a live holder has to be killed
+    # first: exec cannot respawn the pane, so that case belongs to launch().
+    if (in_socket == socket and in_pane and not replace_pane
+            and not getattr(args, "in_team", False) and not os.environ.get("CLAUDECODE")):
+        pane_exists = any(p["pane"] == want_pane for p in list_panes(socket)) if want_pane else False
+        if in_pane == want_pane or not pane_exists:
+            print(f"{prefix}exec     you are in {in_pane} on {socket}; running here rather than splitting")
+            if ctx.get("to_team"):
+                register_member(ctx["to_team"], ctx, in_pane, args.dry_run)
+                if ctx["to_team"] != merged.pick("teamName")[0]:
+                    retire_member(ctx, args.dry_run)
+            else:
+                ensure_inbox(merged.pick("teamName")[0], merged.pick("agentName")[0], args.dry_run)
+                if not args.no_update_config:
+                    update_team_config(ctx, in_pane, args.dry_run)
+            rendered = f"exec in {cwd or os.getcwd()}: {' '.join(shlex.quote(c) for c in command)}"
+            step(args.dry_run, f"would {rendered}", rendered, indent=prefix)
+            if args.dry_run:
+                return "launched", socket
+            # The same environment and cwd launch() would have given it: the
+            # team vars a flag-bound boot needs, no inherited API poison, and
+            # the project dir --resume looks the transcript up under.
+            environ = dict(os.environ)
+            environ.pop("ANTHROPIC_BASE_URL", None)
+            environ.update(dict(pair.split("=", 1) for pair in TEAM_ENV))
+            if not args.no_color:
+                tint_pane(socket, in_pane, merged.pick("color")[0], merged.pick("agentName")[0], False)
+            if cwd:
+                try:
+                    os.chdir(cwd)
+                except OSError as exc:
+                    die(f"cannot enter {cwd}: {exc}")
+            try:
+                os.execvpe(command[0], command, environ)
+            except OSError as exc:
+                # exec replaces this process or it does not happen at all, so
+                # reaching here means the member the roster was just told about
+                # does not exist. Take the claim back before failing.
+                if ctx.get("to_team"):
+                    retire_member(ctx, False)
+                die(f"cannot exec {command[0]}: {exc}")
+
+    try:
+        launched_at = ctx["transcript"][0].stat().st_mtime
+    except OSError:
+        launched_at = 0.0
+    pane, action = launch(socket, want_pane, cwd, command, args.dry_run, replace_pane)
+    print(f"{prefix}{'would run' if args.dry_run else 'running'} in pane {pane or '<new>'} ({action})")
+    if not args.no_color:
+        tint_pane(socket, pane, merged.pick("color")[0], merged.pick("agentName")[0], args.dry_run)
+
+    alive = True
+    if not args.dry_run:
+        alive, why = launch_survived(socket, pane, build_command_agent_id(ctx),
+                                     ctx["transcript"][0], launched_at)
+        if alive:
+            print(f"{prefix}alive    {why}")
+        else:
+            warn(f"the launch in pane {pane} is not running: {why}; recording it as inactive")
+
+    if ctx.get("to_team"):
+        register_member(ctx["to_team"], ctx, pane, args.dry_run, alive)
+        if ctx["to_team"] != merged.pick("teamName")[0]:
+            retire_member(ctx, args.dry_run)
+    else:
+        ensure_inbox(merged.pick("teamName")[0], merged.pick("agentName")[0], args.dry_run)
+        if not args.no_update_config:
+            update_team_config(ctx, pane, args.dry_run, alive)
+
+    return ("launched" if alive else "failed"), socket
+
+
+def run_complete(topic):
+    """Emit completion candidates. `selector` prefixes each line with its group
+    so one process serves all three, instead of paying interpreter startup thrice."""
+    if topic == "selector":
+        # A uuid is a valid selector, so the selector position offers them too;
+        # they were previously reachable only behind --resume.
+        for group in ("names", "teams", "leads"):
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                run_complete(group)
+            for line in buffer.getvalue().splitlines():
+                print(f"{group}\t{line}")
+        return 0
+
+    if topic == "sockets":
+        for path in swarm_sockets():
+            state = "live" if socket_alive(path) else "dead"
+            print(f"{path.name}:{state}, {ms_str(int(path.stat().st_mtime * 1000))}")
+        return 0
+
+    if topic == "sessions":
+        files = sorted(
+            RESOLVER.transcripts_by_mtime()
+        )
+        for path in files:
+            when = ms_str(int(path.stat().st_mtime * 1000))
+            title = session_title(path, limit=COMPLETION_TITLE)
+            desc = f"{title}  [{path.parent.name}, {when}]" if title else f"{path.parent.name}, {when}"
+            print(f"{path.stem}:{desc}")
+        return 0
+
+    entries = RESOLVER.scan_teams()
+    entries.sort(key=lambda e: e["ts"], reverse=True)
+
+    if topic == "agent-ids":
+        for entry in entries:
+            agent_id = entry["member"].get("agentId")
+            if agent_id:
+                ansi = COLOR_ANSI.get(entry["member"].get("color") or "", "")
+                print(f"{agent_id}\tjoined {ms_str(entry['ts'])}\t{ansi}")
+        return 0
+
+    if topic == "teams":
+        seen = set()
+        for entry in entries:
+            team = entry["team"]
+            if team in seen:
+                continue
+            seen.add(team)
+            count = sum(1 for e in entries if e["team"] == team)
+            plural = "member" if count == 1 else "members"
+            title = lead_title(entries, team, limit=COMPLETION_TITLE)
+            when = ms_str(entry["ts"])
+            if title:
+                desc = f"{title}  [{count} {plural}, {when}]"
+            elif not team_souls(team):
+                # Nothing in it resolves any more, which is also what the reaper
+                # checks before removing the directory.
+                desc = f"nothing left to resurrect, {count} {plural}, {when}"
+            else:
+                desc = f"{count} {plural}, {when}"
+            print(f"{team}:{desc}")
+        return 0
+
+    if topic == "leads":
+        seen = set()
+        for entry in entries:
+            agent_id = entry["member"].get("agentId")
+            if not agent_id or agent_id in seen or agent_id != entry.get("leadAgentId"):
+                continue
+            seen.add(agent_id)
+            # a bare "team-lead" names every team, so only full ids, titled
+            title = lead_title(entries, entry["team"], limit=COMPLETION_TITLE)
+            if not title and not RESOLVER.resolve_transcript(lead_session=entry.get("leadSessionId"),
+                                                    team=entry.get("team"), is_lead=True, quick=True):
+                title = "transcript gone, cannot be resumed"
+            joined = f"joined {ms_str(entry['ts'])}"
+            print(f"{agent_id}\t{title + ', ' + joined if title else joined}\t")
+        return 0
+
+    if topic == "names":
+        # A roster is where an agent's colour and join time live, but not where
+        # its existence is decided: the harness deletes a team dir when its lead
+        # exits, leaving members that are still perfectly resurrectable. So the
+        # candidates are every stamped transcript, enriched from the roster when
+        # one survives.
+        candidates = {}
+        for path, (name, team) in RESOLVER.stamp_index().items():
+            if not name or not team or name == "team-lead":
+                continue
+            agent_id = f"{name}@{team}"
+            try:
+                when = int(path.stat().st_mtime * 1000)
+            except OSError:
+                continue
+            if agent_id not in candidates or when > candidates[agent_id][0]:
+                candidates[agent_id] = (when, path, None)
+        for entry in entries:
+            member = entry["member"]
+            agent_id, name = member.get("agentId"), member.get("name")
+            if not agent_id or not name or agent_id == entry.get("leadAgentId"):
+                continue
+            known = candidates.get(agent_id)
+            res = RESOLVER.resolve_transcript(team=entry["team"], name=name, quick=True)
+            candidates[agent_id] = (
+                max(entry["ts"], known[0] if known else 0),
+                res.path if res else (known[1] if known else None),
+                member,
+            )
+        # One row per agent. The same name is registered in several teams after
+        # a rebind, and only one of those registrations is worth offering:
+        # a live one, else one that resolves to a transcript, else the newest.
+        # An entry that is neither live nor resolvable is a leftover claim.
+        live_agents = {e["agent"] for e in RESOLVER.live_sessions() if e["alive"] and e["agent"]}
+        best = {}
+        for agent_id, (when, path, member) in candidates.items():
+            name = agent_id.split("@", 1)[0]
+            rank = (agent_id in live_agents, path is not None, when)
+            if name not in best or rank > best[name][0]:
+                best[name] = (rank, agent_id)
+        candidates = {agent_id: candidates[agent_id] for _, agent_id in best.values()}
+
+        # Grouped by the session they belong to, newest session first and newest
+        # member first inside it. An agent whose roster is gone still names its
+        # team in its transcript, so orphans sit with their own siblings rather
+        # than scattered through one long list.
+        by_team = collections.defaultdict(list)
+        for agent_id, (when, path, member) in candidates.items():
+            by_team[agent_id.split("@", 1)[-1]].append((when, agent_id, path, member))
+        rosters = {e["team"] for e in RESOLVER.scan_teams()}
+        for team in sorted(by_team, key=lambda t: max(w for w, *_ in by_team[t]), reverse=True):
+            members = sorted(by_team[team], reverse=True)
+            label = f"{team}  {ms_str(members[0][0])}"
+            if team not in rosters:
+                label += ", no roster"
+            for when, agent_id, path, member in members:
+                title = session_title(path, limit=COMPLETION_TITLE) if path else None
+                stamp = f"joined {ms_str(when)}" if member else f"last active {ms_str(when)}"
+                desc = f"{title}, {stamp}" if title else stamp
+                colour = (member or {}).get("color") or RESOLVER.spawn_payload(agent_id).get("color")
+                ansi = "" if NO_COLOR else COLOR_ANSI.get(colour or "", "")
+                print(f"{label}\t{agent_id}\t{desc}\t{ansi}")
+        return 0
+
+    die(f"unknown completion topic {topic!r}")
+
+
+SOCKET_GRACE_S = 60  # never reap a socket younger than this; a server may be mid-bind
+
+
+def cleanup_sockets(dry=False):
+    """Remove swarm socket files whose tmux server is gone.
+
+    Probes with a connect() rather than spawning tmux per socket: this runs
+    from a SessionStart hook, so it has to be measured in milliseconds.
+    """
+    removed = []
+    now = time.time()
+    for path in swarm_sockets():
+        try:
+            if now - path.stat().st_mtime < SOCKET_GRACE_S:
+                continue
+        except OSError:
+            continue
+        if socket_alive(path):
+            continue
+        if dry:
+            removed.append(path.name)
+            continue
+        try:
+            path.unlink()
+            removed.append(path.name)
+        except OSError as exc:
+            warn(f"cannot remove {path}: {exc}")
+    if removed:
+        print(f"{'would remove' if dry else 'removed'} {len(removed)} dead socket(s): {', '.join(removed)}")
+    return 0
+
+
+# A team dir is created before the things that prove its session is alive: the
+# registry entry, the first spawn payload, the masquerade's argv. This covers
+# that gap only. Age is not evidence of emptiness, so it stays small.
+TEAM_GRACE_S = 300
+
+# Descriptions in completion have a whole terminal row to themselves.
+COMPLETION_TITLE = 400
+NO_COLOR = False  # zsh truncates to the real terminal width
+
+
+def cruft_reason(team_dir):
+    """Why this directory is NOT pure scaffolding, or None if it is.
+
+    Every entry must be something this tool or the harness is known to create,
+    and known to be contentless. Anything unrecognised, anything nested, any
+    symlink, and any inbox holding mail means the directory is spared.
+    """
+    known = {
+        "config.json",
+        "inboxes",
+        f"config.json.bak-{TOOL}",
+        f"config.json.tmp-{TOOL}",
+        "config.json.lock",
+    }
+    try:
+        entries = list(team_dir.iterdir())
+    except OSError as exc:
+        return f"unreadable ({exc})"
+
+    for item in entries:
+        if item.is_symlink():
+            return f"{item.name} is a symlink"
+        if item.name not in known:
+            return f"unexpected entry {item.name!r}"
+        if item.name != "inboxes":
+            if not item.is_file():
+                return f"{item.name} is not a regular file"
+            continue
+
+        if not item.is_dir():
+            return "inboxes is not a directory"
+        for inbox in item.iterdir():
+            if inbox.is_symlink():
+                return f"inboxes/{inbox.name} is a symlink"
+            if not inbox.is_file():
+                return f"inboxes/{inbox.name} is not a regular file"
+            if inbox.suffix != ".json":
+                return f"inboxes/{inbox.name} is not a .json file"
+            try:
+                mail = json.loads(inbox.read_text() or "[]")
+            except (OSError, ValueError) as exc:
+                return f"inboxes/{inbox.name} is unreadable or not JSON ({exc})"
+            if not isinstance(mail, list):
+                return f"inboxes/{inbox.name} is not a message array"
+            if mail:
+                return f"inboxes/{inbox.name} holds {len(mail)} undelivered message(s)"
+
+    config = team_dir / "config.json"
+    if not config.is_file():
+        return "no config.json"
+    try:
+        data = json.loads(config.read_text())
+    except (OSError, ValueError) as exc:
+        return f"config.json unreadable ({exc})"
+    if not isinstance(data, dict) or not isinstance(data.get("members", []), list):
+        return "config.json is not a roster"
+    return None
+
+
+def remove_if_cruft(path, dry, kind):
+    """Delete a directory only after re-proving it holds nothing.
+
+    Re-checked immediately before unlinking, and the loop refuses anything that
+    appeared since, so a file landing mid-sweep stops the deletion instead of
+    being swept up with it.
+    """
+    if not path.is_dir():
+        return True
+    if RESOLVER.roster_path(path.name).parent.parent not in path.parents \
+            and (CLAUDE_DIR / "tasks") not in path.parents:
+        warn(f"refusing to remove {path}: outside the directories this tool owns")
+        return False
+    if kind == "team":
+        reason = cruft_reason(path)
+        if reason:
+            warn(f"not removing {path.name}: {reason}")
+            return False
+    else:  # a task dir must be completely empty
+        leftovers = list(path.iterdir())
+        if leftovers:
+            warn(f"not removing {path}: holds {', '.join(p.name for p in leftovers[:3])}")
+            return False
+    if dry:
+        return True
+
+    # Checking names is not enough: an inbox filename is in the verified set, so
+    # mail arriving after the check would be deleted along with the directory.
+    # Take the directory out of reach with an atomic rename, THEN re-prove it,
+    # so a writer racing us either lands before the rename (and is seen) or
+    # finds the path gone. Anything unexpected is put straight back.
+    staged = path.with_name(f"{path.name}.reaping-{os.getpid()}")
+    try:
+        os.rename(path, staged)
+    except OSError as exc:
+        warn(f"cannot stage {path} for removal: {exc}")
+        return False
+
+    reason = cruft_reason(staged) if kind == "team" else (
+        f"holds {', '.join(p.name for p in list(staged.iterdir())[:3])}" if any(staged.iterdir()) else None
+    )
+    if reason:
+        try:
+            os.rename(staged, path)
+            warn(f"not removing {path.name}: {reason} (appeared while removing; put back)")
+        except OSError as exc:
+            warn(f"{path.name}: {reason}, and restoring it failed: {exc}; it is at {staged}")
+        return False
+
+    try:
+        # config.json last, so an interrupted deletion leaves something the
+        # keep-checks still recognise as a team rather than a headless dir.
+        for sub in sorted(staged.iterdir(), key=lambda p: p.name == "config.json"):
+            if sub.is_dir():
+                for inbox in sorted(sub.iterdir()):
+                    inbox.unlink()
+                sub.rmdir()
+            else:
+                sub.unlink()
+        staged.rmdir()
+    except OSError as exc:
+        warn(f"cannot remove {staged}: {exc}")
+        return False
+    return True
+
+
+def team_keep_reason(cfg, table):
+    """Why this team must be kept, or None if nothing in it is resurrectable.
+
+    Empty means provably unresurrectable: no live process running as it, no
+    lead transcript, and not one member with a transcript. Teams in that state
+    are the residue of a Claude launch that registered a team at startup and
+    exited before the first prompt, so nothing was ever written. Anything less
+    certain is left alone; the cost of a stale directory is nothing, and the
+    cost of deleting a resurrectable team is somebody's memory.
+    """
+    entries = [e for e in RESOLVER.scan_teams() if e["cfg"] == cfg]
+    if not entries:
+        return "unreadable or memberless roster"
+    team, lead_session = entries[0]["team"], entries[0]["leadSessionId"]
+
+    if time.time() - cfg.parent.stat().st_mtime < TEAM_GRACE_S:
+        return "created moments ago"
+    pid, alive, _, _exact = RESOLVER.lead_pid(lead_session, team)
+    if pid and alive:
+        return f"pid {pid} is live for this team"
+    # Both transcript questions go through the resolver, so "does a soul exist
+    # here" is answered by the same engine that would resurrect it. Asking any
+    # other way risks deleting something the tool could have brought back.
+    souls = team_souls(team, entries)
+    if souls:
+        return f"still resurrectable: {', '.join(sorted(souls))}"
+    return cruft_reason(cfg.parent)
+
+
+def cleanup_teams(dry=False):
+    """Remove team dirs that hold nothing resurrectable, and their task dirs."""
+    removed = []
+    table = RESOLVER.ps_table()
+    for cfg in sorted(RESOLVER.roster_path(d.name) for d in RESOLVER.team_dirs()):
+        keep = team_keep_reason(cfg, table)
+        if keep:
+            if dry:  # auditable, but not noise in the hook
+                print(f"  keeping {cfg.parent.name}: {keep}")
+            continue
+        if not remove_if_cruft(cfg.parent, dry, "team"):
+            continue
+        remove_if_cruft(CLAUDE_DIR / "tasks" / cfg.parent.name, dry, "tasks")
+        removed.append(cfg.parent.name)
+    if removed:
+        print(f"{'would remove' if dry else 'removed'} {len(removed)} empty team(s): {', '.join(removed)}")
+    return removed
+
+
+def run_cleanup(dry=False):
+    """Everything the SessionStart hook reaps."""
+    cleanup_sockets(dry)
+    cleanup_teams(dry)
+    return 0
+
+
+HOOK_MARKER = "--cleanup"
+
+
+def write_settings(settings, data):
+    if settings.exists():
+        settings.with_suffix(f".json.bak-{TOOL}").write_text(settings.read_text())
+    tmp = settings.with_suffix(f".json.tmp-{TOOL}")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, settings)
+
+
+def install_hook(command):
+    """Add the SessionStart janitor hook, preserving everything else."""
+    settings = CLAUDE_DIR / "settings.json"
+    try:
+        data = json.loads(settings.read_text()) if settings.exists() else {}
+    except ValueError as exc:
+        warn(f"{settings} is not valid JSON ({exc}); leaving hooks alone")
+        return False
+    if not isinstance(data, dict):
+        warn(f"{settings} is not a JSON object; leaving hooks alone")
+        return False
+
+    entries = data.setdefault("hooks", {}).setdefault("SessionStart", [])
+    for entry in entries:
+        for hook in entry.get("hooks", []):
+            existing = hook.get("command") or ""
+            if existing == command:
+                print(f"ok        SessionStart cleanup hook already in {settings}")
+                return True
+            if TOOL in existing or "resume-agent --cleanup" in existing:
+                # An older command for this same tool: update in place rather
+                # than leave two hooks reaping the same things.
+                hook["command"] = command
+                write_settings(settings, data)
+                print(f"rehooked  SessionStart in {settings} (was: {existing})")
+                return True
+    entries.append(
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command,
+                    "async": True,  # a janitor must never delay session start
+                    "timeout": 10,
+                }
+            ]
+        }
+    )
+    write_settings(settings, data)
+    print(f"hooked    SessionStart in {settings} (backup: settings.json.bak-{TOOL})")
+    return True
+
+
+def drop_stale_compdumps():
+    """Delete completion caches that predate this install.
+
+    zsh does not rescan fpath when a cached dump exists, and oh-my-zsh only
+    refreshes it about daily, so a freshly linked completion silently does
+    nothing in new shells. The dump is a cache and regenerates on next start,
+    so removing it is cheap; leaving it means the install did not take.
+    """
+    stale = []
+    for dump in sorted(Path.home().glob(".zcompdump*")):
+        try:
+            if dump.suffix == ".zwc" or TOOL not in dump.read_text(errors="replace"):
+                dump.unlink()
+                stale.append(dump.name)
+        except OSError:
+            continue
+    if stale:
+        print(f"  cleared stale completion cache: {', '.join(stale)}")
+
+
+def run_install():
+    """Symlink the script into ~/.local/bin and its zsh completion onto fpath."""
+    src = Path(__file__).resolve()
+    comp_src = src.parent / f"_{TOOL}"
+    failed = False
+
+    def link(target, dest):
+        nonlocal failed
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.resolve() == target:
+            print(f"ok        {dest} -> {target} (already)")
+            return
+        if dest.exists() or dest.is_symlink():
+            warn(f"skipping {dest}: exists and points elsewhere ({dest.resolve()})")
+            failed = True
+            return
+        rel = os.path.relpath(target, dest.parent)
+        dest.symlink_to(rel)
+        print(f"linked    {dest} -> {rel}")
+
+    link(src, Path.home() / ".local/bin" / TOOL)
+
+    bin_path = Path.home() / ".local/bin" / TOOL
+    if not install_hook(f"{bin_path} {HOOK_MARKER} >/dev/null 2>&1"):
+        failed = True
+
+    if not comp_src.exists():
+        warn(f"no completion file at {comp_src}; script link done, completion skipped")
+        return 1
+
+    # Prefer a dir already on fpath; oh-my-zsh puts custom/completions there.
+    omz = Path(os.environ.get("ZSH") or Path.home() / ".oh-my-zsh")
+    if omz.is_dir():
+        link(comp_src, omz / "custom/completions" / f"_{TOOL}")
+        drop_stale_compdumps()
+        print("completion active in new shells; reload this one with: exec zsh")
+    else:
+        comp_dir = Path.home() / ".zsh/completions"
+        link(comp_src, comp_dir / f"_{TOOL}")
+        print(f"add to ~/.zshrc before compinit: fpath=({comp_dir} $fpath)")
+    return 1 if failed else 0
+
+
+def newest_live_socket():
+    for path in swarm_sockets():
+        if socket_alive(path):
+            return path.name
+    return None
+
+
+def run_poison(args):
+    """Recipe 1 steps 0 and 2: (un)set ANTHROPIC_BASE_URL on the swarm server.
+
+    While poisoned, every NEW pane's claude dies at TCP connect: $0 billed, no
+    5-hour window anchored. Processes already running keep the env they were
+    born with, in both directions; env is fixed at exec.
+    """
+    sock = args.socket or newest_live_socket()
+    if not sock:
+        die("no live swarm socket; pass --socket claude-swarm-<pid>")
+    if not socket_alive(sock):
+        die(f"socket {sock} has no live tmux server; poison lives in server env, nothing to set")
+
+    if args.poison:
+        res = tmux(sock, "set-environment", "-g", "ANTHROPIC_BASE_URL", POISON_URL)
+        if res.returncode != 0:
+            die(f"set-environment failed on {sock}: {res.stderr.strip()}")
+        print(f"poisoned {sock}: new panes get ANTHROPIC_BASE_URL={POISON_URL}")
+        print(f"placeholders will sit in an API error; unpoison with: {TOOL} --unpoison --socket {sock}")
+    else:
+        res = tmux(sock, "set-environment", "-gu", "ANTHROPIC_BASE_URL")
+        if res.returncode != 0:
+            die(f"set-environment -gu failed on {sock}: {res.stderr.strip()}")
+        print(f"unpoisoned {sock}: new panes get a working API again")
+        print("live placeholders keep their poisoned env; the swap's env scrub handles the pane")
+
+    cur = tmux(sock, "show-environment", "-g", "ANTHROPIC_BASE_URL")
+    state = cur.stdout.strip() if cur.returncode == 0 else "-ANTHROPIC_BASE_URL (unset)"
+    print(f"server env now: {state}")
+    return 0
+
+
+def team_socket(data, args, table):
+    """(socket, why) for the whole team, so every member lands on the same server.
+
+    Evidence strongest first, the same order resolve_socket uses per member:
+    --socket, the server already hosting a live member, the live lead's pid, and
+    a server named after the team.
+
+    A live member outranks the lead's pid because it is where a process
+    demonstrably is, while the pid only says where a server would be if the lead
+    had made one. A lead never does: it runs in your terminal rather than a pane,
+    so a socket named after its pid holds nothing unless a member happened to be
+    launched while that lead was up. Members resurrected without a live lead land
+    on the team's own server and never move, so the moment a lead appears the two
+    names disagree and the pid names an empty server. Asking the members first is
+    what keeps one team on one socket across those transitions.
+    """
+    if args.socket:
+        return args.socket, "--socket"
+    team = data.get("name")
+    lead_id = data.get("leadAgentId")
+    # The lead is skipped because it never runs in a pane, so it can never be
+    # the process that answers where the team's server is.
+    sock, why = RESOLVER.socket_hosting(
+        [m.get("agentId") for m in data.get("members", []) if m.get("agentId") != lead_id],
+        table,
+    )
+    if sock:
+        return sock, why
+    pid, alive, _, _exact = RESOLVER.lead_pid(data.get("leadSessionId"), team)
+    if pid and alive:
+        return f"{SOCKET_PREFIX}{pid}", f"lead pid {pid}"
+    if pid:
+        warn(f"the lead of {team} last ran as pid {pid}, which is gone; using the team's own server")
+    # Same answer resolve_socket reaches per member, said once: with the lead
+    # gone the team gets a server of its own, named after it.
+    if team:
+        warn(f"no live lead for {team}; standing up that team's own server, as if its lead were up")
+        return f"{SOCKET_PREFIX}{team}", f"resurrected server for {team}"
+    return None, "unresolved"
+
+
+def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
+    """Run each prepared invocation, then finish the run once.
+
+    A single agent is a team of one, and both entry points come through here so
+    that stays true. Attaching is decided in one place: it depends on this run
+    having left something in a pane, not on which entry point asked. A noop
+    counts, since an agent already sitting in its pane is worth showing.
+
+    `jobs` is (label, args) pairs; a None args is a member that was skipped.
+    `socket` pins the whole run to one server when the caller already knows it,
+    as a team does; otherwise the first agent to reach one decides.
+    """
+    results = []
+    for label, sub_args in jobs:
+        if label is not None:
+            print(f"\n[{label}]")
+        if sub_args is None:
+            print(f"{prefix}skipped")
+            results.append((label, "skipped"))
+            continue
+        status, used = run_one(sub_args, passthrough, table, prefix=prefix)
+        results.append((label, status))
+        socket = socket or used
+    if len(jobs) > 1:
+        print("\nsummary")
+        for label, status in results:
+            print(f"  {label:<24} {status}")
+    if not args.dry_run and socket and any(s in ("launched", "noop") for _, s in results):
+        print()
+        maybe_attach(args, socket)
+    return 1 if any(s == "failed" for _, s in results) else 0
+
+
+def run_team(args, passthrough, table):
+    cfg = RESOLVER.roster_path(args.team)
+    if not cfg.exists():
+        die(f"no team config at {cfg}; a graceful lead exit rm -rf's the team dir, so forge it first")
+    try:
+        data = json.loads(cfg.read_text())
+    except ValueError as exc:
+        die(f"{cfg} is not valid JSON: {exc}")
+
+    members = data.get("members", [])
+    if not members:
+        die(f"team {args.team} has no members")
+    lead_id = data.get("leadAgentId")
+    socket, socket_why = team_socket(data, args, table)
+
+    # Members first, lead last: the lead is not spawned into a pane, so its turn
+    # only prints the command for you to run, and that reads better at the end.
+    # Members boot fine without it: the mailbox is a directory, not a process.
+    ordered = sorted(members, key=lambda m: 1 if m.get("agentId") == lead_id else 0)
+    where = (f"socket {socket} ({socket_why}, {socket_state(socket)})" if socket
+             else "socket resolved per member")
+    print(f"team     {args.team}  ({len(ordered)} members, {where})")
+
+    jobs = []
+    for member in ordered:
+        agent_id = member.get("agentId")
+        name = member.get("name") or "?"
+        ensure_inbox(args.team, name, args.dry_run)  # every member, not just the launched ones
+        if args.no_lead and agent_id == lead_id:
+            jobs.append((name, None))
+            continue
+        one = copy.copy(args)
+        one.agent_id, one.resume, one.team, one.socket = agent_id, None, None, socket
+        one.socket_reason = "team socket" if not args.socket else "--socket"
+        one.in_team = True  # never exec the lead mid-loop; the members need us alive
+        jobs.append((name, one))
+    return run_agents(args, passthrough, table, jobs, socket=socket, prefix="  ")
+
+
+def set_tmux_target(session, window):
+    global TMUX_SESSION, TMUX_WINDOW
+    TMUX_SESSION = session or TMUX_SESSION
+    TMUX_WINDOW = window or TMUX_WINDOW
+
+
+RUNNING_SELFTEST_LINES = (3417, 3724)
+
+
+def run_selftest():
+    """Assert the invariants this tool keeps rediscovering. Read-only.
+
+    Two kinds: structural ones read from this file's own syntax tree, because
+    an invariant like "only the engine picks a transcript" is a property of the
+    code rather than of a run; and behavioural ones exercised against whatever
+    real data is on this machine, skipped rather than faked when absent.
+    """
+    import ast
+    import tempfile
+
+    results = []
+
+    def check(name, ok, detail=""):
+        results.append((name, ok, detail))
+
+    source = Path(__file__).resolve().read_text()
+    tree = ast.parse(source)
+    def is_delegate(node):
+        """A transitional forwarder: one return of RESOLVER.<same name>(*a, **k).
+
+        Recognised by shape rather than by a name list, so the step-5 deletion
+        cannot leave a stale exemption behind, and so a hand-written function
+        cannot quietly acquire one.
+        """
+        if len(node.body) != 1 or not isinstance(node.body[0], ast.Return):
+            return False
+        call = node.body[0].value
+        return (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and getattr(call.func.value, "id", None) == "RESOLVER"
+                and call.func.attr == node.name)
+
+    delegates = {n.name for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and is_delegate(n)}
+    funcs = {n.name: n for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef) and not is_delegate(n)}
+
+    def callers_of(target):
+        """Callers by either spelling: a module function calls `target(...)`, an
+        engine method calls `self.target(...)`. Matching only the first would
+        make every invariant below pass by vacuity once the engine became a
+        class, which is the opposite of what they are for."""
+        out = set()
+        for name, node in funcs.items():
+            for sub in ast.walk(node):
+                if not isinstance(sub, ast.Call):
+                    continue
+                if getattr(sub.func, "id", None) == target or (
+                        isinstance(sub.func, ast.Attribute) and sub.func.attr == target):
+                    out.add(name)
+        return out
+
+    # -- structural
+    dupes = [n for n in ("resolve_transcript", "edit_team_config", "socket_alive", "lead_pid",
+                         "stamp_index", "ps_table", "session_registry")
+             if sum(1 for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
+                    and f.name == n and not is_delegate(f)) != 1]
+    check("engine primitives defined exactly once", not dupes, ", ".join(dupes))
+
+    # the checker itself is not a caller of the thing it checks
+    # The engine is a class, so membership of it is the exemption, not a list of
+    # names. Enumerating names is what let a caller add a picker without tripping
+    # this: a new engine method had to be remembered, and one was not.
+    engine_node = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.ClassDef) and node.name == "Resolver")
+    engine = {m.name for m in engine_node.body if isinstance(m, ast.FunctionDef)}
+    pickers = callers_of("transcript_path") - engine - {"team_keep_reason", "run_selftest"}
+    check("only the engine picks a transcript", not pickers, ", ".join(sorted(pickers)))
+
+    # The boundary. Naming the functions allowed to reach the tree was the form
+    # that failed: a picker only had to avoid the named entry point, and one did,
+    # by globbing directly. Membership of the class is checkable and cannot be
+    # sidestepped by choosing a different spelling.
+    ambient = {"PROJECTS_DIR", "SESSIONS_DIR", "TEAMS_DIR",
+               "_ps", "_stamps", "_spawns", "_spawn_log", "_by_agent", "_by_team"}
+    engine_lines = set(range(engine_node.lineno, engine_node.end_lineno + 1))
+    trespass = sorted({
+        f"{node.id} at line {node.lineno}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id in ambient
+        and isinstance(node.ctx, ast.Load)   # the declaration is a Store; only a use is a reach
+        and node.lineno not in engine_lines
+        and not (RUNNING_SELFTEST_LINES[0] <= node.lineno <= RUNNING_SELFTEST_LINES[1])})
+    check("the tree is reached only through the engine", not trespass, "; ".join(trespass))
+
+    writers = {n for n, node in funcs.items()
+               if "os.replace" in ast.get_source_segment(source, node)}
+    check("one roster writer", writers <= {"edit_team_config", "write_settings", "run_selftest"},
+          ", ".join(sorted(writers - {"run_selftest"})))
+
+    run_one_src = ast.get_source_segment(source, funcs["run_one"])
+    # team_minted_by and pid_running_team read payloads for team membership,
+    # a different question; this guards the per-agent lookup only.
+    payload_readers = (callers_of("_spawn_by_agent") | callers_of("_spawn_records")) - {
+        "spawn_payload", "_spawn_by_agent", "team_minted_by", "_pid_running_team",
+        "members_spawned_into", "run_selftest"}
+    check("one lookup for an agent's spawn payload", not payload_readers, ", ".join(sorted(payload_readers)))
+
+    # A preview must be printed through step(), which carries both tenses, or
+    # inline as "would X if dry else did X". A bare print of a "would" line has
+    # no real counterpart and silently makes a real run quieter than its preview.
+    unpaired = [line.strip()[:60] for line in source.splitlines()
+                if "print(" in line and "would " in line and " else " not in line]
+    check("every preview line has a real counterpart", not unpaired, "; ".join(unpaired))
+
+    check("a self-migrate is refused",
+          bool(RESOLVER.self_holds_transcript("selftest-uuid",
+               [(os.getpid(), os.getppid(), "/usr/bin/claude --resume selftest-uuid --agent-id a@b")])))
+
+    check("default path cannot kill",
+          'if ctx.get("to_team") and not ctx.get("auto_redirect"):' in run_one_src)
+
+    body = source.split('"""', 2)[-1]
+    check("tool name not hardcoded", TOOL not in body, f"{body.count(TOOL)} literal(s)")
+
+    # -- behavioural, against real data where it exists
+    index = RESOLVER.stamp_index()
+    stamped = next(((p, n, t) for p, (n, t) in index.items() if n and t and n != "team-lead"), None)
+    if stamped:
+        path, name, team = stamped
+        check("rung: session uuid", bool(RESOLVER.resolve_transcript(session_uuid=path.stem, quick=True)))
+        res = RESOLVER.resolve_transcript(team=team, name=name)
+        check("rung: agentName+teamName stamps", bool(res) and res.via.startswith("agentName+teamName"))
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):  # the refusal is the point, not its noise
+                verify_identity(res, "definitely-not-" + name, team, False, False)
+            check("identity gate refuses a mismatch", False, "it allowed one")
+        except SystemExit:
+            check("identity gate refuses a mismatch", True)
+    else:
+        check("rung: stamps (no stamped transcript on this machine)", True, "skipped")
+
+    lead = next((e for e in RESOLVER.scan_teams()
+                 if e["leadSessionId"] and RESOLVER.transcript_path(e["leadSessionId"])), None)
+    if lead:
+        res = RESOLVER.resolve_transcript(lead_session=lead["leadSessionId"], team=lead.get("team"),
+                                 is_lead=True, quick=True)
+        check("rung: roster leadSessionId", bool(res) and res.via == "roster leadSessionId")
+    else:
+        check("rung: leadSessionId (no lead transcript on this machine)", True, "skipped")
+
+    ambiguous = [n for n in {e["member"].get("name") for e in RESOLVER.scan_teams()}
+                 if n and len(RESOLVER.name_rosters(n)) > 1]
+    if ambiguous:
+        check("ambiguous name is refused", not RESOLVER.resolve_transcript(name=ambiguous[0]))
+    else:
+        check("ambiguous name (none on this machine)", True, "skipped")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        cases = {
+            "pure": ({"team-lead.json": "[]"}, None, None),
+            "mail": ({"team-lead.json": '[{"from":"x"}]'}, None, "undelivered"),
+            "stray": ({"team-lead.json": "[]"}, "notes.txt", "unexpected"),
+            "notjson": ({"team-lead.txt": "x"}, None, ".json"),
+        }
+        # a message landing in a name-verified file after the check
+        race = base / "race"
+        (race / "inboxes").mkdir(parents=True)
+        (race / "config.json").write_text(json.dumps({"name": "race", "members": []}))
+        (race / "inboxes" / "team-lead.json").write_text("[]")
+        real_reason, fired = cruft_reason, []
+
+        def racing(target):
+            reason = real_reason(target)
+            if not fired:
+                fired.append(True)
+                (race / "inboxes" / "team-lead.json").write_text('[{"from":"x"}]')
+            return reason
+
+        real_teams = RESOLVER.teams_dir
+        globals()["cruft_reason"], RESOLVER.teams_dir = racing, base
+        with contextlib.redirect_stderr(io.StringIO()):  # the refusal is the point
+            removed = remove_if_cruft(race, False, "team")
+        globals()["cruft_reason"], RESOLVER.teams_dir = real_reason, real_teams
+        check("mail arriving mid-removal is not deleted",
+              not removed and race.exists() and (race / "inboxes" / "team-lead.json").read_text() != "[]")
+
+        # one row per agent, even when several rosters claim the name
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            run_complete("names")
+        names = [line.split("\t")[1].split("@", 1)[0] for line in buffer.getvalue().splitlines() if line]
+        check("completion offers each agent once", len(names) == len(set(names)),
+              ", ".join(sorted({n for n in names if names.count(n) > 1})))
+
+        for label, (inboxes, stray, expect) in cases.items():
+            team = base / label
+            (team / "inboxes").mkdir(parents=True)
+            (team / "config.json").write_text(json.dumps({"name": label, "members": []}))
+            for fname, content in inboxes.items():
+                (team / "inboxes" / fname).write_text(content)
+            if stray:
+                (team / stray).write_text("x")
+            reason = cruft_reason(team)
+            ok = (reason is None) if expect is None else (reason is not None and expect in reason)
+            check(f"cruft check: {label}", ok, reason or "considered empty")
+
+    for topic in ("names", "teams", "leads", "sockets", "sessions"):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            run_complete(topic)
+        lines = [line for line in buffer.getvalue().splitlines() if line]
+        malformed = [line for line in lines if "\t" not in line and ":" not in line]
+        check(f"completion emits parseable {topic}", not malformed, f"{len(lines)} candidates")
+
+    width = max(len(name) for name, _, _ in results)
+    for name, ok, detail in results:
+        note = f"  ({detail})" if detail else ""
+        print(f"  {'PASS' if ok else 'FAIL'}  {name:<{width}}{note}")
+    failed = sum(1 for _, ok, _ in results if not ok)
+    print(f"\n{len(results) - failed}/{len(results)} checks passed")
+    return 1 if failed else 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog=TOOL, allow_abbrev=False, add_help=False,
+        description="Resume a Claude Code teammate in its swarm tmux session.",
+    )
+    parser.add_argument("--agent-id")
+    parser.add_argument("--resume", metavar="SESSION_UUID")
+    parser.add_argument("--team", metavar="TEAM", help="resume every member of this team")
+    parser.add_argument("--no-lead", action="store_true", help="with --team, skip the lead")
+    parser.add_argument("--keep-team", action="store_true",
+                        help="do not adopt the team the lead now runs as; stay on the recorded roster")
+    parser.add_argument("--to-team", metavar="TEAM|live",
+                        help="rebind the member onto another team (live = the live lead's implicit team)")
+    parser.add_argument("--install", action="store_true",
+                        help="symlink into ~/.local/bin, set up completion and the cleanup hook")
+    parser.add_argument("--no-color", "--no-colour", dest="no_color", action="store_true",
+                        help="do not tint the pane, and emit completion candidates uncoloured")
+    parser.add_argument("--selftest", action="store_true",
+                        help="check the tool's invariants against this machine; changes nothing")
+    parser.add_argument("--cleanup", "--cleanup-sockets", dest="cleanup", action="store_true",
+                        help="reap dead swarm sockets and team dirs with nothing resurrectable")
+    parser.add_argument("--complete", metavar="TOPIC", help=argparse.SUPPRESS)
+    parser.add_argument("--poison", action="store_true",
+                        help="point the swarm server's ANTHROPIC_BASE_URL at a dead port (Recipe 1 step 0)")
+    parser.add_argument("--unpoison", action="store_true",
+                        help="remove the poison from the swarm server (Recipe 1 step 2)")
+    parser.add_argument("--socket")
+    parser.add_argument("--tmux-session", metavar="NAME",
+                        help=f"tmux session to launch into (default {TMUX_SESSION})")
+    parser.add_argument("--tmux-window", metavar="NAME",
+                        help=f"window to create when the session is missing (default {TMUX_WINDOW})")
+    parser.add_argument("--claude-bin")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--explain", action="store_true")
+    parser.add_argument("--no-update-config", action="store_true")
+    parser.add_argument("--attach", action="store_true",
+                        help="attach even if the swarm already has a watcher")
+    parser.add_argument("--no-attach", action="store_true",
+                        help="never attach; just print the command")
+    parser.add_argument("-h", "--help", action="store_true")
+    # Only a *leading* bare word is the selector; later bare words belong to
+    # forwarded flags (argparse can't know that --model takes a value).
+    argv = sys.argv[1:]
+    selector = argv.pop(0) if argv and not argv[0].startswith("-") else None
+    args, passthrough = parser.parse_known_args(argv)
+
+    if args.selftest:
+        return run_selftest()
+
+    if args.cleanup:
+        return run_cleanup(args.dry_run)
+
+    if args.dry_run and (args.install or args.poison or args.unpoison):
+        die("--dry-run does not cover --install/--poison/--unpoison; they mutate on purpose")
+
+    if args.install:
+        return run_install()
+
+    if args.complete:
+        global NO_COLOR
+        NO_COLOR = args.no_color
+        return run_complete(args.complete)
+
+    if args.poison and args.unpoison:
+        die("--poison and --unpoison are mutually exclusive")
+    if args.poison or args.unpoison:
+        if selector or args.agent_id or args.resume or args.team:
+            die("--poison/--unpoison stand alone; they act on the server, not an agent")
+        return run_poison(args)
+
+    if args.help or not (selector or args.agent_id or args.resume or args.team):
+        parser.print_help()
+        print(__doc__)
+        return 0 if args.help else 2
+
+    if args.tmux_session or args.tmux_window:
+        # One constant, set once: everything downstream reads these.
+        set_tmux_target(args.tmux_session, args.tmux_window)
+
+    check_substrate()
+    table = RESOLVER.ps_table()
+    if selector:
+        apply_selector(selector, args, table)
+
+    if args.team:
+        return run_team(args, passthrough, table)
+
+    return run_agents(args, passthrough, table, [(None, args)])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
