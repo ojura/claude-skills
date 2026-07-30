@@ -76,13 +76,16 @@ roughly what it cost.
 
 ## How it runs
 
-Redrawing every second means the renderer has to be cheap, and this one is: about three
-milliseconds a redraw, for a line that parses transcripts and keeps a database. A small
+Redrawing every second means the renderer has to be cheap. On macOS and Linux a small
 C client hands the harness's JSON to a resident Python renderer over a socket, and the
 renderer answers most redraws from memory, since usually the only thing that changed is
-the clock. It exits after ten idle minutes and restarts itself whenever you edit
-it. If it cannot be reached at all, the client renders the line the slow way, so the
-line never goes blank.
+the clock. The steady-state path takes about three milliseconds. It exits after ten idle
+minutes and restarts itself whenever you edit it. If it cannot be reached at all, the
+client renders the line the slow way, so the line never goes blank.
+
+Windows uses that same one-shot Python path directly. This avoids Unix sockets,
+daemonization, and symlink requirements while keeping the status line and its persistent
+transcript cache portable.
 
 Your transcripts are only read, never written. The tool's own state is one small
 database it can rebuild from the transcripts, so if the numbers ever look wrong you can
@@ -91,6 +94,8 @@ hashed into a filename to find that proxy's usage file; the token is not sent an
 and without a proxy that path never runs.
 
 ## Get started
+
+### macOS and Linux
 
 ```sh
 ./install.sh
@@ -107,9 +112,28 @@ block for `~/.claude/settings.json`:
 }
 ```
 
-You need `python3` and a C compiler. Everything honours `CLAUDE_CONFIG_DIR` if your
-Claude Code config lives somewhere other than `~/.claude`. Copy the folder into
-`~/.claude/skills/` as well and you can ask Claude Code to change the line:
+You need `python3` and a C compiler. The resident renderer keeps the steady-state path to
+about three milliseconds. Everything honours `CLAUDE_CONFIG_DIR` if your Claude Code
+config lives somewhere other than `~/.claude`.
+
+### Windows
+
+```powershell
+.\install.ps1
+```
+
+You need Python 3. The installer copies the renderer into `$HOME\.claude`, smoke-tests
+it, and prints the `statusLine` block to merge into `settings.json`. Pass
+`-ClaudeConfigDir` or `-PythonExe` to override its detected paths. The printed command
+uses forward slashes so it works whether Claude Code invokes Git Bash or PowerShell.
+
+Windows runs the Python renderer once per refresh instead of using the POSIX resident
+daemon. It has the same displayed metrics and persistent transcript cache, but starts a
+Python process for each redraw; the Unix socket optimization remains available on macOS
+and Linux.
+
+Copy the folder into `~/.claude/skills/` as well and you can ask Claude Code to change
+the line:
 
 > add a segment to my status line showing how long the session has been running
 

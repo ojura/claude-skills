@@ -43,9 +43,13 @@ import sys
 import time
 
 HOME = os.path.expanduser("~")
-# Same resolution the harness and install.sh use, so a non-default config dir
-# does not leave the client spawning a daemon from a path that does not exist.
-CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or HOME + "/.claude"
+try:
+    CONFIG_ARG = sys.argv[sys.argv.index("--config-dir") + 1]
+except (ValueError, IndexError):
+    CONFIG_ARG = None
+# Same resolution the harness and install scripts use, so a non-default config
+# dir does not split renderer state across two locations.
+CLAUDE_DIR = CONFIG_ARG or os.environ.get("CLAUDE_CONFIG_DIR") or HOME + "/.claude"
 DB_PATH = CLAUDE_DIR + "/statusline-cache-health.db"
 SIDECAR = CLAUDE_DIR + "/statusline-cache-health.state.json"
 SOCK = CLAUDE_DIR + "/statusline.sock"
@@ -520,7 +524,7 @@ def daemon_main():
             conn.settimeout(2.0)
             raw = read_all(conn)
             try:
-                data = json.loads(raw.decode("utf-8", "replace")) if raw.strip() else {}
+                data = json.loads(raw.decode("utf-8-sig", "replace")) if raw.strip() else {}
             except Exception:
                 data = {}
             try:
@@ -549,14 +553,15 @@ def daemon_main():
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "--daemon":
+    if "--daemon" in sys.argv[1:]:
         daemon_main()
         return
+    raw = sys.stdin.buffer.read()
     try:
-        data = json.load(sys.stdin)
+        data = json.loads(raw.decode("utf-8-sig", "replace")) if raw.strip() else {}
     except Exception:
         data = {}
-    sys.stdout.write(render(data, Cache(persistent=True)))
+    sys.stdout.buffer.write(render(data, Cache(persistent=True)).encode("utf-8"))
 
 
 if __name__ == "__main__":
