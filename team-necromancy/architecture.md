@@ -103,9 +103,11 @@ channel between the leader and an out-of-process teammate:
   (`{id, from, text, timestamp, status}`). It must contain `[]` when empty;
   a zero-byte file is a parse error that wedges both reader and writer.
 - Teammates resolve `team-lead` through their *own* recorded team name. If
-  that team is dead, the mail lands in a dir nobody reads. `@main` bypasses
-  teams entirely (background-agent channel to the parent session), which makes
-  it the reliable escape hatch for agents grafted across team generations.
+  that team is dead, the mail lands in a dir nobody reads, and there is no
+  escape hatch: `@main` is the background-agent channel to the parent session
+  and is documented as background subagents ONLY, so a pane-backed teammate
+  cannot use it. An agent grafted across team generations is mute until its
+  recorded team name matches a team the lead is actually running as.
 
 The leader's in-memory picture (`teamContext` in AppState) is a different
 animal: an event-sourced projection updated only by the leader's own actions
@@ -123,9 +125,15 @@ cannot resolve any name, no matter what the roster says. Real TeamCreate
 
 ## Session id vs transcript id
 
-The pid files in `~/.claude/sessions/` give each live process's current
-internal session id. That id diverges from the transcript filename across
-resume and clear cycles, and team names are minted from the internal id.
+The pid files in `~/.claude/sessions/` record the session id the process was
+**resumed from**, i.e. its transcript filename, NOT its current internal id
+(verified live on 2.1.220: a lead resumed from a52cb2af... shows sessionId
+a52cb2af... in the registry while running internally as 1d040460..., proven by
+the team it minted). Team names come from the internal id, so after a resume no
+file on disk maps team name to pid, and the join has to be temporal: the team
+dir is created a few hundred ms before the session file (measured 281, 252 and
+402ms). Before the first resume the two ids are the same, so a fresh lead's
+team name does match a registry sessionId and an exact join is available.
 When something team-related does not add up, check both ids before reasoning.
 
 ## Adopt, in one paragraph

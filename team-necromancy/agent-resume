@@ -2631,8 +2631,20 @@ def run_one(args, passthrough, table, prefix=""):
         # case here rather than an edge one. Forging above this guard meant a run
         # that then declined to launch had already written a team dir.
         forge_team(ctx, args.dry_run)
-        # In --team we must stay alive for the other members, so never exec there.
-        if sys.stdout.isatty() and not args.dry_run and not getattr(args, "in_team", False):
+        # The lead runs last, after every member is already in its pane, so there is
+        # nothing left for this process to stay alive for. A lead is an interactive
+        # session you drive rather than a pane you watch, so the run ends by becoming
+        # it. Starting it from the wrong directory would leave it unable to find its
+        # own conversation, since --resume looks the transcript up under the project
+        # dir of wherever it starts.
+        if sys.stdout.isatty() and not args.dry_run:
+            where = agent_cwd(ctx)
+            if where and os.path.realpath(where) != os.path.realpath(os.getcwd()):
+                print(f"{prefix}cd       {where}")
+                try:
+                    os.chdir(where)
+                except OSError as exc:
+                    die(f"cannot enter {where}: {exc}")
             print(f"{prefix}exec     taking over this terminal")
             os.execvp(command[0], command)
         print(f"{prefix}run this in your terminal (leads are not spawned into tmux):")
@@ -3407,6 +3419,11 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
         print("\nsummary")
         for label, status in results:
             print(f"  {label:<24} {status}")
+    if any(status == "manual" for _, status in results):
+        # The lead is the foreground of this run: either we became it, or we could
+        # not and printed its command. Either way the thing to look at is the lead,
+        # not the swarm, so attaching would put the wrong window in front of you.
+        return 1 if any(s == "failed" for _, s in results) else 0
     if not args.dry_run and socket and any(s in ("launched", "noop") for _, s in results):
         print()
         maybe_attach(args, socket)

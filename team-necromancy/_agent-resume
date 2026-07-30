@@ -1,0 +1,167 @@
+#compdef agent-resume
+# Completion for the tool named on the #compdef line above (team-necromancy
+# skill). Everything below refers to it as $service, zsh's own name for the
+# command being completed, so a rename touches only that line, the function
+# name, and this file's name. Candidates come from the
+# script itself via the hidden --complete emitter, so the two never drift.
+# Emitter lines are either "cand:desc" or "cand<TAB>desc<TAB>ansi-color".
+# Display strings are built here (compadd -d): names are padded so the @session
+# columns align (globally, across groups sharing one listing), and list-colors
+# patterns are generated from those exact displays so per-agent colors match.
+
+_ra_parse() {  # line -> cand desc color (caller's locals, via dynamic scope)
+  if [[ $1 == *$'\t'* ]]; then
+    cand=${1%%$'\t'*}
+    local rest=${1#*$'\t'}
+    desc=${rest%%$'\t'*} color=${rest#*$'\t'}
+    [[ $color == $rest ]] && color=''
+  else
+    cand=${1%%:*} desc=${1#*:} color=''
+  fi
+}
+
+_ra_widths() {  # lines... -> maxname maxid (caller's locals)
+  local line cand desc color name
+  local -i idlen
+  for line; do
+    _ra_parse $line
+    if [[ $cand == *@* ]]; then
+      name=${cand%%@*}
+      (( ${#name} > maxname )) && maxname=${#name}
+    fi
+  done
+  # Only zsh knows the terminal width, so the columns are sized here. The name
+  # cap has to land before the id width is measured, or one agentName that is
+  # really a task description sizes the id column for everybody.
+  local -i width=${COLUMNS:-80}
+  local -i namecap=$(( width / 4 )) idcap=$(( width / 2 ))
+  (( namecap > 24 )) && namecap=24
+  (( maxname > namecap )) && maxname=$namecap
+  for line; do
+    _ra_parse $line
+    if [[ $cand == *@* ]] && (( maxname )); then
+      name=${cand%%@*}
+      idlen=$(( maxname + ${#cand} - ${#name} ))
+    else
+      idlen=${#cand}
+    fi
+    (( idlen > maxid )) && maxid=idlen
+  done
+  (( maxid > idcap )) && maxid=$idcap
+}
+
+_ra_render() {  # topic descr session-colour lines...  (maxname/maxid from caller)
+  local topic=$1 descr=$2 scolour=$3
+  shift 3
+  local -a cands disp zls expl
+  local line cand desc color name id padded row nameseg sessseg
+  local -i width=${COLUMNS:-80}
+  for line; do
+    _ra_parse $line
+    if [[ $cand == *@* ]] && (( maxname )); then
+      name=${cand%%@*}
+      nameseg=${(r:maxname:)name}
+      sessseg="@${cand#*@}"
+      id="${nameseg}${sessseg}"
+    else
+      nameseg=$cand sessseg='' id=$cand
+    fi
+    padded=${(r:maxid:)id}
+    cands+=($cand)
+    row="${padded} -- ${desc}"
+    (( ${#row} > width - 2 )) && row="${row[1,width-5]}..."
+    disp+=($row)
+    # Name in the agent's own colour, session column in the cluster's, so a
+    # glance groups rows by session even when the headers scroll away.
+    if [[ -n $sessseg && -n $scolour ]]; then
+      zls+=("=(#b)(${(b)nameseg})(${(b)sessseg}[ ]#)( -- *)=0=${color:-39}=${scolour}=39")
+    elif [[ -n $color ]]; then
+      zls+=("=(#b)(${(b)padded})( -- *)=0=${color}=39")
+    fi
+  done
+  (( $#zls )) && zstyle ":completion:*:*:${service}:*:$topic" list-colors $zls
+  _wanted -V "$topic" expl "$descr" compadd -l -d disp -a cands
+}
+
+_agent_resume_topic() {  # single group, self-scoped widths
+  local -a lines
+  local -i maxname=0 maxid=0
+  lines=(${(f)"$($service --complete $1 2>/dev/null)"})
+  (( $#lines )) || return 1
+  _ra_widths $lines
+  _ra_render "$1" "$2" "" $lines
+}
+
+_agent_resume_selector() {  # names/teams/leads in one call, widths shared
+  local -a all n t l s
+  local -i maxname=0 maxid=0 ret=1
+  local line
+  # names arrive as "names<TAB>group<TAB>cand<TAB>desc<TAB>colour", already
+  # ordered newest session first; keep that order and one array per group.
+  local -a groups
+  local rest group
+  typeset -A grouped
+  all=(${(f)"$($service --complete selector 2>/dev/null)"})
+  for line in $all; do
+    case $line in
+      names$'\t'*)
+        rest=${line#*$'\t'}
+        group=${rest%%$'\t'*}
+        (( ${+grouped[$group]} )) || groups+=($group)
+        grouped[$group]+="${rest#*$'\t'}"$'\n'
+        n+=(${rest#*$'\t'})
+        ;;
+      teams$'\t'*)    t+=(${line#*$'\t'}) ;;
+      leads$'\t'*)    l+=(${line#*$'\t'}) ;;
+    esac
+  done
+  # Transcripts are only worth listing once you are clearly typing a uuid:
+  # hundreds of them would bury the names on a blank tab.
+  if (( ${#PREFIX} >= 2 )) && [[ -z ${PREFIX//[0-9a-fA-F-]/} ]]; then
+    s=(${(f)"$($service --complete sessions 2>/dev/null)"})
+  fi
+  _ra_widths $n $t $l $s
+  # one colour per session cluster, cycled
+  local -a cluster_colours=(36 33 35 32 34 31 96 93)
+  local -i i=0
+  for group in $groups; do
+    (( i++ ))
+    _ra_render "names$i" "$group" ${cluster_colours[(( (i - 1) % $#cluster_colours + 1 ))]} \
+      ${(f)${grouped[$group]%$'\n'}} && ret=0
+  done
+  (( $#t )) && _ra_render teams "whole team" "" $t && ret=0
+  (( $#l )) && _ra_render leads "team lead" "" $l && ret=0
+  (( $#s )) && _ra_render sessions "session transcript" "" $s && ret=0
+  return ret
+}
+
+_agent-resume() {
+  zmodload -i zsh/complist 2>/dev/null  # list-colors renders through complist
+  _arguments -S \
+    '--agent-id[resume this agent id]:agent id:{_agent_resume_topic agent-ids "agent id"}' \
+    '--resume[resume this session transcript]:session uuid:{_agent_resume_topic sessions "session uuid"}' \
+    '--team[resume every member of this team]:team:{_agent_resume_topic teams team}' \
+    '--no-lead[with --team, skip the lead]' \
+    '--to-team[migrate this member onto another team, restarting it (live = the live lead'"'"'s team)]:team:{_agent_resume_topic teams team}' \
+    '--keep-team[do not adopt the team the lead now runs as]' \
+    '--socket[swarm tmux socket]:socket:{_agent_resume_topic sockets socket}' \
+    '--tmux-session[tmux session to launch into]:session:' \
+    '--tmux-window[window to create if the session is missing]:window:' \
+    '--claude-bin[claude binary to launch]:binary:_files' \
+    '--force[override liveness guards]' \
+    '--dry-run[preview without launching]' \
+    '--explain[show per-field provenance]' \
+    '--no-update-config[leave the team roster untouched]' \
+    '--attach[attach even if the swarm already has a watcher]' \
+    '--no-attach[never attach; just print the command]' \
+    '--no-color[do not tint the pane; uncoloured completion]' \
+    '--install[symlink into ~/.local/bin, completion, cleanup hook]' \
+    '--cleanup[reap dead swarm sockets and empty team dirs]' \
+    '--selftest[check the tool'"'"'s invariants; changes nothing]' \
+    '--poison[poison the swarm server API (Recipe 1 step 0)]' \
+    '--unpoison[remove the API poison (Recipe 1 step 2)]' \
+    '1:selector:_agent_resume_selector' \
+    '*:forwarded to claude:'
+}
+
+_agent-resume "$@"
