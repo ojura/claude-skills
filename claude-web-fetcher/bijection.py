@@ -2,35 +2,40 @@
 """
 claude.ai export  ->  LOADABLE Claude Code session JSONL   (+ optional lossless reverse)
 
-Goal (primary): emit a session that actually (a) appears in the picker and (b) `--resume`s.
-Design is measured, not guessed — from real CC JSONLs and the bijection council:
+The session this emits has to do two things: appear in the resume picker, and survive
+`--resume`. Both requirements come from reading real CC session files, not from the
+documented format.
 
-  THREADING (bj-tree, measured): a single linear `parentUuid` SPINE in execution order
-    that flows THROUGH the role:user tool_result lines. Every line's parent = the
-    immediately preceding line. Within a node, blocks chain linearly; a node's head
-    parents off its parent node's TAIL (last line); sibling regenerations fork off the
-    shared parent tail. There is no star and no per-node reset.
+  THREADING: the `parentUuid` links form one straight chain in execution order, and that
+    chain runs through the role:user tool_result lines as well. Each line's parent is the
+    line immediately before it. Blocks inside a node chain one to the next, a node's first
+    line parents off the last line of its parent node, and sibling regenerations fork off
+    that same last line. Nothing fans out from a single root, and the chain does not restart
+    at each node.
 
-  SCHEMA (measured required floor): every threadable (user/assistant) line carries
-    {cwd, entrypoint, gitBranch, isSidechain, message, parentUuid, sessionId, timestamp,
-     type, userType, uuid, version}.  assistant message{} carries
-     {content, id, model, role, stop_reason, stop_sequence, type, usage}.
-    tool_result -> role:user line + top-level toolUseResult + sourceToolAssistantUUID.
+  SCHEMA: every user or assistant line has to carry {cwd, entrypoint, gitBranch, isSidechain,
+    message, parentUuid, sessionId, timestamp, type, userType, uuid, version}, and an
+    assistant message{} additionally needs {content, id, model, role, stop_reason,
+    stop_sequence, type, usage}. A tool_result becomes a role:user line plus a top-level
+    toolUseResult and sourceToolAssistantUUID. Anything less than this fails to load.
 
-  SYNTHESIS: the export lacks id/model/usage/stop_reason/requestId/timestamp — these are
-    synthesized (deterministically) so the file loads; they are CC-only and not recovered
-    from the export. message.id is shared per API-response round (fresh after each
-    tool_result); stop_reason = tool_use if the round called a tool, else end_turn.
+  SYNTHESIS: the export has no id, model, usage, stop_reason, requestId or timestamp, so we
+    generate them from the conversation and message uuids. The same input always produces the
+    same values, but they are Claude Code's own bookkeeping and the export cannot tell us what
+    they were. All lines of one API response share a message.id, and a fresh one starts after
+    each tool_result. stop_reason is tool_use when that response called a tool, end_turn
+    otherwise.
 
-  THINKING REPLAY GATE (bj-replay): the dev API cryptographically verifies replayed
-    signatures, and a claude.ai-minted signature is the unproven/breaking case (D1);
-    16% are null (D2, certain reject under thinking-enabled replay).
-      thinking='carry'  -> replay {thinking, signature} verbatim (fidelity; D1 risk)
-      thinking='strip'  -> drop thinking blocks (guaranteed resume; loses raw reasoning)
+  THINKING: the account export is the only place thinking signatures survive, so carry is the
+    default.
+      thinking='carry'  -> replay {thinking, signature} unchanged
+      thinking='strip'  -> drop the thinking blocks, keeping only the visible turns
+    A block whose signature is null goes out as signature:"", which the API accepts.
 
-  ESCROW (escrow=True): export-only fields ride in a LINE-LEVEL `exportEscrow` key (CC's
-    reader tolerates unknown line keys), letting to_export rebuild the conversation
-    losslessly. escrow=False is a one-way loadable teleport; dropped fields are reported.
+  ESCROW (escrow=True): fields that exist only in the export ride along in an `exportEscrow`
+    key on the line envelope, which CC's reader ignores, and to_export reads them back to
+    rebuild the original conversation exactly. With escrow=False the conversion only runs one
+    way and reports what it dropped.
 """
 import json, uuid
 
@@ -56,28 +61,31 @@ USAGE = {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0
 def _uid(*p):  return str(uuid.uuid5(NS, "|".join(map(str, p))))
 def _mid(*p):  return "msg_" + uuid.uuid5(NS, "m|" + "|".join(map(str, p))).hex
 def _rid(*p):  return "req_" + uuid.uuid5(NS, "r|" + "|".join(map(str, p))).hex
-def _toolid(*p): return "toolu_synth_" + uuid.uuid5(NS, "t|" + "|".join(map(str, p))).hex  # sentinel prefix: disjoint from real toolu_0… ids
+def _toolid(*p): return "toolu_synth_" + uuid.uuid5(NS, "t|" + "|".join(map(str, p))).hex  # the prefix keeps these apart from real toolu_0… ids
 
 
-# ---- block <-> native CC content (core natively, residue escrowed) ----
+# ---- converting one block between the export and CC, with the remainder in escrow ----
 
 def _api_tool_result_content(content, images=None):
-    """claude.ai tool_result.content items carry extra fields (e.g. `uuid`) and non-API
-    item types (knowledge/local_resource/rag_reference) that the dev API rejects on resume.
-    Reduce to API-valid items: text->{type,text}, image->{type,source}, others flattened to
-    text. The original is escrowed for the lossless reverse.
+    """The items inside a claude.ai tool_result.content carry fields the API rejects, such as
+    `uuid`, and item types it does not know at all: knowledge, local_resource and
+    rag_reference. Resuming with any of them returns a 400. This rewrites each item into a
+    form the API accepts, turning text into {type,text}, image into {type,source}, and
+    everything else into plain text. The item as it arrived goes into escrow, so the reverse
+    conversion still reproduces it.
 
-    claude.ai stores tool_result images as {type:image, file_uuid:…} — a server-side asset
-    reference with no inline `source`, which the dev API can't process (it strips them on
-    resume). `images` is an optional resolver {file_uuid: {media_type, data(=base64)}} (bytes
-    fetched from /api/{org}/files/{uuid}/preview); when present we emit the native CC form
-    {type:image, source:{type:base64, media_type, data}}. Unresolved -> text placeholder.
-    Reverse is unaffected: the whole original content rides in tool_result `_orig_content`."""
+    Images are the awkward case. claude.ai writes them as {type:image, file_uuid:…}, which
+    points at a file on its own servers and carries no inline `source`, so the API has nothing
+    to read and drops the block. Pass `images` as {file_uuid: {media_type, data}} with the
+    bytes fetched from /api/{org}/files/{uuid}/preview and each one becomes a
+    {type:image, source:{type:base64, media_type, data}} block instead. A file_uuid with no
+    entry becomes a line of text saying the image was left out. Either way the original
+    content sits in the tool_result's `_orig_content`, so the reverse is unaffected."""
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
         return "" if content is None else str(content)
-    # API-valid tool_result content item types (measured from the API's own 400):
+    # The item types the API accepts inside a tool_result, taken from its own rejection message:
     VALID = {"document", "image", "search_result", "text", "tool_reference"}
     out = []
     for it in content:
@@ -85,35 +93,36 @@ def _api_tool_result_content(content, images=None):
             continue
         t = it.get("type")
         if t == "text":
-            out.append({k: v for k, v in it.items() if k != "uuid"})   # shed ONLY the field that 400s
+            out.append({k: v for k, v in it.items() if k != "uuid"})   # drop only `uuid`, which is the field that fails
         elif t == "image":
             src = it.get("source")
             if isinstance(src, dict) and ((src.get("type") == "base64" and src.get("data"))
                                           or (src.get("type") == "url" and src.get("url"))):
                 src = {k: v for k, v in src.items() if k in ("type", "media_type", "data", "url")}  # shed non-API keys
-                out.append({"type": "image", "source": src})           # already API-valid (whitelisted)
-            elif images and images.get(it.get("file_uuid"), {}).get("data"):   # empty bytes -> fall through to placeholder
+                out.append({"type": "image", "source": src})           # this one already has bytes the API can read
+            elif images and images.get(it.get("file_uuid"), {}).get("data"):   # no bytes means fall through to the text below
                 r = images[it["file_uuid"]]
                 out.append({"type": "image", "source": {"type": "base64",
                             "media_type": r["media_type"], "data": r["data"]}})
-            else:                                                      # no bytes -> valid text placeholder
+            else:                                                      # nothing to show, so say so in text
                 out.append({"type": "text", "text": f"[image omitted from teleport: {it.get('file_uuid', '?')}]"})
         elif t == "document" and not it.get("source") and it.get("file_uuid"):
-            out.append({"type": "text", "text": f"[document omitted from teleport: {it['file_uuid']}]"})  # bare file_uuid -> API can't resolve
+            out.append({"type": "text", "text": f"[document omitted from teleport: {it['file_uuid']}]"})  # a file_uuid alone is not something the API can look up
         elif t in VALID:
-            out.append(it)                                             # search_result/tool_reference/resolvable document pass verbatim
-        else:                                                          # unknown type -> minimal valid text
+            out.append(it)                                             # search_result, tool_reference and readable documents pass through
+        else:                                                          # a type we do not recognise becomes plain text
             out.append({"type": "text", "text": it.get("text") or f"[{t}]"})
     return out
 
 
 def _block_native(b, images=None):
-    """Return (cc_content_block, escrow_residue). Core fields go native; rest -> escrow.
-    `images` is an optional {file_uuid: {media_type, data}} resolver for tool_result images."""
+    """Split one export block into the CC content block and whatever did not fit in it. The
+    fields CC understands go into the first, everything else into the second, which travels in
+    escrow. `images` supplies bytes for tool_result images, as in _api_tool_result_content."""
     t = b.get("type")
     if t == "text":
         if not (b.get("text") or "").strip():
-            return (None, {"_raw": b})                       # empty text: API 400s on empty blocks -> escrow whole
+            return (None, {"_raw": b})                       # the API rejects an empty text block, so keep the whole thing in escrow
         consumed = {"type", "text"}
         nat = {"type": "text", "text": b.get("text", "")}
     elif t == "thinking":
@@ -168,7 +177,8 @@ def _block_restore(nat, esc):
 
 
 def _rounds(blocks):
-    """Partition a node's blocks into API-response rounds (split AFTER each tool_result)."""
+    """Group a node's blocks by the API response each one came from. A response ends at a
+    tool_result, so a new group starts after every one of them."""
     out, cur = [], []
     for i, b in enumerate(blocks):
         cur.append(i)
@@ -187,13 +197,12 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
     nblk = {m["uuid"]: len(m.get("content") or []) for m in msgs}
     sid = ctx["sessionId"]
 
-    # ORPHAN tool_use (bj-tree, measured): claude.ai assistant turns sometimes end on a tool_use
-    # that the source never answers (interrupted/abandoned call — measured shape is uniformly
-    # [..., tool_use, text], the orphan in the node's last round). The dev API rejects an
-    # assistant tool_use not answered by a tool_result in the next user message (400). On the
-    # active-leaf path this 400s resume in 9/145 convos (carry AND strip). We answer every
-    # convo-wide-unanswered tool_use with a synthetic role:user tool_result stub on the spine,
-    # marked synthetic so to_export DROPS it (the export never had it → reverse stays exact).
+    # An assistant turn sometimes ends on a tool_use the conversation never answers, because
+    # the call was interrupted or abandoned. The API requires the next user message to answer
+    # every tool_use the assistant made, and returns a 400 otherwise, whether we carry thinking
+    # or strip it. So for each tool_use that nothing anywhere in the conversation answers, we
+    # add a role:user tool_result stub saying the call did not complete. The stub is marked as
+    # ours, and to_export drops it again, so the reverse still reproduces the export exactly.
     answered = set()
     for m in msgs:
         for b in m.get("content") or []:
@@ -205,9 +214,10 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
                 "sessionId": sid, "cwd": ctx["cwd"], "version": ctx["version"],
                 "gitBranch": ctx["gitBranch"], "userType": ctx["userType"], "entrypoint": ctx["entrypoint"]}
 
-    node_tail = {}   # node_uuid -> uuid of its last ACTUALLY-EMITTED line. Skip-aware: under
-                     # thinking='strip' a stripped trailing block must not stay a parent target
-                     # (else children dangle); a node that emits nothing maps to its own prev (pass-through).
+    node_tail = {}   # node_uuid -> the uuid of the last line we actually wrote for that node.
+                     # Under thinking='strip' a dropped trailing block must not be left as a
+                     # parent, or its children point at a line that is not in the file. A node
+                     # that writes nothing at all maps to whatever preceded it.
 
     def tail(node_uuid):
         if node_uuid in node_tail:
@@ -224,11 +234,12 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
     lines += [title, {"type": "mode", "mode": "normal", "sessionId": sid},
               {"type": "permission-mode", "permissionMode": "default", "sessionId": sid}]
 
-    # forest -> tree (deliberated): claude.ai exports a FOREST — each branch's root parents off the
-    # SENTINEL, and editing the first message spawns multiple SENTINEL-rooted branches (39/145
-    # convos). CC wants a single-root tree, so when there are 2+ roots we emit ONE virtual null root
-    # node and parent every branch off it — the whole forest becomes one connected tree (a 1-root
-    # convo is already a tree; no virtual node added). to_export drops it (no escrow), so reverse is exact.
+    # An export is a forest, not a tree: every branch root parents off the SENTINEL, and
+    # editing the first message of a conversation starts another branch rooted there. CC needs
+    # a single root, so when a conversation has more than one we add a root node of our own and
+    # parent every branch off it, which connects the forest into one tree. A conversation with
+    # a single root is already a tree and gets no extra node. The added node carries no escrow,
+    # so to_export leaves it out and the reverse still matches the export.
     roots0 = [m for m in msgs if (m.get("parent_message_uuid") in (SENTINEL, None))
               or (m.get("parent_message_uuid") not in nblk)]
     vroot = None
@@ -241,16 +252,17 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
 
     for ni, m in enumerate(msgs):
         nu = m["uuid"]; sender = m.get("sender"); blocks = m.get("content") or []
-        # council guards: ≤1 None-id tool_use per node (the None-tuid pairing relies on it),
-        # and real tool ids must stay disjoint from the synth sentinel namespace (no silent cross-wire)
+        # Two things the pairing below relies on. A node may hold at most one tool_use whose
+        # id is None, because a second one would have nothing to distinguish it by. And no real
+        # tool id may start with toolu_synth_, or a real call and one we invented could collide.
         _tu = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
         assert sum(1 for b in _tu if not (isinstance(b.get("id"), str) and b.get("id"))) <= 1, f"node {nu}: >1 None-id tool_use"
         assert not any(isinstance(b.get("id"), str) and b["id"].startswith("toolu_synth_") for b in _tu), f"node {nu}: real tool_use id in synth namespace"
         ts = m.get("created_at") or "1970-01-01T00:00:00.000Z"
         pmu = m.get("parent_message_uuid")
-        prev = tail(pmu) if (pmu in nblk and pmu != SENTINEL) else vroot   # roots hang off the virtual node (tree), else None
-        tu_uid = {}                                       # tool_use id -> emitted line uuid (for sourceToolAssistantUUID)
-        last_tool_id = None                               # most recent emitted tool_use id, real OR synth (for None-tuid pairing)
+        prev = tail(pmu) if (pmu in nblk and pmu != SENTINEL) else vroot   # a branch root hangs off the node we added, if there is one
+        tu_uid = {}                                       # tool_use id -> the line we wrote it on, for sourceToolAssistantUUID
+        last_tool_id = None                               # the id of the most recent tool_use, to match a result that carries none
         node_unanswered = []                              # (emitted_id, line_uuid) for this node's tool_use never answered convo-wide
         first_emitted = True
 
@@ -291,20 +303,21 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
                     continue
                 u = _uid(nu, bi)
                 nat, residue = _block_native(b, images)
-                # API requires tool_use.id / tool_result.tool_use_id to be valid strings;
-                # claude.ai emits id=None on degenerate blocks. Synthesize + pair, escrow originals.
+                # The API needs tool_use.id and tool_result.tool_use_id to be real strings, but
+                # claude.ai leaves them None on some blocks. Invent an id, match the result to the
+                # call it belongs to, and keep the original None in escrow for the reverse.
                 if t == "tool_use" and not (isinstance(nat.get("id"), str) and nat["id"]):
                     residue["_orig_id"] = nat["id"]; nat["id"] = _toolid(nu, bi)
                 elif t == "tool_result" and not (isinstance(nat.get("tool_use_id"), str) and nat["tool_use_id"]):
-                    # pair a None tool_use_id to the most recent emitted tool_use id (real OR synth), then
-                    # CLEAR it — a tool_use takes exactly ONE result, so a 2nd orphan can't re-grab the same
-                    # id (that produced a duplicate tool_use_id -> API 400). Reverse stays exact via _orig_tuid.
+                    # Attach this result to the most recent tool_use we wrote, then forget that id.
+                    # One call takes one result, so if another result also arrives with no id it must
+                    # not claim the same call again; that produced a duplicate tool_use_id and a 400.
                     residue["_orig_tuid"] = nat["tool_use_id"]; nat["tool_use_id"] = last_tool_id or _toolid(nu, bi)
                     last_tool_id = None
                 if t == "tool_use":
                     last_tool_id = nat["id"]
                 if t == "tool_result":
-                    if nat and not nat.get("content"):          # API 400s on empty tool_result content (orig in _orig_content escrow)
+                    if nat and not nat.get("content"):          # the API rejects an empty tool_result; the original is in escrow
                         nat["content"] = [{"type": "text", "text": "[empty result]"}]
                     ln = {**base(u, prev, ts), "type": "user",
                           "message": {"role": "user", "content": [nat] if nat else []},
@@ -332,9 +345,9 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
                 lines.append(ln)
                 prev = u
 
-        # answer any orphan tool_use of this node with a synthetic tool_result stub on the spine
-        # (immediately after the owning assistant turn → satisfies the API's next-user-message rule).
-        # exportEscrow={_synthetic_stub:True} but NO node_uuid → to_export never sees it (reverse exact).
+        # Answer this node's unanswered tool_use calls. The stub goes immediately after the
+        # assistant turn that made the call, which is where the API expects to find it. It is
+        # marked _synthetic_stub and carries no node_uuid, so to_export never picks it up.
         for oidx, (oid, osrc) in enumerate(node_unanswered):
             su = _uid(nu, "stub", oidx)
             stub = {**base(su, prev, ts), "type": "user",
@@ -348,11 +361,11 @@ def to_cc(convo, ctx=CTX, thinking="carry", escrow=True, images=None):
                 stub["exportEscrow"] = {"_synthetic_stub": True}
             lines.append(stub)
             prev = su
-        node_tail[nu] = prev          # node's emitted tail (skip-aware) — children chain off this
+        node_tail[nu] = prev          # node's emitted tail (skip-aware); children chain off this
 
-    # active-leaf pointer: resume reads the last last-prompt's leafUuid, then walks
-    # parentUuid to root. Without it CC can't find the conversation (measured: 103/107
-    # real sessions carry one). Point at the most-recent leaf = last emitted message line.
+    # Resuming starts at the leafUuid on the last last-prompt line and walks parentUuid back to
+    # the root to rebuild the conversation. Without that line CC has no entry point and cannot
+    # find the conversation at all, so point it at the last message line we wrote.
     leaf = next((l["uuid"] for l in reversed(lines) if l.get("type") in ("user", "assistant")), None)
     if leaf is not None:
         last_user = next((m.get("text") for m in reversed(msgs) if m.get("sender") == "human"), None)
@@ -398,13 +411,15 @@ def to_export(lines):
 # ---- validators ----
 
 def conformance(lines):
-    """Return list of (uuid, problem) — real-CC schema + threading violations."""
+    """Check the emitted lines against what a real CC session file requires, and against the
+    threading rules. Returns the problems found as (uuid, description) pairs, along with how
+    many lines have no parent; more than one of those means the file is not a single tree."""
     probs = []
     uids = {l["uuid"] for l in lines if "uuid" in l}
     roots = 0
     for l in lines:
         if l.get("type") not in ("user", "assistant"):
-            continue                                      # sidecars are off-thread
+            continue                                      # title, mode and last-prompt lines are not part of the chain
         miss = REQ_LINE - set(l)
         if miss:
             probs.append((l.get("uuid", "?")[:8], f"missing line keys {sorted(miss)}"))
@@ -420,15 +435,16 @@ def conformance(lines):
             roots += 1
         elif p not in uids:
             probs.append((l.get("uuid", "?")[:8], f"dangling parentUuid {str(p)[:8]}"))
-        for b in m.get("content") or []:                  # empty inner content -> API 400 on replay
+        for b in m.get("content") or []:                  # an empty block inside the message also fails on replay
             if isinstance(b, dict) and b.get("type") == "tool_result" and not b.get("content"):
                 probs.append((l.get("uuid", "?")[:8], "empty tool_result content"))
             elif isinstance(b, dict) and b.get("type") == "thinking" and not (b.get("thinking") or "").strip():
                 probs.append((l.get("uuid", "?")[:8], "empty thinking block"))
 
-    # tool_use <-> tool_result pairing on the ACTIVE-LEAF PATH (what `--resume` replays to the API).
-    # An assistant tool_use whose id is not answered by a tool_result later on the path 400s the
-    # Messages API on the first new turn. Walk leaf->root, then check pairing in path order.
+    # Resuming replays only the path from the leaf back to the root, so that is the path where
+    # every tool_use has to be answered. An assistant tool_use with no matching tool_result
+    # later on it makes the first new turn fail with a 400. Walk the path, collect the results
+    # it contains, then look for calls none of them answer.
     by_uuid = {l["uuid"]: l for l in lines if "uuid" in l}
     leaf = next((l.get("leafUuid") for l in reversed(lines) if l.get("type") == "last-prompt"), None)
     if leaf is not None:
@@ -455,7 +471,7 @@ def audit(convo):
     cc = to_cc(convo, thinking="carry", escrow=True)
     back = to_export(cc)
     probs, roots = conformance(cc)
-    strip_probs, _ = conformance(to_cc(convo, thinking="strip", escrow=True))   # strip is the 'guaranteed resume' mode; test it
+    strip_probs, _ = conformance(to_cc(convo, thinking="strip", escrow=True))   # check the other thinking mode too
     return {"roundtrip": _diff(convo, back), "conformance": probs, "roots": roots,
             "strip_conformance": strip_probs,
             "lines": len(cc), "msgs": len(convo.get("chat_messages", []))}

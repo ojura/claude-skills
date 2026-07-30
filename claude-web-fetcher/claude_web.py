@@ -138,7 +138,7 @@ class ClaudeWeb:
                 body = json.loads(e.read() or b"{}")
             except Exception:
                 body = {}
-            # any daemon non-2xx is a failure — surface it (never return a value-bearing
+            # Any non-2xx from the daemon is a failure and has to be raised, never turned into a
             # body that would degrade to a silent None downstream)
             err = body.get("error") if isinstance(body, dict) else None
             raise RuntimeError(f"cdp-daemon {path} HTTP {e.code}: {err or str(body)[:200]}")
@@ -220,10 +220,10 @@ class ClaudeWeb:
                 if self._cdp_eval(sid, "location.origin", await_promise=False, timeout=6) == BASE:
                     return sid
             except Exception:
-                continue  # stale/frozen/slow tab — try the next one
+                continue  # this tab is stale, frozen or just slow, so try the next one
         # none responded instantly: reuse existing tabs, polling their async un-freeze/
         # reload round-robin BEFORE opening a duplicate (a discarded tab reloads, not
-        # instant). Poll ALL claude.ai tabs, not just the first — the one un-freezing
+        # instant). Poll every claude.ai tab rather than only the first, because the one that
         # may not be pages[0].
         sids = []
         for t in pages:
@@ -273,7 +273,7 @@ class ClaudeWeb:
         if self.backend == "patchright":
             self._browser.close()
             self._pw.stop()
-        # cdp backend drives the user's real Chrome — nothing to tear down
+        # the cdp backend drives the user's own Chrome, so there is nothing to tear down
 
     def __enter__(self):
         return self
@@ -478,7 +478,7 @@ class ClaudeWeb:
             body = r.get("body") or ""
             if "export_link_used" in body:
                 raise RuntimeError(f"export link already spent (nonce used): {body[:200]}")
-            # terminal failures won't resolve by polling — fail fast instead of
+            # polling will not turn a terminal failure into a success, so stop now instead of
             # spinning until poll_export's timeout.
             if st in (400, 401, 403) or st >= 500:
                 raise RuntimeError(f"export_signed_url HTTP {st}: {body[:300]}")

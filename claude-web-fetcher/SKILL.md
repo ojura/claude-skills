@@ -10,7 +10,7 @@ exports from claude.ai.
 
 ## Backends
 
-- **`backend="cdp"` (default)** — drives the user's real, logged-in Chrome via the
+- **`backend="cdp"` (default)** drives the user's real, logged-in Chrome via the
   **cdp-daemon** (`127.0.0.1:7799`; see the cdp-daemon skill). No Cloudflare
   friction, no `session_key` needed. The daemon is **auto-started** if it isn't
   running, and a parked one (a connect attempt expired un-Allowed, e.g. after
@@ -18,7 +18,7 @@ exports from claude.ai.
   (`_ensure_daemon()`). The daemon's in-process presser handles Chrome's "Allow
   remote debugging?" dialog itself; a manual Allow click is only ever needed if
   AT-SPI genuinely cannot see Chrome.
-- **`backend="patchright"`** — headless fallback that launches its own browser and
+- **`backend="patchright"`** is the headless fallback; it launches its own browser and
   needs a `session_key`. Cloudflare-prone (patchright currently flaky); use only if
   the real-Chrome path is unavailable.
 
@@ -27,7 +27,7 @@ import sys, os
 sys.path.insert(0, os.path.expanduser("~/.claude/skills/claude-web-fetcher"))
 from claude_web import ClaudeWeb
 
-# Default: real Chrome via the cdp-daemon — no session key.
+# Default: real Chrome via the cdp-daemon, so no session key is needed.
 with ClaudeWeb() as c:
     convos = c.list_conversations(limit=10)
 
@@ -50,7 +50,7 @@ with ClaudeWeb() as c:
     for f in c.find_files(convos[0]["uuid"]):
         c.download_file_to(f, "/tmp/" + f.name)
 
-    # Account data export — the ONLY surface that preserves thinking signatures.
+    # Account data export, the only surface that preserves thinking signatures.
     # Scriptable: trigger -> poll signed url -> download zip (download is browserless). Date-scope to cut size.
     c.export_account("/tmp/export.zip", start_date="2026-06-14",
                      end_date="2026-06-22", skip_files=True)
@@ -59,24 +59,24 @@ with ClaudeWeb() as c:
 ## API summary
 
 ### Client
-- `ClaudeWeb(session_key=None, backend="cdp", daemon=None)` — context manager.
+- `ClaudeWeb(session_key=None, backend="cdp", daemon=None)` is a context manager.
   `session_key` is only needed for `backend="patchright"`.
-- `verify()` — org name/uuid/billing_type/capabilities/rate_limit_tier
+- `verify()` returns the org name, uuid, billing_type, capabilities and rate_limit_tier
 
 ### Conversations
 - `list_conversations(limit=60)`
-- `get_conversation(uuid, full=True)` — full message tree
+- `get_conversation(uuid, full=True)` returns the full message tree
 - `find_files(conversation_uuid)` → `[FileRef]`
 - `download_file(ref)` / `download_file_to(ref, dest)`
 
 ### Account data export (only surface with thinking-block signatures)
 - `trigger_export(start_date=None, end_date=None, skip_file_content=True)` → `nonce`
   (dates `YYYY-MM-DD` or ISO; omit both to export everything; a date-only `end_date` is end-day-inclusive)
-- `export_signed_url(nonce)` → signed GCS url, or `None` if not ready — **SINGLE-USE** (a ready 200 with no url, or a spent link, raises)
+- `export_signed_url(nonce)` returns a signed GCS url, or `None` while the export is still building. The url works once: a 200 that carries no url, and a link that has already been used, both raise.
 - `poll_export(nonce, timeout=900, interval=5)` → url (blocks until ready; raises TimeoutError after `timeout`s, or RuntimeError if the link is spent)
 - `download_export(signed_url, dest)` → downloads the zip (plain `urllib`; the signed
   GCS URL needs no browser/cookies)
-- `export_account(dest, start_date=None, end_date=None, skip_files=True, timeout=900)` — one-shot
+- `export_account(dest, start_date=None, end_date=None, skip_files=True, timeout=900)` does the whole export in one call
   trigger→poll→download; the zip's `conversations.json` carries signatures.
 
   Flow: `POST /api/organizations/{org}/export_data` → `POST .../export_signed_url/{nonce}`
@@ -87,13 +87,13 @@ with ClaudeWeb() as c:
 - **Caveat:** these need the SPA's CCR gating headers (`anthropic-client-feature`,
   `anthropic-beta`), captured only under `backend="patchright"`. Under the default
   CDP backend `_ccr_headers` is empty, so these methods **raise a clear RuntimeError
-  before sending any request** — use `backend="patchright"` for Code-web sessions.
+  before sending any request**, so use `backend="patchright"` for Code-web sessions.
 
 Session events have a `type` field: `user`, `assistant`, `tool_use`, `tool_result`,
 `env_manager_log`, `control_request`, etc.
 
 ## FileRef kinds
-- `kind="upload"`: user-uploaded files — `/api/{org}/files/{uuid}/preview`, falling back to the VM mount (`wiggle/download-file?path=/mnt/user-data/uploads/<name>`) when that asset endpoint has purged the upload.
+- `kind="upload"`: user-uploaded files, read from `/api/{org}/files/{uuid}/preview`, falling back to the VM mount (`wiggle/download-file?path=/mnt/user-data/uploads/<name>`) once that asset endpoint has deleted the upload.
 - `kind="wiggle"`: sandbox `present_files` outputs (zip-wrapped; single-file zips auto-unwrapped).
 
 ## Session key acquisition (patchright backend only)
@@ -123,7 +123,7 @@ the value out of conversation context).
 
 ## Notes
 - The export is async; `poll_export` waits for the signed URL. `export_signed_url` is
-  **single-use** — a successful call consumes the link (re-POST → 404 `export_link_used`).
+  **single-use**: a successful call consumes the link, and posting again returns 404 `export_link_used`.
 - Signatures live ONLY in the export (and in local Claude Code JSONL); every live read
   surface strips them. Full format/signature map: `claude_ai_vs_cc_format.md`.
 - Reads have the same scope as the logged-in user on claude.ai.
