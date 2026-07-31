@@ -25,6 +25,7 @@ Any flag agent-resume does not recognise is forwarded verbatim to claude, and a
 forwarded flag overrides the value agent-resume would have derived.
 """
 
+import difflib
 import argparse
 import collections
 import contextlib
@@ -92,6 +93,231 @@ DERIVED_FLAGS = {
     "--model": "model",
     "--effort": "effort",
 }
+
+
+# Flags forwarded to the resumed claude. An allowlist rather than a passthrough,
+# because a passthrough cannot tell a flag meant for claude from a misspelling of
+# one of ours: `--dry-ryn` reached claude as an unknown argument and the run
+# looked like it had honoured a dry run it never saw.
+#
+# Not derived from `claude --help`: that costs most of a second, and it omits
+# --agent-id, --agent-name, --team-name, --parent-session-id and --agent-color,
+# which are real, undocumented, and exactly the flags this tool exists to set.
+# ONE  the flag names a single agent, so a run covering several would give them
+#      all the same identity; refuse rather than do that
+# MANY the flag describes how an agent should run, which is coherent for any
+#      number of them
+ONE, MANY = "one", "many"
+PASSTHROUGH_FLAGS = {
+    # identity, normally derived from the roster and the transcript
+    "--agent-id": ONE, "--agent-name": ONE, "--parent-session-id": ONE,
+    "--agent-color": ONE,          # one colour across a swarm is what the colours exist to avoid
+    "--team-name": MANY, "--agent-type": MANY,
+    # model and reasoning
+    "--model": MANY, "--fallback-model": MANY, "--effort": MANY,
+    # permissions and tools
+    "--permission-mode": MANY, "--dangerously-skip-permissions": MANY,
+    "--allowed": MANY, "--disallowed": MANY, "--tools": MANY, "--add-dir": MANY,
+    # configuration the resumed session reads
+    "--settings": MANY, "--setting-sources": MANY, "--mcp-config": MANY,
+    "--strict-mcp-config": MANY, "--append-system-prompt": MANY,
+    "--system-prompt": MANY, "--plugin-dir": MANY, "--plugin-url": MANY,
+    "--betas": MANY, "--max-budget-usd": MANY,
+    # diagnostics
+    "--verbose": MANY, "--debug-file": MANY, "--include-partial-messages": MANY,
+}
+
+
+def forwarded_flags(passthrough):
+    """The flags in a passthrough, without their values."""
+    return [token.split("=", 1)[0] for token in passthrough
+            if token.startswith("-") and token != "--"]
+
+
+def check_flag_scope(passthrough, count):
+    """Refuse a flag that names one agent when the run covers several.
+
+    Every member would be launched wearing the same identity, which is the state
+    the tool exists to prevent rather than one it should produce on request.
+    """
+    if count <= 1:
+        return
+    named = sorted({f for f in forwarded_flags(passthrough)
+                    if PASSTHROUGH_FLAGS.get(f) == ONE})
+    if named:
+        verb = "names" if len(named) == 1 else "name"
+        die(f"{', '.join(named)} {verb} a single agent, but this run covers {count} of them; "
+            f"resume one by name to use {named[0]}")
+
+
+def check_flags_took_effect(passthrough, results, args):
+    """Refuse to let a forwarded flag look applied when nothing was started.
+
+    These configure a process at exec, so an agent that was already up kept the
+    settings it was started with. Silently dropping them is how you conclude a
+    resume ran at a different effort than it did.
+    """
+    if args.dry_run:
+        return
+    named = sorted(set(forwarded_flags(passthrough)))
+    if not named or any(status in ("launched", "manual") for _, status in results):
+        return
+    verb = "takes" if len(named) == 1 else "take"
+    die(f"{', '.join(named)} only {verb} effect on a process that is started, and nothing "
+        f"was started: every agent named was already running. Stop it first (--stop), "
+        f"or pass --force to start a second copy.")
+
+
+def agent_colour(agent_id, member=None):
+    """The roster colour for an agent, falling back to the spawn record.
+
+    One answer for every surface that paints an agent: completion candidates and
+    the abort listing both ask here, so a name cannot be offered in one colour
+    and killed in another.
+    """
+    colour = (member or {}).get("color") or RESOLVER.spawn_payload(agent_id).get("color")
+    return colour or ""
+
+
+def paint(text, colour):
+    """`text` in the agent's colour, or unchanged when colour is off."""
+    ansi = "" if NO_COLOR else COLOR_ANSI.get(colour or "", "")
+    return f"\033[{ansi}m{text}\033[0m" if ansi else text
+
+
+def running_agents(targets, table):
+    """[(pid, agent_id, description, colour)] for the agents named by `targets`.
+
+    `targets` is a list of agent ids. The description says what the process is
+    actually doing, taken from its own transcript rather than the roster, so the
+    listing shown before a kill describes the conversation about to be ended.
+    """
+    found = []
+    for agent_id in targets:
+        for pid, path in RESOLVER.wearer_transcripts(agent_id, table):
+            title = session_title(path, limit=ABORT_TITLE) if path else None
+            found.append((pid, agent_id, title or "(no title)", agent_colour(agent_id)))
+    return found
+
+
+def stop_targets(args, argv, table):
+    """What --stop was pointed at, as [(pid, label, description, colour)].
+
+    One resolution, three shapes of argument: a team stops every member, an agent
+    stops that agent wherever it runs, and a session stops whoever holds that
+    transcript. The last is not an agent question, so it is answered from the
+    transcript rather than by inventing an id for it.
+    """
+    if args.team:
+        cfg = RESOLVER.roster_path(args.team)
+        if not cfg.exists():
+            die(f"no team config at {cfg}")
+        members = json.loads(cfg.read_text()).get("members", [])
+        return running_agents([m["agentId"] for m in members if m.get("agentId")], table)
+
+    selector = next((a for a in argv if not a.startswith("-")), None)
+    if not selector:
+        die("--stop needs an agent, a session or a team to stop")
+    apply_selector(selector, args, table)
+    if args.agent_id:
+        return running_agents([args.agent_id], table)
+    held = RESOLVER.holders_of(args.resume, table) if args.resume else []
+    return [(pid, args.resume[:8],
+             session_title(path, limit=ABORT_TITLE) if path else "(no title)", "")
+            for pid, path in held]
+
+
+def abort_agents(running, assume_yes=False):
+    """Kill these processes, after showing what each one is working on.
+
+    Ending a conversation cannot be undone, so the listing comes first and
+    describes every process by its own transcript. Returns how many stopped.
+    """
+    if not running:
+        print("nothing running for that")
+        return 0
+    print(f"about to abort {len(running)} process(es):")
+    for pid, agent_id, desc, colour in running:
+        print(f"  {pid:<8} {paint(agent_id, colour)}  {desc}")
+    if not assume_yes:
+        try:
+            answer = input("abort these? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer != "y":
+            print("left alone")
+            return 0
+    killed = 0
+    for pid, agent_id, _desc, _colour in running:
+        result = subprocess.run(["kill", str(pid)], capture_output=True)
+        time.sleep(0.2)
+        if result.returncode == 0 and not pid_alive(pid):
+            killed += 1
+            continue
+        warn(f"pid {pid} ({agent_id}) did not stop"
+             f"{': ' + result.stderr.decode().strip() if result.stderr else ''}")
+    print(f"aborted {killed} of {len(running)}")
+    return killed
+
+
+def read_one_key():
+    """One keypress, raw, or None when there is no terminal to read from."""
+    if not sys.stdin.isatty():
+        return None
+    import termios, tty
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        # os.read, not sys.stdin.read: the latter goes through a buffered text
+        # wrapper that can sit waiting to fill its buffer instead of returning
+        # the keypress, which is a hang at a prompt that asks for one key.
+        data = os.read(fd, 1)
+        return data.decode("utf-8", "replace") if data else None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def confirm_attach(targets, table):
+    """Ask before opening the swarm. Returns True to attach.
+
+    The run has just printed what it did, and attaching replaces that with a
+    tmux client, so the summary is unreadable the moment it succeeds. Stopping
+    here is what makes the output worth printing.
+    """
+    print("Press any key to attach, Ctrl-C to skip attaching, "
+          "Ctrl-X to abort the running process(es)")
+    key = read_one_key()
+    if key is None:
+        return True
+    if key == "\x03":          # Ctrl-C
+        print("skipped attaching")
+        return False
+    if key == "\x18":          # Ctrl-X
+        print()
+        abort_agents(running_agents(targets, table))
+        return False
+    return True
+
+
+def check_passthrough(passthrough, parser):
+    """Reject a flag that is neither ours nor claude's, and say what was meant.
+
+    A near miss is almost always a typo of one of our own flags rather than an
+    unknown claude flag, so the suggestion is drawn from both sets.
+    """
+    known = set(PASSTHROUGH_FLAGS)  # the table's keys are the allowlist
+    ours = {opt for action in parser._actions for opt in action.option_strings}
+    for token in passthrough:
+        if not token.startswith("-") or token == "--":
+            continue
+        flag = token.split("=", 1)[0]
+        if flag in known:
+            continue
+        near = difflib.get_close_matches(flag, sorted(known | ours), n=1, cutoff=0.7)
+        hint = f"; did you mean {near[0]}?" if near else ""
+        die(f"unknown flag {flag}{hint}\n"
+            f"  flags for the resumed session must be one of: {', '.join(sorted(known))}")
 
 
 def step(dry, would, did, indent="  "):
@@ -408,6 +634,26 @@ class Resolver:
 
     def live_agent_procs(self, agent_id, table):
         return claude_procs(f"--agent-id {agent_id}", table)
+
+    def holders_of(self, session_uuid, table):
+        """[(pid, transcript path or None)] for whoever holds this transcript.
+
+        The transcript-shaped counterpart of wearer_transcripts: --stop can be
+        pointed at a session rather than an agent, and that still must not make a
+        caller resolve a path for itself.
+        """
+        path = self.transcript_path(session_uuid) if session_uuid else None
+        return [(pid, path) for pid, _ in self.procs_on_transcript(session_uuid, table)]
+
+    def wearer_transcripts(self, agent_id, table=None):
+        """[(pid, transcript path or None)] for every live process wearing this id.
+
+        wearers() gives the session id from argv; this resolves it to a file, so
+        a caller wanting to say what a process is working on never has to pick a
+        transcript for itself.
+        """
+        return [(pid, self.transcript_path(held) if held else None)
+                for pid, held in self.wearers(agent_id, table)]
 
     def wearers(self, agent_id, table=None):
         """(pid, transcript) for every live process wearing this agent-id.
@@ -2616,7 +2862,7 @@ def auto_redirect(ctx, args, table, prefix=""):
 
 
 def run_one(args, passthrough, table, prefix=""):
-    """Resume one agent. Returns (status, socket), status being
+    """Resume one agent. Returns Outcome(status, socket, is_lead), status being
     'noop' | 'launched' | 'manual' | 'failed'.
 
     The socket is whichever server this agent ended up on, or None when it never
@@ -2627,7 +2873,7 @@ def run_one(args, passthrough, table, prefix=""):
     try:
         ctx = build(args)
     except SystemExit:
-        return "failed", None
+        return Outcome("failed", None, False)
     merged = ctx["merged"]
     agent_id = merged.pick("agentId")[0]
 
@@ -2649,7 +2895,7 @@ def run_one(args, passthrough, table, prefix=""):
         owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
         if owner and owner[2] and not args.force:
             warn(f"already live as pid {owner[0]}{state_note(owner[0])}; pass --force to run a second copy")
-            return "noop", None
+            return Outcome("noop", None, True)
         # Check what we are about to become before writing anything. Forging first
         # and discovering the binary is unusable second leaves a team dir behind for
         # a run that never launched, which is the same mutation-on-a-run-that-does-
@@ -2678,7 +2924,7 @@ def run_one(args, passthrough, table, prefix=""):
                 die(f"cannot exec {command[0]}: {exc}")
         print(f"{prefix}run this in your terminal (leads are not spawned into tmux):")
         print(f"{prefix}  {' '.join(shlex.quote(c) for c in command)}")
-        return "manual", None
+        return Outcome("manual", None, True)
 
     if args.to_team:
         dest = resolve_to_team(args, ctx)
@@ -2691,7 +2937,7 @@ def run_one(args, passthrough, table, prefix=""):
     socket, how = resolve_socket(ctx, args, table)
     if not socket:
         warn("could not determine a tmux socket; pass --socket claude-swarm-<lead-pid>")
-        return "failed", None
+        return Outcome("failed", None, False)
 
     cwd = agent_cwd(ctx)
     want_pane = merged.pick("tmuxPaneId")[0]
@@ -2755,7 +3001,7 @@ def run_one(args, passthrough, table, prefix=""):
             tint_pane(socket, want_pane, merged.pick("color")[0], merged.pick("agentName")[0], args.dry_run)
         if not args.no_update_config:
             update_team_config(ctx, want_pane, args.dry_run)
-        return "noop", socket
+        return Outcome("noop", socket, False)
     if others and not replace_pane:
         warn(f"pane {want_pane} runs a different claude (pid {', '.join(map(str, others))}); using a new pane")
 
@@ -2767,7 +3013,7 @@ def run_one(args, passthrough, table, prefix=""):
             f"session {ctx['session_uuid']} is live as pid {owner[0]}{state_note(owner[0])}; "
             "pass --force to resume a second copy"
         )
-        return "noop", socket
+        return Outcome("noop", socket, False)
 
     live = RESOLVER.live_agent_procs(agent_id, table) if agent_id else []
     elsewhere = [pid for pid, _ in live if pid not in here]
@@ -2776,7 +3022,7 @@ def run_one(args, passthrough, table, prefix=""):
             f"{agent_id} is already running outside pane {want_pane or '?'} "
             f"(pid {', '.join(map(str, elsewhere))}); pass --force to start another instance"
         )
-        return "noop", socket
+        return Outcome("noop", socket, False)
 
     # Already standing in the right place: run the agent in this pane instead of
     # splitting a new one and leaving the shell we were invoked from idle beside
@@ -2801,7 +3047,7 @@ def run_one(args, passthrough, table, prefix=""):
             rendered = f"exec in {cwd or os.getcwd()}: {' '.join(shlex.quote(c) for c in command)}"
             step(args.dry_run, f"would {rendered}", rendered, indent=prefix)
             if args.dry_run:
-                return "launched", socket
+                return Outcome("launched", socket, False)
             # The same environment and cwd launch() would have given it: the
             # team vars a flag-bound boot needs, no inherited API poison, and
             # the project dir --resume looks the transcript up under.
@@ -2848,7 +3094,7 @@ def run_one(args, passthrough, table, prefix=""):
         if not args.no_update_config:
             update_team_config(ctx, pane, args.dry_run, alive)
 
-    return ("launched" if alive else "failed"), socket
+    return Outcome("launched" if alive else "failed", socket, False)
 
 
 def run_complete(topic):
@@ -2889,7 +3135,7 @@ def run_complete(topic):
         for entry in entries:
             agent_id = entry["member"].get("agentId")
             if agent_id:
-                ansi = COLOR_ANSI.get(entry["member"].get("color") or "", "")
+                ansi = "" if NO_COLOR else COLOR_ANSI.get(agent_colour(agent_id, entry["member"]), "")
                 print(f"{agent_id}\tjoined {ms_str(entry['ts'])}\t{ansi}")
         return 0
 
@@ -2990,8 +3236,7 @@ def run_complete(topic):
                 title = session_title(path, limit=COMPLETION_TITLE) if path else None
                 stamp = f"joined {ms_str(when)}" if member else f"last active {ms_str(when)}"
                 desc = f"{title}, {stamp}" if title else stamp
-                colour = (member or {}).get("color") or RESOLVER.spawn_payload(agent_id).get("color")
-                ansi = "" if NO_COLOR else COLOR_ANSI.get(colour or "", "")
+                ansi = "" if NO_COLOR else COLOR_ANSI.get(agent_colour(agent_id, member), "")
                 print(f"{label}\t{agent_id}\t{desc}\t{ansi}")
         return 0
 
@@ -3037,6 +3282,9 @@ TEAM_GRACE_S = 300
 
 # Descriptions in completion have a whole terminal row to themselves.
 COMPLETION_TITLE = 400
+# The abort listing is read under time pressure, with a finger on a key, so it
+# gets a glance-sized title rather than the completion menu's paragraph.
+ABORT_TITLE = 60
 NO_COLOR = False  # zsh truncates to the real terminal width
 
 
@@ -3417,7 +3665,13 @@ def team_socket(data, args, table):
     return None, "unresolved"
 
 
-def run_agents(args, passthrough, table, jobs, socket=None, prefix="", includes_lead=False):
+class Outcome(collections.namedtuple("Outcome", "status socket is_lead")):
+    """What one agent's run produced: how it went, where it landed, and whether
+    it was the lead. The role comes from resolution rather than from the entry
+    point, so a single resume and a team resume answer it the same way."""
+
+
+def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
     """Run each prepared invocation, then finish the run once.
 
     A single agent is a team of one, and both entry points come through here so
@@ -3429,22 +3683,26 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix="", includes_
     `socket` pins the whole run to one server when the caller already knows it,
     as a team does; otherwise the first agent to reach one decides.
     """
-    results = []
+    check_flag_scope(passthrough, sum(1 for _, a in jobs if a is not None))
+    results, roles = [], []
     for label, sub_args in jobs:
         if label is not None:
             print(f"\n[{label}]")
         if sub_args is None:
             print(f"{prefix}skipped")
             results.append((label, "skipped"))
+            roles.append(False)
             continue
-        status, used = run_one(sub_args, passthrough, table, prefix=prefix)
-        results.append((label, status))
-        socket = socket or used
+        outcome = run_one(sub_args, passthrough, table, prefix=prefix)
+        results.append((label, outcome.status))
+        roles.append(outcome.is_lead)
+        socket = socket or outcome.socket
     if len(jobs) > 1:
         print("\nsummary")
         for label, status in results:
             print(f"  {label:<24} {status}")
-    if includes_lead:
+    check_flags_took_effect(passthrough, results, args)
+    if any(roles):
         # A run that includes the lead ends at the lead: either this process became
         # it, or it was already up, or we printed its command. In every one of those
         # the thing to look at is the lead, so attaching would put the swarm in front
@@ -3454,7 +3712,9 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix="", includes_
         return 1 if any(s == "failed" for _, s in results) else 0
     if not args.dry_run and socket and any(s in ("launched", "noop") for _, s in results):
         print()
-        maybe_attach(args, socket)
+        targets = [a.agent_id for _, a in jobs if a is not None and getattr(a, "agent_id", None)]
+        if confirm_attach(targets, table):
+            maybe_attach(args, socket)
     return 1 if any(s == "failed" for _, s in results) else 0
 
 
@@ -3494,9 +3754,7 @@ def run_team(args, passthrough, table):
         one.socket_reason = "team socket" if not args.socket else "--socket"
         one.in_team = True  # never exec the lead mid-loop; the members need us alive
         jobs.append((name, one))
-    return run_agents(args, passthrough, table, jobs, socket=socket, prefix="  ",
-                      includes_lead=any(m.get("agentId") == lead_id for m in ordered
-                                        if not (args.no_lead and m.get("agentId") == lead_id)))
+    return run_agents(args, passthrough, table, jobs, socket=socket, prefix="  ")
 
 
 def set_tmux_target(session, window):
@@ -3756,6 +4014,10 @@ def main():
                         help=f"window to create when the session is missing (default {TMUX_WINDOW})")
     parser.add_argument("--claude-bin")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--stop", "--terminate", action="store_true", dest="stop",
+                        help="stop the agent, session or team instead of resuming it")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="do not ask before stopping")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--explain", action="store_true")
     parser.add_argument("--no-update-config", action="store_true")
@@ -3769,6 +4031,19 @@ def main():
     argv = sys.argv[1:]
     selector = argv.pop(0) if argv and not argv[0].startswith("-") else None
     args, passthrough = parser.parse_known_args(argv)
+    check_passthrough(passthrough, parser)
+    if args.team and (args.agent_id or args.resume):
+        die(f"--team names every member of {args.team}, and "
+            f"{'--agent-id' if args.agent_id else '--resume'} names one agent; pick one")
+
+    if args.stop:
+        if passthrough:
+            named = sorted(set(forwarded_flags(passthrough)))
+            die(f"{', '.join(named)} {'configures' if len(named) == 1 else 'configure'} a process "
+                f"being started, and --stop starts nothing")
+        table = RESOLVER.ps_table()
+        running = stop_targets(args, argv, table)
+        return 0 if abort_agents(running, assume_yes=args.yes) else 1
 
     if args.selftest:
         return run_selftest()
