@@ -7,8 +7,17 @@ sidechains are dropped. Keeps user/assistant TEXT; `--mode enriched` also keeps
 assistant `tool_use` (name + input, clipped); `tool_result` and `thinking` are
 always excluded. `<system-reminder>...</system-reminder>` blocks are stripped.
 
+Harness-injected user nodes (`isMeta: true`) - skill content dumps, local-command
+caveats, session-name reminders - are stubbed to one line by default (`--meta stub`);
+they are text blocks, not tool_results, so block-type filtering alone would keep
+them in full (a single skill load can be thousands of lines). The stub names the
+first line, the line count, and the `sourceToolUseID` when the injection came from
+a Skill tool call. `--meta drop` removes them silently, `--meta keep` restores the
+old emit-in-full behavior. Compact-summary nodes are never stubbed; short one-line
+meta (e.g. `[Image: ...]` placeholders) is kept as-is.
+
 Usage:
-    python3 extract.py <SESSION.jsonl> <OUT.md> [--mode text|enriched] [--cap 300]
+    python3 extract.py <SESSION.jsonl> <OUT.md> [--mode text|enriched] [--cap 300] [--meta stub|drop|keep]
 
 Then read OUT.md back in ~600-line chunks (the Read tool caps ~25k tokens/call).
 In enriched mode each turn is tagged `uuid=<id>`; recover a clipped tool input via
@@ -91,6 +100,15 @@ def render_tool(b, cap):
     return "\n".join(lines)
 
 
+def meta_stub(txt, node):
+    first = txt.lstrip().splitlines()[0].strip()
+    if len(first) > 100:
+        first = first[:100] + "…"
+    src = node.get("sourceToolUseID")
+    via = " | via %s" % src if src else ""
+    return "[[meta injection stripped: %s (%d lines%s)]]" % (first, txt.count("\n") + 1, via)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Reconstruct the active conversation path from a session JSONL.")
     ap.add_argument("jsonl", help="path to the session .jsonl")
@@ -98,6 +116,8 @@ def main():
     ap.add_argument("--mode", choices=("text", "enriched"), default="enriched",
                     help="text = prose only (small); enriched = prose + tool calls (large)")
     ap.add_argument("--cap", type=int, default=300, help="clip tool inputs to N chars (enriched mode)")
+    ap.add_argument("--meta", choices=("stub", "drop", "keep"), default="stub",
+                    help="isMeta user nodes (skill dumps, caveats): stub to one line (default), drop, or keep in full")
     a = ap.parse_args()
 
     path = active_path(load(a.jsonl))
@@ -142,6 +162,19 @@ def main():
                     elif bt == "tool_use" and role == "assistant" and a.mode == "enriched":
                         items.append(("tool", b))
                         tools[b.get("name", "?")] += 1
+            # Harness-injected meta (isMeta) rides ordinary text blocks; stub or drop it
+            # at the emission step only, so the walk and the compaction-boundary report
+            # below still see every node. Compact summaries are exempt (they anchor the
+            # read-back intervals), as are short one-liners like [Image: ...] placeholders,
+            # which a stub would lengthen, not shorten.
+            if o.get("isMeta") and a.meta != "keep" and not o.get("isCompactSummary"):
+                meta_text = "\n".join(p for k, p in items if k == "text")
+                if meta_text and not ("\n" not in meta_text and len(meta_text) <= 120):
+                    non_text = [it for it in items if it[0] != "text"]
+                    if a.meta == "drop":
+                        items = non_text
+                    else:
+                        items = [("text", meta_stub(meta_text, o))] + non_text
             if not items:
                 continue
             turns += 1
