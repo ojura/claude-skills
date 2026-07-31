@@ -118,24 +118,57 @@ DERIVED_FLAGS = {
 # MANY the flag describes how an agent should run, which is coherent for any
 #      number of them
 ONE, MANY = "one", "many"
+Flag = collections.namedtuple("Flag", "scope valued")
+VALUE, BOOL = True, False
 PASSTHROUGH_FLAGS = {
     # identity, normally derived from the roster and the transcript
-    "--agent-id": ONE, "--agent-name": ONE, "--parent-session-id": ONE,
-    "--agent-color": ONE,          # one colour across a swarm is what the colours exist to avoid
-    "--team-name": MANY, "--agent-type": MANY,
+    "--agent-id": Flag(ONE, VALUE), "--agent-name": Flag(ONE, VALUE),
+    "--parent-session-id": Flag(ONE, VALUE),
+    "--agent-color": Flag(ONE, VALUE),   # one colour across a swarm defeats the colours
+    "--team-name": Flag(MANY, VALUE), "--agent-type": Flag(MANY, VALUE),
     # model and reasoning
-    "--model": MANY, "--fallback-model": MANY, "--effort": MANY,
+    "--model": Flag(MANY, VALUE), "--fallback-model": Flag(MANY, VALUE),
+    "--effort": Flag(MANY, VALUE),
     # permissions and tools
-    "--permission-mode": MANY, "--dangerously-skip-permissions": MANY,
-    "--allowed": MANY, "--disallowed": MANY, "--tools": MANY, "--add-dir": MANY,
+    "--permission-mode": Flag(MANY, VALUE),
+    "--dangerously-skip-permissions": Flag(MANY, BOOL),
+    "--allowed": Flag(MANY, VALUE), "--disallowed": Flag(MANY, VALUE),
+    "--tools": Flag(MANY, VALUE), "--add-dir": Flag(MANY, VALUE),
     # configuration the resumed session reads
-    "--settings": MANY, "--setting-sources": MANY, "--mcp-config": MANY,
-    "--strict-mcp-config": MANY, "--append-system-prompt": MANY,
-    "--system-prompt": MANY, "--plugin-dir": MANY, "--plugin-url": MANY,
-    "--betas": MANY, "--max-budget-usd": MANY,
+    "--settings": Flag(MANY, VALUE), "--setting-sources": Flag(MANY, VALUE),
+    "--mcp-config": Flag(MANY, VALUE), "--strict-mcp-config": Flag(MANY, BOOL),
+    "--append-system-prompt": Flag(MANY, VALUE), "--system-prompt": Flag(MANY, VALUE),
+    "--plugin-dir": Flag(MANY, VALUE), "--plugin-url": Flag(MANY, VALUE),
+    "--betas": Flag(MANY, VALUE), "--max-budget-usd": Flag(MANY, VALUE),
     # diagnostics
-    "--verbose": MANY, "--debug-file": MANY, "--include-partial-messages": MANY,
+    "--verbose": Flag(MANY, BOOL), "--debug-file": Flag(MANY, VALUE),
+    "--include-partial-messages": Flag(MANY, BOOL),
 }
+
+
+def take_selector(passthrough):
+    """(selector, remaining tokens) for a selector written after the flags.
+
+    A flag's value is not a name. The table already records which flags take
+    one, so the walk consults it rather than treating every token without a
+    leading dash as a candidate: `--model opus` would otherwise offer `opus` as
+    an agent to go looking for, and `--stop NAME --model opus` would see two
+    candidates, promote neither, and fall out as a usage error.
+    """
+    bare, rest, skip = [], [], False
+    for token in passthrough:
+        if skip:
+            rest.append(token)
+            skip = False
+        elif token.startswith("-"):
+            rest.append(token)
+            spec = PASSTHROUGH_FLAGS.get(token.split("=", 1)[0])
+            skip = bool(spec and spec.valued and "=" not in token)
+        else:
+            bare.append(token)
+    if len(bare) != 1:
+        return None, passthrough
+    return bare[0], rest
 
 
 def forwarded_flags(passthrough):
@@ -153,7 +186,7 @@ def check_flag_scope(passthrough, count):
     if count <= 1:
         return
     named = sorted({f for f in forwarded_flags(passthrough)
-                    if PASSTHROUGH_FLAGS.get(f) == ONE})
+                    if getattr(PASSTHROUGH_FLAGS.get(f), "scope", None) == ONE})
     if named:
         verb = "names" if len(named) == 1 else "name"
         die(f"{', '.join(named)} {verb} a single agent, but this run covers {count} of them; "
@@ -3895,6 +3928,21 @@ def run_selftest():
                 if "print(" in line and "would " in line and " else " not in line]
     check("every preview line has a real counterpart", not unpaired, "; ".join(unpaired))
 
+    # A flag's value is not a selector: the promotion must consult the table
+    # rather than treat any dash-less token as a name.
+    promo = {
+        "value not promoted": take_selector(["--model", "opus"]) == (None, ["--model", "opus"]),
+        "selector before a valued flag": take_selector(["a@b", "--model", "opus"])
+            == ("a@b", ["--model", "opus"]),
+        "selector after a boolean flag": take_selector(["--verbose", "a@b"])
+            == ("a@b", ["--verbose"]),
+        "equals spelling leaves its value alone": take_selector(["--model=opus", "a@b"])
+            == ("a@b", ["--model=opus"]),
+        "two candidates promote neither": take_selector(["a@b", "c@d"])[0] is None,
+    }
+    wrong = sorted(k for k, good in promo.items() if not good)
+    check("a flag value is never taken as a selector", not wrong, ", ".join(wrong))
+
     # --stop resolves a selector that has already become args; every shape of it
     # was broken at once because each was derived separately from a mangled argv.
     stop_base = Path(tempfile.mkdtemp())
@@ -4089,10 +4137,7 @@ def main():
     selector = argv.pop(0) if argv and not argv[0].startswith("-") else None
     args, passthrough = parser.parse_known_args(argv)
     if selector is None:
-        bare = [t for t in passthrough if not t.startswith("-")]
-        if len(bare) == 1:
-            selector = bare[0]
-            passthrough = [t for t in passthrough if t != selector]
+        selector, passthrough = take_selector(passthrough)
     check_passthrough(passthrough, parser)
     if args.team and (args.agent_id or args.resume):
         die(f"--team names every member of {args.team}, and "
