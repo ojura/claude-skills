@@ -343,7 +343,7 @@ def read_one_key():
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
-def confirm_attach(targets, table):
+def confirm_attach(targets, table, socket):
     """Ask before opening the swarm. Returns True to attach.
 
     The run has just printed what it did, and attaching replaces that with a
@@ -354,8 +354,10 @@ def confirm_attach(targets, table):
         # Nothing can answer, so promising a keypress would be theatre; the
         # attach itself is vetoed downstream when there is no terminal for it.
         return True
-    print("Press any key to attach, Ctrl-C to skip attaching, "
-          "Ctrl-X to abort the running process(es)")
+    # Name the server: several swarms can be up at once, and "attach" without
+    # saying to what is a keypress taken on trust.
+    print(f"Press any key to attach to {socket} ({TMUX_SESSION}), "
+          f"Ctrl-C to skip attaching, Ctrl-X to abort the running process(es)")
     key = read_one_key()
     if key is None:
         return True
@@ -2296,6 +2298,7 @@ TMUX_COLORS = {"purple": "magenta", "orange": "colour208", "pink": "colour205"}
 
 LAUNCH_APPEAR_S = 10.0   # only ever waited out when nothing appears at all
 LAUNCH_SETTLE_S = 1.5    # then confirm it did not exit immediately
+LAUNCH_WRITE_S = 45.0    # a large session takes tens of seconds to load and write
 
 
 def launch_present(socket, pane, agent_id):
@@ -2943,7 +2946,7 @@ def run_one(args, passthrough, table, prefix=""):
     try:
         ctx = build(args)
     except SystemExit:
-        return Outcome("failed", None, False)
+        return Outcome("failed", None, False, None)
     merged = ctx["merged"]
     agent_id = merged.pick("agentId")[0]
 
@@ -2965,7 +2968,7 @@ def run_one(args, passthrough, table, prefix=""):
         owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
         if owner and owner[2] and not args.force:
             warn(f"already live as pid {owner[0]}{state_note(owner[0])}; pass --force to run a second copy")
-            return Outcome("noop", None, True)
+            return Outcome("noop", None, True, None)
         # Check what we are about to become before writing anything. Forging first
         # and discovering the binary is unusable second leaves a team dir behind for
         # a run that never launched, which is the same mutation-on-a-run-that-does-
@@ -2994,7 +2997,7 @@ def run_one(args, passthrough, table, prefix=""):
                 die(f"cannot exec {command[0]}: {exc}")
         print(f"{prefix}run this in your terminal (leads are not spawned into tmux):")
         print(f"{prefix}  {' '.join(shlex.quote(c) for c in command)}")
-        return Outcome("manual", None, True)
+        return Outcome("manual", None, True, None)
 
     if args.to_team:
         dest = resolve_to_team(args, ctx)
@@ -3007,7 +3010,7 @@ def run_one(args, passthrough, table, prefix=""):
     socket, how = resolve_socket(ctx, args, table)
     if not socket:
         warn("could not determine a tmux socket; pass --socket claude-swarm-<lead-pid>")
-        return Outcome("failed", None, False)
+        return Outcome("failed", None, False, None)
 
     cwd = agent_cwd(ctx)
     want_pane = merged.pick("tmuxPaneId")[0]
@@ -3071,7 +3074,7 @@ def run_one(args, passthrough, table, prefix=""):
             tint_pane(socket, want_pane, merged.pick("color")[0], merged.pick("agentName")[0], args.dry_run)
         if not args.no_update_config:
             update_team_config(ctx, want_pane, args.dry_run)
-        return Outcome("noop", socket, False)
+        return Outcome("noop", socket, False, None)
     if others and not replace_pane:
         warn(f"pane {want_pane} runs a different claude (pid {', '.join(map(str, others))}); using a new pane")
 
@@ -3083,7 +3086,7 @@ def run_one(args, passthrough, table, prefix=""):
             f"session {ctx['session_uuid']} is live as pid {owner[0]}{state_note(owner[0])}; "
             "pass --force to resume a second copy"
         )
-        return Outcome("noop", socket, False)
+        return Outcome("noop", socket, False, None)
 
     live = RESOLVER.live_agent_procs(agent_id, table) if agent_id else []
     elsewhere = [pid for pid, _ in live if pid not in here]
@@ -3092,7 +3095,7 @@ def run_one(args, passthrough, table, prefix=""):
             f"{agent_id} is already running outside pane {want_pane or '?'} "
             f"(pid {', '.join(map(str, elsewhere))}); pass --force to start another instance"
         )
-        return Outcome("noop", socket, False)
+        return Outcome("noop", socket, False, None)
 
     # Already standing in the right place: run the agent in this pane instead of
     # splitting a new one and leaving the shell we were invoked from idle beside
@@ -3117,7 +3120,7 @@ def run_one(args, passthrough, table, prefix=""):
             rendered = f"exec in {cwd or os.getcwd()}: {' '.join(shlex.quote(c) for c in command)}"
             step(args.dry_run, f"would {rendered}", rendered, indent=prefix)
             if args.dry_run:
-                return Outcome("launched", socket, False)
+                return Outcome("launched", socket, False, None)
             # The same environment and cwd launch() would have given it: the
             # team vars a flag-bound boot needs, no inherited API poison, and
             # the project dir --resume looks the transcript up under.
@@ -3146,10 +3149,11 @@ def run_one(args, passthrough, table, prefix=""):
     if not args.no_color:
         tint_pane(socket, pane, merged.pick("color")[0], merged.pick("agentName")[0], args.dry_run)
 
-    alive = True
+    alive, wrote = True, True
     if not args.dry_run:
         alive, why = launch_survived(socket, pane, build_command_agent_id(ctx),
                                      ctx["transcript"][0], launched_at)
+        wrote = alive and why == "wrote to its transcript"
         if alive:
             print(f"{prefix}alive    {why}")
         else:
@@ -3164,7 +3168,13 @@ def run_one(args, passthrough, table, prefix=""):
         if not args.no_update_config:
             update_team_config(ctx, pane, args.dry_run, alive)
 
-    return Outcome("launched" if alive else "failed", socket, False)
+    # A launch that has not written yet is not a verdict, only an unfinished
+    # observation: the settle window is a second and a half and a healthy agent
+    # takes tens of seconds to load a large session. Hand it back so the run can
+    # answer it at the end rather than leaving "not yet" as the last word.
+    unwritten = ((merged.pick("agentId")[0] or ctx["session_uuid"][:8],
+                  ctx["transcript"][0], launched_at) if alive and not wrote else None)
+    return Outcome("launched" if alive else "failed", socket, False, unwritten)
 
 
 def run_complete(topic):
@@ -3735,10 +3745,41 @@ def team_socket(data, args, table):
     return None, "unresolved"
 
 
-class Outcome(collections.namedtuple("Outcome", "status socket is_lead")):
+class Outcome(collections.namedtuple("Outcome", "status socket is_lead pending_write")):
     """What one agent's run produced: how it went, where it landed, and whether
     it was the lead. The role comes from resolution rather than from the entry
     point, so a single resume and a team resume answer it the same way."""
+
+
+def report_transcript_writes(pending, args, grace=LAUNCH_WRITE_S):
+    """Finish the observation a launch left open.
+
+    launch_survived waits a second and a half for a resumed agent to write its
+    own transcript, which is the proof it loaded the session rather than merely
+    started a process. A large session takes tens of seconds to get there, so
+    "no transcript write yet" is the ordinary result and saying only that leaves
+    the run reporting a question instead of an answer. The rest of the run has
+    already bought some of the wait; this spends what is left.
+    """
+    if args.dry_run or not pending:
+        return
+    print()
+    deadline = time.monotonic() + grace
+    waiting = list(pending)
+    while waiting and time.monotonic() < deadline:
+        for item in list(waiting):
+            label, path, since = item
+            try:
+                if path.stat().st_mtime > since:
+                    print(f"wrote    {label} loaded its session and wrote its transcript")
+                    waiting.remove(item)
+            except OSError:
+                pass
+        if waiting:
+            time.sleep(0.5)
+    for label, path, _since in waiting:
+        warn(f"{label} is running but has not written its transcript in {grace:.0f}s; "
+             f"it may still be loading, or it may be stuck before it got there")
 
 
 def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
@@ -3754,7 +3795,7 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
     as a team does; otherwise the first agent to reach one decides.
     """
     check_flag_scope(passthrough, sum(1 for _, a in jobs if a is not None))
-    results, roles = [], []
+    results, roles, outcomes = [], [], []
     for label, sub_args in jobs:
         if label is not None:
             print(f"\n[{label}]")
@@ -3766,11 +3807,13 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
         outcome = run_one(sub_args, passthrough, table, prefix=prefix)
         results.append((label, outcome.status))
         roles.append(outcome.is_lead)
+        outcomes.append(outcome)
         socket = socket or outcome.socket
     if len(jobs) > 1:
         print("\nsummary")
         for label, status in results:
             print(f"  {label:<24} {status}")
+    report_transcript_writes([o.pending_write for o in outcomes if o.pending_write], args)
     check_flags_took_effect(passthrough, results, args)
     if any(roles):
         # A run that includes the lead ends at the lead: either this process became
@@ -3783,7 +3826,7 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
     if not args.dry_run and socket and any(s in ("launched", "noop") for _, s in results):
         print()
         targets = [a.agent_id for _, a in jobs if a is not None and getattr(a, "agent_id", None)]
-        if confirm_attach(targets, table):
+        if confirm_attach(targets, table, socket):
             maybe_attach(args, socket)
     return 1 if any(s == "failed" for _, s in results) else 0
 
