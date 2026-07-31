@@ -3877,7 +3877,119 @@ def set_tmux_target(session, window):
     TMUX_WINDOW = window or TMUX_WINDOW
 
 
-def run_selftest():
+def live_checks():
+    """Checks that need a real process, a real terminal or a real directory.
+
+    Kept apart from the read-only ones because they spawn, chdir and open a pty,
+    and --selftest runs from a SessionStart hook where changing nothing is the
+    contract. Everything here undoes itself: processes are killed, the cwd is
+    restored, temporary trees are removed.
+
+    They exist because the alternative was leaving these paths to one-off
+    scripts, and the paths a script tested once are the ones that broke.
+    """
+    import pty
+    import subprocess as sp
+    out = []
+
+    def check(name, ok, detail=""):
+        out.append((name, ok, detail))
+
+    # read_one_key against a terminal, which is the only place it does anything.
+    keys = {}
+    for label, byte in (("Ctrl-C", b"\x03"), ("Ctrl-X", b"\x18"), ("a plain key", b"a")):
+        master, slave = pty.openpty()
+        probe = sp.Popen([sys.executable, "-c",
+                          "import sys,termios,tty,os\n"
+                          "fd=sys.stdin.fileno(); saved=termios.tcgetattr(fd)\n"
+                          "tty.setraw(fd)\n"
+                          "sys.stderr.write(str(os.read(fd,1)[0]))\n"
+                          "termios.tcsetattr(fd, termios.TCSADRAIN, saved)"],
+                         stdin=slave, stdout=sp.DEVNULL, stderr=sp.PIPE)
+        os.close(slave)
+        time.sleep(0.4)          # tty.setraw flushes, so write only once it is raw
+        os.write(master, byte)
+        try:
+            got = probe.communicate(timeout=10)[1].decode().strip()
+        except sp.TimeoutExpired:
+            probe.kill()
+            got = "hung"
+        os.close(master)
+        keys[label] = got == str(byte[0])
+    wrong = sorted(k for k, good in keys.items() if not good)
+    check("a raw keypress is read from a real terminal", not wrong, ", ".join(wrong))
+
+    # enter_agent_cwd really moves the process, and refuses rather than exec from
+    # the wrong place.
+    here = os.getcwd()
+    moved = Path(tempfile.mkdtemp())
+    real_cwd = globals()["agent_cwd"]
+    try:
+        globals()["agent_cwd"] = lambda ctx: str(moved)
+        with contextlib.redirect_stdout(io.StringIO()):
+            enter_agent_cwd({})
+        went = os.path.realpath(os.getcwd()) == os.path.realpath(moved)
+        with contextlib.redirect_stdout(io.StringIO()) as quiet:
+            enter_agent_cwd({})
+        stayed = quiet.getvalue() == ""
+        globals()["agent_cwd"] = lambda ctx: "/no-such-dir-for-a-check"
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                enter_agent_cwd({})
+                refused = False
+            except SystemExit:
+                refused = True
+        globals()["agent_cwd"] = lambda ctx: None
+        stood = enter_agent_cwd({}) is None
+    finally:
+        globals()["agent_cwd"] = real_cwd
+        os.chdir(here)
+        shutil.rmtree(moved, ignore_errors=True)
+    entering = {"moves there": went, "says nothing when already there": stayed,
+                "refuses a directory it cannot enter": refused,
+                "stands still when none is recorded": stood}
+    wrong = sorted(k for k, good in entering.items() if not good)
+    check("a launch enters the agent's directory", not wrong, ", ".join(wrong))
+
+    # abort_agents against processes spawned for the purpose.
+    victims = [sp.Popen(["sleep", "30"]) for _ in range(2)]
+    running = [(v.pid, f"probe-{i}@check", "a sleep standing in for an agent", "")
+               for i, v in enumerate(victims)]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            killed = abort_agents(running, assume_yes=True)
+        gone = all(not pid_alive(v.pid) for v in victims)
+        check("an abort stops what it listed", killed == 2 and gone,
+              f"killed {killed}, all gone: {gone}")
+        check("the abort listing says what each process is doing",
+              "a sleep standing in for an agent" in said.getvalue()
+              and "probe-0@check" in said.getvalue())
+    finally:
+        for v in victims:
+            v.kill()
+            v.wait()
+
+    # a refusal at the prompt leaves them running
+    spared = sp.Popen(["sleep", "30"])
+    real_input = globals()["input"] if "input" in globals() else None
+    try:
+        globals()["input"] = lambda prompt="": "n"
+        with contextlib.redirect_stdout(io.StringIO()):
+            killed = abort_agents([(spared.pid, "spared@check", "still working", "")])
+        check("answering no leaves the process alone",
+              killed == 0 and pid_alive(spared.pid))
+    finally:
+        if real_input is None:
+            globals().pop("input", None)
+        else:
+            globals()["input"] = real_input
+        spared.kill()
+        spared.wait()
+
+    return out
+
+
+def run_selftest(live=False):
     """Assert the invariants this tool keeps rediscovering. Read-only.
 
     Two kinds: structural ones read from this file's own syntax tree, because
@@ -4266,6 +4378,9 @@ def run_selftest():
         malformed = [line for line in lines if "\t" not in line and ":" not in line]
         check(f"completion emits parseable {topic}", not malformed, f"{len(lines)} candidates")
 
+    if live:
+        results.extend(live_checks())
+
     width = max(len(name) for name, _, _ in results)
     for name, ok, detail in results:
         note = f"  ({detail})" if detail else ""
@@ -4292,6 +4407,9 @@ def main():
                         help="symlink into ~/.local/bin, set up completion and the cleanup hook")
     parser.add_argument("--no-color", "--no-colour", dest="no_color", action="store_true",
                         help="do not tint the pane, and emit completion candidates uncoloured")
+    parser.add_argument("--live", action="store_true",
+                        help="with --selftest, also run the checks that spawn a process, "
+                             "open a terminal or change directory (each cleans up after itself)")
     parser.add_argument("--selftest", action="store_true",
                         help="check the tool's invariants against this machine; changes nothing")
     parser.add_argument("--cleanup", "--cleanup-sockets", dest="cleanup", action="store_true",
@@ -4331,7 +4449,9 @@ def main():
             f"{'--agent-id' if args.agent_id else '--resume'} names one agent; pick one")
 
     if args.selftest:
-        return run_selftest()
+        return run_selftest(live=args.live)
+    if args.live:
+        die("--live extends --selftest; it does nothing on its own")
 
     if args.cleanup:
         return run_cleanup(args.dry_run)

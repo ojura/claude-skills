@@ -106,8 +106,12 @@ next lead's exit. Members come up first: the mailbox is a directory, not a
 process, so nobody has to wait for the lead.
 
 `--dry-run` previews (it does not cover `--install`/`--poison`, which refuse
-it), `--explain` shows per-field provenance, `--selftest` checks the tool's own
-invariants and changes nothing, extra flags pass through to claude. After a
+it), `--explain` shows per-field provenance, and `--selftest` checks the tool's own
+invariants while changing nothing, which is what lets it run from a hook.
+`--selftest --live` adds the checks that need a real process, a terminal or a
+directory change; each undoes itself. Flags for the resumed session are an
+allowlist rather than a passthrough, so a misspelling of one of ours is caught
+instead of reaching claude as an unknown argument. After a
 launch it attaches you to the swarm unless a Claude Code tool is driving, there
 is no tty, you are already inside tmux, or somebody is watching it already;
 `--attach` and `--no-attach` force either way. Run from inside the target pane,
