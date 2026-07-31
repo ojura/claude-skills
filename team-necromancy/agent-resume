@@ -2935,7 +2935,7 @@ def auto_redirect(ctx, args, table, prefix=""):
     ctx["to_lead"] = RESOLVER.team_lead_session(dest)
 
 
-def run_one(args, passthrough, table, prefix=""):
+def run_one(args, passthrough, table, prefix="", pending=()):
     """Resume one agent. Returns Outcome(status, socket, is_lead), status being
     'noop' | 'launched' | 'manual' | 'failed'.
 
@@ -2987,6 +2987,14 @@ def run_one(args, passthrough, table, prefix=""):
         # own conversation, since --resume looks the transcript up under the project
         # dir of wherever it starts.
         if sys.stdout.isatty() and not args.dry_run:
+            # Becoming the lead replaces this process, so anything the run was
+            # still watching is never reported. Say what was outstanding rather
+            # than let it vanish; waiting for it here would cost the terminal
+            # forty-five seconds before the lead you asked for appears.
+            if pending:
+                names = ", ".join(label for label, _path, _since in pending)
+                print(f"{prefix}loading  {len(pending)} member(s) had not written a transcript "
+                      f"yet when this took over: {names}")
             enter_agent_cwd(ctx, prefix)
             print(f"{prefix}exec     taking over this terminal")
             try:
@@ -3805,7 +3813,8 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
             results.append((label, "skipped"))
             roles.append(False)
             continue
-        outcome = run_one(sub_args, passthrough, table, prefix=prefix)
+        outcome = run_one(sub_args, passthrough, table, prefix=prefix,
+                          pending=[o.pending_write for o in outcomes if o.pending_write])
         results.append((label, outcome.status))
         roles.append(outcome.is_lead)
         outcomes.append(outcome)
@@ -4221,6 +4230,27 @@ def run_selftest(live=False):
     }
     wrong = sorted(k for k, good in took.items() if not good)
     check("a flag that could not apply is not reported as applied", not wrong, ", ".join(wrong))
+
+    # A lead execs away mid-loop, so anything the run was still watching would go
+    # unreported unless it is handed to the lead before it takes over.
+    real_one, real_report = run_one, report_transcript_writes
+    handed = []
+    try:
+        def _fake_one(args_, passthrough_, table_, prefix="", pending=()):
+            handed.append([label for label, *_ in pending])
+            if len(handed) < 3:
+                return Outcome("launched", "s", False, (f"member{len(handed)}", Path("p"), 1))
+            return Outcome("manual", None, True, None)
+        globals()["run_one"] = _fake_one
+        globals()["report_transcript_writes"] = lambda *a, **kw: None
+        with contextlib.redirect_stdout(io.StringIO()):
+            job_args = _Args(no_attach=True, attach=False)
+            run_agents(job_args, [], {},
+                       [("m1", job_args), ("m2", job_args), ("lead", job_args)], socket="s")
+    finally:
+        globals()["run_one"], globals()["report_transcript_writes"] = real_one, real_report
+    check("a lead is told what is still loading before it takes over",
+          handed == [[], ["member1"], ["member1", "member2"]], str(handed))
 
     # --- the attach prompt: which key does what, and when it is offered at all
     real_key, real_abort, real_stdin = read_one_key, abort_agents, sys.stdin
