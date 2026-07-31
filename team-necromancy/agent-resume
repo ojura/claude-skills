@@ -21,8 +21,17 @@ permission mode, cwd, parent session, tmux socket + pane) is reconstructed from
 three on-disk sources plus the live process table; when they disagree, the most
 recent value wins.
 
-Any flag agent-resume does not recognise is forwarded verbatim to claude, and a
-forwarded flag overrides the value agent-resume would have derived.
+Flags for the resumed session are an allowlist, PASSTHROUGH_FLAGS, not a
+passthrough, and a forwarded flag overrides the value this tool would have
+derived. The allowlist is what lets a misspelling of one of our own flags be
+caught instead of reaching claude as an unknown argument: a run given --dry-ryn
+read as though it had honoured a dry run it never saw.
+
+The cost is maintenance. The list is hand-held, so a flag claude grows is
+refused here until the table learns it, and the newer ones churn. It is not
+derived from `claude --help` because that costs most of a second per run and
+omits --agent-id, --agent-name, --team-name and --parent-session-id, which are
+real and are precisely the flags this tool exists to set.
 """
 
 import difflib
@@ -39,6 +48,7 @@ import shutil
 import socket as socketlib
 import subprocess
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -163,6 +173,12 @@ def check_flags_took_effect(passthrough, results, args):
     if not named or any(status in ("launched", "manual") for _, status in results):
         return
     verb = "takes" if len(named) == 1 else "take"
+    if any(status in ("failed", "skipped") for _, status in results):
+        # The run has already said why nothing started. Adding "they were all
+        # already running" would be false, and "--force to start a second copy"
+        # is the wrong advice for something that failed.
+        warn(f"{', '.join(named)} never applied: nothing was started")
+        return
     die(f"{', '.join(named)} only {verb} effect on a process that is started, and nothing "
         f"was started: every agent named was already running. Stop it first (--stop), "
         f"or pass --force to start a second copy.")
@@ -200,7 +216,7 @@ def running_agents(targets, table):
     return found
 
 
-def stop_targets(args, argv, table):
+def stop_targets(args, table):
     """What --stop was pointed at, as [(pid, label, description, colour)].
 
     One resolution, three shapes of argument: a team stops every member, an agent
@@ -214,11 +230,9 @@ def stop_targets(args, argv, table):
             die(f"no team config at {cfg}")
         members = json.loads(cfg.read_text()).get("members", [])
         return running_agents([m["agentId"] for m in members if m.get("agentId")], table)
-
-    selector = next((a for a in argv if not a.startswith("-")), None)
-    if not selector:
+    if not (args.agent_id or args.resume):
         die("--stop needs an agent, a session or a team to stop")
-    apply_selector(selector, args, table)
+
     if args.agent_id:
         return running_agents([args.agent_id], table)
     held = RESOLVER.holders_of(args.resume, table) if args.resume else []
@@ -250,7 +264,13 @@ def abort_agents(running, assume_yes=False):
     killed = 0
     for pid, agent_id, _desc, _colour in running:
         result = subprocess.run(["kill", str(pid)], capture_output=True)
-        time.sleep(0.2)
+        # A healthy claude takes a moment to shut down cleanly, so poll rather
+        # than declare failure after one short sleep and warn about a process
+        # that was merely still on its way out.
+        for _ in range(10):
+            time.sleep(0.15)
+            if not pid_alive(pid):
+                break
         if result.returncode == 0 and not pid_alive(pid):
             killed += 1
             continue
@@ -285,6 +305,10 @@ def confirm_attach(targets, table):
     tmux client, so the summary is unreadable the moment it succeeds. Stopping
     here is what makes the output worth printing.
     """
+    if not sys.stdin.isatty():
+        # Nothing can answer, so promising a keypress would be theatre; the
+        # attach itself is vetoed downstream when there is no terminal for it.
+        return True
     print("Press any key to attach, Ctrl-C to skip attaching, "
           "Ctrl-X to abort the running process(es)")
     key = read_one_key()
@@ -3871,6 +3895,39 @@ def run_selftest():
                 if "print(" in line and "would " in line and " else " not in line]
     check("every preview line has a real counterpart", not unpaired, "; ".join(unpaired))
 
+    # --stop resolves a selector that has already become args; every shape of it
+    # was broken at once because each was derived separately from a mangled argv.
+    stop_base = Path(tempfile.mkdtemp())
+    stop_team = "session-selftest"
+    (stop_base / stop_team / "inboxes").mkdir(parents=True)
+    (stop_base / stop_team / "config.json").write_text(json.dumps({
+        "name": stop_team, "leadAgentId": f"team-lead@{stop_team}", "leadSessionId": "x",
+        "members": [{"agentId": f"team-lead@{stop_team}", "name": "team-lead"},
+                    {"agentId": f"m1@{stop_team}", "name": "m1"}]}))
+    real_teams_dir, real_running = RESOLVER.teams_dir, globals()["running_agents"]
+    real_holders = RESOLVER.holders_of
+    RESOLVER.teams_dir = stop_base
+    globals()["running_agents"] = lambda targets, table: [(0, t, "", "") for t in targets]
+    RESOLVER.holders_of = lambda uuid, table: [(0, None)]
+
+    class _Sel:
+        def __init__(self, **kw):
+            self.team = self.agent_id = self.resume = None
+            self.__dict__.update(kw)
+
+    try:
+        shapes = {
+            "agent": len(stop_targets(_Sel(agent_id=f"m1@{stop_team}"), {})) == 1,
+            "team": len(stop_targets(_Sel(team=stop_team), {})) == 2,
+            "session": len(stop_targets(_Sel(resume="abcd-1234"), {})) == 1,
+        }
+        bad = sorted(k for k, good in shapes.items() if not good)
+    finally:
+        RESOLVER.teams_dir, RESOLVER.holders_of = real_teams_dir, real_holders
+        globals()["running_agents"] = real_running
+        shutil.rmtree(stop_base, ignore_errors=True)
+    check("--stop resolves every selector shape", not bad, ", ".join(bad))
+
     check("a self-migrate is refused",
           bool(RESOLVER.self_holds_transcript("selftest-uuid",
                [(os.getpid(), os.getppid(), "/usr/bin/claude --resume selftest-uuid --agent-id a@b")])))
@@ -4031,19 +4088,15 @@ def main():
     argv = sys.argv[1:]
     selector = argv.pop(0) if argv and not argv[0].startswith("-") else None
     args, passthrough = parser.parse_known_args(argv)
+    if selector is None:
+        bare = [t for t in passthrough if not t.startswith("-")]
+        if len(bare) == 1:
+            selector = bare[0]
+            passthrough = [t for t in passthrough if t != selector]
     check_passthrough(passthrough, parser)
     if args.team and (args.agent_id or args.resume):
         die(f"--team names every member of {args.team}, and "
             f"{'--agent-id' if args.agent_id else '--resume'} names one agent; pick one")
-
-    if args.stop:
-        if passthrough:
-            named = sorted(set(forwarded_flags(passthrough)))
-            die(f"{', '.join(named)} {'configures' if len(named) == 1 else 'configure'} a process "
-                f"being started, and --stop starts nothing")
-        table = RESOLVER.ps_table()
-        running = stop_targets(args, argv, table)
-        return 0 if abort_agents(running, assume_yes=args.yes) else 1
 
     if args.selftest:
         return run_selftest()
@@ -4082,6 +4135,16 @@ def main():
     table = RESOLVER.ps_table()
     if selector:
         apply_selector(selector, args, table)
+
+    if args.stop:
+        # After apply_selector, so a selector in either position has already
+        # become args.agent_id, args.resume or args.team. Deriving it here a
+        # second time is what made every selector shape fail.
+        named = sorted(set(forwarded_flags(passthrough)))
+        if named:
+            die(f"{', '.join(named)} {'configures' if len(named) == 1 else 'configure'} "
+                f"a process being started, and --stop starts nothing")
+        return 0 if abort_agents(stop_targets(args, table), assume_yes=args.yes) else 1
 
     if args.team:
         return run_team(args, passthrough, table)
