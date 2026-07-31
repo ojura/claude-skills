@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """agent-resume: resurrect a Claude Code teammate into its swarm tmux session.
 
-Usage: agent-resume [<selector>] [options] [...forwarded to claude]
+Usage: agent-resume [<selector>] [options] [-- ...forwarded to claude]
 
-The leading bare argument is classified by shape:
+The selector may sit anywhere among the flags: the allowlist records which flags
+take a value, so a bare token is either that value or the selector, and position
+carries no meaning. Two bare tokens are an error naming both, since one of them
+would otherwise reach the resumed session as an unasked-for prompt. Put anything
+genuinely meant for claude after `--`, which ends classification.
+
+The bare argument is classified by shape:
     2a38de2d-bd34-...   session UUID       -> --resume
     teammate@session-x  full agent id      -> --agent-id
     session-a52cb2af    a dir under teams/ -> --team (whole roster, lead last)
@@ -146,29 +152,35 @@ PASSTHROUGH_FLAGS = {
 }
 
 
-def take_selector(passthrough):
-    """(selector, remaining tokens) for a selector written after the flags.
+def classify_passthrough(passthrough):
+    """(selector, forwarded) for the tokens argparse did not consume.
 
-    A flag's value is not a name. The table already records which flags take
-    one, so the walk consults it rather than treating every token without a
-    leading dash as a candidate: `--model opus` would otherwise offer `opus` as
-    an agent to go looking for, and `--stop NAME --model opus` would see two
-    candidates, promote neither, and fall out as a usage error.
+    Position stops mattering. check_passthrough has already established that every
+    dash token here is one the table knows, so the walk can ask the table which of
+    them take a value; whatever is left over is a name. That makes
+    `NAME --model x`, `--model x NAME` and `--stop NAME` the same command.
+
+    An explicit `--` ends classification: everything after it reaches claude
+    untouched, which is how a prompt, or a value that begins with a dash, gets
+    through without being read as ours.
     """
-    bare, rest, skip = [], [], False
-    for token in passthrough:
+    cut = passthrough.index("--") if "--" in passthrough else len(passthrough)
+    head, tail = passthrough[:cut], passthrough[cut:]
+    bare, forwarded, skip = [], [], False
+    for token in head:
         if skip:
-            rest.append(token)
+            forwarded.append(token)
             skip = False
         elif token.startswith("-"):
-            rest.append(token)
+            forwarded.append(token)
             spec = PASSTHROUGH_FLAGS.get(token.split("=", 1)[0])
             skip = bool(spec and spec.valued and "=" not in token)
         else:
             bare.append(token)
-    if len(bare) != 1:
-        return None, passthrough
-    return bare[0], rest
+    if len(bare) > 1:
+        die(f"{bare[0]} and {bare[1]} both name an agent; name one, and put anything "
+            f"meant for the resumed session after --")
+    return (bare[0] if bare else None), forwarded + tail
 
 
 def forwarded_flags(passthrough):
@@ -365,7 +377,8 @@ def check_passthrough(passthrough, parser):
     """
     known = set(PASSTHROUGH_FLAGS)  # the table's keys are the allowlist
     ours = {opt for action in parser._actions for opt in action.option_strings}
-    for token in passthrough:
+    cut = passthrough.index("--") if "--" in passthrough else len(passthrough)
+    for token in passthrough[:cut]:
         if not token.startswith("-") or token == "--":
             continue
         flag = token.split("=", 1)[0]
@@ -3820,9 +3833,6 @@ def set_tmux_target(session, window):
     TMUX_WINDOW = window or TMUX_WINDOW
 
 
-RUNNING_SELFTEST_LINES = (3417, 3724)
-
-
 def run_selftest():
     """Assert the invariants this tool keeps rediscovering. Read-only.
 
@@ -3899,13 +3909,18 @@ def run_selftest():
     ambient = {"PROJECTS_DIR", "SESSIONS_DIR", "TEAMS_DIR",
                "_ps", "_stamps", "_spawns", "_spawn_log", "_by_agent", "_by_team"}
     engine_lines = set(range(engine_node.lineno, engine_node.end_lineno + 1))
+    # Found from the tree, never written down: a recorded line range drifts as the
+    # file grows, and a drifted exemption silently excuses whatever moved into it.
+    selftest_node = next(n for n in ast.walk(tree)
+                         if isinstance(n, ast.FunctionDef) and n.name == "run_selftest")
+    selftest_lines = set(range(selftest_node.lineno, selftest_node.end_lineno + 1))
     trespass = sorted({
         f"{node.id} at line {node.lineno}"
         for node in ast.walk(tree)
         if isinstance(node, ast.Name) and node.id in ambient
         and isinstance(node.ctx, ast.Load)   # the declaration is a Store; only a use is a reach
         and node.lineno not in engine_lines
-        and not (RUNNING_SELFTEST_LINES[0] <= node.lineno <= RUNNING_SELFTEST_LINES[1])})
+        and node.lineno not in selftest_lines})
     check("the tree is reached only through the engine", not trespass, "; ".join(trespass))
 
     writers = {n for n, node in funcs.items()
@@ -3928,20 +3943,38 @@ def run_selftest():
                 if "print(" in line and "would " in line and " else " not in line]
     check("every preview line has a real counterpart", not unpaired, "; ".join(unpaired))
 
-    # A flag's value is not a selector: the promotion must consult the table
-    # rather than treat any dash-less token as a name.
-    promo = {
-        "value not promoted": take_selector(["--model", "opus"]) == (None, ["--model", "opus"]),
-        "selector before a valued flag": take_selector(["a@b", "--model", "opus"])
-            == ("a@b", ["--model", "opus"]),
-        "selector after a boolean flag": take_selector(["--verbose", "a@b"])
-            == ("a@b", ["--verbose"]),
-        "equals spelling leaves its value alone": take_selector(["--model=opus", "a@b"])
-            == ("a@b", ["--model=opus"]),
-        "two candidates promote neither": take_selector(["a@b", "c@d"])[0] is None,
+    # Classification, not position, decides what a token is. Every entry must
+    # carry both facts, or a future flag is added half-specified and the walk
+    # silently treats its value as a name.
+    shape = [f for f, spec in PASSTHROUGH_FLAGS.items()
+             if not (isinstance(spec, Flag) and spec.scope in (ONE, MANY)
+                     and isinstance(spec.valued, bool))]
+    check("every forwarded flag declares scope and arity", not shape, ", ".join(sorted(shape)))
+
+    with contextlib.redirect_stderr(io.StringIO()):
+        two_selectors = False
+        try:
+            classify_passthrough(["a@b", "c@d"])
+        except SystemExit:
+            two_selectors = True
+    classified = {
+        "bare alone": classify_passthrough(["a@b"]) == ("a@b", []),
+        "before a valued flag": classify_passthrough(["a@b", "--model", "x"])
+            == ("a@b", ["--model", "x"]),
+        "after a valued flag": classify_passthrough(["--model", "x", "a@b"])
+            == ("a@b", ["--model", "x"]),
+        "between flags": classify_passthrough(["--verbose", "a@b", "--model", "x"])
+            == ("a@b", ["--verbose", "--model", "x"]),
+        "a value is not a name": classify_passthrough(["--model", "opus"]) == (None, ["--model", "opus"]),
+        "equals spelling": classify_passthrough(["--model=x", "a@b"]) == ("a@b", ["--model=x"]),
+        "after a boolean flag": classify_passthrough(["--verbose", "a@b"]) == ("a@b", ["--verbose"]),
+        "two names refused": two_selectors,
+        "-- forwards verbatim": classify_passthrough(["a@b", "--", "raw", "--x"])
+            == ("a@b", ["--", "raw", "--x"]),
+        "-- shields a bare word": classify_passthrough(["a@b", "--", "c@d"])[0] == "a@b",
     }
-    wrong = sorted(k for k, good in promo.items() if not good)
-    check("a flag value is never taken as a selector", not wrong, ", ".join(wrong))
+    wrong = sorted(k for k, good in classified.items() if not good)
+    check("a selector is found wherever it sits", not wrong, ", ".join(wrong))
 
     # --stop resolves a selector that has already become args; every shape of it
     # was broken at once because each was derived separately from a mangled argv.
@@ -4134,11 +4167,9 @@ def main():
     # Only a *leading* bare word is the selector; later bare words belong to
     # forwarded flags (argparse can't know that --model takes a value).
     argv = sys.argv[1:]
-    selector = argv.pop(0) if argv and not argv[0].startswith("-") else None
     args, passthrough = parser.parse_known_args(argv)
-    if selector is None:
-        selector, passthrough = take_selector(passthrough)
     check_passthrough(passthrough, parser)
+    selector, passthrough = classify_passthrough(passthrough)
     if args.team and (args.agent_id or args.resume):
         die(f"--team names every member of {args.team}, and "
             f"{'--agent-id' if args.agent_id else '--resume'} names one agent; pick one")
