@@ -56,6 +56,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -4051,6 +4052,118 @@ def run_selftest():
         globals()["running_agents"] = real_running
         shutil.rmtree(stop_base, ignore_errors=True)
     check("--stop resolves every selector shape", not bad, ", ".join(bad))
+
+    # --- forwarded flags: the allowlist, the scope rule, and whether a flag
+    # could have applied at all. Each was a live defect before it was a check.
+    class _Parser:
+        _actions = [type("a", (), {"option_strings": ["--dry-run", "--force"]})()]
+
+    def _dies(fn, *a, **kw):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            try:
+                fn(*a, **kw)
+                return False, ""
+            except SystemExit:
+                return True, err.getvalue()
+
+    typo_died, typo_msg = _dies(check_passthrough, ["--dry-ryn"], _Parser())
+    junk_died, junk_msg = _dies(check_passthrough, ["--frobnicate"], _Parser())
+    flags = {
+        "a typo is refused": typo_died,
+        "and names the flag meant": "--dry-run" in typo_msg,
+        "an unknown flag is refused": junk_died,
+        "with no invented suggestion": "did you mean" not in junk_msg,
+        "a table flag passes": not _dies(check_passthrough, ["--effort", "low"], _Parser())[0],
+        "past -- is not judged": not _dies(check_passthrough, ["--", "--anything"], _Parser())[0],
+    }
+    wrong = sorted(k for k, good in flags.items() if not good)
+    check("only flags the table knows are forwarded", not wrong, ", ".join(wrong))
+
+    scope = {
+        "one-agent flag refused for many": _dies(check_flag_scope, ["--agent-color", "red"], 4)[0],
+        "one-agent flag fine for one": not _dies(check_flag_scope, ["--agent-color", "red"], 1)[0],
+        "many-agent flag fine for many": not _dies(check_flag_scope, ["--effort", "low"], 4)[0],
+    }
+    wrong = sorted(k for k, good in scope.items() if not good)
+    check("a flag naming one agent is refused for a run of several", not wrong, ", ".join(wrong))
+
+    class _Args:
+        def __init__(self, **kw):
+            self.dry_run = False
+            self.__dict__.update(kw)
+
+    took = {
+        "nothing started is refused": _dies(
+            check_flags_took_effect, ["--effort", "low"], [("x", "noop")], _Args())[0],
+        "a launch is accepted": not _dies(
+            check_flags_took_effect, ["--effort", "low"], [("x", "launched")], _Args())[0],
+        "a printed lead command counts": not _dies(
+            check_flags_took_effect, ["--effort", "low"], [("x", "manual")], _Args())[0],
+        "one of several starting is enough": not _dies(
+            check_flags_took_effect, ["--effort", "low"],
+            [("x", "noop"), ("y", "launched")], _Args())[0],
+        "a failure is not called 'already running'": not _dies(
+            check_flags_took_effect, ["--effort", "low"], [("x", "failed")], _Args())[0],
+        "a dry run never complains": not _dies(
+            check_flags_took_effect, ["--effort", "low"], [("x", "noop")], _Args(dry_run=True))[0],
+    }
+    wrong = sorted(k for k, good in took.items() if not good)
+    check("a flag that could not apply is not reported as applied", not wrong, ", ".join(wrong))
+
+    # --- the attach prompt: which key does what, and when it is offered at all
+    real_key, real_abort, real_stdin = read_one_key, abort_agents, sys.stdin
+    aborted = []
+    globals()["abort_agents"] = lambda running, assume_yes=False: aborted.append(1) or 0
+    globals()["running_agents"] = globals()["running_agents"]
+    keys = {}
+    try:
+        # confirm_attach asks whether anyone can answer before it asks anything,
+        # so a check for what the keys do has to look like a terminal.
+        sys.stdin = types.SimpleNamespace(isatty=lambda: True)
+        for name, key, want_attach, want_abort in (
+                ("a plain key attaches", "\r", True, False),
+                ("Ctrl-C skips", "\x03", False, False),
+                ("Ctrl-X aborts", "\x18", False, True)):
+            globals()["read_one_key"] = (lambda k: (lambda: k))(key)
+            aborted.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                got = confirm_attach([], {}, "sock")
+            keys[name] = got == want_attach and bool(aborted) == want_abort
+        sys.stdin = types.SimpleNamespace(isatty=lambda: False)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            keys["no terminal does not prompt"] = confirm_attach([], {}, "sock") and not out.getvalue()
+    finally:
+        globals()["read_one_key"], globals()["abort_agents"] = real_key, real_abort
+        sys.stdin = real_stdin
+    wrong = sorted(k for k, good in keys.items() if not good)
+    check("the attach prompt does what each key says", not wrong, ", ".join(wrong))
+
+    # --- the observation a launch leaves open is finished, per agent
+    watch = Path(tempfile.mkdtemp())
+    try:
+        wrote_path, silent_path = watch / "w.jsonl", watch / "s.jsonl"
+        for path in (wrote_path, silent_path):
+            path.write_text("x")
+            os.utime(path, (1000, 1000))
+        os.utime(wrote_path, None)
+        with contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            report_transcript_writes([("wrote-one", wrote_path, 1000),
+                                      ("silent-one", silent_path, 1000)], _Args(), grace=0.5)
+        told = [line for line in out.getvalue().splitlines() if line.startswith("wrote")]
+        writes = {
+            "the one that wrote is named": len(told) == 1 and "wrote-one" in told[0],
+            "the silent one is warned about": "silent-one" in err.getvalue(),
+            "and is not claimed as written": "silent-one" not in out.getvalue(),
+        }
+        with contextlib.redirect_stdout(io.StringIO()) as quiet:
+            report_transcript_writes([], _Args(), grace=0.1)
+            report_transcript_writes([("x", wrote_path, 1000)], _Args(dry_run=True), grace=0.1)
+        writes["nothing to say stays silent"] = quiet.getvalue() == ""
+    finally:
+        shutil.rmtree(watch, ignore_errors=True)
+    wrong = sorted(k for k, good in writes.items() if not good)
+    check("a launch is followed up per agent", not wrong, ", ".join(wrong))
 
     check("a self-migrate is refused",
           bool(RESOLVER.self_holds_transcript("selftest-uuid",
