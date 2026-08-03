@@ -1331,6 +1331,55 @@ class Resolver:
             "to_team": to_team,
         }
 
+    def agent_cwd(self, ctx):
+        """Working dir for the revived process, or None. Never a guess.
+
+        /cd moves a session's cwd mid-life, so a transcript records several, and the
+        newest is not automatically right: --resume looks the session up under the
+        project dir, and that dir tracks only one of them (usually the first, but
+        not always: of 20 transcripts here that moved, most match their first cwd
+        and at least one matches its last). So prefer whichever recorded cwd
+        actually flattens to this transcript's own project dir, newest first, and
+        fall back to the newest with a warning.
+
+        The dir name itself is not a source: flattening maps every non-alphanumeric
+        to '-', so '_', '.', ' ', '-' and '/' all collapse together (verified across
+        70 project dirs), which leaves it with no inverse.
+        """
+        merged, path = ctx["merged"], ctx["transcript"][0]
+        trail = list(ctx["transcript"][1].get("_cwds", ([],))[0])
+        roster_cwd = (ctx.get("team_entry") or {}).get("member", {}).get("cwd")
+        candidates = trail + ([roster_cwd] if roster_cwd else [])
+        project = path.parent.name
+
+        consistent = [c for c in candidates if flatten_cwd(c) == project]
+        if consistent:
+            return consistent[-1]
+        if candidates:
+            if len(set(candidates)) > 1:
+                warn(f"cwd moved during this session ({' -> '.join(dict.fromkeys(candidates))}); "
+                     f"none flattens to project dir {project}, using the newest")
+            return candidates[-1]
+        fallback = merged.pick("cwd")[0]
+        if not fallback:
+            warn("no cwd recorded in roster or transcript; the agent starts in whatever "
+                 "directory it inherits, and --resume looks a transcript up under the project "
+                 "dir of that directory, so it may not find its own conversation")
+        return fallback or None
+
+    def field(self, ctx, name, prefer_specific=False):
+        """One assembled field's value, or None.
+
+        The accessor consumers use, so the merge stays an engine internal. Every
+        caller reaching into it directly was a caller that could have assembled a
+        different answer than the engine did.
+        """
+        return ctx["merged"].pick(name, prefer_specific=prefer_specific)[0]
+
+    def provenance(self, ctx, name):
+        """(value, timestamp, source) for a field, for --explain."""
+        return ctx["merged"].pick(name)
+
     def classify(self, token):
         """What kind of thing this token names: (kind, value, why).
 
@@ -1790,7 +1839,7 @@ def inherit_credentials(ctx):
     The lead pid comes from the ~/.claude chain (roster -> leadSessionId ->
     session registry), not from our process ancestry."""
     merged = ctx["merged"]
-    pid, alive, _, _exact = RESOLVER.lead_pid(merged.pick("parentSessionId")[0], merged.pick("teamName")[0])
+    pid, alive, _, _exact = RESOLVER.lead_pid(RESOLVER.field(ctx, "parentSessionId"), RESOLVER.field(ctx, "teamName"))
     if not (pid and alive):
         return []
     adopted = []
@@ -1976,13 +2025,13 @@ def enter_agent_cwd(ctx, prefix=""):
     Every path that execs rather than spawning a pane comes through here: the
     lead taking the foreground, and a member run in the pane you are already
     standing in. The pane paths carry the same answer as tmux's -c, so
-    agent_cwd() decides the directory once and only the mechanism differs.
+    RESOLVER.agent_cwd() decides the directory once and only the mechanism differs.
 
     Unifying it is what keeps the two from drifting: they had different answers
     to entering failing, to announcing the move, and to there being no recorded
     directory at all, none of which is a property of the mechanism.
     """
-    where = agent_cwd(ctx)
+    where = RESOLVER.agent_cwd(ctx)
     if not where or os.path.realpath(where) == os.path.realpath(os.getcwd()):
         return where
     print(f"{prefix}cd       {where}")
@@ -1993,41 +2042,6 @@ def enter_agent_cwd(ctx, prefix=""):
     return where
 
 
-def agent_cwd(ctx):
-    """Working dir for the revived process, or None. Never a guess.
-
-    /cd moves a session's cwd mid-life, so a transcript records several, and the
-    newest is not automatically right: --resume looks the session up under the
-    project dir, and that dir tracks only one of them (usually the first, but
-    not always: of 20 transcripts here that moved, most match their first cwd
-    and at least one matches its last). So prefer whichever recorded cwd
-    actually flattens to this transcript's own project dir, newest first, and
-    fall back to the newest with a warning.
-
-    The dir name itself is not a source: flattening maps every non-alphanumeric
-    to '-', so '_', '.', ' ', '-' and '/' all collapse together (verified across
-    70 project dirs), which leaves it with no inverse.
-    """
-    merged, path = ctx["merged"], ctx["transcript"][0]
-    trail = list(ctx["transcript"][1].get("_cwds", ([],))[0])
-    roster_cwd = (ctx.get("team_entry") or {}).get("member", {}).get("cwd")
-    candidates = trail + ([roster_cwd] if roster_cwd else [])
-    project = path.parent.name
-
-    consistent = [c for c in candidates if flatten_cwd(c) == project]
-    if consistent:
-        return consistent[-1]
-    if candidates:
-        if len(set(candidates)) > 1:
-            warn(f"cwd moved during this session ({' -> '.join(dict.fromkeys(candidates))}); "
-                 f"none flattens to project dir {project}, using the newest")
-        return candidates[-1]
-    fallback = merged.pick("cwd")[0]
-    if not fallback:
-        warn("no cwd recorded in roster or transcript; the agent starts in whatever "
-             "directory it inherits, and --resume looks a transcript up under the project "
-             "dir of that directory, so it may not find its own conversation")
-    return fallback or None
 
 
 
@@ -2175,8 +2189,8 @@ def resolve_to_team(args, ctx):
         return args.to_team
 
     merged = ctx["merged"]
-    source = merged.pick("teamName")[0]
-    pid, alive, how, _exact = RESOLVER.lead_pid(merged.pick("parentSessionId")[0], source)
+    source = RESOLVER.field(ctx, "teamName")
+    pid, alive, how, _exact = RESOLVER.lead_pid(RESOLVER.field(ctx, "parentSessionId"), source)
     if not (pid and alive):
         die(f"no live lead for team {source}; pass --to-team <name> explicitly")
     dest, _ = RESOLVER.team_minted_by(pid)
@@ -2325,7 +2339,7 @@ def own_lineage(table):
 def resolve_socket(ctx, args, table):
     """--socket > socket hosting a live process for this agent > lead pid > invent."""
     merged = ctx["merged"]
-    agent_id = merged.pick("agentId")[0]
+    agent_id = RESOLVER.field(ctx, "agentId")
 
     if args.socket:
         return args.socket, getattr(args, "socket_reason", "--socket")
@@ -2337,8 +2351,8 @@ def resolve_socket(ctx, args, table):
     # When rebinding, the member is being placed on the DESTINATION lead's
     # server; asking about the source team fails outright when that team is dead,
     # which is the usual reason for rebinding in the first place.
-    team = ctx.get("to_team") or merged.pick("teamName")[0]
-    parent = ctx.get("to_lead") if ctx.get("to_team") else merged.pick("parentSessionId")[0]
+    team = ctx.get("to_team") or RESOLVER.field(ctx, "teamName")
+    parent = ctx.get("to_lead") if ctx.get("to_team") else RESOLVER.field(ctx, "parentSessionId")
     pid, alive, how, _exact = RESOLVER.lead_pid(parent, team)
     if pid and not alive:
         # A pid is only a socket name while its process exists. Pid numbers are
@@ -2650,15 +2664,15 @@ def forge_team(ctx, dry, evidence=None):
     The roster is scaffolding; the transcript is the identity. Everything the
     config needs is already in the merge, so a missing team is not fatal."""
     merged = ctx["merged"]
-    team = merged.pick("teamName")[0]
-    name = merged.pick("agentName")[0]
+    team = RESOLVER.field(ctx, "teamName")
+    name = RESOLVER.field(ctx, "agentName")
     if not team or not name:
         return
     cfg = RESOLVER.roster_path(team)
     if cfg.exists():
         return
     now = int(time.time() * 1000)
-    lead_sid = merged.pick("parentSessionId")[0] or ""
+    lead_sid = RESOLVER.field(ctx, "parentSessionId") or ""
     if name == "team-lead":
         # Forging for the lead itself. Recording the resumed transcript as
         # leadSessionId is what lets rung 1 find this lead again next time.
@@ -2675,7 +2689,7 @@ def forge_team(ctx, dry, evidence=None):
             "agentType": "team-lead",
             "joinedAt": now,
             "tmuxPaneId": "leader",
-            **({"cwd": cwd} if (cwd := agent_cwd(ctx)) else {}),
+            **({"cwd": cwd} if (cwd := RESOLVER.agent_cwd(ctx)) else {}),
             "subscriptions": [],
             "backendType": "in-process",
         }]
@@ -2731,21 +2745,21 @@ def forge_team(ctx, dry, evidence=None):
             ensure_inbox(team, member["name"], dry)
         return config
     member = {
-        "agentId": merged.pick("agentId")[0] or f"{name}@{team}",
+        "agentId": RESOLVER.field(ctx, "agentId") or f"{name}@{team}",
         "name": name,
         "joinedAt": now,
         "tmuxPaneId": "",
         "subscriptions": [],
-        "agentType": merged.pick("agentType")[0] or DEFAULT_AGENT_TYPE,
-        "planModeRequired": merged.pick("permissionMode")[0] == "plan",
-        **({"cwd": cwd} if (cwd := agent_cwd(ctx)) else {}),
+        "agentType": RESOLVER.field(ctx, "agentType") or DEFAULT_AGENT_TYPE,
+        "planModeRequired": RESOLVER.field(ctx, "permissionMode") == "plan",
+        **({"cwd": cwd} if (cwd := RESOLVER.agent_cwd(ctx)) else {}),
         "backendType": "tmux",
         "isActive": False,
     }
-    color = merged.pick("color")[0]
+    color = RESOLVER.field(ctx, "color")
     if color:
         member["color"] = color
-    model = merged.pick("model", prefer_specific=True)[0]
+    model = RESOLVER.field(ctx, "model", prefer_specific=True)
     if model:
         member["model"] = model
     config = {
@@ -2760,7 +2774,7 @@ def forge_team(ctx, dry, evidence=None):
                 "agentType": "team-lead",
                 "joinedAt": now,
                 "tmuxPaneId": "leader",
-                **({"cwd": cwd} if (cwd := agent_cwd(ctx)) else {}),
+                **({"cwd": cwd} if (cwd := RESOLVER.agent_cwd(ctx)) else {}),
                 "subscriptions": [],
                 "backendType": "in-process",
             },
@@ -2877,7 +2891,7 @@ def synced_fields(ctx):
     merged = ctx["merged"]
     out = {}
     for field in ("color", "model", "agentType"):
-        value = merged.pick(field, prefer_specific=(field == "model"))[0]
+        value = RESOLVER.field(ctx, field, prefer_specific=(field == "model"))
         if value:
             out[field] = value
     return out
@@ -2890,7 +2904,7 @@ def register_member(team, ctx, pane, dry, alive=True):
     what makes the member addressable from the live lead."""
     merged = ctx["merged"]
     cfg = RESOLVER.roster_path(team)
-    name = merged.pick("agentName")[0]
+    name = RESOLVER.field(ctx, "agentName")
     agent_id = f"{name}@{team}"
 
     def mutate(data):
@@ -2904,14 +2918,14 @@ def register_member(team, ctx, pane, dry, alive=True):
                 "name": name,
                 "joinedAt": int(time.time() * 1000),
                 "subscriptions": [],
-                "agentType": merged.pick("agentType")[0] or DEFAULT_AGENT_TYPE,
-                "planModeRequired": merged.pick("permissionMode")[0] == "plan",
-                **({"cwd": member_cwd} if (member_cwd := agent_cwd(ctx)) else {}),
+                "agentType": RESOLVER.field(ctx, "agentType") or DEFAULT_AGENT_TYPE,
+                "planModeRequired": RESOLVER.field(ctx, "permissionMode") == "plan",
+                **({"cwd": member_cwd} if (member_cwd := RESOLVER.agent_cwd(ctx)) else {}),
             }
-            color = merged.pick("color")[0]
+            color = RESOLVER.field(ctx, "color")
             if color:
                 member["color"] = color
-            model = merged.pick("model", prefer_specific=True)[0]
+            model = RESOLVER.field(ctx, "model", prefer_specific=True)
             if model:
                 member["model"] = model
             data.setdefault("members", []).append(member)
@@ -3003,12 +3017,12 @@ def build_command(ctx, args, passthrough):
     for flag, field in DERIVED_FLAGS.items():
         if flag in user_flags:
             continue
-        value = merged.pick(field, prefer_specific=(field == "model"))[0]
+        value = RESOLVER.field(ctx, field, prefer_specific=(field == "model"))
         if dest:  # rebinding onto a live lead's implicit team
             if field == "teamName":
                 value = dest
             elif field == "agentId":
-                value = f"{merged.pick('agentName')[0]}@{dest}"
+                value = f"{RESOLVER.field(ctx, 'agentName')}@{dest}"
             elif field == "parentSessionId":
                 value = ctx.get("to_lead") or value
         if not value:
@@ -3021,7 +3035,7 @@ def build_command(ctx, args, passthrough):
             continue
         cmd += [flag, str(value)]
 
-    mode = merged.pick("permissionMode")[0]
+    mode = RESOLVER.field(ctx, "permissionMode")
     if mode and not user_flags & {"--permission-mode", "--dangerously-skip-permissions"}:
         if mode == "bypassPermissions":
             cmd.append("--dangerously-skip-permissions")
@@ -3036,7 +3050,7 @@ def explain(ctx):
     print("resolved fields (most recent source wins):")
     width = max((len(f) for f in merged.cands), default=8)
     for field in sorted(merged.cands):
-        value, ts, source = merged.pick(field, prefer_specific=(field == "model"))
+        value, ts, source = RESOLVER.provenance(ctx, field)
         conflict = merged.conflicts(field)
         mark = "  <- conflict: " + ", ".join(sorted(str(c) for c in conflict)) if len(conflict) > 1 else ""
         print(f"  {field:<{width}}  {value}   [{source} @ {ms_str(ts)}]{mark}")
@@ -3059,7 +3073,7 @@ def build_command_agent_id(ctx):
     """The agent id the launch wears, which a rebind changes."""
     merged = ctx["merged"]
     dest = ctx.get("to_team")
-    return f"{merged.pick('agentName')[0]}@{dest}" if dest else merged.pick("agentId")[0]
+    return f"{RESOLVER.field(ctx, 'agentName')}@{dest}" if dest else RESOLVER.field(ctx, "agentId")
 
 
 def auto_redirect(ctx, args, table, prefix=""):
@@ -3077,11 +3091,11 @@ def auto_redirect(ctx, args, table, prefix=""):
     and acting on a heuristic unasked is how "pick the newest" comes back.
     """
     merged = ctx["merged"]
-    agent_id, source = merged.pick("agentId")[0], merged.pick("teamName")[0]
+    agent_id, source = RESOLVER.field(ctx, "agentId"), RESOLVER.field(ctx, "teamName")
     if args.keep_team or not (agent_id and source):
         return
 
-    pid, alive, _, exact_lead = RESOLVER.lead_pid(merged.pick("parentSessionId")[0], source)
+    pid, alive, _, exact_lead = RESOLVER.lead_pid(RESOLVER.field(ctx, "parentSessionId"), source)
     if not (pid and alive and exact_lead):
         return
     dest, exact_team = RESOLVER.team_minted_by(pid)
@@ -3123,7 +3137,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     except SystemExit:
         return Outcome("failed", None, False, None)
     merged = ctx["merged"]
-    agent_id = merged.pick("agentId")[0]
+    agent_id = RESOLVER.field(ctx, "agentId")
 
     if args.explain:
         explain(ctx)
@@ -3139,7 +3153,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         title = session_title(ctx["transcript"][0], limit=100)
         if title:
             print(f"{prefix}title    {title}")
-        print(f"{prefix}cwd      {merged.pick('cwd')[0] or '(inherit)'}")
+        print(f"{prefix}cwd      {RESOLVER.field(ctx, 'cwd') or '(inherit)'}")
         owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
         if owner and owner[2] and not args.force:
             warn(f"already live as pid {owner[0]}{state_note(owner[0])}; pass --force to run a second copy")
@@ -3195,8 +3209,8 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         warn("could not determine a tmux socket; pass --socket claude-swarm-<lead-pid>")
         return Outcome("failed", None, False, None)
 
-    cwd = agent_cwd(ctx)
-    want_pane = merged.pick("tmuxPaneId")[0]
+    cwd = RESOLVER.agent_cwd(ctx)
+    want_pane = RESOLVER.field(ctx, "tmuxPaneId")
     if want_pane and not re.fullmatch(r"%\d+", str(want_pane)):
         want_pane = None  # e.g. the lead's "leader" placeholder
 
@@ -3255,7 +3269,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     elif here and not args.force:
         print(f"{prefix}noop     {agent_id} is already running in pane {want_pane} (pid {here[0]}{state_note(here[0])})")
         if not args.no_color:
-            tint_pane(socket, want_pane, merged.pick("color")[0], merged.pick("agentName")[0], args.dry_run)
+            tint_pane(socket, want_pane, RESOLVER.field(ctx, "color"), RESOLVER.field(ctx, "agentName"), args.dry_run)
         if not args.no_update_config:
             update_team_config(ctx, want_pane, args.dry_run)
         return Outcome("noop", socket, False, None)
@@ -3295,10 +3309,10 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             print(f"{prefix}exec     you are in {in_pane} on {socket}; running here rather than splitting")
             if ctx.get("to_team"):
                 register_member(ctx["to_team"], ctx, in_pane, args.dry_run)
-                if ctx["to_team"] != merged.pick("teamName")[0]:
+                if ctx["to_team"] != RESOLVER.field(ctx, "teamName"):
                     retire_member(ctx, args.dry_run)
             else:
-                ensure_inbox(merged.pick("teamName")[0], merged.pick("agentName")[0], args.dry_run)
+                ensure_inbox(RESOLVER.field(ctx, "teamName"), RESOLVER.field(ctx, "agentName"), args.dry_run)
                 if not args.no_update_config:
                     update_team_config(ctx, in_pane, args.dry_run)
             rendered = f"exec in {cwd or os.getcwd()}: {' '.join(shlex.quote(c) for c in command)}"
@@ -3312,7 +3326,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             environ.pop("ANTHROPIC_BASE_URL", None)
             environ.update(dict(pair.split("=", 1) for pair in TEAM_ENV))
             if not args.no_color:
-                tint_pane(socket, in_pane, merged.pick("color")[0], merged.pick("agentName")[0], False)
+                tint_pane(socket, in_pane, RESOLVER.field(ctx, "color"), RESOLVER.field(ctx, "agentName"), False)
             enter_agent_cwd(ctx, prefix)
             try:
                 os.execvpe(command[0], command, environ)
@@ -3331,7 +3345,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     pane, action = launch(socket, want_pane, cwd, command, args.dry_run, replace_pane)
     print(f"{prefix}{'would run' if args.dry_run else 'running'} in pane {pane or '<new>'} ({action})")
     if not args.no_color:
-        tint_pane(socket, pane, merged.pick("color")[0], merged.pick("agentName")[0], args.dry_run)
+        tint_pane(socket, pane, RESOLVER.field(ctx, "color"), RESOLVER.field(ctx, "agentName"), args.dry_run)
 
     alive, wrote = True, True
     if not args.dry_run:
@@ -3345,10 +3359,10 @@ def run_one(args, passthrough, table, prefix="", pending=()):
 
     if ctx.get("to_team"):
         register_member(ctx["to_team"], ctx, pane, args.dry_run, alive)
-        if ctx["to_team"] != merged.pick("teamName")[0]:
+        if ctx["to_team"] != RESOLVER.field(ctx, "teamName"):
             retire_member(ctx, args.dry_run)
     else:
-        ensure_inbox(merged.pick("teamName")[0], merged.pick("agentName")[0], args.dry_run)
+        ensure_inbox(RESOLVER.field(ctx, "teamName"), RESOLVER.field(ctx, "agentName"), args.dry_run)
         if not args.no_update_config:
             update_team_config(ctx, pane, args.dry_run, alive)
 
@@ -3356,7 +3370,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     # observation: the settle window is a second and a half and a healthy agent
     # takes tens of seconds to load a large session. Hand it back so the run can
     # answer it at the end rather than leaving "not yet" as the last word.
-    unwritten = ((merged.pick("agentId")[0] or ctx["session_uuid"][:8],
+    unwritten = ((RESOLVER.field(ctx, "agentId") or ctx["session_uuid"][:8],
                   ctx["transcript"][0], launched_at) if alive and not wrote else None)
     return Outcome("launched" if alive else "failed", socket, False, unwritten)
 
@@ -4128,26 +4142,26 @@ def live_checks():
     # the wrong place.
     here = os.getcwd()
     moved = Path(tempfile.mkdtemp())
-    real_cwd = globals()["agent_cwd"]
+    real_cwd = RESOLVER.agent_cwd
     try:
-        globals()["agent_cwd"] = lambda ctx: str(moved)
+        RESOLVER.agent_cwd = lambda ctx: str(moved)
         with contextlib.redirect_stdout(io.StringIO()):
             enter_agent_cwd({})
         went = os.path.realpath(os.getcwd()) == os.path.realpath(moved)
         with contextlib.redirect_stdout(io.StringIO()) as quiet:
             enter_agent_cwd({})
         stayed = quiet.getvalue() == ""
-        globals()["agent_cwd"] = lambda ctx: "/no-such-dir-for-a-check"
+        RESOLVER.agent_cwd = lambda ctx: "/no-such-dir-for-a-check"
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             try:
                 enter_agent_cwd({})
                 refused = False
             except SystemExit:
                 refused = True
-        globals()["agent_cwd"] = lambda ctx: None
+        RESOLVER.agent_cwd = lambda ctx: None
         stood = enter_agent_cwd({}) is None
     finally:
-        globals()["agent_cwd"] = real_cwd
+        RESOLVER.agent_cwd = real_cwd
         os.chdir(here)
         shutil.rmtree(moved, ignore_errors=True)
     entering = {"moves there": went, "says nothing when already there": stayed,
@@ -4489,6 +4503,15 @@ def run_selftest(live=False):
     check("a lead is told what is still loading before it takes over",
           handed == [[], ["member1"], ["member1", "member2"]], str(handed))
 
+    # The merge is an engine internal. A caller reaching into it directly is a
+    # caller that can assemble a different answer than the engine did, which is
+    # the whole class of fault this file keeps rediscovering.
+    reachers = sorted(
+        node.name for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and re.search(r"\.pick\(|_Merged\(", ast.get_source_segment(source, node) or ""))
+    check("the merge is reached only through the engine", not reachers, ", ".join(reachers))
+
     # Assembly is exercised, not just its parts. A NameError in identity() once
     # passed a full battery of structural checks while every real invocation of
     # the tool died: nothing in the suite called the function that answers who an
@@ -4500,7 +4523,7 @@ def run_selftest(live=False):
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 assembled = RESOLVER.identity(agent_id=f"{name}@{team}")
-            got = assembled["merged"].pick("agentId")[0]
+            got = RESOLVER.field(assembled, "agentId")
             why = assembled.get("via")
         except Exception as exc:                      # the point is that it runs
             got, why = None, f"{type(exc).__name__}: {exc}"
