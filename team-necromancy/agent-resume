@@ -1655,8 +1655,17 @@ class Resolver:
                 elif kind == "mode":
                     headers.append(("mode", rec.get("mode")))
                 for key in ("teamName", "agentName", "cwd", "version", "gitBranch", "effort"):
-                    if rec.get(key) is not None:
-                        put(key, rec[key], ts or mtime)
+                    if rec.get(key) is None:
+                        continue
+                    if key == "agentName" and kind == "agent-name":
+                        # The harness's label channel, not an identity stamp. Its
+                        # value is a display name or a session title, and reading it
+                        # as agentName is how a label reached --agent-name, got
+                        # compared against rosters, and raised mismatch objections
+                        # against agents that were never called that.
+                        put("_label", rec[key], ts or mtime)
+                        continue
+                    put(key, rec[key], ts or mtime)
                 if rec.get("cwd") and (not cwds or cwds[-1] != rec["cwd"]):
                     cwds.append(rec["cwd"])  # /cd moves it mid-session; keep the trail
                 msg = rec.get("message")
