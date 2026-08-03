@@ -4200,6 +4200,47 @@ def live_checks():
     wrong = sorted(k for k, good in entering.items() if not good)
     check("a launch enters the agent's directory", not wrong, ", ".join(wrong))
 
+    # Which carrier launch() consults. The predicate is pinned in the read-only
+    # tier; this pins the decision, which is where it broke: asking only the
+    # server misses a poison that a server about to be created will inherit.
+    def scrubs(socket, shell_value):
+        had = os.environ.get("ANTHROPIC_BASE_URL")
+        real_panes = globals()["list_panes"]
+        try:
+            globals()["list_panes"] = lambda _sock: []
+            os.environ.pop("ANTHROPIC_BASE_URL", None)
+            if shell_value:
+                os.environ["ANTHROPIC_BASE_URL"] = shell_value
+            said = io.StringIO()
+            with contextlib.redirect_stdout(said), contextlib.redirect_stderr(io.StringIO()):
+                launch(socket, "%0", "/tmp", ["claude", "--resume", "x"], True)
+            return "-u ANTHROPIC_BASE_URL" in said.getvalue()
+        finally:
+            globals()["list_panes"] = real_panes
+            os.environ.pop("ANTHROPIC_BASE_URL", None)
+            if had is not None:
+                os.environ["ANTHROPIC_BASE_URL"] = had
+
+    probe_sock = f"{TOOL}-selftest-baseurl"
+    tmux(probe_sock, "new-session", "-d", "-s", TMUX_SESSION, "sleep", "20")
+    try:
+        tmux(probe_sock, "set-environment", "-g", "ANTHROPIC_BASE_URL", "https://gateway.example")
+        keeps_real = not scrubs(probe_sock, None)
+        tmux(probe_sock, "set-environment", "-g", "ANTHROPIC_BASE_URL", POISON_URL)
+        drops_server = scrubs(probe_sock, None)
+        drops_inherited = scrubs(f"{TOOL}-selftest-absent", POISON_URL)
+        keeps_inherited_real = not scrubs(f"{TOOL}-selftest-absent", "https://gateway.example")
+    finally:
+        tmux(probe_sock, "kill-server")
+    carriers = {
+        "a real url on the server is kept": keeps_real,
+        "a poisoned server is scrubbed": drops_server,
+        "a poison we would pass down is scrubbed": drops_inherited,
+        "a real url we would pass down is kept": keeps_inherited_real,
+    }
+    wrong = sorted(k for k, good in carriers.items() if not good)
+    check("a launch consults both carriers of a base url", not wrong, ", ".join(wrong))
+
     # abort_agents against processes spawned for the purpose.
     victims = [sp.Popen(["sleep", "30"]) for _ in range(2)]
     running = [(v.pid, f"probe-{i}@check", "a sleep standing in for an agent", "")
