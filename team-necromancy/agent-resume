@@ -274,7 +274,7 @@ def stop_targets(args, table):
         cfg = RESOLVER.roster_path(args.team)
         if not cfg.exists():
             die(f"no team config at {cfg}")
-        members = json.loads(cfg.read_text()).get("members", [])
+        members = (RESOLVER.roster_of(args.team) or {}).get("members", [])
         return running_agents([m["agentId"] for m in members if m.get("agentId")], table)
     if not (args.agent_id or args.resume):
         die("--stop needs an agent, a session or a team to stop")
@@ -615,7 +615,7 @@ class Resolver:
                 best = (rank, (entry["pid"], entry["updated"], entry["alive"]))
         return best[1] if best else None
 
-    def _lead_transcript_for(self, team):
+    def lead_transcript_for(self, team):
         """(transcript, why) for the transcript that led this team, or (None, reason).
 
         Several transcripts can claim one team: a fork carries the history it was
@@ -706,7 +706,7 @@ class Resolver:
         return self.by_team
 
     def live_agent_procs(self, agent_id, table):
-        return claude_procs(f"--agent-id {agent_id}", table)
+        return self._claude_procs(f"--agent-id {agent_id}", table)
 
     def holders_of(self, session_uuid, table):
         """[(pid, transcript path or None)] for whoever holds this transcript.
@@ -740,7 +740,7 @@ class Resolver:
         """
         out = []
         for pid, args in self.live_agent_procs(agent_id, table or self.ps_table()):
-            held = next((pair.partition(" ")[2] for pair in _argv_pairs(args)
+            held = next((pair.partition(" ")[2] for pair in self._argv_pairs(args)
                          if pair.startswith("--resume ")), None)
             out.append((pid, held))
         return out
@@ -770,9 +770,9 @@ class Resolver:
                 "alive": pid_alive(pid, data.get("procStart")),
             }
         for pid, _, args in self.ps_table():
-            if not looks_like_claude(args):
+            if not self.is_claude(args):
                 continue
-            pairs = _argv_pairs(args)
+            pairs = self._argv_pairs(args)
             held = next((v.split(" ", 1)[1] for v in pairs if v.startswith("--resume ")), None)
             agent = next((v.split(" ", 1)[1] for v in pairs if v.startswith("--agent-id ")), None)
             if not (held or agent):
@@ -837,13 +837,13 @@ class Resolver:
         entry; without this, every agent of a resumed lead's team has an
         unresolvable socket.
         """
-        return next((pid for name, pid, _ in boot_join() if name == team), None)
+        return next((pid for name, pid, _ in self._boot_join() if name == team), None)
 
     def procs_on_transcript(self, session_uuid, table):
         """Whoever holds this transcript, under any identity. Two processes
         appending to one JSONL is the thing to never allow, and a rebind changes the
         agent-id, so identity is the wrong key here."""
-        return claude_procs(f"--resume {session_uuid}", table)
+        return self._claude_procs(f"--resume {session_uuid}", table)
 
     def ps_table(self, refresh=False):
         """[(pid, ppid, args)] for every process we can see, snapshotted once.
@@ -893,7 +893,7 @@ class Resolver:
             if entry["team"] == team and entry.get("leadSessionId"):
                 if self.transcript_path(entry["leadSessionId"]):
                     return entry["leadSessionId"]
-        path, _why = self._lead_transcript_for(team)
+        path, _why = self.lead_transcript_for(team)
         if path:
             return path.stem
         block = re.fullmatch(r"session-([0-9a-f]{8})", team or "")
@@ -981,7 +981,7 @@ class Resolver:
             if path:
                 fields, last = ({}, 0) if quick else self._scan_transcript(path)
                 return Resolution(path, fields, last, via="roster leadSessionId", strength=EXACT)
-            path, why = self._lead_transcript_for(team) if team else (None, "no team was named")
+            path, why = self.lead_transcript_for(team) if team else (None, "no team was named")
             if path:
                 fields, last = ({}, 0) if quick else self._scan_transcript(path)
                 return Resolution(path, fields, last, via=why, strength=EXACT)
@@ -1008,15 +1008,112 @@ class Resolver:
                 )
         return Resolution(reason=f"no transcript found for {name or '?'}@{team or '?'}")
 
-    def scan_teams(self):
-        """Every member of every team config, newest-first metadata attached."""
-        entries = []
-        for cfg in (RESOLVER.roster_path(d.name) for d in RESOLVER.team_dirs()):
+    def _boot_join(self):
+        """[(team, pid, createdAt)] pairing each implicit team with the live process
+        that minted it, newest first.
+
+        A boot mints its implicit team named after its internal session id, while
+        sessions/<pid>.json keeps the *resumed transcript* id. The two diverge after
+        a resume (before one they are the same id, which lead_pid exploits as an
+        exact join), and nothing else records the post-resume internal id, so for
+        those teams time is a join of last resort: a
+        team dir is created a few hundred ms before the session file when a boot
+        mints it eagerly (measured 281, 252 and 402ms), but it can instead be
+        minted at the first spawn, minutes later, which this window does not cover.
+        That is why the exact rungs above it are tried first.
+        """
+        live = [
+            (data["pid"], data.get("startedAt") or 0)
+            for data in self.session_registry()
+            if pid_alive(data["pid"], data.get("procStart"))
+        ]
+        pairs = []
+        for cfg, data, _mtime in self.rosters():
+            created = data.get("createdAt") or 0
+            for pid, started in live:
+                if 0 <= started - created <= TEAM_MINT_WINDOW_MS:
+                    pairs.append((data.get("name") or cfg.parent.name, pid, created))
+        pairs.sort(key=lambda item: item[2], reverse=True)
+        for team in {name for name, _, _ in pairs}:
+            owners = {pid for name, pid, _ in pairs if name == team}
+            if len(owners) > 1:
+                warn(f"{team} pairs with {len(owners)} processes started within "
+                     f"{TEAM_MINT_WINDOW_MS}ms ({', '.join(map(str, sorted(owners)))}); "
+                     "the pick between them is arbitrary")
+        return pairs
+
+    def is_claude(self, args):
+        """Whether this cmdline is a claude process. Public: pane bookkeeping asks
+        it, and a caller reaching a private method for a fair question means the
+        underscore has stopped meaning anything."""
+        return self._looks_like_claude_impl(args)
+
+    def _looks_like_claude_impl(self, args):
+        """Match on argv[0] only. A tmux server's own cmdline embeds the whole
+        spawn command, so searching the full args counts the server as an agent."""
+        argv0 = args.split(None, 1)[0] if args.strip() else ""
+        return bool(CLAUDE_PROC.search(argv0))
+
+    def _argv_pairs(self, args):
+        """{"--flag value"} for each flag/value pair in a cmdline, both spellings.
+
+        Substring matching would let `--agent-id alpha@team` match a process running
+        `--agent-id alpha@team2`, which for forged team names is a real collision.
+        """
+        tokens = args.split()
+        pairs = set()
+        for index, token in enumerate(tokens):
+            if not token.startswith("-"):
+                continue
+            if "=" in token:
+                flag, _, value = token.partition("=")
+                pairs.add(f"{flag} {value}")
+            elif index + 1 < len(tokens):
+                pairs.add(f"{token} {tokens[index + 1]}")
+        return pairs
+
+    def _claude_procs(self, needle, table):
+        """Live claude processes whose argv contains this exact flag/value pair,
+        excluding our own lineage (whose cmdline quotes what we searched for)."""
+        mine = own_lineage(table)
+        return [
+            (pid, args)
+            for pid, _, args in table
+            if needle in self._argv_pairs(args) and pid not in mine and self.is_claude(args)
+        ]
+
+    def rosters(self):
+        """[(cfg path, parsed roster, mtime ms)] for every team config on disk.
+
+        The one place a roster is read. Three callers were parsing configs for
+        themselves, which is three chances to disagree about what a roster is and
+        three places to fix when the shape changes.
+
+        Deliberately uncached: a run can forge a roster partway through, and a
+        cache would hide it from everything downstream of the forge.
+        """
+        out = []
+        for cfg in (self.roster_path(d.name) for d in self.team_dirs()):
             try:
                 data = json.loads(cfg.read_text())
             except (OSError, ValueError):
                 continue
-            mtime = int(cfg.stat().st_mtime * 1000)
+            try:
+                mtime = int(cfg.stat().st_mtime * 1000)
+            except OSError:
+                mtime = 0
+            out.append((cfg, data, mtime))
+        return out
+
+    def roster_of(self, team):
+        """One team's parsed roster, or None."""
+        return next((data for cfg, data, _ in self.rosters()
+                     if (data.get("name") or cfg.parent.name) == team), None)
+
+    def scan_teams(self):
+        """Every member of every team config, newest-first metadata attached."""
+        entries = []
+        for cfg, data, mtime in self.rosters():
             for member in data.get("members", []):
                 entries.append(
                     {
@@ -1098,8 +1195,8 @@ class Resolver:
         """
         mine = own_lineage(table)
         return [pid for pid, _, args in table
-                if pid in mine and looks_like_claude(args)
-                and f"--resume {session_uuid}" in _argv_pairs(args)]
+                if pid in mine and self.is_claude(args)
+                and f"--resume {session_uuid}" in self._argv_pairs(args)]
 
     def session_registry(self):
         """Every ~/.claude/sessions/<pid>.json, parsed once. The registry is the
@@ -1270,7 +1367,7 @@ class Resolver:
                 # from an earlier one's, so the rung declines rather than guessing.
                 if payload.get("team_name") and started and stamp >= started:
                     return payload["team_name"], True
-        return next((team for team, owner, _ in boot_join() if owner == pid), None), False
+        return next((team for team, owner, _ in self._boot_join() if owner == pid), None), False
 
     def teams_led_by(self, session_stem):
         """Teams this transcript led, newest first.
@@ -1760,43 +1857,6 @@ def apply_selector(token, args, table):
 
 
 
-def boot_join():
-    """[(team, pid, createdAt)] pairing each implicit team with the live process
-    that minted it, newest first.
-
-    A boot mints its implicit team named after its internal session id, while
-    sessions/<pid>.json keeps the *resumed transcript* id. The two diverge after
-    a resume (before one they are the same id, which lead_pid exploits as an
-    exact join), and nothing else records the post-resume internal id, so for
-    those teams time is a join of last resort: a
-    team dir is created a few hundred ms before the session file when a boot
-    mints it eagerly (measured 281, 252 and 402ms), but it can instead be
-    minted at the first spawn, minutes later, which this window does not cover.
-    That is why the exact rungs above it are tried first.
-    """
-    live = [
-        (data["pid"], data.get("startedAt") or 0)
-        for data in RESOLVER.session_registry()
-        if pid_alive(data["pid"], data.get("procStart"))
-    ]
-    pairs = []
-    for cfg in (RESOLVER.roster_path(d.name) for d in RESOLVER.team_dirs()):
-        try:
-            data = json.loads(cfg.read_text())
-        except (OSError, ValueError):
-            continue
-        created = data.get("createdAt") or 0
-        for pid, started in live:
-            if 0 <= started - created <= TEAM_MINT_WINDOW_MS:
-                pairs.append((data.get("name") or cfg.parent.name, pid, created))
-    pairs.sort(key=lambda item: item[2], reverse=True)
-    for team in {name for name, _, _ in pairs}:
-        owners = {pid for name, pid, _ in pairs if name == team}
-        if len(owners) > 1:
-            warn(f"{team} pairs with {len(owners)} processes started within "
-                 f"{TEAM_MINT_WINDOW_MS}ms ({', '.join(map(str, sorted(owners)))}); "
-                 "the pick between them is arbitrary")
-    return pairs
 
 
 
@@ -1921,11 +1981,6 @@ def descendants(root_pid, table):
 CLAUDE_PROC = re.compile(r"(^|/)claude$|/versions/[\d.]+$")
 
 
-def looks_like_claude(args):
-    """Match on argv[0] only. A tmux server's own cmdline embeds the whole
-    spawn command, so searching the full args counts the server as an agent."""
-    argv0 = args.split(None, 1)[0] if args.strip() else ""
-    return bool(CLAUDE_PROC.search(argv0))
 
 
 def pane_occupants(socket, pane_id, table):
@@ -1935,7 +1990,7 @@ def pane_occupants(socket, pane_id, table):
         if pane["pane"] != pane_id:
             continue
         procs = [(pid, by_pid.get(pid, "")) for pid in descendants(pane["pid"], table)]
-        return True, [(pid, args) for pid, args in procs if looks_like_claude(args)]
+        return True, [(pid, args) for pid, args in procs if RESOLVER.is_claude(args)]
     return False, []
 
 
@@ -1949,34 +2004,8 @@ def own_lineage(table):
     return chain
 
 
-def _argv_pairs(args):
-    """{"--flag value"} for each flag/value pair in a cmdline, both spellings.
-
-    Substring matching would let `--agent-id alpha@team` match a process running
-    `--agent-id alpha@team2`, which for forged team names is a real collision.
-    """
-    tokens = args.split()
-    pairs = set()
-    for index, token in enumerate(tokens):
-        if not token.startswith("-"):
-            continue
-        if "=" in token:
-            flag, _, value = token.partition("=")
-            pairs.add(f"{flag} {value}")
-        elif index + 1 < len(tokens):
-            pairs.add(f"{token} {tokens[index + 1]}")
-    return pairs
 
 
-def claude_procs(needle, table):
-    """Live claude processes whose argv contains this exact flag/value pair,
-    excluding our own lineage (whose cmdline quotes what we searched for)."""
-    mine = own_lineage(table)
-    return [
-        (pid, args)
-        for pid, _, args in table
-        if needle in _argv_pairs(args) and pid not in mine and looks_like_claude(args)
-    ]
 
 
 
@@ -2341,7 +2370,7 @@ LAUNCH_WRITE_S = 45.0    # a large session takes tens of seconds to load and wri
 
 def launch_present(socket, pane, agent_id):
     fresh = RESOLVER.ps_table(refresh=True)
-    if agent_id and claude_procs(f"--agent-id {agent_id}", fresh):
+    if agent_id and RESOLVER.wearers(agent_id, fresh):
         return True
     if pane:
         _, occupants = pane_occupants(socket, pane, fresh)
@@ -2583,16 +2612,19 @@ def forge_team(ctx, dry):
             "members": members,
         }
         rebuilt = ", ".join(m["name"] for m in members[1:]) or "no members recovered"
+        ctx["lead_agent_id"] = f"team-lead@{team}"
         if dry:
             step(True, f"would forge {cfg} (lead + {rebuilt}) and seed every inbox", "")
-            return
+            # Returned in both modes so a dry run previews the same roster a real
+            # run would proceed on. Enumerating it separately for the preview
+            # would be a second implementation, free to drift from this one.
+            return config
         (cfg.parent / "inboxes").mkdir(parents=True, exist_ok=True)
         edit_team_config(cfg, lambda _: config, f"forged for the lead being resumed ({rebuilt})",
                          create=config)
         for member in members:
             ensure_inbox(team, member["name"], dry)
-        ctx["lead_agent_id"] = f"team-lead@{team}"
-        return
+        return config
     member = {
         "agentId": merged.pick("agentId")[0] or f"{name}@{team}",
         "name": name,
@@ -3081,7 +3113,8 @@ def run_one(args, passthrough, table, prefix="", pending=()):
 
     # Same agent already in that pane -> nothing to do. Anything else in it -> new pane.
     _, occupants = pane_occupants(socket, want_pane, table) if want_pane else (False, [])
-    here = [pid for pid, cmd in occupants if agent_id and f"--agent-id {agent_id}" in _argv_pairs(cmd)]
+    worn = {pid for pid, _ in RESOLVER.wearers(agent_id, table)} if agent_id else set()
+    here = [pid for pid, _cmd in occupants if pid in worn]
     others = [pid for pid, _ in occupants if pid not in here]
 
     held_by_us = RESOLVER.self_holds_transcript(ctx["session_uuid"], table)
@@ -3887,7 +3920,7 @@ def rebuild_roster(team, args, passthrough, table):
     forge_team's lead branch rebuilds the members with the colours and models
     those payloads recorded.
     """
-    path, why = RESOLVER._lead_transcript_for(team)
+    path, why = RESOLVER.lead_transcript_for(team)
     if not path:
         die(f"no roster for {team} and none can be rebuilt: {why}")
     print(f"team     {team} has no roster; rebuilding from {path.stem[:8]} ({why})")
@@ -3895,25 +3928,18 @@ def rebuild_roster(team, args, passthrough, table):
     lead.team, lead.agent_id, lead.resume = None, None, path.stem
     lead.for_team = team
     ctx = build(lead)
-    forge_team(ctx, args.dry_run)
-    cfg = RESOLVER.roster_path(team)
-    if not cfg.exists() and not args.dry_run:
+    config = forge_team(ctx, args.dry_run)
+    if not config:
         die(f"could not rebuild a roster for {team}")
-    return cfg
+    if not args.dry_run and not RESOLVER.roster_path(team).exists():
+        die(f"forged a roster for {team} but it is not on disk")
+    return config
 
 
 def run_team(args, passthrough, table):
-    cfg = RESOLVER.roster_path(args.team)
-    if not cfg.exists():
-        cfg = rebuild_roster(args.team, args, passthrough, table)
-        if args.dry_run and not cfg.exists():
-            print(f"team     {args.team}: preview stops here, since the roster it "
-                  f"lists does not exist yet")
-            return 0
-    try:
-        data = json.loads(cfg.read_text())
-    except ValueError as exc:
-        die(f"{cfg} is not valid JSON: {exc}")
+    data = RESOLVER.roster_of(args.team)
+    if data is None:
+        data = rebuild_roster(args.team, args, passthrough, table)
 
     members = data.get("members", [])
     if not members:
@@ -4144,6 +4170,36 @@ def run_selftest(live=False):
     selftest_node = next(n for n in ast.walk(tree)
                          if isinstance(n, ast.FunctionDef) and n.name == "run_selftest")
     selftest_lines = set(range(selftest_node.lineno, selftest_node.end_lineno + 1))
+    # The evidence ban stopped raw tree access. These stop the decisions: a roster
+    # parsed by hand, an argv matched by hand, and the underscore convention going
+    # quietly hollow. Every regression so far took the same route, which was that
+    # the raw form was still reachable, so somebody reached.
+    # Narrowly: reading a roster file. Parsing a transcript line or a settings
+    # file is a different question and stays where it is; what regressed five
+    # times was several functions each deciding for themselves what a roster is.
+    def reads_a_roster(node):
+        body = ast.get_source_segment(source, node) or ""
+        return ("loads" in body
+                and ("roster_path" in body or "config.json" in body)
+                and "read_text" in body)
+
+    roster_readers = sorted(
+        node.name for node in tree.body
+        if isinstance(node, ast.FunctionDef) and reads_a_roster(node)
+        # edit_team_config is the writer and re-reads under its own lock.
+        # cruft_reason asks a different question: not "give me the rosters" but
+        # "is this directory a valid team at all", and it needs the parse error
+        # that rosters() swallows in order to answer it.
+        and node.name not in {"edit_team_config", "cruft_reason", "run_selftest"})
+    check("a roster is read in one place", not roster_readers, ", ".join(roster_readers))
+
+    private_reach = sorted({
+        f"{node.name} -> {m.group(1)}"
+        for node in tree.body if isinstance(node, ast.FunctionDef)
+        for m in re.finditer(r"RESOLVER\.(_\w+)\(", ast.get_source_segment(source, node) or "")})
+    check("no module code reaches a private engine method", not private_reach,
+          "; ".join(private_reach))
+
     trespass = sorted({
         f"{node.id} at line {node.lineno}"
         for node in ast.walk(tree)
