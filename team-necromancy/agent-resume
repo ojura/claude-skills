@@ -1025,9 +1025,8 @@ class Resolver:
         5. agentName alone, refused when that name is in more than one roster
         6. for a lead only: the transcript whose spawn payloads name this team
 
-        Rungs are named rather than numbered below, because prose that counts them
-        stops being true the moment one is inserted, which is how this paragraph
-        was last wrong.
+        Rungs are named rather than numbered below: prose that counts them stops
+        being true the moment one is inserted.
 
         A lead writes no stamps, so neither stamp rung can reach one. The
         leadSessionId rung reaches it whenever that id is a real transcript, which
@@ -4656,9 +4655,7 @@ def run_selftest(live=False):
         and node.name not in {"_complete", "run_selftest"})
     check("one policy decides which roster claims an agent", not ts_sorters, ", ".join(ts_sorters))
 
-    # Attributes as well as calls. Matching only calls left evidence state
-    # reachable: a public cache is a global with a prefix, and reading one from
-    # module code is the thing the caches were made instance state to stop.
+    # Attributes as well as calls: a cache read is a reach inside, same as a call.
     private_reach = sorted({
         f"{node.name} -> {m.group(1)}"
         for node in tree.body if isinstance(node, ast.FunctionDef)
@@ -4855,9 +4852,8 @@ def run_selftest(live=False):
     wrong = sorted(k for k, good in poison_calls.items() if not good)
     check("only the poison is stripped from a launch", not wrong, ", ".join(wrong))
 
-    # The merge is an engine internal. A caller reaching into it directly is a
-    # caller that can assemble a different answer than the engine did, which is
-    # the whole class of fault this file keeps rediscovering.
+    # The merge is an engine internal: a caller reaching into it can assemble a
+    # different answer than the engine did.
     reachers = sorted(
         node.name for node in tree.body
         if isinstance(node, ast.FunctionDef)
