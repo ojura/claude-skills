@@ -4588,7 +4588,11 @@ def run_selftest(live=False):
     engine_node = next(node for node in ast.walk(tree)
                        if isinstance(node, ast.ClassDef) and node.name == "Resolver")
     engine = {m.name for m in engine_node.body if isinstance(m, ast.FunctionDef)}
-    pickers = callers_of("transcript_path") - engine - {"team_keep_reason", "run_selftest"}
+    # run_selftest and run_census observe the engine rather than resolve with it:
+    # they ask what it answers in order to report on it, which is the opposite of
+    # a caller picking a transcript for itself.
+    pickers = (callers_of("transcript_path") - engine
+               - {"team_keep_reason", "run_selftest", "run_census"})
     check("only the engine picks a transcript", not pickers, ", ".join(sorted(pickers)))
 
     # The boundary. Naming the functions allowed to reach the tree was the form
