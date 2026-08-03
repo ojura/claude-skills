@@ -1447,7 +1447,17 @@ class Resolver:
             return objections
 
         if want_name and stamped_name != want_name:
-            objections.append(("name_mismatch", stamped_name, want_name, res.via))
+            # A lead may carry a name of its own. When the transcript was reached
+            # because a roster names it as that team's lead, or because its own
+            # payloads do, the roster role and the session's name are two facts
+            # about one session rather than two sessions. Reading that as
+            # "somebody else's conversation" refuses to resume a lead the tool
+            # just finished rebuilding a roster for.
+            lead_rung = (res.via == "roster leadSessionId"
+                         or "payload claimant" in res.via
+                         or res.via.startswith("spawn payloads naming"))
+            if not (want_name == "team-lead" and lead_rung):
+                objections.append(("name_mismatch", stamped_name, want_name, res.via))
 
         if want_team and stamped_team and stamped_team != want_team:
             # A rebind asks for the change; a unique name and a live process wearing
@@ -4685,6 +4695,40 @@ def run_selftest(live=False):
               f"{name}@{team} -> {got or why}")
     else:
         check("an identity can be assembled (no stamped agent here)", True, "skipped")
+
+    # The lead role and a session's own name are two facts about one session. The
+    # guard against resuming a stranger's conversation must tolerate that, and
+    # only that: team-lead asked of a teammate is still somebody else.
+    guarded = None
+    for team in RESOLVER.known_teams():
+        path, _why = RESOLVER.lead_transcript_for(team)
+        if not path:
+            continue
+        name, stamped_team = RESOLVER.stamp_index().get(path, (None, None))
+        if name and name != "team-lead" and not stamped_team:
+            # Resolved the way a team run resolves it, through the roster, or the
+            # check exercises a rung the exemption does not cover.
+            with contextlib.redirect_stderr(io.StringIO()):
+                found = RESOLVER.resolve_transcript(lead_session=path.stem, team=team, is_lead=True)
+                if found:
+                    guarded = RESOLVER.objections(found, "team-lead", team)
+            break
+    stamped_any = next((e for e in RESOLVER.scan_teams() if e["member"].get("name")
+                        and e["member"]["name"] != "team-lead"), None)
+    stranger = None
+    if stamped_any:
+        with contextlib.redirect_stderr(io.StringIO()):
+            found = RESOLVER.resolve_transcript(team=stamped_any["team"],
+                                                name=stamped_any["member"]["name"], quick=False)
+            if found:
+                stranger = RESOLVER.objections(found, "team-lead", stamped_any["team"])
+    if guarded is not None and stranger is not None:
+        check("a lead is not a stranger, but a teammate still is",
+              not any(o[0] == "name_mismatch" for o in guarded)
+              and any(o[0] == "name_mismatch" for o in stranger),
+              f"lead objections {[o[0] for o in guarded]}, teammate {[o[0] for o in stranger]}")
+    else:
+        check("a lead is not a stranger (no such pair here)", True, "skipped")
 
     # The reaper bets deletions on the soul count, and that count now consults
     # stamps as well as the roster. Too permissive and a dead directory is kept
