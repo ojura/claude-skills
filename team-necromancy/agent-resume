@@ -3937,6 +3937,76 @@ def cleanup_teams(dry=False):
     return removed
 
 
+def run_census():
+    """Count what this machine's ~/.claude actually contains. Read-only.
+
+    Every number comes from the readers the tool itself resolves with, which is
+    the point. Each reading defect found so far came from a probe that
+    re-implemented a reader and then judged the behaviour by its own answer: a
+    regex that could not tell a label record from an identity stamp reported
+    damage that did not exist, and a bounded window read as if it were the whole
+    file reported an identity that was a session title. A census built on the
+    engine cannot disagree with the engine; if a reader is wrong, the census
+    reports something implausible instead of accusing the tool.
+
+    The shapes here differ between machines, which is why the frequencies live in
+    a command rather than in a docstring: run it on the box in question.
+    """
+    print(f"census of {CLAUDE_DIR}\n")
+
+    rosters = RESOLVER.rosters()
+    members = [(cfg, data, member) for cfg, data, _ in rosters
+               for member in data.get("members", [])]
+    id_agrees = sum(1 for _, _, m in members
+                    if m.get("agentId") and m.get("name")
+                    and m["agentId"].split("@", 1)[0] == m["name"])
+    id_total = sum(1 for _, _, m in members if m.get("agentId") and m.get("name"))
+    lead_agrees = sum(1 for _, data, _ in rosters_leads(rosters)
+                      if data.get("leadAgentId") == f"team-lead@{data.get('name')}")
+    print("identity")
+    print(f"  roster members whose id is name@team   {id_agrees}/{id_total}")
+    print(f"  rosters whose lead is team-lead@team   {lead_agrees}/{len(rosters)}")
+
+    RESOLVER.led_teams()  # the spawn log is filled lazily; ask for it before counting it
+    payload_pairs = [(p.get("agent_id"), p.get("name"), p.get("team_name"))
+                     for entries in RESOLVER.spawn_log.values() for _stamp, p in entries]
+    payload_ok = sum(1 for aid, name, team in payload_pairs
+                     if aid and name and team and aid == f"{name}@{team}")
+    payload_total = sum(1 for aid, name, team in payload_pairs if aid and name and team)
+    print(f"  spawn payloads whose id is name@team   {payload_ok}/{payload_total}")
+
+    resolves = sum(1 for _, data, _ in rosters
+                   if data.get("leadSessionId") and RESOLVER.transcript_path(data["leadSessionId"]))
+    named = sum(1 for _, data, _ in rosters if data.get("leadSessionId"))
+    print("\nleads")
+    print(f"  rosters naming a lead session          {named}/{len(rosters)}")
+    print(f"  ...whose session is a real transcript  {resolves}/{named}")
+    print(f"  ...which is the shape the roster rung answers; the rest need the payloads")
+
+    known = RESOLVER.known_teams()
+    by_evidence = collections.Counter(known.values())
+    print("\nteams")
+    for evidence, count in by_evidence.most_common():
+        print(f"  {evidence:38} {count}")
+    contested = {t: hits for t, hits in RESOLVER.led_teams().items() if len(hits) > 1}
+    print(f"  teams claimed by several transcripts    {len(contested)}"
+          + (f" (up to {max(len(h) for h in contested.values())} each)" if contested else ""))
+
+    stamps = RESOLVER.stamp_index()
+    both = sum(1 for name, team in stamps.values() if name and team)
+    name_only = sum(1 for name, team in stamps.values() if name and not team)
+    print("\ntranscripts")
+    print(f"  stamped with a name and a team         {both}")
+    print(f"  stamped with a name and no team        {name_only}")
+    print(f"  ...either ran team-less or were launched with mismatched team flags")
+    return 0
+
+
+def rosters_leads(rosters):
+    """The roster entries that name a lead, for counting."""
+    return [(cfg, data, mtime) for cfg, data, mtime in rosters if data.get("leadAgentId")]
+
+
 def run_cleanup(dry=False):
     """Everything the SessionStart hook reaps."""
     cleanup_sockets(dry)
@@ -5234,6 +5304,9 @@ def main():
                              "open a terminal or change directory (each cleans up after itself)")
     parser.add_argument("--selftest", action="store_true",
                         help="check the tool's invariants against this machine; changes nothing")
+    parser.add_argument("--census", action="store_true",
+                        help="count what this machine's ~/.claude contains, through the "
+                             "same readers the tool resolves with")
     parser.add_argument("--cleanup", "--cleanup-sockets", dest="cleanup", action="store_true",
                         help="reap dead swarm sockets and team dirs with nothing resurrectable")
     parser.add_argument("--complete", metavar="TOPIC", help=argparse.SUPPRESS)
@@ -5275,6 +5348,9 @@ def main():
         return run_selftest(live=args.live)
     if args.live:
         die("--live extends --selftest; it does nothing on its own")
+
+    if args.census:
+        return run_census()
 
     if args.cleanup:
         return run_cleanup(args.dry_run)
