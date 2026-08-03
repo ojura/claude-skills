@@ -90,6 +90,30 @@ good components that nobody introduced to each other.
    env. Rendering the literal string `HEAD` as a git branch label in the
    same slot invites the same misreading.
 
+6. **A subagent's teammate is spawned into a team that is never instantiated,
+   and its mail reports success into it.** An in-process subagent calling the
+   Agent tool gets back an agent id naming a fresh team, but a subagent cannot
+   host a team server, so nothing is created for it: no team directory, no
+   config, no session file for the lead the id names. The teammate runs, works,
+   and reports; every `SendMessage` returns `{"success": true, "message":
+   "Message sent to team-lead's inbox"}` into a queue nobody polls, and from
+   inside there is no way to tell.
+
+   Observed with a teammate stamped `teamName: session-2b76dc77`: no
+   `~/.claude/teams/session-2b76dc77/`, no transcript beginning `2b76dc77`,
+   `~/.claude/tasks/session-2b76dc77` empty, and two successful sends in its
+   transcript. Its report was recovered only by reading the transcript directly.
+
+   Two directories *were* created at the two spawn times, named after neither
+   the agent's stamped team nor each other, each holding only a `team-lead`
+   member whose `leadSessionId` has no transcript. So the path that mints the
+   agent id and the path that writes the roster disagreed on the team name, and
+   neither produced a live lead.
+
+   Either refuse the spawn where it cannot be hosted, or report the delivery
+   honestly. Success returned for a message with no recipient is worse than a
+   failure, because it ends the sender's attempts to be heard.
+
 ## Feature requests (in order of leverage)
 
 1. **`teammateMode: bg`.** The daemon substrate already gives supervision,
