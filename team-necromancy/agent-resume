@@ -4433,6 +4433,37 @@ def run_selftest(live=False):
     check("a lead is told what is still loading before it takes over",
           handed == [[], ["member1"], ["member1", "member2"]], str(handed))
 
+    # A lead that ran several teams must rebuild the one that was named, not
+    # whichever it ran as last. Both spellings of that fault shipped once: the
+    # forge proposed the newest team's name over the right members, and an agent
+    # id resolved the right transcript under the wrong team.
+    multi = next(((stem, teams) for stem, teams in
+                  ((path.stem, RESOLVER.teams_led_by(path.stem))
+                   for hits in RESOLVER.led_teams().values() for _stamp, path in hits)
+                  if len(teams) > 1), None)
+    if multi:
+        stem, teams = multi
+        # Every payload handed back for a team must belong to that team. The fault
+        # was that a lead's newest team answered for an older one, which shows up
+        # here as a payload stamped with a team nobody asked about.
+        strays = {t: [p["name"] for p in RESOLVER.members_spawned_into(stem, t)
+                      if p.get("team_name") != t]
+                  for t in teams}
+        wrong = sorted(t for t, names in strays.items() if names)
+        check("a named team is rebuilt, not the lead's newest", not wrong,
+              f"{len(teams)} teams from one lead; strays in {', '.join(wrong)}" if wrong
+              else f"{len(teams)} teams from one lead, none crossed")
+    else:
+        check("a named team is rebuilt (no multi-team lead here)", True, "skipped")
+
+    # A dry run must promise what a real run does. They share one code path, so
+    # the check is that the path really is shared: the forge hands back the same
+    # roster in both modes rather than the preview enumerating separately.
+    forge_src = ast.get_source_segment(source, funcs["forge_team"])
+    returns_both = forge_src.count("return config") >= 2
+    check("a preview and a real forge return the same roster", returns_both,
+          f"{forge_src.count('return config')} return sites")
+
     # A guess must not be written where it will later be read as a fact. Rung 1
     # reads leadSessionId as EXACT and asks nothing more, so an uncorroborated
     # rebuild leaves it empty and the ladder re-derives, and re-warns, every run.
