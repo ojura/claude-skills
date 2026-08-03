@@ -33,13 +33,14 @@ than one roster, which on any box with several teams is exactly what
 this team.
 
 The last rung is there because a lead writes no stamps, and `leadSessionId`
-sometimes names nothing resumable. A team is normally named after its lead's
-transcript and records that transcript, which is why most leads resolve at the
-roster rung: of fourteen rosters here that this tool has never rewritten,
-thirteen name a transcript that exists. The exception is a lead that was resumed,
-because the team then carries the *internal* session id of the life that minted
-it, and that id has no file. What a lead leaves behind either way is a spawn
-payload per teammate, each naming the team it was running as. Several transcripts can claim
+sometimes names nothing resumable. A team minted on a fresh boot is named after
+its lead's transcript and records it, so that lead resolves at the roster rung. A
+lead already resumed when it minted the team carries the *internal* session id of
+that later life instead, and that id has no file.
+
+Which shape dominates differs between machines, so neither is the default to
+reason from. What a lead leaves behind either way is a spawn payload per
+teammate, each naming the team it was running as. Several transcripts can claim
 one team, so that rung corroborates before it answers, against a live process
 running as the team, a roster naming the transcript, the payload names matching
 the roster's members, or the team-name block; a sole uncorroborated claimant is

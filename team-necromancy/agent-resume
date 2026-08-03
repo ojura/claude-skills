@@ -737,13 +737,15 @@ class Resolver:
         every payload names the team the lead was running as at the time. That makes
         the payload the only identity a lead leaves on disk.
 
-        The roster usually can stand in for it, and this rung is for when it cannot.
-        A team is normally named after its lead's transcript and records that
-        transcript, so most leads resolve at the roster rung. A lead that was
-        resumed breaks that: the team carries the internal session id of the life
-        that minted it, which has no file, and then nothing a user can type reaches
-        the lead. Measured on rosters this tool had not rewritten, thirteen of
-        fourteen named a transcript that exists; do not assume either shape.
+        The roster sometimes stands in for it, and this rung is for when it cannot.
+        A team minted on a fresh boot is named after its lead's transcript and
+        records it, so that lead resolves at the roster rung. A lead already
+        resumed when it minted the team breaks that: the team carries the internal
+        session id of that later life, which has no file, and then nothing a user
+        can type reaches the lead.
+
+        Which shape dominates differs between machines, so this rung is the rare
+        path on some and the usual path on others. Assume neither.
 
         Built from the scan self._spawn_by_agent() already performs: containing a spawn
         payload is what makes a transcript a lead's, so the same files answer both.
@@ -1286,9 +1288,10 @@ class Resolver:
             elif not stamped_team:
                 # No team stamp, so this is nobody's teammate: the harness stamps
                 # both or neither on a teammate's lines. A name may still be there
-                # without being teammate identity, and the known cause is damage,
-                # not a species: a launch carrying --agent-name without matching
-                # team flags, which this tool once produced itself. Either way the
+                # without being teammate identity, from either of two causes: a
+                # session that ran named but team-less, or a launch that carried
+                # --agent-name with mismatched team flags. Both occur, so neither
+                # can be assumed. Either way the
                 # name is noise here and the payloads are the structural fact, so
                 # the lead identity is derived rather than read off the stamp.
                 #
@@ -2236,11 +2239,15 @@ def enforce_identity(res, objections, allow_team_change, force):
             message = (f"{res.path.name} is stamped agentName={stamped!r}, not {wanted!r} "
                        f"(matched by {why})")
             if corroborated:
-                # The roster and the payloads agree on the identity being asked
-                # for, so the stamp is the odd one out: the signature of a launch
-                # that carried the wrong name. Say what resuming does about it.
+                # The roster and the payloads agree on the identity being asked for,
+                # so the stamp is the odd one out. Two shapes produce that and the
+                # remedy is the same, but the diagnosis is not: a launch that carried
+                # the wrong name, or a session that was a teammate in an earlier life
+                # and became a lead in a later one. The second has an honest past and
+                # calling it mis-flagged would be wrong, so both are named.
                 message += (f"; the roster and the spawn payloads both say {wanted!r}, so the "
-                            f"stamp looks like a mis-flagged launch rather than another agent")
+                            f"stamp is either a launch that carried the wrong name or an "
+                            f"earlier life of this session as a teammate")
             if not force:
                 die(f"{message}. --force resumes it as {wanted!r}, and the lines it writes "
                     f"from then on are stamped correctly")
