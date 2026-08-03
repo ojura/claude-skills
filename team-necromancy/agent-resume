@@ -1173,6 +1173,7 @@ class Resolver:
 
     def identity(self, session_uuid=None, agent_id=None, for_team=None, to_team=None):
         merged = self._Merged()
+        leads_team = None
         team_entry = None
         transcript = None
         session_uuid = session_uuid
@@ -1222,12 +1223,18 @@ class Resolver:
             if stamped_team and stamped_name:
                 matches = self.roster_entries(team=stamped_team, name=stamped_name)
                 team_entry = matches[0] if matches else None
-            elif not stamped_name and not stamped_team:
-                # Nothing stamped this transcript, so it is not a teammate's: only a
-                # lead writes an unstamped one. Ask the payloads it wrote which team
-                # it was running as, and adopt that team's lead entry. Without this
-                # the run falls through to the member path and dies asking for a
-                # tmux socket, which is several steps downstream of the real answer.
+            elif not stamped_team:
+                # No team stamp, so this is nobody's teammate: the harness stamps
+                # both or neither on a teammate's lines. It may still carry a name,
+                # from an agent that ran named but team-less and later spawned
+                # teammates of its own, which is what makes it a lead. Keying this
+                # on "no stamps at all" left that one between the branches, adopting
+                # nothing, and a rebuild of its team then produced no roster.
+                #
+                # Ask the payloads it wrote which team it was running as, and adopt
+                # that team's lead entry. Without this the run falls through to the
+                # member path and dies asking for a tmux socket, which is several
+                # steps downstream of the real answer.
                 # A lead that ran several teams across its lives adopts the one the
                 # caller asked to rebuild, not whichever it ran as last.
                 led_teams_here = self.teams_led_by(session_uuid)
@@ -1242,6 +1249,16 @@ class Resolver:
                         break
                     # The team dir is gone, so state the identity the payloads prove
                     # and let forge_team rebuild the roster around it.
+                    #
+                    # Recorded as a fact, not merged as a value. A session that ran
+                    # under its own name and later spawned teammates is that team's
+                    # lead, and a roster's lead entry is team-lead@<team> whatever
+                    # the session calls itself. Competing on timestamps to say so
+                    # does not work and should not have to: the transcript's own
+                    # stamp can be newer than the activity the resolution recorded,
+                    # and a structural fact that must win a race is one waiting to
+                    # be lost.
+                    leads_team = led
                     merged.add("teamName", led, res.last_ts, "spawn payloads in this transcript")
                     merged.add("agentName", "team-lead", res.last_ts, "spawn payloads in this transcript")
                     merged.add("agentId", f"team-lead@{led}", res.last_ts, "spawn payloads in this transcript")
@@ -1334,11 +1351,13 @@ class Resolver:
             "other_transcripts": others,
             # A lead reached by rung 4 has no roster entry yet, so its own merged id
             # is the answer: the payloads that named its team also make it the lead.
-            "lead_agent_id": (team_entry["leadAgentId"] if team_entry
+            "lead_agent_id": (f"team-lead@{leads_team}" if leads_team
+                              else team_entry["leadAgentId"] if team_entry
                               else (aid if (aid := merged.pick("agentId")[0])
                                     and merged.pick("agentName")[0] == "team-lead" else None)),
             "via": res.via,
             "objections": objections,
+            "leads_team": leads_team,
             "resolution": res,
             "to_team": to_team,
         }
@@ -2696,14 +2715,14 @@ def forge_team(ctx, dry, evidence=None):
     merged = ctx["merged"]
     team = RESOLVER.field(ctx, "teamName")
     name = RESOLVER.field(ctx, "agentName")
-    if not team or not name:
+    if not team or not (name or ctx.get("leads_team")):
         return
     cfg = RESOLVER.roster_path(team)
     if cfg.exists():
         return
     now = int(time.time() * 1000)
     lead_sid = RESOLVER.field(ctx, "parentSessionId") or ""
-    if name == "team-lead":
+    if name == "team-lead" or ctx.get("leads_team"):
         # Forging for the lead itself. Recording the resumed transcript as
         # leadSessionId is what lets rung 1 find this lead again next time.
         #
@@ -4624,6 +4643,30 @@ def run_selftest(live=False):
               f"{name}@{team} -> {got or why}")
     else:
         check("an identity can be assembled (no stamped agent here)", True, "skipped")
+
+    # A lead may carry a name of its own. An agent that ran with --agent-name and
+    # no --team-name, then spawned teammates, is that team's lead while being
+    # stamped with its own name; keying lead-ness on "no stamps at all" left it
+    # between the branches and its team could not be rebuilt at all.
+    half = None
+    for team in RESOLVER.led_teams():
+        path, _why = RESOLVER.lead_transcript_for(team)
+        if not path:
+            continue
+        name, stamped_team = RESOLVER.stamp_index().get(path, (None, None))
+        if name and not stamped_team:
+            half = (team, path)
+            break
+    if half:
+        team, path = half
+        with contextlib.redirect_stderr(io.StringIO()):
+            assembled = RESOLVER.identity(session_uuid=path.stem, for_team=team)
+        check("a lead with a name of its own still leads its team",
+              assembled.get("leads_team") == team
+              and assembled.get("lead_agent_id") == f"team-lead@{team}",
+              f"{path.stem[:8]} -> {assembled.get('leads_team')}")
+    else:
+        check("a lead with a name of its own (none on this machine)", True, "skipped")
 
     # A lead that ran several teams must rebuild the one that was named, not
     # whichever it ran as last. Both spellings of that fault shipped once: the
