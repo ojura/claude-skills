@@ -4686,6 +4686,47 @@ def run_selftest(live=False):
     else:
         check("an identity can be assembled (no stamped agent here)", True, "skipped")
 
+    # The reaper bets deletions on the soul count, and that count now consults
+    # stamps as well as the roster. Too permissive and a dead directory is kept
+    # forever; too strict and somebody's memory is deleted. Both fixtures are
+    # backdated past the age grace, or they are kept for being new and the check
+    # proves nothing.
+    reap_base = Path(tempfile.mkdtemp())
+    real_teams_dir, aged = RESOLVER.teams_dir, time.time() - 86400
+    try:
+        RESOLVER.teams_dir = reap_base
+
+        def stage(name, members):
+            directory = reap_base / name
+            (directory / "inboxes").mkdir(parents=True)
+            (directory / "inboxes" / "team-lead.json").write_text("[]")
+            cfg = directory / "config.json"
+            cfg.write_text(json.dumps({"name": name, "leadAgentId": f"team-lead@{name}",
+                                       "leadSessionId": "no-such-session-uuid",
+                                       "members": members}))
+            for path in (cfg, directory / "inboxes" / "team-lead.json",
+                         directory / "inboxes", directory):
+                os.utime(path, (aged, aged))
+            return cfg
+
+        gone = stage("session-selftest-gone",
+                     [{"agentId": "team-lead@session-selftest-gone", "name": "team-lead"},
+                      {"agentId": "nobody@session-selftest-gone", "name": "nobody-here-at-all"}])
+        survivor = next((n for n, t in RESOLVER.stamp_index().values() if n and t), None)
+        held = stage("session-selftest-held",
+                     [{"agentId": "team-lead@session-selftest-held", "name": "team-lead"},
+                      {"agentId": f"{survivor}@session-selftest-held", "name": survivor}]) \
+            if survivor else None
+        with contextlib.redirect_stderr(io.StringIO()):
+            table = RESOLVER.ps_table()
+            reapable = team_keep_reason(gone, table) is None
+            kept = team_keep_reason(held, table) is not None if held else True
+    finally:
+        RESOLVER.teams_dir = real_teams_dir
+        shutil.rmtree(reap_base, ignore_errors=True)
+    check("the reaper spares what can still be resurrected", reapable and kept,
+          f"dead reapable: {reapable}, live kept: {kept}")
+
     # Enumeration and the single-token question must not diverge: a team the
     # selector accepts and rebuilds was missing from the list of teams, which is
     # revivable-but-undiscoverable, the mirror of advertised-then-deleted.
