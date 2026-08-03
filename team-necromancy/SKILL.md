@@ -32,11 +32,14 @@ than one roster, which on any box with several teams is exactly what
 `team-lead` does; and, for a lead only, the transcript whose spawn payloads name
 this team.
 
-The last rung is there because a lead writes no stamps, and `leadSessionId` is
-the lead's *internal* live session id: it names the implicit team, is not a
-transcript filename, and usually has no file at all, so it cannot equal the uuid
-anyone is able to type. What a lead does leave behind is a spawn payload per
-teammate, each naming the team it was running as. Several transcripts can claim
+The last rung is there because a lead writes no stamps, and `leadSessionId`
+sometimes names nothing resumable. A team is normally named after its lead's
+transcript and records that transcript, which is why most leads resolve at the
+roster rung: of fourteen rosters here that this tool has never rewritten,
+thirteen name a transcript that exists. The exception is a lead that was resumed,
+because the team then carries the *internal* session id of the life that minted
+it, and that id has no file. What a lead leaves behind either way is a spawn
+payload per teammate, each naming the team it was running as. Several transcripts can claim
 one team, so that rung corroborates before it answers, against a live process
 running as the team, a roster naming the transcript, the payload names matching
 the roster's members, or the team-name block; a sole uncorroborated claimant is
@@ -251,9 +254,10 @@ needs one. Two cases:
 
 - **A leader is alive and you are it (or driving it):** use its current team.
   Find it as the team file its last spawn wrote, or the newest
-  `~/.claude/teams/session-*` dir. Do not try to predict it: the implicit team
-  is named after the leader's internal live session id, which changes on every
-  resume and does not match any transcript filename.
+  `~/.claude/teams/session-*` dir. Do not try to predict it: the implicit team is
+  named after the leader's internal live session id. On a first boot that is also
+  its transcript id, which is why most teams do match their lead's transcript, but
+  a resume mints a new internal id and the two part company from then on.
 - **No live leader (full team resurrection):** invent a name and forge the
   team file yourself; Recipe 3's identity flags bind the resumed leader to
   whatever name you chose.
@@ -552,8 +556,9 @@ Limits of the masquerade, both verified:
 
 Do not bother with these dead ends, they are tested: `--agent-id ""` fails the
 same falsy check as omitting it. Pre-forging a team named after the leader's
-transcript id fails because the implicit team is named after the internal live
-session id, which changes on every resume and cannot be predicted before boot.
+transcript id is a coin toss: the implicit team is named after the internal live
+session id, which equals the transcript id on a first boot and diverges from it
+after any resume, and which cannot be predicted before boot either way.
 
 ## Driving and observing resurrected agents
 

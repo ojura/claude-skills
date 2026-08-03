@@ -717,12 +717,13 @@ class Resolver:
         every payload names the team the lead was running as at the time. That makes
         the payload the only identity a lead leaves on disk.
 
-        The roster cannot stand in for it. `leadSessionId` is the lead's internal
-        live session id, which is what the implicit team is named after; it is not a
-        transcript filename and usually has no file at all, so it can never equal the
-        uuid a user is able to supply. Without this index, a lead is reachable only
-        while its team dir still records a leadSessionId that happens to be a real
-        transcript, which is the masquerade case alone.
+        The roster usually can stand in for it, and this rung is for when it cannot.
+        A team is normally named after its lead's transcript and records that
+        transcript, so most leads resolve at the roster rung. A lead that was
+        resumed breaks that: the team carries the internal session id of the life
+        that minted it, which has no file, and then nothing a user can type reaches
+        the lead. Measured on rosters this tool had not rewritten, thirteen of
+        fourteen named a transcript that exists; do not assume either shape.
 
         Built from the scan self._spawn_by_agent() already performs: containing a spawn
         payload is what makes a transcript a lead's, so the same files answer both.
