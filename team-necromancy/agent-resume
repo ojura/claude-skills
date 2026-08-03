@@ -1128,6 +1128,209 @@ class Resolver:
                     souls[name] = found
         return souls
 
+    class _Merged:
+        """Field values from many sources; most recent wins."""
+
+        def __init__(self):
+            self.cands = defaultdict(list)
+
+        def add(self, field, value, ts, source):
+            if value in (None, ""):
+                return
+            self.cands[field].append((value, ts or 0, source))
+
+        def pick(self, field, prefer_specific=False):
+            cands = self.cands.get(field)
+            if not cands:
+                return None, None, None
+            value, ts, source = max(cands, key=lambda c: c[1])
+            if prefer_specific and isinstance(value, str):
+                # e.g. jsonl records "claude-opus-5" but the team config kept
+                # "claude-opus-5[1m]", same model, one is simply lossier.
+                # Only a bracketed variant counts (claude-opus-5 -> claude-opus-5[1m]).
+                # Any longer string would let a stale roster silently revert a model
+                # the user changed mid-session.
+                richer = [c for c in cands if isinstance(c[0], str) and c[0].startswith(value + "[")]
+                if richer:
+                    value, ts, source = max(richer, key=lambda c: len(c[0]))
+                    source += " (more specific)"
+            return value, ts, source
+
+        def conflicts(self, field):
+            return {c[0] for c in self.cands.get(field, [])}
+
+    def identity(self, session_uuid=None, agent_id=None, for_team=None, to_team=None):
+        merged = self._Merged()
+        team_entry = None
+        transcript = None
+        session_uuid = session_uuid
+        others = []
+
+        if agent_id:
+            matches = self.roster_entries(agent_id=agent_id)
+            if matches:
+                team_entry = matches[0]
+                if len(matches) > 1:
+                    warn(f"{len(matches)} team configs claim {agent_id}; using {team_entry['cfg']}")
+            else:
+                warn(f"no team config lists {agent_id}; falling back to name@team parsing")
+
+        team = name = None
+        if team_entry:
+            team, name = team_entry["team"], team_entry["member"].get("name")
+        elif agent_id and "@" in agent_id:
+            name, team = agent_id.split("@", 1)
+
+        worn_id = f"{name}@{team}" if name and team else None
+        # The harness reserves the name, so a lead is a lead whether or not a roster
+        # survives to say so; without this a reaped team's lead is refused as a name
+        # that lives in several rosters.
+        is_lead_member = ((bool(team_entry) and team_entry["member"].get("agentId") == team_entry.get("leadAgentId"))
+                          or name == "team-lead")
+        res = self.resolve_transcript(
+            session_uuid=session_uuid,
+            lead_session=(team_entry.get("leadSessionId")
+                          if is_lead_member and team_entry else None),
+            team=team,
+            name=name,
+            is_lead=is_lead_member,
+        )
+        if not res:
+            die(
+                f"{res.reason}; a truly in-process agent leaves only a sidechain under the lead's "
+                "subagents/ dir, which no CLI can resume"
+            )
+        objections = identity_objections(res, name, team)
+        transcript = (res.path, res.fields, res.last_ts)
+        others = [(p, f, t) for p, f, t in res.others]
+        session_uuid = res.path.stem
+
+        if not team_entry:  # a uuid or a stranger's id: adopt the roster the transcript names
+            stamped_team, stamped_name = res.stamped("teamName"), res.stamped("agentName")
+            if stamped_team and stamped_name:
+                matches = self.roster_entries(team=stamped_team, name=stamped_name)
+                team_entry = matches[0] if matches else None
+            elif not stamped_name and not stamped_team:
+                # Nothing stamped this transcript, so it is not a teammate's: only a
+                # lead writes an unstamped one. Ask the payloads it wrote which team
+                # it was running as, and adopt that team's lead entry. Without this
+                # the run falls through to the member path and dies asking for a
+                # tmux socket, which is several steps downstream of the real answer.
+                # A lead that ran several teams across its lives adopts the one the
+                # caller asked to rebuild, not whichever it ran as last.
+                led_teams_here = self.teams_led_by(session_uuid)
+                # Whichever way the caller named a team - as --team, or as the right
+                # half of an agent id - that is the team being rebuilt, not whichever
+                # this lead happened to run as last.
+                wanted = for_team or team
+                for led in ([wanted] if wanted in led_teams_here else led_teams_here):
+                    matches = self.roster_entries(team=led, lead_only=True)
+                    if matches:
+                        team_entry = matches[0]
+                        break
+                    # The team dir is gone, so state the identity the payloads prove
+                    # and let forge_team rebuild the roster around it.
+                    merged.add("teamName", led, res.last_ts, "spawn payloads in this transcript")
+                    merged.add("agentName", "team-lead", res.last_ts, "spawn payloads in this transcript")
+                    merged.add("agentId", f"team-lead@{led}", res.last_ts, "spawn payloads in this transcript")
+                    break
+                else:
+                    # Nothing stamped it and it spawned nobody, so it is neither a
+                    # teammate's transcript nor a lead's. Say that, rather than
+                    # continuing down the member path to fail on a missing socket,
+                    # which describes a pane this transcript was never going to get.
+                    if not agent_id:
+                        die(
+                            f"{res.path.name} carries no agent stamps, so it is not a teammate's, "
+                            "and records spawning no teammates, so it never led a team either. "
+                            "There is no agent identity to restore here: resume it with plain "
+                            "`claude --resume`, or pass --agent-id to give it one."
+                        )
+
+        # ---- team config contributions
+        if team_entry:
+            member, ts, src = team_entry["member"], team_entry["ts"], f"team:{team_entry['cfg']}"
+            merged.add("agentId", member.get("agentId"), ts, src)
+            merged.add("agentName", member.get("name"), ts, src)
+            merged.add("teamName", team_entry["team"], ts, src)
+            merged.add("color", member.get("color"), ts, src)
+            merged.add("agentType", member.get("agentType"), ts, src)
+            merged.add("model", member.get("model"), ts, src)
+            merged.add("cwd", member.get("cwd"), ts, src)
+            merged.add("tmuxPaneId", member.get("tmuxPaneId"), ts, src)
+            merged.add("backendType", member.get("backendType"), ts, src)
+            merged.add("parentSessionId", team_entry["leadSessionId"], ts, src)
+            if member.get("planModeRequired"):
+                merged.add("permissionMode", "plan", ts, src)
+
+        # ---- transcript contributions
+        path, fields, last_ts = transcript
+        src = f"jsonl:{path.name}"
+        for field, (value, ts) in fields.items():
+            if not field.startswith("_"):
+                merged.add(field, value, ts, src)
+        if not merged.cands.get("agentId"):
+            name = fields.get("agentName", (None,))[0]
+            team = fields.get("teamName", (None,))[0]
+            if name and team:
+                merged.add("agentId", f"{name}@{team}", last_ts, src + " (derived)")
+
+        # ---- a worn identity pins the identity triple
+        # When a live process is what identified this transcript, that process is
+        # wearing the identity now: its argv carries --agent-id and --team-name, so
+        # this is evidence already held rather than a derivation. Stamps are older
+        # lines on the same file and a rebind is exactly what puts them out of step,
+        # so per-field most-recent-wins can otherwise take the id from one source and
+        # the team from another, and emit a command wearing two different teams.
+        # Non-identity fields keep normal merge semantics.
+        if res.via.startswith("live pid ") and worn_id and "@" in worn_id:
+            worn_name, _, worn_team = worn_id.partition("@")
+            pinned = last_ts + 1  # outranks anything the transcript itself can say
+            merged.add("agentId", worn_id, pinned, "live argv")
+            merged.add("agentName", worn_name, pinned, "live argv")
+            merged.add("teamName", worn_team, pinned, "live argv")
+
+        # ---- last resort: the lead's record of spawning this member
+        # Timestamp 0 so it loses every tie: it is a snapshot from spawn time, and
+        # the roster or the transcript is newer whenever either has the field. Read
+        # lazily, since the lead transcript can be megabytes.
+        # Consulted unconditionally, not only when a field is missing: "present" is
+        # not "good". A roster can hold claude-opus-5 where the spawn record holds
+        # claude-opus-5[1m], and gating on absence would let that degraded value
+        # stick forever. One cached read of the lead transcript per process.
+        record = self.spawn_payload(merged.pick("agentId")[0], merged.pick("parentSessionId")[0])
+        if record:
+            for key, field in SPAWN_FIELDS.items():
+                merged.add(field, record.get(key), 0, "lead transcript spawn record")
+            if record.get("plan_mode_required"):
+                merged.add("permissionMode", "plan", 0, "lead transcript spawn record")
+
+        # A dead team dir takes leadSessionId with it. Asking the engine rather than
+        # globbing here keeps one answer to "which session led this team": the glob is
+        # the engine's weakest rung, below the roster and the payloads, and reaching
+        # for it directly skipped both.
+        if not merged.cands.get("parentSessionId"):
+            lead = self.lead_session_for(merged.pick("teamName")[0] or "")
+            if lead:
+                merged.add("parentSessionId", lead, transcript[2], "engine: lead session for team")
+
+        return {
+            "merged": merged,
+            "team_entry": team_entry,
+            "transcript": transcript,
+            "session_uuid": session_uuid,
+            "other_transcripts": others,
+            # A lead reached by rung 4 has no roster entry yet, so its own merged id
+            # is the answer: the payloads that named its team also make it the lead.
+            "lead_agent_id": (team_entry["leadAgentId"] if team_entry
+                              else (aid if (aid := merged.pick("agentId")[0])
+                                    and merged.pick("agentName")[0] == "team-lead" else None)),
+            "via": res.via,
+            "objections": objections,
+            "resolution": res,
+            "to_team": to_team,
+        }
+
     def classify(self, token):
         """What kind of thing this token names: (kind, value, why).
 
@@ -1831,46 +2034,87 @@ def agent_cwd(ctx):
 
 
 
-def verify_identity(res, want_name, want_team, allow_team_change, force):
-    """Judge the conclusion, not the path that reached it.
+def build(args):
+    """The identity for this run, and the one place that knows flags exist.
 
-    Whatever rung resolution used, the transcript we are about to resume must
-    not belong to somebody else: a process launched with --agent-id X wearing
-    Y's conversation is the worst outcome this tool can produce.
+    The engine is handed facts, never args, so that who an agent is cannot come
+    to depend on how the question was spelled. It judges but does not act: the
+    objections come back with the answer and are enforced here, where --force
+    and a requested team change are known.
+    """
+    ctx = RESOLVER.identity(session_uuid=args.resume, agent_id=args.agent_id,
+                            for_team=getattr(args, "for_team", None), to_team=args.to_team)
+    enforce_identity(ctx["resolution"], ctx["objections"],
+                     allow_team_change=bool(args.to_team), force=args.force)
+    return ctx
+
+
+def identity_objections(res, want_name, want_team):
+    """Typed facts about what the chosen transcript contradicts, or an empty list.
+
+    Judgement only. Whether an objection is fatal depends on --force and on
+    whether a team change was asked for, and those are the caller's to weigh:
+    this says what is true, enforce_identity says what to do about it.
+
+    Splitting them is also what stops the check from being optional. It used to
+    run only where a caller remembered to call it, which was one site out of
+    several that resolve identities.
     """
     stamped_name, stamped_team = res.stamped("agentName"), res.stamped("teamName")
+    objections = []
 
     if stamped_name is None:
         # Unstamped means a lead transcript. Only an exact rung may claim one.
         if res.strength < EXACT:
-            message = (f"{res.path.name} carries no agent stamps and was matched by {res.via}; "
+            objections.append(("unstamped_below_exact", None, None, res.via))
+        return objections
+
+    if want_name and stamped_name != want_name:
+        objections.append(("name_mismatch", stamped_name, want_name, res.via))
+
+    if want_team and stamped_team and stamped_team != want_team:
+        # A rebind asks for the change; a unique name and a live process wearing
+        # the identity both make the stamp the stale half rather than the wrong one.
+        tolerated = (res.strength == NAME_ONLY or res.via.startswith("live pid "))
+        objections.append(("team_mismatch", stamped_team, want_team,
+                           "tolerated" if tolerated else res.via))
+    return objections
+
+
+def enforce_identity(res, objections, allow_team_change, force):
+    """Act on what identity_objections found. Disposition, not judgement.
+
+    A process launched with --agent-id X wearing Y's conversation is the worst
+    outcome this tool can produce, so a contradiction stops the run unless the
+    caller has said otherwise.
+    """
+    for kind, stamped, wanted, why in objections:
+        if kind == "unstamped_below_exact":
+            message = (f"{res.path.name} carries no agent stamps and was matched by {why}; "
                        "only an exact session id may claim an unstamped transcript")
             if not force:
                 die(f"{message} (--force to override)")
             warn(f"--force: {message}")
-        return
+        elif kind == "name_mismatch":
+            message = (f"{res.path.name} is stamped agentName={stamped!r}, not {wanted!r} "
+                       f"(matched by {why})")
+            if not force:
+                die(f"{message}; refusing to resume another agent's conversation (--force to override)")
+            warn(f"--force: {message}; resuming another agent's conversation anyway")
+        elif kind == "team_mismatch":
+            if allow_team_change or why == "tolerated":
+                warn(f"{res.path.name} is stamped team={stamped}, resuming as {wanted}")
+            elif not force:
+                die(f"{res.path.name} is stamped team={stamped}, not {wanted} "
+                    f"(matched by {why}); --force to override")
+            else:
+                warn(f"--force: {res.path.name} is stamped team={stamped}, resuming as {wanted}")
 
-    if want_name and stamped_name != want_name:
-        message = (f"{res.path.name} is stamped agentName={stamped_name!r}, not {want_name!r} "
-                   f"(matched by {res.via})")
-        if not force:
-            die(f"{message}; refusing to resume another agent's conversation (--force to override)")
-        warn(f"--force: {message}; resuming another agent's conversation anyway")
 
-    if want_team and stamped_team and stamped_team != want_team:
-        # Legitimate when rebinding, when the name proved unique anyway, or when a
-        # live process wearing this identity is what identified the transcript. In
-        # that last case the stamps are the stale half by construction: they record
-        # the team the agent was in when those lines were written, argv records the
-        # team it is in now, and a rebind is exactly what puts the two out of step.
-        # Dying here would refuse to resume an agent that is running in front of us.
-        if allow_team_change or res.strength == NAME_ONLY or res.via.startswith("live pid "):
-            warn(f"{res.path.name} is stamped team={stamped_team}, resuming as {want_team}")
-        elif not force:
-            die(f"{res.path.name} is stamped team={stamped_team}, not {want_team} "
-                f"(matched by {res.via}); --force to override")
-        else:
-            warn(f"--force: {res.path.name} is stamped team={stamped_team}, resuming as {want_team}")
+def verify_identity(res, want_name, want_team, allow_team_change, force):
+    """Judge, then act. Kept as one call for the sites that want both."""
+    enforce_identity(res, identity_objections(res, want_name, want_team),
+                     allow_team_change, force)
 
 
 def apply_selector(token, args, table):
@@ -2072,206 +2316,8 @@ def own_lineage(table):
 
 # ---------------------------------------------------------------- resolution
 
-class Merged:
-    """Field values from many sources; most recent wins."""
-
-    def __init__(self):
-        self.cands = defaultdict(list)
-
-    def add(self, field, value, ts, source):
-        if value in (None, ""):
-            return
-        self.cands[field].append((value, ts or 0, source))
-
-    def pick(self, field, prefer_specific=False):
-        cands = self.cands.get(field)
-        if not cands:
-            return None, None, None
-        value, ts, source = max(cands, key=lambda c: c[1])
-        if prefer_specific and isinstance(value, str):
-            # e.g. jsonl records "claude-opus-5" but the team config kept
-            # "claude-opus-5[1m]", same model, one is simply lossier.
-            # Only a bracketed variant counts (claude-opus-5 -> claude-opus-5[1m]).
-            # Any longer string would let a stale roster silently revert a model
-            # the user changed mid-session.
-            richer = [c for c in cands if isinstance(c[0], str) and c[0].startswith(value + "[")]
-            if richer:
-                value, ts, source = max(richer, key=lambda c: len(c[0]))
-                source += " (more specific)"
-        return value, ts, source
-
-    def conflicts(self, field):
-        return {c[0] for c in self.cands.get(field, [])}
 
 
-def build(args):
-    merged = Merged()
-    team_entry = None
-    transcript = None
-    session_uuid = args.resume
-    others = []
-
-    if args.agent_id:
-        matches = RESOLVER.roster_entries(agent_id=args.agent_id)
-        if matches:
-            team_entry = matches[0]
-            if len(matches) > 1:
-                warn(f"{len(matches)} team configs claim {args.agent_id}; using {team_entry['cfg']}")
-        else:
-            warn(f"no team config lists {args.agent_id}; falling back to name@team parsing")
-
-    team = name = None
-    if team_entry:
-        team, name = team_entry["team"], team_entry["member"].get("name")
-    elif args.agent_id and "@" in args.agent_id:
-        name, team = args.agent_id.split("@", 1)
-
-    worn_id = f"{name}@{team}" if name and team else None
-    # The harness reserves the name, so a lead is a lead whether or not a roster
-    # survives to say so; without this a reaped team's lead is refused as a name
-    # that lives in several rosters.
-    is_lead_member = ((bool(team_entry) and team_entry["member"].get("agentId") == team_entry.get("leadAgentId"))
-                      or name == "team-lead")
-    res = RESOLVER.resolve_transcript(
-        session_uuid=session_uuid,
-        lead_session=(team_entry.get("leadSessionId")
-                      if is_lead_member and team_entry else None),
-        team=team,
-        name=name,
-        is_lead=is_lead_member,
-    )
-    if not res:
-        die(
-            f"{res.reason}; a truly in-process agent leaves only a sidechain under the lead's "
-            "subagents/ dir, which no CLI can resume"
-        )
-    verify_identity(res, name, team, allow_team_change=bool(args.to_team), force=args.force)
-    transcript = (res.path, res.fields, res.last_ts)
-    others = [(p, f, t) for p, f, t in res.others]
-    session_uuid = res.path.stem
-
-    if not team_entry:  # a uuid or a stranger's id: adopt the roster the transcript names
-        stamped_team, stamped_name = res.stamped("teamName"), res.stamped("agentName")
-        if stamped_team and stamped_name:
-            matches = RESOLVER.roster_entries(team=stamped_team, name=stamped_name)
-            team_entry = matches[0] if matches else None
-        elif not stamped_name and not stamped_team:
-            # Nothing stamped this transcript, so it is not a teammate's: only a
-            # lead writes an unstamped one. Ask the payloads it wrote which team
-            # it was running as, and adopt that team's lead entry. Without this
-            # the run falls through to the member path and dies asking for a
-            # tmux socket, which is several steps downstream of the real answer.
-            # A lead that ran several teams across its lives adopts the one the
-            # caller asked to rebuild, not whichever it ran as last.
-            led_teams_here = RESOLVER.teams_led_by(session_uuid)
-            # Whichever way the caller named a team - as --team, or as the right
-            # half of an agent id - that is the team being rebuilt, not whichever
-            # this lead happened to run as last.
-            wanted = getattr(args, "for_team", None) or team
-            for led in ([wanted] if wanted in led_teams_here else led_teams_here):
-                matches = RESOLVER.roster_entries(team=led, lead_only=True)
-                if matches:
-                    team_entry = matches[0]
-                    break
-                # The team dir is gone, so state the identity the payloads prove
-                # and let forge_team rebuild the roster around it.
-                merged.add("teamName", led, res.last_ts, "spawn payloads in this transcript")
-                merged.add("agentName", "team-lead", res.last_ts, "spawn payloads in this transcript")
-                merged.add("agentId", f"team-lead@{led}", res.last_ts, "spawn payloads in this transcript")
-                break
-            else:
-                # Nothing stamped it and it spawned nobody, so it is neither a
-                # teammate's transcript nor a lead's. Say that, rather than
-                # continuing down the member path to fail on a missing socket,
-                # which describes a pane this transcript was never going to get.
-                if not args.agent_id:
-                    die(
-                        f"{res.path.name} carries no agent stamps, so it is not a teammate's, "
-                        "and records spawning no teammates, so it never led a team either. "
-                        "There is no agent identity to restore here: resume it with plain "
-                        "`claude --resume`, or pass --agent-id to give it one."
-                    )
-
-    # ---- team config contributions
-    if team_entry:
-        member, ts, src = team_entry["member"], team_entry["ts"], f"team:{team_entry['cfg']}"
-        merged.add("agentId", member.get("agentId"), ts, src)
-        merged.add("agentName", member.get("name"), ts, src)
-        merged.add("teamName", team_entry["team"], ts, src)
-        merged.add("color", member.get("color"), ts, src)
-        merged.add("agentType", member.get("agentType"), ts, src)
-        merged.add("model", member.get("model"), ts, src)
-        merged.add("cwd", member.get("cwd"), ts, src)
-        merged.add("tmuxPaneId", member.get("tmuxPaneId"), ts, src)
-        merged.add("backendType", member.get("backendType"), ts, src)
-        merged.add("parentSessionId", team_entry["leadSessionId"], ts, src)
-        if member.get("planModeRequired"):
-            merged.add("permissionMode", "plan", ts, src)
-
-    # ---- transcript contributions
-    path, fields, last_ts = transcript
-    src = f"jsonl:{path.name}"
-    for field, (value, ts) in fields.items():
-        if not field.startswith("_"):
-            merged.add(field, value, ts, src)
-    if not merged.cands.get("agentId"):
-        name = fields.get("agentName", (None,))[0]
-        team = fields.get("teamName", (None,))[0]
-        if name and team:
-            merged.add("agentId", f"{name}@{team}", last_ts, src + " (derived)")
-
-    # ---- a worn identity pins the identity triple
-    # When a live process is what identified this transcript, that process is
-    # wearing the identity now: its argv carries --agent-id and --team-name, so
-    # this is evidence already held rather than a derivation. Stamps are older
-    # lines on the same file and a rebind is exactly what puts them out of step,
-    # so per-field most-recent-wins can otherwise take the id from one source and
-    # the team from another, and emit a command wearing two different teams.
-    # Non-identity fields keep normal merge semantics.
-    if res.via.startswith("live pid ") and worn_id and "@" in worn_id:
-        worn_name, _, worn_team = worn_id.partition("@")
-        pinned = last_ts + 1  # outranks anything the transcript itself can say
-        merged.add("agentId", worn_id, pinned, "live argv")
-        merged.add("agentName", worn_name, pinned, "live argv")
-        merged.add("teamName", worn_team, pinned, "live argv")
-
-    # ---- last resort: the lead's record of spawning this member
-    # Timestamp 0 so it loses every tie: it is a snapshot from spawn time, and
-    # the roster or the transcript is newer whenever either has the field. Read
-    # lazily, since the lead transcript can be megabytes.
-    # Consulted unconditionally, not only when a field is missing: "present" is
-    # not "good". A roster can hold claude-opus-5 where the spawn record holds
-    # claude-opus-5[1m], and gating on absence would let that degraded value
-    # stick forever. One cached read of the lead transcript per process.
-    record = RESOLVER.spawn_payload(merged.pick("agentId")[0], merged.pick("parentSessionId")[0])
-    if record:
-        for key, field in SPAWN_FIELDS.items():
-            merged.add(field, record.get(key), 0, "lead transcript spawn record")
-        if record.get("plan_mode_required"):
-            merged.add("permissionMode", "plan", 0, "lead transcript spawn record")
-
-    # A dead team dir takes leadSessionId with it. Asking the engine rather than
-    # globbing here keeps one answer to "which session led this team": the glob is
-    # the engine's weakest rung, below the roster and the payloads, and reaching
-    # for it directly skipped both.
-    if not merged.cands.get("parentSessionId"):
-        lead = RESOLVER.lead_session_for(merged.pick("teamName")[0] or "")
-        if lead:
-            merged.add("parentSessionId", lead, transcript[2], "engine: lead session for team")
-
-    return {
-        "merged": merged,
-        "team_entry": team_entry,
-        "transcript": transcript,
-        "session_uuid": session_uuid,
-        "other_transcripts": others,
-        # A lead reached by rung 4 has no roster entry yet, so its own merged id
-        # is the answer: the payloads that named its team also make it the lead.
-        "lead_agent_id": (team_entry["leadAgentId"] if team_entry
-                          else (aid if (aid := merged.pick("agentId")[0])
-                                and merged.pick("agentName")[0] == "team-lead" else None)),
-        "via": res.via,
-    }
 
 
 
@@ -4442,6 +4488,26 @@ def run_selftest(live=False):
         globals()["run_one"], globals()["report_transcript_writes"] = real_one, real_report
     check("a lead is told what is still loading before it takes over",
           handed == [[], ["member1"], ["member1", "member2"]], str(handed))
+
+    # Assembly is exercised, not just its parts. A NameError in identity() once
+    # passed a full battery of structural checks while every real invocation of
+    # the tool died: nothing in the suite called the function that answers who an
+    # agent is.
+    stamped = next(((name, team) for name, team in RESOLVER.stamp_index().values()
+                    if name and team and name != "team-lead"), None)
+    if stamped:
+        name, team = stamped
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                assembled = RESOLVER.identity(agent_id=f"{name}@{team}")
+            got = assembled["merged"].pick("agentId")[0]
+            why = assembled.get("via")
+        except Exception as exc:                      # the point is that it runs
+            got, why = None, f"{type(exc).__name__}: {exc}"
+        check("an identity can actually be assembled", bool(got and why),
+              f"{name}@{team} -> {got or why}")
+    else:
+        check("an identity can be assembled (no stamped agent here)", True, "skipped")
 
     # A lead that ran several teams must rebuild the one that was named, not
     # whichever it ran as last. Both spellings of that fault shipped once: the
