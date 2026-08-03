@@ -744,8 +744,10 @@ class Resolver:
         session id of that later life, which has no file, and then nothing a user
         can type reaches the lead.
 
-        Which shape dominates differs between machines, so this rung is the rare
-        path on some and the usual path on others. Assume neither.
+        Assume neither shape. A corpus cannot settle it: rosters are written by
+        this tool, by hand-forged recipes, and by the harness alike, so counting
+        them measures what has been done to a machine as much as what the harness
+        does.
 
         Built from the scan self._spawn_by_agent() already performs: containing a spawn
         payload is what makes a transcript a lead's, so the same files answer both.
@@ -2242,12 +2244,13 @@ def enforce_identity(res, objections, allow_team_change, force):
                 # The roster and the payloads agree on the identity being asked for,
                 # so the stamp is the odd one out. Two shapes produce that and the
                 # remedy is the same, but the diagnosis is not: a launch that carried
-                # the wrong name, or a session that was a teammate in an earlier life
-                # and became a lead in a later one. The second has an honest past and
-                # calling it mis-flagged would be wrong, so both are named.
+                # the wrong name, or a session that was a teammate first and was
+                # later resumed into leading a team. The second has an honest past,
+                # so naming only the first would accuse it of damage it does not
+                # have. Both are stated and neither is assumed.
                 message += (f"; the roster and the spawn payloads both say {wanted!r}, so the "
-                            f"stamp is either a launch that carried the wrong name or an "
-                            f"earlier life of this session as a teammate")
+                            f"stamp is either a launch that carried the wrong name or this "
+                            f"session's earlier life as a teammate")
             if not force:
                 die(f"{message}. --force resumes it as {wanted!r}, and the lines it writes "
                     f"from then on are stamped correctly")
@@ -3949,8 +3952,15 @@ def run_census():
     engine cannot disagree with the engine; if a reader is wrong, the census
     reports something implausible instead of accusing the tool.
 
-    The shapes here differ between machines, which is why the frequencies live in
-    a command rather than in a docstring: run it on the box in question.
+    The shapes differ between machines, which is why the frequencies live in a
+    command rather than in a docstring: run it on the box in question.
+
+    What it counts is that box, not the harness. A ~/.claude is written by the
+    harness, by this tool, and by anyone following the hand-forging recipes, and
+    the last two leave rosters that look like the first. So a shape seen here is
+    evidence that the shape occurs, never evidence that the harness produces it:
+    check whether our own ecosystem could have written it before concluding
+    anything about the harness from a count.
     """
     print(f"census of {CLAUDE_DIR}\n")
 

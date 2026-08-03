@@ -38,9 +38,12 @@ its lead's transcript and records it, so that lead resolves at the roster rung. 
 lead already resumed when it minted the team carries the *internal* session id of
 that later life instead, and that id has no file.
 
-Which shape dominates differs between machines, so neither is the default to
-reason from. What a lead leaves behind either way is a spawn payload per
-teammate, each naming the team it was running as. Several transcripts can claim
+Neither shape is the default to reason from, and counting a machine will not
+tell you which is: its rosters were written by the harness, by `agent-resume`,
+and by the hand-forging recipes below, so a census of them measures what has been
+done to that machine as much as what the harness does. What a lead leaves behind
+either way is a spawn payload per teammate, each naming the team it was running
+as. Several transcripts can claim
 one team, so that rung corroborates before it answers, against a live process
 running as the team, a roster naming the transcript, the payload names matching
 the roster's members, or the team-name block; a sole uncorroborated claimant is
