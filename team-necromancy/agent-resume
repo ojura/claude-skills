@@ -1082,6 +1082,89 @@ class Resolver:
             if needle in self._argv_pairs(args) and pid not in mine and self.is_claude(args)
         ]
 
+    def team_souls(self, team, entries=None):
+        """{name: Resolution} for everything in a team the resolver can still find.
+
+        "Is there anything here to resurrect" is the engine's own question, so it
+        is answered here once: the reaper uses it to decide what is cruft, and the
+        completion labels use it to mark teams that cannot come back. Answering it
+        anywhere else means a team could be advertised as revivable and deleted by
+        the same run.
+        """
+        if entries is None:
+            entries = self.roster_entries(team=team)
+        souls = {}
+        lead_session = entries[0]["leadSessionId"] if entries else None
+        if lead_session:
+            found = self.resolve_transcript(lead_session=lead_session, team=team, is_lead=True, quick=True)
+            if found:
+                souls["team-lead"] = found
+        named = [entry["member"].get("name") for entry in entries]
+        if not entries:
+            # team_evidence proved a roster is not the only witness to a team, and the
+            # reaper bets deletions on this answer, so a team with no roster left is
+            # asked of the stamps rather than assumed empty.
+            named = [stamped_name for stamped_name, stamped_team in self.stamp_index().values()
+                     if stamped_team == team]
+        for name in named:
+            if name and name != "team-lead" and name not in souls:
+                found = self.resolve_transcript(team=team, name=name, quick=True)
+                if found:
+                    souls[name] = found
+        return souls
+
+    def classify(self, token):
+        """What kind of thing this token names: (kind, value, why).
+
+        kind is one of uuid, agent_id, team, name, ambiguous, unknown. The
+        selector used to decide this itself, running its own roster-name scan and
+        its own several-rosters refusal beside the engine's rung 3 - the same rule
+        written twice, answering in two different voices.
+
+        The caller still does the talking: an ambiguous token comes back with its
+        candidates so the refusal can annotate them with live state, which is
+        presentation and not a decision.
+        """
+        if UUID_RE.match(token):
+            return "uuid", token, "a session uuid"
+        if "@" in token:
+            return "agent_id", token, "a full agent id"
+        team_why = self.team_evidence(token)
+        if team_why:
+            return "team", token, team_why
+        if re.fullmatch(r"session-[0-9a-f]{8}", token):
+            return ("unknown", None,
+                    "is shaped like a team but is not one: no roster on disk, no spawn "
+                    "payloads name it, and no transcript is stamped with it")
+        matches = self.roster_entries(name=token)
+        if len({entry["team"] for entry in matches}) > 1:
+            return "ambiguous", matches, f"in {len({e['team'] for e in matches})} rosters"
+        if matches:
+            return "agent_id", matches[0]["member"].get("agentId"), "the only roster naming it"
+        found = self.resolve_transcript(name=token)
+        if found:
+            return "name", found, f"matched by transcript ({found.via})"
+        return "unknown", None, f"is in no roster: {found.reason}"
+
+    def roster_entries(self, agent_id=None, name=None, team=None, lead_only=False):
+        """Roster entries matching these criteria, newest first.
+
+        The newest-wins tie-break between rosters claiming one agent was written
+        out four times. It is a policy, not a filter: when several rosters claim
+        one agent, which is believed decides whose conversation gets resumed, and
+        four copies of that are four chances to answer it differently.
+        """
+        found = [
+            entry for entry in self.scan_teams()
+            if (agent_id is None or entry["member"].get("agentId") == agent_id)
+            and (name is None or entry["member"].get("name") == name)
+            and (team is None or entry["team"] == team)
+            and (not lead_only or entry["member"].get("agentId") == entry.get("leadAgentId"))
+        ]
+        found.sort(key=lambda entry: entry["ts"], reverse=True)
+        return found
+
+
     def rosters(self):
         """[(cfg path, parsed roster, mtime ms)] for every team config on disk.
 
@@ -1731,30 +1814,6 @@ def agent_cwd(ctx):
 
 
 
-def team_souls(team, entries=None):
-    """{name: Resolution} for everything in a team the resolver can still find.
-
-    "Is there anything here to resurrect" is the engine's own question, so it
-    is answered here once: the reaper uses it to decide what is cruft, and the
-    completion labels use it to mark teams that cannot come back. Answering it
-    anywhere else means a team could be advertised as revivable and deleted by
-    the same run.
-    """
-    if entries is None:
-        entries = [e for e in RESOLVER.scan_teams() if e["team"] == team]
-    souls = {}
-    lead_session = entries[0]["leadSessionId"] if entries else None
-    if lead_session:
-        found = RESOLVER.resolve_transcript(lead_session=lead_session, team=team, is_lead=True, quick=True)
-        if found:
-            souls["team-lead"] = found
-    for entry in entries:
-        name = entry["member"].get("name")
-        if name and name != "team-lead" and name not in souls:
-            found = RESOLVER.resolve_transcript(team=team, name=name, quick=True)
-            if found:
-                souls[name] = found
-    return souls
 
 
 def verify_identity(res, want_name, want_team, allow_team_change, force):
@@ -1800,59 +1859,39 @@ def verify_identity(res, want_name, want_team, allow_team_change, force):
 
 
 def apply_selector(token, args, table):
-    """Turn the bare leading argument into --resume or --agent-id."""
-    if UUID_RE.match(token):
+    """Turn the bare argument into --resume, --agent-id or --team.
+
+    The engine decides what the token is; this sets the flag and does the talking.
+    An ambiguous name is refused here rather than in the engine because the
+    refusal is worth annotating with who is running, which is presentation.
+    """
+    kind, value, why = RESOLVER.classify(token)
+
+    if kind == "uuid":
         if args.resume and args.resume != token:
             die(f"conflicting sessions: {token} and --resume {args.resume}")
         args.resume = token
-        return
-    if "@" in token:
-        if args.agent_id and args.agent_id != token:
+    elif kind == "agent_id":
+        if args.agent_id and args.agent_id != value:
             die(f"conflicting agents: {token} and --agent-id {args.agent_id}")
-        args.agent_id = token
-        return
-    why = RESOLVER.team_evidence(token)
-    if why:
-        if not RESOLVER.roster_path(token).exists():
+        args.agent_id = value
+    elif kind == "team":
+        if why != "a roster on disk":
             print(f"team     {token} has no roster on disk; rebuilding it from {why}")
         args.team = token
-        return
-
-    if re.fullmatch(r"session-[0-9a-f]{8}", token):
-        # Shaped like a team, known as nothing. Reporting it as a missing agent
-        # sends the reader hunting in the wrong ontology.
-        die(f"{token} looks like a team but is not one: no roster on disk, no spawn "
-            f"payloads name it, and no transcript is stamped with it")
-
-    matches = [e for e in RESOLVER.scan_teams() if e["member"].get("name") == token]
-    matches.sort(key=lambda e: e["ts"], reverse=True)
-    if matches:
-        if len({e["team"] for e in matches}) > 1:
-            # Same rule the resolver applies: a name living in several rosters is
-            # not an identity. Choosing "newest" here would silently decide whose
-            # conversation gets resumed.
-            warn(f"{token!r} is in {len(matches)} rosters, so it names nobody; pick one:")
-            for entry in matches:
-                agent_id = entry["member"].get("agentId")
-                procs = RESOLVER.live_agent_procs(agent_id, table)
-                state = f"running{state_note(procs[0][0])}" if procs else "not running"
-                warn(f"    {agent_id:<44} joined {ms_str(entry['ts'])}  [{state}]")
-            die("pass one of those ids, or a session uuid")
-        args.agent_id = matches[0]["member"].get("agentId")
-        return
-
-    res = RESOLVER.resolve_transcript(name=token)
-    if not res:
-        die(f"no agent named {token!r} in any roster: {res.reason}")
-    warn(f"no team config lists {token!r}; matched by transcript ({res.via})")
-    if res.others:
-        warn(f"{len(res.others) + 1} transcripts for {token!r}:")
-        for path, fields, last_ts in [(res.path, res.fields, res.last_ts)] + res.others:
-            warn(f"    {path.name}  team={fields.get('teamName', (None,))[0]}  last active {ms_str(last_ts)}")
-        warn(f"  choosing the most recent: {res.path.name}")
-    args.resume = res.path.stem
-    if res.stamped("teamName"):
-        args.agent_id = args.agent_id or f"{token}@{res.stamped('teamName')}"
+    elif kind == "name":
+        warn(f"no team config lists {token!r}; {why}")
+        args.resume = value.path.stem
+    elif kind == "ambiguous":
+        warn(f"{token!r} is {why}, so it names nobody; pick one:")
+        for entry in value:
+            agent_id = entry["member"].get("agentId")
+            procs = RESOLVER.live_agent_procs(agent_id, table)
+            state = f"running{state_note(procs[0][0])}" if procs else "not running"
+            warn(f"    {agent_id:<44} joined {ms_str(entry['ts'])}  [{state}]")
+        die("pass one of those ids, or a session uuid")
+    else:
+        die(f"{token} {why}")
 
 
 
@@ -2058,9 +2097,8 @@ def build(args):
     others = []
 
     if args.agent_id:
-        matches = [e for e in RESOLVER.scan_teams() if e["member"].get("agentId") == args.agent_id]
+        matches = RESOLVER.roster_entries(agent_id=args.agent_id)
         if matches:
-            matches.sort(key=lambda e: e["ts"], reverse=True)
             team_entry = matches[0]
             if len(matches) > 1:
                 warn(f"{len(matches)} team configs claim {args.agent_id}; using {team_entry['cfg']}")
@@ -2100,11 +2138,7 @@ def build(args):
     if not team_entry:  # a uuid or a stranger's id: adopt the roster the transcript names
         stamped_team, stamped_name = res.stamped("teamName"), res.stamped("agentName")
         if stamped_team and stamped_name:
-            matches = [
-                e for e in RESOLVER.scan_teams()
-                if e["team"] == stamped_team and e["member"].get("name") == stamped_name
-            ]
-            matches.sort(key=lambda e: e["ts"], reverse=True)
+            matches = RESOLVER.roster_entries(team=stamped_team, name=stamped_name)
             team_entry = matches[0] if matches else None
         elif not stamped_name and not stamped_team:
             # Nothing stamped this transcript, so it is not a teammate's: only a
@@ -2120,11 +2154,7 @@ def build(args):
             # this lead happened to run as last.
             wanted = getattr(args, "for_team", None) or team
             for led in ([wanted] if wanted in led_teams_here else led_teams_here):
-                matches = [
-                    e for e in RESOLVER.scan_teams()
-                    if e["team"] == led and e["member"].get("agentId") == e.get("leadAgentId")
-                ]
-                matches.sort(key=lambda e: e["ts"], reverse=True)
+                matches = RESOLVER.roster_entries(team=led, lead_only=True)
                 if matches:
                     team_entry = matches[0]
                     break
@@ -3311,7 +3341,7 @@ def run_complete(topic):
             when = ms_str(entry["ts"])
             if title:
                 desc = f"{title}  [{count} {plural}, {when}]"
-            elif not team_souls(team):
+            elif not RESOLVER.team_souls(team):
                 # Nothing in it resolves any more, which is also what the reaper
                 # checks before removing the directory.
                 desc = f"nothing left to resurrect, {count} {plural}, {when}"
@@ -3595,7 +3625,7 @@ def team_keep_reason(cfg, table):
     # Both transcript questions go through the resolver, so "does a soul exist
     # here" is answered by the same engine that would resurrect it. Asking any
     # other way risks deleting something the tool could have brought back.
-    souls = team_souls(team, entries)
+    souls = RESOLVER.team_souls(team, entries)
     if souls:
         return f"still resurrectable: {', '.join(sorted(souls))}"
     return cruft_reason(cfg.parent)
@@ -4193,6 +4223,17 @@ def run_selftest(live=False):
         and node.name not in {"edit_team_config", "cruft_reason", "run_selftest"})
     check("a roster is read in one place", not roster_readers, ", ".join(roster_readers))
 
+    # Which roster is believed when several claim one agent is a policy, not a
+    # filter: it decides whose conversation gets resumed. run_complete sorts for
+    # display, which is presentation and not that question.
+    ts_sorters = sorted(
+        node.name for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and 'key=lambda e: e["ts"]' in (ast.get_source_segment(source, node) or "")
+        # run_complete sorts for display; run_selftest holds this check's own text.
+        and node.name not in {"run_complete", "run_selftest"})
+    check("one policy decides which roster claims an agent", not ts_sorters, ", ".join(ts_sorters))
+
     private_reach = sorted({
         f"{node.name} -> {m.group(1)}"
         for node in tree.body if isinstance(node, ast.FunctionDef)
@@ -4372,6 +4413,20 @@ def run_selftest(live=False):
         globals()["run_one"], globals()["report_transcript_writes"] = real_one, real_report
     check("a lead is told what is still loading before it takes over",
           handed == [[], ["member1"], ["member1", "member2"]], str(handed))
+
+    # One classifier decides what a token names. apply_selector used to run its
+    # own roster-name scan and its own several-rosters refusal beside the
+    # engine's rung 3: one rule, two implementations, two voices.
+    kinds = {
+        "a uuid": RESOLVER.classify("2a38de2d-bd34-4c7f-8f9a-000000000000")[0] == "uuid",
+        "an agent id": RESOLVER.classify("someone@session-abcdef12")[0] == "agent_id",
+        "a team with a roster": RESOLVER.classify(
+            next(iter({e["team"] for e in RESOLVER.scan_teams()}), "session-none"))[0] == "team",
+        "an unknown team shape": RESOLVER.classify("session-deadbeef")[0] == "unknown",
+        "an unknown name": RESOLVER.classify("no-such-agent-anywhere")[0] == "unknown",
+    }
+    wrong = sorted(k for k, good in kinds.items() if not good)
+    check("one classifier says what a selector names", not wrong, ", ".join(wrong))
 
     # A team outlives its directory: a graceful lead exit removes the roster, so
     # existence alone reports a cleaned-up team as one that never existed.
