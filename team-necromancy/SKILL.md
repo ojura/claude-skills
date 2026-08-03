@@ -191,9 +191,11 @@ lists cannot drift from reality. The flag list in `_agent-resume` is
 hand-maintained and has drifted before; add new flags there too. For Recipe 1's
 placeholder ritual, `agent-resume --poison` / `--unpoison` set and clear the
 server-level ANTHROPIC_BASE_URL poison (newest live swarm socket by default,
-`--socket` to aim). Every launch agent-resume itself performs is scrubbed with
-`env -u ANTHROPIC_BASE_URL`, so a poison left behind by an interrupted run
-cannot starve a real resurrection. Use the manual
+`--socket` to aim). A launch agent-resume performs drops
+ANTHROPIC_BASE_URL only when it holds that poison, so an interrupted run cannot
+starve a real resurrection while a base url you set on purpose still reaches the
+agent. A stripped poison is announced; anything else is passed through, since
+the swarm's own agents are running with it. Use the manual
 recipes below when the automation's assumptions break (forged teams, bg
 substrate, argv surgery) or when you need to understand what just went wrong.
 Known limits, shared with the recipes: a masqueraded lead cannot spawn
