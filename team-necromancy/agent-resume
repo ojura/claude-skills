@@ -202,6 +202,28 @@ def forwarded_flags(passthrough):
             if token.startswith("-") and token != "--"]
 
 
+def check_identity_flags(args, passthrough):
+    """Refuse a user-supplied id and name that disagree.
+
+    The harness builds agentId as name@team, so the two are one fact. A caller
+    who supplies both and contradicts them is describing an agent that cannot
+    exist, and the name is what routes mail: the mailbox is inboxes/<name>.json,
+    so the wrong name reads an address nobody writes to.
+    """
+    named = None
+    tokens = list(passthrough)
+    for index, token in enumerate(tokens):
+        if token == "--agent-name" and index + 1 < len(tokens):
+            named = tokens[index + 1]
+        elif token.startswith("--agent-name="):
+            named = token.split("=", 1)[1]
+    if named and args.agent_id and "@" in args.agent_id:
+        wearing = args.agent_id.split("@", 1)[0]
+        if wearing != named:
+            die(f"--agent-id says {wearing!r} and --agent-name says {named!r}; they are one "
+                f"fact, and the name is what addresses the mailbox. Pass one, or matching ones")
+
+
 def check_flag_scope(passthrough, count):
     """Refuse a flag that names one agent when the run covers several.
 
@@ -1240,11 +1262,12 @@ class Resolver:
                 team_entry = matches[0] if matches else None
             elif not stamped_team:
                 # No team stamp, so this is nobody's teammate: the harness stamps
-                # both or neither on a teammate's lines. It may still carry a name,
-                # from an agent that ran named but team-less and later spawned
-                # teammates of its own, which is what makes it a lead. Keying this
-                # on "no stamps at all" left that one between the branches, adopting
-                # nothing, and a rebuild of its team then produced no roster.
+                # both or neither on a teammate's lines. A name may still be there
+                # without being teammate identity, and the known cause is damage,
+                # not a species: a launch carrying --agent-name without matching
+                # team flags, which this tool once produced itself. Either way the
+                # name is noise here and the payloads are the structural fact, so
+                # the lead identity is derived rather than read off the stamp.
                 #
                 # Ask the payloads it wrote which team it was running as, and adopt
                 # that team's lead entry. Without this the run falls through to the
@@ -1447,17 +1470,19 @@ class Resolver:
             return objections
 
         if want_name and stamped_name != want_name:
-            # A lead may carry a name of its own. When the transcript was reached
-            # because a roster names it as that team's lead, or because its own
-            # payloads do, the roster role and the session's name are two facts
-            # about one session rather than two sessions. Reading that as
-            # "somebody else's conversation" refuses to resume a lead the tool
-            # just finished rebuilding a roster for.
-            lead_rung = (res.via == "roster leadSessionId"
-                         or "payload claimant" in res.via
-                         or res.via.startswith("spawn payloads naming"))
-            if not (want_name == "team-lead" and lead_rung):
-                objections.append(("name_mismatch", stamped_name, want_name, res.via))
+            # Never relaxed. This objection once fired because this tool had
+            # launched a lead under the wrong name and the harness stamped the
+            # transcript with it; teaching the guard to accept that would have
+            # converted corruption detection into permanent silence, and the next
+            # identity-corrupting bug would pass unremarked.
+            #
+            # What the roster and the payloads say is reported alongside, so the
+            # refusal can name the remedy instead of only the contradiction.
+            corroborated = (res.via == "roster leadSessionId"
+                            or "payload claimant" in res.via
+                            or res.via.startswith("spawn payloads naming"))
+            objections.append(("name_mismatch", stamped_name, want_name,
+                               f"{res.via}|corroborated" if corroborated else res.via))
 
         if want_team and stamped_team and stamped_team != want_team:
             # A rebind asks for the change; a unique name and a live process wearing
@@ -2167,11 +2192,19 @@ def enforce_identity(res, objections, allow_team_change, force):
                 die(f"{message} (--force to override)")
             warn(f"--force: {message}")
         elif kind == "name_mismatch":
+            why, _, corroborated = why.partition("|")
             message = (f"{res.path.name} is stamped agentName={stamped!r}, not {wanted!r} "
                        f"(matched by {why})")
+            if corroborated:
+                # The roster and the payloads agree on the identity being asked
+                # for, so the stamp is the odd one out: the signature of a launch
+                # that carried the wrong name. Say what resuming does about it.
+                message += (f"; the roster and the spawn payloads both say {wanted!r}, so the "
+                            f"stamp looks like a mis-flagged launch rather than another agent")
             if not force:
-                die(f"{message}; refusing to resume another agent's conversation (--force to override)")
-            warn(f"--force: {message}; resuming another agent's conversation anyway")
+                die(f"{message}. --force resumes it as {wanted!r}, and the lines it writes "
+                    f"from then on are stamped correctly")
+            warn(f"--force: {message}; resuming as {wanted!r}")
         elif kind == "team_mismatch":
             if allow_team_change or why == "tolerated":
                 warn(f"{res.path.name} is stamped team={stamped}, resuming as {wanted}")
@@ -3099,6 +3132,19 @@ def build_command(ctx, args, passthrough):
                 value = f"{RESOLVER.field(ctx, 'agentName')}@{dest}"
             elif field == "parentSessionId":
                 value = ctx.get("to_lead") or value
+        # The name is the left half of the id, not a second opinion about it.
+        # Derived separately, a lead resolved as team-lead@<team> was launched
+        # with whatever name its transcript last carried, often a session title.
+        # The harness stamps every line with that name, so the tool corrupted the
+        # identity it was asked to restore and then refused the session next time,
+        # its stamps no longer matching the roster. Enforced here rather than in
+        # the merge because a structural fact should not have to win a timestamp
+        # race against a stamp.
+        if flag == "--agent-name":
+            emitted_id = next((cmd[i + 1] for i, token in enumerate(cmd)
+                               if token == "--agent-id"), None)
+            if emitted_id and "@" in emitted_id:
+                value = emitted_id.split("@", 1)[0]
         if not value:
             continue
         # The lead masquerade wears the teammate flags but not these two: there
@@ -4696,39 +4742,86 @@ def run_selftest(live=False):
     else:
         check("an identity can be assembled (no stamped agent here)", True, "skipped")
 
-    # The lead role and a session's own name are two facts about one session. The
-    # guard against resuming a stranger's conversation must tolerate that, and
-    # only that: team-lead asked of a teammate is still somebody else.
-    guarded = None
+    # Supplying an id and a name that contradict describes an agent that cannot
+    # exist, and the name is the routing key, so the wrong one reads a mailbox
+    # nobody writes to.
+    class _Flags:
+        def __init__(self, agent_id):
+            self.agent_id = agent_id
+
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            check_identity_flags(_Flags("auth@session-x"), ["--agent-name", "katalog"])
+            refused_mismatch = False
+        except SystemExit:
+            refused_mismatch = True
+        try:
+            check_identity_flags(_Flags("auth@session-x"), ["--agent-name", "auth"])
+            allowed_match = True
+        except SystemExit:
+            allowed_match = False
+    check("an id and a name that disagree are refused", refused_mismatch and allowed_match,
+          f"mismatch refused: {refused_mismatch}, match allowed: {allowed_match}")
+
+    # A launch must never wear two identities. --agent-id and --agent-name were
+    # derived independently, so a lead resolved as team-lead@<team> went out with
+    # whatever name its transcript last carried; the harness stamped every line
+    # with that name, and the next resume refused the session because its stamps
+    # no longer matched its roster. The tool corrupted what it was restoring.
+    class _Emit:
+        def __init__(self, agent_id):
+            self.resume = self.team = self.to_team = None
+            self.agent_id, self.force, self.dry_run = agent_id, False, True
+            self.claude_bin, self.no_color = None, True
+
+    mismatched = []
+    with contextlib.redirect_stderr(io.StringIO()):
+        for entry in RESOLVER.scan_teams():
+            agent_id = entry["member"].get("agentId")
+            if not agent_id:
+                continue
+            try:
+                command = build_command(RESOLVER.identity(agent_id=agent_id),
+                                        _Emit(agent_id), [])
+            except SystemExit:
+                continue
+            flags = dict(zip(command, command[1:]))
+            wore, called = flags.get("--agent-id"), flags.get("--agent-name")
+            if wore and called and wore.split("@", 1)[0] != called:
+                mismatched.append(f"{wore} as {called}")
+    check("a launch wears one identity", not mismatched, "; ".join(mismatched[:2]))
+
+    # A stamp contradicting the roster is reported, never tolerated: it is how
+    # this tool caught itself launching a lead under the wrong name. The refusal
+    # carries the remedy when the roster and the payloads agree on the identity
+    # being asked for, so a corrupted stamp is recoverable without being ignored.
+    contradicted = None
     for team in RESOLVER.known_teams():
         path, _why = RESOLVER.lead_transcript_for(team)
         if not path:
             continue
-        name, stamped_team = RESOLVER.stamp_index().get(path, (None, None))
-        if name and name != "team-lead" and not stamped_team:
-            # Resolved the way a team run resolves it, through the roster, or the
-            # check exercises a rung the exemption does not cover.
+        name, _stamped_team = RESOLVER.stamp_index().get(path, (None, None))
+        if name and name != "team-lead":
             with contextlib.redirect_stderr(io.StringIO()):
                 found = RESOLVER.resolve_transcript(lead_session=path.stem, team=team, is_lead=True)
                 if found:
-                    guarded = RESOLVER.objections(found, "team-lead", team)
+                    contradicted = RESOLVER.objections(found, "team-lead", team)
             break
-    stamped_any = next((e for e in RESOLVER.scan_teams() if e["member"].get("name")
-                        and e["member"]["name"] != "team-lead"), None)
-    stranger = None
-    if stamped_any:
-        with contextlib.redirect_stderr(io.StringIO()):
-            found = RESOLVER.resolve_transcript(team=stamped_any["team"],
-                                                name=stamped_any["member"]["name"], quick=False)
-            if found:
-                stranger = RESOLVER.objections(found, "team-lead", stamped_any["team"])
-    if guarded is not None and stranger is not None:
-        check("a lead is not a stranger, but a teammate still is",
-              not any(o[0] == "name_mismatch" for o in guarded)
-              and any(o[0] == "name_mismatch" for o in stranger),
-              f"lead objections {[o[0] for o in guarded]}, teammate {[o[0] for o in stranger]}")
+    if contradicted is not None:
+        raised = [o for o in contradicted if o[0] == "name_mismatch"]
+        spoken = ""
+        if raised:
+            with contextlib.redirect_stderr(io.StringIO()) as said:
+                try:
+                    enforce_identity(found, raised, allow_team_change=False, force=False)
+                except SystemExit:
+                    pass
+            spoken = said.getvalue()
+        check("a contradicted stamp is refused, with a way forward",
+              bool(raised) and "--force resumes it" in spoken,
+              f"raised={bool(raised)}, remedy={'--force resumes it' in spoken}")
     else:
-        check("a lead is not a stranger (no such pair here)", True, "skipped")
+        check("a contradicted stamp is refused (none on this machine)", True, "skipped")
 
     # The reaper bets deletions on the soul count, and that count now consults
     # stamps as well as the roster. Too permissive and a dead directory is kept
@@ -5120,6 +5213,7 @@ def main():
     args, passthrough = parser.parse_known_args(argv)
     check_passthrough(passthrough, parser)
     selector, passthrough = classify_passthrough(passthrough)
+    check_identity_flags(args, passthrough)
     if args.team and (args.agent_id or args.resume):
         die(f"--team names every member of {args.team}, and "
             f"{'--agent-id' if args.agent_id else '--resume'} names one agent; pick one")
