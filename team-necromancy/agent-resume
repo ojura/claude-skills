@@ -1212,7 +1212,7 @@ class Resolver:
                 f"{res.reason}; a truly in-process agent leaves only a sidechain under the lead's "
                 "subagents/ dir, which no CLI can resume"
             )
-        objections = identity_objections(res, name, team)
+        objections = self.objections(res, name, team)
         transcript = (res.path, res.fields, res.last_ts)
         others = [(p, f, t) for p, f, t in res.others]
         session_uuid = res.path.stem
@@ -1391,6 +1391,37 @@ class Resolver:
     def provenance(self, ctx, name):
         """(value, timestamp, source) for a field, for --explain."""
         return ctx["merged"].pick(name)
+
+    def objections(self, res, want_name, want_team):
+        """Typed facts about what the chosen transcript contradicts, or an empty list.
+
+        Judgement only. Whether an objection is fatal depends on --force and on
+        whether a team change was asked for, and those are the caller's to weigh:
+        this says what is true, enforce_identity says what to do about it.
+
+        Splitting them is also what stops the check from being optional. It used to
+        run only where a caller remembered to call it, which was one site out of
+        several that resolve identities.
+        """
+        stamped_name, stamped_team = res.stamped("agentName"), res.stamped("teamName")
+        objections = []
+
+        if stamped_name is None:
+            # Unstamped means a lead transcript. Only an exact rung may claim one.
+            if res.strength < EXACT:
+                objections.append(("unstamped_below_exact", None, None, res.via))
+            return objections
+
+        if want_name and stamped_name != want_name:
+            objections.append(("name_mismatch", stamped_name, want_name, res.via))
+
+        if want_team and stamped_team and stamped_team != want_team:
+            # A rebind asks for the change; a unique name and a live process wearing
+            # the identity both make the stamp the stale half rather than the wrong one.
+            tolerated = (res.strength == NAME_ONLY or res.via.startswith("live pid "))
+            objections.append(("team_mismatch", stamped_team, want_team,
+                               "tolerated" if tolerated else res.via))
+        return objections
 
     def classify(self, token):
         """What kind of thing this token names: (kind, value, why).
@@ -2075,36 +2106,6 @@ def build(args):
     return ctx
 
 
-def identity_objections(res, want_name, want_team):
-    """Typed facts about what the chosen transcript contradicts, or an empty list.
-
-    Judgement only. Whether an objection is fatal depends on --force and on
-    whether a team change was asked for, and those are the caller's to weigh:
-    this says what is true, enforce_identity says what to do about it.
-
-    Splitting them is also what stops the check from being optional. It used to
-    run only where a caller remembered to call it, which was one site out of
-    several that resolve identities.
-    """
-    stamped_name, stamped_team = res.stamped("agentName"), res.stamped("teamName")
-    objections = []
-
-    if stamped_name is None:
-        # Unstamped means a lead transcript. Only an exact rung may claim one.
-        if res.strength < EXACT:
-            objections.append(("unstamped_below_exact", None, None, res.via))
-        return objections
-
-    if want_name and stamped_name != want_name:
-        objections.append(("name_mismatch", stamped_name, want_name, res.via))
-
-    if want_team and stamped_team and stamped_team != want_team:
-        # A rebind asks for the change; a unique name and a live process wearing
-        # the identity both make the stamp the stale half rather than the wrong one.
-        tolerated = (res.strength == NAME_ONLY or res.via.startswith("live pid "))
-        objections.append(("team_mismatch", stamped_team, want_team,
-                           "tolerated" if tolerated else res.via))
-    return objections
 
 
 def enforce_identity(res, objections, allow_team_change, force):
@@ -2139,7 +2140,7 @@ def enforce_identity(res, objections, allow_team_change, force):
 
 def verify_identity(res, want_name, want_team, allow_team_change, force):
     """Judge, then act. Kept as one call for the sites that want both."""
-    enforce_identity(res, identity_objections(res, want_name, want_team),
+    enforce_identity(res, RESOLVER.objections(res, want_name, want_team),
                      allow_team_change, force)
 
 
@@ -2574,20 +2575,21 @@ def launch(socket, want_pane, cwd, command, dry, replace_pane=None):
     # A poison left on the server by an interrupted Recipe 1 run must not be
     # inherited by a real resume. Anything else set there is the operator's and
     # is passed through: the swarm's own agents are running with it.
-    # Two routes carry a base url into the pane, so both are asked. A live server
-    # holds one in its global environment; a server this run is about to create
-    # inherits ours instead, which tmux then seeds that same global environment
-    # from. Asking only the server misses the second: the query fails because
-    # there is no server yet, and the poison arrives moments later by descent.
-    server_url = tmux(socket, "show-environment", "-g", "ANTHROPIC_BASE_URL")
-    server_value = ""
-    if server_url.returncode == 0:
-        server_value = server_url.stdout.strip().partition("=")[2]
-    inherited = os.environ.get("ANTHROPIC_BASE_URL", "")
-    carrier = ("this shell" if base_url_is_poison(inherited)
-               else socket if base_url_is_poison(server_value) else None)
-    scrub = "-u ANTHROPIC_BASE_URL " if carrier else ""
-    if carrier:
+    # Two routes carry a base url into the pane, and exactly one of them is live
+    # for any given launch. A server already running hands the pane its own
+    # global environment; a server this run creates inherits ours, which tmux
+    # then seeds that global environment from. Asking the wrong one is a fault in
+    # either direction: ask only the server and a poison arrives by descent
+    # moments later, ask both and a launch from inside a poisoned pane strips the
+    # legitimate url a live server was about to give the agent.
+    if socket_alive(socket):
+        server_url = tmux(socket, "show-environment", "-g", "ANTHROPIC_BASE_URL")
+        value = server_url.stdout.strip().partition("=")[2] if server_url.returncode == 0 else ""
+        carrier = socket
+    else:
+        value, carrier = os.environ.get("ANTHROPIC_BASE_URL", ""), "this shell"
+    scrub = "-u ANTHROPIC_BASE_URL " if base_url_is_poison(value) else ""
+    if scrub:
         warn(f"{carrier} carries the Recipe 1 poison; dropping it for this launch")
     quoted = (
         "exec env " + scrub
@@ -4226,6 +4228,10 @@ def live_checks():
     try:
         tmux(probe_sock, "set-environment", "-g", "ANTHROPIC_BASE_URL", "https://gateway.example")
         keeps_real = not scrubs(probe_sock, None)
+        # Launched from inside a poisoned pane, against a live server holding a
+        # real url: the pane will inherit the server's, so ours is not the
+        # carrier and stripping would take the operator's gateway with it.
+        keeps_real_from_poisoned_shell = not scrubs(probe_sock, POISON_URL)
         tmux(probe_sock, "set-environment", "-g", "ANTHROPIC_BASE_URL", POISON_URL)
         drops_server = scrubs(probe_sock, None)
         drops_inherited = scrubs(f"{TOOL}-selftest-absent", POISON_URL)
@@ -4234,6 +4240,7 @@ def live_checks():
         tmux(probe_sock, "kill-server")
     carriers = {
         "a real url on the server is kept": keeps_real,
+        "a live server's real url survives a poisoned shell": keeps_real_from_poisoned_shell,
         "a poisoned server is scrubbed": drops_server,
         "a poison we would pass down is scrubbed": drops_inherited,
         "a real url we would pass down is kept": keeps_inherited_real,
