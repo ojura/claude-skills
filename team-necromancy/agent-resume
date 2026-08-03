@@ -109,6 +109,23 @@ DEFAULT_AGENT_TYPE = "claude"
 # Window read from each end of a transcript when indexing stamps.
 INDEX_CHUNK = 8 * 1024
 STAMP_RE = re.compile(rb'"(agentName|teamName)":"([^"]*)"')
+LABEL_LINE = b'"type":"agent-name"'
+
+
+def _stamps_in(chunk):
+    """{field: value} from a window, ignoring the harness's display-label lines.
+
+    A `type: "agent-name"` record holds a label, not an identity, and the label is
+    whatever the session was called: a task sentence, "resume agent dev old". Read
+    as a stamp it overrides hundreds of real ones, because the index takes the last
+    match in the window and a label often sits at the end.
+    """
+    stamps = {}
+    for line in chunk.split(b"\n"):
+        if LABEL_LINE in line.replace(b'"type": "agent-name"', LABEL_LINE):
+            continue
+        stamps.update(STAMP_RE.findall(line))
+    return stamps
 
 
 # derived flag -> field name; a user-supplied flag of the same name wins
@@ -1777,6 +1794,14 @@ class Resolver:
         files). Grep is the wrong tool for the index: -m1 exits early on stamped
         files but scans every byte of the unstamped ones, and this tree holds 2GB of
         those, which cost 1.7s per pass.
+
+        `type: "agent-name"` lines are skipped. They carry a display label rather
+        than an identity, and the label is free text: real ones on this machine
+        include "resume agent dev old" and a whole sentence of task description.
+        Matching bytes without regard to the record they sit in read those as the
+        agent's name, so a transcript stamped team-lead on nine hundred lines
+        answered with a title from one line at its tail, and everything downstream
+        inherited it.
         """
         if self.stamps is not None:
             return self.stamps
@@ -1788,10 +1813,10 @@ class Resolver:
                     tail_at = max(0, size - INDEX_CHUNK)
                     if tail_at:
                         handle.seek(tail_at)
-                    stamps = dict(STAMP_RE.findall(handle.read(INDEX_CHUNK)))
+                    stamps = _stamps_in(handle.read(INDEX_CHUNK))
                     if not stamps and tail_at:  # a session stamped only after a resume
                         handle.seek(0)
-                        stamps = dict(STAMP_RE.findall(handle.read(INDEX_CHUNK)))
+                        stamps = _stamps_in(handle.read(INDEX_CHUNK))
             except OSError:
                 continue
             if stamps:
