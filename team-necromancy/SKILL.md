@@ -24,11 +24,27 @@ relaunching into a pane with the identity flags, team env vars, and seeded
 inboxes.
 
 Finding the soul is one engine with a stated evidence ladder, not a pile of
-fallbacks: an exact session uuid (yours, or the roster's `leadSessionId`, the
-only thing that can name an unstamped lead transcript) beats both stamps
-(`agentName` AND `teamName` on the transcript's own lines) beats `agentName`
-alone, refused when the name lives in more than one roster, which on any box
-with several teams is exactly what `team-lead` does. Whatever rung fires, the conclusion is
+fallbacks. Strongest first: a session uuid you typed; a live process wearing
+that agent id, whose `--resume` value is what it is working on right now; the
+roster's `leadSessionId`; both stamps (`agentName` AND `teamName` on the
+transcript's own lines); `agentName` alone, refused when the name lives in more
+than one roster, which on any box with several teams is exactly what
+`team-lead` does; and, for a lead only, the transcript whose spawn payloads name
+this team.
+
+The last rung is there because a lead writes no stamps, and `leadSessionId` is
+the lead's *internal* live session id: it names the implicit team, is not a
+transcript filename, and usually has no file at all, so it cannot equal the uuid
+anyone is able to type. What a lead does leave behind is a spawn payload per
+teammate, each naming the team it was running as. Several transcripts can claim
+one team, so that rung corroborates before it answers, against a live process
+running as the team, a roster naming the transcript, the payload names matching
+the roster's members, or the team-name block; a sole uncorroborated claimant is
+still taken, and says so, because the ordinary dead-team case is exactly that.
+
+A live process outranks the roster and the stamps because argv is frozen at exec
+and a migration is kill-and-restart: a roster entry or a stamp records what was
+true when it was written, while argv records what is true. Whatever rung fires, the conclusion is
 then checked against the identity about to be claimed, and a mismatch stops
 the run: launching `--agent-id X` on Y's conversation is the worst thing this
 tool could do. The chosen rung is printed as `via` on every run. It noops when the same agent already runs in its recorded pane,
@@ -43,7 +59,23 @@ agent-resume <session-uuid>                  # exact transcript
 agent-resume session-xxxx                    # whole team: members into panes, lead last
 agent-resume session-xxxx --no-lead          # members only, lead already alive
 agent-resume NAME --to-team live             # rebind onto the team the lead now runs as
+agent-resume NAME --stop                     # stop it, listing what it is working on first
+agent-resume session-xxxx --stop             # stop the whole team
 ```
+
+The selector may sit anywhere among the flags. The forwarded flags are an
+allowlist that records which of them take a value, so a bare token is either
+that value or the selector and position carries no meaning; `--model x NAME`,
+`NAME --model x` and `--stop NAME` are the same command. Two bare tokens are an
+error naming both, since one would otherwise reach the resumed session as a
+prompt nobody typed. Put anything genuinely meant for claude after `--`.
+
+A team whose directory a graceful lead exit removed is still a team: it is
+recognised from the payloads or the stamps, and rebuilt from its lead's
+transcript with the members, colours and models those payloads recorded. A
+rebuild driven by an uncorroborated claimant leaves `leadSessionId` empty rather
+than recording a guess in a field later read as fact, so the evidence is
+re-derived, and re-warned about, on every resume until it genuinely improves.
 
 A bare name is resolved only when it is unambiguous; if several rosters carry
 it (every team has a `team-lead`) the tool lists the candidates and refuses
@@ -204,7 +236,7 @@ every recipe here), while a truly in-process agent's transcript lives under
 the leader session's `subagents/` dir (`agent-*.jsonl`) and has no
 independent life to resume. Also mind the cwd: an agent whose cwd was the
 leader's scratchpad flattens to a project dir named after that scratchpad
-path, not `/tmp` — search all of `~/.claude/projects/` for the
+path, not `/tmp`. Search all of `~/.claude/projects/` for the
 `"agentName"` stamp before concluding a transcript does not exist
 (verified 2026-07-19: a TaskStop-killed "in_process_teammate" left a normal
 205-line main transcript under
@@ -226,14 +258,22 @@ needs one. Two cases:
 
 ## Forging a team file
 
-`agent-resume` forges automatically when it finds a transcript whose team dir
-is gone: lead entry plus the one member being resumed, leadSessionId recovered
-by expanding the team name's uuid block against the transcript dirs, inboxes
-seeded. Forge by hand when you need more than that: several members up front, or a
-custom team name for a masquerade. Colour and the model's `[1m]` suffix are no
-longer lost: they live only in the roster, but the lead's transcript keeps the
-harness's spawn payload, and the forge recovers them from there. Nothing
-recovers them if the lead's transcript is gone too.
+`agent-resume` forges automatically when it finds a transcript whose team dir is
+gone. Resuming a member forges the lead entry plus that member. Resuming a team
+or its lead rebuilds the whole roster from the lead's transcript, every teammate
+its payloads name, so forging by hand is now only for a custom team name in a
+masquerade. Colour and the model's `[1m]` suffix are not lost: they live only in
+the roster, but the lead's transcript keeps the harness's spawn payload and the
+forge recovers them from there. Nothing recovers them if the lead's transcript
+is gone too.
+
+`leadSessionId` is written only when the lead was identified by evidence the
+engine will later honour at that field's strength. Rung 1 reads it as exact and
+asks nothing further, so a rebuild resting on a sole uncorroborated claimant
+leaves it empty instead: the lead is still reachable, through the corroboration
+ladder, and the run says every time that nothing corroborates it. A roster with
+no `leadSessionId` also cannot corroborate a claim about the lead, or a roster
+derived from a lead's payloads would vouch for those same payloads.
 
 The complete shape, learned by copying real ones. Every field shown is
 consumed somewhere; do not trim:
@@ -423,10 +463,10 @@ ping as always.
 ## Recipe 2: resurrect as a background job (one command)
 
 Substrate choice is not yours to make: check `teammateMode` in
-`~/.claude/settings.json` first — if it says `tmux`, resurrect into a tmux
+`~/.claude/settings.json` first: if it says `tmux`, resurrect into a tmux
 pane (Recipe 1 or 1b), and use this recipe only when the user explicitly
 asks for a background job. Beyond honoring the setting, the bg caveat below
-(no transcript flush) means a bg resurrection is amnesiac — the wrong
+(no transcript flush) means a bg resurrection is amnesiac, and the wrong
 default for an agent whose memory you just went to the trouble of
 recovering. What bg does offer when asked for: no tmux, native truecolor,
 daemon supervision, `claude agents` / `attach` / `logs` / `stop` management,
@@ -498,7 +538,7 @@ right roster, watches the leader's inbox, and can SendMessage every member
 immediately. No spawn ritual, no waiting for an implicit team.
 
 3. Bring the members back with Recipe 1/1b (or Recipe 2 if explicitly
-   requested — honor `teammateMode` as above), pointing their `--team-name`
+   requested, honoring `teammateMode` as above), pointing their `--team-name`
    at this team.
 
 Limits of the masquerade, both verified:

@@ -937,21 +937,31 @@ class Resolver:
                            is_lead=False, quick=False):
         """The only place a transcript is chosen. Evidence, strongest first:
 
-        1. an exact session uuid, given by the user or named by the roster as
-           leadSessionId
-        2. both stamps: agentName AND teamName written on the transcript's lines
-        3. agentName alone, refused when that name is in more than one roster
-        4. for a lead only: the transcript whose spawn payloads name this team
+        1. an exact session uuid, given by the user
+        2. a live process wearing this agent id, whose --resume value says what it
+           is working on now
+        3. the roster's leadSessionId
+        4. both stamps: agentName AND teamName written on the transcript's lines
+        5. agentName alone, refused when that name is in more than one roster
+        6. for a lead only: the transcript whose spawn payloads name this team
 
-        A lead writes no stamps, so rungs 2 and 3 can never reach one. Rung 1
-        reaches it only when leadSessionId happens to be a real transcript, which is
-        true of a masqueraded lead and false of every natively created one, whose
-        leadSessionId is an internal live id with no file. Rung 4 is what covers the
-        rest: see self.led_teams().
+        Rungs are named rather than numbered below, because prose that counts them
+        stops being true the moment one is inserted, which is how this paragraph
+        was last wrong.
 
-        Rung 3 is why "team-lead" can never be resolved by name: it lives in every
-        team, so the name carries no identity and the engine returns nothing rather
-        than adopting a stranger's conversation.
+        A lead writes no stamps, so neither stamp rung can reach one. The
+        leadSessionId rung reaches it only when that id happens to be a real
+        transcript, which is true of a masqueraded lead and false of every natively
+        created one, whose leadSessionId is an internal live id with no file. The
+        spawn-payload rung covers the rest: see self.led_teams().
+
+        The bare-name rung is why "team-lead" can never be resolved by name: it
+        lives in every team, so the name carries no identity and the engine returns
+        nothing rather than adopting a stranger's conversation.
+
+        The live-process rung outranks the roster and the stamps because argv is
+        frozen at exec and a migration is kill-and-restart: those record what was
+        true when written, argv records what is true.
         """
         if session_uuid:
             path = self.transcript_path(session_uuid)
