@@ -3132,7 +3132,8 @@ def build_command(ctx, args, passthrough):
                 value = f"{RESOLVER.field(ctx, 'agentName')}@{dest}"
             elif field == "parentSessionId":
                 value = ctx.get("to_lead") or value
-        # The name is the left half of the id, not a second opinion about it.
+        # The name and the team are the two halves of the id, not second opinions
+        # about it.
         # Derived separately, a lead resolved as team-lead@<team> was launched
         # with whatever name its transcript last carried, often a session title.
         # The harness stamps every line with that name, so the tool corrupted the
@@ -3140,11 +3141,12 @@ def build_command(ctx, args, passthrough):
         # its stamps no longer matching the roster. Enforced here rather than in
         # the merge because a structural fact should not have to win a timestamp
         # race against a stamp.
-        if flag == "--agent-name":
+        if flag in ("--agent-name", "--team-name"):
             emitted_id = next((cmd[i + 1] for i, token in enumerate(cmd)
                                if token == "--agent-id"), None)
             if emitted_id and "@" in emitted_id:
-                value = emitted_id.split("@", 1)[0]
+                name_half, _, team_half = emitted_id.partition("@")
+                value = name_half if flag == "--agent-name" else team_half
         if not value:
             continue
         # The lead masquerade wears the teammate flags but not these two: there
@@ -4786,9 +4788,13 @@ def run_selftest(live=False):
             except SystemExit:
                 continue
             flags = dict(zip(command, command[1:]))
-            wore, called = flags.get("--agent-id"), flags.get("--agent-name")
-            if wore and called and wore.split("@", 1)[0] != called:
+            wore = flags.get("--agent-id") or ""
+            name_half, _, team_half = wore.partition("@")
+            called, on_team = flags.get("--agent-name"), flags.get("--team-name")
+            if wore and called and called != name_half:
                 mismatched.append(f"{wore} as {called}")
+            if wore and on_team and on_team != team_half:
+                mismatched.append(f"{wore} on team {on_team}")
     check("a launch wears one identity", not mismatched, "; ".join(mismatched[:2]))
 
     # A stamp contradicting the roster is reported, never tolerated: it is how
