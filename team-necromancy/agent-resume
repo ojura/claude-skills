@@ -759,7 +759,7 @@ class Resolver:
         self._ingest_spawn_lines(leads)
         for path in leads:
             newest = {}
-            for stamp, payload in self._spawn_log.get(path.stem, []):
+            for stamp, payload in self._log(path.stem):
                 team = payload.get("team_name")
                 if team:
                     newest[team] = max(newest.get(team, 0), stamp or 0)
@@ -854,11 +854,24 @@ class Resolver:
                 entry["team"] = agent.split("@", 1)[1] if "@" in agent else None
         return list(found.values())
 
+    def _log(self, stem):
+        """This transcript's spawn entries, filled on demand.
+
+        Reading the log unfilled returns an empty list, which is what a transcript
+        that spawned nobody also returns, so a missed fill is a false negative
+        shaped like an answer. Filling happens here, where the read happens.
+        """
+        self._spawn_records(stem)
+        return self._spawn_log.get(stem) or []
+
+    def _every_log(self):
+        """{transcript stem: entries} for the whole tree, filled on demand."""
+        self.led_teams()
+        return dict(self._spawn_log)
+
     def spawn_payloads(self):
-        """Every spawn payload on this machine. Self-populating, like every reader
-        here, so a caller never has to know what fills the log or in what order."""
-        self.led_teams()  # the one scan that fills the log
-        return [payload for entries in self._spawn_log.values() for _stamp, payload in entries]
+        """Every spawn payload on this machine."""
+        return [payload for entries in self._every_log().values() for _stamp, payload in entries]
 
     def members_spawned_into(self, lead_session, team):
         """The payloads for every teammate this lead spawned into this team.
@@ -869,9 +882,8 @@ class Resolver:
         fresh implicit team each life while appending to one transcript, so payloads
         naming another team are skipped rather than adopted.
         """
-        self._spawn_records(lead_session)  # fills the ordered log for this transcript
         latest = {}
-        for _stamp, payload in self._spawn_log.get(lead_session) or []:
+        for _stamp, payload in self._log(lead_session):
             if payload.get("name") and payload.get("team_name") == team:
                 latest[payload["name"]] = payload  # last spawn of that name into this team
         return list(latest.values())
@@ -894,9 +906,8 @@ class Resolver:
         for entry in self.live_sessions():
             if not (entry["alive"] and entry["session"]):
                 continue
-            self._spawn_records(entry["session"])
             # Any life's payload will do here: it is the same process either way.
-            if any(item.get("team_name") == team for _, item in self._spawn_log.get(entry["session"], [])):
+            if any(item.get("team_name") == team for _, item in self._log(entry["session"])):
                 matches.append((entry["updated"], entry["pid"]))
         return max(matches)[1] if matches else None
 
@@ -1758,7 +1769,7 @@ class Resolver:
         leads = self._grep_files(SPAWN_MARKER, [PROJECTS_DIR], True) or []
         self._ingest_spawn_lines(leads)
         for path in leads:
-            for _, payload in self._spawn_log.get(path.stem, []):
+            for _, payload in self._log(path.stem):
                 name, team = payload.get("name"), payload.get("team_name")
                 if name and team:
                     self._by_agent[f"{name}@{team}"] = payload
@@ -1872,9 +1883,8 @@ class Resolver:
             # keeps appending to the same transcript, so an older life's payload
             # names a team this process no longer runs as, and rebinding onto it
             # would cause exactly the orphaning --to-team exists to prevent.
-            self._spawn_records(entry["session"])
             started = entry.get("started")
-            for stamp, payload in reversed(self._spawn_log.get(entry["session"]) or []):
+            for stamp, payload in reversed(self._log(entry["session"])):
                 # Without a start time there is no way to tell this life's payloads
                 # from an earlier one's, so the rung declines rather than guessing.
                 if payload.get("team_name") and started and stamp >= started:
@@ -4655,6 +4665,17 @@ def run_selftest(live=False):
         and node.name not in {"_complete", "run_selftest"})
     check("one policy decides which roster claims an agent", not ts_sorters, ", ".join(ts_sorters))
 
+    # Reading the spawn log unfilled returns an empty list, which is also what a
+    # transcript that spawned nobody returns, so a missed fill is a false negative
+    # shaped like an answer. Only the ingester and the accessors may touch it.
+    log_touchers = sorted(
+        node.name for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and "_spawn_log" in (ast.get_source_segment(source, node) or "")
+        and node.name not in {"__init__", "_ingest_spawn_lines", "_log", "_every_log",
+                              "run_selftest"})
+    check("the spawn log is filled where it is read", not log_touchers, ", ".join(log_touchers))
+
     # Attributes as well as calls: a cache read is a reach inside, same as a call.
     private_reach = sorted({
         f"{node.name} -> {m.group(1)}"
@@ -4683,7 +4704,7 @@ def run_selftest(live=False):
     # a different question; this guards the per-agent lookup only.
     payload_readers = (callers_of("_spawn_by_agent") | callers_of("_spawn_records")) - {
         "spawn_payload", "_spawn_by_agent", "team_minted_by", "_pid_running_team",
-        "members_spawned_into", "run_selftest"}
+        "members_spawned_into", "_log", "run_selftest"}
     check("one lookup for an agent's spawn payload", not payload_readers, ", ".join(sorted(payload_readers)))
 
     # A preview must be printed through step(), which carries both tenses, or
