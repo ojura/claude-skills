@@ -2574,13 +2574,21 @@ def launch(socket, want_pane, cwd, command, dry, replace_pane=None):
     # A poison left on the server by an interrupted Recipe 1 run must not be
     # inherited by a real resume. Anything else set there is the operator's and
     # is passed through: the swarm's own agents are running with it.
+    # Two routes carry a base url into the pane, so both are asked. A live server
+    # holds one in its global environment; a server this run is about to create
+    # inherits ours instead, which tmux then seeds that same global environment
+    # from. Asking only the server misses the second: the query fails because
+    # there is no server yet, and the poison arrives moments later by descent.
     server_url = tmux(socket, "show-environment", "-g", "ANTHROPIC_BASE_URL")
     server_value = ""
     if server_url.returncode == 0:
         server_value = server_url.stdout.strip().partition("=")[2]
-    scrub = "-u ANTHROPIC_BASE_URL " if base_url_is_poison(server_value) else ""
-    if scrub:
-        warn(f"{socket} still carries the Recipe 1 poison; dropping it for this launch")
+    inherited = os.environ.get("ANTHROPIC_BASE_URL", "")
+    carrier = ("this shell" if base_url_is_poison(inherited)
+               else socket if base_url_is_poison(server_value) else None)
+    scrub = "-u ANTHROPIC_BASE_URL " if carrier else ""
+    if carrier:
+        warn(f"{carrier} carries the Recipe 1 poison; dropping it for this launch")
     quoted = (
         "exec env " + scrub
         + " ".join(TEAM_ENV) + " "
