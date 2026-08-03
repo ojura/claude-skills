@@ -495,16 +495,16 @@ class Resolver:
     """
 
     def __init__(self):
-        self.procs = None       # pid -> row, from ps
-        self.stamps = None      # transcript stem -> (agentName, teamName)
-        self.spawns = {}        # transcript stem -> {name: last payload of that name}
-        self.spawn_log = {}     # transcript stem -> [(stamp, payload)] in file order
-        self.by_agent = None    # "name@team" -> payload, across every transcript
-        self.by_team = None     # team -> [(stamp, path)] of transcripts that led it
+        self._procs = None       # pid -> row, from ps
+        self._stamps = None      # transcript stem -> (agentName, teamName)
+        self._spawns = {}        # transcript stem -> {name: last payload of that name}
+        self._spawn_log = {}     # transcript stem -> [(stamp, payload)] in file order
+        self._by_agent = None    # "name@team" -> payload, across every transcript
+        self._by_team = None     # team -> [(stamp, path)] of transcripts that led it
         self.teams_dir = TEAMS_DIR   # overridable so a test engine can read a synthetic tree
 
     def refresh_procs(self):
-        self.procs = None
+        self._procs = None
     def _grep_files(self, needle, scope, recursive):
         """Files containing this literal."""
         result = subprocess.run(self._searcher("files", needle, scope, recursive), capture_output=True, text=True)
@@ -592,9 +592,9 @@ class Resolver:
         transcript that merely discusses spawning cannot contribute a quoted
         example as if it were real.
         """
-        paths = [p for p in paths if p and p.stem not in self.spawns]
+        paths = [p for p in paths if p and p.stem not in self._spawns]
         for path in paths:
-            self.spawns[path.stem], self.spawn_log[path.stem] = {}, []
+            self._spawns[path.stem], self._spawn_log[path.stem] = {}, []
         if not paths:
             return
         result = subprocess.run(self._searcher("lines", SPAWN_MARKER, paths, False), capture_output=True, text=True)
@@ -604,7 +604,7 @@ class Resolver:
         for line in result.stdout.splitlines():
             where, _, text = line.partition(":")
             stem = Path(where).stem
-            if stem not in self.spawns:
+            if stem not in self._spawns:
                 continue
             try:
                 record = json.loads(text)
@@ -612,8 +612,8 @@ class Resolver:
                 continue
             stamp = iso_ms(record.get("timestamp"))
             for payload in self._walk_spawn_payloads(record):
-                self.spawns[stem][payload["name"]] = payload  # last spawn of a name wins
-                self.spawn_log[stem].append((stamp, payload))
+                self._spawns[stem][payload["name"]] = payload  # last spawn of a name wins
+                self._spawn_log[stem].append((stamp, payload))
 
     def lead_pid(self, parent_session=None, team=None):
         """(pid, alive, how, exact) for the live process this agent's lead runs as.
@@ -752,22 +752,22 @@ class Resolver:
         Built from the scan self._spawn_by_agent() already performs: containing a spawn
         payload is what makes a transcript a lead's, so the same files answer both.
         """
-        if self.by_team is not None:
-            return self.by_team
-        self.by_team = {}
+        if self._by_team is not None:
+            return self._by_team
+        self._by_team = {}
         leads = self._grep_files(SPAWN_MARKER, [PROJECTS_DIR], True) or []
         self._ingest_spawn_lines(leads)
         for path in leads:
             newest = {}
-            for stamp, payload in self.spawn_log.get(path.stem, []):
+            for stamp, payload in self._spawn_log.get(path.stem, []):
                 team = payload.get("team_name")
                 if team:
                     newest[team] = max(newest.get(team, 0), stamp or 0)
             for team, stamp in newest.items():
-                self.by_team.setdefault(team, []).append((stamp, path))
-        for team in self.by_team:
-            self.by_team[team].sort(reverse=True)
-        return self.by_team
+                self._by_team.setdefault(team, []).append((stamp, path))
+        for team in self._by_team:
+            self._by_team[team].sort(reverse=True)
+        return self._by_team
 
     def live_agent_procs(self, agent_id, table):
         return self._claude_procs(f"--agent-id {agent_id}", table)
@@ -854,6 +854,12 @@ class Resolver:
                 entry["team"] = agent.split("@", 1)[1] if "@" in agent else None
         return list(found.values())
 
+    def spawn_payloads(self):
+        """Every spawn payload on this machine. Self-populating, like every reader
+        here, so a caller never has to know what fills the log or in what order."""
+        self.led_teams()  # the one scan that fills the log
+        return [payload for entries in self._spawn_log.values() for _stamp, payload in entries]
+
     def members_spawned_into(self, lead_session, team):
         """The payloads for every teammate this lead spawned into this team.
 
@@ -865,7 +871,7 @@ class Resolver:
         """
         self._spawn_records(lead_session)  # fills the ordered log for this transcript
         latest = {}
-        for _stamp, payload in self.spawn_log.get(lead_session) or []:
+        for _stamp, payload in self._spawn_log.get(lead_session) or []:
             if payload.get("name") and payload.get("team_name") == team:
                 latest[payload["name"]] = payload  # last spawn of that name into this team
         return list(latest.values())
@@ -890,7 +896,7 @@ class Resolver:
                 continue
             self._spawn_records(entry["session"])
             # Any life's payload will do here: it is the same process either way.
-            if any(item.get("team_name") == team for _, item in self.spawn_log.get(entry["session"], [])):
+            if any(item.get("team_name") == team for _, item in self._spawn_log.get(entry["session"], [])):
                 matches.append((entry["updated"], entry["pid"]))
         return max(matches)[1] if matches else None
 
@@ -915,8 +921,8 @@ class Resolver:
         One run judges liveness against one consistent picture, and a single
         resolve was spawning ps three times.
         """
-        if self.procs is not None and not refresh:
-            return self.procs
+        if self._procs is not None and not refresh:
+            return self._procs
         out = subprocess.run(
             ["ps", "-eo", "pid=,ppid=,args="], capture_output=True, text=True
         ).stdout
@@ -925,7 +931,7 @@ class Resolver:
             parts = line.strip().split(None, 2)
             if len(parts) == 3 and parts[0].isdigit():
                 rows.append((int(parts[0]), int(parts[1]), parts[2]))
-        self.procs = rows
+        self._procs = rows
         return rows
 
     def known_teams(self):
@@ -1747,17 +1753,17 @@ class Resolver:
         this is where they survive. Only the transcripts that mention a spawn are
         read, which is a fraction of the tree.
         """
-        if self.by_agent is not None:
-            return self.by_agent
-        self.by_agent = {}
+        if self._by_agent is not None:
+            return self._by_agent
+        self._by_agent = {}
         leads = self._grep_files(SPAWN_MARKER, [PROJECTS_DIR], True) or []
         self._ingest_spawn_lines(leads)
         for path in leads:
-            for _, payload in self.spawn_log.get(path.stem, []):
+            for _, payload in self._spawn_log.get(path.stem, []):
                 name, team = payload.get("name"), payload.get("team_name")
                 if name and team:
-                    self.by_agent[f"{name}@{team}"] = payload
-        return self.by_agent
+                    self._by_agent[f"{name}@{team}"] = payload
+        return self._by_agent
 
     def spawn_payload(self, agent_id, lead_session=None):
         """The harness's spawn record for an agent, wherever it survives.
@@ -1792,11 +1798,11 @@ class Resolver:
         """
         if not lead_session:
             return {}
-        if lead_session in self.spawns:
-            return self.spawns[lead_session]
+        if lead_session in self._spawns:
+            return self._spawns[lead_session]
         path = self.transcript_path(lead_session)
         self._ingest_spawn_lines([path] if path else [])
-        return self.spawns.setdefault(lead_session, {})
+        return self._spawns.setdefault(lead_session, {})
 
     def stamp_index(self):
         """{path: (agentName, teamName)} for every stamped transcript, built once.
@@ -1817,8 +1823,8 @@ class Resolver:
         answered with a title from one line at its tail, and everything downstream
         inherited it.
         """
-        if self.stamps is not None:
-            return self.stamps
+        if self._stamps is not None:
+            return self._stamps
         index = {}
         for path in PROJECTS_DIR.glob("*/*.jsonl"):
             try:
@@ -1838,8 +1844,8 @@ class Resolver:
                     (stamps.get(b"agentName") or b"").decode("utf-8", "replace") or None,
                     (stamps.get(b"teamName") or b"").decode("utf-8", "replace") or None,
                 )
-        self.stamps = index
-        return self.stamps
+        self._stamps = index
+        return self._stamps
 
     def team_lead_session(self, team):
         """The session id a team names as its lead's, via the roster reader."""
@@ -1869,7 +1875,7 @@ class Resolver:
             # would cause exactly the orphaning --to-team exists to prevent.
             self._spawn_records(entry["session"])
             started = entry.get("started")
-            for stamp, payload in reversed(self.spawn_log.get(entry["session"]) or []):
+            for stamp, payload in reversed(self._spawn_log.get(entry["session"]) or []):
                 # Without a start time there is no way to tell this life's payloads
                 # from an earlier one's, so the rung declines rather than guessing.
                 if payload.get("team_name") and started and stamp >= started:
@@ -3977,9 +3983,8 @@ def run_census():
     print(f"  roster members whose id is name@team   {id_agrees}/{id_total}")
     print(f"  rosters whose lead is team-lead@team   {lead_agrees}/{len(rosters)}")
 
-    RESOLVER.led_teams()  # the spawn log is filled lazily; ask for it before counting it
     payload_pairs = [(p.get("agent_id"), p.get("name"), p.get("team_name"))
-                     for entries in RESOLVER.spawn_log.values() for _stamp, p in entries]
+                     for p in RESOLVER.spawn_payloads()]
     payload_ok = sum(1 for aid, name, team in payload_pairs
                      if aid and name and team and aid == f"{name}@{team}")
     payload_total = sum(1 for aid, name, team in payload_pairs if aid and name and team)
@@ -4651,11 +4656,15 @@ def run_selftest(live=False):
         and node.name not in {"_complete", "run_selftest"})
     check("one policy decides which roster claims an agent", not ts_sorters, ", ".join(ts_sorters))
 
+    # Attributes as well as calls. Matching only calls left evidence state
+    # reachable: a public cache is a global with a prefix, and reading one from
+    # module code is the thing the caches were made instance state to stop.
     private_reach = sorted({
         f"{node.name} -> {m.group(1)}"
         for node in tree.body if isinstance(node, ast.FunctionDef)
-        for m in re.finditer(r"RESOLVER\.(_\w+)\(", ast.get_source_segment(source, node) or "")})
-    check("no module code reaches a private engine method", not private_reach,
+        and node.name != "run_selftest"
+        for m in re.finditer(r"RESOLVER\.(_\w+)", ast.get_source_segment(source, node) or "")})
+    check("no module code reaches inside the engine", not private_reach,
           "; ".join(private_reach))
 
     trespass = sorted({
@@ -5105,17 +5114,17 @@ def run_selftest(live=False):
 
     # A team outlives its directory: a graceful lead exit removes the roster, so
     # existence alone reports a cleaned-up team as one that never existed.
-    real_by_team = RESOLVER.by_team
+    real_by_team = RESOLVER._by_team
     try:
-        RESOLVER.by_team = dict(real_by_team or {})
-        RESOLVER.by_team["session-ghostteam"] = [(1, Path("/nowhere/x.jsonl"))]
+        RESOLVER._by_team = dict(real_by_team or {})
+        RESOLVER._by_team["session-ghostteam"] = [(1, Path("/nowhere/x.jsonl"))]
         evidence = {
             "known only by payloads": RESOLVER.team_evidence("session-ghostteam")
                 == "spawn payloads naming it",
             "unknown is not a team": RESOLVER.team_evidence("session-deadbeef") is None,
         }
     finally:
-        RESOLVER.by_team = real_by_team
+        RESOLVER._by_team = real_by_team
     wrong = sorted(k for k, good in evidence.items() if not good)
     check("a team is recognised without its directory", not wrong, ", ".join(wrong))
 
