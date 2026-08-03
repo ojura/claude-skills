@@ -601,9 +601,12 @@ class Resolver:
     def lead_pid(self, parent_session=None, team=None):
         """(pid, alive, how, exact) for the live process this agent's lead runs as.
 
-        The roster names that lead one of two ways, and only one of them is in the
-        session registry: a forged or explicit team carries a transcript id, an
-        implicit team's leadSessionId is a boot uuid that no registry entry records.
+        The roster names that lead in one of two shapes, and they answer differently.
+        A team minted on a fresh boot carries that boot's id, which is also the
+        lead's transcript and is in the session registry, so the exact join below
+        answers it. A team minted by a lead that had already been resumed carries an
+        internal id from that later life, which has no transcript and no registry
+        entry, and only the payload evidence reaches it. Do not assume either shape.
         Socket resolution and credential inheritance both need this exact answer, so
         they ask here rather than each handling half the cases.
         """
@@ -1000,10 +1003,12 @@ class Resolver:
         was last wrong.
 
         A lead writes no stamps, so neither stamp rung can reach one. The
-        leadSessionId rung reaches it only when that id happens to be a real
-        transcript, which is true of a masqueraded lead and false of every natively
-        created one, whose leadSessionId is an internal live id with no file. The
-        spawn-payload rung covers the rest: see self.led_teams().
+        leadSessionId rung reaches it whenever that id is a real transcript, which
+        is the case for a masqueraded lead and for a team minted on a fresh boot,
+        since a first life's internal id is its transcript id. A lead that had
+        already been resumed when it minted the team is the shape that rung cannot
+        reach: the id belongs to that later life and has no file. The spawn-payload
+        rung covers those: see self.led_teams(). Do not assume either shape.
 
         The bare-name rung is why "team-lead" can never be resolved by name: it
         lives in every team, so the name carries no identity and the engine returns
