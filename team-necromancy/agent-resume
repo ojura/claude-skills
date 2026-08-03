@@ -82,6 +82,18 @@ TEAM_ENV = ("CLAUDECODE=1", "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1", "CLAUDE_CO
 # 5-hour window anchored. Server-level env reaches every new pane on the socket.
 POISON_URL = "http://127.0.0.1:9"
 
+
+def base_url_is_poison(value):
+    """Whether this ANTHROPIC_BASE_URL is Recipe 1's dead port rather than a real one.
+
+    Only the poison is stripped from a revived agent's environment. Stripping any
+    base url would silently send an agent somewhere other than where its lead
+    talks, which is a worse failure than the one being prevented: a poisoned
+    child dies loudly at connect, a redirected one runs and answers from the
+    wrong endpoint.
+    """
+    return bool(value) and value.strip().rstrip("/") == POISON_URL
+
 # Title lookup reads the tail first (titles are rewritten every few turns, so the
 # current one is almost always there) and only falls back to the head.
 TITLE_TAIL_BYTES = 64 * 1024
@@ -2559,10 +2571,18 @@ def launch(socket, want_pane, cwd, command, dry, replace_pane=None):
     lives in the recorded pane is not this agent, so we always get our own pane.
     """
     session_live = swarm_session_live(socket)
-    # -u ANTHROPIC_BASE_URL: a real resume must never inherit a poison left on
-    # the server by an interrupted Recipe 1 run.
+    # A poison left on the server by an interrupted Recipe 1 run must not be
+    # inherited by a real resume. Anything else set there is the operator's and
+    # is passed through: the swarm's own agents are running with it.
+    server_url = tmux(socket, "show-environment", "-g", "ANTHROPIC_BASE_URL")
+    server_value = ""
+    if server_url.returncode == 0:
+        server_value = server_url.stdout.strip().partition("=")[2]
+    scrub = "-u ANTHROPIC_BASE_URL " if base_url_is_poison(server_value) else ""
+    if scrub:
+        warn(f"{socket} still carries the Recipe 1 poison; dropping it for this launch")
     quoted = (
-        "exec env -u ANTHROPIC_BASE_URL "
+        "exec env " + scrub
         + " ".join(TEAM_ENV) + " "
         + " ".join(shlex.quote(c) for c in command)
     )
@@ -3320,10 +3340,12 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             if args.dry_run:
                 return Outcome("launched", socket, False, None)
             # The same environment and cwd launch() would have given it: the
-            # team vars a flag-bound boot needs, no inherited API poison, and
+            # team vars a flag-bound boot needs, the poison dropped if present, and
             # the project dir --resume looks the transcript up under.
             environ = dict(os.environ)
-            environ.pop("ANTHROPIC_BASE_URL", None)
+            if base_url_is_poison(environ.get("ANTHROPIC_BASE_URL")):
+                warn("this shell carries the Recipe 1 poison; dropping it for the exec")
+                environ.pop("ANTHROPIC_BASE_URL", None)
             environ.update(dict(pair.split("=", 1) for pair in TEAM_ENV))
             if not args.no_color:
                 tint_pane(socket, in_pane, RESOLVER.field(ctx, "color"), RESOLVER.field(ctx, "agentName"), False)
@@ -4502,6 +4524,21 @@ def run_selftest(live=False):
         globals()["run_one"], globals()["report_transcript_writes"] = real_one, real_report
     check("a lead is told what is still loading before it takes over",
           handed == [[], ["member1"], ["member1", "member2"]], str(handed))
+
+    # Only Recipe 1's dead port is stripped from a revived agent's environment.
+    # Stripping every base url would silently send an agent to a different
+    # endpoint than its lead talks to, which fails quietly where a poisoned
+    # child fails loudly at connect.
+    poison_calls = {
+        "the dead port": base_url_is_poison(POISON_URL),
+        "with a trailing slash": base_url_is_poison(POISON_URL + "/"),
+        "a real endpoint": not base_url_is_poison("https://api.anthropic.com"),
+        "a proxy": not base_url_is_poison("http://proxy.internal:8080"),
+        "another local port": not base_url_is_poison("http://127.0.0.1:8080"),
+        "unset": not base_url_is_poison(None),
+    }
+    wrong = sorted(k for k, good in poison_calls.items() if not good)
+    check("only the poison is stripped from a launch", not wrong, ", ".join(wrong))
 
     # The merge is an engine internal. A caller reaching into it directly is a
     # caller that can assemble a different answer than the engine did, which is
