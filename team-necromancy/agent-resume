@@ -864,6 +864,22 @@ class Resolver:
         self.procs = rows
         return rows
 
+    def team_evidence(self, token):
+        """Why this token is a team, or None. A roster dir is only one answer.
+
+        A graceful lead exit removes the dir, which forge_team's own docstring
+        calls the ordinary case, so existence alone reports a team that has been
+        cleaned up as something that was never a team. The payloads and the stamps
+        outlive the directory and say so.
+        """
+        if self.roster_path(token).exists():
+            return "a roster on disk"
+        if token in self.led_teams():
+            return "spawn payloads naming it"
+        if any(stamped == token for _name, stamped in self.stamp_index().values()):
+            return "a transcript stamped with it"
+        return None
+
     def lead_session_for(self, team):
         """The session id of this team's lead, or None.
 
@@ -1698,9 +1714,18 @@ def apply_selector(token, args, table):
             die(f"conflicting agents: {token} and --agent-id {args.agent_id}")
         args.agent_id = token
         return
-    if RESOLVER.roster_path(token).exists():
+    why = RESOLVER.team_evidence(token)
+    if why:
+        if not RESOLVER.roster_path(token).exists():
+            print(f"team     {token} has no roster on disk; rebuilding it from {why}")
         args.team = token
         return
+
+    if re.fullmatch(r"session-[0-9a-f]{8}", token):
+        # Shaped like a team, known as nothing. Reporting it as a missing agent
+        # sends the reader hunting in the wrong ontology.
+        die(f"{token} looks like a team but is not one: no roster on disk, no spawn "
+            f"payloads name it, and no transcript is stamped with it")
 
     matches = [e for e in RESOLVER.scan_teams() if e["member"].get("name") == token]
     matches.sort(key=lambda e: e["ts"], reverse=True)
@@ -2020,10 +2045,15 @@ def build(args):
         name, team = args.agent_id.split("@", 1)
 
     worn_id = f"{name}@{team}" if name and team else None
-    is_lead_member = bool(team_entry) and team_entry["member"].get("agentId") == team_entry.get("leadAgentId")
+    # The harness reserves the name, so a lead is a lead whether or not a roster
+    # survives to say so; without this a reaped team's lead is refused as a name
+    # that lives in several rosters.
+    is_lead_member = ((bool(team_entry) and team_entry["member"].get("agentId") == team_entry.get("leadAgentId"))
+                      or name == "team-lead")
     res = RESOLVER.resolve_transcript(
         session_uuid=session_uuid,
-        lead_session=team_entry.get("leadSessionId") if is_lead_member else None,
+        lead_session=(team_entry.get("leadSessionId")
+                      if is_lead_member and team_entry else None),
         team=team,
         name=name,
         is_lead=is_lead_member,
@@ -2053,7 +2083,14 @@ def build(args):
             # it was running as, and adopt that team's lead entry. Without this
             # the run falls through to the member path and dies asking for a
             # tmux socket, which is several steps downstream of the real answer.
-            for led in RESOLVER.teams_led_by(session_uuid):
+            # A lead that ran several teams across its lives adopts the one the
+            # caller asked to rebuild, not whichever it ran as last.
+            led_teams_here = RESOLVER.teams_led_by(session_uuid)
+            # Whichever way the caller named a team - as --team, or as the right
+            # half of an agent id - that is the team being rebuilt, not whichever
+            # this lead happened to run as last.
+            wanted = getattr(args, "for_team", None) or team
+            for led in ([wanted] if wanted in led_teams_here else led_teams_here):
                 matches = [
                     e for e in RESOLVER.scan_teams()
                     if e["team"] == led and e["member"].get("agentId") == e.get("leadAgentId")
@@ -3841,10 +3878,38 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
     return 1 if any(s == "failed" for _, s in results) else 0
 
 
+def rebuild_roster(team, args, passthrough, table):
+    """Forge a reaped team's roster from its lead's transcript, or die saying why.
+
+    The error this replaces told the reader to forge it first and gave them no
+    way to do so. Everything needed is already here: the lead is found through
+    the corroboration ladder, build adopts its identity from the payloads, and
+    forge_team's lead branch rebuilds the members with the colours and models
+    those payloads recorded.
+    """
+    path, why = RESOLVER._lead_transcript_for(team)
+    if not path:
+        die(f"no roster for {team} and none can be rebuilt: {why}")
+    print(f"team     {team} has no roster; rebuilding from {path.stem[:8]} ({why})")
+    lead = copy.copy(args)
+    lead.team, lead.agent_id, lead.resume = None, None, path.stem
+    lead.for_team = team
+    ctx = build(lead)
+    forge_team(ctx, args.dry_run)
+    cfg = RESOLVER.roster_path(team)
+    if not cfg.exists() and not args.dry_run:
+        die(f"could not rebuild a roster for {team}")
+    return cfg
+
+
 def run_team(args, passthrough, table):
     cfg = RESOLVER.roster_path(args.team)
     if not cfg.exists():
-        die(f"no team config at {cfg}; a graceful lead exit rm -rf's the team dir, so forge it first")
+        cfg = rebuild_roster(args.team, args, passthrough, table)
+        if args.dry_run and not cfg.exists():
+            print(f"team     {args.team}: preview stops here, since the roster it "
+                  f"lists does not exist yet")
+            return 0
     try:
         data = json.loads(cfg.read_text())
     except ValueError as exc:
@@ -4251,6 +4316,31 @@ def run_selftest(live=False):
         globals()["run_one"], globals()["report_transcript_writes"] = real_one, real_report
     check("a lead is told what is still loading before it takes over",
           handed == [[], ["member1"], ["member1", "member2"]], str(handed))
+
+    # A team outlives its directory: a graceful lead exit removes the roster, so
+    # existence alone reports a cleaned-up team as one that never existed.
+    real_by_team = RESOLVER.by_team
+    try:
+        RESOLVER.by_team = dict(real_by_team or {})
+        RESOLVER.by_team["session-ghostteam"] = [(1, Path("/nowhere/x.jsonl"))]
+        evidence = {
+            "known only by payloads": RESOLVER.team_evidence("session-ghostteam")
+                == "spawn payloads naming it",
+            "unknown is not a team": RESOLVER.team_evidence("session-deadbeef") is None,
+        }
+    finally:
+        RESOLVER.by_team = real_by_team
+    wrong = sorted(k for k, good in evidence.items() if not good)
+    check("a team is recognised without its directory", not wrong, ", ".join(wrong))
+
+    with contextlib.redirect_stderr(io.StringIO()) as diag:
+        try:
+            apply_selector("session-deadbeef", _Args(resume=None, agent_id=None, team=None), {})
+        except SystemExit:
+            pass
+    said = diag.getvalue()
+    named = all(kind in said for kind in ("roster on disk", "spawn payloads", "stamped"))
+    check("an unknown team-shaped token names every evidence it lacks", named, said.strip()[:70])
 
     # --- the attach prompt: which key does what, and when it is offered at all
     real_key, real_abort, real_stdin = read_one_key, abort_agents, sys.stdin
