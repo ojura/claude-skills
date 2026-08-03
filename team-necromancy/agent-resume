@@ -881,21 +881,36 @@ class Resolver:
         self.procs = rows
         return rows
 
-    def team_evidence(self, token):
-        """Why this token is a team, or None. A roster dir is only one answer.
+    def known_teams(self):
+        """{team: what proves it exists}, over every source that can prove one.
 
-        A graceful lead exit removes the dir, which forge_team's own docstring
-        calls the ordinary case, so existence alone reports a team that has been
-        cleaned up as something that was never a team. The payloads and the stamps
-        outlive the directory and say so.
+        A graceful lead exit removes the roster directory, which forge_team's own
+        docstring calls the ordinary case, so a directory listing describes the
+        teams that happen to be tidy rather than the teams that exist. The
+        payloads and the stamps outlive the directory.
+
+        Enumeration and the single-token question are the same answer, so one is
+        implemented on the other: a team the selector will accept and rebuild
+        cannot then be missing from the list of teams.
         """
-        if self.roster_path(token).exists():
-            return "a roster on disk"
-        if token in self.led_teams():
-            return "spawn payloads naming it"
-        if any(stamped == token for _name, stamped in self.stamp_index().values()):
-            return "a transcript stamped with it"
-        return None
+        found = {}
+        for _name, stamped in self.stamp_index().values():
+            if stamped:
+                found[stamped] = "a transcript stamped with it"
+        for team in self.led_teams():
+            found[team] = "spawn payloads naming it"
+        for directory in self.team_dirs():
+            # Only a directory holding a roster counts. One holding just inboxes
+            # is scaffolding: it proves nothing about a team ever having existed,
+            # and offering it as rebuildable said "rebuildable from an empty team
+            # directory", which promises something nothing can deliver.
+            if self.roster_path(directory.name).exists():
+                found[directory.name] = "a roster on disk"
+        return found
+
+    def team_evidence(self, token):
+        """Why this token is a team, or None."""
+        return self.known_teams().get(token)
 
     def lead_session_for(self, team):
         """The session id of this team's lead, or None.
@@ -3427,6 +3442,18 @@ def run_one(args, passthrough, table, prefix="", pending=()):
 
 
 def run_complete(topic):
+    """Candidates on stdout, and nothing on stderr.
+
+    This runs on every TAB. A warning here lands in the middle of whatever the
+    user is typing, and the conditions that produce one (an uncorroborated
+    claimant, a stale roster) are the ordinary state of the corpus rather than
+    anything a completion should interrupt to report.
+    """
+    with contextlib.redirect_stderr(io.StringIO()):
+        return _complete(topic)
+
+
+def _complete(topic):
     """Emit completion candidates. `selector` prefixes each line with its group
     so one process serves all three, instead of paying interpreter startup thrice."""
     if topic == "selector":
@@ -3488,6 +3515,12 @@ def run_complete(topic):
             else:
                 desc = f"{count} {plural}, {when}"
             print(f"{team}:{desc}")
+        # A team outlives its directory, and the selector accepts and rebuilds
+        # these, so listing only the tidy ones offers less than the tool takes.
+        for team, evidence in sorted(RESOLVER.known_teams().items()):
+            if team in seen:
+                continue
+            print(f"{team}:no roster, rebuildable from {evidence}")
         return 0
 
     if topic == "leads":
@@ -3504,6 +3537,15 @@ def run_complete(topic):
                 title = "transcript gone, cannot be resumed"
             joined = f"joined {ms_str(entry['ts'])}"
             print(f"{agent_id}\t{title + ', ' + joined if title else joined}\t")
+        for team, evidence in sorted(RESOLVER.known_teams().items()):
+            if f"team-lead@{team}" in seen or RESOLVER.roster_path(team).exists():
+                continue
+            path, why = RESOLVER.lead_transcript_for(team)
+            if not path:
+                continue
+            title = session_title(path, limit=COMPLETION_TITLE)
+            label = f"{title}, no roster" if title else f"no roster, found by {evidence}"
+            print(f"team-lead@{team}\t{label}\t")
         return 0
 
     if topic == "names":
@@ -4416,8 +4458,8 @@ def run_selftest(live=False):
         node.name for node in tree.body
         if isinstance(node, ast.FunctionDef)
         and 'key=lambda e: e["ts"]' in (ast.get_source_segment(source, node) or "")
-        # run_complete sorts for display; run_selftest holds this check's own text.
-        and node.name not in {"run_complete", "run_selftest"})
+        # _complete sorts for display; run_selftest holds this check's own text.
+        and node.name not in {"_complete", "run_selftest"})
     check("one policy decides which roster claims an agent", not ts_sorters, ", ".join(ts_sorters))
 
     private_reach = sorted({
@@ -4644,6 +4686,20 @@ def run_selftest(live=False):
     else:
         check("an identity can be assembled (no stamped agent here)", True, "skipped")
 
+    # Enumeration and the single-token question must not diverge: a team the
+    # selector accepts and rebuilds was missing from the list of teams, which is
+    # revivable-but-undiscoverable, the mirror of advertised-then-deleted.
+    known = RESOLVER.known_teams()
+    disagreed = sorted(t for t in known if RESOLVER.team_evidence(t) != known[t])
+    check("what is a team is one answer", not disagreed, ", ".join(disagreed[:3]))
+
+    offered = io.StringIO()
+    with contextlib.redirect_stdout(offered):
+        run_complete("teams")
+    listed = {line.split(":", 1)[0] for line in offered.getvalue().splitlines() if line}
+    unlisted = sorted(set(known) - listed)
+    check("every team the engine knows is offered", not unlisted, ", ".join(unlisted[:3]))
+
     # A lead may carry a name of its own. An agent that ran with --agent-name and
     # no --team-name, then spawned teammates, is that team's lead while being
     # stamped with its own name; keying lead-ness on "no stamps at all" left it
@@ -4654,7 +4710,7 @@ def run_selftest(live=False):
         if not path:
             continue
         name, stamped_team = RESOLVER.stamp_index().get(path, (None, None))
-        if name and not stamped_team:
+        if name and not stamped_team and not RESOLVER.roster_path(team).exists():
             half = (team, path)
             break
     if half:
