@@ -637,7 +637,12 @@ class Resolver:
         if not hits:
             return None, f"no transcript records spawning into {team}"
 
-        rosters = [e for e in self.scan_teams() if e["team"] == team]
+        # A roster with no leadSessionId is one that was forged without knowing who
+        # led: either uncorroborated by us, or written before a lead was identified.
+        # It cannot corroborate a claim about the lead, and skipping it is what stops
+        # a roster derived from these payloads from vouching for them. The empty
+        # field is the marker, in the harness's own vocabulary rather than ours.
+        rosters = [e for e in self.roster_entries(team=team) if e.get("leadSessionId")]
         roster_members = {e["member"].get("name") for e in rosters}
         roster_leads = {e.get("leadSessionId") for e in rosters}
         live_here = {e.get("session") for e in self.live_sessions() if e.get("team") == team}
@@ -2583,7 +2588,7 @@ SPAWN_FIELDS = {
 
 
 
-def forge_team(ctx, dry):
+def forge_team(ctx, dry, evidence=None):
     """Recreate a team dir the graceful lead exit rm -rf'd, from merged fields.
 
     The roster is scaffolding; the transcript is the identity. Everything the
@@ -2638,7 +2643,21 @@ def forge_team(ctx, dry):
             "name": team,
             "createdAt": now,
             "leadAgentId": f"team-lead@{team}",
-            "leadSessionId": ctx["session_uuid"],
+            # Written only at the strength the engine will later read it at. Rung 1
+            # treats leadSessionId as EXACT and asks nothing further, so recording an
+            # uncorroborated guess there would convert a one-off warning into a
+            # permanent fact, and would then satisfy rung 4's "a roster names it"
+            # corroboration with a roster we derived from that same guess.
+            #
+            # Left empty instead. The lead gate does not need it, so resolution falls
+            # to the corroboration ladder and runs again on every resume: the warning
+            # returns until the evidence genuinely improves, and improves by itself
+            # once the lead has run once and is a live process wearing the identity.
+            # `evidence` is the ladder's own verdict, passed through verbatim. It is
+            # not ctx["via"]: a rebuild hands the engine a uuid, so via reports
+            # "session uuid" and would launder the very judgement this consults.
+            "leadSessionId": "" if "uncorroborated" in (evidence or "")
+                             else ctx["session_uuid"],
             "members": members,
         }
         rebuilt = ", ".join(m["name"] for m in members[1:]) or "no members recovered"
@@ -3958,7 +3977,7 @@ def rebuild_roster(team, args, passthrough, table):
     lead.team, lead.agent_id, lead.resume = None, None, path.stem
     lead.for_team = team
     ctx = build(lead)
-    config = forge_team(ctx, args.dry_run)
+    config = forge_team(ctx, args.dry_run, evidence=why)
     if not config:
         die(f"could not rebuild a roster for {team}")
     if not args.dry_run and not RESOLVER.roster_path(team).exists():
@@ -4413,6 +4432,25 @@ def run_selftest(live=False):
         globals()["run_one"], globals()["report_transcript_writes"] = real_one, real_report
     check("a lead is told what is still loading before it takes over",
           handed == [[], ["member1"], ["member1", "member2"]], str(handed))
+
+    # A guess must not be written where it will later be read as a fact. Rung 1
+    # reads leadSessionId as EXACT and asks nothing more, so an uncorroborated
+    # rebuild leaves it empty and the ladder re-derives, and re-warns, every run.
+    # A roster with no leadSessionId also cannot corroborate a claim about the
+    # lead, or the roster we derived from these payloads would vouch for them.
+    forged = {"name": "session-forgecheck", "createdAt": 1,
+              "leadAgentId": "team-lead@session-forgecheck", "leadSessionId": "",
+              "members": [{"agentId": "team-lead@session-forgecheck", "name": "team-lead"},
+                          {"agentId": "m1@session-forgecheck", "name": "m1"}]}
+    real_rosters = RESOLVER.rosters
+    try:
+        RESOLVER.rosters = lambda: [(Path("/nowhere/config.json"), forged, 0)]
+        vouched = [e for e in RESOLVER.roster_entries(team="session-forgecheck")
+                   if e.get("leadSessionId")]
+    finally:
+        RESOLVER.rosters = real_rosters
+    check("a roster with no lead cannot corroborate one", not vouched,
+          f"{len(vouched)} entries vouched")
 
     # One classifier decides what a token names. apply_selector used to run its
     # own roster-name scan and its own several-rosters refusal beside the
