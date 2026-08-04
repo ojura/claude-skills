@@ -4385,6 +4385,16 @@ def run_standing(args):
     return 0
 
 
+# What each verdict claims, in the order of how much is wrong.
+DOCTOR_LEGEND = (
+    ("CONNECTED", "a live lead runs this team, its members are listed, no mail is waiting"),
+    ("DEGRADED", "reachable, but carrying former members or with nothing running"),
+    ("UNKNOWABLE", "a plain lead reads the roster from its own memory, which cannot be "
+                   "seen from outside"),
+    ("SEVERED", "members are running or mail is waiting, and no live lead reads this team"),
+)
+
+
 def diagnose_team(team):
     """(verdict, lines, remedies) for one team. Asks the engine; reads nothing.
 
@@ -4405,6 +4415,12 @@ def diagnose_team(team):
 
     lines = [f"lead     {'pid ' + str(pid) if pid else '(none)'}"
              f"{'' if alive else ', not running'}  ({how})"]
+    # Through the helper that already answers this, so the engine still does the
+    # picking. A team whose roster is gone has no recorded lead session and so no
+    # title here, which is the honest gap rather than the doctor choosing a file.
+    title = lead_title(RESOLVER.roster_entries(team=team), team, limit=64)
+    if title:
+        lines.append(f"title    {title}")
     if pid and alive:
         lines.append(f"runs as  {lead_team or '(unknown)'}"
                      f"  [{'exact' if exact_team else 'inferred from boot timing'}]")
@@ -4460,6 +4476,10 @@ def run_doctor(args):
     if skipped:
         print(f"\n{skipped} team(s) with nothing live and no waiting mail were not "
               f"examined; --all covers them")
+    if teams:
+        print("\nverdicts")
+        for name, meaning in DOCTOR_LEGEND:
+            print(f"  {name:<11} {meaning}")
     return worst
 
 
