@@ -2637,10 +2637,13 @@ def resolve_socket(ctx, args, table):
             # into the old roster still works, but the lead's SendMessage
             # resolves against the team it runs as now, so mail to this member
             # would land in an inbox directory nobody reads.
-            current, _ = RESOLVER.team_minted_by(pid)
-            if current and team and current != team and not ctx.get("stale_team_warned"):
-                warn(f"the lead is live but now runs as team {current}, not {team}; "
-                     f"without --to-team live this member will be mailbox-orphaned")
+            agent_id = RESOLVER.field(ctx, "agentId")
+            if agent_id and not ctx.get("stale_team_warned"):
+                standing = RESOLVER.standing(agent_id, parent)
+                reachable, why = standing["reachable"]
+                if not reachable:
+                    fix = "; ".join(f"{what} ({cost})" for what, cost in standing["remedies"])
+                    warn(f"{why}{'. ' + fix if fix else ''}")
         return f"{SOCKET_PREFIX}{pid}", how
 
     # The team's lead is gone, so stand its own server back up rather than
@@ -3407,8 +3410,10 @@ def auto_redirect(ctx, args, table, prefix=""):
         # Alive: leave it to the liveness guards. Say what the move would cost
         # rather than making it, since restarting throws away its current turn.
         who = f"pid {holders[0][0]}" if holders else f"pid {owner[0]} (registry)"
-        warn(f"{agent_id} is running under stale team {source} as {who}; the lead now runs as {dest}. "
-             f"--to-team live migrates it (restarts the process, losing its in-flight turn)")
+        standing = RESOLVER.standing(agent_id, RESOLVER.field(ctx, "parentSessionId"))
+        fix = "; ".join(f"{what} ({cost})" for what, cost in standing["remedies"])
+        warn(f"{agent_id} is running as {who}: {standing['reachable'][1]}"
+             f"{'. ' + fix if fix else ''}")
         ctx["stale_team_warned"] = True
         return
 
