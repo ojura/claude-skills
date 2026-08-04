@@ -1385,10 +1385,17 @@ class Resolver:
 
         if not team_entry:  # a uuid or a stranger's id: adopt the roster the transcript names
             stamped_team, stamped_name = res.stamped("teamName"), res.stamped("agentName")
-            if stamped_team and stamped_name:
+            # A lead that led several teams across its lives carries the stamps of
+            # one of them. When the caller names a team this transcript is proved
+            # to have led, that is the question being asked, and the stamps are an
+            # earlier life answering a different one.
+            asked = for_team or team
+            leads_asked = bool(asked and asked != stamped_team
+                               and asked in self.teams_led_by(session_uuid))
+            if stamped_team and stamped_name and not leads_asked:
                 matches = self.roster_entries(team=stamped_team, name=stamped_name)
                 team_entry = matches[0] if matches else None
-            elif not stamped_team:
+            elif not stamped_team or leads_asked:
                 # No team stamp, so this is nobody's teammate: the harness stamps
                 # both or neither on a teammate's lines. A name may still be there
                 # without being teammate identity, from either of two causes: a
@@ -5529,6 +5536,30 @@ def run_selftest(live=False):
               f"{path.stem[:8]} -> {assembled.get('leads_team')}")
     else:
         check("a lead with a name of its own (none on this machine)", True, "skipped")
+
+    # The same lead one life later: stamped with a team it used to run as, asked
+    # about a team it led afterwards. The stamps answer an older question, so the
+    # named team has to win in the stamped branch too, or a reaped team whose lead
+    # went on to lead another cannot be rebuilt at all.
+    multi = None
+    for other in RESOLVER.led_teams():
+        found = RESOLVER.lead_transcript_for(other)
+        if not (found and found[0]):
+            continue
+        stamped = RESOLVER.stamp_index().get(found[0], (None, None))[1]
+        if stamped and stamped != other:
+            multi = (other, found[0])
+            break
+    if multi:
+        other, path = multi
+        with contextlib.redirect_stderr(io.StringIO()):
+            assembled = RESOLVER.identity(session_uuid=path.stem, for_team=other)
+        check("a named team outranks the stamps of an earlier life",
+              assembled.get("lead_agent_id") == f"team-lead@{other}",
+              f"{path.stem[:8]} stamped {stamped}, asked {other}, "
+              f"got {assembled.get('lead_agent_id')}")
+    else:
+        check("multi-team lead (none stamped with another team here)", True, "skipped")
 
     # A lead that ran several teams must rebuild the one that was named, not
     # whichever it ran as last. Both spellings of that fault shipped once: the
