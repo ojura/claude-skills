@@ -72,6 +72,9 @@ PROJECTS_DIR = CLAUDE_DIR / "projects"
 
 TMUX_SESSION = "claude-swarm"
 TMUX_WINDOW = "swarm-view"
+# Geometry for a server this tool stands up. Nothing attaches at creation, so
+# tmux would otherwise size it 80x24.
+SWARM_COLS, SWARM_ROWS = 220, 50
 SOCKET_PREFIX = "claude-swarm-"
 
 # New panes inherit the tmux server's environment, which is whatever started the
@@ -2747,6 +2750,10 @@ def pane_of_pid(socket, pid, table):
     return None
 
 
+class LaunchFailed(Exception):
+    """tmux refused to place this agent. One member's problem, not the run's."""
+
+
 def launch(socket, want_pane, cwd, command, dry, replace_pane=None):
     """Start the agent: reuse the socket/session if live, else rebuild it.
 
@@ -2804,7 +2811,10 @@ def launch(socket, want_pane, cwd, command, dry, replace_pane=None):
             warn(f"socket {socket} is down, reestablishing")
         else:
             warn(f"session {TMUX_SESSION} missing on {socket}, recreating")
-        argv = ["new-session", "-d", "-s", TMUX_SESSION, "-n", TMUX_WINDOW, "-P", "-F", "#{pane_id}"]
+        # A detached server takes tmux's 80x24 default. A resurrected swarm gets
+        # the room the harness's own spawner has.
+        argv = ["new-session", "-d", "-s", TMUX_SESSION, "-n", TMUX_WINDOW,
+                "-x", str(SWARM_COLS), "-y", str(SWARM_ROWS), "-P", "-F", "#{pane_id}"]
         action = "new-session"
     elif want_pane and any(p["pane"] == want_pane for p in list_panes(socket)):
         argv = ["split-window", "-t", want_pane, "-P", "-F", "#{pane_id}"]
@@ -2829,7 +2839,12 @@ def launch(socket, want_pane, cwd, command, dry, replace_pane=None):
         return (replace_pane if action == "respawn" else None), action
     res = tmux(socket, *argv)
     if res.returncode != 0:
-        die(f"tmux {argv[0]} failed: {res.stderr.strip()}")
+        raise LaunchFailed(f"tmux {argv[0]} failed: {res.stderr.strip()}")
+    if action in ("split", "new-window"):
+        # Panes are placed the way the harness's own spawner places them. Tiling
+        # reclaims the whole window, so what fits is a property of the window
+        # rather than of how many splits preceded it.
+        tmux(socket, "select-layout", "-t", TMUX_SESSION, "tiled")
     step(False, "", f"ran: {rendered}")
     # respawn-pane takes no -P/-F, so it prints nothing: the pane is the one we
     # aimed at. Everything else printed its new pane id.
@@ -3552,7 +3567,14 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         launched_at = ctx["transcript"][0].stat().st_mtime
     except OSError:
         launched_at = 0.0
-    pane, action = launch(socket, want_pane, cwd, command, args.dry_run, replace_pane)
+    try:
+        pane, action = launch(socket, want_pane, cwd, command, args.dry_run, replace_pane)
+    except LaunchFailed as exc:
+        # A member's pane is that member's problem. The run continues, so the
+        # summary, the flag check and the write report still reach every agent
+        # that did launch.
+        warn(f"{prefix}{build_command_agent_id(ctx)} did not launch: {exc}")
+        return Outcome("failed", socket, False, None)
     print(f"{prefix}{'would run' if args.dry_run else 'running'} in pane {pane or '<new>'} ({action})")
     if not args.no_color:
         tint_pane(socket, pane, RESOLVER.field(ctx, "color"), RESOLVER.field(ctx, "agentName"), args.dry_run)
@@ -4537,6 +4559,30 @@ def live_checks():
     }
     wrong = sorted(k for k, good in carriers.items() if not good)
     check("a launch consults both carriers of a base url", not wrong, ", ".join(wrong))
+
+    # A team is larger than the splits a window affords. Fixed at 80x24 so the
+    # check measures tiling rather than the room a real launch asks for.
+    geom_sock = f"{TOOL}-selftest-geometry"
+    tmux(geom_sock, "kill-server")
+    wanted = 7
+    placed, refused = [], None
+    try:
+        for i in range(wanted):
+            try:
+                pane, _action = launch(geom_sock, placed[0] if placed else None,
+                                       "/tmp", ["sleep", "30"], False)
+                placed.append(pane)
+            except LaunchFailed as exc:
+                refused = f"member {i + 1}: {exc}"
+                break
+            if i == 0:
+                tmux(geom_sock, "resize-window", "-t", TMUX_SESSION, "-x", "80", "-y", "24")
+        alive = {p["pane"] for p in list_panes(geom_sock)}
+        check(f"a team of {wanted} fits the window it is launched into",
+              refused is None and len(placed) == wanted and set(placed) <= alive,
+              refused or f"placed {len(placed)}/{wanted}, {len(alive)} alive")
+    finally:
+        tmux(geom_sock, "kill-server")
 
     # abort_agents against processes spawned for the purpose.
     victims = [sp.Popen(["sleep", "30"]) for _ in range(2)]
