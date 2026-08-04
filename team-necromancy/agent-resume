@@ -2268,14 +2268,34 @@ def build(args):
 
     The engine is handed facts, never args, so that who an agent is cannot come
     to depend on how the question was spelled. It judges but does not act: the
-    objections come back with the answer and are enforced here, where --force
-    and a requested team change are known.
+    objections come back with the answer, and a caller enforces them at the
+    point it is about to act. Enforcing here would refuse launches that never
+    happen, since the guards that turn a run into a noop sit further down.
     """
-    ctx = RESOLVER.identity(session_uuid=args.resume, agent_id=args.agent_id,
-                            for_team=getattr(args, "for_team", None), to_team=args.to_team)
+    return RESOLVER.identity(session_uuid=args.resume, agent_id=args.agent_id,
+                             for_team=getattr(args, "for_team", None), to_team=args.to_team)
+
+
+def enforce_ctx(ctx, args):
+    """The identity gate, at the boundary where this run starts acting."""
     enforce_identity(ctx["resolution"], ctx["objections"],
                      allow_team_change=bool(args.to_team), force=args.force)
-    return ctx
+
+
+def note_identity(ctx, prefix=""):
+    """State the objections without acting on them, for a run that stops here.
+
+    A noop launches nothing, so there is nothing for the gate to protect and a
+    refusal would be friction reported as a fact. The contradiction is still
+    worth saying, because it is true and the reader may be looking at it.
+    """
+    for kind, stamped, wanted, _why in ctx.get("objections", ()):
+        if kind == "team_mismatch":
+            warn(f"{prefix}note: this transcript is stamped team={stamped}, not {wanted}; "
+                 "it is live under that identity regardless")
+        elif kind == "name_mismatch":
+            warn(f"{prefix}note: this transcript is stamped agentName={stamped!r}, "
+                 f"not {wanted!r}; it is live under that identity regardless")
 
 
 
@@ -3380,7 +3400,11 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
         if owner and owner[2] and not args.force:
             warn(f"already live as pid {owner[0]}{state_note(owner[0])}; pass --force to run a second copy")
+            note_identity(ctx, prefix)
             return Outcome("noop", None, True, None)
+        # This run is about to become the lead, so the identity gate applies from
+        # here down.
+        enforce_ctx(ctx, args)
         # Check what we are about to become before writing anything. Forging first
         # and discovering the binary is unusable second leaves a team dir behind for
         # a run that never launched, which is the same mutation-on-a-run-that-does-
@@ -3494,7 +3518,8 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         if not args.no_color:
             tint_pane(socket, want_pane, RESOLVER.field(ctx, "color"), RESOLVER.field(ctx, "agentName"), args.dry_run)
         if not args.no_update_config:
-            update_team_config(ctx, want_pane, args.dry_run)
+            update_team_config(ctx, RESOLVER.roster_record(ctx), want_pane, args.dry_run)
+        note_identity(ctx, prefix)
         return Outcome("noop", socket, False, None)
     if others and not replace_pane:
         warn(f"pane {want_pane} runs a different claude (pid {', '.join(map(str, others))}); using a new pane")
@@ -3507,6 +3532,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             f"session {ctx['session_uuid']} is live as pid {owner[0]}{state_note(owner[0])}; "
             "pass --force to resume a second copy"
         )
+        note_identity(ctx, prefix)
         return Outcome("noop", socket, False, None)
 
     live = RESOLVER.live_agent_procs(agent_id, table) if agent_id else []
@@ -3516,7 +3542,12 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             f"{agent_id} is already running outside pane {want_pane or '?'} "
             f"(pid {', '.join(map(str, elsewhere))}); pass --force to start another instance"
         )
+        note_identity(ctx, prefix)
         return Outcome("noop", socket, False, None)
+
+    # Every guard that could still turn this into a noop has passed, so the run
+    # is about to act and the identity gate applies.
+    enforce_ctx(ctx, args)
 
     # Already standing in the right place: run the agent in this pane instead of
     # splitting a new one and leaving the shell we were invoked from idle beside
@@ -4391,6 +4422,7 @@ def rebuild_roster(team, args, passthrough, table):
     lead.team, lead.agent_id, lead.resume = None, None, path.stem
     lead.for_team = team
     ctx = build(lead)
+    enforce_ctx(ctx, args)
     config = forge_team(ctx, args.dry_run, evidence=why)
     if not config:
         die(f"could not rebuild a roster for {team}")
@@ -5349,6 +5381,20 @@ def run_selftest(live=False):
             check("identity gate refuses a mismatch", False, "it allowed one")
         except SystemExit:
             check("identity gate refuses a mismatch", True)
+
+        # Judgement and enforcement are separate stages. Assembling an identity
+        # that contradicts its stamps must produce objections and nothing else:
+        # the guards that turn a run into a noop sit between here and the act,
+        # and a gate upstream of them refuses launches that never happen.
+        judged, raised = None, None
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                judged = RESOLVER.identity(agent_id=f"{name}@definitely-not-{team}")
+        except SystemExit as exc:
+            raised = exc
+        check("an identity is judged without being enforced",
+              raised is None and judged is not None and bool(judged.get("objections")),
+              "assembly exited" if raised else f"objections={bool((judged or {}).get('objections'))}")
     else:
         check("rung: stamps (no stamped transcript on this machine)", True, "skipped")
 
