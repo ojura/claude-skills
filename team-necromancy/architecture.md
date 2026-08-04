@@ -136,6 +136,37 @@ dir is created a few hundred ms before the session file (measured 281, 252 and
 team name does match a registry sessionId and an exact join is available.
 When something team-related does not add up, check both ids before reasoning.
 
+## Wanted from the harness: a record of the id a life minted
+
+One structural record would close the gap above: the internal session id a
+boot minted, written where a later reader can find it. Either shape works, a
+line in the boot's own transcript (which already carries identity stamps) or
+the internal id alongside the resumed-transcript id in
+`~/.claude/sessions/<pid>.json`. Nothing else records it, so today it exists
+only in the running process and in the name of the team directory.
+
+Without it, "which team is this live process running as" has two exact rungs
+and a guess. The exact ones are `--team-name` in argv, which only a
+flag-bound agent has, and a spawn payload written by this life, which needs
+the lead to have spawned someone since it resumed and needs a process start
+time to tell this life's payloads from an earlier life's. Everything else
+falls to pairing the team's `createdAt` against a live process's `startedAt`.
+
+That pairing is weaker than a tolerance suggests, because the mint is not one
+event. Minted eagerly at boot it lands a few hundred ms before the session
+file (measured 281, 252 and 402ms), but a team can instead be minted at the
+first spawn, minutes later, which no window centred on boot covers at all. So
+the join does not merely lose precision on the second shape, it does not
+apply, and a pairing that survives the window still has to be shown unique in
+both directions before it means anything: several processes can start inside
+one team's window, and one process can start inside several teams' windows.
+
+Downstream this is why `agent-resume` will not rebind a member onto a team it
+inferred from timing without asking. Given the record, the pairing, its
+uniqueness proof, the prompt, the evidence grades that travel with every
+answer about a lead's team, and the rule that a printed guess must never be
+read back as evidence all become unnecessary rather than merely better.
+
 ## Adopt, in one paragraph
 
 Adopt is the orphaned-work recovery system: on exit or backgrounding, running
