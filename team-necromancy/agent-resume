@@ -1234,9 +1234,11 @@ class Resolver:
     def team_population(self, team):
         """{name: (in_roster, evidence)} for everyone this team has had.
 
-        The member-level counterpart of known_teams. A roster is the team as it
-        stands, and the harness prunes a member from it when that member
-        finishes; the stamps are every transcript that ever ran as part of it.
+        States: listed, unrecorded (running, in no roster), and former. A roster
+        is the team as it stands, and the harness prunes a member from it when
+        that member finishes, so former is the trace of a team that completed
+        something rather than a fault. The stamps are every transcript that ever
+        ran as part of it.
         Both are the team, so which one a run means is a choice and not a
         default. Built from the sources standing() consults, so a member it
         calls unlisted cannot be missing from here.
@@ -1245,10 +1247,15 @@ class Resolver:
         for member in (self.roster_of(team) or {}).get("members", []):
             name = member.get("name")
             if name:
-                people[name] = (True, "listed in the roster")
+                people[name] = ("listed", "listed in the roster")
         for _path, (name, stamped_team) in self.stamp_index().items():
             if stamped_team == team and name and name not in people:
-                people[name] = (False, "a transcript stamped with this team")
+                # Running and absent from the roster is not former: former is the
+                # trace of work that finished, and this agent has not. The run
+                # path drew that line already; this is the same word, one reader.
+                people[name] = (("unrecorded", "running, and in no roster")
+                                if self.wearers(f"{name}@{team}")
+                                else ("former", "a transcript stamped with this team"))
         return people
 
     def live_teams(self):
@@ -4477,18 +4484,20 @@ DOCTOR_LEGEND = (
 )
 
 
-def diagnose_team(team):
+def diagnose_team(team, table=None):
     """(verdict, lines, remedies) for one team. Asks the engine; reads nothing.
 
     Every fact here is an answer, so the doctor cannot reach a conclusion the
     tool would not reach when it acts.
     """
+    table = RESOLVER.ps_table() if table is None else table
     pid, alive, how, _exact = RESOLVER.lead_pid(None, team)
     lead_team, exact_team = RESOLVER.team_minted_by(pid) if (pid and alive) else (None, False)
     worn = RESOLVER.worn_team(pid) if (pid and alive) else None
     population = RESOLVER.team_population(team)
-    listed = [n for n, (in_roster, _w) in population.items() if in_roster]
-    former = [n for n, (in_roster, _w) in population.items() if not in_roster]
+    listed = [n for n, (state, _w) in population.items() if state == "listed"]
+    unrecorded = [n for n, (state, _w) in population.items() if state == "unrecorded"]
+    former = [n for n, (state, _w) in population.items() if state == "former"]
     mail = RESOLVER.inbox_state(team)
     waiting = {n: v for n, v in mail.items() if v[0]}
     live = {n: RESOLVER.wearers(f"{n}@{team}") for n in population}
@@ -4506,7 +4515,19 @@ def diagnose_team(team):
     if pid and alive:
         lines.append(f"runs as  {lead_team or '(unknown)'}"
                      f"  [{'exact' if exact_team else 'inferred from boot timing'}]")
-    lines.append(f"members  {len(listed)} listed, {len(former)} former, {len(live)} live")
+    lines.append(f"members  {len(listed)} listed, {len(unrecorded)} unrecorded, "
+                 f"{len(former)} former, {len(live)} live")
+    # A lead never sits in a pane, so it is not part of the seat count. Counting
+    # it would call every team with a live masqueraded lead split.
+    seats = {RESOLVER.socket_hosting([f"{n}@{team}"], table)[0]
+             for n in live if n != "team-lead"}
+    seats.discard(None)
+    split = len(seats) > 1
+    if split:
+        lines.append(f"warning  its crew is seated on {len(seats)} servers: "
+                     f"{', '.join(sorted(seats))}")
+    for name in sorted(unrecorded):
+        lines.append(f"note     {name} is running and in no roster; resuming it registers it")
     for name, (count, oldest) in sorted(waiting.items()):
         lines.append(f"mail     {count} waiting for {name}, oldest {oldest}")
     for name in doubled:
@@ -4526,10 +4547,14 @@ def diagnose_team(team):
         verdict = "UNKNOWABLE"
         remedies.append((f"{TOOL} team-lead@{team}",
                          "restarts the lead, which reads this roster on the way up"))
-    elif former or doubled:
+    elif doubled or split:
+        # A verdict names what an operator must act on. Former members are the
+        # trace of work that finished; an unrecorded one is fixed by the next run
+        # of it. What is left needs a person: two processes on one agent are a
+        # turn from the two-writers state, and a split crew stays split.
         verdict = "DEGRADED"
-        if former:
-            remedies.append((f"{TOOL} {team} --all", "also resumes its former members"))
+        if split:
+            remedies.append((f"{TOOL} {team}", "reseats the crew together"))
     else:
         verdict = "CONNECTED"
     return verdict, lines, remedies
@@ -6307,6 +6332,35 @@ def run_selftest(live=False):
               f"{len(verdicts)} verdict(s) for {one}")
     else:
         check("doctor target (no teams on this machine)", True, "skipped")
+
+    # A verdict names what an operator must act on. Pruned members are the trace
+    # of finished work and an unrecorded one is fixed by running it, so neither
+    # degrades a team; and a lead sits in no pane by design, so it is not a seat.
+    table = RESOLVER.ps_table()
+    verdicts = {}
+    for team in sorted(RESOLVER.live_teams()):
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                verdict, lines, _rem = diagnose_team(team, table)
+        except BaseException as exc:  # a diagnosis that crashes is a failed one
+            verdicts[team] = f"diagnosis raised {type(exc).__name__}"
+            continue
+        pop = RESOLVER.team_population(team)
+        said_split = any(ln.startswith("warning  its crew is seated") for ln in lines)
+        # Computed here rather than read from the verdict: a lead runs in a
+        # terminal, so it occupies no pane and cannot be a seat. Counting it calls
+        # every team with a live masqueraded lead split.
+        seats = {RESOLVER.socket_hosting([f"{n}@{team}"], table)[0]
+                 for n, (state, _w) in pop.items()
+                 if n != "team-lead" and RESOLVER.wearers(f"{n}@{team}")}
+        seats.discard(None)
+        if said_split != (len(seats) > 1):
+            verdicts[team] = f"split said {said_split}, crew sits on {len(seats)} server(s)"
+        if verdict == "DEGRADED" and not (said_split or any(
+                ln.startswith("warning  ") and "worn by" in ln for ln in lines)):
+            verdicts[team] = "degraded with nothing to act on"
+    check("a verdict names something to act on", not verdicts,
+          "; ".join(f"{t}: {why}" for t, why in verdicts.items()))
 
     # --- one job per agent, whatever assembled the list
     said = ""
