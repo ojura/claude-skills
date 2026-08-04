@@ -106,6 +106,10 @@ TEAM_MINT_WINDOW_MS = 5000
 # What the skill's forge template uses when a transcript records no agent type.
 DEFAULT_AGENT_TYPE = "claude"
 
+# The member fields every roster writer keeps in step with the launch it just
+# performed. Spelled once.
+SYNCED_FIELDS = ("color", "model", "agentType")
+
 # Window read from each end of a transcript when indexing stamps.
 INDEX_CHUNK = 8 * 1024
 STAMP_RE = re.compile(rb'"(agentName|teamName)":"([^"]*)"')
@@ -492,6 +496,15 @@ class Resolver:
     A run is one process, so these were already per-run state as module
     globals. What the object adds is a place for cache lifetime to be stated
     (`refresh_procs`) instead of implied by a keyword argument.
+
+    It answers and never acts. No tmux, no exec, no roster writes, no forge:
+    those consume answers, and keeping them out is what stops this becoming the
+    one class that does everything.
+
+    Which leaves the writers needing values. They take a description from here
+    rather than the assembled identity: `roster_record` says what belongs in a
+    roster entry and where it goes, and the writers write it. The engine
+    describes, the writer writes.
     """
 
     def __init__(self):
@@ -868,6 +881,33 @@ class Resolver:
         """{transcript stem: entries} for the whole tree, filled on demand."""
         self.led_teams()
         return dict(self._spawn_log)
+
+    def roster_record(self, ctx, team=None):
+        """Everything a roster writer needs: the entry, and where it is written.
+
+        Writers take this rather than the assembled identity. The entry travels
+        with its team because name, team and agentId are one fact in three
+        spellings, and the triple is projected here and nowhere else.
+
+        `team` names a destination: a rebind asks for the entry as it should be
+        written in the team it is moving to, and the id is reprojected onto it.
+
+        The keys are the roster's own names, not the engine's, so a writer copies
+        them across without translating.
+        """
+        name = self.field(ctx, "agentName")
+        team = team or self.field(ctx, "teamName")
+        return {
+            "name": name,
+            "team": team,
+            "agentId": (f"{name}@{team}" if name and team else self.field(ctx, "agentId") or ""),
+            "parentSession": self.field(ctx, "parentSessionId") or "",
+            "agentType": self.field(ctx, "agentType"),
+            "planModeRequired": self.field(ctx, "permissionMode") == "plan",
+            "cwd": self.agent_cwd(ctx),
+            "color": self.field(ctx, "color"),
+            "model": self.field(ctx, "model", prefer_specific=True),
+        }
 
     def spawn_payloads(self):
         """Every spawn payload on this machine."""
@@ -2835,16 +2875,15 @@ def forge_team(ctx, dry, evidence=None):
 
     The roster is scaffolding; the transcript is the identity. Everything the
     config needs is already in the merge, so a missing team is not fatal."""
-    merged = ctx["merged"]
-    team = RESOLVER.field(ctx, "teamName")
-    name = RESOLVER.field(ctx, "agentName")
+    record = RESOLVER.roster_record(ctx)
+    team, name = record["team"], record["name"]
     if not team or not (name or ctx.get("leads_team")):
         return
     cfg = RESOLVER.roster_path(team)
     if cfg.exists():
         return
     now = int(time.time() * 1000)
-    lead_sid = RESOLVER.field(ctx, "parentSessionId") or ""
+    lead_sid = record["parentSession"]
     if name == "team-lead" or ctx.get("leads_team"):
         # Forging for the lead itself. Recording the resumed transcript as
         # leadSessionId is what lets rung 1 find this lead again next time.
@@ -2861,7 +2900,7 @@ def forge_team(ctx, dry, evidence=None):
             "agentType": "team-lead",
             "joinedAt": now,
             "tmuxPaneId": "leader",
-            **({"cwd": cwd} if (cwd := RESOLVER.agent_cwd(ctx)) else {}),
+            **({"cwd": record["cwd"]} if record.get("cwd") else {}),
             "subscriptions": [],
             "backendType": "in-process",
         }]
@@ -2917,23 +2956,18 @@ def forge_team(ctx, dry, evidence=None):
             ensure_inbox(team, member["name"], dry)
         return config
     member = {
-        "agentId": RESOLVER.field(ctx, "agentId") or f"{name}@{team}",
+        "agentId": record["agentId"],
         "name": name,
         "joinedAt": now,
         "tmuxPaneId": "",
         "subscriptions": [],
-        "agentType": RESOLVER.field(ctx, "agentType") or DEFAULT_AGENT_TYPE,
-        "planModeRequired": RESOLVER.field(ctx, "permissionMode") == "plan",
-        **({"cwd": cwd} if (cwd := RESOLVER.agent_cwd(ctx)) else {}),
+        "agentType": record.get("agentType") or DEFAULT_AGENT_TYPE,
+        "planModeRequired": bool(record.get("planModeRequired")),
+        **({"cwd": record["cwd"]} if record.get("cwd") else {}),
         "backendType": "tmux",
         "isActive": False,
     }
-    color = RESOLVER.field(ctx, "color")
-    if color:
-        member["color"] = color
-    model = RESOLVER.field(ctx, "model", prefer_specific=True)
-    if model:
-        member["model"] = model
+    member.update({k: record[k] for k in SYNCED_FIELDS if record.get(k)})
     config = {
         "name": team,
         "createdAt": now,
@@ -2946,7 +2980,7 @@ def forge_team(ctx, dry, evidence=None):
                 "agentType": "team-lead",
                 "joinedAt": now,
                 "tmuxPaneId": "leader",
-                **({"cwd": cwd} if (cwd := RESOLVER.agent_cwd(ctx)) else {}),
+                **({"cwd": record["cwd"]} if record.get("cwd") else {}),
                 "subscriptions": [],
                 "backendType": "in-process",
             },
@@ -3058,26 +3092,19 @@ def ensure_inbox(team, name, dry):
     step(False, "", f"seeded {path} with []")
 
 
-def synced_fields(ctx):
-    """The member fields both roster writers keep in step with the launch."""
-    merged = ctx["merged"]
-    out = {}
-    for field in ("color", "model", "agentType"):
-        value = RESOLVER.field(ctx, field, prefer_specific=(field == "model"))
-        if value:
-            out[field] = value
-    return out
-
-
-def register_member(team, ctx, pane, dry, alive=True):
-    """Hand-register the rebound member in the destination roster (Recipe 1b).
+def register_member(record, pane, dry, alive=True):
+    """Write this member into the roster, inserting it if absent (Recipe 1b).
 
     SendMessage's roster fallback reads this file at send time, so the entry is
-    what makes the member addressable from the live lead."""
-    merged = ctx["merged"]
+    what makes the member addressable from the live lead.
+
+    The record says both what to write and where: on a rebind the engine has
+    already reprojected the id onto the destination team.
+    """
+    team = record.get("team")
+    name = record.get("name")
+    agent_id = record["agentId"]
     cfg = RESOLVER.roster_path(team)
-    name = RESOLVER.field(ctx, "agentName")
-    agent_id = f"{name}@{team}"
 
     def mutate(data):
         if agent_id == data.get("leadAgentId"):
@@ -3090,18 +3117,12 @@ def register_member(team, ctx, pane, dry, alive=True):
                 "name": name,
                 "joinedAt": int(time.time() * 1000),
                 "subscriptions": [],
-                "agentType": RESOLVER.field(ctx, "agentType") or DEFAULT_AGENT_TYPE,
-                "planModeRequired": RESOLVER.field(ctx, "permissionMode") == "plan",
-                **({"cwd": member_cwd} if (member_cwd := RESOLVER.agent_cwd(ctx)) else {}),
+                "agentType": record.get("agentType") or DEFAULT_AGENT_TYPE,
+                "planModeRequired": bool(record.get("planModeRequired")),
+                **({"cwd": record["cwd"]} if record.get("cwd") else {}),
             }
-            color = RESOLVER.field(ctx, "color")
-            if color:
-                member["color"] = color
-            model = RESOLVER.field(ctx, "model", prefer_specific=True)
-            if model:
-                member["model"] = model
             data.setdefault("members", []).append(member)
-        member.update(synced_fields(ctx))
+        member.update({k: record[k] for k in SYNCED_FIELDS if record.get(k)})
         member.update({"tmuxPaneId": pane or "", "backendType": "tmux", "isActive": alive})
         return data
 
@@ -3135,7 +3156,7 @@ def retire_member(ctx, dry):
     edit_team_config(cfg, mutate, f"retired {agent_id} in")
 
 
-def update_team_config(ctx, pane, dry, alive=True):
+def update_team_config(ctx, record, pane, dry, alive=True):
     entry = ctx["team_entry"]
     if not entry:
         return
@@ -3157,7 +3178,7 @@ def update_team_config(ctx, pane, dry, alive=True):
             # filling blanks: a roster saying claude-opus-5 while the process
             # runs claude-opus-5[1m] describes something that does not exist.
             updates = [("tmuxPaneId", pane), ("backendType", "tmux"), ("isActive", alive)]
-            updates += list(synced_fields(ctx).items())
+            updates += [(k, record[k]) for k in SYNCED_FIELDS if record.get(k)]
             for key, value in updates:
                 if value is not None and member.get(key) != value:
                     member[key] = value
@@ -3495,13 +3516,13 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         if in_pane == want_pane or not pane_exists:
             print(f"{prefix}exec     you are in {in_pane} on {socket}; running here rather than splitting")
             if ctx.get("to_team"):
-                register_member(ctx["to_team"], ctx, in_pane, args.dry_run)
+                register_member(RESOLVER.roster_record(ctx, team=ctx["to_team"]), in_pane, args.dry_run)
                 if ctx["to_team"] != RESOLVER.field(ctx, "teamName"):
                     retire_member(ctx, args.dry_run)
             else:
                 ensure_inbox(RESOLVER.field(ctx, "teamName"), RESOLVER.field(ctx, "agentName"), args.dry_run)
                 if not args.no_update_config:
-                    update_team_config(ctx, in_pane, args.dry_run)
+                    update_team_config(ctx, RESOLVER.roster_record(ctx), in_pane, args.dry_run)
             rendered = f"exec in {cwd or os.getcwd()}: {' '.join(shlex.quote(c) for c in command)}"
             step(args.dry_run, f"would {rendered}", rendered, indent=prefix)
             if args.dry_run:
@@ -3547,7 +3568,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             warn(f"the launch in pane {pane} is not running: {why}; recording it as inactive")
 
     if ctx.get("to_team"):
-        register_member(ctx["to_team"], ctx, pane, args.dry_run, alive)
+        register_member(RESOLVER.roster_record(ctx, team=ctx["to_team"]), pane, args.dry_run, alive)
         if ctx["to_team"] != RESOLVER.field(ctx, "teamName"):
             retire_member(ctx, args.dry_run)
     else:
@@ -3555,14 +3576,14 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         ensure_inbox(team, RESOLVER.field(ctx, "agentName"), args.dry_run)
         if not args.no_update_config:
             if ctx.get("team_entry"):
-                update_team_config(ctx, pane, args.dry_run, alive)
+                update_team_config(ctx, RESOLVER.roster_record(ctx), pane, args.dry_run, alive)
             elif team and RESOLVER.roster_path(team).exists():
                 # The roster exists but has no entry for this agent, so there is
                 # nothing to update and the member would go unlisted: launched,
                 # inbox seeded, invisible to its own lead. A lead delivers mail
                 # from members it knows about, so an unlisted one can write to the
                 # lead's inbox and never be read from it.
-                register_member(team, ctx, pane, args.dry_run, alive)
+                register_member(RESOLVER.roster_record(ctx, team=team), pane, args.dry_run, alive)
 
     # A launch that has not written yet is not a verdict, only an unfinished
     # observation: the settle window is a second and a half and a healthy agent
@@ -4687,12 +4708,9 @@ def run_selftest(live=False):
         RESOLVER.roster_path(team).write_text(json.dumps({
             "name": team, "leadAgentId": f"team-lead@{team}", "leadSessionId": "x",
             "members": [{"agentId": f"team-lead@{team}", "name": "team-lead"}]}))
-        ctx = {"merged": RESOLVER._Merged(), "team_entry": None, "session_uuid": "s",
-               "transcript": (reg_base / "s.jsonl", {}, 0)}
-        ctx["merged"].add("agentName", "newcomer", 1, "check")
-        ctx["merged"].add("teamName", team, 1, "check")
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            register_member(team, ctx, "%9", False, True)
+            register_member({"name": "newcomer", "team": team,
+                             "agentId": f"newcomer@{team}"}, "%9", False, True)
         listed = [m.get("name") for m in
                   json.loads(RESOLVER.roster_path(team).read_text()).get("members", [])]
     finally:
@@ -4913,9 +4931,25 @@ def run_selftest(live=False):
     # different answer than the engine did.
     reachers = sorted(
         node.name for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name != "run_selftest"
+        if isinstance(node, ast.FunctionDef)
         and re.search(r"\.pick\(|_Merged\(", ast.get_source_segment(source, node) or ""))
     check("the merge is reached only through the engine", not reachers, ", ".join(reachers))
+
+    # A roster writer takes the engine's description and reads no field itself.
+    # The ban is total: no field read in a function that writes a roster.
+    # Function-local: a helper handed ctx could read on a writer's behalf.
+    def writes_roster(fn):
+        return any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                   and c.func.id == "edit_team_config" for c in ast.walk(fn))
+
+    def reads_a_field(fn):
+        return any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                   and c.func.attr in ("field", "agent_cwd") for c in ast.walk(fn))
+
+    assemblers = sorted(node.name for node in tree.body
+                        if isinstance(node, ast.FunctionDef)
+                        and writes_roster(node) and reads_a_field(node))
+    check("a roster writer reads no field of its own", not assemblers, ", ".join(assemblers))
 
     # Assembly is exercised, not just its parts. A NameError in identity() once
     # passed a full battery of structural checks while every real invocation of
