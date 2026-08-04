@@ -1192,6 +1192,26 @@ class Resolver:
                      "the pick between them is arbitrary")
         return pairs
 
+    def team_population(self, team):
+        """{name: (in_roster, evidence)} for everyone this team has had.
+
+        The member-level counterpart of known_teams. A roster is the team as it
+        stands, and the harness prunes a member from it when that member
+        finishes; the stamps are every transcript that ever ran as part of it.
+        Both are the team, so which one a run means is a choice and not a
+        default. Built from the sources standing() consults, so a member it
+        calls unlisted cannot be missing from here.
+        """
+        people = {}
+        for member in (self.roster_of(team) or {}).get("members", []):
+            name = member.get("name")
+            if name:
+                people[name] = (True, "listed in the roster")
+        for _path, (name, stamped_team) in self.stamp_index().items():
+            if stamped_team == team and name and name not in people:
+                people[name] = (False, "a transcript stamped with this team")
+        return people
+
     def sole_mint_pairing(self, pid):
         """The team only this process could have minted, or None if ambiguous.
 
@@ -4570,6 +4590,20 @@ def rebuild_roster(team, args, passthrough, table):
     return config
 
 
+def former_members_note(former):
+    """What a default team run is leaving out, or None when it leaves out nothing.
+
+    A bounded sweep says what it dropped. The harness prunes a member from the
+    roster when that member finishes, so reviving them all by default would
+    restart work that already ended, and dropping them silently would report a
+    team smaller than the one on disk as if it were the whole of it.
+    """
+    if not former:
+        return None
+    return (f"{len(former)} more stamped with this team are no longer in its roster; "
+            f"name one to re-register it, or pass --all")
+
+
 def run_team(args, passthrough, table):
     data = RESOLVER.roster_of(args.team)
     if data is None:
@@ -4584,15 +4618,26 @@ def run_team(args, passthrough, table):
     # Members first, lead last: the lead is not spawned into a pane, so its turn
     # only prints the command for you to run, and that reads better at the end.
     # Members boot fine without it: the mailbox is a directory, not a process.
+    population = RESOLVER.team_population(args.team)
+    former = [name for name, (in_roster, _why) in sorted(population.items()) if not in_roster]
+    if getattr(args, "all_members", False):
+        members = members + [{"agentId": f"{name}@{args.team}", "name": name, "former": True}
+                             for name in former]
+        former = []
     ordered = sorted(members, key=lambda m: 1 if m.get("agentId") == lead_id else 0)
     where = (f"socket {socket} ({socket_why}, {socket_state(socket)})" if socket
              else "socket resolved per member")
     print(f"team     {args.team}  ({len(ordered)} members, {where})")
+    note = former_members_note(former)
+    if note:
+        print(f"         {note}")
 
     jobs = []
     for member in ordered:
         agent_id = member.get("agentId")
         name = member.get("name") or "?"
+        if member.get("former"):
+            print(f"  [{name}] former member, will re-register")
         ensure_inbox(args.team, name, args.dry_run)  # every member, not just the launched ones
         if args.no_lead and agent_id == lead_id:
             jobs.append((name, None))
@@ -5557,6 +5602,33 @@ def run_selftest(live=False):
     wrong = sorted(k for k, good in asks.items() if not good)
     check("a redirect timing suggests is asked, not taken", not wrong, ", ".join(wrong))
 
+    # --- a team is larger than its roster, and a run that takes the roster says so
+    pop_wrong, with_former = [], None
+    for team in list(RESOLVER.known_teams())[:40]:
+        population = RESOLVER.team_population(team)
+        listed = {m.get("name") for m in (RESOLVER.roster_of(team) or {}).get("members", [])
+                  if m.get("name")}
+        if not listed <= set(population):
+            pop_wrong.append(f"{team} loses {sorted(listed - set(population))[:2]}")
+        if any(not in_roster for in_roster, _why in population.values()):
+            with_former = with_former or team
+    if with_former:
+        extras = [n for n, (in_roster, _w) in RESOLVER.team_population(with_former).items()
+                  if not in_roster]
+        listed = {m.get("name") for m in (RESOLVER.roster_of(with_former) or {}).get("members", [])}
+        if set(extras) & listed:
+            pop_wrong.append(f"{with_former} calls a listed member former")
+    check("a team population contains its roster", not pop_wrong, "; ".join(pop_wrong[:2])
+          or f"{len(RESOLVER.known_teams())} teams, unrostered members on {with_former}")
+
+    notes = {
+        "silent when the run covers everyone": former_members_note([]) is None,
+        "names the count and the flag": (lambda n: n and "3 more" in n and "--all" in n)(
+            former_members_note(["a", "b", "c"])),
+    }
+    wrong = sorted(k for k, good in notes.items() if not good)
+    check("a team run says what it left out", not wrong, ", ".join(wrong))
+
 
     # --- the composed answer agrees with the parts it is composed of
     seen = [(e["team"], e["member"].get("name")) for e in RESOLVER.scan_teams()
@@ -5787,6 +5859,9 @@ def main():
                              "open a terminal or change directory (each cleans up after itself)")
     parser.add_argument("--selftest", action="store_true",
                         help="check the tool's invariants against this machine; changes nothing")
+    parser.add_argument("--all", dest="all_members", action="store_true",
+                        help="with a team, also resume members the roster no longer lists "
+                             "but whose transcripts are stamped with it")
     parser.add_argument("--standing", action="store_true",
                         help="say where the named agent stands with its lead: parentage, "
                              "liveness, the team the lead runs as, and whether its mail is read")
