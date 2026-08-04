@@ -1395,7 +1395,42 @@ class Resolver:
         def conflicts(self, field):
             return {c[0] for c in self.cands.get(field, [])}
 
-    def identity(self, session_uuid=None, agent_id=None, for_team=None, to_team=None):
+    def place(self, res, typed_team, for_team=None, to_team=None, keep_team=False):
+        """(team, why) for the agent this transcript holds. The only writer of it.
+
+        An address locates an agent; it does not place one. Completion collapses
+        an agent to a single entry, so a stale team can be the only spelling
+        available to type, and honouring it puts an agent where its own evidence
+        says it is not. Moving an agent is what --to-team says and rebuilding a
+        named team is what for_team says: destinations are spoken. A team inside
+        an agent id is not spoken, it is how the agent was found.
+
+        Precedence: a spoken destination, then --keep-team, then the team whose
+        members are running, then the team as addressed. Several running crews is
+        a choice between live teams and not the engine's to make.
+        """
+        spoken = to_team or for_team
+        if spoken:
+            return spoken, "asked for"
+        led = self.teams_led_by(res.path.stem)
+        live_led = [t for t in led if t in self.live_teams()]
+        if keep_team:
+            if typed_team and live_led and typed_team not in live_led:
+                warn(f"--keep-team: staying on {typed_team}, though this transcript's "
+                     f"live members are on {', '.join(live_led)}; their mail goes "
+                     f"unread while it runs as {typed_team}")
+            return typed_team, "as typed"
+        if len(live_led) > 1:
+            die(f"this transcript leads {len(live_led)} teams with members running "
+                f"({', '.join(live_led)}); name one with --team")
+        if live_led and live_led[0] != typed_team:
+            return live_led[0], (f"its live members are here; {typed_team} as addressed "
+                                 f"has nobody running" if typed_team
+                                 else "its live members are here")
+        return typed_team, "as addressed"
+
+    def identity(self, session_uuid=None, agent_id=None, for_team=None, to_team=None,
+                 keep_team=False):
         merged = self._Merged()
         leads_team = None
         team_entry = None
@@ -1441,6 +1476,14 @@ class Resolver:
         transcript = (res.path, res.fields, res.last_ts)
         others = [(p, f, t) for p, f, t in res.others]
         session_uuid = res.path.stem
+
+        # Located; now placed. Clearing the entry when the team changes is what
+        # keeps a stale roster from contributing the team it described a life ago:
+        # its appearance still travels, through the payload record below.
+        placed, placed_why = self.place(res, team, for_team, to_team, keep_team)
+        redirected = bool(placed and placed != team)
+        if redirected:
+            team, team_entry = placed, None
 
         if not team_entry:  # a uuid or a stranger's id: adopt the roster the transcript names
             stamped_team, stamped_name = res.stamped("teamName"), res.stamped("agentName")
@@ -1591,6 +1634,7 @@ class Resolver:
             "via": res.via,
             "objections": objections,
             "leads_team": leads_team,
+            "placed": (placed, placed_why) if redirected else None,
             "resolution": res,
             "to_team": to_team,
         }
@@ -2563,7 +2607,8 @@ def build(args):
     happen, since the guards that turn a run into a noop sit further down.
     """
     return RESOLVER.identity(session_uuid=args.resume, agent_id=args.agent_id,
-                             for_team=getattr(args, "for_team", None), to_team=args.to_team)
+                             for_team=getattr(args, "for_team", None), to_team=args.to_team,
+                             keep_team=getattr(args, "keep_team", False))
 
 
 def enforce_ctx(ctx, args):
@@ -3741,21 +3786,12 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         print(f"{prefix}lead     {agent_id}")
         print(f"{prefix}session  {ctx['session_uuid']}  ({ctx['transcript'][0]})")
         print(f"{prefix}via      {ctx['via']}")
+        if ctx.get("placed"):
+            print(f"{prefix}team     {ctx['placed'][0]}  ({ctx['placed'][1]})")
         title = session_title(ctx["transcript"][0], limit=100)
         if title:
             print(f"{prefix}title    {title}")
         print(f"{prefix}cwd      {RESOLVER.field(ctx, 'cwd') or '(inherit)'}")
-        # A lead resumed several times leads a team per life while appending to
-        # one transcript. Coming back as one of them leaves the others' members
-        # addressing a lead that is no longer theirs, and this is the last moment
-        # anyone can be told: the exec below does not return.
-        team_now = RESOLVER.field(ctx, "teamName")
-        abandoned = sorted(set(RESOLVER.teams_led_by(ctx["session_uuid"]))
-                           & RESOLVER.live_teams() - {team_now})
-        for other in abandoned:
-            warn(f"this transcript also leads {other}, which has members running now; "
-                 f"resuming as {team_now} leaves their mail unread. "
-                 f"Resume it as team-lead@{other} instead to serve them")
         owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
         if owner and owner[2] and not args.force:
             warn(f"already live as pid {owner[0]}{state_note(owner[0])}; pass --force to run a second copy")
@@ -3826,6 +3862,8 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     print(f"{prefix}agent    {agent_id or '(unknown)'}")
     print(f"{prefix}session  {ctx['session_uuid']}  ({ctx['transcript'][0]})")
     print(f"{prefix}via      {ctx['via']}")
+    if ctx.get("placed"):
+        print(f"{prefix}team     {ctx['placed'][0]}  ({ctx['placed'][1]})")
     title = session_title(ctx["transcript"][0], limit=100)
     if title:
         print(f"{prefix}title    {title}")
@@ -6153,22 +6191,45 @@ def run_selftest(live=False):
         f"{len(unresolved)} tie(s) held")
 
     # A lead that leads several teams is told which live ones it is walking away
-    # from. The exec does not return, so this is the last moment to say it.
-    multi_live = [(stem, sorted(set(RESOLVER.teams_led_by(stem)) & RESOLVER.live_teams()))
-                  for stem in {path.stem for paths in claimed.values() for path in paths}]
-    multi_live = [(stem, teams) for stem, teams in multi_live if len(teams) >= 1
-                  and len(RESOLVER.teams_led_by(stem)) > 1]
-    if multi_live:
-        stem, live_led = multi_live[0]
-        # Coming back as one of them must name the others; coming back as the only
-        # live one must say nothing.
-        abandoned = sorted(set(RESOLVER.teams_led_by(stem)) & RESOLVER.live_teams() - {live_led[0]})
-        check("a lead is told which live team it leaves behind",
-              set(abandoned) <= set(RESOLVER.teams_led_by(stem))
-              and live_led[0] not in abandoned,
-              f"{stem[:8]} leads {RESOLVER.teams_led_by(stem)}, live {live_led}")
+
+    # Placement: an address locates, evidence places. The same agent, addressed
+    # four ways, must come back to the team its members are running under.
+    spec = None
+    for stem in {path.stem for paths in claimed.values() for path in paths}:
+        led = RESOLVER.teams_led_by(stem)
+        live_led = [t for t in led if t in RESOLVER.live_teams()]
+        if len(led) > 1 and len(live_led) == 1:
+            spec = (stem, led, live_led[0])
+            break
+    if spec:
+        # Not named `live`: that is run_selftest's own parameter, and shadowing it
+        # here opened the live tier inside a read-only run.
+        stem, led, serving = spec
+        stale = next(t for t in led if t != serving)
+        res = RESOLVER.resolve_transcript(session_uuid=stem)
+        placed = {}
+        with contextlib.redirect_stderr(io.StringIO()):
+            placed["as addressed with a stale team"] = RESOLVER.place(res, stale)[0] == serving
+            placed["addressed with the live team"] = RESOLVER.place(res, serving)[0] == serving
+            placed["--keep-team pins what was typed"] = (
+                RESOLVER.place(res, stale, keep_team=True)[0] == stale)
+            placed["a spoken destination wins"] = (
+                RESOLVER.place(res, stale, for_team="session-elsewhere")[0] == "session-elsewhere")
+        wrong = sorted(k for k, ok in placed.items() if not ok)
+        check("an address locates an agent, evidence places it", not wrong, ", ".join(wrong))
     else:
-        check("multi-team lead with a live team (none here)", True, "skipped")
+        check("placement (no multi-team lead with one live crew here)", True, "skipped")
+
+    # And it is decided in one function, so the two-sites fault cannot regrow.
+    deciders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name in (
+                "place", "run_selftest", "diagnose_team", "run_census"):
+            continue
+        body = ast.get_source_segment(source, node) or ""
+        if "live_teams()" in body and "teams_led_by(" in body:
+            deciders.append(node.name)
+    check("a team is placed in one function", not deciders, ", ".join(sorted(deciders)))
 
     # --- one job per agent, whatever assembled the list
     said = ""
