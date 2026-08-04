@@ -4368,19 +4368,17 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
     as a team does; otherwise the first agent to reach one decides.
     """
     check_flag_scope(passthrough, sum(1 for _, a in jobs if a is not None))
-    results, roles, outcomes = [], [], []
+    results, outcomes = [], []
     for label, sub_args in jobs:
         if label is not None:
             print(f"\n[{label}]")
         if sub_args is None:
             print(f"{prefix}skipped")
             results.append((label, "skipped"))
-            roles.append(False)
             continue
         outcome = run_one(sub_args, passthrough, table, prefix=prefix,
                           pending=[o.pending_write for o in outcomes if o.pending_write])
         results.append((label, outcome.status))
-        roles.append(outcome.is_lead)
         outcomes.append(outcome)
         socket = socket or outcome.socket
     if len(jobs) > 1:
@@ -4389,13 +4387,11 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
             print(f"  {label:<24} {status}")
     report_transcript_writes([o.pending_write for o in outcomes if o.pending_write], args)
     check_flags_took_effect(passthrough, results, args)
-    if any(roles):
-        # A run that includes the lead ends at the lead: either this process became
-        # it, or it was already up, or we printed its command. In every one of those
-        # the thing to look at is the lead, so attaching would put the swarm in front
-        # of you instead. Keyed on the lead being in the run rather than on how it
-        # turned out, because "already live" is the case that most looks like a
-        # reason to attach and is not one.
+    if any(o.is_lead and o.status == "manual" for o in outcomes):
+        # The run ends by handing over the lead's command, and attaching would
+        # bury it. Keyed on that handover rather than on the lead being in the
+        # run: a lead that was already up leaves this shell with nothing to look
+        # at, so the swarm is the only thing left to offer.
         return 1 if any(s == "failed" for _, s in results) else 0
     if not args.dry_run and socket and any(s in ("launched", "noop") for _, s in results):
         print()
@@ -5356,6 +5352,31 @@ def run_selftest(live=False):
         shutil.rmtree(watch, ignore_errors=True)
     wrong = sorted(k for k, good in writes.items() if not good)
     check("a launch is followed up per agent", not wrong, ", ".join(wrong))
+
+    # --- the swarm is offered unless the run already handed the user somewhere
+    real_one, real_confirm = globals()["run_one"], globals()["confirm_attach"]
+    asked = []
+    try:
+        globals()["confirm_attach"] = lambda targets, table, sock: asked.append(sock) and False
+        offers = {}
+        for label, status in (("a lead already up", "noop"), ("a lead handed over", "manual")):
+            # A launched member rides along in both runs, so the attach path is
+            # reachable either way and only the lead's outcome decides. Without
+            # it the manual case would pass because a lone manual run never
+            # reaches the offer at all, which tests nothing.
+            def stub(*a, _s=status, _seen=[], **k):
+                _seen.append(1)
+                return (Outcome(_s, "sock", True, None) if len(_seen) == 1
+                        else Outcome("launched", "sock", False, None))
+            globals()["run_one"] = stub
+            asked.clear()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                run_agents(_Args(), [], {}, [("lead", _Args()), ("member", _Args())], None)
+            offers[label] = bool(asked) == (status == "noop")
+    finally:
+        globals()["run_one"], globals()["confirm_attach"] = real_one, real_confirm
+    wrong = sorted(k for k, good in offers.items() if not good)
+    check("the swarm is offered when nothing else took over", not wrong, ", ".join(wrong))
 
     check("a self-migrate is refused",
           bool(RESOLVER.self_holds_transcript("selftest-uuid",
