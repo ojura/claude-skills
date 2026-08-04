@@ -6050,8 +6050,13 @@ def run_selftest(live=False):
     admitted = sorted(k for k, rec in quotations.items()
                       if list(RESOLVER._walk_spawn_payloads(rec)))
     genuine = list(RESOLVER._walk_spawn_payloads({"toolUseResult": payload}))
-    check("a quoted payload is not evidence", not admitted and len(genuine) == 1,
-          ", ".join(admitted) or f"{len(genuine)} genuine found")
+    # Once per occurrence, whatever it is wrapped in. Depth must not multiply a
+    # payload, and a line that genuinely carries two spawns must still yield two.
+    buried = list(RESOLVER._walk_spawn_payloads({"toolUseResult": {"a": {"b": payload}}}))
+    twin = list(RESOLVER._walk_spawn_payloads({"toolUseResult": [payload, dict(payload)]}))
+    check("a quoted payload is not evidence",
+          not admitted and len(genuine) == 1 and len(buried) == 1 and len(twin) == 2,
+          ", ".join(admitted) or f"genuine={len(genuine)} buried={len(buried)} twin={len(twin)}")
 
     # --- one job per agent, whatever assembled the list
     said = ""
