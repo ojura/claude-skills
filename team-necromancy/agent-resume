@@ -4671,6 +4671,15 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
     as a team does; otherwise the first agent to reach one decides.
     """
     check_flag_scope(passthrough, sum(1 for _, a in jobs if a is not None))
+    seen = [label for label, _a in jobs]
+    twice = sorted({label for label in seen if seen.count(label) > 1})
+    if twice:
+        # Two jobs for one agent is two launches of one conversation. The guards
+        # that would catch the second read a process table snapshotted before the
+        # first, so they see nothing and it proceeds. Refused here rather than in
+        # each job-builder, so no future one can reintroduce it.
+        die(f"{', '.join(twice)} appears twice in this run; that would start a "
+            f"second process on one transcript")
     results, outcomes = [], []
     for label, sub_args in jobs:
         if label is not None:
@@ -4758,8 +4767,12 @@ def run_team(args, passthrough, table):
     # Members first, lead last: the lead is not spawned into a pane, so its turn
     # only prints the command for you to run, and that reads better at the end.
     # Members boot fine without it: the mailbox is a directory, not a process.
+    # Against the roster in hand, not the one on disk. A rebuilt team's roster is
+    # a value this run just forged, and on a dry run it was never written, so
+    # asking the disk calls every member of it a former and the union doubles.
+    listed = {m.get("name") for m in members if m.get("name")}
     population = RESOLVER.team_population(args.team)
-    former = [name for name, (in_roster, _why) in sorted(population.items()) if not in_roster]
+    former = [name for name in sorted(population) if name not in listed]
     if getattr(args, "all_members", False):
         members = members + [{"agentId": f"{name}@{args.team}", "name": name, "former": True}
                              for name in former]
@@ -5817,6 +5830,19 @@ def run_selftest(live=False):
     }
     wrong = sorted(k for k, good in notes.items() if not good)
     check("a team run says what it left out", not wrong, ", ".join(wrong))
+
+    # --- one job per agent, whatever assembled the list
+    said = ""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            run_agents(_Args(), [], {}, [("twin", _Args()), ("twin", _Args())], None)
+    except BaseException:  # a crash is not a refusal, and must not read as one
+        said = err.getvalue()
+    # The reason, not merely that it exited: a run that died of something else
+    # would otherwise read as a refusal and this check would pass on any code.
+    check("one agent cannot be launched twice in a run", "appears twice" in said,
+          f"exited saying {said.strip()[:60]!r}" if said else "the duplicate was accepted")
 
     # --- what a boot recorded about itself outranks a guess about it
     real_mints = RESOLVER._mints
