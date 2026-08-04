@@ -30,6 +30,18 @@ Harness-injected user nodes (`isMeta: true` — skill content dumps, `<local-com
 
 Because it runs to root, the stdout **reading guidance** is the part you act on: it prints the **read-back intervals** between compaction boundaries (line ranges with their compaction times), marks the one that is exactly what the latest compaction dropped and the tail already in your live context, and puts a **`+`** on any interval that contains a prior `/reingest-transcript` — so you can read the slice you need and skip a transcript-of-a-transcript instead of ingesting it twice. (The `+` errs loud: it fires on any sighting of the command, including a summary merely quoting it, so treat it as "look here" not "proven reingest.")
 
+## pseudocompact.py — graft a synthetic compaction leaf
+
+The inverse companion to reingesting: when a session's context is exhausted (or its tail is dead cruft), pseudocompact it so the next resume starts with an empty window while `logicalParentUuid` keeps the full ancestry walkable.
+
+```
+python3 ~/.claude/skills/reingest-transcript/pseudocompact.py <SESSION.jsonl | session-id> [--leaf UUID] [--message TEXT] [--dry-run]
+```
+
+Appends a rootless `isCompactSummary` user entry (`parentUuid: null`, `logicalParentUuid` = chosen leaf, default text "The conversation was compacted.") **plus a trailing `last-prompt` line pointing at it — the harness picks its resume leaf from the file's final `last-prompt` line, and silently ignores the new entry without it** (found empirically 2026-08-03). `--leaf UUID` also trims everything after that entry (a dead tail of failed turns), keeping an adjacent `last-prompt` that already points at it. Backs up first, verifies no newly-dangling refs (pre-existing cross-file lpu danglers are tolerated), warns about live processes, and survives a trailing `last-prompt` whose leafUuid a killed process left pointing at an entry it never persisted.
+
+After running it: **kill and re-resume** the session — a live process keeps its old in-memory leaf, and prompting it appends entries parented on uuids that may no longer exist. A cancelled `/resume` in the fresh process writes a cruft turn plus a `last-prompt` re-aiming the leaf at it; delete those trailing lines (the correct `last-prompt` is right above them) rather than re-running the tool.
+
 ## Gotchas (don't re-learn these)
 - **Read the guidance, not the whole file.** The walk goes all the way to root, but you rarely want all of it — read the one-boundary-back slice the report points at (what the latest compaction flattened), and skip the lines it marks as already-in-context or as a prior reingest.
 - **Prefer `--mode text`.** Enriched roughly doubles the turn count (prose and tool calls are often separate nodes) and is token-heavy — use it only when the action sequence matters.
