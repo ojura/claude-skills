@@ -4870,13 +4870,21 @@ def rebuild_roster(team, args, passthrough, table):
 def select_jobs(members, population, live, lead_id, all_members, team):
     """(members to run, names left out) for one team run.
 
-    A record is not a policy. When members of this team are running, they are
-    what the team is now, and everything else is history to report rather than
-    restart. When none is, the record is all there is and resuming it whole is
-    the only thing resuming can mean. --all is always everything.
+    Liveness is evidence about the world, a record is evidence about the past,
+    and which agents to run is a question about the world. So the live members
+    plus the lead, where live means wearing the team in argv whether or not any
+    record has heard of it, and the record proposes nobody by itself while
+    anyone is alive. Only when nothing is alive does the record become the
+    world. This is the live-argv rung's logic at the level of a set: a process
+    wearing the team is a member, its identity frozen at exec, for the same
+    reason argv outranks stamps. --all is always everything.
     """
     def entry(name):
-        return {"agentId": f"{name}@{team}", "name": name, "former": True}
+        # A live member the record lacks is not a former anything. It is running
+        # now and merely unrecorded, and a section header calling it an ex-member
+        # describes the record's gap as the agent's state.
+        kind = "unrecorded" if name in live else "former"
+        return {"agentId": f"{name}@{team}", "name": name, kind: True}
 
     listed = {m.get("name") for m in members if m.get("name")}
     if all_members:
@@ -4941,7 +4949,9 @@ def run_team(args, passthrough, table):
     for member in ordered:
         agent_id = member.get("agentId")
         name = member.get("name") or "?"
-        if member.get("former"):
+        if member.get("unrecorded"):
+            print(f"  [{name}] unrecorded member, running now, will re-register")
+        elif member.get("former"):
             print(f"  [{name}] former member, will re-register")
         ensure_inbox(args.team, name, args.dry_run)  # every member, not just the launched ones
         if args.no_lead and agent_id == lead_id:
@@ -6016,6 +6026,10 @@ def run_selftest(live=False):
     got, left = select_jobs(list(roster), pop, {"a", "d"}, "team-lead@t", False, "t")
     picks["a live member the record lacks still runs"] = (
         {m["name"] for m in got} == {"a", "d", "team-lead"} and "d" not in left)
+    # It is running, so it is unrecorded rather than former. Calling it former
+    # would describe the record's gap as the agent's state.
+    picks["and is not called a former member"] = any(
+        m["name"] == "d" and m.get("unrecorded") and not m.get("former") for m in got)
     got, left = select_jobs(list(roster), pop, set(), "team-lead@t", False, "t")
     picks["with none live the record is the team"] = (
         {m["name"] for m in got} == {"team-lead", "a", "b"} and left == ["c", "d"])
