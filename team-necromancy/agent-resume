@@ -1060,6 +1060,30 @@ class Resolver:
         """Where this member's mailbox lives."""
         return self.teams_dir / team / "inboxes" / f"{name}.json"
 
+    def inbox_state(self, team):
+        """{name: (undelivered count, oldest timestamp)} for this team's mailboxes.
+
+        Mail nobody has read is the symptom a severed team shows first, and it
+        is on disk whether or not anything is running.
+        """
+        state = {}
+        try:
+            boxes = sorted((self.teams_dir / team / "inboxes").iterdir())
+        except OSError:
+            return state
+        for box in boxes:
+            if box.suffix != ".json" or not box.is_file():
+                continue
+            try:
+                mail = json.loads(box.read_text() or "[]")
+            except (OSError, ValueError):
+                continue
+            if not isinstance(mail, list):
+                continue
+            stamps = sorted(m.get("timestamp") or "" for m in mail if isinstance(m, dict))
+            state[box.stem] = (len(mail), stamps[0] if stamps else None)
+        return state
+
     def team_dirs(self):
         """Every team directory on disk, roster or not."""
         return [d for d in self.teams_dir.glob("*") if d.is_dir()]
@@ -1218,6 +1242,29 @@ class Resolver:
             if stamped_team == team and name and name not in people:
                 people[name] = (False, "a transcript stamped with this team")
         return people
+
+    def worn_team(self, pid):
+        """The team this live process names in its own argv, or None.
+
+        A lead that states its team read the roster when it booted. One that
+        does not is reading a projection nothing outside it can see.
+        """
+        return next((e.get("team") for e in self.live_sessions() if e["pid"] == pid), None)
+
+    def teams_with_live_evidence(self):
+        """Teams with a live lead, a live member, or mail nobody has read.
+
+        What a diagnosis is for. Every other team on the machine is history
+        until someone asks for it by name.
+        """
+        teams = {e["team"] for e in self.live_sessions() if e.get("team")}
+        for team in self.known_teams():
+            if team in teams:
+                continue
+            pid, alive, _how, _exact = self.lead_pid(None, team)
+            if (pid and alive) or any(n for n, _o in self.inbox_state(team).values() if n):
+                teams.add(team)
+        return teams
 
     def sole_mint_pairing(self, pid):
         """The team only this process could have minted, or None if ambiguous.
@@ -2051,7 +2098,7 @@ class Resolver:
         # read this file when it booted, and a plain one is not knowable from
         # here at all. Emptying its members stops the loop, and repopulating the
         # file does not start it again.
-        worn = next((e.get("team") for e in self.live_sessions() if e["pid"] == pid), None)
+        worn = self.worn_team(pid)
         if not members:
             polls = (False, "the roster lists no members")
         elif worn:
@@ -4330,6 +4377,84 @@ def run_standing(args):
     return 0
 
 
+def diagnose_team(team):
+    """(verdict, lines, remedies) for one team. Asks the engine; reads nothing.
+
+    Every fact here is an answer, so the doctor cannot reach a conclusion the
+    tool would not reach when it acts.
+    """
+    pid, alive, how, _exact = RESOLVER.lead_pid(None, team)
+    lead_team, exact_team = RESOLVER.team_minted_by(pid) if (pid and alive) else (None, False)
+    worn = RESOLVER.worn_team(pid) if (pid and alive) else None
+    population = RESOLVER.team_population(team)
+    listed = [n for n, (in_roster, _w) in population.items() if in_roster]
+    former = [n for n, (in_roster, _w) in population.items() if not in_roster]
+    mail = RESOLVER.inbox_state(team)
+    waiting = {n: v for n, v in mail.items() if v[0]}
+    live = {n: RESOLVER.wearers(f"{n}@{team}") for n in population}
+    live = {n: w for n, w in live.items() if w}
+    doubled = sorted(n for n, w in live.items() if len({p for p, _t in w}) > 1)
+
+    lines = [f"lead     {'pid ' + str(pid) if pid else '(none)'}"
+             f"{'' if alive else ', not running'}  ({how})"]
+    if pid and alive:
+        lines.append(f"runs as  {lead_team or '(unknown)'}"
+                     f"  [{'exact' if exact_team else 'inferred from boot timing'}]")
+    lines.append(f"members  {len(listed)} listed, {len(former)} former, {len(live)} live")
+    for name, (count, oldest) in sorted(waiting.items()):
+        lines.append(f"mail     {count} waiting for {name}, oldest {oldest}")
+    for name in doubled:
+        lines.append(f"warning  {name} is worn by {len(live[name])} processes at once")
+
+    reads = bool(pid and alive and lead_team == team)
+    remedies = []
+    if (waiting or live) and not reads:
+        verdict = "SEVERED"
+        remedies.append((f"{TOOL} {team}", "rebuilds the roster and places its members"))
+        if pid and alive and lead_team and lead_team != team:
+            remedies.append((f"--to-team live on each member", "restarts them onto {lead_team}"
+                             .format(lead_team=lead_team)))
+    elif not reads:
+        verdict = "DEGRADED"
+    elif not worn:
+        verdict = "UNKNOWABLE"
+        remedies.append((f"{TOOL} team-lead@{team}",
+                         "restarts the lead, which reads this roster on the way up"))
+    elif former or doubled:
+        verdict = "DEGRADED"
+        if former:
+            remedies.append((f"{TOOL} {team} --all", "also resumes its former members"))
+    else:
+        verdict = "CONNECTED"
+    return verdict, lines, remedies
+
+
+def run_doctor(args):
+    """Say whether each team's lead is connected to it. Diagnoses, never treats."""
+    target = args.team or (args.agent_id or "").partition("@")[2] or None
+    everything = RESOLVER.known_teams()
+    if target:
+        teams, skipped = [target], 0
+    else:
+        interesting = RESOLVER.teams_with_live_evidence()
+        teams = sorted(interesting) if not args.all_members else sorted(everything)
+        skipped = 0 if args.all_members else len(everything) - len(teams)
+    worst = 0
+    for team in teams:
+        verdict, lines, remedies = diagnose_team(team)
+        print(f"\n{verdict:<11} {team}")
+        for line in lines:
+            print(f"  {line}")
+        for what, cost in remedies:
+            print(f"  remedy   {what}  ({cost})")
+        if verdict == "SEVERED":
+            worst = 1
+    if skipped:
+        print(f"\n{skipped} team(s) with nothing live and no waiting mail were not "
+              f"examined; --all covers them")
+    return worst
+
+
 def run_census():
     """Count what this machine's ~/.claude actually contains. Read-only.
 
@@ -5366,6 +5491,26 @@ def run_selftest(live=False):
                         and writes_roster(node) and reads_a_field(node))
     check("a roster writer reads no field of its own", not assemblers, ", ".join(assemblers))
 
+    # The doctor composes answers and gathers nothing. A diagnosis assembled from
+    # its own reads could reach a conclusion the tool would not reach when acting,
+    # which is the whole fault it exists to report on.
+    gathered = []
+    for node in tree.body:
+        if not (isinstance(node, ast.FunctionDef) and node.name in ("diagnose_team", "run_doctor")):
+            continue
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call):
+                continue
+            fn = call.func
+            if isinstance(fn, ast.Name) and fn.id in ("open", "Path"):
+                gathered.append(f"{node.name} calls {fn.id}")
+            if isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name):
+                if fn.value.id in ("json", "os", "sp", "subprocess", "shutil", "time"):
+                    gathered.append(f"{node.name} calls {fn.value.id}.{fn.attr}")
+                if fn.value.id == "RESOLVER" and fn.attr.startswith("_"):
+                    gathered.append(f"{node.name} reaches {fn.attr}")
+    check("the doctor invents no evidence", not gathered, ", ".join(sorted(set(gathered))))
+
     # Assembly is exercised, not just its parts. A NameError in identity() once
     # passed a full battery of structural checks while every real invocation of
     # the tool died: nothing in the suite called the function that answers who an
@@ -6113,6 +6258,8 @@ def main():
     parser.add_argument("--all", dest="all_members", action="store_true",
                         help="with a team, also resume members the roster no longer lists "
                              "but whose transcripts are stamped with it")
+    parser.add_argument("--doctor", action="store_true",
+                        help="say whether each team's lead is connected to it; reports only")
     parser.add_argument("--standing", action="store_true",
                         help="say where the named agent stands with its lead: parentage, "
                              "liveness, the team the lead runs as, and whether its mail is read")
@@ -6160,6 +6307,9 @@ def main():
         return run_selftest(live=args.live)
     if args.live:
         die("--live extends --selftest; it does nothing on its own")
+
+    if args.doctor:
+        return run_doctor(args)
 
     if args.census:
         return run_census()
