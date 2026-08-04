@@ -1251,6 +1251,10 @@ class Resolver:
                 people[name] = (False, "a transcript stamped with this team")
         return people
 
+    def live_teams(self):
+        """Teams a live process is currently running as, from its own argv."""
+        return {e["team"] for e in self.live_sessions() if e.get("team")}
+
     def worn_team(self, pid):
         """The team this live process names in its own argv, or None.
 
@@ -3686,6 +3690,30 @@ def auto_redirect(ctx, args, table, prefix=""):
     ctx["to_lead"] = RESOLVER.team_lead_session(dest)
 
 
+def record_membership(ctx, args, pane, alive=True):
+    """Put this agent in its team's roster, whether or not this run launched it.
+
+    Being listed is what makes a member addressable: a lead delivers mail from
+    the members it knows about, so an unlisted one can write to the lead's inbox
+    and never be read from it. That is true of an agent already running just as
+    much as of one this run started, and a run that noops has still established
+    that the agent is there.
+    """
+    if ctx.get("to_team"):
+        register_member(RESOLVER.roster_record(ctx, team=ctx["to_team"]), pane, args.dry_run, alive)
+        if ctx["to_team"] != RESOLVER.field(ctx, "teamName"):
+            retire_member(ctx, args.dry_run)
+        return
+    team = RESOLVER.field(ctx, "teamName")
+    ensure_inbox(team, RESOLVER.field(ctx, "agentName"), args.dry_run)
+    if args.no_update_config:
+        return
+    if ctx.get("team_entry"):
+        update_team_config(ctx, RESOLVER.roster_record(ctx), pane, args.dry_run, alive)
+    elif team and RESOLVER.roster_path(team).exists():
+        register_member(RESOLVER.roster_record(ctx, team=team), pane, args.dry_run, alive)
+
+
 def run_one(args, passthrough, table, prefix="", pending=()):
     """Resume one agent. Returns Outcome(status, socket, is_lead), status being
     'noop' | 'launched' | 'manual' | 'failed'.
@@ -3717,6 +3745,17 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         if title:
             print(f"{prefix}title    {title}")
         print(f"{prefix}cwd      {RESOLVER.field(ctx, 'cwd') or '(inherit)'}")
+        # A lead resumed several times leads a team per life while appending to
+        # one transcript. Coming back as one of them leaves the others' members
+        # addressing a lead that is no longer theirs, and this is the last moment
+        # anyone can be told: the exec below does not return.
+        team_now = RESOLVER.field(ctx, "teamName")
+        abandoned = sorted(set(RESOLVER.teams_led_by(ctx["session_uuid"]))
+                           & RESOLVER.live_teams() - {team_now})
+        for other in abandoned:
+            warn(f"this transcript also leads {other}, which has members running now; "
+                 f"resuming as {team_now} leaves their mail unread. "
+                 f"Resume it as team-lead@{other} instead to serve them")
         owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
         if owner and owner[2] and not args.force:
             warn(f"already live as pid {owner[0]}{state_note(owner[0])}; pass --force to run a second copy")
@@ -3837,8 +3876,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         print(f"{prefix}noop     {agent_id} is already running in pane {want_pane} (pid {here[0]}{state_note(here[0])})")
         if not args.no_color:
             tint_pane(socket, want_pane, RESOLVER.field(ctx, "color"), RESOLVER.field(ctx, "agentName"), args.dry_run)
-        if not args.no_update_config:
-            update_team_config(ctx, RESOLVER.roster_record(ctx), want_pane, args.dry_run)
+        record_membership(ctx, args, want_pane)
         note_identity(ctx, prefix)
         return Outcome("noop", socket, False, None)
     if others and not replace_pane:
@@ -3852,6 +3890,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             f"session {ctx['session_uuid']} is live as pid {owner[0]}{state_note(owner[0])}; "
             "pass --force to resume a second copy"
         )
+        record_membership(ctx, args, want_pane)
         note_identity(ctx, prefix)
         return Outcome("noop", socket, False, None)
 
@@ -3862,6 +3901,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             f"{agent_id} is already running outside pane {want_pane or '?'} "
             f"(pid {', '.join(map(str, elsewhere))}); pass --force to start another instance"
         )
+        record_membership(ctx, args, want_pane)
         note_identity(ctx, prefix)
         return Outcome("noop", socket, False, None)
 
@@ -3940,23 +3980,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         else:
             warn(f"the launch in pane {pane} is not running: {why}; recording it as inactive")
 
-    if ctx.get("to_team"):
-        register_member(RESOLVER.roster_record(ctx, team=ctx["to_team"]), pane, args.dry_run, alive)
-        if ctx["to_team"] != RESOLVER.field(ctx, "teamName"):
-            retire_member(ctx, args.dry_run)
-    else:
-        team = RESOLVER.field(ctx, "teamName")
-        ensure_inbox(team, RESOLVER.field(ctx, "agentName"), args.dry_run)
-        if not args.no_update_config:
-            if ctx.get("team_entry"):
-                update_team_config(ctx, RESOLVER.roster_record(ctx), pane, args.dry_run, alive)
-            elif team and RESOLVER.roster_path(team).exists():
-                # The roster exists but has no entry for this agent, so there is
-                # nothing to update and the member would go unlisted: launched,
-                # inbox seeded, invisible to its own lead. A lead delivers mail
-                # from members it knows about, so an unlisted one can write to the
-                # lead's inbox and never be read from it.
-                register_member(RESOLVER.roster_record(ctx, team=team), pane, args.dry_run, alive)
+    record_membership(ctx, args, pane, alive)
 
     # A launch that has not written yet is not a verdict, only an unfinished
     # observation: the settle window is a second and a half and a healthy agent
@@ -4945,8 +4969,8 @@ def former_members_note(former):
     """
     if not former:
         return None
-    return (f"{len(former)} more stamped with this team are no longer in its roster; "
-            f"name one to re-register it, or pass --all")
+    return (f"{len(former)} more belong to this team and are not running; "
+            f"pass --all to resume them too")
 
 
 def run_team(args, passthrough, table):
@@ -6127,6 +6151,24 @@ def run_selftest(live=False):
     check("copies of one history still refuse", all(
         not RESOLVER.lead_transcript_for(t)[0] for t in unresolved),
         f"{len(unresolved)} tie(s) held")
+
+    # A lead that leads several teams is told which live ones it is walking away
+    # from. The exec does not return, so this is the last moment to say it.
+    multi_live = [(stem, sorted(set(RESOLVER.teams_led_by(stem)) & RESOLVER.live_teams()))
+                  for stem in {path.stem for paths in claimed.values() for path in paths}]
+    multi_live = [(stem, teams) for stem, teams in multi_live if len(teams) >= 1
+                  and len(RESOLVER.teams_led_by(stem)) > 1]
+    if multi_live:
+        stem, live_led = multi_live[0]
+        # Coming back as one of them must name the others; coming back as the only
+        # live one must say nothing.
+        abandoned = sorted(set(RESOLVER.teams_led_by(stem)) & RESOLVER.live_teams() - {live_led[0]})
+        check("a lead is told which live team it leaves behind",
+              set(abandoned) <= set(RESOLVER.teams_led_by(stem))
+              and live_led[0] not in abandoned,
+              f"{stem[:8]} leads {RESOLVER.teams_led_by(stem)}, live {live_led}")
+    else:
+        check("multi-team lead with a live team (none here)", True, "skipped")
 
     # --- one job per agent, whatever assembled the list
     said = ""
