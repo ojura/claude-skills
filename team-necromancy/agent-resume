@@ -4535,9 +4535,13 @@ def diagnose_team(team):
     return verdict, lines, remedies
 
 
-def run_doctor(args):
+def run_doctor(args, selector=None):
     """Say whether each team's lead is connected to it. Diagnoses, never treats."""
-    target = args.team or (args.agent_id or "").partition("@")[2] or None
+    named = args.team or (args.agent_id or "").partition("@")[2] or None
+    if not named and selector:
+        kind, value, _why = RESOLVER.classify(selector)
+        named = value if kind == "team" else (value or "").partition("@")[2] or None
+    target = named or None
     everything = RESOLVER.known_teams()
     if target:
         teams, skipped = [target], 0
@@ -6289,6 +6293,21 @@ def run_selftest(live=False):
     else:
         check("crew socket (no live crew on this machine)", True, "skipped")
 
+    # A named target is examined, not swept past. The doctor runs before the
+    # selector is applied, so it resolves its own target; taking it from
+    # args.team gave a full machine sweep for a team the user had typed.
+    known = sorted(RESOLVER.known_teams())
+    if known:
+        one = known[0]
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            run_doctor(_Args(team=None, agent_id=None, all_members=False), selector=one)
+        verdicts = [ln for ln in out.getvalue().splitlines()
+                    if ln[:1].isalpha() and ln.split()[:1] and ln.split()[0].isupper()]
+        check("a named team is the only one examined", len(verdicts) == 1,
+              f"{len(verdicts)} verdict(s) for {one}")
+    else:
+        check("doctor target (no teams on this machine)", True, "skipped")
+
     # --- one job per agent, whatever assembled the list
     said = ""
     try:
@@ -6622,7 +6641,10 @@ def main():
         die("--live extends --selftest; it does nothing on its own")
 
     if args.doctor:
-        return run_doctor(args)
+        # Before the help gate, because a sweep needs no selector, and resolving
+        # its own target because there is no args.team yet: a named team must not
+        # be silently swept into the whole machine.
+        return run_doctor(args, selector)
 
     if args.census:
         return run_census()
