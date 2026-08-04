@@ -49,6 +49,7 @@ import io
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import socket as socketlib
@@ -68,6 +69,11 @@ TOOL = Path(__file__).resolve().name
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 TEAMS_DIR = CLAUDE_DIR / "teams"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
+# Where the SessionStart hook records the id this life minted its team from.
+# The harness keeps that id in the running process and in the team directory's
+# name and nowhere else, so a later reader has only timing to join them by.
+MINT_LEDGER = CLAUDE_DIR / f"{TOOL}-mints.json"
+MINT_LEDGER_KEEP = 200
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 
 TMUX_SESSION = "claude-swarm"
@@ -513,6 +519,7 @@ class Resolver:
     def __init__(self):
         self._procs = None       # pid -> row, from ps
         self._stamps = None      # transcript stem -> (agentName, teamName)
+        self._mints = None       # what each boot's SessionStart recorded
         self._spawns = {}        # transcript stem -> {name: last payload of that name}
         self._spawn_log = {}     # transcript stem -> [(stamp, payload)] in file order
         self._by_agent = None    # "name@team" -> payload, across every transcript
@@ -1977,7 +1984,34 @@ class Resolver:
                 # from an earlier one's, so the rung declines rather than guessing.
                 if payload.get("team_name") and started and stamp >= started:
                     return payload["team_name"], True
+        recorded = self.recorded_mint(pid)
+        if recorded:
+            return recorded, True
         return next((team for team, owner, _ in self._boot_join() if owner == pid), None), False
+
+    def recorded_mint(self, pid):
+        """The team this process minted, as its own SessionStart wrote it down.
+
+        Exact: the id came from the process itself at the moment it booted, not
+        from a window around the time a directory appeared. The start time is
+        checked because pid numbers are recycled and a stale row would otherwise
+        name a live stranger's team.
+        """
+        for row in reversed(self._mint_ledger()):
+            if row.get("pid") == pid and row.get("sessionId"):
+                if pid_alive(pid, row.get("procStart")):
+                    return f"session-{row['sessionId'][:8]}"
+                return None
+        return None
+
+    def _mint_ledger(self):
+        if self._mints is None:
+            try:
+                rows = json.loads(MINT_LEDGER.read_text())
+                self._mints = rows if isinstance(rows, list) else []
+            except (OSError, ValueError):
+                self._mints = []
+        return self._mints
 
     def standing(self, agent_id, parent_session=None):
         """Where a member stands with its lead: parentage, liveness, team, mail.
@@ -2115,6 +2149,74 @@ def pid_alive(pid, procstart=None):
     if st is None or state in ("Z", "X"):
         return False
     return procstart in (None, "", st)
+
+
+def claude_ancestor(pid):
+    """The nearest claude process at or above this one, with its start time.
+
+    The hook runs as a grandchild of the session it belongs to, so the pid that
+    matters is up the tree rather than the one calling.
+    """
+    seen = 0
+    while pid and pid > 1 and seen < 8:
+        seen += 1
+        try:
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode().replace("\0", " ")
+        except OSError:
+            return None, None
+        if RESOLVER.is_claude(argv):
+            return pid, proc_stat(pid)[1]
+        try:
+            ppid = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1]
+        except (OSError, IndexError):
+            return None, None
+        pid = int(ppid)
+    return None, None
+
+
+def record_mint(event):
+    """Write down the session id this boot will name its implicit team after.
+
+    The harness hands SessionStart the same id it passes to sessionTeamName and
+    stores as leadSessionId, so recording it here is the one moment that id is
+    both knowable and joinable to a process.
+    """
+    session_id = (event or {}).get("session_id")
+    if not session_id:
+        return
+    pid, started = claude_ancestor(os.getppid())
+    if not pid:
+        return
+    try:
+        ledger = json.loads(MINT_LEDGER.read_text())
+        if not isinstance(ledger, list):
+            ledger = []
+    except (OSError, ValueError):
+        ledger = []
+    ledger = [e for e in ledger if e.get("pid") != pid][-MINT_LEDGER_KEEP:]
+    ledger.append({"sessionId": session_id, "pid": pid, "procStart": started,
+                   "transcript": (event or {}).get("transcript_path"),
+                   "at": int(time.time() * 1000)})
+    try:
+        replace_json(MINT_LEDGER, ledger, indent=1)
+    except OSError as exc:
+        warn(f"could not record the mint for {session_id}: {exc}")
+
+
+def hook_event():
+    """The SessionStart payload on stdin, or None when there is nothing to read.
+
+    A hook is handed its event on stdin; the same flag run by hand is not, and
+    reading unconditionally would hang the janitor on a terminal.
+    """
+    if sys.stdin is None or sys.stdin.closed or sys.stdin.isatty():
+        return None
+    try:
+        if not select.select([sys.stdin], [], [], 0.25)[0]:
+            return None
+        return json.loads(sys.stdin.read() or "null")
+    except (OSError, ValueError):
+        return None
 
 
 def state_note(pid):
@@ -4278,7 +4380,13 @@ def rosters_leads(rosters):
 
 
 def run_cleanup(dry=False):
-    """Everything the SessionStart hook reaps."""
+    """Everything the SessionStart hook does: record this boot, then reap.
+
+    Recording comes first because it is the half that cannot be redone later:
+    the id a life mints is knowable only from inside that life.
+    """
+    if not dry:
+        record_mint(hook_event())
     cleanup_sockets(dry)
     cleanup_teams(dry)
     return 0
@@ -4287,12 +4395,17 @@ def run_cleanup(dry=False):
 HOOK_MARKER = "--cleanup"
 
 
+def replace_json(path, data, indent=2):
+    """Write JSON where a reader can only ever see a whole file."""
+    tmp = path.with_suffix(f".json.tmp-{TOOL}")
+    tmp.write_text(json.dumps(data, indent=indent) + "\n")
+    os.replace(tmp, path)
+
+
 def write_settings(settings, data):
     if settings.exists():
         settings.with_suffix(f".json.bak-{TOOL}").write_text(settings.read_text())
-    tmp = settings.with_suffix(f".json.tmp-{TOOL}")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
-    os.replace(tmp, settings)
+    replace_json(settings, data)
 
 
 def install_hook(command):
@@ -5012,7 +5125,7 @@ def run_selftest(live=False):
 
     writers = {n for n, node in funcs.items()
                if "os.replace" in ast.get_source_segment(source, node)}
-    check("one roster writer", writers <= {"edit_team_config", "write_settings", "run_selftest"},
+    check("one roster writer", writers <= {"edit_team_config", "replace_json", "run_selftest"},
           ", ".join(sorted(writers - {"run_selftest"})))
 
     run_one_src = ast.get_source_segment(source, funcs["run_one"])
@@ -5602,6 +5715,31 @@ def run_selftest(live=False):
     wrong = sorted(k for k, good in asks.items() if not good)
     check("a redirect timing suggests is asked, not taken", not wrong, ", ".join(wrong))
 
+    # --- the hook writes down what only that boot knows (live: it walks /proc)
+    real_ledger = globals()["MINT_LEDGER"]
+    scratch = Path(tempfile.mkdtemp()) / "mints.json"
+    try:
+        globals()["MINT_LEDGER"] = scratch
+        record_mint({"session_id": "feedface-0000-0000-0000-000000000000",
+                     "transcript_path": "/tmp/probe.jsonl"})
+        rows = json.loads(scratch.read_text()) if scratch.exists() else []
+        wrote = {
+            "one row per boot": len(rows) == 1,
+            "the id it will name its team after": rows and rows[0]["sessionId"].startswith("feedface"),
+            "a live claude, not the hook's own shell": bool(rows) and pid_alive(rows[0]["pid"])
+                and RESOLVER.is_claude(
+                    Path(f"/proc/{rows[0]['pid']}/cmdline").read_bytes().decode().replace("\0", " ")),
+            "with a start time to outlive pid reuse": bool(rows) and bool(rows[0].get("procStart")),
+        }
+        record_mint({"session_id": "feedface-0000-0000-0000-000000000000"})
+        wrote["a second boot of one pid replaces its row"] = (
+            len(json.loads(scratch.read_text())) == 1)
+    finally:
+        globals()["MINT_LEDGER"] = real_ledger
+        shutil.rmtree(scratch.parent, ignore_errors=True)
+    wrong = sorted(k for k, good in wrote.items() if not good)
+    check("the hook records what only that boot knows", not wrong, ", ".join(wrong))
+
     # --- a team is larger than its roster, and a run that takes the roster says so
     pop_wrong, with_former = [], None
     for team in list(RESOLVER.known_teams())[:40]:
@@ -5628,6 +5766,28 @@ def run_selftest(live=False):
     }
     wrong = sorted(k for k, good in notes.items() if not good)
     check("a team run says what it left out", not wrong, ", ".join(wrong))
+
+    # --- what a boot recorded about itself outranks a guess about it
+    real_mints = RESOLVER._mints
+    try:
+        me, mine = os.getpid(), proc_stat(os.getpid())[1]
+        RESOLVER._mints = [{"sessionId": "a01fdd1e-1e5a-460b-be96-0546ee3fa8a8",
+                            "pid": me, "procStart": mine}]
+        reads = {"the team is named from the recorded id":
+                 RESOLVER.recorded_mint(me) == "session-a01fdd1e",
+                 "a pid with no record has none": RESOLVER.recorded_mint(-1) is None,
+                 # The rung has to be reachable, not merely present: this pid
+                 # states no team in its argv, so the record is what answers.
+                 "the rung answers where argv cannot":
+                     RESOLVER.team_minted_by(me) == ("session-a01fdd1e", True)}
+        RESOLVER._mints = [{"sessionId": "a01fdd1e-1e5a", "pid": me, "procStart": "0"}]
+        # A pid number outlives the process that held it, so a row whose start
+        # time has moved on describes somebody else's team.
+        reads["a recycled pid is not that boot"] = RESOLVER.recorded_mint(me) is None
+    finally:
+        RESOLVER._mints = real_mints
+    wrong = sorted(k for k, good in reads.items() if not good)
+    check("a boot's own record of its team is read back", not wrong, ", ".join(wrong))
 
 
     # --- the composed answer agrees with the parts it is composed of
