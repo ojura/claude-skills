@@ -733,6 +733,14 @@ class Resolver:
             spawned = {payload.get("name") for payload in self.members_spawned_into(path.stem, team)}
             if roster_members and spawned & roster_members:
                 return "member names"
+            # Members this claimant spawned that are running as this team now. A
+            # process wearing an identity is the strongest evidence the tool has
+            # anywhere, and a claimant whose children are alive under the team is
+            # a lead of it in the only sense that acts on anything. Fork siblings
+            # share their children, so this separates claimants with different
+            # payloads and never breaks a tie between copies of one history.
+            if spawned and any(self.wearers(f"{name}@{team}") for name in spawned):
+                return "live members it spawned"
             if block and path.stem.startswith(block.group(1)):
                 return "team-name block"
             return None
@@ -6074,6 +6082,31 @@ def run_selftest(live=False):
     check("an unresolved team is a claimed team", unresolved <= raw,
           f"raw {len(raw)}, unresolved {len(unresolved)}, "
           f"stray {sorted(t[-8:] for t in unresolved - raw)}")
+
+    # A claimant whose spawned members are running as the team is corroborated by
+    # them; copies of one history share their children, so it never breaks a tie.
+    live_kids = {}
+    for team, paths in claimed.items():
+        with contextlib.redirect_stderr(io.StringIO()):
+            found = RESOLVER.lead_transcript_for(team)
+        why = (found[1] or "") if found else ""
+        if "live members it spawned" not in why:
+            continue
+        spawned = {pay.get("name")
+                   for path in paths
+                   for pay in RESOLVER.members_spawned_into(path.stem, team)}
+        live_kids[team] = any(RESOLVER.wearers(f"{n}@{team}") for n in spawned if n)
+    wrong = sorted(t for t, ok in live_kids.items() if not ok)
+    # And the upgrade must reach the write: an evidence string without the word
+    # uncorroborated is what lets the forge record a real leadSessionId.
+    launders = sorted(t for t, ok in live_kids.items() if ok and "uncorroborated" in
+                      (RESOLVER.lead_transcript_for(t)[1] or ""))
+    check("a claimant is corroborated only by children that are running",
+          not wrong and not launders,
+          ", ".join(wrong + launders) or f"{len(live_kids)} team(s) upgraded")
+    check("copies of one history still refuse", all(
+        not RESOLVER.lead_transcript_for(t)[0] for t in unresolved),
+        f"{len(unresolved)} tie(s) held")
 
     # --- one job per agent, whatever assembled the list
     said = ""
