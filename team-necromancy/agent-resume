@@ -2172,10 +2172,11 @@ class Resolver:
     def _walk_spawn_payloads(self, node, depth=0):
         """Yield genuine spawn payloads inside a parsed transcript line.
 
-        Structure, not text: a real payload is a dict the harness put there, so it
-        is reached by walking the record. Strings are also parsed one level, since
-        tool results carry their JSON as text, but prose that merely quotes a
-        payload never becomes a dict and so never matches.
+        Structure, never text. A payload the harness wrote is a dict in the
+        record; the same JSON printed by a command or pasted into a message is a
+        string, and parsing strings admits it as evidence. Measured on this
+        machine: 199 payloads reached as dicts, and every string that parsed was
+        one command's stdout quoting a payload back.
         """
         if depth > 10:  # deepest real payload seen is 5; leave room for another wrapper
             return
@@ -2187,11 +2188,7 @@ class Resolver:
         elif isinstance(node, list):
             for value in node:
                 yield from self._walk_spawn_payloads(value, depth + 1)
-        elif isinstance(node, str) and SPAWN_MARKER in node and node.lstrip()[:1] in "{[":
-            try:
-                yield from self._walk_spawn_payloads(json.loads(node), depth + 1)
-            except ValueError:
-                return
+
 
 
 
@@ -6039,6 +6036,22 @@ def run_selftest(live=False):
     wrong = sorted(k for k, good in picks.items() if not good)
     check("a run takes the live team, or the record when none is live",
           not wrong, ", ".join(wrong))
+
+    # --- a payload is a record the harness wrote, not JSON someone printed
+    payload = {"status": SPAWN_MARKER, "name": "ghost", "team_name": "t",
+               "agent_id": "ghost@t"}
+    quoted = json.dumps(payload)
+    quotations = {
+        "a command's stdout": {"toolUseResult": {"stdout": quoted}},
+        "a file that was read": {"toolUseResult": {"file": {"content": quoted}}},
+        "an assistant's prose": {"message": {"content": [{"type": "text", "text": quoted}]}},
+        "a pasted message": {"message": {"role": "user", "content": quoted}},
+    }
+    admitted = sorted(k for k, rec in quotations.items()
+                      if list(RESOLVER._walk_spawn_payloads(rec)))
+    genuine = list(RESOLVER._walk_spawn_payloads({"toolUseResult": payload}))
+    check("a quoted payload is not evidence", not admitted and len(genuine) == 1,
+          ", ".join(admitted) or f"{len(genuine)} genuine found")
 
     # --- one job per agent, whatever assembled the list
     said = ""
