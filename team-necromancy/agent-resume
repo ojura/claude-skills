@@ -2185,7 +2185,7 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 # One engine. Every caller that needs "which transcript is this agent" goes
 # through RESOLVER.resolve_transcript(); nothing else may pick a file. Each rung records
 # how it concluded, and the strength of that evidence, so callers can report it
-# and verify_identity() can judge the conclusion without re-deriving it.
+# and the identity gate can judge the conclusion without re-deriving it.
 
 EXACT, STAMPS, NAME_ONLY = 3, 2, 1
 
@@ -2341,12 +2341,6 @@ def enforce_identity(res, objections, allow_team_change, force):
                     f"(matched by {why}); --force to override")
             else:
                 warn(f"--force: {res.path.name} is stamped team={stamped}, resuming as {wanted}")
-
-
-def verify_identity(res, want_name, want_team, allow_team_change, force):
-    """Judge, then act. Kept as one call for the sites that want both."""
-    enforce_identity(res, RESOLVER.objections(res, want_name, want_team),
-                     allow_team_change, force)
 
 
 def apply_selector(token, args, table):
@@ -5398,7 +5392,8 @@ def run_selftest(live=False):
         check("rung: agentName+teamName stamps", bool(res) and res.via.startswith("agentName+teamName"))
         try:
             with contextlib.redirect_stderr(io.StringIO()):  # the refusal is the point, not its noise
-                verify_identity(res, "definitely-not-" + name, team, False, False)
+                enforce_identity(res, RESOLVER.objections(res, "definitely-not-" + name, team),
+                                 allow_team_change=False, force=False)
             check("identity gate refuses a mismatch", False, "it allowed one")
         except SystemExit:
             check("identity gate refuses a mismatch", True)
