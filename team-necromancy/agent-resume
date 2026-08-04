@@ -3551,9 +3551,18 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         if ctx["to_team"] != RESOLVER.field(ctx, "teamName"):
             retire_member(ctx, args.dry_run)
     else:
-        ensure_inbox(RESOLVER.field(ctx, "teamName"), RESOLVER.field(ctx, "agentName"), args.dry_run)
+        team = RESOLVER.field(ctx, "teamName")
+        ensure_inbox(team, RESOLVER.field(ctx, "agentName"), args.dry_run)
         if not args.no_update_config:
-            update_team_config(ctx, pane, args.dry_run, alive)
+            if ctx.get("team_entry"):
+                update_team_config(ctx, pane, args.dry_run, alive)
+            elif team and RESOLVER.roster_path(team).exists():
+                # The roster exists but has no entry for this agent, so there is
+                # nothing to update and the member would go unlisted: launched,
+                # inbox seeded, invisible to its own lead. A lead delivers mail
+                # from members it knows about, so an unlisted one can write to the
+                # lead's inbox and never be read from it.
+                register_member(team, ctx, pane, args.dry_run, alive)
 
     # A launch that has not written yet is not a verdict, only an unfinished
     # observation: the settle window is a second and a half and a healthy agent
@@ -4665,6 +4674,33 @@ def run_selftest(live=False):
         and node.name not in {"_complete", "run_selftest"})
     check("one policy decides which roster claims an agent", not ts_sorters, ", ".join(ts_sorters))
 
+    # A member the roster does not list is launched, inboxed, and invisible to its
+    # own lead: it can write to the lead's inbox and never be read from it. The
+    # update path can only change an existing entry, so a missing one has to be
+    # inserted instead of skipped.
+    reg_base = Path(tempfile.mkdtemp())
+    real_teams_dir = RESOLVER.teams_dir
+    try:
+        RESOLVER.teams_dir = reg_base
+        team = "session-regcheck"
+        (reg_base / team / "inboxes").mkdir(parents=True)
+        RESOLVER.roster_path(team).write_text(json.dumps({
+            "name": team, "leadAgentId": f"team-lead@{team}", "leadSessionId": "x",
+            "members": [{"agentId": f"team-lead@{team}", "name": "team-lead"}]}))
+        ctx = {"merged": RESOLVER._Merged(), "team_entry": None, "session_uuid": "s",
+               "transcript": (reg_base / "s.jsonl", {}, 0)}
+        ctx["merged"].add("agentName", "newcomer", 1, "check")
+        ctx["merged"].add("teamName", team, 1, "check")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            register_member(team, ctx, "%9", False, True)
+        listed = [m.get("name") for m in
+                  json.loads(RESOLVER.roster_path(team).read_text()).get("members", [])]
+    finally:
+        RESOLVER.teams_dir = real_teams_dir
+        shutil.rmtree(reg_base, ignore_errors=True)
+    check("a member missing from its roster is added to it", "newcomer" in listed,
+          f"roster lists {listed}")
+
     # Reading the spawn log unfilled returns an empty list, which is also what a
     # transcript that spawned nobody returns, so a missed fill is a false negative
     # shaped like an answer. Only the ingester and the accessors may touch it.
@@ -4877,7 +4913,7 @@ def run_selftest(live=False):
     # different answer than the engine did.
     reachers = sorted(
         node.name for node in tree.body
-        if isinstance(node, ast.FunctionDef)
+        if isinstance(node, ast.FunctionDef) and node.name != "run_selftest"
         and re.search(r"\.pick\(|_Merged\(", ast.get_source_segment(source, node) or ""))
     check("the merge is reached only through the engine", not reachers, ", ".join(reachers))
 
