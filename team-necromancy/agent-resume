@@ -1590,8 +1590,18 @@ class Resolver:
             # A rebind asks for the change; a unique name and a live process wearing
             # the identity both make the stamp the stale half rather than the wrong one.
             tolerated = (res.strength == NAME_ONLY or res.via.startswith("live pid "))
-            objections.append(("team_mismatch", stamped_team, want_team,
-                               "tolerated" if tolerated else res.via))
+            why = "tolerated" if tolerated else res.via
+            if not tolerated:
+                # A transcript that was a teammate first and later led another team
+                # carries stamps from the earlier life and payloads from the newer
+                # one. Which came first decides what an override means, so the
+                # relation is measured rather than left for the reader to guess.
+                stamped_ts = res.fields.get("teamName", (None, 0))[1]
+                claimed_ts = max((stamp for stamp, payload in self._log(res.path.stem)
+                                  if payload.get("team_name") == want_team), default=0)
+                if stamped_ts and claimed_ts > stamped_ts:
+                    why += "|newer"
+            objections.append(("team_mismatch", stamped_team, want_team, why))
         return objections
 
     def classify(self, token):
@@ -2412,11 +2422,17 @@ def enforce_identity(res, objections, allow_team_change, force):
                     f"from then on are stamped correctly")
             warn(f"--force: {message}; resuming as {wanted!r}")
         elif kind == "team_mismatch":
+            why, _, newer = why.partition("|")
             if allow_team_change or why == "tolerated":
                 warn(f"{res.path.name} is stamped team={stamped}, resuming as {wanted}")
             elif not force:
-                die(f"{res.path.name} is stamped team={stamped}, not {wanted} "
-                    f"(matched by {why}); --force to override")
+                message = (f"{res.path.name} is stamped team={stamped}, not {wanted} "
+                           f"(matched by {why})")
+                if newer:
+                    message += (f"; the payloads naming {wanted} were written after those "
+                                f"stamps, so --force ratifies the newer evidence rather than "
+                                f"overriding the older")
+                die(f"{message}; --force to override")
             else:
                 warn(f"--force: {res.path.name} is stamped team={stamped}, resuming as {wanted}")
 
@@ -5541,6 +5557,7 @@ def run_selftest(live=False):
     wrong = sorted(k for k, good in asks.items() if not good)
     check("a redirect timing suggests is asked, not taken", not wrong, ", ".join(wrong))
 
+
     # --- the composed answer agrees with the parts it is composed of
     seen = [(e["team"], e["member"].get("name")) for e in RESOLVER.scan_teams()
             if e["member"].get("name") and e["member"].get("name") != "team-lead"]
@@ -5612,6 +5629,45 @@ def run_selftest(live=False):
               "assembly exited" if raised else f"objections={bool((judged or {}).get('objections'))}")
     else:
         check("rung: stamps (no stamped transcript on this machine)", True, "skipped")
+
+    # --- an override is told which way the evidence runs
+    # Every ex-member lead on the box, so both directions are exercised wherever
+    # both exist: one whose payloads postdate its stamps and one that does not.
+    # Drawn from the transcripts that led a team and scanned in full, not from
+    # the stamp index: its window is the last 8KB, and the specimen that proves
+    # the newer direction carries its team stamp further up the file.
+    seen_dirs, wrong = set(), []
+    candidates = []
+    for other in RESOLVER.led_teams():
+        found = RESOLVER.lead_transcript_for(other)
+        # A lead that led only one team cannot be this shape, and deciding that
+        # from the payload index costs nothing, where scanning every lead on the
+        # machine to find out costs megabytes each.
+        # The shape is a lead whose transcript is not the one the team is named
+        # after: an implicit team carries its minter's block, so a lead leading a
+        # team block it does not start is leading a team from a later life.
+        if found and found[0] and not found[0].stem.startswith(other.rsplit("-", 1)[-1]):
+            candidates.append((other, found[0]))
+    for other, path in candidates[:6]:
+        res = RESOLVER.resolve_transcript(session_uuid=path.stem)
+        steam = res.stamped("teamName") if res else None
+        if not steam or steam == other:
+            continue
+        why = next((w for kind, _s, _w2, w in RESOLVER.objections(res, None, other)
+                    if kind == "team_mismatch"), "")
+        stamped_ts = res.fields.get("teamName", (None, 0))[1]
+        claimed_ts = max((stamp for stamp, payload in RESOLVER._log(path.stem)
+                          if payload.get("team_name") == other), default=0)
+        newer = bool(stamped_ts and claimed_ts > stamped_ts)
+        seen_dirs.add(newer)
+        if ("|newer" in why) != newer:
+            wrong.append(f"{path.stem[:8]} says {why!r} for newer={newer}")
+    if seen_dirs:
+        check("an override is told which way the evidence runs", not wrong,
+              "; ".join(wrong[:2]) or f"directions covered: {sorted(seen_dirs)}")
+    else:
+        check("recency (no ex-member lead on this machine)", True,
+              f"skipped: {len(candidates)} multi-team lead(s)")
 
     lead = next((e for e in RESOLVER.scan_teams()
                  if e["leadSessionId"] and RESOLVER.transcript_path(e["leadSessionId"])), None)
