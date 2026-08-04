@@ -1192,6 +1192,21 @@ class Resolver:
                      "the pick between them is arbitrary")
         return pairs
 
+    def sole_mint_pairing(self, pid):
+        """The team only this process could have minted, or None if ambiguous.
+
+        Unique in both directions. _boot_join warns when several processes fall
+        in one team's window but returns them anyway, and it never asks whether
+        one process falls inside several teams' windows, so neither direction is
+        established by appearing in that list.
+        """
+        pairs = self._boot_join()
+        mine = {team for team, owner, _ in pairs if owner == pid}
+        if len(mine) != 1:
+            return None
+        team = mine.pop()
+        return team if {owner for t, owner, _ in pairs if t == team} == {pid} else None
+
     def is_claude(self, args):
         """Whether this cmdline is a claude process. Public: pane bookkeeping asks
         it, and a caller reaching a private method for a fair question means the
@@ -1969,6 +1984,11 @@ class Resolver:
             remedies = [("--to-team live", "restarts this member, losing its in-flight turn")]
             if not exact_team:
                 remedies.append(("ask before redirecting", "needs a terminal to ask at"))
+        elif lead_team is None:
+            reachable, why = False, ("its lead is live, but no structural record says which "
+                                     "team it runs as, so where its mail is read is unknown")
+            remedies = [("resume the lead under its own identity",
+                         "restarts it, and it then states its team in argv")]
         elif not listed:
             reachable, why = False, (f"{lead_team} does not list it, so its lead has no record "
                                      "it exists")
@@ -3374,6 +3394,30 @@ def build_command_agent_id(ctx):
     return f"{RESOLVER.field(ctx, 'agentName')}@{dest}" if dest else RESOLVER.field(ctx, "agentId")
 
 
+def confirm_redirect(agent_id, pid, dest, source, prefix=""):
+    """Offer a redirect the mint window suggests. True to take it.
+
+    The pairing is corroborated rather than proven, so it is offered instead of
+    acted on, and only when it is the only pairing in either direction. No
+    terminal means no answer, and the launch stays on the team it names.
+    """
+    if RESOLVER.sole_mint_pairing(pid) != dest:
+        return False
+    if not sys.stdin.isatty():
+        warn(f"pid {pid} is this agent's lead and only {dest} matches its boot, "
+             f"but that is timing rather than evidence; staying on {source}")
+        return False
+    print(f"{prefix}pid {pid} is this agent's lead, and exactly one team matches "
+          f"its boot: {dest}")
+    try:
+        answer = input(f"redirect {agent_id} onto {dest}? [y/N] ").strip().lower()
+    except EOFError:
+        answer = ""
+    if answer != "y":
+        print(f"{prefix}staying on {source}")
+    return answer == "y"
+
+
 def auto_redirect(ctx, args, table, prefix=""):
     """Give a launch the identity of the team the lead actually runs as.
 
@@ -3397,7 +3441,7 @@ def auto_redirect(ctx, args, table, prefix=""):
     if not (pid and alive and exact_lead):
         return
     dest, exact_team = RESOLVER.team_minted_by(pid)
-    if not (dest and exact_team) or dest == source:
+    if not dest or dest == source:
         return
 
     # Setting to_team below suppresses the guards further down (they are for the
@@ -3415,6 +3459,11 @@ def auto_redirect(ctx, args, table, prefix=""):
         warn(f"{agent_id} is running as {who}: {standing['reachable'][1]}"
              f"{'. ' + fix if fix else ''}")
         ctx["stale_team_warned"] = True
+        return
+
+    # Asked last, so a run that was going to decline anyway never puts a question
+    # in front of anyone.
+    if not exact_team and not confirm_redirect(agent_id, pid, dest, source, prefix):
         return
 
     print(f"{prefix}redirect the lead now runs as {dest}, not {source}; "
@@ -5455,6 +5504,42 @@ def run_selftest(live=False):
         globals()["run_one"], globals()["confirm_attach"] = real_one, real_confirm
     wrong = sorted(k for k, good in offers.items() if not good)
     check("the swarm is offered when nothing else took over", not wrong, ", ".join(wrong))
+
+    # --- a pairing timing alone suggests is offered, never taken
+    real_input, real_stdin = globals().get("input"), sys.stdin
+    real_sole = RESOLVER.sole_mint_pairing
+    try:
+        asks = {}
+        RESOLVER.sole_mint_pairing = lambda pid: "session-dest"
+        sys.stdin = types.SimpleNamespace(isatty=lambda: True)
+        for label, reply, want in (("yes redirects", "y", True),
+                                   ("no stays put", "n", False),
+                                   ("a bare return stays put", "", False)):
+            globals()["input"] = lambda prompt="", _r=reply: _r
+            with contextlib.redirect_stdout(io.StringIO()):
+                asks[label] = confirm_redirect("a@src", 1, "session-dest", "src") is want
+        globals()["input"] = lambda prompt="": "y"
+        RESOLVER.sole_mint_pairing = lambda pid: "session-other"
+        with contextlib.redirect_stdout(io.StringIO()) as quiet:
+            asks["an ambiguous pairing is not offered"] = (
+                confirm_redirect("a@src", 1, "session-dest", "src") is False
+                and quiet.getvalue() == "")
+        RESOLVER.sole_mint_pairing = lambda pid: "session-dest"
+        sys.stdin = types.SimpleNamespace(isatty=lambda: False)
+        with contextlib.redirect_stdout(io.StringIO()) as quiet, \
+                contextlib.redirect_stderr(io.StringIO()):
+            asks["no terminal does not ask"] = (
+                confirm_redirect("a@src", 1, "session-dest", "src") is False
+                and quiet.getvalue() == "")
+    finally:
+        RESOLVER.sole_mint_pairing = real_sole
+        sys.stdin = real_stdin
+        if real_input is not None:
+            globals()["input"] = real_input
+        else:
+            globals().pop("input", None)
+    wrong = sorted(k for k, good in asks.items() if not good)
+    check("a redirect timing suggests is asked, not taken", not wrong, ", ".join(wrong))
 
     # --- the composed answer agrees with the parts it is composed of
     seen = [(e["team"], e["member"].get("name")) for e in RESOLVER.scan_teams()
