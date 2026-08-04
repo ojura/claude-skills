@@ -1934,6 +1934,64 @@ class Resolver:
                     return payload["team_name"], True
         return next((team for team, owner, _ in self._boot_join() if owner == pid), None), False
 
+    def standing(self, agent_id, parent_session=None):
+        """Where a member stands with its lead: parentage, liveness, team, mail.
+
+        One composed answer, each part carrying the evidence it rests on. The
+        parts existed already and every consumer composed them by hand, which is
+        the same fault as two readers of one file: the engine answers, so the
+        answers cannot disagree.
+
+        Only structural records count as evidence of the team a session runs as.
+        A team name appearing in a transcript's prose is this tool's own printed
+        guess read back, and would corroborate itself.
+        """
+        name, _, team = agent_id.partition("@")
+        parent = next((stem for stem, entries in self._every_log().items()
+                       for _stamp, payload in entries
+                       if payload.get("agent_id") == agent_id), None)
+        pid, alive, how, exact_lead = self.lead_pid(parent_session, team)
+        lead_team, exact_team = self.team_minted_by(pid) if pid and alive else (None, False)
+        roster = self.roster_of(lead_team) if lead_team else None
+        members = [m for m in (roster or {}).get("members", []) if m.get("name") != "team-lead"]
+        listed = any(m.get("agentId") == agent_id or m.get("name") == name for m in members)
+
+        # A lead polls once it has members to poll for. A team holding only its
+        # lead has no inboxes directory at all, so mail written there is read by
+        # nobody however correctly it is addressed.
+        polls = bool(members)
+        if not (pid and alive):
+            reachable, why = False, f"no live lead for {team}"
+            remedies = [("resume the lead", "starts a process")]
+        elif lead_team and lead_team != team:
+            reachable, why = False, (f"its lead is live but runs as {lead_team}, so mail sent "
+                                     f"to {team} is read by nobody")
+            remedies = [("--to-team live", "restarts this member, losing its in-flight turn")]
+            if not exact_team:
+                remedies.append(("ask before redirecting", "needs a terminal to ask at"))
+        elif not listed:
+            reachable, why = False, (f"{lead_team} does not list it, so its lead has no record "
+                                     "it exists")
+            if not polls:
+                why += "; that roster lists no members at all, so nothing is polled yet"
+            remedies = [("resume this member once", "a launch; it registers itself")]
+        else:
+            reachable, why = True, f"listed in {lead_team}, whose live lead polls it"
+            remedies = []
+        return {
+            "agent_id": agent_id, "name": name, "team": team,
+            "parent": (parent, "spawn payload naming it" if parent
+                       else "no spawn payload names this agent"),
+            "lead": (pid, alive, how, "exact" if exact_lead else "inferred"),
+            "lead_team": (lead_team, "exact" if exact_team else
+                          f"paired by a boot within {TEAM_MINT_WINDOW_MS}ms, not proven"),
+            "polls": (polls, "a lead polls once it has members "
+                             "(per harness knowledge, not demonstrated here)"),
+            "listed": listed,
+            "reachable": (reachable, why),
+            "remedies": remedies,
+        }
+
     def teams_led_by(self, session_stem):
         """Teams this transcript led, newest first.
 
@@ -4032,6 +4090,27 @@ def cleanup_teams(dry=False):
     return removed
 
 
+def run_standing(args):
+    """Print where one agent stands with its lead. Reports, never acts."""
+    agent_id = args.agent_id
+    if not agent_id or "@" not in str(agent_id):
+        die("--standing needs an agent, as name@team")
+    s = RESOLVER.standing(agent_id)
+    pid, alive, how, grade = s["lead"]
+    print(f"agent    {s['agent_id']}")
+    print(f"parent   {s['parent'][0] or '(none)'}  ({s['parent'][1]})")
+    print(f"lead     {('pid ' + str(pid)) if pid else '(none)'}"
+          f"{'' if alive else ', not running'}  ({how}) [{grade}]")
+    print(f"runs as  {s['lead_team'][0] or '(unknown)'}  [{s['lead_team'][1]}]")
+    print(f"polls    {'yes' if s['polls'][0] else 'no'}  ({s['polls'][1]})")
+    print(f"listed   {'yes' if s['listed'] else 'no'}")
+    reachable, why = s["reachable"]
+    print(f"mail     {'reaches its lead' if reachable else 'does not reach its lead'}: {why}")
+    for what, cost in s["remedies"]:
+        print(f"remedy   {what}  ({cost})")
+    return 0
+
+
 def run_census():
     """Count what this machine's ~/.claude actually contains. Read-only.
 
@@ -5372,6 +5451,36 @@ def run_selftest(live=False):
     wrong = sorted(k for k, good in offers.items() if not good)
     check("the swarm is offered when nothing else took over", not wrong, ", ".join(wrong))
 
+    # --- the composed answer agrees with the parts it is composed of
+    seen = [(e["team"], e["member"].get("name")) for e in RESOLVER.scan_teams()
+            if e["member"].get("name") and e["member"].get("name") != "team-lead"]
+    if seen:
+        agree = {}
+        for team, name in seen[:20]:
+            st = RESOLVER.standing(f"{name}@{team}")
+            reachable, _why = st["reachable"]
+            pid, alive, _how, _grade = st["lead"]
+            lead_team, _grade2 = st["lead_team"]
+            # Reachable is the conjunction of its own parts, so a verdict cannot
+            # drift from the facts printed beside it.
+            agree[f"{name}@{team}"] = reachable == bool(
+                pid and alive and lead_team == team and st["listed"] and st["polls"][0])
+            if reachable and not st["listed"]:
+                agree[f"{name}@{team} unlisted yet reachable"] = False
+        # Every agent above came out of a roster, so all of them are listed and
+        # the unlisted branch is unreachable from that population alone. A name
+        # no roster carries is the case that exercises it.
+        team = seen[0][0]
+        absent = RESOLVER.standing(f"definitely-not-a-member@{team}")
+        agree["a name no roster carries is not reachable"] = (
+            not absent["listed"] and not absent["reachable"][0]
+            and bool(absent["remedies"]))
+        wrong = sorted(k for k, good in agree.items() if not good)
+        check("a standing verdict follows from its own evidence", not wrong,
+              ", ".join(wrong[:3]))
+    else:
+        check("standing (no rostered member on this machine)", True, "skipped")
+
     check("a self-migrate is refused",
           bool(RESOLVER.self_holds_transcript("selftest-uuid",
                [(os.getpid(), os.getppid(), "/usr/bin/claude --resume selftest-uuid --agent-id a@b")])))
@@ -5522,6 +5631,9 @@ def main():
                              "open a terminal or change directory (each cleans up after itself)")
     parser.add_argument("--selftest", action="store_true",
                         help="check the tool's invariants against this machine; changes nothing")
+    parser.add_argument("--standing", action="store_true",
+                        help="say where the named agent stands with its lead: parentage, "
+                             "liveness, the team the lead runs as, and whether its mail is read")
     parser.add_argument("--census", action="store_true",
                         help="count what this machine's ~/.claude contains, through the "
                              "same readers the tool resolves with")
@@ -5604,6 +5716,11 @@ def main():
     table = RESOLVER.ps_table()
     if selector:
         apply_selector(selector, args, table)
+
+    if args.standing:
+        # After the selector, so a bare name@team resolves the way it does for
+        # every other mode rather than through a second reading of argv.
+        return run_standing(args)
 
     if args.stop:
         # After apply_selector, so a selector in either position has already
