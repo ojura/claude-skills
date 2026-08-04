@@ -35,13 +35,29 @@ look. Once the line redraws it says `(cold)` instead of a countdown.
 
 The line also carries the model and effort level, how full the context window is, what
 the session has cost so far, how much of each usage window is gone, and the session id.
+The context bar embeds a fixed-width used/total label such as `245k/372k` or
+`1.1M/1.0M`; without truecolor support it falls back to the same label as plain text.
+
+### Terminal colors and narrow layouts
+
+`NO_COLOR` disables ANSI styling. `CLAUDE_STATUSLINE_COLOR=always` forces truecolor
+and `CLAUDE_STATUSLINE_COLOR=never` disables it; the default detects `COLORTERM` or a
+`direct` terminfo entry. Set `CLAUDE_STATUSLINE_THEME=light` for the light palette
+(the default is dark, or inferred from `COLORFGBG`). Palette entries can be overridden
+with `CLAUDE_STATUSLINE_{ALARM,MUTED,BAR_DIM,BAR_ON_FILL,BAR_ON_DIM}_RGB`, using
+`#rrggbb` or `r,g,b` values.
+
+`CLAUDE_STATUSLINE_COMPACT=1` shortens separators and renewal stamps and omits the
+session id. The embedded context value remains because it carries more information per
+column than the lower-priority fields it replaces.
 
 ## Cache health
 
 `cache 92%` is the share of this conversation's requests that have run since the last
 time the cache was lost. It sits near 100% while things are working. When a request
 fails to find the cache and has to send the conversation from scratch, it drops to
-almost nothing and then climbs back as you keep working.
+almost nothing and then climbs back as you keep working. Below 25%, the percentage is
+alarm-colored so a failing cache outranks moderate context usage visually.
 
 The `1h` beside it is how long this cache lives. If it reads `5m` instead, in red, your
 writes have moved to the short-lived cache, which usually means you are over your usage

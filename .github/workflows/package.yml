@@ -83,6 +83,18 @@ jobs:
         with:
           lake-package-directory: archive-conversation-forks/proofs
 
+  test-statusline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check statusline contrast
+        run: python -m unittest discover -s statusline-cachequota -p 'test_statusline_render.py' -v
+
   package:
     runs-on: ubuntu-latest
     steps:

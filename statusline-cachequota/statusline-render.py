@@ -51,9 +51,60 @@ SIDECAR = CLAUDE_DIR + "/statusline-cache-health.state.json"
 SOCK = CLAUDE_DIR + "/statusline.sock"
 IDLE_EXIT_S = 600
 
-DIM = "\033[2m"
-RESET = "\033[0m"
-ALARM = "\033[38;2;240;126;117m"
+def _env_flag(name):
+    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
+
+
+def _rgb_env(name, default):
+    raw = os.environ.get(name, "").strip()
+    try:
+        if raw.startswith("#") and len(raw) == 7:
+            return tuple(int(raw[i:i + 2], 16) for i in (1, 3, 5))
+        rgb = tuple(int(v) for v in raw.replace(";", ",").split(","))
+        if len(rgb) == 3 and all(0 <= v <= 255 for v in rgb):
+            return rgb
+    except ValueError:
+        pass
+    return default
+
+
+def _default_theme():
+    try:
+        return "light" if int(os.environ.get("COLORFGBG", "").split(";")[-1]) >= 7 else "dark"
+    except (ValueError, IndexError):
+        return "dark"
+
+
+PALETTES = {
+    "dark": {
+        "alarm": (240, 126, 117), "muted": (136, 136, 136),
+        "bar_dim": (76, 76, 76), "bar_on_fill": (32, 36, 38),
+        "bar_on_dim": (211, 215, 207),
+    },
+    "light": {
+        "alarm": (180, 45, 45), "muted": (90, 90, 90),
+        "bar_dim": (225, 225, 225), "bar_on_fill": (32, 36, 38),
+        "bar_on_dim": (32, 36, 38),
+    },
+}
+THEME = os.environ.get("CLAUDE_STATUSLINE_THEME", _default_theme()).lower()
+PALETTE = PALETTES.get(THEME, PALETTES["dark"])
+ALARM_RGB = _rgb_env("CLAUDE_STATUSLINE_ALARM_RGB", PALETTE["alarm"])
+MUTED_RGB = _rgb_env("CLAUDE_STATUSLINE_MUTED_RGB", PALETTE["muted"])
+BAR_DIM_RGB = _rgb_env("CLAUDE_STATUSLINE_BAR_DIM_RGB", PALETTE["bar_dim"])
+BAR_ON_FILL_RGB = _rgb_env("CLAUDE_STATUSLINE_BAR_ON_FILL_RGB", PALETTE["bar_on_fill"])
+BAR_ON_DIM_RGB = _rgb_env("CLAUDE_STATUSLINE_BAR_ON_DIM_RGB", PALETTE["bar_on_dim"])
+COLOR_MODE = os.environ.get("CLAUDE_STATUSLINE_COLOR", "auto").lower()
+COLOR_ENABLED = "NO_COLOR" not in os.environ and COLOR_MODE != "never"
+TRUECOLOR = COLOR_ENABLED and (COLOR_MODE == "always" or
+    os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit") or
+    "direct" in os.environ.get("TERM", "").lower())
+COMPACT = _env_flag("CLAUDE_STATUSLINE_COMPACT")
+BAR_WIDTH = 10
+TOKEN_WIDTH = 4
+BAR_LABEL_WIDTH = TOKEN_WIDTH * 2 + 1
+LABELED_BAR_WIDTH = BAR_LABEL_WIDTH + 2
+CACHE_ALARM_PCT = 25
 
 # Azure -> yellow -> orange -> red ramp. The cool half traces the GIMP
 # azure/yellow gradient (a straight-RGB blend whose desaturated sage midpoint
@@ -62,6 +113,27 @@ ALARM = "\033[38;2;240;126;117m"
 RAMP = [(0, (0, 150, 255)), (8, (46, 154, 252)), (17, (99, 168, 240)),
         (26, (154, 192, 215)), (33, (177, 211, 194)), (48, (249, 231, 121)),
         (73, (248, 178, 104)), (100, (240, 126, 117))]
+
+
+def paint(text, fg=None, bg=None, dim=False):
+    if not COLOR_ENABLED:
+        return text
+    codes = ["2"] if dim else []
+    if TRUECOLOR and fg is not None:
+        codes.extend(("38", "2", *(str(v) for v in fg)))
+    if TRUECOLOR and bg is not None:
+        codes.extend(("48", "2", *(str(v) for v in bg)))
+    if not codes:
+        return text
+    return "\033[%sm%s\033[0m" % (";".join(codes), text)
+
+
+def muted(text):
+    return paint(text, fg=MUTED_RGB, dim=not TRUECOLOR)
+
+
+def dimmed(text):
+    return paint(text, dim=True)
 
 
 def ramp_rgb(p):
@@ -74,19 +146,78 @@ def ramp_rgb(p):
     pos_hi, c_hi = RAMP[lo + 1]
     span = pos_hi - pos_lo
     t = (p - pos_lo) / span if span > 0 else 0.0
-    r, g, b = (int(c_lo[k] + (c_hi[k] - c_lo[k]) * t + 0.5) for k in range(3))
-    return "%d;%d;%d" % (r, g, b)
+    return tuple(int(c_lo[k] + (c_hi[k] - c_lo[k]) * t + 0.5) for k in range(3))
 
 
-def make_bar(pct, color_pct=None):
-    # 10-char block bar; color_pct lets a bar invert the ramp semantics
-    # (cache health: full bar sampled at the azure end)
+def round_half_up(value, digits=0):
+    factor = 10 ** digits
+    rounded = int(float(value) * factor + 0.5)
+    return rounded if not digits else rounded / factor
+
+
+def fit_cells(text, width):
+    # Status labels are ASCII; normalize here so make_bar owns its cell width.
+    return str(text)[:width].ljust(width)
+
+
+def format_tokens(tokens):
+    value = max(0.0, float(tokens))
+    if 0 < value < 1000:
+        text = "<1k"
+    elif value <= 999_000:
+        text = "%dk" % round_half_up(value / 1000)
+    else:
+        units = ((1_000_000, "M"), (1_000_000_000, "G"),
+                 (1_000_000_000_000, "T"))
+        for i, (scale, suffix) in enumerate(units):
+            amount = value / scale
+            if amount < 999.5 or i == len(units) - 1:
+                amount = min(amount, 999)
+                if amount < 9.95:
+                    amount = round_half_up(amount, 1)
+                    text = ("%.1f%s" if amount < 10 else "%.0f%s") % (amount, suffix)
+                else:
+                    text = "%d%s" % (round_half_up(amount), suffix)
+                break
+    return text.rjust(TOKEN_WIDTH)
+
+
+def format_context_label(used, total):
+    return "%s/%s" % (format_tokens(used), format_tokens(total))
+
+
+def format_pct(pct):
+    value = max(0.0, min(100.0, float(pct)))
+    return "%3d%%" % round_half_up(value)
+
+
+def make_bar(pct, color_pct=None, label=None):
+    # A label replaces the interior of a fixed-width bar. Its two backgrounds
+    # retain the filled and dim colors while neutral text crosses the split;
+    # color_pct lets cache health invert the ramp semantics.
     if color_pct is None:
         color_pct = pct
-    filled = round(pct / 100 * 10)  # banker's rounding, same as printf %.0f
-    filled = 0 if filled < 0 else 10 if filled > 10 else filled
-    fill = "\033[38;2;%sm" % ramp_rgb(color_pct)
-    return "%s%s%s%s%s%s" % (fill, "█" * filled, RESET, DIM, "░" * (10 - filled), RESET)
+    width = LABELED_BAR_WIDTH if label is not None else BAR_WIDTH
+    filled = round_half_up(pct / 100 * width)
+    filled = 0 if filled < 0 else width if filled > width else filled
+    fill_rgb = ramp_rgb(color_pct)
+    if label is None:
+        return paint("█" * filled, fg=fill_rgb) + dimmed("░" * (width - filled))
+
+    label = fit_cells(label, BAR_LABEL_WIDTH)
+    if not TRUECOLOR:
+        return label
+    label_filled = max(0, min(BAR_LABEL_WIDTH, filled - 1))
+    filled_edge = paint("█", fg=fill_rgb, bg=fill_rgb)
+    empty_edge = paint("░", fg=BAR_DIM_RGB, bg=BAR_DIM_RGB)
+    left = filled_edge if filled else empty_edge
+    text = ""
+    if label_filled:
+        text += paint(label[:label_filled], fg=BAR_ON_FILL_RGB, bg=fill_rgb)
+    if label_filled < BAR_LABEL_WIDTH:
+        text += paint(label[label_filled:], fg=BAR_ON_DIM_RGB, bg=BAR_DIM_RGB)
+    right = filled_edge if filled == width else empty_edge
+    return left + text + right
 
 
 def open_db():
@@ -273,23 +404,27 @@ def slot_str(kind, exp):
         if not exp or exp <= 0:
             return ""
         now = int(time.time())
-        stamp = "%s→ %s" % (DIM, time.strftime("%H:%M", time.localtime(exp)))
+        stamp = "→ %s" % time.strftime("%H:%M", time.localtime(exp))
         if now < exp:
+            if COMPACT:
+                return muted(stamp)
             rem = exp - now
-            return "%s (%d:%02d)%s" % (stamp, rem // 60, rem % 60, RESET)
-        return "%s %s%s(cold)%s" % (stamp, RESET, ALARM, RESET)
+            return muted("%s (%d:%02d)" % (stamp, rem // 60, rem % 60))
+        return "%s %s" % (muted(stamp), paint("(cold)", fg=ALARM_RGB))
     if kind == "reset_rel":
         # Window renewal within the day: wall clock plus countdown (H:MM:SS).
+        stamp = "→ %s" % time.strftime("%H:%M", time.localtime(exp))
+        if COMPACT:
+            return muted(stamp)
         rem = max(0, exp - int(time.time()))
-        return "%s→ %s (%d:%02d:%02d)%s" % (
-            DIM, time.strftime("%H:%M", time.localtime(exp)),
-            rem // 3600, rem % 3600 // 60, rem % 60, RESET)
+        return muted("%s (%d:%02d:%02d)" % (
+            stamp, rem // 3600, rem % 3600 // 60, rem % 60))
     if kind == "reset_abs":
         # Renewal days out: weekday + date, where a countdown reads as noise.
         t = time.localtime(exp)
-        return "%s→ %s %d.%d. %s%s" % (
-            DIM, HR_DAYS[t.tm_wday], t.tm_mday, t.tm_mon,
-            time.strftime("%H:%M", t), RESET)
+        return muted("→ %s %d.%d. %s" % (
+            HR_DAYS[t.tm_wday], t.tm_mday, t.tm_mon,
+            time.strftime("%H:%M", t)))
     return ""
 
 
@@ -358,8 +493,15 @@ def render_core(data, cache):
         parts.append("org %s" % org_id.split("-")[0])
 
     used_pct = get(["context_window", "used_percentage"])
+    used_tokens = get(["context_window", "total_input_tokens"])
+    context_size = get(["context_window", "context_window_size"])
     if used_pct is not None:
-        parts.append("ctx %s %.0f%%" % (make_bar(used_pct), used_pct))
+        if used_tokens is not None and context_size:
+            label = format_context_label(used_tokens, context_size)
+            parts.append("ctx %s %s" % (make_bar(used_pct, label=label),
+                                         format_pct(used_pct)))
+        else:
+            parts.append("ctx %s %s" % (make_bar(used_pct), format_pct(used_pct)))
 
     # Cache health bar: ramp inverted, so a full bar reads azure and a
     # drained one red.
@@ -374,10 +516,13 @@ def render_core(data, cache):
         # clock ticks rebuild it on its own.
         badge = ""
         if ttl == "1h":
-            badge = " %s1h%s" % (DIM, RESET)
+            badge = " " + muted("1h")
         elif ttl and ttl != "?":
-            badge = " %s%s%s" % (ALARM, ttl, RESET)
-        seg = "cache%s %s %.0f%%" % (badge, make_bar(health, 100 - health), health)
+            badge = " " + paint(ttl, fg=ALARM_RGB)
+        pct = format_pct(health)
+        if health < CACHE_ALARM_PCT:
+            pct = paint(pct, fg=ALARM_RGB)
+        seg = "cache%s %s %s" % (badge, make_bar(health, 100 - health), pct)
         if exp:
             seg += " " + SLOT % len(slots)
             slots.append(("warm", exp))
@@ -386,7 +531,7 @@ def render_core(data, cache):
         # Cumulative rewrite factor as a colored multiplier: tokens
         # redundantly re-cached over the current context footprint. 0.00x
         # azure = purely additive; 1.00x = re-cached once; can exceed 1.
-        parts.append("recached \033[38;2;%sm%.2fx%s" % (ramp_rgb(rw), rw / 100, RESET))
+        parts.append("recached " + paint("%.2fx" % (rw / 100), fg=ramp_rgb(rw)))
 
     cost = get(["cost", "total_cost_usd"])
     if cost is not None and cost > 0:
@@ -395,14 +540,14 @@ def render_core(data, cache):
     # Each rate-limit bar carries when its window renews: the 5h window gets
     # wall clock plus a live countdown, the 7d window a dated stamp.
     if five_pct is not None:
-        seg = "5h %s %.0f%%" % (make_bar(five_pct), five_pct)
+        seg = "5h %s %s" % (make_bar(five_pct), format_pct(five_pct))
         r5 = get(["rate_limits", "five_hour", "resets_at"])
         if r5:
             seg += " " + SLOT % len(slots)
             slots.append(("reset_rel", int(r5)))
         parts.append(seg)
     if week_pct is not None:
-        seg = "7d %s %.0f%%" % (make_bar(week_pct), week_pct)
+        seg = "7d %s %s" % (make_bar(week_pct), format_pct(week_pct))
         r7 = get(["rate_limits", "seven_day", "resets_at"])
         if r7:
             seg += " " + SLOT % len(slots)
@@ -410,13 +555,13 @@ def render_core(data, cache):
         parts.append(seg)
 
     # Session id (transcript filename without extension), dimmed
-    if tp:
+    if tp and not COMPACT:
         base = os.path.basename(tp)
         if base.endswith(".jsonl"):
             base = base[:-6]
-        parts.append("%s%s%s" % (DIM, base, RESET))
+        parts.append(muted(base))
 
-    sep = "  %s·%s  " % (DIM, RESET)
+    sep = (" %s " if COMPACT else "  %s  ") % muted("·")
     return sep.join(parts), slots
 
 
@@ -449,7 +594,10 @@ def _fingerprint(data, cache):
         except OSError:
             ps_mt = None
     sig = (g("model", "display_name"), g("model", "id"), g("effort", "level"),
-           g("context_window", "used_percentage"), g("cost", "total_cost_usd"),
+           g("context_window", "used_percentage"),
+           g("context_window", "total_input_tokens"),
+           g("context_window", "context_window_size"),
+           g("cost", "total_cost_usd"),
            g("rate_limits", "five_hour", "used_percentage"),
            g("rate_limits", "five_hour", "resets_at"),
            g("rate_limits", "seven_day", "used_percentage"),
