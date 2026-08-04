@@ -4523,15 +4523,6 @@ def run_census():
     print(f"  ...still unresolved after corroboration {len(unresolved)}")
     print(f"  ...the rest are decided by the ladder; these are refused, not guessed")
 
-    # An id that looks typed rather than generated. Reported, never acted on: the
-    # corpus is written by the harness, by this tool and by hand, and a census
-    # that cannot say which is which invites the reader to assume the first.
-    patterned = sorted(sid for sid in {path.stem for paths in claimed.values() for path in paths}
-                       if sum(1 for part in sid.split("-")
-                              if len(part) > 2 and part == part[:2] * (len(part) // 2)) >= 3)
-    if patterned:
-        print(f"  claimants whose id looks hand-written   {len(patterned)}"
-              f" ({', '.join(sid[:8] for sid in patterned)})")
 
     stamps = RESOLVER.stamp_index()
     both = sum(1 for name, team in stamps.values() if name and team)
