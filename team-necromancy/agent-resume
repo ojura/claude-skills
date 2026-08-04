@@ -4226,6 +4226,9 @@ def cruft_reason(team_dir):
                 return f"inboxes/{inbox.name} is not a message array"
             if mail:
                 return f"inboxes/{inbox.name} holds {len(mail)} undelivered message(s)"
+        # This loop reads the files rather than asking inbox_state for counts.
+        # A deletion gate re-proves the structure itself: a count is not proof
+        # that what it counted is a mailbox.
 
     config = team_dir / "config.json"
     if not config.is_file():
@@ -4864,6 +4867,33 @@ def rebuild_roster(team, args, passthrough, table):
     return config
 
 
+def select_jobs(members, population, live, lead_id, all_members, team):
+    """(members to run, names left out) for one team run.
+
+    A record is not a policy. When members of this team are running, they are
+    what the team is now, and everything else is history to report rather than
+    restart. When none is, the record is all there is and resuming it whole is
+    the only thing resuming can mean. --all is always everything.
+    """
+    def entry(name):
+        return {"agentId": f"{name}@{team}", "name": name, "former": True}
+
+    listed = {m.get("name") for m in members if m.get("name")}
+    if all_members:
+        members = members + [entry(n) for n in sorted(population) if n not in listed]
+        return members, []
+    if live:
+        kept = [m for m in members if m.get("name") in live or m.get("agentId") == lead_id]
+        have = {m.get("name") for m in kept}
+        # Every live member, not merely the live ones the record happens to
+        # carry: a member running now is the team whether or not the roster ever
+        # heard of it, and narrowing the record alone files a working agent
+        # under former.
+        members = kept + [entry(n) for n in sorted(live - have)]
+        listed = {m.get("name") for m in members if m.get("name")}
+    return members, [n for n in sorted(population) if n not in listed]
+
+
 def former_members_note(former):
     """What a default team run is leaving out, or None when it leaves out nothing.
 
@@ -4895,13 +4925,10 @@ def run_team(args, passthrough, table):
     # Against the roster in hand, not the one on disk. A rebuilt team's roster is
     # a value this run just forged, and on a dry run it was never written, so
     # asking the disk calls every member of it a former and the union doubles.
-    listed = {m.get("name") for m in members if m.get("name")}
     population = RESOLVER.team_population(args.team)
-    former = [name for name in sorted(population) if name not in listed]
-    if getattr(args, "all_members", False):
-        members = members + [{"agentId": f"{name}@{args.team}", "name": name, "former": True}
-                             for name in former]
-        former = []
+    live = {name for name in population if RESOLVER.wearers(f"{name}@{args.team}")}
+    members, former = select_jobs(members, population, live, lead_id,
+                                  getattr(args, "all_members", False), args.team)
     ordered = sorted(members, key=lambda m: 1 if m.get("agentId") == lead_id else 0)
     where = (f"socket {socket} ({socket_why}, {socket_state(socket)})" if socket
              else "socket resolved per member")
@@ -5975,6 +6002,29 @@ def run_selftest(live=False):
     }
     wrong = sorted(k for k, good in notes.items() if not good)
     check("a team run says what it left out", not wrong, ", ".join(wrong))
+
+    # --- live members define the team; the record only stands in for them
+    roster = [{"agentId": "team-lead@t", "name": "team-lead"},
+              {"agentId": "a@t", "name": "a"}, {"agentId": "b@t", "name": "b"}]
+    pop = {"team-lead": (True, ""), "a": (True, ""), "b": (True, ""),
+           "c": (False, ""), "d": (False, "")}
+    picks = {}
+    got, left = select_jobs(list(roster), pop, {"a"}, "team-lead@t", False, "t")
+    names = {m["name"] for m in got}
+    picks["a live member and the lead run"] = names == {"a", "team-lead"}
+    picks["the rest are reported"] = left == ["b", "c", "d"]
+    got, left = select_jobs(list(roster), pop, {"a", "d"}, "team-lead@t", False, "t")
+    picks["a live member the record lacks still runs"] = (
+        {m["name"] for m in got} == {"a", "d", "team-lead"} and "d" not in left)
+    got, left = select_jobs(list(roster), pop, set(), "team-lead@t", False, "t")
+    picks["with none live the record is the team"] = (
+        {m["name"] for m in got} == {"team-lead", "a", "b"} and left == ["c", "d"])
+    got, left = select_jobs(list(roster), pop, {"a"}, "team-lead@t", True, "t")
+    picks["--all takes everything once"] = (
+        sorted(m["name"] for m in got) == ["a", "b", "c", "d", "team-lead"] and not left)
+    wrong = sorted(k for k, good in picks.items() if not good)
+    check("a run takes the live team, or the record when none is live",
+          not wrong, ", ".join(wrong))
 
     # --- one job per agent, whatever assembled the list
     said = ""
