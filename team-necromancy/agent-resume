@@ -5648,7 +5648,17 @@ def run_selftest(live=False):
         # team block it does not start is leading a team from a later life.
         if found and found[0] and not found[0].stem.startswith(other.rsplit("-", 1)[-1]):
             candidates.append((other, found[0]))
-    for other, path in candidates[:6]:
+    # Sorted, so the six that get scanned are the same six on every run. Taking
+    # them in dict order made the check sample a different population each time
+    # and pass by not finding the case rather than by testing it.
+    scans = 0
+    for other, path in sorted(candidates):
+        # Bounded by scans rather than by position: a full scan is the cost, and
+        # stopping at the sixth candidate stopped before the direction that
+        # matters. Stops as soon as both directions are covered.
+        if scans >= 14 or len(seen_dirs) == 2:
+            break
+        scans += 1
         res = RESOLVER.resolve_transcript(session_uuid=path.stem)
         steam = res.stamped("teamName") if res else None
         if not steam or steam == other:
