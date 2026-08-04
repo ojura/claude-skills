@@ -1941,6 +1941,22 @@ class Resolver:
         match = re.search(r"-L\s+(\S+)", cmdline(ppid))
         return match.group(1) if match else None
 
+    def crew_socket(self, team, table):
+        """(socket, why) for the server this team's crew is already sitting on.
+
+        The crew is every agent wearing this team in argv, which is neither the
+        roster's member list nor the resumed agent alone. A roster can miss a
+        member that is running, and one agent is not a crew: asking only about
+        itself sends a relaunched member to a server of its own while its
+        siblings sit together, and asking only the roster misses whoever the
+        roster never heard of.
+        """
+        if not team:
+            return None, ""
+        crew = sorted(e.get("agent") for e in self.live_sessions()
+                      if e.get("team") == team and e.get("agent"))
+        return self.socket_hosting(crew, table)
+
     def socket_hosting(self, agent_ids, table):
         """(socket, why) for the live server already hosting any of these agents.
 
@@ -2897,7 +2913,11 @@ def resolve_socket(ctx, args, table):
     if args.socket:
         return args.socket, getattr(args, "socket_reason", "--socket")
 
-    sock, why = RESOLVER.socket_hosting([agent_id], table)
+    # The team placement chose, so a redirected member seats with the crew it was
+    # placed into rather than with whatever its address named.
+    sock, why = RESOLVER.crew_socket(RESOLVER.field(ctx, "teamName"), table)
+    if not sock:
+        sock, why = RESOLVER.socket_hosting([agent_id], table)
     if sock:
         return sock, why
 
@@ -4825,10 +4845,13 @@ def team_socket(data, args, table):
     lead_id = data.get("leadAgentId")
     # The lead is skipped because it never runs in a pane, so it can never be
     # the process that answers where the team's server is.
-    sock, why = RESOLVER.socket_hosting(
-        [m.get("agentId") for m in data.get("members", []) if m.get("agentId") != lead_id],
-        table,
-    )
+    sock, why = RESOLVER.crew_socket(team, table)
+    if not sock:
+        # A team whose crew is not running yet still has a roster to go on.
+        sock, why = RESOLVER.socket_hosting(
+            [m.get("agentId") for m in data.get("members", []) if m.get("agentId") != lead_id],
+            table,
+        )
     if sock:
         return sock, why
     pid, alive, _, _exact = RESOLVER.lead_pid(data.get("leadSessionId"), team)
@@ -6230,6 +6253,41 @@ def run_selftest(live=False):
         if "live_teams()" in body and "teams_led_by(" in body:
             deciders.append(node.name)
     check("a team is placed in one function", not deciders, ", ".join(sorted(deciders)))
+
+    # The socket follows the crew: every agent wearing the team, not the roster's
+    # list and not the resumed agent alone. A member that is not running has no
+    # server of its own to be found on, and must still seat with its siblings.
+    table = RESOLVER.ps_table()
+    # The population comes from live argv, not from the thing under test: drawing
+    # it from crew_socket let a neutered crew_socket skip the check instead of
+    # failing it. Sorted, so the same team is examined on every run.
+    crewed = next((t for t in sorted(RESOLVER.live_teams())
+                   if RESOLVER.socket_hosting(
+                       sorted(e.get("agent") for e in RESOLVER.live_sessions()
+                              if e.get("team") == t and e.get("agent")), table)[0]), None)
+    if crewed:
+        seat, _why = RESOLVER.crew_socket(crewed, table)
+        wearers = {e.get("agent") for e in RESOLVER.live_sessions() if e.get("team") == crewed}
+        listed = {m.get("agentId") for m in (RESOLVER.roster_of(crewed) or {}).get("members", [])}
+        absent = f"definitely-not-running@{crewed}"
+        seats = {
+            "a crew anchors the seat": bool(seat),
+            "an agent that is not running still seats with them":
+                RESOLVER.crew_socket(crewed, table)[0] == seat
+                and not RESOLVER.socket_hosting([absent], table)[0],
+            # The answer must come from a wearer, which is what makes it
+            # independent of the roster: an unlisted wearer anchors it just the
+            # same, and a listed member that is not running anchors nothing.
+            "the seat is one a wearer is sitting on":
+                RESOLVER.socket_hosting(sorted(w for w in wearers if w), table)[0] == seat,
+            "a listed member that is not running anchors nothing":
+                not RESOLVER.socket_hosting(sorted(listed - wearers) or [absent], table)[0],
+        }
+        wrong = sorted(k for k, ok in seats.items() if not ok)
+        check("the socket follows the crew, not the roster", not wrong,
+              ", ".join(wrong) or f"{crewed} on {seat}")
+    else:
+        check("crew socket (no live crew on this machine)", True, "skipped")
 
     # --- one job per agent, whatever assembled the list
     said = ""
