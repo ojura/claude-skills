@@ -2038,7 +2038,20 @@ class Resolver:
         # A lead polls once it has members to poll for. A team holding only its
         # lead has no inboxes directory at all, so mail written there is read by
         # nobody however correctly it is addressed.
-        polls = bool(members)
+        # A lead polls from its own memory of the roster, and that memory is
+        # updated by its own actions only: a roster written from outside never
+        # reaches it. So a flag-bound lead is known to be reading, because it
+        # read this file when it booted, and a plain one is not knowable from
+        # here at all. Emptying its members stops the loop, and repopulating the
+        # file does not start it again.
+        worn = next((e.get("team") for e in self.live_sessions() if e["pid"] == pid), None)
+        if not members:
+            polls = (False, "the roster lists no members")
+        elif worn:
+            polls = (True, "its argv names the team, so it read this roster when it booted")
+        else:
+            polls = (None, "a plain lead reads its own memory of the roster, which a roster "
+                           "written from outside does not reach")
         if not (pid and alive):
             reachable, why = False, f"no live lead for {team}"
             remedies = [("resume the lead", "starts a process")]
@@ -2056,9 +2069,14 @@ class Resolver:
         elif not listed:
             reachable, why = False, (f"{lead_team} does not list it, so its lead has no record "
                                      "it exists")
-            if not polls:
+            if polls[0] is False:
                 why += "; that roster lists no members at all, so nothing is polled yet"
             remedies = [("resume this member once", "a launch; it registers itself")]
+        elif polls[0] is None:
+            reachable, why = None, (f"listed in {lead_team}, but whether its lead is still "
+                                    f"reading cannot be told from outside its process")
+            remedies = [(f"resume the lead as team-lead@{lead_team}",
+                         "restarts it, and it reads this roster again on the way up")]
         else:
             reachable, why = True, f"listed in {lead_team}, whose live lead polls it"
             remedies = []
@@ -2069,8 +2087,7 @@ class Resolver:
             "lead": (pid, alive, how, "exact" if exact_lead else "inferred"),
             "lead_team": (lead_team, "exact" if exact_team else
                           f"paired by a boot within {TEAM_MINT_WINDOW_MS}ms, not proven"),
-            "polls": (polls, "a lead polls once it has members "
-                             "(per harness knowledge, not demonstrated here)"),
+            "polls": polls,
             "listed": listed,
             "reachable": (reachable, why),
             "remedies": remedies,
@@ -2799,7 +2816,7 @@ def resolve_socket(ctx, args, table):
             if agent_id and not ctx.get("stale_team_warned"):
                 standing = RESOLVER.standing(agent_id, parent)
                 reachable, why = standing["reachable"]
-                if not reachable:
+                if reachable is False:
                     fix = "; ".join(f"{what} ({cost})" for what, cost in standing["remedies"])
                     warn(f"{why}{'. ' + fix if fix else ''}")
         return f"{SOCKET_PREFIX}{pid}", how
@@ -4294,10 +4311,13 @@ def run_standing(args):
     print(f"lead     {('pid ' + str(pid)) if pid else '(none)'}"
           f"{'' if alive else ', not running'}  ({how}) [{grade}]")
     print(f"runs as  {s['lead_team'][0] or '(unknown)'}  [{s['lead_team'][1]}]")
-    print(f"polls    {'yes' if s['polls'][0] else 'no'}  ({s['polls'][1]})")
+    said = {True: "yes", False: "no", None: "unknowable"}[s["polls"][0]]
+    print(f"polls    {said}  ({s['polls'][1]})")
     print(f"listed   {'yes' if s['listed'] else 'no'}")
     reachable, why = s["reachable"]
-    print(f"mail     {'reaches its lead' if reachable else 'does not reach its lead'}: {why}")
+    verdict = {True: "reaches its lead", False: "does not reach its lead",
+               None: "may not reach its lead"}[reachable]
+    print(f"mail     {verdict}: {why}")
     for what, cost in s["remedies"]:
         print(f"remedy   {what}  ({cost})")
     return 0
@@ -5802,8 +5822,22 @@ def run_selftest(live=False):
             lead_team, _grade2 = st["lead_team"]
             # Reachable is the conjunction of its own parts, so a verdict cannot
             # drift from the facts printed beside it.
-            agree[f"{name}@{team}"] = reachable == bool(
-                pid and alive and lead_team == team and st["listed"] and st["polls"][0])
+            # polls is checked against argv rather than against itself: a lead
+            # whose command line names its team read this roster at boot, and one
+            # that does not cannot be known from outside. Deriving the expectation
+            # from the answer would agree with any answer.
+            worn = next((e.get("team") for e in RESOLVER.live_sessions()
+                         if e["pid"] == pid), None) if pid and alive else None
+            members = [m for m in (RESOLVER.roster_of(lead_team) or {}).get("members", [])
+                       if m.get("name") != "team-lead"] if lead_team else []
+            want_polls = False if not members else (True if worn else None)
+            if st["polls"][0] is not want_polls:
+                agree[f"{name}@{team} polls"] = False
+            reaches = (pid and alive and lead_team == team and st["listed"])
+            want = (st["polls"][0] if reaches else False)
+            # True only when the lead is known to be reading, None when that
+            # cannot be told from outside its process, False otherwise.
+            agree[f"{name}@{team}"] = reachable is (want if want is None else bool(want))
             if reachable and not st["listed"]:
                 agree[f"{name}@{team} unlisted yet reachable"] = False
         # Every agent above came out of a roster, so all of them are listed and
@@ -5812,7 +5846,7 @@ def run_selftest(live=False):
         team = seen[0][0]
         absent = RESOLVER.standing(f"definitely-not-a-member@{team}")
         agree["a name no roster carries is not reachable"] = (
-            not absent["listed"] and not absent["reachable"][0]
+            not absent["listed"] and absent["reachable"][0] is False
             and bool(absent["remedies"]))
         wrong = sorted(k for k, good in agree.items() if not good)
         check("a standing verdict follows from its own evidence", not wrong,
