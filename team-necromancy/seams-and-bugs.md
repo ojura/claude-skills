@@ -55,7 +55,12 @@ good components that nobody introduced to each other.
    harness reads the loaded window's first entry, and when it carries both
    `agentName` and `teamName` stamps it overwrites the team context from
    them: stamped team, roster self-match by name, an empty in-RAM teammate
-   map, no idle hook for a restored lead. That empty map is why a restored
+   map, no idle hook for a restored lead. The empty map is why a resumed
+   lead reads no mail at all until it starts a teammate itself: it polls
+   for the members it knows about, and it learns about members only from
+   its own spawns. Starting any teammate fixes it immediately. Restarting
+   it with team flags also fixes it, since it reads the roster file on the
+   way up. Editing that file from outside never does. That empty map is why a restored
    lead reads no mail at all until it spawns a member itself: the poll loop
    runs for the members it knows about, and it learns about members only
    through its own spawns. Writing the roster from outside does not reach
