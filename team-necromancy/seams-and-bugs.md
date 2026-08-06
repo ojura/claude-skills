@@ -100,15 +100,22 @@ good components that nobody introduced to each other.
    the upstream design question is only ever which paths require the
    recipient's attention to be whole.
 
-10. **The drain-then-die window.** Messages are marked read after being
-    "successfully delivered or reliably queued" (useInboxPoller.ts:861-863,
-    its own comment) - and the queue is AppState, which is RAM. A crash
-    between queueing and turn-end delivery loses mail the inbox file now
-    claims was read, and the loss is invisible to transcripts: the message
-    survives only as a successful send in the sender's transcript. The
-    protection comment documents the exact window it does not close. A
-    sender-vs-recipient transcript join (mail_ledger) is what surfaces this
-    shape as an "unexplained" unmatched send.
+10. **The drain-then-die window: mark-read is a deletion.** Confirmed in
+    the 2.1.220 bundle, not code-read: on the busy path, mail is queued
+    into process RAM as pending and then PRUNED from the inbox file, under
+    the lock, with atomicWrite, perfectly safely ("pruned N delivered
+    message", verbatim). Kill the process before its turn ends and the
+    message is gone from the recipient's world entirely: inbox pruned,
+    transcript never touched, the sender's transcript the only record. The
+    irony carries the grade line: every hardening that landed between the
+    eras (locks, atomicWrite, schema pruning) made each file operation safe
+    while leaving the cross-operation ordering untouched, so the binary now
+    executes a destructive order flawlessly. Detection: the mail ledger's
+    "in memory" state, the only instrument that sees a live loss window,
+    already field-sighted on this box. Closure: a recipient-side
+    consumption log, or the upstream deferred-prune fix (mark "delivered,
+    pending turn" in the file; prune only after the turn lands) - a
+    wishlist item with confirmed stakes.
 
 11. **The mailbox writer was lock-free RMW; fixed in the running binary,
     and no casualty was ever produced.** Version-bounded, historical: the

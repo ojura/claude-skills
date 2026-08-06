@@ -1345,8 +1345,10 @@ class Resolver:
 
         Harness-emitted traffic (idle notifications) has no send side, so it
         never appears here; protocol-object sends are counted, not joined.
-        The transcript join is also the durable record: inbox files are
-        deletable by routine cleanup (code-read grade), transcripts are not.
+        The transcript join is the ONLY durable record, two ways over:
+        cleanup deletes inbox dirs wholesale, and normal delivery prunes the
+        inbox on queueing (bundle-confirmed), so "in memory" is the one
+        state any instrument can show while a loss window is open.
         """
         people = {}
         for path, (name, stamped) in self.stamp_index().items():
