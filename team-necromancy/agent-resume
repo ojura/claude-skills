@@ -2927,7 +2927,6 @@ def inherit_credentials(ctx):
 
     The lead pid comes from the ~/.claude chain (roster -> leadSessionId ->
     session registry), not from our process ancestry."""
-    merged = ctx["merged"]
     pid, alive, _, _exact = RESOLVER.lead_pid(RESOLVER.field(ctx, "parentSessionId"), RESOLVER.field(ctx, "teamName"))
     if not (pid and alive):
         return []
@@ -3317,7 +3316,6 @@ def resolve_to_team(args, ctx):
             die(f"no team config at {cfg}")
         return args.to_team
 
-    merged = ctx["merged"]
     source = RESOLVER.field(ctx, "teamName")
     pid, alive, how, _exact = RESOLVER.lead_pid(RESOLVER.field(ctx, "parentSessionId"), source)
     if not (pid and alive):
@@ -3467,7 +3465,6 @@ def own_lineage(table):
 
 def resolve_socket(ctx, args, table):
     """--socket > socket hosting a live process for this agent > lead pid > invent."""
-    merged = ctx["merged"]
     agent_id = RESOLVER.field(ctx, "agentId")
 
     if args.socket:
@@ -4155,7 +4152,6 @@ def claude_binary(args):
 
 
 def build_command(ctx, args, passthrough):
-    merged = ctx["merged"]
     user_flags = {a.split("=", 1)[0] for a in passthrough if a.startswith("-")}
     cmd = [claude_binary(args), "--resume", ctx["session_uuid"]]
 
@@ -4232,7 +4228,6 @@ def check_substrate():
 
 def build_command_agent_id(ctx):
     """The agent id the launch wears, which a rebind changes."""
-    merged = ctx["merged"]
     dest = ctx.get("to_team")
     return f"{RESOLVER.field(ctx, 'agentName')}@{dest}" if dest else RESOLVER.field(ctx, "agentId")
 
@@ -4275,7 +4270,6 @@ def auto_redirect(ctx, args, table, prefix=""):
     Redirect also requires exact evidence: the mint-window join is a heuristic,
     and acting on a heuristic unasked is how "pick the newest" comes back.
     """
-    merged = ctx["merged"]
     agent_id, source = RESOLVER.field(ctx, "agentId"), RESOLVER.field(ctx, "teamName")
     if args.keep_team or not (agent_id and source):
         return
@@ -4352,7 +4346,6 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         ctx = build(args)
     except SystemExit:
         return Outcome("failed", None, False, None)
-    merged = ctx["merged"]
     agent_id = RESOLVER.field(ctx, "agentId")
 
     if args.explain:
@@ -5104,7 +5097,7 @@ def diagnose_team(team, table=None):
         verdict = "SEVERED"
         remedies.append((f"{TOOL} {team}", "rebuilds the roster and places its members"))
         if pid and alive and lead_team and lead_team != team:
-            remedies.append((f"--to-team live on each member", "restarts them onto {lead_team}"
+            remedies.append(("--to-team live on each member", "restarts them onto {lead_team}"
                              .format(lead_team=lead_team)))
     elif not reads:
         verdict = "DEGRADED"
@@ -5396,7 +5389,7 @@ def run_census():
     print("\nleads")
     print(f"  rosters naming a lead session          {named}/{len(rosters)}")
     print(f"  ...whose session is a real transcript  {resolves}/{named}")
-    print(f"  ...which is the shape the roster rung answers; the rest need the payloads")
+    print("  ...which is the shape the roster rung answers; the rest need the payloads")
 
     known = RESOLVER.known_teams()
     by_evidence = collections.Counter(known.values())
@@ -5412,7 +5405,7 @@ def run_census():
     print(f"  teams claimed by several transcripts    {len(contested)}"
           + (f" (up to {max(len(v) for v in contested.values())} each)" if contested else ""))
     print(f"  ...still unresolved after corroboration {len(unresolved)}")
-    print(f"  ...the rest are decided by the ladder; these are refused, not guessed")
+    print("  ...the rest are decided by the ladder; these are refused, not guessed")
 
 
     stamps = RESOLVER.stamp_index()
@@ -5421,7 +5414,7 @@ def run_census():
     print("\ntranscripts")
     print(f"  stamped with a name and a team         {both}")
     print(f"  stamped with a name and no team        {name_only}")
-    print(f"  ...either ran team-less or were launched with mismatched team flags")
+    print("  ...either ran team-less or were launched with mismatched team flags")
     return 0
 
 
@@ -6098,8 +6091,6 @@ def run_selftest(live=False):
                 and getattr(call.func.value, "id", None) == "RESOLVER"
                 and call.func.attr == node.name)
 
-    delegates = {n.name for n in ast.walk(tree)
-                 if isinstance(n, ast.FunctionDef) and is_delegate(n)}
     funcs = {n.name: n for n in ast.walk(tree)
              if isinstance(n, ast.FunctionDef) and not is_delegate(n)}
 
