@@ -4608,6 +4608,28 @@ def record_membership(ctx, args, pane, alive=True):
         register_member(RESOLVER.roster_record(ctx, team=team), pane, args.dry_run, alive)
 
 
+def report_launch(ctx, command, prefix="", role="agent", agent_id=None, extra=()):
+    """The facts a launch reports, whichever way it launches.
+
+    One block, because two were kept by hand and drifted: a lead exec'd
+    without ever printing its command, since the field lived in the member
+    block and nowhere else. What genuinely differs between the paths is the
+    mechanism - a pane and a socket, or taking over this terminal - so that
+    is what `extra` carries, and everything common is answered here once.
+    """
+    print(f"{prefix}{role:<8} {agent_id or '(unknown)'}")
+    print(f"{prefix}session  {ctx['session_uuid']}  ({ctx['transcript'][0]})")
+    print(f"{prefix}via      {ctx['via']}")
+    if ctx.get("placed"):
+        print(f"{prefix}team     {ctx['placed'][0]}  ({ctx['placed'][1]})")
+    title = session_title(ctx["transcript"][0], limit=100)
+    if title:
+        print(f"{prefix}title    {title}")
+    for label, value in extra:
+        print(f"{prefix}{label:<8} {value}")
+    print(f"{prefix}command  {' '.join(shlex.quote(c) for c in command)}")
+
+
 def run_one(args, passthrough, table, prefix="", pending=()):
     """Resume one agent. Returns Outcome(status, socket, is_lead), status being
     'noop' | 'launched' | 'manual' | 'failed'.
@@ -4631,15 +4653,8 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     # the next lead's exit anyway. No socket, no pane, no roster patch.
     if agent_id and agent_id == ctx.get("lead_agent_id"):
         command = build_command(ctx, args, passthrough)
-        print(f"{prefix}lead     {agent_id}")
-        print(f"{prefix}session  {ctx['session_uuid']}  ({ctx['transcript'][0]})")
-        print(f"{prefix}via      {ctx['via']}")
-        if ctx.get("placed"):
-            print(f"{prefix}team     {ctx['placed'][0]}  ({ctx['placed'][1]})")
-        title = session_title(ctx["transcript"][0], limit=100)
-        if title:
-            print(f"{prefix}title    {title}")
-        print(f"{prefix}cwd      {RESOLVER.field(ctx, 'cwd') or '(inherit)'}")
+        report_launch(ctx, command, prefix, role="lead", agent_id=agent_id,
+                      extra=[("cwd", RESOLVER.field(ctx, "cwd") or "(inherit)")])
         owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
         if owner and owner[2] and not args.force:
             warn(f"already live as pid {owner[0]}{state_note(owner[0])}; pass --force to run a second copy")
@@ -4683,7 +4698,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
                 # traceback through a tool that has already moved the cwd.
                 die(f"cannot exec {command[0]}: {exc}")
         print(f"{prefix}run this in your terminal (leads are not spawned into tmux):")
-        print(f"{prefix}  {' '.join(shlex.quote(c) for c in command)}")
+        print(f"{prefix}  {' '.join(shlex.quote(c) for c in command)}")  # copy-paste form
         return Outcome("manual", None, True, None)
 
     if args.to_team:
@@ -4715,20 +4730,12 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     command = build_command(ctx, args, passthrough)
     adopted = inherit_credentials(ctx)
 
-    print(f"{prefix}agent    {agent_id or '(unknown)'}")
-    print(f"{prefix}session  {ctx['session_uuid']}  ({ctx['transcript'][0]})")
-    print(f"{prefix}via      {ctx['via']}")
-    if ctx.get("placed"):
-        print(f"{prefix}team     {ctx['placed'][0]}  ({ctx['placed'][1]})")
-    title = session_title(ctx["transcript"][0], limit=100)
-    if title:
-        print(f"{prefix}title    {title}")
-    print(f"{prefix}socket   {socket}  [{how}] ({socket_state(socket)})")
-    print(f"{prefix}pane     {want_pane or '(none recorded)'}")
-    print(f"{prefix}cwd      {cwd or '(inherit)'}")
+    seat = [("socket", f"{socket}  [{how}] ({socket_state(socket)})"),
+            ("pane", want_pane or "(none recorded)"),
+            ("cwd", cwd or "(inherit)")]
     if adopted:
-        print(f"{prefix}creds    inherited {', '.join(adopted)} from the lead")
-    print(f"{prefix}command  {' '.join(shlex.quote(c) for c in command)}")
+        seat.append(("creds", f"inherited {', '.join(adopted)} from the lead"))
+    report_launch(ctx, command, prefix, role="agent", agent_id=agent_id, extra=seat)
 
     # Same agent already in that pane -> nothing to do. Anything else in it -> new pane.
     _, occupants = pane_occupants(socket, want_pane, table) if want_pane else (False, [])
@@ -7393,6 +7400,33 @@ def run_selftest(live=False):
     }
     wrong = sorted(k for k, good in notes.items() if not good)
     check("a team run says what it left out", not wrong, ", ".join(wrong))
+
+    # --- a lead and a member report the same launch facts
+    # Two hand-maintained report blocks in one function is why the lead once
+    # exec'd without ever printing its command: the field existed in the
+    # member block and nowhere else. Whatever else the two paths differ in,
+    # they answer these questions alike.
+    run_one_src = ast.get_source_segment(source, funcs["run_one"]) or ""
+    lead_block, _, member_block = run_one_src.partition("if args.to_team:")
+    reporters = sorted(callers_of("report_launch"))
+    # Both halves report through the one function, so a field cannot exist in
+    # one report and not the other: what differs is the seat, not the facts.
+    split = [where for where, block in (("the lead path", lead_block),
+                                        ("the member path", member_block))
+             if "report_launch(" not in block]
+    if set(reporters) - {"run_one", "run_selftest"}:
+        split.append("reported from " + ", ".join(
+            sorted(set(reporters) - {"run_one", "run_selftest"})))
+    printed = io.StringIO()
+    fake = {"session_uuid": "s-1", "transcript": [Path("/nonexistent/t.jsonl")],
+            "via": "test", "placed": None}
+    with contextlib.redirect_stdout(printed):
+        report_launch(fake, ["claude", "--resume", "s-1"], role="lead",
+                      agent_id="team-lead@t")
+    if "command  claude --resume s-1" not in printed.getvalue():
+        split.append("a lead report omits its command")
+    check("a lead and a member report the same launch facts", not split,
+          ", ".join(split))
 
     # --- live members define the team; the record only stands in for them
     roster = [{"agentId": "team-lead@t", "name": "team-lead"},
