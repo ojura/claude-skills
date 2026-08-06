@@ -60,15 +60,9 @@ good components that nobody introduced to each other.
    for the members it knows about, and it learns about members only from
    its own spawns. Starting any teammate fixes it immediately. Restarting
    it with team flags also fixes it, since it reads the roster file on the
-   way up. Editing that file from outside never does. That empty map is why a restored
-   lead reads no mail at all until it spawns a member itself: the poll loop
-   runs for the members it knows about, and it learns about members only
-   through its own spawns. Writing the roster from outside does not reach
-   it, restarting it flag-bound does (it reads the file on the way up), and
-   spawning any teammate does immediately - the cheap fix, and the one that
-   keeps happening by accident, because whoever forks an agent to do
-   something unrelated also drains the mail. Everything operative follows the
-   restored context, and every new line re-stamps it, so a flagless resume of
+   way up. Editing that file from outside never does.
+
+   Everything operative follows the restored context, and every new line re-stamps it, so a flagless resume of
    a stamped transcript runs as the stamped team forever, not the minted one.
    The mint record is a mint event that adoption then discards. Anything that
    answers "runs as" from the session id or the mint ledger overclaims for
