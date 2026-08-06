@@ -5243,6 +5243,13 @@ def run_standing(args):
                False: "does not reach its lead",
                None: "may not reach its lead"}[reachable]
     print(f"mail     {verdict}: {why}")
+    name, _, team = s["agent_id"].partition("@")
+    addressed = [r for r in RESOLVER.mail_ledger(team) if r["to"] == name]
+    held = sum(r["state"] == "in memory" for r in addressed)
+    lost = sum(r["state"] == "unexplained" for r in addressed)
+    if held or lost:
+        print(f"ledger   {held} in its memory, {lost} unexplained, of "
+              f"{len(addressed)} sends addressed to it")
     for what, cost in s["remedies"]:
         print(f"remedy   {what}  ({cost})")
     return 0
@@ -5259,11 +5266,32 @@ DOCTOR_LEGEND = (
 )
 
 
-def diagnose_team(team, table=None):
+def undelivered_mail_lines(rows):
+    """Report lines for the ledger states a mailbox file cannot show.
+
+    The inbox file is pruned the moment a busy recipient queues mail into
+    memory, so the file's silence proves nothing; these lines carry the two
+    states only the send-vs-delivery join can see.
+    """
+    out = []
+    held = collections.Counter(r["to"] for r in rows if r["state"] == "in memory")
+    for to, count in held.most_common():
+        out.append(f"mail     {count} in {to}'s memory; delivery waits on its "
+                   "next turn boundary and dies with its process")
+    for r in rows:
+        if r["state"] == "unexplained":
+            out.append(f"mail     unexplained: {r['sender']} -> {r['to']} at "
+                       f"{ms_str(r['sent'])}  {(r['summary'] or '')[:40]}")
+    return out
+
+
+def diagnose_team(team, table=None, deep=False):
     """(verdict, lines, remedies) for one team. Asks the engine; reads nothing.
 
     Every fact here is an answer, so the doctor cannot reach a conclusion the
-    tool would not reach when it acts.
+    tool would not reach when it acts. `deep` adds the send-vs-delivery join,
+    which reads every member transcript in full and so runs only for a named
+    team, never in the sweep.
     """
     table = RESOLVER.ps_table() if table is None else table
     pid, alive, how, _exact = RESOLVER.lead_pid(None, team)
@@ -5313,6 +5341,8 @@ def diagnose_team(team, table=None):
         lines.append(f"mail     {count} waiting for {name}, oldest {oldest}")
     for name, why in sorted(torn.items()):
         lines.append(f"mail     {name}'s inbox is {why}; its contents are unknown")
+    if deep:
+        lines.extend(undelivered_mail_lines(RESOLVER.mail_ledger(team)))
     for name in doubled:
         lines.append(f"warning  {name} is worn by {len(live[name])} processes at once")
 
@@ -5359,7 +5389,7 @@ def run_doctor(args, selector=None):
         skipped = 0 if args.all_members else len(everything) - len(teams)
     worst = 0
     for team in teams:
-        verdict, lines, remedies = diagnose_team(team)
+        verdict, lines, remedies = diagnose_team(team, deep=bool(target))
         print(f"\n{verdict:<11} {team}")
         for line in lines:
             print(f"  {line}")
@@ -5370,6 +5400,9 @@ def run_doctor(args, selector=None):
     if skipped:
         print(f"\n{skipped} team(s) with nothing live and no waiting mail were not "
               f"examined; --all covers them")
+    if not target and teams:
+        print("\nmail beyond the inbox files is joined for a named team only; "
+              "--mail-ledger <team> shows it for any team")
     for stem in RESOLVER.nameless_receipts():
         print(f"\nnote     receipt {stem[:8]} is materialized without a recorded "
               "identity, so no team can count it; re-promote to record one")
@@ -7570,6 +7603,37 @@ def run_selftest(live=False):
         check("a torn inbox is reported, not skipped",
               bool(got) and got[0] is None and "torn" in got[1],
               str(got))
+
+    # --- the reports carry what the mailbox file cannot show
+    sample = [
+        {"sender": "a", "to": "lead", "summary": "s1", "sent": 1,
+         "state": "delivered", "detail": ""},
+        {"sender": "a", "to": "lead", "summary": "s2", "sent": 2,
+         "state": "in memory", "detail": ""},
+        {"sender": "b", "to": "lead", "summary": "s3", "sent": 3,
+         "state": "in memory", "detail": ""},
+        {"sender": "a", "to": "lead", "summary": "s4", "sent": 4,
+         "state": "unexplained", "detail": ""},
+    ]
+    told = undelivered_mail_lines(sample)
+    quiet = []
+    if not any("2 in lead's memory" in line for line in told):
+        quiet.append("in-memory rows are not grouped and counted")
+    if not any("unexplained: a -> lead" in line for line in told):
+        quiet.append("an unexplained row is not named")
+    if any("delivered" in line for line in told):
+        quiet.append("a delivered row leaked into the undelivered lines")
+    doctor_src = ast.get_source_segment(source, funcs["diagnose_team"]) or ""
+    if "mail_ledger(" not in doctor_src:
+        quiet.append("the doctor does not consult the ledger")
+    runner_src = ast.get_source_segment(source, funcs["run_doctor"]) or ""
+    if "deep=bool(target)" not in runner_src:
+        quiet.append("the sweep and the named team share a depth")
+    standing_src = ast.get_source_segment(source, funcs["run_standing"]) or ""
+    if "mail_ledger(" not in standing_src:
+        quiet.append("standing does not consult the ledger")
+    check("the reports carry what the mailbox file cannot show", not quiet,
+          ", ".join(quiet))
 
     # --- the unread-mail refusal refuses instead of crashing (its first
     # spelling raised NameError at exactly the moment it was needed)
