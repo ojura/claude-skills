@@ -6201,13 +6201,18 @@ def run_mail_ledger(selector=None):
 
 
 def run_sides(selector=None):
-    """List side transcripts, newest first. Read-only; the engine classifies.
+    """List side transcripts grouped under the sessions they hang from,
+    newest first. Read-only; the engine classifies.
 
     The grammar column is the load-bearing one: conversion acts only on the
     two shapes it can prove an inverse for, so this listing is also the
-    census of what a promote could and could not touch.
+    census of what a promote could and could not touch. A machine-wide
+    sweep shows each parent's newest few and counts the rest by grammar,
+    because nine hundred interleaved rows are a dump, not a report; naming
+    a parent lists it in full.
     """
     sides = RESOLVER.side_transcripts()
+    named = bool(selector)
     if selector:
         want = selector[len("session-"):] if selector.startswith("session-") else selector
         sides = [e for e in sides if e["parent"].startswith(want)]
@@ -6215,13 +6220,35 @@ def run_sides(selector=None):
             die(f"no side transcripts under a session starting {selector!r}")
     sides.sort(key=lambda e: e["mtime"], reverse=True)
     counts = collections.Counter(e["grammar"] for e in sides)
+
+    by_parent = {}
     for e in sides:
-        name = e["name"] or e["task_id"]
-        kind = e["agent_type"] or "?"
-        print(f"{e['parent'][:8]}/{name:32} {e['grammar']:15} {kind:16} "
-              f"{ms_str(e['mtime'])}")
-        if e["grammar"] == "unclassifiable":
-            print(f"  {'':8} {e['detail']}")
+        by_parent.setdefault(e["parent"], []).append(e)
+    shown_parents = list(by_parent) if named else list(by_parent)[:15]
+    if not named:
+        print(fill(f"side transcripts under {len(by_parent)} session(s), "
+                   "most recently active first; --sides <session> lists one in full"))
+    cap = None if named else 3
+    for parent in shown_parents:
+        entries = by_parent[parent]
+        breakdown = collections.Counter(e["grammar"] for e in entries)
+        said = ", ".join(f"{n} {g}" for g, n in breakdown.most_common())
+        print(f"\n{parent[:8]}  ({said})")
+        for e in entries[:cap]:
+            name = e["name"] or e["task_id"]
+            kind = e["agent_type"] or "?"
+            print(f"  {name:32} {e['grammar']:15} {kind:16} {ms_str(e['mtime'])}")
+            if e["grammar"] == "unclassifiable":
+                print(fill(f"    {e['detail']}"))
+        left = len(entries) - len(entries[:cap])
+        if left:
+            print(f"  ...and {left} more  (--sides {parent[:8]} lists them)")
+    folded_parents = len(by_parent) - len(shown_parents)
+    if folded_parents:
+        folded_count = sum(len(by_parent[p]) for p in list(by_parent)[15:])
+        print(fill(f"\n...and {folded_parents} older session(s) holding "
+                   f"{folded_count} side transcript(s); --sides <session> "
+                   "lists any of them"))
     total = sum(counts.values())
     print(f"\n{total} side transcript(s): " +
           ", ".join(f"{n} {g}" for g, n in counts.most_common()))
@@ -7415,6 +7442,40 @@ def run_selftest(live=False):
           comp_text and not missing and not unknown,
           f"missing from completion: {missing}; unknown to the parser: {unknown}"
           if (missing or unknown) else "no completion file found")
+
+    # The sides sweep groups under each parent session and bounds itself,
+    # saying what it folded and how to see it; a named parent lists in full.
+    real_sides_fn = RESOLVER.side_transcripts
+    RESOLVER.side_transcripts = lambda parent=None: (
+        [{"parent": "aaaa1111-fixture", "name": f"side{n}", "task_id": f"t{n}",
+          "agent_type": "fork", "grammar": "pointer", "mtime": 1000 - n,
+          "detail": ""} for n in range(5)]
+        + [{"parent": "bbbb2222-fixture", "name": "only-one", "task_id": "t9",
+            "agent_type": "Explore", "grammar": "rooted", "mtime": 500,
+            "detail": ""}])
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as swept:
+            run_sides()
+        with contextlib.redirect_stdout(io.StringIO()) as listed_out:
+            run_sides("aaaa1111")
+    finally:
+        RESOLVER.side_transcripts = real_sides_fn
+    sweep_text, listed_text = swept.getvalue(), listed_out.getvalue()
+    folded = {
+        "one header per session": sweep_text.count("aaaa1111") == 2  # header + remedy
+            and sweep_text.count("bbbb2222") == 1,
+        "newest few shown, rest counted": "side2" in sweep_text
+            and "side3" not in sweep_text
+            and "...and 2 more  (--sides aaaa1111 lists them)" in sweep_text,
+        "counts ride the header": "(5 pointer)" in sweep_text
+            and "(1 rooted)" in sweep_text,
+        "a named parent lists in full": all(f"side{n}" in listed_text
+                                           for n in range(5))
+            and "...and" not in listed_text,
+    }
+    wrong = sorted(k for k, ok in folded.items() if not ok)
+    check("the sides sweep folds each session and says what it folded",
+          not wrong, ", ".join(wrong))
 
     # Classification, not position, decides what a token is. Every entry must
     # carry both facts, or a future flag is added half-specified and the walk
