@@ -528,6 +528,7 @@ class Resolver:
         self._by_agent = None    # "name@team" -> payload, across every transcript
         self._by_team = None     # team -> [(stamp, path)] of transcripts that led it
         self.teams_dir = TEAMS_DIR   # overridable so a test engine can read a synthetic tree
+        self.projects_dir = PROJECTS_DIR  # same, for the transcript tree
 
     def refresh_procs(self):
         self._procs = None
@@ -2278,6 +2279,92 @@ class Resolver:
         elif isinstance(node, list):
             for value in node:
                 yield from self._walk_spawn_payloads(value, depth + 1)
+
+    def side_transcripts(self, parent=None):
+        """Every side transcript on this machine, classified by its own bytes.
+
+        A side transcript lives at <project>/<parent-session>/subagents/
+        agent-<taskId>.jsonl, with an optional .meta.json beside it. The meta
+        contributes a display name and an agent type and classifies nothing:
+        this corpus holds a meta that says fork beside a file whose bytes are
+        a rooted chain, and the file wins.
+
+        Grammars, decided by the first record alone:
+          pointer  line 1 is a fork-context-ref naming the parent, the leaf it
+                   forked from, and a context length; history is by reference.
+          rooted   the first record is a null-parent sidechain record with a
+                   uuid; the chain carries its own history.
+        Anything else is reported as what it is, never guessed at.
+        """
+        pattern = f"*/{parent or '*'}/subagents/agent-*.jsonl"
+        out = []
+        for path in sorted(self.projects_dir.glob(pattern)):
+            try:
+                mtime = int(path.stat().st_mtime * 1000)
+            except OSError:
+                continue
+            entry = {"path": path, "parent": path.parent.parent.name,
+                     "task_id": path.stem[len("agent-"):],
+                     "name": None, "agent_type": None, "mtime": mtime}
+            try:
+                meta = json.loads(path.with_name(path.stem + ".meta.json").read_text())
+                entry["name"] = meta.get("name")
+                entry["agent_type"] = meta.get("agentType")
+            except (OSError, ValueError):
+                pass
+            entry["grammar"], entry["detail"] = self._side_grammar(path)
+            out.append(entry)
+        return out
+
+    def _side_grammar(self, path):
+        """(grammar, detail) for one side transcript, from its first record.
+
+        pointer -> the ref record itself; rooted -> the root uuid;
+        unclassifiable -> a sentence naming what the first record actually is.
+        """
+        try:
+            with path.open(errors="replace") as handle:
+                first = handle.readline().strip()
+        except OSError as err:
+            return "unclassifiable", f"unreadable ({err.__class__.__name__})"
+        if not first:
+            return "unclassifiable", "the file is empty"
+        try:
+            rec = json.loads(first)
+        except ValueError:
+            return "unclassifiable", "the first line is not JSON"
+        if rec.get("type") == "fork-context-ref":
+            return "pointer", rec
+        if rec.get("parentUuid") is None and rec.get("isSidechain") is True and rec.get("uuid"):
+            return "rooted", rec["uuid"]
+        parent = "null" if rec.get("parentUuid") is None else "set"
+        return "unclassifiable", (f"the first record is type={rec.get('type', '?')}, "
+                                  f"parentUuid={parent}, isSidechain={rec.get('isSidechain')}")
+
+    def side_transcript(self, selector):
+        """One side transcript for a typed selector, or (None, why not).
+
+        Accepted spellings: the task id, <parent-session-prefix>/<name>, a
+        rooted file's root uuid, or a bare meta name that exactly one side
+        transcript wears. Several matches are named and refused, never ranked.
+        """
+        sides = self.side_transcripts()
+        if "/" in selector:
+            parent_part, _, name_part = selector.partition("/")
+            hits = [e for e in sides if e["parent"].startswith(parent_part)
+                    and name_part in (e["name"], e["task_id"])]
+        else:
+            hits = [e for e in sides if e["task_id"] == selector]
+            hits = hits or [e for e in sides
+                            if e["grammar"] == "rooted" and e["detail"] == selector]
+            hits = hits or [e for e in sides if e["name"] == selector]
+        if not hits:
+            return None, f"no side transcript matches {selector!r}"
+        if len(hits) > 1:
+            shown = ", ".join(f"{e['parent'][:8]}/{e['name'] or e['task_id']}" for e in hits[:6])
+            more = f" and {len(hits) - 6} more" if len(hits) > 6 else ""
+            return None, f"{len(hits)} side transcripts match {selector!r}: {shown}{more}"
+        return hits[0], ""
 
 
 
@@ -4110,6 +4197,12 @@ def _complete(topic):
             print(f"{path.stem}:{desc}")
         return 0
 
+    if topic == "sides":
+        for e in RESOLVER.side_transcripts():
+            name = e["name"] or e["task_id"]
+            print(f"{e['parent'][:8]}/{name}:{e['grammar']}, {ms_str(e['mtime'])}")
+        return 0
+
     entries = RESOLVER.scan_teams()
     entries.sort(key=lambda e: e["ts"], reverse=True)
 
@@ -4603,6 +4696,34 @@ def run_doctor(args, selector=None):
         for name, meaning in DOCTOR_LEGEND:
             print(f"  {name:<11} {meaning}")
     return worst
+
+
+def run_sides(selector=None):
+    """List side transcripts, newest first. Read-only; the engine classifies.
+
+    The grammar column is the load-bearing one: conversion acts only on the
+    two shapes it can prove an inverse for, so this listing is also the
+    census of what a promote could and could not touch.
+    """
+    sides = RESOLVER.side_transcripts()
+    if selector:
+        want = selector[len("session-"):] if selector.startswith("session-") else selector
+        sides = [e for e in sides if e["parent"].startswith(want)]
+        if not sides:
+            die(f"no side transcripts under a session starting {selector!r}")
+    sides.sort(key=lambda e: e["mtime"], reverse=True)
+    counts = collections.Counter(e["grammar"] for e in sides)
+    for e in sides:
+        name = e["name"] or e["task_id"]
+        kind = e["agent_type"] or "?"
+        print(f"{e['parent'][:8]}/{name:32} {e['grammar']:15} {kind:16} "
+              f"{ms_str(e['mtime'])}")
+        if e["grammar"] == "unclassifiable":
+            print(f"  {'':8} {e['detail']}")
+    total = sum(counts.values())
+    print(f"\n{total} side transcript(s): " +
+          ", ".join(f"{n} {g}" for g, n in counts.most_common()))
+    return 0
 
 
 def run_census():
@@ -6243,6 +6364,51 @@ def run_selftest(live=False):
             leaks.append("the recursive searcher")
     check("a sidechain line is not evidence", not leaks, ", ".join(leaks))
 
+    # --- side transcripts: the file classifies itself; the meta only decorates
+    with tempfile.TemporaryDirectory() as td:
+        sub = Path(td) / "proj" / "PARENT-UUID" / "subagents"
+        sub.mkdir(parents=True)
+        ref = {"type": "fork-context-ref", "agentId": "p1", "parentSessionId":
+               "PARENT-UUID", "parentLastUuid": "leaf-1", "contextLength": 5}
+        (sub / "agent-p1.jsonl").write_text(json.dumps(ref) + "\n")
+        root = {"type": "user", "parentUuid": None, "isSidechain": True, "uuid": "root-1"}
+        (sub / "agent-r1.jsonl").write_text(json.dumps(root) + "\n")
+        (sub / "agent-r1.meta.json").write_text(
+            json.dumps({"isFork": True, "agentType": "fork", "name": "liar"}))
+        mid = {"type": "assistant", "parentUuid": "elsewhere", "isSidechain": True, "uuid": "m"}
+        (sub / "agent-m1.jsonl").write_text(json.dumps(mid) + "\n")
+        eng = Resolver()
+        eng.projects_dir = Path(td)
+        got = {e["task_id"]: e for e in eng.side_transcripts()}
+        wrong = []
+        if got.get("p1", {}).get("grammar") != "pointer":
+            wrong.append("the ref file is not pointer")
+        if got.get("r1", {}).get("grammar") != "rooted":
+            wrong.append("a lying meta out-voted the bytes")
+        if got.get("r1", {}).get("name") != "liar":
+            wrong.append("the meta name was not carried as display")
+        if got.get("m1", {}).get("grammar") != "unclassifiable":
+            wrong.append("a mid-chain start was classified")
+        for sel, want in (("p1", "p1"), ("PARENT-UUID/liar", "r1"), ("root-1", "r1")):
+            hit, _why = eng.side_transcript(sel)
+            if not hit or hit["task_id"] != want:
+                wrong.append(f"selector {sel!r} missed")
+        hit, why = eng.side_transcript("nobody")
+        if hit or "no side transcript" not in why:
+            wrong.append("an absent selector did not refuse")
+        check("a side transcript is classified by its own bytes",
+              not wrong, ", ".join(wrong))
+
+    # Every side transcript on this machine classifies without a crash, and the
+    # ones that are neither grammar are counted, not guessed at.
+    corpus = RESOLVER.side_transcripts()
+    tallies = collections.Counter(e["grammar"] for e in corpus)
+    stray = tallies.get("unclassifiable", 0)
+    ok = sum(tallies.values()) == len(corpus) and \
+        set(tallies) <= {"pointer", "rooted", "unclassifiable"}
+    check("the side-transcript census answers for every file", ok,
+          ", ".join(f"{n} {g}" for g, n in tallies.most_common()) or "none on this machine")
+
     # Two counts of "contested" that mean different things, so both are named.
     claimed = {t: {path for _st, path in hits} for t, hits in RESOLVER.led_teams().items()}
     raw = {t for t, paths in claimed.items() if len(paths) > 1}
@@ -6634,7 +6800,7 @@ def run_selftest(live=False):
             ok = (reason is None) if expect is None else (reason is not None and expect in reason)
             check(f"cruft check: {label}", ok, reason or "considered empty")
 
-    for topic in ("names", "teams", "leads", "sockets", "sessions"):
+    for topic in ("names", "teams", "leads", "sockets", "sessions", "sides"):
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             run_complete(topic)
@@ -6687,6 +6853,9 @@ def main():
     parser.add_argument("--census", action="store_true",
                         help="count what this machine's ~/.claude contains, through the "
                              "same readers the tool resolves with")
+    parser.add_argument("--sides", action="store_true",
+                        help="list side transcripts (subagent conversations), each "
+                             "classified by its own bytes; reports only")
     parser.add_argument("--cleanup", "--cleanup-sockets", dest="cleanup", action="store_true",
                         help="reap dead swarm sockets and team dirs with nothing resurrectable")
     parser.add_argument("--complete", metavar="TOPIC", help=argparse.SUPPRESS)
@@ -6737,6 +6906,12 @@ def main():
 
     if args.census:
         return run_census()
+
+    if args.sides:
+        # Like the doctor: before the help gate because a bare sweep needs no
+        # selector, and resolving its own target because args.team is not set
+        # yet; a named session must not be silently swept into the machine.
+        return run_sides(selector)
 
     if args.cleanup:
         return run_cleanup(args.dry_run)
