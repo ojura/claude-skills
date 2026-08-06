@@ -614,17 +614,59 @@ class NEED(enum.Enum):
     TITLES = "transcript titles"
 
 
-class Maybe:
-    """A declared need the run may or may not exercise.
+class DECLARED(enum.Enum):
+    """How firmly a verb declared one need. Absence is an answer, not a gap."""
+    HARD = "declared"            # always computed; unexercised is a fault
+    MAYBE = "declared if used"   # a runtime branch decides; unexercised is fine
+    ABSENT = "not declared"      # computing it at all is a fault
 
-    Conditional paths (a deep doctor's mail join, a root-spelling side)
-    declare Maybe(X): the engine will compute X if asked, and the audit
-    excuses X unexercised, where an unexercised hard need is a fat
-    declaration and refused.
+
+class Needs:
+    """What one verb may compute, and how firmly it said so.
+
+    A declaration is two buckets rather than a bag of mixed elements, so an
+    author writing one has to place every need in exactly one of them. The
+    conditional bucket is for a runtime branch (liveness, corpus content)
+    deciding, never for an author who has not worked out what the input
+    implies; each entry carries a comment naming what decides it.
+
+    Asking is one operation, needs[X], which distinguishes all three states.
+    A wrapper object could not: it carried no equality, so membership tests
+    answered no both for a conditional declaration and for none at all, and
+    a check written that way passed with its subject deleted.
     """
 
-    def __init__(self, need):
-        self.need = need
+    def __init__(self, hard=(), maybe=()):
+        self._hard = frozenset(hard)
+        self._maybe = frozenset(maybe) - self._hard   # hard wins; nothing is both
+
+    def __getitem__(self, need):
+        if need in self._hard:
+            return DECLARED.HARD
+        if need in self._maybe:
+            return DECLARED.MAYBE
+        return DECLARED.ABSENT
+
+    @property
+    def hard(self):
+        """The needs whose absence from a run is a fat declaration."""
+        return self._hard
+
+    @property
+    def reachable(self):
+        """Every need this run may compute, however firmly declared."""
+        return self._hard | self._maybe
+
+    def __eq__(self, other):
+        return (isinstance(other, Needs)
+                and (self._hard, self._maybe) == (other._hard, other._maybe))
+
+    def __hash__(self):
+        return hash((self._hard, self._maybe))
+
+    def __repr__(self):
+        return (f"Needs(hard={sorted(n.name for n in self._hard)}, "
+                f"maybe={sorted(n.name for n in self._maybe)})")
 
 
 class Resolver:
@@ -655,9 +697,8 @@ class Resolver:
     ask its loader or the whole run may not.
     """
 
-    def __init__(self, needs=()):
-        self.hard_needs = {n for n in needs if isinstance(n, NEED)}
-        self.needs = self.hard_needs | {n.need for n in needs if isinstance(n, Maybe)}
+    def __init__(self, needs=None):
+        self.needs = needs if needs is not None else Needs()
         self.exercised = set()
         self._procs = None       # pid -> row, from ps
         self._stamps = None      # transcript stem -> (agentName, teamName)
@@ -670,12 +711,12 @@ class Resolver:
 
     def _exercise(self, need):
         """Record one declared compute happening, or refuse an undeclared one."""
-        if need not in self.needs:
+        if self.needs[need] is DECLARED.ABSENT:
             raise RuntimeError(
                 f"this run declared no need for {need.value}; the engine "
                 f"computes only what its constructor was told, so declare "
-                f"NEED.{need.name} (or Maybe(NEED.{need.name}) for a "
-                f"conditional path) where the verb states its needs")
+                f"NEED.{need.name} where the verb states its needs, in the "
+                f"maybe bucket if only some runs of that verb reach it")
         self.exercised.add(need)
 
     def audit_needs(self):
@@ -683,17 +724,17 @@ class Resolver:
 
         The destructor's contract, spelled where Python can enforce it: a
         raise from __del__ is swallowed, so the run calls this when its verb
-        completes. Unexercised Maybe declarations are the escape for
-        conditional paths and pass silently.
+        completes. Conditional declarations are the escape for branchy paths
+        and pass silently when unexercised.
         """
-        fat = self.hard_needs - self.exercised
+        fat = self.needs.hard - self.exercised
         if fat:
             raise RuntimeError(
                 "declared and never computed: "
                 + ", ".join(sorted(n.name for n in fat))
                 + "; a smaller declaration would have served this run, so "
-                  "drop it or mark it Maybe(...) if some runs of this verb "
-                  "genuinely use it")
+                  "drop it or move it to the maybe bucket if some runs of "
+                  "this verb genuinely use it")
 
     def refresh_procs(self):
         self._procs = None
@@ -7730,7 +7771,7 @@ def run_selftest(live=False):
                  "type": "user"}) + "\n")
             (side_dir / f"agent-{task}.meta.json").write_text(json.dumps(
                 {"name": side_name, "agentType": "fork"}))
-        eng11 = Resolver(needs={Maybe(n) for n in NEED})
+        eng11 = Resolver(needs=Needs(maybe=set(NEED)))
         eng11.projects_dir = Path(td)
         graded = []
         real_grammar = eng11._side_grammar
@@ -7757,8 +7798,8 @@ def run_selftest(live=False):
 
     # Compute is a constructor contract: declared as an enum set, nothing by
     # default, refused by name at use when undeclared and at end of run when
-    # declared and never exercised, with Maybe the honest escape for a
-    # conditional branch. (Python swallows a raise from __del__, so the
+    # declared and never exercised, with the conditional bucket the honest
+    # escape for a branchy path. (Python swallows a raise from __del__, so the
     # end-of-run audit is the destructor this contract can enforce.)
     with tempfile.TemporaryDirectory() as td:
         mute = Resolver()
@@ -7768,7 +7809,7 @@ def run_selftest(live=False):
             mute.stamp_index()
         except RuntimeError as err:
             refused = str(err)
-        allowed = Resolver(needs={NEED.STAMPS})
+        allowed = Resolver(needs=Needs(hard={NEED.STAMPS}))
         allowed.projects_dir = Path(td)
         answered = allowed.stamp_index() == {}
         try:
@@ -7776,7 +7817,7 @@ def run_selftest(live=False):
             lean_ok = True
         except RuntimeError:
             lean_ok = False
-        fat = Resolver(needs={NEED.STAMPS, NEED.PROCS})
+        fat = Resolver(needs=Needs(hard={NEED.STAMPS, NEED.PROCS}))
         fat.projects_dir = Path(td)
         fat.stamp_index()
         fat_refused = ""
@@ -7784,7 +7825,7 @@ def run_selftest(live=False):
             fat.audit_needs()
         except RuntimeError as err:
             fat_refused = str(err)
-        excused = Resolver(needs={NEED.STAMPS, Maybe(NEED.PROCS)})
+        excused = Resolver(needs=Needs(hard={NEED.STAMPS}, maybe={NEED.PROCS}))
         excused.projects_dir = Path(td)
         excused.stamp_index()
         try:
@@ -7805,12 +7846,28 @@ def run_selftest(live=False):
         "a declared one answers, and a lean run audits clean": answered and lean_ok,
         "a fat declaration is refused at the end": "PROCS" in fat_refused
             and "STAMPS" not in fat_refused,
-        "a Maybe is excused unexercised": maybe_ok,
+        "a conditional declaration is excused unexercised": maybe_ok,
         "the verbs declare before anything computes":
             "RESOLVER = Resolver(needs=verb_needs(args, selector))" in main_src
             and main_src.index("Resolver(needs=verb_needs")
                 < main_src.index("RESOLVER.ps_table()"),
     }
+    # One reader. A declaration's buckets are the engine's business; anything
+    # else asks needs[X] and gets one of three answers. Two readers of one
+    # shape is the fault this file has already had with holder questions and
+    # identity rungs, so it is refused rather than remembered.
+    readers = set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef) or fn.name == "run_selftest":
+            continue
+        body = ast.get_source_segment(source, fn) or ""
+        if ".hard" in body or ".reachable" in body:
+            readers.add(fn.name)
+    engine_methods = {m.name for m in engine_node.body
+                      if isinstance(m, ast.FunctionDef)} | {"hard", "reachable"}
+    stray_readers = sorted(readers - engine_methods)
+    contract["only the engine reads a declaration's buckets"] = not stray_readers
+
     wrong = sorted(k for k, ok in contract.items() if not ok)
     check("compute is declared at construction and audited at the end",
           not wrong, ", ".join(wrong))
@@ -8670,19 +8727,15 @@ def run_selftest(live=False):
     # it, which no input can say.
     shapes = {
         "a uuid declares stamps it can never read":
-            NEED.STAMPS in verb_needs(_ByUuid, None),
+            verb_needs(_ByUuid, None)[NEED.STAMPS] is not DECLARED.ABSENT,
         "a bare name does not declare the stamps that find it":
-            NEED.STAMPS not in verb_needs(_ByName, "unslop-docs"),
+            verb_needs(_ByName, "unslop-docs")[NEED.STAMPS] is not DECLARED.HARD,
         "a team does not declare the stamps that find its members":
-            NEED.STAMPS not in verb_needs(_ByName, "session-abc12345"),
-        # Read the way the engine reads a declaration, since Maybe carries no
-        # equality: a set-membership test cannot tell conditional from absent.
-        "an agent id hardens a need its live rung may skip":
-            NEED.STAMPS in Resolver(
-                needs=verb_needs(_ByName, "a@session-abc12345")).hard_needs,
-        "an agent id cannot reach the stamps at all":
-            NEED.STAMPS not in Resolver(
-                needs=verb_needs(_ByName, "a@session-abc12345")).needs,
+            verb_needs(_ByName, "session-abc12345")[NEED.STAMPS]
+            is not DECLARED.HARD,
+        "an agent id does not leave its stamps conditional":
+            verb_needs(_ByName, "a@session-abc12345")[NEED.STAMPS]
+            is not DECLARED.MAYBE,
     }
     terminal.extend(k for k, wrong in shapes.items() if wrong)
     check("this terminal goes to one agent, and each input declares what it "
@@ -8693,7 +8746,7 @@ def run_selftest(live=False):
 
     # --- shape, not timing, bounds which team a process could have minted
     with tempfile.TemporaryDirectory() as td:
-        eng9 = Resolver(needs={Maybe(n) for n in NEED})
+        eng9 = Resolver(needs=Needs(maybe=set(NEED)))
         eng9.projects_dir, eng9.teams_dir = Path(td) / "proj", Path(td) / "teams"
         (eng9.projects_dir / "p").mkdir(parents=True)
         (eng9.projects_dir / "p" / "aaaaaaaa-1111.jsonl").write_text("{}\n")
@@ -8796,7 +8849,7 @@ def run_selftest(live=False):
     # A revived lead has a new pid, and a server is named after it, so the
     # next spawn lands somewhere its old crew is not. Naming one seat while
     # the crew sits on two is the half-answer this file keeps deleting.
-    eng10 = Resolver(needs={Maybe(n) for n in NEED})
+    eng10 = Resolver(needs=Needs(maybe=set(NEED)))
     eng10.live_sessions = lambda: [
         {"pid": 1, "alive": True, "team": "t", "agent": "old@t", "session": None},
         {"pid": 2, "alive": True, "team": "t", "agent": "new@t", "session": None},
@@ -8897,7 +8950,7 @@ def run_selftest(live=False):
             json.dumps({"isFork": True, "agentType": "fork", "name": "liar"}))
         mid = {"type": "assistant", "parentUuid": "elsewhere", "isSidechain": True, "uuid": "m"}
         (sub / "agent-m1.jsonl").write_text(json.dumps(mid) + "\n")
-        eng = Resolver(needs={Maybe(n) for n in NEED})
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
         eng.projects_dir = Path(td)
         got = {e["task_id"]: e for e in eng.side_transcripts()}
         wrong = []
@@ -8954,7 +9007,7 @@ def run_selftest(live=False):
         rooted = sub / "agent-t1.jsonl"
         rooted.write_text("".join(compact(r) + "\n" for r in rows))
         (sub / "agent-t1.meta.json").write_text('{"agentType":"x","name":"t"}')
-        eng = Resolver(needs={Maybe(n) for n in NEED})
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
         eng.projects_dir = Path(td)
         faults = []
         plan = eng.conversion_plan(rooted, "promote")
@@ -9064,7 +9117,7 @@ def run_selftest(live=False):
         side.chmod(0o600)
         meta_body = '{"agentType":"fork","name":"xp"}'
         (sub / "agent-x1.meta.json").write_text(meta_body)
-        eng4 = Resolver(needs={Maybe(n) for n in NEED})
+        eng4 = Resolver(needs=Needs(maybe=set(NEED)))
         eng4.projects_dir = Path(td)
         real_receipts = RECEIPTS_DIR
         globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
@@ -9175,7 +9228,7 @@ def run_selftest(live=False):
         boxdir = Path(td) / "teams" / "TML" / "inboxes"
         boxdir.mkdir(parents=True)
         (boxdir / "bob.json").write_text(json.dumps([{"text": "two"}]))
-        eng5 = Resolver(needs={Maybe(n) for n in NEED})
+        eng5 = Resolver(needs=Needs(maybe=set(NEED)))
         eng5.projects_dir, eng5.teams_dir = Path(td), Path(td) / "teams"
         full_rows = eng5.mail_ledger("TML")
         states = {e["summary"]: e["state"] for e in full_rows}
@@ -9274,7 +9327,7 @@ def run_selftest(live=False):
         target = proj / "RS.jsonl"
         target.write_text("".join(compact(r) + "\n" for r in rows))
         target.chmod(0o600)
-        eng7 = Resolver(needs={Maybe(n) for n in NEED})
+        eng7 = Resolver(needs=Needs(maybe=set(NEED)))
         eng7.projects_dir = Path(td)
         real_receipts = RECEIPTS_DIR
         globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
@@ -9367,7 +9420,7 @@ def run_selftest(live=False):
 
     # --- a rebind retires the stamped team only when nothing would notice
     with tempfile.TemporaryDirectory() as td:
-        eng6 = Resolver(needs={Maybe(n) for n in NEED})
+        eng6 = Resolver(needs=Needs(maybe=set(NEED)))
         eng6.projects_dir, eng6.teams_dir = Path(td), Path(td) / "teams"
         adir = eng6.teams_dir / "TEAMA"
         (adir / "inboxes").mkdir(parents=True)
@@ -9625,7 +9678,7 @@ def run_selftest(live=False):
                       json.dumps({"type": "last-prompt", "leafUuid": "u-root"}) + "\n")
         if RESOLVER.window_start(un) is not None:
             stray.append("an unstamped window start restored")
-        eng3 = Resolver(needs={Maybe(n) for n in NEED})
+        eng3 = Resolver(needs=Needs(maybe=set(NEED)))
         eng3.teams_dir = Path(td) / "teams"
         (eng3.teams_dir / "teamC").mkdir(parents=True)
         (eng3.teams_dir / "teamC" / "config.json").write_text("{}")
@@ -10153,37 +10206,47 @@ def run_selftest(live=False):
 def verb_needs(args, selector):
     """What each verb declares to the engine, mirroring main's dispatch.
 
-    Hard where the verb's fixed path always computes it, Maybe where a
-    branch or the corpus decides. The end-of-run audit refuses a hard need
+    Hard where the verb's fixed path always computes it, conditional where
+    a branch or the corpus decides. The end-of-run audit refuses a hard need
     nobody exercised, so nothing survives here just in case; the maps are
     tightened by running the verbs, not by guessing.
     """
-    may = Maybe
     if args.selftest or args.complete or args.cleanup:
         # the suite and completion exercise by fixture and topic; cleanup
         # runs from the startup hook, where a refused compute would fail
         # silently behind its own output redirection
-        return {may(n) for n in NEED}
+        return Needs(maybe=set(NEED))
     if args.doctor:
-        return {NEED.PROCS, NEED.STAMPS, NEED.SPAWNS, may(NEED.MAIL)}
+        # the mail join runs only for a named team
+        return Needs(hard={NEED.PROCS, NEED.STAMPS, NEED.SPAWNS},
+                     maybe={NEED.MAIL})
     if args.census:
-        return {NEED.STAMPS, NEED.SPAWNS, may(NEED.PROCS)}
+        # the process table only where a count is about live agents
+        return Needs(hard={NEED.STAMPS, NEED.SPAWNS}, maybe={NEED.PROCS})
     if args.sides:
-        return {NEED.SIDES, may(NEED.TITLES)}
+        # titles only when a listing has a session to title
+        return Needs(hard={NEED.SIDES}, maybe={NEED.TITLES})
     if args.promote:
-        return {NEED.SIDES, may(NEED.PROCS), may(NEED.STAMPS), may(NEED.SPAWNS)}
+        # a promote resolves an identity only once it has one to place
+        return Needs(hard={NEED.SIDES},
+                     maybe={NEED.PROCS, NEED.STAMPS, NEED.SPAWNS})
     if args.demote:
-        return {NEED.PROCS, NEED.STAMPS, may(NEED.SIDES), may(NEED.SPAWNS)}
+        # the side corpus only when a stored receipt names one
+        return Needs(hard={NEED.PROCS, NEED.STAMPS},
+                     maybe={NEED.SIDES, NEED.SPAWNS})
     if args.mail_ledger:
-        return {NEED.STAMPS, NEED.MAIL, may(NEED.PROCS), may(NEED.SPAWNS)}
+        # liveness only for the rows a live holder would explain
+        return Needs(hard={NEED.STAMPS, NEED.MAIL},
+                     maybe={NEED.PROCS, NEED.SPAWNS})
     if args.install or args.poison or args.unpoison or args.help:
-        return set()
+        return Needs()
     if not (selector or args.agent_id or args.resume or args.team):
-        return set()  # the help gate answers this run
+        return Needs()  # the help gate answers this run
     if args.standing:
-        return {NEED.PROCS, NEED.STAMPS, NEED.SPAWNS, NEED.MAIL}
+        return Needs(hard={NEED.PROCS, NEED.STAMPS, NEED.SPAWNS, NEED.MAIL})
     if args.stop:
-        return {NEED.PROCS, NEED.STAMPS, may(NEED.SPAWNS)}
+        # payloads only when a target has to be found by parentage
+        return Needs(hard={NEED.PROCS, NEED.STAMPS}, maybe={NEED.SPAWNS})
     # The input decides which resolution rungs can run. A uuid resolves from
     # the filename and never reaches the stamps. A bare name or a team can be
     # found through the stamps and nothing else. An agent id reaches them only
@@ -10191,10 +10254,11 @@ def verb_needs(args, selector):
     # anything the input says.
     by_uuid = bool(args.resume) or bool(selector and UUID_RE.match(selector))
     if args.agent_id or (selector and "@" in selector):
-        return {NEED.PROCS, NEED.SPAWNS, may(NEED.STAMPS)}
+        # an agent id reaches the stamps only when nothing live wears it
+        return Needs(hard={NEED.PROCS, NEED.SPAWNS}, maybe={NEED.STAMPS})
     if by_uuid and not args.team:
-        return {NEED.PROCS, NEED.SPAWNS}
-    return {NEED.PROCS, NEED.SPAWNS, NEED.STAMPS}
+        return Needs(hard={NEED.PROCS, NEED.SPAWNS})
+    return Needs(hard={NEED.PROCS, NEED.SPAWNS, NEED.STAMPS})
 
 
 def audited(entry):
