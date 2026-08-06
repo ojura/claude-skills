@@ -3405,9 +3405,7 @@ def enforce_restore(ctx, args):
     if rebind and not args.force:
         die(f"restored from window-start stamps: this transcript restores as "
             f"{stamped}, so a rebind onto {dest} undoes itself at the next "
-            f"restart, and no durable rebind exists that preserves the "
-            f"conversation (a boundary graft would rebind at the cost of "
-            f"compact-style amnesia). --force launches the split anyway")
+            f"restart. --force launches the split anyway")
     warn(f"restored from window-start stamps: this launch runs split - lines "
          f"and spawns as {stamped}, idle notifications as {dest}, both "
          f"inboxes polled")
