@@ -233,3 +233,20 @@ deserve the same verification as claims in code. One refusal presented a
 conversation-wiping graft as the durable fix for a whole day, because no
 check runs on unbuilt designs; a single angry question did what the suite
 could not.
+
+A fifth, earned in one afternoon of readability work that kept striking
+engine rot: a reporter renders engine answers and gathers nothing, and a
+caller declares to the engine what it needs, so the engine resolves no more.
+Both directions bite. A renderer reaching for a path helper has found an
+engine gap, and the fix is a new engine answer (transcript_title), never a
+widened exemption on the fence that keeps pickers out of the tree. And an
+engine answer fatter than the declared need taxes every caller: the mail
+ledger joined a whole team to render one agent's line (now to=), one typed
+side classified nine hundred (now classify-on-hit), the doctor swept a
+census only the sweep branch reads, and the standing dossier walked the
+spawn log for a field its caller discarded (now dossier=). Each narrowing
+is proven answer-identical and checked by name, and an undeclared field
+answers "not asked" rather than faking a claim about a corpus nobody
+consulted. The cost of a field is measured, never presumed cached:
+"approximately free" turned out to mean "someone else usually pays" the
+one time it went unmeasured.
