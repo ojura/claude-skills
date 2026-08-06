@@ -2380,7 +2380,210 @@ class Resolver:
             return None, f"{len(hits)} side transcripts match {selector!r}: {shown}{more}"
         return hits[0], ""
 
+    # -- side transcript <-> teammate conversion: the engine plans, proves the
+    #    inverse, and never writes; materialize/embed consume a proved plan.
 
+    @staticmethod
+    def _codec_load(raw):
+        """(record, dump style) for one line, or (None, why).
+
+        A line is convertible only when one dump form reproduces its bytes,
+        because the round-trip proof is a byte comparison: a line the codec
+        cannot reproduce untouched cannot be proved restored either.
+        """
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            return None, "is not JSON"
+        for style, kwargs in (("compact", {"separators": (",", ":")}), ("spaced", {})):
+            if json.dumps(rec, ensure_ascii=False, **kwargs) == raw:
+                return (rec, style), None
+        return None, "has bytes no dump form reproduces"
+
+    @staticmethod
+    def _codec_dump(rec, style):
+        kwargs = {"separators": (",", ":")} if style == "compact" else {}
+        return json.dumps(rec, ensure_ascii=False, **kwargs)
+
+    @staticmethod
+    def _insert_after(rec, anchor, key, value):
+        """The record with key set right after anchor, harness key order."""
+        out = {}
+        for k, v in rec.items():
+            out[k] = v
+            if k == anchor:
+                out[key] = value
+        if key not in out:
+            out = {key: value, **rec}
+        return out
+
+    def _convert(self, raws, direction, receipt):
+        """(out_lines, objections) - one edit set, applied forward or backward.
+
+        `receipt` is both the record of a promote and the parameters of the
+        demote that undoes it: the forward pass fills it, the backward pass
+        consumes it, so the two directions cannot drift apart. The fields a
+        conversion may touch are closed (sessionId, isSidechain, the root's
+        logicalParentUuid, the ref line, last-prompt trailers, in that
+        vocabulary and no other); a line whose transform would need any other
+        field is an objection, not an edit.
+        """
+        objections, parsed = [], []
+        for n, raw in enumerate(raws, 1):
+            loaded, why = self._codec_load(raw)
+            if loaded is None:
+                objections.append(f"line {n} {why}")
+                continue
+            parsed.append((n, raw) + loaded)
+        if objections:
+            return None, objections
+
+        parent, dest = receipt["parent"], receipt["dest_stem"]
+        out = []
+        if direction == "promote":
+            root_uuid = receipt.get("root")
+            inserted = set(receipt.get("inserted_sidechain") or [])
+            for n, raw, rec, style in parsed:
+                if (n == 1 and receipt["grammar"] == "pointer"
+                        and rec.get("type") == "fork-context-ref"):
+                    receipt["ref"] = raw
+                    continue
+                new = dict(rec)
+                if new.get("sessionId") == parent:
+                    new["sessionId"] = dest
+                if new.get("uuid") in inserted and new.get("isSidechain") is True:
+                    # The demote being undone put this field here; remove it
+                    # rather than flip it, or the round trip grows a field.
+                    new.pop("isSidechain")
+                elif new.get("isSidechain") is True:
+                    new["isSidechain"] = False
+                if (receipt["grammar"] == "pointer" and receipt.get("ref")
+                        and new.get("uuid") == root_uuid):
+                    graft = json.loads(receipt["ref"])["parentLastUuid"]
+                    new = self._insert_after(new, "parentUuid", "logicalParentUuid", graft)
+                    receipt["graft"] = graft
+                bad = self._edit_closure(rec, new)
+                if bad:
+                    objections.append(f"line {n}: the edit set would need {bad}")
+                out.append(self._codec_dump(new, style))
+            if receipt.get("stripped"):
+                # Undoing a demote: the harness's own trailers come back
+                # verbatim where they sat; a fresh one would forge history.
+                for pos, raw in receipt["stripped"]:
+                    out.insert(pos, raw)
+            else:
+                leaf = next((json.loads(line).get("uuid") for line in reversed(out)
+                             if '"uuid"' in line and json.loads(line).get("uuid")), None)
+                if leaf is None:
+                    objections.append("no record carries a uuid, so there is no leaf")
+                trailer = {"type": "last-prompt", "lastPrompt": receipt.get("prompt", ""),
+                           "leafUuid": leaf, "sessionId": dest}
+                out.append(json.dumps(trailer, separators=(",", ":"), ensure_ascii=False))
+                receipt["trailer"] = out[-1]
+        else:
+            trailers, inserted = [], []
+            for n, raw, rec, style in parsed:
+                if rec.get("type") == "last-prompt":
+                    # Positions count earlier trailers too, so the undo can
+                    # reinsert sequentially and land every line where it sat.
+                    trailers.append((len(out) + len(trailers), raw))
+                    continue
+                new = dict(rec)
+                if new.get("sessionId") == dest:
+                    new["sessionId"] = parent
+                if new.get("isSidechain") is False:
+                    new["isSidechain"] = True
+                elif "isSidechain" not in new:
+                    anchor = ("logicalParentUuid" if "logicalParentUuid" in new
+                              else "parentUuid")
+                    new = self._insert_after(new, anchor, "isSidechain", True)
+                    if new.get("uuid"):
+                        inserted.append(new["uuid"])
+                if receipt.get("graft") and new.get("logicalParentUuid") == receipt["graft"]:
+                    new.pop("logicalParentUuid")
+                bad = self._edit_closure(rec, new)
+                if bad:
+                    objections.append(f"line {n}: the edit set would need {bad}")
+                out.append(self._codec_dump(new, style))
+            if receipt.get("ref"):
+                out.insert(0, receipt["ref"])
+            receipt["stripped"] = trailers
+            receipt["inserted_sidechain"] = inserted
+        return out, objections
+
+    @staticmethod
+    def _edit_closure(before, after):
+        """The first field outside the conversion vocabulary, or None."""
+        allowed = {"sessionId", "isSidechain", "logicalParentUuid"}
+        for key in set(before) | set(after):
+            if key in allowed:
+                continue
+            if before.get(key, _MISSING) != after.get(key, _MISSING):
+                return key
+        return None
+
+    def conversion_plan(self, source, direction, into=None, dest=None):
+        """The full plan for one conversion, proved before anyone acts on it.
+
+        Answers only: edit set (as the rendered lines), receipt, objections,
+        and the destination path. Every plan computes its own inverse in
+        memory and byte-compares against the source; a plan whose inverse
+        cannot be proved carries the objection and no writer may apply it.
+        """
+        source = Path(source)
+        try:
+            text = source.read_text(errors="strict")
+        except (OSError, UnicodeDecodeError) as err:
+            return {"objections": [f"unreadable source: {err}"], "proved": False}
+        raws = text.split("\n")
+        if raws and raws[-1] == "":
+            raws.pop()
+
+        if direction == "promote":
+            grammar, detail, root = self._side_grammar(source)
+            if grammar == "unclassifiable":
+                return {"objections": [f"not convertible: {detail}"], "proved": False}
+            parent = source.parent.parent.name
+            receipt = {"grammar": grammar, "parent": parent, "root": root,
+                       "dest_stem": dest or root,
+                       "task_id": source.stem[len("agent-"):]}
+            meta = source.with_name(source.stem + ".meta.json")
+            try:
+                receipt["meta"] = meta.read_text()
+            except OSError:
+                receipt["meta"] = None
+            out, objections = self._convert(raws, "promote", receipt)
+            dest_path = source.parent.parent.parent / f"{receipt['dest_stem']}.jsonl"
+        else:
+            if not into:
+                return {"objections": ["demote needs the parent session (--into)"],
+                        "proved": False}
+            receipt = {"grammar": "rooted", "parent": into, "dest_stem": source.stem,
+                       "task_id": dest or source.stem, "root": None, "meta": None}
+            out, objections = self._convert(raws, "demote", receipt)
+            dest_path = (self.projects_dir / source.parent.name / into / "subagents"
+                         / f"agent-{receipt['task_id']}.jsonl")
+
+        proved = False
+        if out is not None and not objections:
+            back, back_obj = self._convert(
+                list(out), "demote" if direction == "promote" else "promote",
+                dict(receipt))
+            if back_obj:
+                objections.append(f"the inverse raises its own objections: {back_obj[0]}")
+            else:
+                proved = back == raws
+                if not proved:
+                    objections.append("the inverse does not restore the source bytes")
+
+        return {"direction": direction, "source": source, "dest_path": dest_path,
+                "lines": out, "receipt": receipt, "objections": objections,
+                "proved": proved}
+
+
+
+
+_MISSING = object()
 
 
 RESOLVER = Resolver()
@@ -6433,6 +6636,79 @@ def run_selftest(live=False):
         set(tallies) <= {"pointer", "rooted", "unclassifiable"}
     check("the side-transcript census answers for every file", ok,
           ", ".join(f"{n} {g}" for g, n in tallies.most_common()) or "none on this machine")
+
+    # --- a conversion proves its inverse before anything may act on it
+    with tempfile.TemporaryDirectory() as td:
+        sub = Path(td) / "proj" / "PARENT" / "subagents"
+        sub.mkdir(parents=True)
+        compact = lambda d: json.dumps(d, separators=(",", ":"))
+        rows = [
+            {"parentUuid": None, "isSidechain": True, "sessionId": "PARENT",
+             "agentId": "t1", "type": "user", "uuid": "cv-root",
+             "message": {"role": "user", "content": "do the thing"}},
+            {"parentUuid": "cv-root", "isSidechain": True, "sessionId": "PARENT",
+             "agentId": "t1", "type": "assistant", "uuid": "cv-2",
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}},
+        ]
+        rooted = sub / "agent-t1.jsonl"
+        rooted.write_text("".join(compact(r) + "\n" for r in rows))
+        (sub / "agent-t1.meta.json").write_text('{"agentType":"x","name":"t"}')
+        eng = Resolver()
+        eng.projects_dir = Path(td)
+        faults = []
+        plan = eng.conversion_plan(rooted, "promote")
+        if plan["objections"] or not plan["proved"]:
+            faults.append(f"rooted: {plan['objections'] or 'unproved'}")
+        else:
+            body = "\n".join(plan["lines"])
+            if '"isSidechain":true' in body or '"sessionId":"PARENT"' in body.rsplit("\n", 1)[0]:
+                faults.append("rooted promote left side fields")
+            if not plan["lines"][-1].startswith('{"type":"last-prompt"'):
+                faults.append("rooted promote appended no trailer")
+            if plan["dest_path"].stem != "cv-root":
+                faults.append("the stem is not the chain root")
+        # a born teammate: no isSidechain anywhere, harness trailers in place
+        mate = Path(td) / "proj" / "MATE.jsonl"
+        mate.write_text(
+            compact({"parentUuid": None, "sessionId": "MATE", "agentId": "m1",
+                     "type": "user", "uuid": "mate-root"}) + "\n" +
+            compact({"type": "last-prompt", "lastPrompt": "hi",
+                     "leafUuid": "mate-root", "sessionId": "MATE"}) + "\n" +
+            compact({"parentUuid": "mate-root", "sessionId": "MATE", "agentId": "m1",
+                     "type": "assistant", "uuid": "mate-2"}) + "\n" +
+            compact({"type": "last-prompt", "lastPrompt": "hi again",
+                     "leafUuid": "mate-2", "sessionId": "MATE"}) + "\n")
+        dplan = eng.conversion_plan(mate, "demote", into="PARENT", dest="m1")
+        if dplan["objections"] or not dplan["proved"]:
+            faults.append(f"demote: {dplan['objections'] or 'unproved'}")
+        else:
+            if any('"type":"last-prompt"' in line for line in dplan["lines"]):
+                faults.append("demote left a trailer in the side file")
+            if sum('"isSidechain":true' in line for line in dplan["lines"]) != 2:
+                faults.append("demote did not sidechain every record")
+        # a line the codec cannot reproduce is a refusal, not a best effort
+        wonky = sub / "agent-w1.jsonl"
+        wonky.write_text('{"parentUuid": null, "isSidechain": true, '
+                         '"uuid": "w-root", "n": 1.10}\n')
+        wplan = eng.conversion_plan(wonky, "promote")
+        if wplan["proved"] or not any("reproduces" in o for o in wplan["objections"]):
+            faults.append("an unstable line did not refuse")
+        check("a conversion proves its inverse before it acts", not faults,
+              ", ".join(faults))
+
+    # And on real bytes: the smallest pointer fork on this machine round-trips
+    # exactly, ref and graft and trailer included.
+    pointers = [e for e in corpus if e["grammar"] == "pointer" and e["root"]]
+    if pointers:
+        pick = min(pointers, key=lambda e: e["path"].stat().st_size)
+        rplan = RESOLVER.conversion_plan(pick["path"], "promote")
+        check("a real fork round-trips byte-exactly",
+              rplan["proved"] and not rplan["objections"],
+              f"{pick['parent'][:8]}/{pick['name'] or pick['task_id']}, "
+              f"{len(rplan['lines'] or [])} lines"
+              if rplan["proved"] else "; ".join(rplan["objections"])[:80])
+    else:
+        check("a real fork round-trips byte-exactly (none on this machine)", True, "skipped")
 
     # Two counts of "contested" that mean different things, so both are named.
     claimed = {t: {path for _st, path in hits} for t, hits in RESOLVER.led_teams().items()}
