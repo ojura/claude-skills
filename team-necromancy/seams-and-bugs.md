@@ -75,6 +75,22 @@ good components that nobody introduced to each other.
    and writes unstamped lines until the team dir exists again; flag-bound,
    argv survives but hook init is skipped (that half is code-read grade).
 
+9. **Delivery is a turn-boundary event.** Teammate mail is three-tier by
+   design: an idle recipient gets an immediate turn; a busy one queues in
+   AppState and drains when its turn ends; a conservative mid-turn
+   attachment lane exists but rarely triggers (useInboxPoller.ts:118-125,
+   :860-864). The weight is deliberate: a message is a full conversational
+   turn (user-role cannot interleave into an agentic loop), ordering is
+   crash-durable at-least-once (mark-read only after delivery), and the
+   mid-turn lane once raced the poller so protocol messages were eaten as
+   raw context (attachments.ts race comment) - it stayed conservative ever
+   since. Consequences: mail to a long-running turn queues for minutes and
+   arrives batched, absence of a reply is not silence, and anything that
+   reports reachability must say "at its next turn boundary" rather than
+   implying immediacy. The upstream wish - mail that behaves like a user
+   correction - is a trigger-frequency change in the existing lane, not
+   architecture.
+
 ## The bugs (file-worthy)
 
 1. **Teammate viewer accepts input it cannot deliver** (seam 4). Either route
