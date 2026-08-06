@@ -3615,12 +3615,12 @@ def enforce_restore(ctx, args):
     if not dest or stamped == dest:
         return
     if rebind and not args.force:
-        die(f"restored from window-start stamps: this transcript restores as "
-            f"{stamped}, so a rebind onto {dest} undoes itself at the next "
-            f"restart. --force launches the split anyway")
-    warn(f"restored from window-start stamps: this launch runs split - lines "
-         f"and spawns as {stamped}, idle notifications as {dest}, both "
-         f"inboxes polled")
+        die(f"this conversation comes back as {stamped} whatever the flags say, "
+            f"so a rebind onto {dest} undoes itself at the next restart. "
+            f"--force launches it anyway, split between the two teams")
+    warn(f"this conversation comes back as {stamped} whatever the flags say, so "
+         f"this launch runs split: it writes its history as {stamped}, sends "
+         f"idle notifications and messages as {dest}, and reads both teams' mail")
 
 
 def already_running(ctx, args, is_lead, agent_id=None, table=None, here=(), pane=None):
@@ -4815,9 +4815,8 @@ def auto_redirect(ctx, args, table, prefix=""):
         # rather than making it, since restarting throws away its current turn.
         who = f"pid {holders[0][0]}" if holders else f"pid {owner[0]} (registry)"
         standing = RESOLVER.standing(agent_id, RESOLVER.field(ctx, "parentSessionId"))
-        fix = "; ".join(f"{what} ({cost})" for what, cost in standing["remedies"])
-        warn(f"{agent_id} is running as {who}: {standing['reachable'][1]}"
-             f"{'. ' + fix if fix else ''}")
+        fix = "".join(f"\n- {what}  ({cost})" for what, cost in standing["remedies"])
+        warn(f"{agent_id} is running as {who}: {standing['reachable'][1]}{fix}")
         ctx["stale_team_warned"] = True
         return
 
@@ -4833,8 +4832,8 @@ def auto_redirect(ctx, args, table, prefix=""):
     # question, a wall of blockers, and a second question.
     blocked = reap_blockers(stamped, args, table) if needs_durable else []
     if blocked:
-        warn(f"{agent_id} cannot follow its lead onto {dest}: "
-             + ". Also: ".join(blocked))
+        warn(f"{agent_id} cannot follow its lead onto {dest}:\n"
+             + "\n".join(blocked))
         return decline_unreachable(ctx, args, agent_id, source, dest, prefix)
 
     # Asked last, so a run that was going to decline anyway never puts a question
@@ -6000,10 +5999,10 @@ def rebind_reap(stamped, dest, args, prefix="", path=None, fatal=True):
     if not args.dry_run:
         reap_team(stamped, archive_mail=args.with_mail)
     print(f"{prefix}rebound  this transcript now runs as {dest}")
-    print(f"{prefix}fragile  it goes back to {stamped} if that team is ever "
-          f"recreated; run /compact in it to make {dest} permanent")
-    print(f"{prefix}quiet    until then it sends no idle notifications; "
-          "mail still works in both directions")
+    print(fill(f"{prefix}fragile  it goes back to {stamped} if that team is ever "
+               f"recreated; run /compact in it to make {dest} permanent"))
+    print(fill(f"{prefix}quiet    until then it sends no idle notifications; "
+               "mail still works in both directions"))
     return True
 
 
@@ -7105,6 +7104,75 @@ def run_selftest(live=False):
           and all(l.endswith(" \\") for l in lines[:-1]),
           f"paste ok {shlex.split(rejoined) == argv_case}, record ok {rec_joined == record_case}")
 
+    # A refusal that blocks on several things says each on its own line under
+    # the caller's sentence, each class closed by its way out, and a bounded
+    # listing says how much it left out instead of dropping it silently.
+    class _Blocked:
+        with_mail, force = False, False
+    real_reap_obj = RESOLVER.reap_objections
+    RESOLVER.reap_objections = lambda team, table, archive_mail=False: (
+        [f"{n} unread for member{n}, oldest 2026-08-06 15:33:30" for n in range(1, 7)]
+        + ["pid 4242 wears it (someone@somewhere)",
+           "pid 4243 holds team-lead's transcript"])
+    try:
+        blocked = reap_blockers("session-blocked", _Blocked(), table={})
+    finally:
+        RESOLVER.reap_objections = real_reap_obj
+    bullets = [l for l in blocked if l.startswith("- ")]
+    ways_out = [l for l in blocked if l.startswith("  (")]
+    itemized = {
+        "one objection per bullet": bullets and not any("; " in l for l in bullets),
+        "every class keeps its way out": len(ways_out) == 3
+            and any("--with-mail" in l for l in ways_out)
+            and any("--force" in l for l in ways_out)
+            and any("stop it first" in l for l in ways_out),
+        "a bounded list says what it dropped": any("and 2 more" in l for l in bullets),
+        "nothing else rode along": len(blocked) == len(bullets) + len(ways_out),
+    }
+    wrong = sorted(k for k, ok in itemized.items() if not ok)
+    check("blockers arrive one per line, each class with its way out", not wrong,
+          ", ".join(wrong))
+
+    # The inbox files store ISO instants; every report and refusal prints the
+    # ledger's local wall time, so a reader never converts timezones by eye.
+    real_inboxes = RESOLVER.inbox_state
+    real_live, real_stamps = RESOLVER.live_sessions, RESOLVER.stamp_index
+    RESOLVER.inbox_state = lambda team: {"team-lead": (26, "2026-08-06T13:33:30.168Z")}
+    RESOLVER.live_sessions = lambda: []
+    RESOLVER.stamp_index = lambda: {}
+    try:
+        told = RESOLVER.reap_objections("session-clock", [], archive_mail=False)
+    finally:
+        RESOLVER.inbox_state = real_inboxes
+        RESOLVER.live_sessions, RESOLVER.stamp_index = real_live, real_stamps
+    want_when = ms_str(iso_ms("2026-08-06T13:33:30.168Z"))
+    check("a refusal prints time the way the ledger does",
+          told == [f"26 unread for team-lead, oldest {want_when}"],
+          "; ".join(told) or "no objection composed")
+
+    # The project's coinages live in docstrings and commit messages; a person
+    # at a terminal gets plain words. Docstrings and the suite's own strings
+    # are the exemption, and nothing else is.
+    doc_strings = set()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if (body and isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef))
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            doc_strings.add(id(body[0].value))
+    suite_lines = set()
+    for suite_name in ("run_selftest", "live_checks"):
+        suite_fn = funcs.get(suite_name)
+        if suite_fn:
+            suite_lines.update(range(suite_fn.lineno, suite_fn.end_lineno + 1))
+    spoken = sorted({f"line {n.lineno}" for n in ast.walk(tree)
+                     if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                     and id(n) not in doc_strings and n.lineno not in suite_lines
+                     and "window-start" in n.value})
+    check("the project's own coinages stay out of printed strings", not spoken,
+          "; ".join(spoken))
+
     # Classification, not position, decides what a token is. Every entry must
     # carry both facts, or a future flag is added half-specified and the walk
     # silently treats its value as a name.
@@ -7757,7 +7825,7 @@ def run_selftest(live=False):
     if redirect_src.count("input(") or "decline_unreachable(" not in redirect_src:
         futile.append("the redirect asks its own second question")
     blockers_src = ast.get_source_segment(source, funcs["reap_blockers"]) or ""
-    for cls in ("--with-mail archives", "--force restamps", "stop it first"):
+    for cls in ("--with-mail archives", "--force instead rewrites", "stop it first"):
         if cls not in blockers_src:
             futile.append(f"a blocker class has no remedy: {cls}")
     check("a redirect a restart would undo is not offered", not futile,
@@ -8461,8 +8529,8 @@ def run_selftest(live=False):
                 took = rebind_reap("OLD", "NEW", _Quiet, path=target, fatal=False)
             if took is not False:
                 stray.append("a blocked redirect claimed the move")
-            for owed in ("--with-mail", "--force restamps"):
-                if owed not in told.getvalue():
+            for owed in ("--with-mail", "--force instead rewrites"):
+                if owed not in " ".join(told.getvalue().split()):
                     stray.append(f"a blocker went unremedied: {owed}")
         finally:
             RESOLVER.teams_dir, RESOLVER.reap_objections = real_teams2, real_objs
@@ -8765,7 +8833,7 @@ def run_selftest(live=False):
                     fired = True
                 except Exception as err:  # a guard that crashes is not a guard
                     stray.append(f"the rebind guard crashed: {err.__class__.__name__}")
-            if not (fired and "restores as teamC" in said.getvalue()):
+            if not (fired and "comes back as teamC" in " ".join(said.getvalue().split())):
                 stray.append("a rebind onto a restoring transcript was not refused")
             with contextlib.redirect_stderr(io.StringIO()):
                 try:
