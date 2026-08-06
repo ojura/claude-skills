@@ -1424,7 +1424,7 @@ class Resolver:
                 out[receipt["name"]] = receipt
         return out
 
-    def mail_ledger(self, team):
+    def mail_ledger(self, team, to=None):
         """[{sender, to, summary, sent, state, detail}] for a team's authored mail.
 
         Conversational mail is double-recorded: every send sits verbatim in
@@ -1442,6 +1442,12 @@ class Resolver:
         cleanup deletes inbox dirs wholesale, and normal delivery prunes the
         inbox on queueing (bundle-confirmed), so "in memory" is the one
         state any instrument can show while a loss window is open.
+
+        `to` is the caller's declared need. A named recipient narrows the
+        join to sends addressed to it, with identical states to the full
+        ledger's rows for it: every transcript is still opened, because a
+        send to it can originate anywhere, but only its own file pays the
+        delivery side, and everyone else's parses only its send lines.
         """
         people = {}
         for path, (name, stamped) in self.stamp_index().items():
@@ -1458,6 +1464,11 @@ class Resolver:
             r'<teammate-message teammate_id="([^"]+)"[^>]*>\n(.*?)\n</teammate-message>',
             re.DOTALL)
         for name, path in people.items():
+            # The caller's declared need bounds the walk: sends to the named
+            # recipient originate anywhere, so every transcript is opened, but
+            # only the recipient's own file pays the delivery side (wrappers,
+            # last write, inbox), and everyone else's parses only its sends.
+            wants_delivery = to is None or name == to
             got_wrappers, newest = [], 0
             try:
                 handle = path.open(errors="replace")
@@ -1465,8 +1476,9 @@ class Resolver:
                 continue
             with handle:
                 for line in handle:
-                    if '"SendMessage"' not in line and "<teammate-message" not in line \
-                            and '"timestamp"' not in line:
+                    if '"SendMessage"' not in line and not (
+                            wants_delivery and ("<teammate-message" in line
+                                                or '"timestamp"' in line)):
                         continue
                     try:
                         rec = json.loads(line)
@@ -1490,7 +1502,7 @@ class Resolver:
                                     "summary": spec.get("summary") or "",
                                     "sent": ts,
                                     "body": body if isinstance(body, str) else None})
-                    elif rec.get("type") == "user":
+                    elif wants_delivery and rec.get("type") == "user":
                         text = content if isinstance(content, str) else "".join(
                             part.get("text", "") for part in content or []
                             if isinstance(part, dict))
@@ -1498,35 +1510,38 @@ class Resolver:
                             for who, body in wrapper_re.findall(text):
                                 got_wrappers.append((who, body))
             wrappers[name] = got_wrappers
-            last_write[name] = newest
-            try:
-                inbox = json.loads(
-                    (self.teams_dir / team / "inboxes" / f"{name}.json").read_text())
-                boxes[name] = [m.get("text") or str(m.get("message", ""))
-                               for m in inbox if isinstance(m, dict)]
-            except (OSError, ValueError):
-                boxes[name] = []
+            if wants_delivery:
+                last_write[name] = newest
+                try:
+                    inbox = json.loads(
+                        (self.teams_dir / team / "inboxes" / f"{name}.json").read_text())
+                    boxes[name] = [m.get("text") or str(m.get("message", ""))
+                                   for m in inbox if isinstance(m, dict)]
+                except (OSError, ValueError):
+                    boxes[name] = []
 
         ledger = []
         for send in sorted(sends, key=lambda s: s["sent"] or 0):
+            addressee = send["to"]
+            if to is not None and addressee != to:
+                continue
             entry = {k: send[k] for k in ("sender", "to", "summary", "sent")}
-            to = send["to"]
             if send["body"] is None:
                 entry.update(state="protocol", detail="an object send; not joined")
-            elif to not in people:
+            elif addressee not in people:
                 entry.update(state="unknown recipient",
-                             detail=f"{to!r} has no transcript stamped with this team")
+                             detail=f"{addressee!r} has no transcript stamped with this team")
             elif any(who == send["sender"] and body == send["body"]
-                     for who, body in wrappers.get(to, [])):
+                     for who, body in wrappers.get(addressee, [])):
                 entry.update(state="delivered", detail="the body sits in the "
                              "recipient's transcript verbatim")
-            elif any(send["body"] == text for text in boxes.get(to, [])):
+            elif any(send["body"] == text for text in boxes.get(addressee, [])):
                 entry.update(state="queued", detail="still in the inbox file; "
                              "delivery is a turn-boundary event")
-            elif (last_write.get(to) or 0) <= (send["sent"] or 0):
+            elif (last_write.get(addressee) or 0) <= (send["sent"] or 0):
                 entry.update(state="pending", detail="the recipient has not "
                              "written since the send")
-            elif any(self.transcript_holders(people[to].stem, self.ps_table())):
+            elif any(self.transcript_holders(people[addressee].stem, self.ps_table())):
                 # Marked read on queueing, held in the recipient's RAM: the
                 # drain-then-die window is open until its turn ends. Both
                 # halves of the holder question, because the recipient may be
@@ -2909,7 +2924,7 @@ class Resolver:
             for value in node:
                 yield from self._walk_spawn_payloads(value, depth + 1)
 
-    def side_transcripts(self, parent=None):
+    def side_transcripts(self, parent=None, classify=True):
         """Every side transcript on this machine, classified by its own bytes.
 
         A side transcript lives at <project>/<parent-session>/subagents/
@@ -2941,7 +2956,11 @@ class Resolver:
                 entry["agent_type"] = meta.get("agentType")
             except (OSError, ValueError):
                 pass
-            entry["grammar"], entry["detail"], entry["root"] = self._side_grammar(path)
+            # classify=False is a caller's declared need: the cheap facts
+            # alone, with grammar left for whatever the caller narrows to,
+            # so one typed side does not buy the whole corpus a read.
+            if classify:
+                entry["grammar"], entry["detail"], entry["root"] = self._side_grammar(path)
             out.append(entry)
         return out
 
@@ -2984,16 +3003,30 @@ class Resolver:
         Accepted spellings: the task id, <parent-session-prefix>/<name>, a
         rooted file's root uuid, or a bare meta name that exactly one side
         transcript wears. Several matches are named and refused, never ranked.
+
+        Classification is paid only where a spelling requires it: task ids
+        and parent/name pairs match on the cheap facts and classify the hit
+        alone; roots live in the bytes, so only that fallback (and the bare
+        name behind it, to keep the spelling order exact) reads the corpus.
         """
-        sides = self.side_transcripts()
+        sides = self.side_transcripts(classify=False)
+
+        def classified(entry):
+            entry = dict(entry)
+            entry["grammar"], entry["detail"], entry["root"] = \
+                self._side_grammar(entry["path"])
+            return entry
+
         if "/" in selector:
             parent_part, _, name_part = selector.partition("/")
             hits = [e for e in sides if e["parent"].startswith(parent_part)
                     and name_part in (e["name"], e["task_id"])]
         else:
             hits = [e for e in sides if e["task_id"] == selector]
-            hits = hits or [e for e in sides if e["root"] == selector]
-            hits = hits or [e for e in sides if e["name"] == selector]
+            if not hits:
+                sides = [classified(e) for e in sides]
+                hits = [e for e in sides if e["root"] == selector]
+                hits = hits or [e for e in sides if e["name"] == selector]
         if not hits:
             return None, f"no side transcript matches {selector!r}"
         if len(hits) > 1:
@@ -3007,7 +3040,8 @@ class Resolver:
             shown = ", ".join(named[:6])
             more = f" and {len(hits) - 6} more" if len(hits) > 6 else ""
             return None, f"{len(hits)} side transcripts match {selector!r}: {shown}{more}"
-        return hits[0], ""
+        hit = hits[0]
+        return (hit if "grammar" in hit else classified(hit)), ""
 
     # -- side transcript <-> teammate conversion: the engine plans, proves the
     #    inverse, and never writes; materialize/embed consume a proved plan.
@@ -5674,7 +5708,7 @@ def run_standing(args):
     fragile = RESOLVER.rebind_fragility(held, team)
     if fragile:
         print(fill(f"fragile  {fragile}"))
-    addressed = [r for r in RESOLVER.mail_ledger(team) if r["to"] == name]
+    addressed = RESOLVER.mail_ledger(team, to=name)
     held = sum(r["state"] == "in memory" for r in addressed)
     lost = sum(r["state"] == "unexplained" for r in addressed)
     if held or lost:
@@ -5847,10 +5881,12 @@ def run_doctor(args, selector=None):
         kind, value, _why = RESOLVER.classify(selector)
         named = value if kind == "team" else (value or "").partition("@")[2] or None
     target = named or None
-    everything = RESOLVER.known_teams()
     if target:
+        # The named team is the declared need; a census of every team on the
+        # machine answers a question this run never asks.
         teams, skipped = [target], 0
     else:
+        everything = RESOLVER.known_teams()
         interesting = RESOLVER.teams_with_live_evidence()
         teams = sorted(interesting) if not args.all_members else sorted(everything)
         skipped = 0 if args.all_members else len(everything) - len(teams)
@@ -7344,6 +7380,7 @@ def run_selftest(live=False):
             real_bits.setdefault(attr, getattr(RESOLVER, attr))
             setattr(RESOLVER, attr, value)
 
+    census_asked = []
     _rewire(ps_table=lambda refresh=False: [],
             lead_pid=lambda parent, team: (None, False, None, False),
             team_population=lambda team: {"alpha": ("unrecorded", None),
@@ -7353,7 +7390,7 @@ def run_selftest(live=False):
             wearers=lambda agent_id, table=None: [],
             roster_entries=lambda **kw: [],
             nameless_receipts=lambda: [],
-            known_teams=lambda: {})
+            known_teams=lambda: (census_asked.append(1), {})[1])
     try:
         with contextlib.redirect_stderr(io.StringIO()):
             _v, lines_none, _r = diagnose_team("session-probe")
@@ -7439,6 +7476,9 @@ def run_selftest(live=False):
             "a live lead runs this team" in " ".join(doc_out.split()),
         "an absent verdict is not": all(v not in doc_out for v in
                                         ("SEVERED", "DEGRADED", "UNKNOWABLE")),
+        # the named team is the declared need; the machine-wide census is
+        # the sweep's question and must not be resolved for one team
+        "a named team asks for no team census": not census_asked,
     }
     wrong = sorted(k for k, ok in legend.items() if not ok)
     check("the legend explains only the verdicts on screen", not wrong,
@@ -7504,7 +7544,7 @@ def run_selftest(live=False):
     # saying what it folded and how to see it; a named parent lists in full.
     real_sides_fn = RESOLVER.side_transcripts
     real_title_fn = RESOLVER.transcript_title
-    RESOLVER.side_transcripts = lambda parent=None: (
+    RESOLVER.side_transcripts = lambda parent=None, classify=True: (
         [{"parent": "aaaa1111-fixture", "name": f"side{n}", "task_id": f"t{n}",
           "agent_type": "fork", "grammar": "pointer", "mtime": 1000 - n,
           "detail": ""} for n in range(5)]
@@ -7541,6 +7581,46 @@ def run_selftest(live=False):
     wrong = sorted(k for k, ok in folded.items() if not ok)
     check("the sides sweep folds each session and says what it folded",
           not wrong, ", ".join(wrong))
+
+    # A typed side is one declared need: the task-id and parent/name
+    # spellings classify the hit alone, and only the root spelling, whose
+    # answer lives in the bytes, buys the corpus a read.
+    with tempfile.TemporaryDirectory() as td:
+        for parent_dir, task, side_name, root in (
+                ("PARENT-A", "t1", "first-side", "root-1"),
+                ("PARENT-A", "t2", "second-side", "root-2"),
+                ("PARENT-B", "t3", "third-side", "root-3")):
+            side_dir = Path(td) / "projx" / parent_dir / "subagents"
+            side_dir.mkdir(parents=True, exist_ok=True)
+            (side_dir / f"agent-{task}.jsonl").write_text(json.dumps(
+                {"parentUuid": None, "isSidechain": True, "uuid": root,
+                 "type": "user"}) + "\n")
+            (side_dir / f"agent-{task}.meta.json").write_text(json.dumps(
+                {"name": side_name, "agentType": "fork"}))
+        eng11 = Resolver()
+        eng11.projects_dir = Path(td)
+        graded = []
+        real_grammar = eng11._side_grammar
+        eng11._side_grammar = lambda p: (graded.append(p), real_grammar(p))[1]
+        by_task, _why = eng11.side_transcript("t1")
+        task_cost = len(graded)
+        graded.clear()
+        by_pair, _why = eng11.side_transcript("PARENT-A/second-side")
+        pair_cost = len(graded)
+        graded.clear()
+        by_root, _why = eng11.side_transcript("root-3")
+        root_cost = len(graded)
+    typed = {
+        "a task id classifies one": task_cost == 1
+            and by_task and by_task["grammar"] == "rooted" and by_task["root"] == "root-1",
+        "a parent/name pair classifies one": pair_cost == 1
+            and by_pair and by_pair["root"] == "root-2",
+        "a root spelling still reads the corpus, and finds it": root_cost == 3
+            and by_root and by_root["root"] == "root-3",
+    }
+    wrong = sorted(k for k, ok in typed.items() if not ok)
+    check("one typed side classifies the hit alone", not wrong,
+          ", ".join(wrong) or f"costs {task_cost}/{pair_cost}/{root_cost}")
 
     # A pane id is per-server: a recorded one is a fact only while its server
     # runs and still carries it. Anything else must not be echoed as a seat
@@ -8813,12 +8893,16 @@ def run_selftest(live=False):
                                 {"type": "tool_use", "name": "SendMessage",
                                  "input": {"to": "bob", "summary": body,
                                            "message": body}}]}})
+        chatter = [compact({"type": "assistant", "agentName": "alice",
+                            "teamName": "TML", "timestamp": f"2026-01-01T00:01:{n:02d}Z",
+                            "uuid": f"c-{n}", "parentUuid": None,
+                            "message": {"content": []}}) for n in range(20)]
         (proj / "ALICE.jsonl").write_text("\n".join([
             send_rec("one", "2026-01-01T00:00:01Z"),
             send_rec("two", "2026-01-01T00:00:02Z"),
             send_rec("three", "2026-01-01T00:00:03Z"),
             send_rec("four", "2026-01-01T00:00:09Z"),
-        ]) + "\n")
+        ] + chatter) + "\n")
         (proj / "BOB.jsonl").write_text("\n".join([
             compact({"type": "user", "agentName": "bob", "teamName": "TML",
                      "timestamp": "2026-01-01T00:00:04Z", "uuid": "b-1",
@@ -8833,13 +8917,41 @@ def run_selftest(live=False):
         (boxdir / "bob.json").write_text(json.dumps([{"text": "two"}]))
         eng5 = Resolver()
         eng5.projects_dir, eng5.teams_dir = Path(td), Path(td) / "teams"
-        states = {e["summary"]: e["state"] for e in eng5.mail_ledger("TML")}
+        full_rows = eng5.mail_ledger("TML")
+        states = {e["summary"]: e["state"] for e in full_rows}
         want = {"one": "delivered", "two": "queued",
                 "three": "unexplained", "four": "pending"}
         off = [f"{k}: {states.get(k)} (wanted {v})" for k, v in want.items()
                if states.get(k) != v]
         check("the mail ledger joins sends against deliveries", not off,
               ", ".join(off) or ", ".join(f"{k}={v}" for k, v in want.items()))
+
+        # A declared recipient gets the same rows the full join would give it,
+        # and buys less: a sender's chatter is not parsed on its behalf.
+        real_loads, parses = json.loads, []
+
+        def counting_loads(raw, *a, **kw):
+            parses.append(1)
+            return real_loads(raw, *a, **kw)
+
+        json.loads = counting_loads
+        try:
+            narrowed = eng5.mail_ledger("TML", to="bob")
+            to_bob = len(parses)
+            parses.clear()
+            everything_rows = eng5.mail_ledger("TML")
+            to_all = len(parses)
+        finally:
+            json.loads = real_loads
+        declared = {
+            "same rows, same states": narrowed ==
+                [r for r in everything_rows if r["to"] == "bob"],
+            "nobody addressed means no rows": eng5.mail_ledger("TML", to="alice") == [],
+            "a sender's chatter is not parsed": to_bob < to_all,
+        }
+        wrong = sorted(k for k, ok in declared.items() if not ok)
+        check("a declared recipient narrows the ledger without changing it",
+              not wrong, ", ".join(wrong) or f"{to_bob} parses vs {to_all}")
         # A torn inbox answers as itself; six real messages in a half-written
         # file must not read as no mail waiting.
         (boxdir / "carol.json").write_text('[{"text": "hal')
