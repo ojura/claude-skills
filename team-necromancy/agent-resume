@@ -3476,6 +3476,28 @@ def enforce_restore(ctx, args):
          f"inboxes polled")
 
 
+def already_running(ctx, args, is_lead):
+    """Why this run must not act, because the conversation is already live.
+
+    One question, both paths: a lead must not be exec'd and a member must not
+    be spawned onto a transcript a process already holds. The acts differ, the
+    precondition does not, and it was asked twice in two spellings until the
+    lead's answer forgot to name the session it was talking about.
+
+    An in-process lead runs as bare `claude` with no --agent-id to match, so
+    the session registry is the only witness in either case. A rebind is the
+    one exemption: --to-team replaces a live member deliberately, and its own
+    kill path owns that.
+    """
+    if args.force or (not is_lead and ctx.get("to_team")):
+        return None
+    owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
+    if not (owner and owner[2]):
+        return None
+    return (f"session {ctx['session_uuid']} is live as pid {owner[0]}"
+            f"{state_note(owner[0])}; pass --force to run a second copy")
+
+
 def noop_outcome(ctx, args, prefix, why, socket=None, is_lead=False, pane=None,
                  report=False):
     """A run that stops without launching: say why, register, state, return.
@@ -4713,11 +4735,11 @@ def run_one(args, passthrough, table, prefix="", pending=()):
                                         f"({socket_state(other)})"))
         report_launch(ctx, command, prefix, role="lead", agent_id=agent_id,
                       extra=seat)
-        owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
-        if owner and owner[2] and not args.force:
-            return noop_outcome(ctx, args, prefix, is_lead=True, why=(
-                f"already live as pid {owner[0]}{state_note(owner[0])}; "
-                "pass --force to run a second copy"))
+        # A lead is not exec'd onto a conversation someone is already running,
+        # for the same reason a member is not spawned onto one.
+        running = already_running(ctx, args, is_lead=True)
+        if running:
+            return noop_outcome(ctx, args, prefix, is_lead=True, why=running)
         # This run is about to become the lead, so the identity gate applies from
         # here down.
         enforce_ctx(ctx, args)
@@ -4842,13 +4864,10 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     if others and not replace_pane:
         warn(f"pane {want_pane} runs a different claude (pid {', '.join(map(str, others))}); using a new pane")
 
-    # An in-process lead runs as bare `claude` with no --agent-id to match, so
-    # ask the session registry who currently owns this transcript.
-    owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
-    if owner and owner[2] and not args.force and not ctx.get("to_team"):
-        return noop_outcome(ctx, args, prefix, socket=socket, pane=want_pane, why=(
-            f"session {ctx['session_uuid']} is live as pid {owner[0]}"
-            f"{state_note(owner[0])}; pass --force to resume a second copy"))
+    running = already_running(ctx, args, is_lead=False)
+    if running:
+        return noop_outcome(ctx, args, prefix, socket=socket, pane=want_pane,
+                            why=running)
 
     live = RESOLVER.live_agent_procs(agent_id, table) if agent_id else []
     elsewhere = [pid for pid, _ in live if pid not in here]
@@ -8026,6 +8045,58 @@ def run_selftest(live=False):
         if needed not in noop_src:
             noops.append(f"the noop path {missing}")
     check("a noop is reported through one function", not noops, ", ".join(noops))
+
+    # The acts differ (exec into your terminal, spawn into a pane); the
+    # precondition does not. Neither path may ask the liveness question for
+    # itself, or the two answers drift as they did when the lead's forgot to
+    # name the session it was refusing to take over.
+    asks_own = sorted(callers_of("lead_pid_for")
+                      - {"already_running", "auto_redirect", "lead_pid", "run_selftest"})
+    # And the guarantee itself, not merely its address: the same live
+    # conversation stops both acts, --force releases both, and only a
+    # member's rebind is exempt (its own kill path owns that).
+    real_owner = RESOLVER.lead_pid_for
+    live_ctx = {"session_uuid": "live-uuid"}
+
+    class _NoForce:
+        force = False
+
+    class _Forced:
+        force = True
+
+    try:
+        RESOLVER.lead_pid_for = lambda uuid: (4242, "x", True)
+        stops = {
+            "a live conversation stops an exec":
+                bool(already_running(live_ctx, _NoForce, is_lead=True)),
+            "a live conversation stops a spawn":
+                bool(already_running(live_ctx, _NoForce, is_lead=False)),
+            "and both name the session and the pid":
+                all("live-uuid" in (already_running(live_ctx, _NoForce, is_lead=k) or "")
+                    and "4242" in (already_running(live_ctx, _NoForce, is_lead=k) or "")
+                    for k in (True, False)),
+            "--force releases the exec":
+                already_running(live_ctx, _Forced, is_lead=True) is None,
+            "--force releases the spawn":
+                already_running(live_ctx, _Forced, is_lead=False) is None,
+            "a member's rebind is exempt":
+                already_running({**live_ctx, "to_team": "t"}, _NoForce,
+                                is_lead=False) is None,
+            "a lead's is not":
+                bool(already_running({**live_ctx, "to_team": "t"}, _NoForce,
+                                     is_lead=True)),
+        }
+        RESOLVER.lead_pid_for = lambda uuid: (4242, "x", False)
+        stops["a dead owner stops nothing"] = all(
+            already_running(live_ctx, _NoForce, is_lead=k) is None for k in (True, False))
+        RESOLVER.lead_pid_for = lambda uuid: None
+        stops["and neither does no owner at all"] = all(
+            already_running(live_ctx, _NoForce, is_lead=k) is None for k in (True, False))
+    finally:
+        RESOLVER.lead_pid_for = real_owner
+    asks_own += sorted(k for k, good in stops.items() if not good)
+    check("a lead is not exec'd, nor a member spawned, onto a live conversation",
+          not asks_own, ", ".join(asks_own))
 
     # Only the conversion writers apply a plan, and only the engine converts.
     applied = {}
