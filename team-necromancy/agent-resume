@@ -3,10 +3,10 @@
 
 Usage: agent-resume [<selector>] [options] [-- ...forwarded to claude]
 
-The selector may sit anywhere among the flags: the allowlist records which flags
-take a value, so a bare token is either that value or the selector, and position
-carries no meaning. Two bare tokens are an error naming both, since one of them
-would otherwise reach the resumed session as an unasked-for prompt. Put anything
+The selector may sit anywhere among the flags: flags that take a value keep
+their values, so a bare token elsewhere is the selector, and position carries
+no meaning. Two bare tokens are an error naming both, since one of them would
+otherwise reach the resumed session as an unasked-for prompt. Put anything
 genuinely meant for claude after `--`, which ends classification.
 
 The bare argument is classified by shape:
@@ -19,13 +19,14 @@ The bare argument is classified by shape:
 with that team's identity, replaces whichever process still holds the
 transcript, registers it in the destination roster and retires the source entry.
 
---install sets up the ~/.local/bin symlink and zsh tab completion.
+--install sets up the ~/.local/bin symlink, zsh tab completion, and the
+Claude Code startup hook that runs --cleanup.
 
 Or select explicitly with --agent-id (as claude spells it) and/or --resume <session-uuid>.
 Everything the harness needs to relaunch it (team, type, color, model, effort,
 permission mode, cwd, parent session, tmux socket + pane) is reconstructed from
-three on-disk sources plus the live process table; when they disagree, the most
-recent value wins.
+what is recorded on disk plus the live process table; when the records
+disagree, the most recent value wins.
 
 Flags for the resumed session ride alongside this tool's own, and a
 forwarded flag overrides the value this tool would have derived. An
