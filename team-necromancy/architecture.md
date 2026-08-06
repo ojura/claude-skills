@@ -241,12 +241,17 @@ Both directions bite. A renderer reaching for a path helper has found an
 engine gap, and the fix is a new engine answer (transcript_title), never a
 widened exemption on the fence that keeps pickers out of the tree. And an
 engine answer fatter than the declared need taxes every caller: the mail
-ledger joined a whole team to render one agent's line (now to=), one typed
-side classified nine hundred (now classify-on-hit), the doctor swept a
-census only the sweep branch reads, and the standing dossier walked the
-spawn log for a field its caller discarded (now dossier=). Each narrowing
-is proven answer-identical and checked by name, and an undeclared field
-answers "not asked" rather than faking a claim about a corpus nobody
-consulted. The cost of a field is measured, never presumed cached:
-"approximately free" turned out to mean "someone else usually pays" the
-one time it went unmeasured.
+ledger joined a whole team to render one agent's line, one typed side
+classified nine hundred, the doctor swept a census only the sweep branch
+reads, and the standing verdict walked the spawn corpus for a field its
+caller discarded. Per-method toggles were the first cut and did not
+survive review; the contract that did: a run declares its needs to the
+constructor (Resolver(needs=...), Maybe(NEED.X) for a genuinely
+conditional path), an undeclared compute refuses at the loader by name,
+and a hard need never exercised refuses when the verb completes, so a fat
+declaration dies as loudly as a missing one. Narrowing within a question
+stays a question parameter (mail_ledger's to=), parentage became its own
+question (spawn_parent_of) that only the verb printing it asks, and each
+narrowing was proven answer-identical and checked by name. The cost of a
+field is measured, never presumed cached: "approximately free" turned out
+to mean "someone else usually pays" the one time it went unmeasured.
