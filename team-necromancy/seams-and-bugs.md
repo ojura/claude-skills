@@ -68,9 +68,16 @@ good components that nobody introduced to each other.
    stamped-disagreeing transcript runs split: it writes transcript lines as
    the stamped team, sends idle notifications as the worn team, and polls
    both teams' inboxes. The transcript half wins every future resume, so a
-   rebind by flags silently undoes itself at each restart; the durable
-   mechanism is an appended re-stamped boundary entry (pseudocompact shape),
-   which changes exactly the entry restore consumes. Two reaped-team edges:
+   rebind by flags silently undoes itself at each restart - and no appended
+   entry can fix it. The theorem: an appended entry either has a null
+   parent, in which case restore reads it but the loaded window truncates
+   to it (compact-style amnesia), or it chains, in which case the window
+   survives and restore never reads it. Restore-visibility and
+   window-preservation are mutually exclusive for appended entries; a
+   boundary graft was ruled as the fix and retracted on this theorem. The
+   real fix is upstream: a dedicated rebind record that restore consumes
+   without it being the window-start (fork-context-ref precedent), or
+   flags outranking stamps. Two reaped-team edges:
    stamped for an absent team and flagless, the session comes up as nobody
    and writes unstamped lines until the team dir exists again; flag-bound,
    argv survives but hook init is skipped (that half is code-read grade).

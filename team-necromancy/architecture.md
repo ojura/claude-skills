@@ -192,7 +192,7 @@ their saved transcripts. `CLAUDE_DISABLE_ADOPT=1` turns all of it off.
 Teammates are not in adopt's inventory, which is the missing piece that would
 make team resume a real feature instead of this skill.
 
-## Method, two rules
+## Method
 
 Carried out of this file's construction rather than designed up front.
 Prove the inverse before acting: a conversion computes its own undo in
@@ -205,3 +205,10 @@ wrong vocabulary collapses on the first live team while the correction is
 still cheap. It has paid twice: a mail ledger's two unmatched states became
 five on first contact, and a promote's roster write dissolved into the
 receipt being the membership.
+
+A third rule earned its place the hard way: a refusal that names an unbuilt
+remedy is making a claim about that remedy, and claims in refusal strings
+deserve the same verification as claims in code. One refusal presented a
+conversation-wiping graft as the durable fix for a whole day, because no
+check runs on unbuilt designs; a single angry question did what the suite
+could not.
