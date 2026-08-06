@@ -4718,9 +4718,12 @@ def auto_redirect(ctx, args, table, prefix=""):
     path = getattr(ctx["resolution"], "path", None)
     stamped, state = RESOLVER.restored_identity(path) if path else (None, None)
     if state == "restored" and stamped != dest:
+        blockers = RESOLVER.reap_objections(stamped, table)
         warn(f"{agent_id} comes back as {stamped} whatever these flags say, so "
-             f"pointing it at {dest} would not survive a restart; "
-             f"{TOOL} {agent_id} --to-team {dest} moves it for good")
+             f"pointing it at {dest} would not survive a restart. "
+             f"{TOOL} {agent_id} --to-team {dest} moves it for good"
+             + (f", once {stamped} can be retired: {'; '.join(blockers[:2])}"
+                if blockers else ""))
         ctx["stale_team_warned"] = True
         return
 
@@ -5803,19 +5806,27 @@ def rebind_reap(stamped, dest, args, prefix="", path=None):
     table = RESOLVER.ps_table()
     objections = RESOLVER.reap_objections(stamped, table,
                                           archive_mail=args.with_mail)
-    alive = [o for o in objections
-             if "wears" in o or "operates" in o or "holds" in o]
-    mail = [o for o in objections if o not in alive]
-    if mail:
-        die(f"a rebind onto {dest} needs {stamped} retired, and it refuses: "
-            + "; ".join(mail[:4])
-            + ("" if args.with_mail
-               else ". --with-mail archives the mail into the receipt"))
-    if alive and not args.force:
-        die(f"a rebind onto {dest} needs {stamped} retired, and it refuses: "
-            + "; ".join(alive[:4])
-            + ". --force restamps the window-start instead "
-              "(two fields, receipted, reversible)")
+    # Every blocker at once, each with its own way out. Reporting the first
+    # class alone sends an operator to fix one thing and meet the next.
+    held = [o for o in objections if "holds" in o]
+    alive = [o for o in objections if o not in held
+             and ("wears" in o or "operates" in o)]
+    mail = [o for o in objections if o not in held and o not in alive]
+    if objections:
+        lines = []
+        if mail:
+            lines.append("; ".join(mail[:4])
+                         + " (--with-mail archives it into the receipt)")
+        if alive and not args.force:
+            lines.append("; ".join(alive[:4])
+                         + " (--force restamps the window-start instead: two "
+                           "fields, receipted, reversible)")
+        if held:
+            lines.append("; ".join(held[:4])
+                         + " (stop it first; nothing forces this one)")
+        if lines:
+            die(f"a rebind onto {dest} needs {stamped} retired, and it refuses: "
+                + ". Also: ".join(lines))
     if alive:
         strangers, ours = RESOLVER.transcript_holders(path.stem, table) if path else ([], [])
         if strangers or ours:
@@ -7551,6 +7562,14 @@ def run_selftest(live=False):
         futile.append("the restore question is asked after the operator is")
     if "--to-team" not in redirect_src:
         futile.append("the durable move is not named")
+    # And named honestly: a remedy advertised without its preconditions is a
+    # prescription ahead of its treatment.
+    if "reap_objections(" not in redirect_src:
+        futile.append("the durable move is promised without checking it is available")
+    reap_src = ast.get_source_segment(source, funcs["rebind_reap"]) or ""
+    for cls in ("--with-mail archives", "--force restamps", "stop it first"):
+        if cls not in reap_src:
+            futile.append(f"a blocker class has no remedy: {cls}")
     check("a redirect a restart would undo is not offered", not futile,
           ", ".join(futile))
 
