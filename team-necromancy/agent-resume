@@ -42,6 +42,7 @@ real and are precisely the flags this tool exists to set.
 
 import difflib
 import argparse
+import enum
 import collections
 import contextlib
 import copy
@@ -602,6 +603,36 @@ def said_when(iso):
 
 # ---------------------------------------------------------------- process table
 
+class NEED(enum.Enum):
+    """The corpus-scale computes a run may ask the engine for, by name.
+
+    Declared to the constructor, never passed to a method: a verb states up
+    front what it consumes, the engine refuses to compute anything else, and
+    the end-of-run audit refuses a declaration a smaller set would have
+    satisfied. The default is nothing, so every caller must say what it needs.
+    The values are the plain words the refusal prints.
+    """
+    PROCS = "the process table"
+    STAMPS = "transcript identity stamps"
+    SPAWNS = "the spawn payload corpus"
+    SIDES = "side transcript classification"
+    MAIL = "the send-vs-delivery mail join"
+    TITLES = "transcript titles"
+
+
+class Maybe:
+    """A declared need the run may or may not exercise.
+
+    Conditional paths (a deep doctor's mail join, a root-spelling side)
+    declare Maybe(X): the engine will compute X if asked, and the audit
+    excuses X unexercised, where an unexercised hard need is a fat
+    declaration and refused.
+    """
+
+    def __init__(self, need):
+        self.need = need
+
+
 class Resolver:
     """Everything a resolution reads, loaded once per run and held together.
 
@@ -622,9 +653,18 @@ class Resolver:
     rather than the assembled identity: `roster_record` says what belongs in a
     roster entry and where it goes, and the writers write it. The engine
     describes, the writer writes.
+
+    `needs` declares, at construction and nowhere else, which corpus-scale
+    computes this engine may perform (see NEED); the loaders refuse the rest,
+    and audit_needs() at the end of a run refuses hard declarations that were
+    never exercised. Compute is never toggled per call: a method either may
+    ask its loader or the whole run may not.
     """
 
-    def __init__(self):
+    def __init__(self, needs=()):
+        self.hard_needs = {n for n in needs if isinstance(n, NEED)}
+        self.needs = self.hard_needs | {n.need for n in needs if isinstance(n, Maybe)}
+        self.exercised = set()
         self._procs = None       # pid -> row, from ps
         self._stamps = None      # transcript stem -> (agentName, teamName)
         self._spawns = {}        # transcript stem -> {name: last payload of that name}
@@ -633,6 +673,33 @@ class Resolver:
         self._by_team = None     # team -> [(stamp, path)] of transcripts that led it
         self.teams_dir = TEAMS_DIR   # overridable so a test engine can read a synthetic tree
         self.projects_dir = PROJECTS_DIR  # same, for the transcript tree
+
+    def _exercise(self, need):
+        """Record one declared compute happening, or refuse an undeclared one."""
+        if need not in self.needs:
+            raise RuntimeError(
+                f"this run declared no need for {need.value}; the engine "
+                f"computes only what its constructor was told, so declare "
+                f"NEED.{need.name} (or Maybe(NEED.{need.name}) for a "
+                f"conditional path) where the verb states its needs")
+        self.exercised.add(need)
+
+    def audit_needs(self):
+        """Refuse a declaration a smaller set would have satisfied.
+
+        The destructor's contract, spelled where Python can enforce it: a
+        raise from __del__ is swallowed, so the run calls this when its verb
+        completes. Unexercised Maybe declarations are the escape for
+        conditional paths and pass silently.
+        """
+        fat = self.hard_needs - self.exercised
+        if fat:
+            raise RuntimeError(
+                "declared and never computed: "
+                + ", ".join(sorted(n.name for n in fat))
+                + "; a smaller declaration would have served this run, so "
+                  "drop it or mark it Maybe(...) if some runs of this verb "
+                  "genuinely use it")
 
     def refresh_procs(self):
         self._procs = None
@@ -725,6 +792,7 @@ class Resolver:
         transcript that merely discusses spawning cannot contribute a quoted
         example as if it were real.
         """
+        self._exercise(NEED.SPAWNS)
         paths = [p for p in paths if p and p.stem not in self._spawns]
         for path in paths:
             self._spawns[path.stem], self._spawn_log[path.stem] = {}, []
@@ -905,6 +973,7 @@ class Resolver:
         Built from the scan self._spawn_by_agent() already performs: containing a spawn
         payload is what makes a transcript a lead's, so the same files answer both.
         """
+        self._exercise(NEED.SPAWNS)
         if self._by_team is not None:
             return self._by_team
         self._by_team = {}
@@ -1113,6 +1182,7 @@ class Resolver:
         One run judges liveness against one consistent picture, and a single
         resolve was spawning ps three times.
         """
+        self._exercise(NEED.PROCS)
         if self._procs is not None and not refresh:
             return self._procs
         out = subprocess.run(
@@ -1449,6 +1519,7 @@ class Resolver:
         send to it can originate anywhere, but only its own file pays the
         delivery side, and everyone else's parses only its send lines.
         """
+        self._exercise(NEED.MAIL)
         people = {}
         for path, (name, stamped) in self.stamp_index().items():
             if stamped == team and name and name not in people:
@@ -2691,6 +2762,7 @@ class Resolver:
         answered with a title from one line at its tail, and everything downstream
         inherited it.
         """
+        self._exercise(NEED.STAMPS)
         if self._stamps is not None:
             return self._stamps
         index = {}
@@ -2777,7 +2849,7 @@ class Resolver:
         return next((team for team, owner, _ in self._boot_join()
                      if owner == pid and team in pool), None), False
 
-    def standing(self, agent_id, parent_session=None, dossier=True):
+    def standing(self, agent_id, parent_session=None):
         """Where a member stands with its lead: parentage, liveness, team, mail.
 
         One composed answer, each part carrying the evidence it rests on. The
@@ -2789,15 +2861,11 @@ class Resolver:
         A team name appearing in a transcript's prose is this tool's own printed
         guess read back, and would corroborate itself.
 
-        `dossier` is the caller's declared need: False answers only what the
-        reachability verdict and its remedies rest on, skipping the
-        who-spawned-it walk that only the printed dossier renders, so a
-        caller consulting the verdict does not buy the corpus's spawn log.
+        Parentage is not here: only the printed dossier renders it, so it is
+        its own engine question (spawn_parent_of) that only --standing asks,
+        and a caller consulting the verdict never buys the spawn corpus.
         """
         name, _, team = agent_id.partition("@")
-        parent = next((stem for stem, entries in self._every_log().items()
-                       for _stamp, payload in entries
-                       if payload.get("agent_id") == agent_id), None) if dossier else None
         pid, alive, how, exact_lead = self.lead_pid(parent_session, team)
         lead_team, exact_team = self.team_minted_by(pid) if pid and alive else (None, False)
         roster = self.roster_of(lead_team) if lead_team else None
@@ -2867,11 +2935,6 @@ class Resolver:
             remedies = []
         return {
             "agent_id": agent_id, "name": name, "team": team,
-            # An unasked question must not answer "no": the caller declared
-            # no need, and "no payload names it" is a claim about the corpus.
-            "parent": (parent, ("spawn payload naming it" if parent else
-                                "no spawn payload names this agent") if dossier
-                       else "not asked"),
             "lead": (pid, alive, how, "exact" if exact_lead else "inferred"),
             "lead_team": (lead_team, "exact" if exact_team else
                           f"paired by a boot within {TEAM_MINT_WINDOW_MS}ms, not proven"),
@@ -2880,6 +2943,17 @@ class Resolver:
             "reachable": (reachable, why),
             "remedies": remedies,
         }
+
+    def spawn_parent_of(self, agent_id):
+        """(stem, evidence) of the transcript whose spawn payload names this
+        agent. The dossier's parentage line, asked only by the verb that
+        prints it; the answer walks the spawn corpus, so it is a declared
+        need of --standing and of nothing else."""
+        parent = next((stem for stem, entries in self._every_log().items()
+                       for _stamp, payload in entries
+                       if payload.get("agent_id") == agent_id), None)
+        return (parent, "spawn payload naming it" if parent
+                else "no spawn payload names this agent")
 
     def teams_led_by(self, session_stem):
         """Teams this transcript led, newest first.
@@ -2909,6 +2983,7 @@ class Resolver:
         The engine finds the file and reads its title in one answer, so a
         reporter renders sessions without ever touching the tree itself.
         """
+        self._exercise(NEED.TITLES)
         path = self.transcript_path(session_uuid)
         return session_title(path, limit=90) if path else None
 
@@ -2932,7 +3007,7 @@ class Resolver:
             for value in node:
                 yield from self._walk_spawn_payloads(value, depth + 1)
 
-    def side_transcripts(self, parent=None, classify=True):
+    def side_transcripts(self, parent=None):
         """Every side transcript on this machine, classified by its own bytes.
 
         A side transcript lives at <project>/<parent-session>/subagents/
@@ -2948,6 +3023,17 @@ class Resolver:
                    uuid; the chain carries its own history.
         Anything else is reported as what it is, never guessed at.
         """
+        self._exercise(NEED.SIDES)
+        out = self._side_listing(parent)
+        for entry in out:
+            entry["grammar"], entry["detail"], entry["root"] = \
+                self._side_grammar(entry["path"])
+        return out
+
+    def _side_listing(self, parent=None):
+        """The corpus by its cheap facts alone (path, parent, meta, mtime):
+        side_transcripts without the classification, for the selector that
+        narrows to a hit before anything reads bytes."""
         pattern = f"*/{parent or '*'}/subagents/agent-*.jsonl"
         out = []
         for path in sorted(self.projects_dir.glob(pattern)):
@@ -2964,11 +3050,6 @@ class Resolver:
                 entry["agent_type"] = meta.get("agentType")
             except (OSError, ValueError):
                 pass
-            # classify=False is a caller's declared need: the cheap facts
-            # alone, with grammar left for whatever the caller narrows to,
-            # so one typed side does not buy the whole corpus a read.
-            if classify:
-                entry["grammar"], entry["detail"], entry["root"] = self._side_grammar(path)
             out.append(entry)
         return out
 
@@ -2980,6 +3061,7 @@ class Resolver:
         record after the ref: 138 of 138 here carry one). unclassifiable ->
         a sentence naming what the first record actually is, root None.
         """
+        self._exercise(NEED.SIDES)
         try:
             with path.open(errors="replace") as handle:
                 first = handle.readline().strip()
@@ -3017,7 +3099,7 @@ class Resolver:
         alone; roots live in the bytes, so only that fallback (and the bare
         name behind it, to keep the spelling order exact) reads the corpus.
         """
-        sides = self.side_transcripts(classify=False)
+        sides = self._side_listing()
 
         def classified(entry):
             entry = dict(entry)
@@ -4919,8 +5001,7 @@ def auto_redirect(ctx, args, table, prefix=""):
         # Alive: leave it to the liveness guards. Say what the move would cost
         # rather than making it, since restarting throws away its current turn.
         who = f"pid {holders[0][0]}" if holders else f"pid {owner[0]} (registry)"
-        standing = RESOLVER.standing(agent_id, RESOLVER.field(ctx, "parentSessionId"),
-                                     dossier=False)
+        standing = RESOLVER.standing(agent_id, RESOLVER.field(ctx, "parentSessionId"))
         fix = "".join(f"\n- {what}  ({cost})" for what, cost in standing["remedies"])
         warn(f"{agent_id} is running as {who}: {standing['reachable'][1]}{fix}")
         ctx["stale_team_warned"] = True
@@ -5693,7 +5774,8 @@ def run_standing(args):
     s = RESOLVER.standing(agent_id)
     pid, alive, how, grade = s["lead"]
     print(f"agent    {s['agent_id']}")
-    print(fill(f"parent   {s['parent'][0] or '(none)'}  ({s['parent'][1]})"))
+    parent = RESOLVER.spawn_parent_of(agent_id)
+    print(fill(f"parent   {parent[0] or '(none)'}  ({parent[1]})"))
     if pid:
         said_how = re.sub(rf"^pid {pid}, ", "", how) if how else None
         print(fill(f"lead     pid {pid}{'' if alive else ', not running'}"
@@ -7414,9 +7496,9 @@ def run_selftest(live=False):
                         {"name": "gamma", "agentId": f"gamma@{team}"}]},
                     _every_log=lambda: (log_walked.append(1), {})[1])
             plain = RESOLVER.standing("gamma@session-probe")
-            walked_when_asked = len(log_walked)
-            verdictless = RESOLVER.standing("gamma@session-probe", dossier=False)
-            walked_undeclared = len(log_walked) - walked_when_asked
+            walked_by_standing = len(log_walked)
+            parent_answer = RESOLVER.spawn_parent_of("gamma@session-probe")
+            walked_by_parent = len(log_walked) - walked_by_standing
             _rewire(roster_of=lambda team: {"members": []})
             empty = RESOLVER.standing("gamma@session-probe")
             _rewire(team_minted_by=lambda pid: (None, False))
@@ -7466,15 +7548,15 @@ def run_selftest(live=False):
         "an empty roster in standing": offers_both(empty["remedies"])
             and any("resume this member" in what for what, _c in empty["remedies"]),
         "a lead with no recorded team": offers_both(unrecorded_team["remedies"]),
-        # The cost of an undeclared field is nothing by construction: the
-        # dossier walks the spawn log, the bare verdict never does, and the
-        # verdict it returns is the same one, with parent honestly unasked.
-        "the dossier asks, the verdict does not":
-            walked_when_asked == 1 and walked_undeclared == 0,
-        "the undeclared verdict still answers whole":
-            offers_both(verdictless["remedies"])
-            and verdictless["parent"] == (None, "not asked"),
-        "the redirect declares its need": "dossier=False" in
+        # Parentage is its own engine question: the verdict never walks the
+        # spawn corpus, only the question whose answer is the parent does,
+        # and only the verb that prints it asks that question.
+        "the verdict walks no spawn corpus": walked_by_standing == 0,
+        "parentage is its own question": walked_by_parent == 1
+            and parent_answer == (None, "no spawn payload names this agent"),
+        "only the dossier verb asks it": "spawn_parent_of(" in
+            (ast.get_source_segment(source, funcs["run_standing"]) or "")
+            and "spawn_parent_of(" not in
             (ast.get_source_segment(source, funcs["auto_redirect"]) or ""),
     }
     wrong = sorted(k for k, ok in both.items() if not ok)
@@ -7620,7 +7702,7 @@ def run_selftest(live=False):
                  "type": "user"}) + "\n")
             (side_dir / f"agent-{task}.meta.json").write_text(json.dumps(
                 {"name": side_name, "agentType": "fork"}))
-        eng11 = Resolver()
+        eng11 = Resolver(needs={Maybe(n) for n in NEED})
         eng11.projects_dir = Path(td)
         graded = []
         real_grammar = eng11._side_grammar
@@ -7644,6 +7726,59 @@ def run_selftest(live=False):
     wrong = sorted(k for k, ok in typed.items() if not ok)
     check("one typed side classifies the hit alone", not wrong,
           ", ".join(wrong) or f"costs {task_cost}/{pair_cost}/{root_cost}")
+
+    # Compute is a constructor contract: declared as an enum set, nothing by
+    # default, refused by name at use when undeclared and at end of run when
+    # declared and never exercised, with Maybe the honest escape for a
+    # conditional branch. (Python swallows a raise from __del__, so the
+    # end-of-run audit is the destructor this contract can enforce.)
+    with tempfile.TemporaryDirectory() as td:
+        mute = Resolver()
+        mute.projects_dir = Path(td)
+        refused = ""
+        try:
+            mute.stamp_index()
+        except RuntimeError as err:
+            refused = str(err)
+        allowed = Resolver(needs={NEED.STAMPS})
+        allowed.projects_dir = Path(td)
+        answered = allowed.stamp_index() == {}
+        try:
+            allowed.audit_needs()
+            lean_ok = True
+        except RuntimeError:
+            lean_ok = False
+        fat = Resolver(needs={NEED.STAMPS, NEED.PROCS})
+        fat.projects_dir = Path(td)
+        fat.stamp_index()
+        fat_refused = ""
+        try:
+            fat.audit_needs()
+        except RuntimeError as err:
+            fat_refused = str(err)
+        excused = Resolver(needs={NEED.STAMPS, Maybe(NEED.PROCS)})
+        excused.projects_dir = Path(td)
+        excused.stamp_index()
+        try:
+            excused.audit_needs()
+            maybe_ok = True
+        except RuntimeError:
+            maybe_ok = False
+    contract = {
+        "an undeclared compute refuses by name":
+            "transcript identity stamps" in refused and "NEED.STAMPS" in refused,
+        "a declared one answers, and a lean run audits clean": answered and lean_ok,
+        "a fat declaration is refused at the end": "PROCS" in fat_refused
+            and "STAMPS" not in fat_refused,
+        "a Maybe is excused unexercised": maybe_ok,
+        "the verbs declare before anything computes":
+            "RESOLVER = Resolver(needs=verb_needs(args, selector))" in main_src
+            and main_src.index("Resolver(needs=verb_needs")
+                < main_src.index("RESOLVER.ps_table()"),
+    }
+    wrong = sorted(k for k, ok in contract.items() if not ok)
+    check("compute is declared at construction and audited at the end",
+          not wrong, ", ".join(wrong))
 
     # A pane id is per-server: a recorded one is a fact only while its server
     # runs and still carries it. Anything else must not be echoed as a seat
@@ -8456,7 +8591,7 @@ def run_selftest(live=False):
 
     # --- shape, not timing, bounds which team a process could have minted
     with tempfile.TemporaryDirectory() as td:
-        eng9 = Resolver()
+        eng9 = Resolver(needs={Maybe(n) for n in NEED})
         eng9.projects_dir, eng9.teams_dir = Path(td) / "proj", Path(td) / "teams"
         (eng9.projects_dir / "p").mkdir(parents=True)
         (eng9.projects_dir / "p" / "aaaaaaaa-1111.jsonl").write_text("{}\n")
@@ -8559,7 +8694,7 @@ def run_selftest(live=False):
     # A revived lead has a new pid, and a server is named after it, so the
     # next spawn lands somewhere its old crew is not. Naming one seat while
     # the crew sits on two is the half-answer this file keeps deleting.
-    eng10 = Resolver()
+    eng10 = Resolver(needs={Maybe(n) for n in NEED})
     eng10.live_sessions = lambda: [
         {"pid": 1, "alive": True, "team": "t", "agent": "old@t", "session": None},
         {"pid": 2, "alive": True, "team": "t", "agent": "new@t", "session": None},
@@ -8660,7 +8795,7 @@ def run_selftest(live=False):
             json.dumps({"isFork": True, "agentType": "fork", "name": "liar"}))
         mid = {"type": "assistant", "parentUuid": "elsewhere", "isSidechain": True, "uuid": "m"}
         (sub / "agent-m1.jsonl").write_text(json.dumps(mid) + "\n")
-        eng = Resolver()
+        eng = Resolver(needs={Maybe(n) for n in NEED})
         eng.projects_dir = Path(td)
         got = {e["task_id"]: e for e in eng.side_transcripts()}
         wrong = []
@@ -8717,7 +8852,7 @@ def run_selftest(live=False):
         rooted = sub / "agent-t1.jsonl"
         rooted.write_text("".join(compact(r) + "\n" for r in rows))
         (sub / "agent-t1.meta.json").write_text('{"agentType":"x","name":"t"}')
-        eng = Resolver()
+        eng = Resolver(needs={Maybe(n) for n in NEED})
         eng.projects_dir = Path(td)
         faults = []
         plan = eng.conversion_plan(rooted, "promote")
@@ -8827,7 +8962,7 @@ def run_selftest(live=False):
         side.chmod(0o600)
         meta_body = '{"agentType":"fork","name":"xp"}'
         (sub / "agent-x1.meta.json").write_text(meta_body)
-        eng4 = Resolver()
+        eng4 = Resolver(needs={Maybe(n) for n in NEED})
         eng4.projects_dir = Path(td)
         real_receipts = RECEIPTS_DIR
         globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
@@ -8938,7 +9073,7 @@ def run_selftest(live=False):
         boxdir = Path(td) / "teams" / "TML" / "inboxes"
         boxdir.mkdir(parents=True)
         (boxdir / "bob.json").write_text(json.dumps([{"text": "two"}]))
-        eng5 = Resolver()
+        eng5 = Resolver(needs={Maybe(n) for n in NEED})
         eng5.projects_dir, eng5.teams_dir = Path(td), Path(td) / "teams"
         full_rows = eng5.mail_ledger("TML")
         states = {e["summary"]: e["state"] for e in full_rows}
@@ -9037,7 +9172,7 @@ def run_selftest(live=False):
         target = proj / "RS.jsonl"
         target.write_text("".join(compact(r) + "\n" for r in rows))
         target.chmod(0o600)
-        eng7 = Resolver()
+        eng7 = Resolver(needs={Maybe(n) for n in NEED})
         eng7.projects_dir = Path(td)
         real_receipts = RECEIPTS_DIR
         globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
@@ -9130,7 +9265,7 @@ def run_selftest(live=False):
 
     # --- a rebind retires the stamped team only when nothing would notice
     with tempfile.TemporaryDirectory() as td:
-        eng6 = Resolver()
+        eng6 = Resolver(needs={Maybe(n) for n in NEED})
         eng6.projects_dir, eng6.teams_dir = Path(td), Path(td) / "teams"
         adir = eng6.teams_dir / "TEAMA"
         (adir / "inboxes").mkdir(parents=True)
@@ -9388,7 +9523,7 @@ def run_selftest(live=False):
                       json.dumps({"type": "last-prompt", "leafUuid": "u-root"}) + "\n")
         if RESOLVER.window_start(un) is not None:
             stray.append("an unstamped window start restored")
-        eng3 = Resolver()
+        eng3 = Resolver(needs={Maybe(n) for n in NEED})
         eng3.teams_dir = Path(td) / "teams"
         (eng3.teams_dir / "teamC").mkdir(parents=True)
         (eng3.teams_dir / "teamC" / "config.json").write_text("{}")
@@ -9913,6 +10048,54 @@ def run_selftest(live=False):
     return 1 if failed else 0
 
 
+def verb_needs(args, selector):
+    """What each verb declares to the engine, mirroring main's dispatch.
+
+    Hard where the verb's fixed path always computes it, Maybe where a
+    branch or the corpus decides. The end-of-run audit refuses a hard need
+    nobody exercised, so nothing survives here just in case; the maps are
+    tightened by running the verbs, not by guessing.
+    """
+    may = Maybe
+    if args.selftest or args.complete or args.cleanup:
+        # the suite and completion exercise by fixture and topic; cleanup
+        # runs from the startup hook, where a refused compute would fail
+        # silently behind its own output redirection
+        return {may(n) for n in NEED}
+    if args.doctor:
+        return {NEED.PROCS, NEED.STAMPS, NEED.SPAWNS, may(NEED.MAIL)}
+    if args.census:
+        return {NEED.STAMPS, NEED.SPAWNS, may(NEED.PROCS)}
+    if args.sides:
+        return {NEED.SIDES, may(NEED.TITLES)}
+    if args.promote:
+        return {NEED.SIDES, may(NEED.PROCS), may(NEED.STAMPS), may(NEED.SPAWNS)}
+    if args.demote:
+        return {NEED.PROCS, NEED.STAMPS, may(NEED.SIDES), may(NEED.SPAWNS)}
+    if args.mail_ledger:
+        return {NEED.STAMPS, NEED.MAIL, may(NEED.PROCS), may(NEED.SPAWNS)}
+    if args.install or args.poison or args.unpoison or args.help:
+        return set()
+    if not (selector or args.agent_id or args.resume or args.team):
+        return set()  # the help gate answers this run
+    if args.standing:
+        return {NEED.PROCS, NEED.STAMPS, NEED.SPAWNS, NEED.MAIL}
+    if args.stop:
+        return {NEED.PROCS, NEED.STAMPS, may(NEED.SPAWNS)}
+    return {NEED.PROCS, NEED.STAMPS, may(NEED.SPAWNS)}
+
+
+def audited(entry):
+    """Run the verb, then let the engine refuse a fat declaration.
+
+    Only a completed verb is audited: a refusal mid-run proves nothing
+    about what the whole verb would have used, and an exec never returns.
+    """
+    code = entry()
+    RESOLVER.audit_needs()
+    return code
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog=TOOL, allow_abbrev=False, add_help=False,
@@ -10031,6 +10214,11 @@ def main():
     check_passthrough(passthrough, parser)
     selector, passthrough = classify_passthrough(passthrough)
     check_identity_flags(args, passthrough)
+    # The one place compute is declared: the engine is constructed knowing
+    # what this verb may ask, and the end of the run refuses declarations a
+    # smaller set would have satisfied.
+    global RESOLVER
+    RESOLVER = Resolver(needs=verb_needs(args, selector))
     if args.team and (args.agent_id or args.resume):
         die(f"--team names every member of {args.team}, and "
             f"{'--agent-id' if args.agent_id else '--resume'} names one agent; pick one")
@@ -10138,4 +10326,4 @@ def interruptible(entry):
 
 
 if __name__ == "__main__":
-    sys.exit(interruptible(main))
+    sys.exit(interruptible(lambda: audited(main)))
