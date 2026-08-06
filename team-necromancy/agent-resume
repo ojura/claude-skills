@@ -29,15 +29,16 @@ recent value wins.
 
 Flags for the resumed session are an allowlist, PASSTHROUGH_FLAGS, not a
 passthrough, and a forwarded flag overrides the value this tool would have
-derived. The allowlist is what lets a misspelling of one of our own flags be
-caught instead of reaching claude as an unknown argument: a run given --dry-ryn
-read as though it had honoured a dry run it never saw.
+derived. Anything the table does not know is refused with the nearest match
+named, so an unknown flag never reaches claude and a misspelling of one of
+this tool's own flags cannot forward while the run proceeds as if the flag
+had been honoured.
 
-The cost is maintenance. The list is hand-held, so a flag claude grows is
-refused here until the table learns it, and the newer ones churn. It is not
-derived from `claude --help` because that costs most of a second per run and
-omits --agent-id, --agent-name, --team-name and --parent-session-id, which are
-real and are precisely the flags this tool exists to set.
+The table is hand-held on purpose: `claude --help` omits --agent-id,
+--agent-name, --team-name and --parent-session-id, the flags this tool
+exists to set, and asking it costs most of a second per run. So the list
+derives from nothing, and a flag claude grows is refused here until the
+table learns it.
 """
 
 import difflib
