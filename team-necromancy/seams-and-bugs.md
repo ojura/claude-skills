@@ -59,9 +59,11 @@ good components that nobody introduced to each other.
    restored context, and every new line re-stamps it, so a flagless resume of
    a stamped transcript runs as the stamped team forever, not the minted one.
    The mint record is a mint event that adoption then discards. Anything that
-   answers "runs as" from the session id or the mint ledger overclaims for
-   resumed transcripts; the window-start stamps are the operand the harness
-   actually consumes.
+   answers "runs as" from the id a life minted overclaims for resumed
+   transcripts: the mint is derivable (a team is named after its boot's
+   session id, which is the transcript filename), but adoption discards it,
+   and the window-start stamps are the operand the harness actually
+   consumes.
 
    Settled, triple-witnessed (stale source, bundle trace, live sandbox):
    restore is not gated on flags. A flag-bound launch onto a
@@ -87,7 +89,16 @@ good components that nobody introduced to each other.
    without it being the window-start (fork-context-ref precedent), or
    flags outranking stamps - or retiring the stamped team, which makes the
    restore bail and the flags win with the conversation intact (the
-   reap-rebind, measured live). Two reaped-team edges: stamped for an
+   reap-rebind, measured live). A third path evades the theorem by
+   mutating rather than appending: restamp the existing window-start's
+   two identity fields in place. Restore then reads the new team from the
+   same entry the walk already terminates at - window intact, no
+   fragility, hooks restored at next boot. Its cost is singular and
+   constitutional: the first in-place edit of a harness-written record's
+   content - a two-field lie with a receipt confessing it, admissible
+   only by explicit operator direction (--force on a rebind the reap
+   refuses for a living team), and only because the receipt preserves
+   the truth the line no longer tells. Two reaped-team edges: stamped for an
    absent team and flagless, the session comes up as nobody and writes
    unstamped lines until the team dir exists again; flag-bound, argv
    survives, mail flows both ways and replies work, but hook init is
