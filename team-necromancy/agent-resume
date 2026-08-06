@@ -7333,6 +7333,16 @@ def run_selftest(live=False):
     check("a corroborated redirect is offered, not taken silently", not wrong,
           ", ".join(wrong))
 
+    # --- Ctrl-C is answered with a sentence, not a stack dump
+    with contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(io.StringIO()) as said:
+        def _interrupted():
+            raise KeyboardInterrupt
+        code = interruptible(_interrupted)
+    check("an interrupt is answered, not dumped",
+          code == 130 and "still running" in said.getvalue(),
+          f"exit {code}, said {said.getvalue().strip()[:50]!r}")
+
     # --- shape, not timing, bounds which team a process could have minted
     with tempfile.TemporaryDirectory() as td:
         eng9 = Resolver()
@@ -8699,5 +8709,22 @@ def main():
     return run_agents(args, passthrough, table, [(None, args)])
 
 
+def interruptible(entry):
+    """Run `entry`, and answer Ctrl-C with a sentence instead of a traceback.
+
+    An interrupt lands wherever the run happens to be, most often the wait
+    that watches a launched agent for its first transcript write. A stack
+    dump there reads as a crash, and the run is anything but: whatever was
+    launched is still running, and saying so is the whole message.
+    """
+    try:
+        return entry()
+    except KeyboardInterrupt:
+        print()
+        warn("interrupted; anything already launched is still running "
+             "(--doctor <team> shows what)")
+        return 130
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(interruptible(main))
