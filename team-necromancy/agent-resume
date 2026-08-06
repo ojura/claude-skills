@@ -137,6 +137,9 @@ def _stamps_in(chunk):
     for line in chunk.split(b"\n"):
         if LABEL_LINE in line.replace(b'"type": "agent-name"', LABEL_LINE):
             continue
+        # A sidechain line is a subagent's record, not this conversation's evidence.
+        if b'"isSidechain":true' in line or b'"isSidechain": true' in line:
+            continue
         stamps.update(STAMP_RE.findall(line))
     return stamps
 
@@ -543,15 +546,17 @@ class Resolver:
         times faster on a transcript tree this size.
         """
         files = [str(p) for p in paths]
+        # subagents/ holds sidechain transcripts, which are never evidence
+        # candidates, so a recursive sweep does not descend into them.
         if shutil.which("rg"):
             argv = ["rg", "--no-ignore", "-F", needle]
             argv += ["-l"] if kind == "files" else ["-N", "-H"]
             if recursive:
-                argv += ["--glob", "*.jsonl"]
+                argv += ["--glob", "*.jsonl", "--glob", "!**/subagents/**"]
             return argv + files
         argv = ["grep", "-F", needle, "-l" if kind == "files" else "-H"]
         if recursive:
-            argv += ["-r", "--include=*.jsonl"]
+            argv += ["-r", "--include=*.jsonl", "--exclude-dir=subagents"]
         return argv + files
 
     def _stamped_candidates(self, name, team=None, verify=True):
@@ -632,6 +637,9 @@ class Resolver:
             try:
                 record = json.loads(text)
             except ValueError:
+                continue
+            # A sidechain line is a subagent's record, not this conversation's evidence.
+            if record.get("isSidechain"):
                 continue
             stamp = iso_ms(record.get("timestamp"))
             for payload in self._walk_spawn_payloads(record):
@@ -1874,6 +1882,9 @@ class Resolver:
                 try:
                     rec = json.loads(line)
                 except ValueError:
+                    continue
+                # A sidechain line is a subagent's record, not this conversation's evidence.
+                if rec.get("isSidechain"):
                     continue
                 ts = iso_ms(rec.get("timestamp"))
                 if ts:
@@ -6207,6 +6218,30 @@ def run_selftest(live=False):
     check("a quoted payload is not evidence",
           not admitted and len(genuine) == 1 and len(buried) == 1 and len(twin) == 2,
           ", ".join(admitted) or f"genuine={len(genuine)} buried={len(buried)} twin={len(twin)}")
+
+    # --- a sidechain line is not evidence, whatever container it sits in
+    side = {"isSidechain": True, "agentName": "ghost", "teamName": "t",
+            "timestamp": "2026-01-01T00:00:00.000Z", "toolUseResult": dict(payload)}
+    leaks = []
+    with tempfile.TemporaryDirectory() as td:
+        planted = Path(td) / "side.jsonl"
+        planted.write_text(json.dumps(side, separators=(",", ":")) + "\n" +
+                           json.dumps(side) + "\n")
+        fields, _ = RESOLVER._scan_transcript(planted)
+        if "agentName" in fields or "teamName" in fields:
+            leaks.append("the stamp scanner")
+        if _stamps_in(planted.read_bytes()):
+            leaks.append("the index window")
+        RESOLVER._ingest_spawn_lines([planted])
+        if RESOLVER._spawns.get(planted.stem):
+            leaks.append("the payload walker")
+        deep = Path(td) / "proj" / "subagents"
+        deep.mkdir(parents=True)
+        (deep / "agent-x.jsonl").write_text(json.dumps(side) + "\n")
+        hits = RESOLVER._grep_files(SPAWN_MARKER, [Path(td)], True) or []
+        if any("subagents" in p.parts for p in hits):
+            leaks.append("the recursive searcher")
+    check("a sidechain line is not evidence", not leaks, ", ".join(leaks))
 
     # Two counts of "contested" that mean different things, so both are named.
     claimed = {t: {path for _st, path in hits} for t, hits in RESOLVER.led_teams().items()}
