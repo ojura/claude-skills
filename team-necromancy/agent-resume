@@ -69,8 +69,11 @@ TOOL = Path(__file__).resolve().name
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 TEAMS_DIR = CLAUDE_DIR / "teams"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
+# Where the SessionStart hook records the id this life minted its team from.
 # The harness keeps that id in the running process and in the team directory's
 # name and nowhere else, so a later reader has only timing to join them by.
+MINT_LEDGER = CLAUDE_DIR / f"{TOOL}-mints.json"
+MINT_LEDGER_KEEP = 200
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 
 TMUX_SESSION = "claude-swarm"
@@ -530,6 +533,7 @@ class Resolver:
     def __init__(self):
         self._procs = None       # pid -> row, from ps
         self._stamps = None      # transcript stem -> (agentName, teamName)
+        self._mints = None       # what each boot's SessionStart recorded
         self._spawns = {}        # transcript stem -> {name: last payload of that name}
         self._spawn_log = {}     # transcript stem -> [(stamp, payload)] in file order
         self._by_agent = None    # "name@team" -> payload, across every transcript
@@ -1617,68 +1621,6 @@ class Resolver:
         return (path, fields.get("agentName", (None,))[0],
                 fields.get("teamName", (None,))[0])
 
-    def restamp_plan(self, path, team, name=None):
-        """The two-field window-start restamp, proved before anyone writes.
-
-        Forbidden by construction, so the line cannot creep: content bytes
-        never, any field beyond teamName/agentName never, any line beyond
-        the located window-start never. The inverse is rebuilt in memory and
-        byte-compared before the plan may be applied.
-        """
-        start = self.window_start(path)
-        if not start:
-            return {"objections": ["no stamped window-start to restamp"],
-                    "proved": False}
-        old_name, old_team, uuid = start
-        if old_team == team and (name is None or name == old_name):
-            return {"objections": [f"the window-start already testifies {team}; "
-                                   "nothing to rewrite"], "proved": False}
-        try:
-            raws = path.read_text(errors="strict").split("\n")
-        except (OSError, UnicodeDecodeError) as err:
-            return {"objections": [f"unreadable: {err}"], "proved": False}
-        trailing = raws and raws[-1] == ""
-        if trailing:
-            raws.pop()
-        for i, raw in enumerate(raws):
-            if f'"{uuid}"' not in raw:
-                continue
-            loaded, why = self._codec_load(raw)
-            if loaded is None:
-                return {"objections": [f"the window-start line {why}"],
-                        "proved": False}
-            rec, style = loaded
-            if rec.get("uuid") != uuid:
-                continue
-            new = dict(rec)
-            new["teamName"] = team
-            if name:
-                new["agentName"] = name
-            allowed = {"teamName"} | ({"agentName"} if name else set())
-            changed = {k for k in set(rec) | set(new)
-                       if rec.get(k, _MISSING) != new.get(k, _MISSING)}
-            if changed - allowed:
-                return {"objections": [f"the edit set would need "
-                                       f"{sorted(changed - allowed)[0]}"],
-                        "proved": False}
-            back = dict(new)
-            back["teamName"] = old_team
-            if name:
-                back["agentName"] = old_name
-            if self._codec_dump(back, style) != raw:
-                return {"objections": ["the inverse does not restore the line"],
-                        "proved": False}
-            out = list(raws)
-            out[i] = self._codec_dump(new, style)
-            receipt = {"kind": "restamp", "stem": path.stem, "uuid": uuid,
-                       "old": {"teamName": old_team, "agentName": old_name},
-                       "new": {"teamName": team, "agentName": name or old_name},
-                       "at": int(time.time() * 1000)}
-            return {"path": path, "lines": out, "receipt": receipt,
-                    "objections": [], "proved": True}
-        return {"objections": [f"window-start {uuid} not found as a line"],
-                "proved": False}
-
     def rebind_fragility(self, stem, team):
         """The fragile sentence for a rebound transcript, or None.
 
@@ -2588,23 +2530,34 @@ class Resolver:
                 # from an earlier one's, so the rung declines rather than guessing.
                 if payload.get("team_name") and started and stamp >= started:
                     return payload["team_name"], True
-        if entry and entry.get("session"):
-            # A boot names its implicit team after its own session id, and a
-            # resumed life's id IS the id it resumed from (measured: every
-            # resumed session this machine recorded minted session-<resumed
-            # id[:8]>, no exceptions). So the id is on disk as the transcript
-            # filename and in the registry, and the mint is a derivation
-            # rather than a timing coincidence.
-            minted = f"session-{entry['session'][:8]}"
-            # Exact as a fact either way; a team whose roster is gone is not
-            # something a consumer may act on unasked, so it answers inexact
-            # rather than handing the question to the guess below.
-            return minted, self.roster_path(minted).exists()
-        # Only for a process the registry cannot name at all. Timing pairs a
-        # process with whatever team appeared near its boot, which on a busy
-        # machine is a stranger's: this is the rung that once named
-        # session-a01fdd1e for a life that had minted session-8f1a0dc1.
+        recorded = self.recorded_mint(pid)
+        if recorded:
+            return recorded, True
         return next((team for team, owner, _ in self._boot_join() if owner == pid), None), False
+
+    def recorded_mint(self, pid):
+        """The team this process minted, as its own SessionStart wrote it down.
+
+        Exact: the id came from the process itself at the moment it booted, not
+        from a window around the time a directory appeared. The start time is
+        checked because pid numbers are recycled and a stale row would otherwise
+        name a live stranger's team.
+        """
+        for row in reversed(self._mint_ledger()):
+            if row.get("pid") == pid and row.get("sessionId"):
+                if pid_alive(pid, row.get("procStart")):
+                    return f"session-{row['sessionId'][:8]}"
+                return None
+        return None
+
+    def _mint_ledger(self):
+        if self._mints is None:
+            try:
+                rows = json.loads(MINT_LEDGER.read_text())
+                self._mints = rows if isinstance(rows, list) else []
+            except (OSError, ValueError):
+                self._mints = []
+        return self._mints
 
     def standing(self, agent_id, parent_session=None):
         """Where a member stands with its lead: parentage, liveness, team, mail.
@@ -3151,6 +3104,35 @@ def claude_ancestor(pid):
             return None, None
         pid = int(ppid)
     return None, None
+
+
+def record_mint(event):
+    """Write down the session id this boot will name its implicit team after.
+
+    The harness hands SessionStart the same id it passes to sessionTeamName and
+    stores as leadSessionId, so recording it here is the one moment that id is
+    both knowable and joinable to a process.
+    """
+    session_id = (event or {}).get("session_id")
+    if not session_id:
+        return
+    pid, started = claude_ancestor(os.getppid())
+    if not pid:
+        return
+    try:
+        ledger = json.loads(MINT_LEDGER.read_text())
+        if not isinstance(ledger, list):
+            ledger = []
+    except (OSError, ValueError):
+        ledger = []
+    ledger = [e for e in ledger if e.get("pid") != pid][-MINT_LEDGER_KEEP:]
+    ledger.append({"sessionId": session_id, "pid": pid, "procStart": started,
+                   "transcript": (event or {}).get("transcript_path"),
+                   "at": int(time.time() * 1000)})
+    try:
+        replace_json(MINT_LEDGER, ledger, indent=1)
+    except OSError as exc:
+        warn(f"could not record the mint for {session_id}: {exc}")
 
 
 def hook_event():
@@ -4710,7 +4692,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         stamped, state = (RESOLVER.restored_identity(rebinding)
                           if rebinding else (None, None))
         if state == "restored" and stamped != dest:
-            rebind_reap(stamped, dest, args, prefix, path=rebinding)
+            rebind_reap(stamped, dest, args, prefix)
     else:
         forge_team(ctx, args.dry_run)
         auto_redirect(ctx, args, table, prefix)
@@ -5622,72 +5604,25 @@ def reap_team(team, archive_mail=False):
     return RECEIPTS_DIR / f"{team}.json"
 
 
-def apply_restamp(plan):
-    """Apply a proved restamp. Receipt first, mandatorily: a restamp that
-    cannot write its confession refuses before touching the file."""
-    if plan["objections"] or not plan["proved"]:
-        raise ValueError("apply_restamp was handed an unproved plan")
-    path = plan["path"]
-    RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
-    replace_json(RECEIPTS_DIR / f"{path.stem}.restamp.json", plan["receipt"])
-    try:
-        keep_mode = path.stat().st_mode & 0o777
-    except OSError:
-        keep_mode = 0o600
-    replace_text(path, "\n".join(plan["lines"]) + "\n", mode=keep_mode)
+def rebind_reap(stamped, dest, args, prefix=""):
+    """Retire the stamped team so a rebind onto dest holds. Refuses first.
 
-
-def rebind_reap(stamped, dest, args, prefix="", path=None):
-    """Retire the stamped team so a rebind onto dest holds - or, on --force
-    against a living team, restamp the window-start instead.
-
-    --force never buys a reap: it buys the OTHER trade, two fields of
-    testimony rewritten in place with a receipt confessing the old values.
-    Mail objections keep their own remedy (--with-mail); a live holder of
-    the transcript itself is absolute either way - a whole-file replace
-    under a live appender is the lost-update disease, self-inflicted.
+    --force never buys a reap: the flag means run anyway, never destroy
+    anyway. Guards failing is a refusal, full stop.
 
     Invariant, not accident: the destination team's roster must be readable
     at boot or the session comes up identity-less. The tool meets it because
     registration precedes launch; if that order ever changes, this sentence
-    is the tripwire. A reaped life also applies no teamAllowedPaths (hook
-    init is structurally unreachable with the stamped team absent); a
-    restamped life keeps its hooks, since the destination roster loads.
+    is the tripwire. The reaped life also applies no teamAllowedPaths (hook
+    init is structurally unreachable with the stamped team absent).
     """
-    table = RESOLVER.ps_table()
-    objections = RESOLVER.reap_objections(stamped, table,
+    objections = RESOLVER.reap_objections(stamped, RESOLVER.ps_table(),
                                           archive_mail=args.with_mail)
-    alive = [o for o in objections
-             if "wears" in o or "operates" in o or "holds" in o]
-    mail = [o for o in objections if o not in alive]
-    if mail:
+    if objections:
         die(f"a rebind onto {dest} needs {stamped} retired, and it refuses: "
-            + "; ".join(mail[:4])
-            + ("" if args.with_mail
+            + "; ".join(objections[:4])
+            + ("" if args.with_mail or not any("unread" in o for o in objections)
                else ". --with-mail archives the mail into the receipt"))
-    if alive and not args.force:
-        die(f"a rebind onto {dest} needs {stamped} retired, and it refuses: "
-            + "; ".join(alive[:4])
-            + ". --force restamps the window-start instead "
-              "(two fields, receipted, reversible)")
-    if alive:
-        strangers, ours = RESOLVER.transcript_holders(path.stem, table) if path else ([], [])
-        if strangers or ours:
-            pid = strangers[0][0] if strangers else ours[0]
-            die(f"pid {pid} holds this transcript; a restamp under a live "
-                "writer loses whatever it writes next. Stop it first, then "
-                "retry with --force")
-        plan = RESOLVER.restamp_plan(path, dest)
-        if plan["objections"] or not plan["proved"]:
-            die("; ".join(plan["objections"]) or "the restamp could not be proved")
-        print(f"{prefix}{'would restamp' if args.dry_run else 'restamped'} "
-              f"the window-start: {stamped} -> {dest}  "
-              f"(receipt: {RECEIPTS_DIR / (path.stem + '.restamp.json')})")
-        if not args.dry_run:
-            apply_restamp(plan)
-        print(f"{prefix}rebound  the window-start now testifies {dest}; no "
-              "fragility, hooks intact at next boot")
-        return
     receipt = RECEIPTS_DIR / f"{stamped}.json"
     print(f"{prefix}{'would reap' if args.dry_run else 'reaped'}   {stamped}  "
           f"(roster archived: {receipt})")
@@ -5935,12 +5870,13 @@ def rosters_leads(rosters):
 
 
 def run_cleanup(dry=False):
-    """Everything the SessionStart hook does: reap what nothing can use.
+    """Everything the SessionStart hook does: record this boot, then reap.
 
-    It once also recorded the id each boot minted its team from, until that
-    id proved to be the session's own - on disk as the transcript filename
-    and in the registry - so the ledger recorded what was already written.
+    Recording comes first because it is the half that cannot be redone later:
+    the id a life mints is knowable only from inside that life.
     """
+    if not dry:
+        record_mint(hook_event())
     cleanup_sockets(dry)
     cleanup_teams(dry)
     return 0
@@ -7384,6 +7320,31 @@ def run_selftest(live=False):
     wrong = sorted(k for k, good in asks.items() if not good)
     check("a redirect timing suggests is asked, not taken", not wrong, ", ".join(wrong))
 
+    # --- the hook writes down what only that boot knows (live: it walks /proc)
+    real_ledger = globals()["MINT_LEDGER"]
+    scratch = Path(tempfile.mkdtemp()) / "mints.json"
+    try:
+        globals()["MINT_LEDGER"] = scratch
+        record_mint({"session_id": "feedface-0000-0000-0000-000000000000",
+                     "transcript_path": "/tmp/probe.jsonl"})
+        rows = json.loads(scratch.read_text()) if scratch.exists() else []
+        wrote = {
+            "one row per boot": len(rows) == 1,
+            "the id it will name its team after": rows and rows[0]["sessionId"].startswith("feedface"),
+            "a live claude, not the hook's own shell": bool(rows) and pid_alive(rows[0]["pid"])
+                and RESOLVER.is_claude(
+                    Path(f"/proc/{rows[0]['pid']}/cmdline").read_bytes().decode().replace("\0", " ")),
+            "with a start time to outlive pid reuse": bool(rows) and bool(rows[0].get("procStart")),
+        }
+        record_mint({"session_id": "feedface-0000-0000-0000-000000000000"})
+        wrote["a second boot of one pid replaces its row"] = (
+            len(json.loads(scratch.read_text())) == 1)
+    finally:
+        globals()["MINT_LEDGER"] = real_ledger
+        shutil.rmtree(scratch.parent, ignore_errors=True)
+    wrong = sorted(k for k, good in wrote.items() if not good)
+    check("the hook records what only that boot knows", not wrong, ", ".join(wrong))
+
     # --- a team is larger than its roster, and a run that takes the roster says so
     pop_wrong, with_former = [], None
     for team in list(RESOLVER.known_teams())[:40]:
@@ -7825,87 +7786,6 @@ def run_selftest(live=False):
     check("the reports carry what the mailbox file cannot show", not quiet,
           ", ".join(quiet))
 
-    # --- --force restamps the window-start instead of reaping a living team
-    with tempfile.TemporaryDirectory() as td:
-        proj = Path(td) / "proj"
-        proj.mkdir()
-        compact = lambda d: json.dumps(d, separators=(",", ":"))
-        rows = [
-            {"parentUuid": None, "agentName": "mate", "teamName": "OLD",
-             "type": "user", "uuid": "rs-root",
-             "timestamp": "2026-01-01T00:00:01Z",
-             "message": {"role": "user", "content": "hi"}},
-            {"parentUuid": "rs-root", "agentName": "mate", "teamName": "OLD",
-             "type": "assistant", "uuid": "rs-tail",
-             "timestamp": "2026-01-01T00:00:02Z"},
-        ]
-        rows.append({"type": "last-prompt", "leafUuid": "rs-tail",
-                     "sessionId": "RS"})
-        target = proj / "RS.jsonl"
-        target.write_text("".join(compact(r) + "\n" for r in rows))
-        target.chmod(0o600)
-        eng7 = Resolver()
-        eng7.projects_dir = Path(td)
-        real_receipts = RECEIPTS_DIR
-        globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
-        stray = []
-        try:
-            # locate + two-field closure, name-optional
-            plan = eng7.restamp_plan(target, "NEW")
-            if plan["objections"] or not plan["proved"]:
-                stray.append(f"no-rename plan: {plan['objections'] or 'unproved'}")
-            else:
-                loaded = json.loads(plan["lines"][0])
-                if loaded.get("teamName") != "NEW":
-                    stray.append("a no-rename restamp did not set teamName")
-                if loaded.get("agentName") != "mate":
-                    stray.append("a no-rename restamp touched agentName")
-                if plan["lines"][1] != compact(rows[1]):
-                    stray.append("the tail line changed under a window-start edit")
-            # renaming touches both fields
-            rplan = eng7.restamp_plan(target, "NEW", name="newmate")
-            if not rplan.get("proved"):
-                stray.append(f"rename plan: {rplan['objections']}")
-            else:
-                r0 = json.loads(rplan["lines"][0])
-                if r0.get("teamName") != "NEW" or r0.get("agentName") != "newmate":
-                    stray.append("a rename restamp did not touch both fields")
-            # already-agreeing is a no-op refusal
-            noop = eng7.restamp_plan(target, "OLD")
-            if noop["proved"] or not noop["objections"]:
-                stray.append("an already-agreeing restamp did not refuse")
-            # receipt is mandatory: apply, then verify, then verify the cycle
-            apply_restamp(plan)
-            stored = json.loads(
-                (Path(td) / "receipts" / f"{target.stem}.restamp.json").read_text())
-            if stored.get("old", {}).get("teamName") != "OLD":
-                stray.append("the receipt did not confess the old value")
-            if target.stat().st_mode & 0o777 != 0o600:
-                stray.append("the restamp did not preserve file mode")
-            back = eng7.restamp_plan(target, "OLD")
-            if not back["proved"]:
-                stray.append("the restamped file does not restamp back")
-            else:
-                apply_restamp(back)
-                if target.read_text() != "".join(compact(r) + "\n" for r in rows):
-                    stray.append("the round trip did not restore the original bytes")
-        finally:
-            globals()["RECEIPTS_DIR"] = real_receipts
-        # The live-holder guard: the composed question sees a lineage pid,
-        # and the writer is unreachable without it being asked first.
-        me = os.getpid()
-        alive_table = [(me, 0, f"claude --resume {target.stem} --agent-id mate@OLD")]
-        if not RESOLVER.transcript_holders(target.stem, alive_table)[1]:
-            stray.append("the holder question misses a live restamp target")
-        reap_src = ast.get_source_segment(source, funcs["rebind_reap"]) or ""
-        holder_at = reap_src.find("transcript_holders(")
-        if not (0 <= holder_at < reap_src.find("restamp_plan(", holder_at)):
-            stray.append("the restamp does not check holders first")
-        if "args.force" not in reap_src.split("restamp_plan(")[0]:
-            stray.append("the restamp is reachable without --force")
-        check("--force restamps a living team's window-start, receipted, "
-              "reversible, mode-preserved", not stray, ", ".join(stray))
-
     # --- a rebind retires the stamped team only when nothing would notice
     with tempfile.TemporaryDirectory() as td:
         eng6 = Resolver()
@@ -7918,16 +7798,10 @@ def run_selftest(live=False):
         compact = lambda d: json.dumps(d, separators=(",", ":"))
         proj = Path(td) / "proj"
         proj.mkdir()
-        tail_line = compact(
-            {"parentUuid": "ra-root", "agentName": "mate", "teamName": "TEAMA",
-             "type": "assistant", "uuid": "ra-tail",
-             "timestamp": "2026-01-01T00:00:02Z"})
         (proj / "MATE-A.jsonl").write_text(compact(
             {"parentUuid": None, "agentName": "mate", "teamName": "TEAMA",
              "type": "user", "uuid": "ra-root",
-             "timestamp": "2026-01-01T00:00:01Z"}) + "\n" + tail_line + "\n" +
-            compact({"type": "last-prompt", "leafUuid": "ra-tail",
-                     "sessionId": "MATE-A"}) + "\n")
+             "timestamp": "2026-01-01T00:00:01Z"}) + "\n")
         me = os.getpid()
         alive_table = [(me, 0, "claude --resume MATE-A --agent-id mate@TEAMA")]
         gates = []
@@ -7963,7 +7837,6 @@ def run_selftest(live=False):
             gates.append("the reap does not precede the act boundary")
         check("a rebind retires the stamped team only when nothing would notice",
               not gates, ", ".join(gates))
-
 
     # --- the unread-mail refusal refuses instead of crashing (its first
     # spelling raised NameError at exactly the moment it was needed)
@@ -8019,7 +7892,7 @@ def run_selftest(live=False):
     # Arbitrary-text whole-file writing stays with the writers of
     # transcript-shaped files; everything JSON-shaped uses the json spelling.
     texters = sorted(callers_of("replace_text")
-                     - {"materialize", "embed", "apply_restamp", "run_selftest"})
+                     - {"materialize", "embed", "run_selftest"})
     check("raw whole-file writes stay with the conversion writers", not texters,
           ", ".join(texters))
 
@@ -8164,13 +8037,9 @@ def run_selftest(live=False):
     spec = RESOLVER.transcript_path("8f1a0dc1-cff0-47b0-83da-2b778e67d6a9")
     if spec:
         got = RESOLVER.window_start(spec)
-        # A chain break (a parentUuid naming no record in the file) is the
-        # documented caveat: the strict walk cannot answer and the harness
-        # falls back on timestamps, which this tool does not implement. The
-        # specimen stops being a specimen then, and says so.
         check("the cautionary specimen restores as its boundary says",
-              got is None or got[1] == "session-b16311b4",
-              f"{got[0]}/{got[1]}" if got else "chain broken; strict walk declines")
+              bool(got) and got[1] == "session-b16311b4",
+              got and f"{got[0]}/{got[1]}")
     else:
         check("the cautionary specimen restores as its boundary says (absent here)",
               True, "skipped")
@@ -8366,32 +8235,28 @@ def run_selftest(live=False):
     check("one agent cannot be launched twice in a run", "appears twice" in said,
           f"exited saying {said.strip()[:60]!r}" if said else "the duplicate was accepted")
 
-    # --- a life's own session id names the team it minted, and it is on disk
-    with tempfile.TemporaryDirectory() as td:
-        eng8 = Resolver()
-        eng8.teams_dir = Path(td) / "teams"
-        (eng8.teams_dir / "session-feedface").mkdir(parents=True)
-        eng8.roster_path("session-feedface").write_text('{"members": []}')
-        me = os.getpid()
-        eng8.live_sessions = lambda: [{"pid": me, "alive": True, "team": None,
-                                       "session": "feedface-1111-2222-3333-444455556666",
-                                       "started": 0, "agent": None}]
-        eng8._boot_join = lambda: [("session-astranger", me, 0)]
-        mints = {"the mint is derived from the session's own id":
-                 eng8.team_minted_by(me) == ("session-feedface", True)}
-        # Derivation outranks the timing join, which on a busy machine pairs a
-        # process with whatever team happened to appear beside it.
-        eng8.teams_dir = Path(td) / "empty"
-        # A reaped team still answers - inexactly, so nothing acts on it -
-        # rather than letting the timing join name a stranger's team.
-        mints["a reaped mint answers inexactly, not by timing"] = (
-            eng8.team_minted_by(me) == ("session-feedface", False))
-        eng8.live_sessions = lambda: [{"pid": me, "alive": True, "team": None,
-                                       "session": None, "started": 0, "agent": None}]
-        mints["only a nameless process falls to timing"] = (
-            eng8.team_minted_by(me) == ("session-astranger", False))
-        wrong = sorted(k for k, good in mints.items() if not good)
-        check("a life's own id names the team it minted", not wrong, ", ".join(wrong))
+    # --- what a boot recorded about itself outranks a guess about it
+    real_mints = RESOLVER._mints
+    try:
+        me, mine = os.getpid(), proc_stat(os.getpid())[1]
+        RESOLVER._mints = [{"sessionId": "a01fdd1e-1e5a-460b-be96-0546ee3fa8a8",
+                            "pid": me, "procStart": mine}]
+        reads = {"the team is named from the recorded id":
+                 RESOLVER.recorded_mint(me) == "session-a01fdd1e",
+                 "a pid with no record has none": RESOLVER.recorded_mint(-1) is None,
+                 # The rung has to be reachable, not merely present: this pid
+                 # states no team in its argv, so the record is what answers.
+                 "the rung answers where argv cannot":
+                     RESOLVER.team_minted_by(me) == ("session-a01fdd1e", True)}
+        RESOLVER._mints = [{"sessionId": "a01fdd1e-1e5a", "pid": me, "procStart": "0"}]
+        # A pid number outlives the process that held it, so a row whose start
+        # time has moved on describes somebody else's team.
+        reads["a recycled pid is not that boot"] = RESOLVER.recorded_mint(me) is None
+    finally:
+        RESOLVER._mints = real_mints
+    wrong = sorted(k for k, good in reads.items() if not good)
+    check("a boot's own record of its team is read back", not wrong, ", ".join(wrong))
+
 
     # --- the composed answer agrees with the parts it is composed of
     seen = [(e["team"], e["member"].get("name")) for e in RESOLVER.scan_teams()

@@ -136,40 +136,49 @@ dir is created a few hundred ms before the session file (measured 281, 252 and
 team name does match a registry sessionId and an exact join is available.
 When something team-related does not add up, check both ids before reasoning.
 
-## The id a life mints, and the guess that outlived it
+## Wanted from the harness: a record of the id a life minted
 
-A boot names its implicit team `session-<its session id[:8]>`. That id is not
-hidden: for a fresh boot it becomes the transcript's filename, and for a
-resumed one it is the id resumed from, which is the filename already. Measured
-against a ledger this tool kept for a day, every resumed session on this
-machine minted a team named after the id it resumed from, with no exceptions
-and no counterexample anywhere in the record.
+One structural record would close the gap above: the internal session id a
+boot minted, written where a later reader can find it. Either shape works, a
+line in the boot's own transcript (which already carries identity stamps) or
+the internal id alongside the resumed-transcript id in
+`~/.claude/sessions/<pid>.json`. Nothing else records it, so today it exists
+only in the running process and in the name of the team directory.
 
-So "which team did this process mint" is a derivation, not a mystery. The
-engine reads the session id the registry already holds, names the team from
-it, and confirms the roster exists. It is exact, it needs nothing installed,
-and it covers every session including the ones already running.
+Without it, "which team is this live process running as" has two exact rungs
+and a guess. The exact ones are `--team-name` in argv, which only a
+flag-bound agent has, and a spawn payload written by this life, which needs
+the lead to have spawned someone since it resumed and needs a process start
+time to tell this life's payloads from an earlier life's. Everything else
+falls to pairing the team's `createdAt` against a live process's `startedAt`.
 
-What that replaces is worth stating, because it cost a night. The rung
-underneath was a timing join: pair a team's `createdAt` against a live
-process's `startedAt` and call the survivor its team. The join is weak in a
-way a tolerance hides, since the mint is not one event (eager at boot it lands
-a few hundred ms before the session file, measured 281, 252 and 402ms, while a
-team minted at the first spawn arrives minutes later and no window centred on
-boot covers it at all). But its real failure is coarser: on a machine booting
-several sessions a second, it pairs a process with a stranger's team. That is
-what happened when a lead that had duly minted `session-8f1a0dc1` was reported
-as running `session-a01fdd1e`, a team some other process had just created. The
-report was printed, believed, and used to aim a rebind that orphaned a
-teammate.
+That pairing is weaker than a tolerance suggests, because the mint is not one
+event. Minted eagerly at boot it lands a few hundred ms before the session
+file (measured 281, 252 and 402ms), but a team can instead be minted at the
+first spawn, minutes later, which no window centred on boot covers at all. So
+the join does not merely lose precision on the second shape, it does not
+apply, and a pairing that survives the window still has to be shown unique in
+both directions before it means anything: several processes can start inside
+one team's window, and one process can start inside several teams' windows.
 
-For a while the answer was a ledger: the janitor hook wrote each boot's id,
-its process and its start time to a file, and the engine read that ahead of
-the join. It worked, and it was unnecessary, because the id it recorded was
-the id already on disk. It is deleted. The derivation stands where it stood,
-the timing join remains as the last resort for a session whose team directory
-is gone, and the rule the whole episode teaches is the one already in this
-file: check who wrote the evidence, including when the evidence is your own.
+Downstream this is why `agent-resume` will not rebind a member onto a team it
+inferred from timing without asking.
+
+Until the harness keeps it, the tool keeps it for itself. `SessionStart` is
+handed the same id, verified in 2.1.220: the hook payload is built as
+`{session_id: kt(), ...}` and `initializeSessionTeam` names the team
+`session-${kt().slice(0,8)}` and stores `leadSessionId: kt()`. So the janitor
+hook now writes each boot's id, the claude process it belongs to and that
+process's start time into `<claude dir>/agent-resume-mints.json`, and
+`team_minted_by` reads it as exact evidence ahead of the timing join. The
+start time is checked on read, because a pid number outlives the process that
+held it.
+
+That closes it only for boots the hook saw. A session already running when
+the hook was installed, or one on a machine without it, still has nothing on
+disk but its team directory's name, so the timing join and everything built
+on it stay. A harness-side record would need no install, would cover every
+session including the ones already up, and would let all of it be deleted.
 
 ## Adopt, in one paragraph
 
