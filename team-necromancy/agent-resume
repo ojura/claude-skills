@@ -1324,6 +1324,120 @@ class Resolver:
                 out[receipt["name"]] = receipt
         return out
 
+    def mail_ledger(self, team):
+        """[{sender, to, summary, sent, state, detail}] for a team's authored mail.
+
+        Conversational mail is double-recorded: every send sits verbatim in
+        the sender's transcript as a SendMessage tool use, and every delivery
+        lands in the recipient's as a teammate-message wrapper carrying the
+        body unchanged. The join is pure evidence-reading, and an unmatched
+        send has three honest states rather than one: still in the inbox
+        file (queued), the recipient has not written since (pending a turn
+        boundary), or the recipient has written and no delivery matches
+        (unexplained - the drain-then-die window's visible shape).
+
+        Harness-emitted traffic (idle notifications) has no send side, so it
+        never appears here; protocol-object sends are counted, not joined.
+        """
+        people = {}
+        for path, (name, stamped) in self.stamp_index().items():
+            if stamped == team and name and name not in people:
+                people[name] = path
+        lead_session = self.team_lead_session(team)
+        if lead_session and "team-lead" not in people:
+            lead_path = self.transcript_path(lead_session)
+            if lead_path:
+                people["team-lead"] = lead_path
+
+        sends, boxes, wrappers, last_write = [], {}, {}, {}
+        wrapper_re = re.compile(
+            r'<teammate-message teammate_id="([^"]+)"[^>]*>\n(.*?)\n</teammate-message>',
+            re.DOTALL)
+        for name, path in people.items():
+            got_wrappers, newest = [], 0
+            try:
+                handle = path.open(errors="replace")
+            except OSError:
+                continue
+            with handle:
+                for line in handle:
+                    if '"SendMessage"' not in line and "<teammate-message" not in line \
+                            and '"timestamp"' not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("isSidechain"):
+                        continue
+                    ts = iso_ms(rec.get("timestamp"))
+                    if ts:
+                        newest = max(newest, ts)
+                    content = (rec.get("message") or {}).get("content")
+                    if rec.get("type") == "assistant" and isinstance(content, list):
+                        for block in content:
+                            if (isinstance(block, dict) and block.get("type") == "tool_use"
+                                    and block.get("name") == "SendMessage"):
+                                spec = block.get("input") or {}
+                                body = spec.get("message")
+                                sends.append({
+                                    "sender": name,
+                                    "to": spec.get("to") or spec.get("recipient"),
+                                    "summary": spec.get("summary") or "",
+                                    "sent": ts,
+                                    "body": body if isinstance(body, str) else None})
+                    elif rec.get("type") == "user":
+                        text = content if isinstance(content, str) else "".join(
+                            part.get("text", "") for part in content or []
+                            if isinstance(part, dict))
+                        if "<teammate-message" in text:
+                            for who, body in wrapper_re.findall(text):
+                                got_wrappers.append((who, body))
+            wrappers[name] = got_wrappers
+            last_write[name] = newest
+            try:
+                inbox = json.loads(
+                    (self.teams_dir / team / "inboxes" / f"{name}.json").read_text())
+                boxes[name] = [m.get("text") or str(m.get("message", ""))
+                               for m in inbox if isinstance(m, dict)]
+            except (OSError, ValueError):
+                boxes[name] = []
+
+        ledger = []
+        for send in sorted(sends, key=lambda s: s["sent"] or 0):
+            entry = {k: send[k] for k in ("sender", "to", "summary", "sent")}
+            to = send["to"]
+            if send["body"] is None:
+                entry.update(state="protocol", detail="an object send; not joined")
+            elif to not in people:
+                entry.update(state="unknown recipient",
+                             detail=f"{to!r} has no transcript stamped with this team")
+            elif any(who == send["sender"] and body == send["body"]
+                     for who, body in wrappers.get(to, [])):
+                entry.update(state="delivered", detail="the body sits in the "
+                             "recipient's transcript verbatim")
+            elif any(send["body"] == text for text in boxes.get(to, [])):
+                entry.update(state="queued", detail="still in the inbox file; "
+                             "delivery is a turn-boundary event")
+            elif (last_write.get(to) or 0) <= (send["sent"] or 0):
+                entry.update(state="pending", detail="the recipient has not "
+                             "written since the send")
+            elif (self.procs_on_transcript(people[to].stem, self.ps_table())
+                  or self.self_holds_transcript(people[to].stem, self.ps_table())):
+                # Marked read on queueing, held in the recipient's RAM: the
+                # drain-then-die window is open until its turn ends. Both
+                # holder questions, because the recipient may be the very
+                # process asking - the self-lineage blindness's second victim.
+                entry.update(state="in memory", detail="the recipient is live "
+                             "mid-turn; delivery waits on its next boundary "
+                             "and dies with its process")
+            else:
+                entry.update(state="unexplained", detail="the recipient has "
+                             "written since, no delivery matches, and no live "
+                             "process holds its transcript")
+            ledger.append(entry)
+        return ledger
+
     def nameless_receipts(self):
         """Roots of materialized receipts with no recorded identity.
 
@@ -2276,7 +2390,7 @@ class Resolver:
         if self._stamps is not None:
             return self._stamps
         index = {}
-        for path in PROJECTS_DIR.glob("*/*.jsonl"):
+        for path in self.projects_dir.glob("*/*.jsonl"):
             try:
                 size = path.stat().st_size
                 with path.open("rb") as handle:
@@ -5413,6 +5527,25 @@ def run_demote(args):
     return 0
 
 
+def run_mail_ledger(selector=None):
+    """A team's mail, send side joined against delivery side. Read-only."""
+    if not selector:
+        die("--mail-ledger needs a team; the join is per-team evidence")
+    team = selector if selector.startswith("session-") else f"session-{selector[:8]}"
+    ledger = RESOLVER.mail_ledger(team)
+    if not ledger:
+        die(f"no authored mail found for {team} (no stamped transcripts, or "
+            "nobody used SendMessage)")
+    for entry in ledger:
+        print(f"{ms_str(entry['sent'])}  {entry['sender']:>14} -> {entry['to'] or '?':<14} "
+              f"{entry['state']:<12} {(entry['summary'] or '')[:44]}")
+        if entry["state"] not in ("delivered", "protocol"):
+            print(f"{'':22}{entry['detail']}")
+    tallies = collections.Counter(e["state"] for e in ledger)
+    print("\n" + ", ".join(f"{n} {state}" for state, n in tallies.most_common()))
+    return 1 if tallies.get("unexplained") else 0
+
+
 def run_sides(selector=None):
     """List side transcripts, newest first. Read-only; the engine classifies.
 
@@ -7353,6 +7486,47 @@ def run_selftest(live=False):
     check("a demote cannot embed the conversation it runs inside", not blind,
           ", ".join(blind))
 
+    # --- the mail ledger joins sends against deliveries, four honest states
+    with tempfile.TemporaryDirectory() as td:
+        proj = Path(td) / "proj"
+        proj.mkdir(parents=True)
+        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def send_rec(body, ts):
+            return compact({"type": "assistant", "agentName": "alice",
+                            "teamName": "TML", "timestamp": ts, "uuid": f"s-{body}",
+                            "parentUuid": None, "message": {"content": [
+                                {"type": "tool_use", "name": "SendMessage",
+                                 "input": {"to": "bob", "summary": body,
+                                           "message": body}}]}})
+        (proj / "ALICE.jsonl").write_text("\n".join([
+            send_rec("one", "2026-01-01T00:00:01Z"),
+            send_rec("two", "2026-01-01T00:00:02Z"),
+            send_rec("three", "2026-01-01T00:00:03Z"),
+            send_rec("four", "2026-01-01T00:00:09Z"),
+        ]) + "\n")
+        (proj / "BOB.jsonl").write_text("\n".join([
+            compact({"type": "user", "agentName": "bob", "teamName": "TML",
+                     "timestamp": "2026-01-01T00:00:04Z", "uuid": "b-1",
+                     "parentUuid": None, "message": {"content":
+                     '<teammate-message teammate_id="alice">\none\n</teammate-message>'}}),
+            compact({"type": "assistant", "agentName": "bob", "teamName": "TML",
+                     "timestamp": "2026-01-01T00:00:05Z", "uuid": "b-2",
+                     "parentUuid": "b-1", "message": {"content": []}}),
+        ]) + "\n")
+        boxdir = Path(td) / "teams" / "TML" / "inboxes"
+        boxdir.mkdir(parents=True)
+        (boxdir / "bob.json").write_text(json.dumps([{"text": "two"}]))
+        eng5 = Resolver()
+        eng5.projects_dir, eng5.teams_dir = Path(td), Path(td) / "teams"
+        states = {e["summary"]: e["state"] for e in eng5.mail_ledger("TML")}
+        want = {"one": "delivered", "two": "queued",
+                "three": "unexplained", "four": "pending"}
+        off = [f"{k}: {states.get(k)} (wanted {v})" for k, v in want.items()
+               if states.get(k) != v]
+        check("the mail ledger joins sends against deliveries", not off,
+              ", ".join(off) or ", ".join(f"{k}={v}" for k, v in want.items()))
+
     # --- the unread-mail refusal refuses instead of crashing (its first
     # spelling raised NameError at exactly the moment it was needed)
     with tempfile.TemporaryDirectory() as td:
@@ -8031,6 +8205,9 @@ def main():
                         help="promote an unclassifiable side transcript as the "
                              "chain from this record; everything else rides the "
                              "receipt")
+    parser.add_argument("--mail-ledger", action="store_true",
+                        help="join a team's sends against its deliveries: "
+                             "delivered, queued, pending, or unexplained")
     parser.add_argument("--cleanup", "--cleanup-sockets", dest="cleanup", action="store_true",
                         help="reap dead swarm sockets and team dirs with nothing resurrectable")
     parser.add_argument("--complete", metavar="TOPIC", help=argparse.SUPPRESS)
@@ -8094,6 +8271,10 @@ def main():
         return run_promote(args)
     if args.demote:
         return run_demote(args)
+
+    if args.mail_ledger:
+        # Before the help gate, resolving its own target: the --sides pattern.
+        return run_mail_ledger(selector)
 
     if args.cleanup:
         return run_cleanup(args.dry_run)
