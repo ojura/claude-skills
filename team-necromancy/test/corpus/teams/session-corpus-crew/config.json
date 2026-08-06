@@ -1,0 +1,24 @@
+{
+  "name": "session-corpus-crew",
+  "leadAgentId": "team-lead@session-corpus-crew",
+  "leadSessionId": "",
+  "members": [
+    {
+      "agentId": "team-lead@session-corpus-crew",
+      "name": "team-lead"
+    },
+    {
+      "agentId": "petrel@session-corpus-crew",
+      "name": "petrel"
+    },
+    {
+      "agentId": "sparrow@session-corpus-crew",
+      "name": "sparrow"
+    },
+    {
+      "agentId": "swift@session-corpus-crew",
+      "name": "swift"
+    }
+  ],
+  "createdAt": 1
+}

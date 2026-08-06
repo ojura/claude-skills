@@ -1,0 +1,12 @@
+{
+  "name": "session-corpus-multiteam-a",
+  "leadAgentId": "team-lead@session-corpus-multiteam-a",
+  "leadSessionId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "members": [
+    {
+      "agentId": "team-lead@session-corpus-multiteam-a",
+      "name": "team-lead"
+    }
+  ],
+  "createdAt": 1
+}

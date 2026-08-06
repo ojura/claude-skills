@@ -1,0 +1,4 @@
+{"type":"user","uuid":"rt-root","parentUuid":null,"timestamp":"2026-02-01T00:00:00Z","sessionId":"55555555-5555-4555-8555-555555555555","agentName":"drifter","teamName":"session-corpus-old","message":{"role":"user","content":"hello"}}
+{"type":"assistant","uuid":"rt-2","parentUuid":"rt-root","timestamp":"2026-02-01T00:00:05Z","sessionId":"55555555-5555-4555-8555-555555555555","agentName":"drifter","teamName":"session-corpus-old"}
+{"type":"user","uuid":"rt-3","parentUuid":"rt-2","timestamp":"2026-02-05T00:00:00Z","sessionId":"55555555-5555-4555-8555-555555555555","message":{"role":"user","content":"spawn into new"}}
+{"type":"assistant","uuid":"rt-4","parentUuid":"rt-3","timestamp":"2026-02-05T00:00:05Z","sessionId":"55555555-5555-4555-8555-555555555555","toolUseResult":{"status":"teammate_spawned","name":"flint","team_name":"session-corpus-new","agent_id":"flint@session-corpus-new"}}

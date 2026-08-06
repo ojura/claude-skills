@@ -1,0 +1,2 @@
+{"type":"user","uuid":"ol-root","parentUuid":null,"timestamp":"2026-01-01T00:00:00Z","sessionId":"44444444-4444-4444-8444-444444444444","agentName":"captain","message":{"role":"user","content":"spawn someone"}}
+{"type":"assistant","uuid":"ol-2","parentUuid":"ol-root","timestamp":"2026-01-01T00:00:05Z","sessionId":"44444444-4444-4444-8444-444444444444","agentName":"captain","toolUseResult":{"status":"teammate_spawned","name":"skiff","team_name":"session-corpus-orphan","agent_id":"skiff@session-corpus-orphan"}}

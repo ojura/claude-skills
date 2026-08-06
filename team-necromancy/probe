@@ -105,6 +105,10 @@ def main(argv):
         # copy must be what runs; nothing here touches the real file.
         copy.write_text(source.replace(old, new, 1))
         shutil.copy2(TOOL.parent / "_agent-resume", Path(scratch) / "_agent-resume")
+        # The portable behavioural checks read test/corpus/ next to the tool
+        # itself; without it they find no data and some paths that assume a
+        # transcript resolves would die instead of failing cleanly.
+        shutil.copytree(TOOL.parent / "test", Path(scratch) / "test")
 
         before, before_said = verdicts(TOOL, live)
         after, after_said = verdicts(copy, live)

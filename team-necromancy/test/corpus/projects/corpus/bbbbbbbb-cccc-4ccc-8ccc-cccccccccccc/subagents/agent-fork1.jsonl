@@ -1,0 +1,3 @@
+{"type":"fork-context-ref","agentId":"scout","parentSessionId":"bbbbbbbb-cccc-4ccc-8ccc-cccccccccccc","parentLastUuid":"pf-leaf","contextLength":4}
+{"parentUuid":null,"isSidechain":true,"sessionId":"bbbbbbbb-cccc-4ccc-8ccc-cccccccccccc","agentId":"scout","type":"user","uuid":"pf-root","message":{"role":"user","content":"fork off"}}
+{"parentUuid":"pf-root","isSidechain":true,"sessionId":"bbbbbbbb-cccc-4ccc-8ccc-cccccccccccc","agentId":"scout","type":"assistant","uuid":"pf-2"}

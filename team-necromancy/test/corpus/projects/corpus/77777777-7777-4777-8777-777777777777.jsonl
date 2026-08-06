@@ -1,0 +1,2 @@
+{"type":"user","uuid":"7777-root","parentUuid":null,"timestamp":"2026-03-01T00:00:00Z","sessionId":"77777777-7777-4777-8777-777777777777","message":{"role":"user","content":"spawn someone"}}
+{"type":"assistant","uuid":"7777-2","parentUuid":"7777-root","timestamp":"2026-03-01T00:00:05Z","sessionId":"77777777-7777-4777-8777-777777777777","toolUseResult":{"status":"teammate_spawned","name":"ash","team_name":"session-corpus-contested","agent_id":"ash@session-corpus-contested"}}

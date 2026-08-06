@@ -1,0 +1,2 @@
+{"type":"user","uuid":"cl-root","parentUuid":null,"timestamp":"2026-01-01T00:00:00Z","sessionId":"33333333-3333-4333-8333-333333333333","agentName":"rogue","message":{"role":"user","content":"spawn someone"}}
+{"type":"assistant","uuid":"cl-2","parentUuid":"cl-root","timestamp":"2026-01-01T00:00:05Z","sessionId":"33333333-3333-4333-8333-333333333333","agentName":"rogue","toolUseResult":{"status":"teammate_spawned","name":"mist","team_name":"session-corpus-contradicted","agent_id":"mist@session-corpus-contradicted"}}

@@ -1,0 +1,20 @@
+{
+  "name": "session-corpus-alpha",
+  "leadAgentId": "team-lead@session-corpus-alpha",
+  "leadSessionId": "11111111-1111-4111-8111-111111111111",
+  "members": [
+    {
+      "agentId": "team-lead@session-corpus-alpha",
+      "name": "team-lead"
+    },
+    {
+      "agentId": "willow@session-corpus-alpha",
+      "name": "willow"
+    },
+    {
+      "agentId": "echo@session-corpus-alpha",
+      "name": "echo"
+    }
+  ],
+  "createdAt": 1
+}

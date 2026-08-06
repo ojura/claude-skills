@@ -811,9 +811,9 @@ class Resolver:
             # The index can both miss (stamps only mid-history) and mislead (a stamp
             # quoted inside message content). Either way the answer is not yet "no",
             # so re-ask over whole files before saying so.
-            deep = self._grep_files(f'"agentName":"{name}"', [PROJECTS_DIR], True)
+            deep = self._grep_files(f'"agentName":"{name}"', [self.projects_dir], True)
             if deep is None:  # grep unavailable
-                deep = sorted(PROJECTS_DIR.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+                deep = sorted(self.projects_dir.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
             elif team and deep:
                 deep = self._grep_files(f'"teamName":"{team}"', deep, False) or []
             seen = set(files)
@@ -1013,7 +1013,7 @@ class Resolver:
         if self._by_team is not None:
             return self._by_team
         self._by_team = {}
-        leads = self._grep_files(SPAWN_MARKER, [PROJECTS_DIR], True) or []
+        leads = self._grep_files(SPAWN_MARKER, [self.projects_dir], True) or []
         self._ingest_spawn_lines(leads)
         for path in leads:
             newest = {}
@@ -1332,13 +1332,13 @@ class Resolver:
 
     def transcripts_by_mtime(self):
         """Every transcript, newest first."""
-        return sorted(PROJECTS_DIR.glob("*/*.jsonl"),
+        return sorted(self.projects_dir.glob("*/*.jsonl"),
                       key=lambda path: path.stat().st_mtime, reverse=True)
 
     def transcripts_starting(self, block):
         """Transcripts whose uuid opens with this block. A path question, so it
         belongs to whoever owns the tree rather than to a caller globbing it."""
-        return list(PROJECTS_DIR.glob(f"*/{block}-*.jsonl"))
+        return list(self.projects_dir.glob(f"*/{block}-*.jsonl"))
 
     def resolve_transcript(self, session_uuid=None, lead_session=None, team=None, name=None,
                            is_lead=False, quick=False):
@@ -2729,7 +2729,7 @@ class Resolver:
         if self._by_agent is not None:
             return self._by_agent
         self._by_agent = {}
-        leads = self._grep_files(SPAWN_MARKER, [PROJECTS_DIR], True) or []
+        leads = self._grep_files(SPAWN_MARKER, [self.projects_dir], True) or []
         self._ingest_spawn_lines(leads)
         for path in leads:
             for _, payload in self._log(path.stem):
@@ -7258,8 +7258,9 @@ def run_selftest(live=False, failed_only=False, list_only=False):
 
     Two kinds: structural ones read from this file's own syntax tree, because
     an invariant like "only the engine picks a transcript" is a property of the
-    code rather than of a run; and behavioural ones exercised against whatever
-    real data is on this machine, skipped rather than faked when absent.
+    code rather than of a run; and behavioural ones exercised against the
+    portable fixture corpus under test/, so the answer never depends on what
+    happens to be on the machine running the suite (see corpus_engine()).
     """
     import ast
     import tempfile
@@ -7272,6 +7273,21 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             raise RuntimeError(f"duplicate check id: {cid!r}")
         seen_ids.add(cid)
         results.append((cid, name, ok, detail))
+
+    def corpus_engine():
+        """A Resolver pointed at test/corpus/ instead of this machine.
+
+        A fresh instance every call, never the shared RESOLVER: sharing one
+        would let one check's cached stamps or spawn index leak into the
+        next. The fixture is checked-in data, composed once, so every
+        machine that runs this suite - a laptop with years of real teams or
+        a bare CI checkout with none - exercises the same behaviour.
+        """
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
+        corpus = Path(__file__).resolve().parent / "test" / "corpus"
+        eng.projects_dir = corpus / "projects"
+        eng.teams_dir = corpus / "teams"
+        return eng
 
     source = Path(__file__).resolve().read_text()
     tree = ast.parse(source)
@@ -8182,21 +8198,17 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # Assembly is exercised, not just its parts: a structural battery can pass
     # over a NameError in identity() while every real invocation dies, when
     # nothing in the suite calls the function that answers who an agent is.
-    stamped = next(((name, team) for name, team in RESOLVER.stamp_index().values()
-                    if name and team and name != "team-lead"), None)
-    if stamped:
-        name, team = stamped
-        try:
-            with contextlib.redirect_stderr(io.StringIO()):
-                assembled = RESOLVER.identity(agent_id=f"{name}@{team}")
-            got = RESOLVER.field(assembled, "agentId")
-            why = assembled.get("via")
-        except Exception as exc:                      # the point is that it runs
-            got, why = None, f"{type(exc).__name__}: {exc}"
-        check("identity-can-assemble", "an identity can actually be assembled", bool(got and why),
-              f"{name}@{team} -> {got or why}")
-    else:
-        check("identity-can-assemble", "an identity can be assembled (no stamped agent here)", True, "skipped")
+    eng = corpus_engine()
+    name, team = "willow", "session-corpus-alpha"
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            assembled = eng.identity(agent_id=f"{name}@{team}")
+        got = eng.field(assembled, "agentId")
+        why = assembled.get("via")
+    except (Exception, SystemExit) as exc:         # the point is that it runs
+        got, why = None, f"{type(exc).__name__}: {exc}"
+    check("identity-can-assemble", "an identity can actually be assembled", bool(got and why),
+          f"{name}@{team} -> {got or why}")
 
     # Supplying an id and a name that contradict describes an agent that cannot
     # exist, and the name is the routing key, so the wrong one reads a mailbox
@@ -8255,33 +8267,24 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # what catches a lead launched under a wrong name. The refusal
     # carries the remedy when the roster and the payloads agree on the identity
     # being asked for, so a corrupted stamp is recoverable without being ignored.
-    contradicted = None
-    for team in RESOLVER.known_teams():
-        path, _why = RESOLVER.lead_transcript_for(team)
-        if not path:
-            continue
-        name, _stamped_team = RESOLVER.stamp_index().get(path, (None, None))
-        if name and name != "team-lead":
-            with contextlib.redirect_stderr(io.StringIO()):
-                found = RESOLVER.resolve_transcript(lead_session=path.stem, team=team, is_lead=True)
-                if found:
-                    contradicted = RESOLVER.objections(found, "team-lead", team)
-            break
-    if contradicted is not None:
-        raised = [o for o in contradicted if o[0] == "name_mismatch"]
-        spoken = ""
-        if raised:
-            with contextlib.redirect_stderr(io.StringIO()) as said:
-                try:
-                    enforce_identity(found, raised, allow_team_change=False, force=False)
-                except SystemExit:
-                    pass
-            spoken = said.getvalue()
-        check("contradicted-stamp-refused", "a contradicted stamp is refused, with a way forward",
-              bool(raised) and "--force resumes it" in spoken,
-              f"raised={bool(raised)}, remedy={'--force resumes it' in spoken}")
-    else:
-        check("contradicted-stamp-refused", "a contradicted stamp is refused (none on this machine)", True, "skipped")
+    eng = corpus_engine()
+    team = "session-corpus-contradicted"
+    path, _why = eng.lead_transcript_for(team)
+    with contextlib.redirect_stderr(io.StringIO()):
+        found = eng.resolve_transcript(lead_session=path.stem, team=team, is_lead=True)
+    contradicted = eng.objections(found, "team-lead", team)
+    raised = [o for o in contradicted if o[0] == "name_mismatch"]
+    spoken = ""
+    if raised:
+        with contextlib.redirect_stderr(io.StringIO()) as said:
+            try:
+                enforce_identity(found, raised, allow_team_change=False, force=False)
+            except SystemExit:
+                pass
+        spoken = said.getvalue()
+    check("contradicted-stamp-refused", "a contradicted stamp is refused, with a way forward",
+          bool(raised) and "--force resumes it" in spoken,
+          f"raised={bool(raised)}, remedy={'--force resumes it' in spoken}")
 
     # The reaper bets deletions on the soul count, and that count now consults
     # stamps as well as the roster. Too permissive and a dead directory is kept
@@ -8342,72 +8345,47 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # no --team-name, then spawned teammates, is that team's lead while being
     # stamped with its own name; keying lead-ness on "no stamps at all" left it
     # between the branches and its team could not be rebuilt at all.
-    half = None
-    for team in RESOLVER.led_teams():
-        path, _why = RESOLVER.lead_transcript_for(team)
-        if not path:
-            continue
-        name, stamped_team = RESOLVER.stamp_index().get(path, (None, None))
-        if name and not stamped_team and not RESOLVER.roster_path(team).exists():
-            half = (team, path)
-            break
-    if half:
-        team, path = half
-        with contextlib.redirect_stderr(io.StringIO()):
-            assembled = RESOLVER.identity(session_uuid=path.stem, for_team=team)
-        check("named-lead-still-leads", "a lead with a name of its own still leads its team",
-              assembled.get("leads_team") == team
-              and assembled.get("lead_agent_id") == f"team-lead@{team}",
-              f"{path.stem[:8]} -> {assembled.get('leads_team')}")
-    else:
-        check("named-lead-still-leads", "a lead with a name of its own (none on this machine)", True, "skipped")
+    eng = corpus_engine()
+    team, uuid = "session-corpus-orphan", "44444444-4444-4444-8444-444444444444"
+    with contextlib.redirect_stderr(io.StringIO()):
+        assembled = eng.identity(session_uuid=uuid, for_team=team)
+    check("named-lead-still-leads", "a lead with a name of its own still leads its team",
+          assembled.get("leads_team") == team
+          and assembled.get("lead_agent_id") == f"team-lead@{team}",
+          f"{uuid[:8]} -> {assembled.get('leads_team')}")
 
     # The same lead one life later: stamped with a team it used to run as, asked
     # about a team it led afterwards. The stamps answer an older question, so the
     # named team has to win in the stamped branch too, or a reaped team whose lead
     # went on to lead another cannot be rebuilt at all.
-    multi = None
-    for other in RESOLVER.led_teams():
-        found = RESOLVER.lead_transcript_for(other)
-        if not (found and found[0]):
-            continue
-        stamped = RESOLVER.stamp_index().get(found[0], (None, None))[1]
-        if stamped and stamped != other:
-            multi = (other, found[0])
-            break
-    if multi:
-        other, path = multi
-        with contextlib.redirect_stderr(io.StringIO()):
-            assembled = RESOLVER.identity(session_uuid=path.stem, for_team=other)
-        check("named-team-outranks-stamps", "a named team outranks the stamps of an earlier life",
-              assembled.get("lead_agent_id") == f"team-lead@{other}",
-              f"{path.stem[:8]} stamped {stamped}, asked {other}, "
-              f"got {assembled.get('lead_agent_id')}")
-    else:
-        check("named-team-outranks-stamps", "multi-team lead (none stamped with another team here)", True, "skipped")
+    eng = corpus_engine()
+    other, uuid = "session-corpus-new", "55555555-5555-4555-8555-555555555555"
+    stamped = eng.stamp_index().get(eng.lead_transcript_for(other)[0], (None, None))[1]
+    with contextlib.redirect_stderr(io.StringIO()):
+        assembled = eng.identity(session_uuid=uuid, for_team=other)
+    check("named-team-outranks-stamps", "a named team outranks the stamps of an earlier life",
+          assembled.get("lead_agent_id") == f"team-lead@{other}",
+          f"{uuid[:8]} stamped {stamped}, asked {other}, "
+          f"got {assembled.get('lead_agent_id')}")
 
     # A lead that ran several teams must rebuild the one that was named, not
     # whichever it ran as last. The fault has two spellings: a forge proposing
     # the newest team's name over the right members, and an agent id resolving
     # the right transcript under the wrong team.
-    multi = next(((stem, teams) for stem, teams in
-                  ((path.stem, RESOLVER.teams_led_by(path.stem))
-                   for hits in RESOLVER.led_teams().values() for _stamp, path in hits)
-                  if len(teams) > 1), None)
-    if multi:
-        stem, teams = multi
-        # Every payload handed back for a team must belong to that team. The
-        # fault shape is a lead's newest team answering for an older one, which
-        # shows up here as a payload stamped with a team nobody asked about.
-        strays = {t: [p["name"] for p in RESOLVER.members_spawned_into(stem, t)
-                      if p.get("team_name") != t]
-                  for t in teams}
-        wrong = sorted(t for t, names in strays.items() if names)
-        check("named-team-not-newest", "a named team is rebuilt, not the lead's newest", not wrong,
-              f"{len(teams)} teams from one lead; strays in {', '.join(wrong)}" if wrong
-              else f"{len(teams)} teams from one lead, none crossed")
-    else:
-        check("named-team-not-newest", "a named team is rebuilt (no multi-team lead here)", True, "skipped")
+    eng = corpus_engine()
+    stem = "59e91a1e-5e91-4a1e-859e-91a1e59e91a1"
+    teams = eng.teams_led_by(stem)
+    # Every payload handed back for a team must belong to that team. The
+    # fault shape is a lead's newest team answering for an older one, which
+    # shows up here as a payload stamped with a team nobody asked about.
+    strays = {t: [p["name"] for p in eng.members_spawned_into(stem, t)
+                  if p.get("team_name") != t]
+              for t in teams}
+    wrong = sorted(t for t, names in strays.items() if names)
+    check("named-team-not-newest", "a named team is rebuilt, not the lead's newest",
+          len(teams) > 1 and not wrong,
+          f"{len(teams)} teams from one lead; strays in {', '.join(wrong)}" if wrong
+          else f"{len(teams)} teams from one lead, none crossed")
 
     # A dry run must promise what a real run does. They share one code path, so
     # the check is that the path really is shared: the forge hands back the same
@@ -8442,8 +8420,10 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     kinds = {
         "a uuid": RESOLVER.classify("2a38de2d-bd34-4c7f-8f9a-000000000000")[0] == "uuid",
         "an agent id": RESOLVER.classify("someone@session-abcdef12")[0] == "agent_id",
-        "a team with a roster": RESOLVER.classify(
-            next(iter({e["team"] for e in RESOLVER.scan_teams()}), "session-none"))[0] == "team",
+        # A team's roster is portable-corpus data (see corpus_engine()), not
+        # whatever this machine happens to have: classify() only takes one
+        # engine, so the corpus is asked directly rather than through RESOLVER.
+        "a team with a roster": corpus_engine().classify("session-corpus-alpha")[0] == "team",
         "an unknown team shape": RESOLVER.classify("session-deadbeef")[0] == "unknown",
         "an unknown name": RESOLVER.classify("no-such-agent-anywhere")[0] == "unknown",
     }
@@ -9800,122 +9780,135 @@ def run_selftest(live=False, failed_only=False, list_only=False):
               ", ".join(stray))
 
     # The live corpus agrees with itself: a process whose transcript restores
-    # is reported as running the restored team.
+    # is reported as running the restored team. Faked live onto the process
+    # table, wearing a transcript whose window-start is stamped with a team
+    # that has a roster (session-corpus-alpha), so restored_identity reads
+    # "restored" rather than "orphaned" and there is something to compare.
+    eng = corpus_engine()
+    eng.session_registry = lambda: []
+    eng.ps_table = lambda refresh=False: [
+        (424242, 0, "claude --resume 1e5701ed-1fe5-4701-8ed1-e5701ed1fe57 "
+                    "--agent-id team-lead@session-corpus-alpha")]
     torn, sighted, restored_n, incomplete = [], 0, 0, 0
-    for e in RESOLVER.live_sessions():
+    for e in eng.live_sessions():
         if not (e.get("alive") and e.get("session")):
             incomplete += 1
             continue
         sighted += 1
-        lived = RESOLVER.transcript_path(e["session"])
+        lived = eng.transcript_path(e["session"])
         if not lived:
             continue
-        team, state = RESOLVER.restored_identity(lived)
+        team, state = eng.restored_identity(lived)
         if state == "restored":
             restored_n += 1
-            got_team, exact = RESOLVER.team_minted_by(e["pid"])
+            got_team, exact = eng.team_minted_by(e["pid"])
             if got_team != team or not exact:
                 torn.append(f"pid {e['pid']}: {got_team} != {team}")
-    check("restored-life-window-start", "a restored life runs as its window start says", not torn,
+    check("restored-life-window-start", "a restored life runs as its window start says",
+          restored_n > 0 and not torn,
           ", ".join(torn) or f"{restored_n} restored of {sighted} registry-complete "
           f"live sessions, {incomplete} incomplete skipped")
 
-    # The cautionary specimen: the transcript whose session-id rung overclaim
-    # mis-aimed a redirect. Skipped wherever it does not exist.
-    spec = RESOLVER.transcript_path("8f1a0dc1-cff0-47b0-83da-2b778e67d6a9")
-    if spec:
-        got = RESOLVER.window_start(spec)
-        # A chain break (a parentUuid naming no record in the file) is the
-        # documented caveat: the strict walk declines and the harness falls
-        # back on timestamps, which this tool does not implement.
-        check("cautionary-specimen-restores", "the cautionary specimen restores as its boundary says",
-              got is None or got[1] == "session-b16311b4",
-              f"{got[0]}/{got[1]}" if got else "chain broken; strict walk declines")
-    else:
-        check("cautionary-specimen-restores", "the cautionary specimen restores as its boundary says (absent here)",
-              True, "skipped")
+    # The cautionary specimen: originally the transcript whose session-id rung
+    # overclaim mis-aimed a redirect on 2026-08-05 (see window_start's own
+    # docstring). Reconstructed here rather than read off that one real
+    # machine's file: two segments, an early unstamped one closed by an early
+    # last-prompt trailer, and a second parentUuid:null root - the
+    # "pseudocompact boundary" - stamped session-corpus-boundary and closed by
+    # the later trailer. The walk must pick the newer leaf by timestamp and
+    # land on the boundary, never touching the first segment.
+    eng = corpus_engine()
+    got = eng.window_start(eng.transcript_path("bcbcbcbc-eeee-4eee-8eee-eeeeeeeeeeee"))
+    check("cautionary-specimen-restores", "the cautionary specimen restores as its boundary says",
+          got is not None and got[1] == "session-corpus-boundary",
+          f"{got[0]}/{got[1]}" if got else "chain broken; strict walk declines")
 
-    # And on real bytes: the smallest pointer fork on this machine round-trips
-    # exactly, ref and graft and trailer included. The specimen must be
-    # quiescent: a file mid-write is evidence about the writer, not the
-    # transform, and it made this check flake once.
-    settled = int(time.time() * 1000) - 60_000
-    pointers = [e for e in corpus if e["grammar"] == "pointer" and e["root"]
-                and e["mtime"] < settled]
-    if pointers:
-        pick = min(pointers, key=lambda e: e["path"].stat().st_size)
-        rplan = RESOLVER.conversion_plan(pick["path"], "promote")
-        check("fork-roundtrip-byte-exact", "a real fork round-trips byte-exactly",
-              rplan["proved"] and not rplan["objections"],
-              f"{pick['parent'][:8]}/{pick['name'] or pick['task_id']}, "
-              f"{len(rplan['lines'] or [])} lines"
-              if rplan["proved"] else "; ".join(rplan["objections"])[:80])
-    else:
-        check("fork-roundtrip-byte-exact", "a real fork round-trips byte-exactly (none on this machine)", True, "skipped")
+    # And on real bytes: a pointer fork round-trips exactly, ref and graft and
+    # trailer included.
+    eng = corpus_engine()
+    pick = next(e for e in eng.side_transcripts() if e["task_id"] == "fork1")
+    rplan = eng.conversion_plan(pick["path"], "promote")
+    check("fork-roundtrip-byte-exact", "a real fork round-trips byte-exactly",
+          rplan["proved"] and not rplan["objections"],
+          f"{pick['parent'][:8]}/{pick['name'] or pick['task_id']}, "
+          f"{len(rplan['lines'] or [])} lines"
+          if rplan["proved"] else "; ".join(rplan["objections"])[:80])
 
     # Two counts of "contested" that mean different things, so both are named.
-    claimed = {t: {path for _st, path in hits} for t, hits in RESOLVER.led_teams().items()}
+    # session-corpus-contested has two lead transcripts, neither corroborated
+    # by anything: a genuine tie, not an opportunistic one.
+    eng = corpus_engine()
+    claimed = {t: {path for _st, path in hits} for t, hits in eng.led_teams().items()}
     raw = {t for t, paths in claimed.items() if len(paths) > 1}
     with contextlib.redirect_stderr(io.StringIO()):
-        unresolved = {t for t in raw if not RESOLVER.lead_transcript_for(t)[0]}
-    check("unresolved-team-claimed", "an unresolved team is a claimed team", unresolved <= raw,
+        unresolved = {t for t in raw if not eng.lead_transcript_for(t)[0]}
+    check("unresolved-team-claimed", "an unresolved team is a claimed team",
+          unresolved <= raw and "session-corpus-contested" in unresolved,
           f"raw {len(raw)}, unresolved {len(unresolved)}, "
           f"stray {sorted(t[-8:] for t in unresolved - raw)}")
+    check("copies-of-history-refuse", "copies of one history still refuse",
+          bool(unresolved) and all(not eng.lead_transcript_for(t)[0] for t in unresolved),
+          f"{len(unresolved)} tie(s) held")
 
     # A claimant whose spawned members are running as the team is corroborated by
     # them; copies of one history share their children, so it never breaks a tie.
+    # session-corpus-contested-b's one claimant is otherwise uncorroborated; its
+    # spawned child "drift" is faked live on the process table, the way
+    # live_checks fakes tmux state elsewhere, to exercise the upgrade for real.
+    # The child's own --resume value must differ from the lead's uuid, or it
+    # reads as the lead itself running live (a stronger, earlier-checked
+    # reason) rather than as a spawned member corroborating it.
+    eng = corpus_engine()
+    eng.session_registry = lambda: []
+    eng.ps_table = lambda refresh=False: [
+        (424242, 0, "claude --resume d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1 "
+                    "--agent-id drift@session-corpus-contested-b")]
+    claimed = {t: {path for _st, path in hits} for t, hits in eng.led_teams().items()}
     live_kids = {}
     for team, paths in claimed.items():
         with contextlib.redirect_stderr(io.StringIO()):
-            found = RESOLVER.lead_transcript_for(team)
+            found = eng.lead_transcript_for(team)
         why = (found[1] or "") if found else ""
         if "live members it spawned" not in why:
             continue
         spawned = {pay.get("name")
                    for path in paths
-                   for pay in RESOLVER.members_spawned_into(path.stem, team)}
-        live_kids[team] = any(RESOLVER.wearers(f"{n}@{team}") for n in spawned if n)
+                   for pay in eng.members_spawned_into(path.stem, team)}
+        live_kids[team] = any(eng.wearers(f"{n}@{team}") for n in spawned if n)
     wrong = sorted(t for t, ok in live_kids.items() if not ok)
     # And the upgrade must reach the write: an evidence string without the word
     # uncorroborated is what lets the forge record a real leadSessionId.
     launders = sorted(t for t, ok in live_kids.items() if ok and "uncorroborated" in
-                      (RESOLVER.lead_transcript_for(t)[1] or ""))
+                      (eng.lead_transcript_for(t)[1] or ""))
     check("claimant-corroborated-by-children", "a claimant is corroborated only by children that are running",
-          not wrong and not launders,
+          bool(live_kids) and not wrong and not launders,
           ", ".join(wrong + launders) or f"{len(live_kids)} team(s) upgraded")
-    check("copies-of-history-refuse", "copies of one history still refuse", all(
-        not RESOLVER.lead_transcript_for(t)[0] for t in unresolved),
-        f"{len(unresolved)} tie(s) held")
-
-    # A lead that leads several teams is told which live ones it is walking away
 
     # Placement: an address locates, evidence places. The same agent, addressed
     # four ways, must come back to the team its members are running under.
-    spec = None
-    for stem in {path.stem for paths in claimed.values() for path in paths}:
-        led = RESOLVER.teams_led_by(stem)
-        live_led = [t for t in led if t in RESOLVER.live_teams()]
-        if len(led) > 1 and len(live_led) == 1:
-            spec = (stem, led, live_led[0])
-            break
-    if spec:
-        # Not named `live`: that is run_selftest's own parameter, and shadowing it
-        # here opened the live tier inside a read-only run.
-        stem, led, serving = spec
-        stale = next(t for t in led if t != serving)
-        res = RESOLVER.resolve_transcript(session_uuid=stem)
-        placed = {}
-        with contextlib.redirect_stderr(io.StringIO()):
-            placed["as addressed with a stale team"] = RESOLVER.place(res, stale)[0] == serving
-            placed["addressed with the live team"] = RESOLVER.place(res, serving)[0] == serving
-            placed["--keep-team pins what was typed"] = (
-                RESOLVER.place(res, stale, keep_team=True)[0] == stale)
-            placed["a spoken destination wins"] = (
-                RESOLVER.place(res, stale, for_team="session-elsewhere")[0] == "session-elsewhere")
-        wrong = sorted(k for k, ok in placed.items() if not ok)
-        check("address-locates-evidence-places", "an address locates an agent, evidence places it", not wrong, ", ".join(wrong))
-    else:
-        check("address-locates-evidence-places", "placement (no multi-team lead with one live crew here)", True, "skipped")
+    # MULTITEAM_LEAD led two teams; faked live as multiteam-b only, so
+    # multiteam-a is the "stale" address and multiteam-b the "live" one.
+    eng = corpus_engine()
+    eng.session_registry = lambda: []
+    eng.ps_table = lambda refresh=False: [
+        (424242, 0, "claude --resume aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa "
+                    "--agent-id team-lead@session-corpus-multiteam-b")]
+    stem = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    led = eng.teams_led_by(stem)
+    live_led = [t for t in led if t in eng.live_teams()]
+    serving, stale = "session-corpus-multiteam-b", "session-corpus-multiteam-a"
+    res = eng.resolve_transcript(session_uuid=stem)
+    placed = {}
+    with contextlib.redirect_stderr(io.StringIO()):
+        placed["as addressed with a stale team"] = eng.place(res, stale)[0] == serving
+        placed["addressed with the live team"] = eng.place(res, serving)[0] == serving
+        placed["--keep-team pins what was typed"] = (
+            eng.place(res, stale, keep_team=True)[0] == stale)
+        placed["a spoken destination wins"] = (
+            eng.place(res, stale, for_team="session-elsewhere")[0] == "session-elsewhere")
+    wrong = sorted(k for k, ok in placed.items() if not ok)
+    check("address-locates-evidence-places", "an address locates an agent, evidence places it",
+          live_led == [serving] and not wrong, ", ".join(wrong))
 
     # And it is decided in one function, so the two-sites fault cannot regrow.
     # The led-and-live evidence pair has one holder (live_led); place() is the
@@ -9937,79 +9930,107 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # The socket follows the crew: every agent wearing the team, not the roster's
     # list and not the resumed agent alone. A member that is not running has no
     # server of its own to be found on, and must still seat with its siblings.
-    table = RESOLVER.ps_table()
+    # socket_hosting ultimately asks a real tmux server, which a file corpus
+    # cannot provide, so it is faked directly here - the same technique the
+    # suite already uses elsewhere (eng10's "a crew on two servers" check) -
+    # rather than a live pane. petrel and sparrow wear session-corpus-crew;
+    # swift is listed but never live.
+    eng = corpus_engine()
+    eng.session_registry = lambda: []
+    eng.ps_table = lambda refresh=False: [
+        (424242, 0, "claude --agent-id petrel@session-corpus-crew"),
+        (424243, 0, "claude --agent-id sparrow@session-corpus-crew")]
+    live_wearers = {"petrel@session-corpus-crew", "sparrow@session-corpus-crew"}
+    eng.socket_hosting = lambda ids, table: (
+        ("sock-crew", "live pane of the crew") if any(i in live_wearers for i in ids)
+        else (None, None))
+    table = eng.ps_table()
     # The population comes from live argv, not from the thing under test: drawing
     # it from crew_socket let a neutered crew_socket skip the check instead of
     # failing it. Sorted, so the same team is examined on every run.
-    crewed = next((t for t in sorted(RESOLVER.live_teams())
-                   if RESOLVER.socket_hosting(
-                       sorted(e.get("agent") for e in RESOLVER.live_sessions()
+    crewed = next((t for t in sorted(eng.live_teams())
+                   if eng.socket_hosting(
+                       sorted(e.get("agent") for e in eng.live_sessions()
                               if e.get("team") == t and e.get("agent")), table)[0]), None)
-    if crewed:
-        seat, _why = RESOLVER.crew_socket(crewed, table)
-        wearers = {e.get("agent") for e in RESOLVER.live_sessions() if e.get("team") == crewed}
-        listed = {m.get("agentId") for m in (RESOLVER.roster_of(crewed) or {}).get("members", [])}
-        absent = f"definitely-not-running@{crewed}"
-        seats = {
-            "a crew anchors the seat": bool(seat),
-            "an agent that is not running still seats with them":
-                RESOLVER.crew_socket(crewed, table)[0] == seat
-                and not RESOLVER.socket_hosting([absent], table)[0],
-            # The answer must come from a wearer, which is what makes it
-            # independent of the roster: an unlisted wearer anchors it just the
-            # same, and a listed member that is not running anchors nothing.
-            "the seat is one a wearer is sitting on":
-                RESOLVER.socket_hosting(sorted(w for w in wearers if w), table)[0] == seat,
-            "a listed member that is not running anchors nothing":
-                not RESOLVER.socket_hosting(sorted(listed - wearers) or [absent], table)[0],
-        }
-        wrong = sorted(k for k, ok in seats.items() if not ok)
-        check("socket-follows-crew", "the socket follows the crew, not the roster", not wrong,
-              ", ".join(wrong) or f"{crewed} on {seat}")
-    else:
-        check("socket-follows-crew", "crew socket (no live crew on this machine)", True, "skipped")
+    seat, _why = eng.crew_socket(crewed, table) if crewed else (None, None)
+    wearers = {e.get("agent") for e in eng.live_sessions() if e.get("team") == crewed}
+    listed = {m.get("agentId") for m in (eng.roster_of(crewed) or {}).get("members", [])} if crewed else set()
+    absent = f"definitely-not-running@{crewed}"
+    seats = {
+        "a crew anchors the seat": bool(seat),
+        "an agent that is not running still seats with them":
+            eng.crew_socket(crewed, table)[0] == seat
+            and not eng.socket_hosting([absent], table)[0],
+        # The answer must come from a wearer, which is what makes it
+        # independent of the roster: an unlisted wearer anchors it just the
+        # same, and a listed member that is not running anchors nothing.
+        "the seat is one a wearer is sitting on":
+            eng.socket_hosting(sorted(w for w in wearers if w), table)[0] == seat,
+        "a listed member that is not running anchors nothing":
+            not eng.socket_hosting(sorted(listed - wearers) or [absent], table)[0],
+    }
+    wrong = sorted(k for k, ok in seats.items() if not ok)
+    check("socket-follows-crew", "the socket follows the crew, not the roster",
+          crewed == "session-corpus-crew" and not wrong,
+          ", ".join(wrong) or f"{crewed} on {seat}")
 
     # A named target is examined, not swept past. The doctor runs before the
     # selector is applied, so it resolves its own target; taking it from
     # args.team gave a full machine sweep for a team the user had typed.
-    known = sorted(RESOLVER.known_teams())
-    if known:
-        one = known[0]
+    # run_doctor reads the module's own RESOLVER rather than taking an
+    # engine, so the corpus is swapped in for the duration and restored
+    # after, the same way the rest of the suite swaps a single global.
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = corpus_engine()
+    try:
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            run_doctor(_Args(team=None, agent_id=None, all_members=False), selector=one)
-        verdicts = [ln for ln in out.getvalue().splitlines()
-                    if ln[:1].isalpha() and ln.split()[:1] and ln.split()[0].isupper()]
-        check("doctor-target-honoured", "a named team is the only one examined", len(verdicts) == 1,
-              f"{len(verdicts)} verdict(s) for {one}")
-    else:
-        check("doctor-target-honoured", "doctor target (no teams on this machine)", True, "skipped")
+            run_doctor(_Args(team=None, agent_id=None, all_members=False),
+                      selector="session-corpus-alpha")
+    finally:
+        globals()["RESOLVER"] = real_resolver
+    verdicts = [ln for ln in out.getvalue().splitlines()
+                if ln[:1].isalpha() and ln.split()[:1] and ln.split()[0].isupper()]
+    check("doctor-target-honoured", "a named team is the only one examined", len(verdicts) == 1,
+          f"{len(verdicts)} verdict(s) for session-corpus-alpha")
 
     # A verdict names what an operator must act on. Pruned members are the trace
     # of finished work and an unrecorded one is fixed by running it, so neither
     # degrades a team; and a lead sits in no pane by design, so it is not a seat.
-    table = RESOLVER.ps_table()
-    verdicts = {}
-    for team in sorted(RESOLVER.live_teams()):
-        try:
-            with contextlib.redirect_stderr(io.StringIO()):
-                verdict, lines, _rem = diagnose_team(team, table)
-        except BaseException as exc:  # a diagnosis that crashes is a failed one
-            verdicts[team] = f"diagnosis raised {type(exc).__name__}"
-            continue
-        pop = RESOLVER.team_population(team)
-        said_split = any(ln.startswith("warning  its crew is seated") for ln in lines)
-        # Computed here rather than read from the verdict: a lead runs in a
-        # terminal, so it occupies no pane and cannot be a seat. Counting it calls
-        # every team with a live masqueraded lead split.
-        seats = {RESOLVER.socket_hosting([f"{n}@{team}"], table)[0]
-                 for n, (state, _w) in pop.items()
-                 if n != "team-lead" and RESOLVER.wearers(f"{n}@{team}")}
-        seats.discard(None)
-        if said_split != (len(seats) > 1):
-            verdicts[team] = f"split said {said_split}, crew sits on {len(seats)} server(s)"
-        if verdict == "DEGRADED" and not (said_split or any(
-                ln.startswith("warning  ") and "worn by" in ln for ln in lines)):
-            verdicts[team] = "degraded with nothing to act on"
+    # diagnose_team also reads the module's own RESOLVER, so this swaps it for
+    # a corpus engine with one live team (a masqueraded lead, faked onto the
+    # process table the way live_checks fakes tmux state elsewhere).
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = eng = corpus_engine()
+    eng.session_registry = lambda: []
+    eng.ps_table = lambda refresh=False: [
+        (424242, 0, "claude --resume aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa "
+                    "--agent-id team-lead@session-corpus-multiteam-b")]
+    try:
+        table = eng.ps_table()
+        verdicts = {}
+        for team in sorted(eng.live_teams()):
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    verdict, lines, _rem = diagnose_team(team, table)
+            except BaseException as exc:  # a diagnosis that crashes is a failed one
+                verdicts[team] = f"diagnosis raised {type(exc).__name__}"
+                continue
+            pop = eng.team_population(team)
+            said_split = any(ln.startswith("warning  its crew is seated") for ln in lines)
+            # Computed here rather than read from the verdict: a lead runs in a
+            # terminal, so it occupies no pane and cannot be a seat. Counting it calls
+            # every team with a live masqueraded lead split.
+            seats = {eng.socket_hosting([f"{n}@{team}"], table)[0]
+                     for n, (state, _w) in pop.items()
+                     if n != "team-lead" and eng.wearers(f"{n}@{team}")}
+            seats.discard(None)
+            if said_split != (len(seats) > 1):
+                verdicts[team] = f"split said {said_split}, crew sits on {len(seats)} server(s)"
+            if verdict == "DEGRADED" and not (said_split or any(
+                    ln.startswith("warning  ") and "worn by" in ln for ln in lines)):
+                verdicts[team] = "degraded with nothing to act on"
+    finally:
+        globals()["RESOLVER"] = real_resolver
     check("verdict-names-actionable", "a verdict names something to act on", not verdicts,
           "; ".join(f"{t}: {why}" for t, why in verdicts.items()))
 
@@ -10027,48 +10048,46 @@ def run_selftest(live=False, failed_only=False, list_only=False):
           f"exited saying {said.strip()[:60]!r}" if said else "the duplicate was accepted")
 
     # --- the composed answer agrees with the parts it is composed of
-    seen = [(e["team"], e["member"].get("name")) for e in RESOLVER.scan_teams()
+    eng = corpus_engine()
+    seen = [(e["team"], e["member"].get("name")) for e in eng.scan_teams()
             if e["member"].get("name") and e["member"].get("name") != "team-lead"]
-    if seen:
-        agree = {}
-        for team, name in seen[:20]:
-            st = RESOLVER.standing(f"{name}@{team}")
-            reachable, _why = st["reachable"]
-            pid, alive, _how, _grade = st["lead"]
-            lead_team, _grade2 = st["lead_team"]
-            # Reachable is the conjunction of its own parts, so a verdict cannot
-            # drift from the facts printed beside it.
-            # polls is checked against argv rather than against itself: a lead
-            # whose command line names its team read this roster at boot, and one
-            # that does not cannot be known from outside. Deriving the expectation
-            # from the answer would agree with any answer.
-            worn = next((e.get("team") for e in RESOLVER.live_sessions()
-                         if e["pid"] == pid), None) if pid and alive else None
-            members = [m for m in (RESOLVER.roster_of(lead_team) or {}).get("members", [])
-                       if m.get("name") != "team-lead"] if lead_team else []
-            want_polls = False if not members else (True if worn else None)
-            if st["polls"][0] is not want_polls:
-                agree[f"{name}@{team} polls"] = False
-            reaches = (pid and alive and lead_team == team and st["listed"])
-            want = (st["polls"][0] if reaches else False)
-            # True only when the lead is known to be reading, None when that
-            # cannot be told from outside its process, False otherwise.
-            agree[f"{name}@{team}"] = reachable is (want if want is None else bool(want))
-            if reachable and not st["listed"]:
-                agree[f"{name}@{team} unlisted yet reachable"] = False
-        # Every agent above came out of a roster, so all of them are listed and
-        # the unlisted branch is unreachable from that population alone. A name
-        # no roster carries is the case that exercises it.
-        team = seen[0][0]
-        absent = RESOLVER.standing(f"definitely-not-a-member@{team}")
-        agree["a name no roster carries is not reachable"] = (
-            not absent["listed"] and absent["reachable"][0] is False
-            and bool(absent["remedies"]))
-        wrong = sorted(k for k, good in agree.items() if not good)
-        check("standing-follows-own-evidence", "a standing verdict follows from its own evidence", not wrong,
-              ", ".join(wrong[:3]))
-    else:
-        check("standing-follows-own-evidence", "standing (no rostered member on this machine)", True, "skipped")
+    agree = {}
+    for team, name in seen[:20]:
+        st = eng.standing(f"{name}@{team}")
+        reachable, _why = st["reachable"]
+        pid, alive, _how, _grade = st["lead"]
+        lead_team, _grade2 = st["lead_team"]
+        # Reachable is the conjunction of its own parts, so a verdict cannot
+        # drift from the facts printed beside it.
+        # polls is checked against argv rather than against itself: a lead
+        # whose command line names its team read this roster at boot, and one
+        # that does not cannot be known from outside. Deriving the expectation
+        # from the answer would agree with any answer.
+        worn = next((e.get("team") for e in eng.live_sessions()
+                     if e["pid"] == pid), None) if pid and alive else None
+        members = [m for m in (eng.roster_of(lead_team) or {}).get("members", [])
+                   if m.get("name") != "team-lead"] if lead_team else []
+        want_polls = False if not members else (True if worn else None)
+        if st["polls"][0] is not want_polls:
+            agree[f"{name}@{team} polls"] = False
+        reaches = (pid and alive and lead_team == team and st["listed"])
+        want = (st["polls"][0] if reaches else False)
+        # True only when the lead is known to be reading, None when that
+        # cannot be told from outside its process, False otherwise.
+        agree[f"{name}@{team}"] = reachable is (want if want is None else bool(want))
+        if reachable and not st["listed"]:
+            agree[f"{name}@{team} unlisted yet reachable"] = False
+    # Every agent above came out of a roster, so all of them are listed and
+    # the unlisted branch is unreachable from that population alone. A name
+    # no roster carries is the case that exercises it.
+    team = seen[0][0]
+    absent = eng.standing(f"definitely-not-a-member@{team}")
+    agree["a name no roster carries is not reachable"] = (
+        not absent["listed"] and absent["reachable"][0] is False
+        and bool(absent["remedies"]))
+    wrong = sorted(k for k, good in agree.items() if not good)
+    check("standing-follows-own-evidence", "a standing verdict follows from its own evidence", not wrong,
+          ", ".join(wrong[:3]))
 
     check("self-migrate-refused", "a self-migrate is refused",
           bool(RESOLVER.transcript_holders("selftest-uuid",
@@ -10080,102 +10099,74 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     body = source.split('"""', 2)[-1]
     check("tool-name-not-hardcoded", "tool name not hardcoded", TOOL not in body, f"{body.count(TOOL)} literal(s)")
 
-    # -- behavioural, against real data where it exists
-    index = RESOLVER.stamp_index()
-    stamped = next(((p, n, t) for p, (n, t) in index.items() if n and t and n != "team-lead"), None)
-    if stamped:
-        path, name, team = stamped
-        check("rung-session-uuid", "rung: session uuid", bool(RESOLVER.resolve_transcript(session_uuid=path.stem, quick=True)))
-        res = RESOLVER.resolve_transcript(team=team, name=name)
-        check("rung-stamps", "rung: agentName+teamName stamps", bool(res) and res.via.startswith("agentName+teamName"))
-        try:
-            with contextlib.redirect_stderr(io.StringIO()):  # the refusal is the point, not its noise
-                enforce_identity(res, RESOLVER.objections(res, "definitely-not-" + name, team),
-                                 allow_team_change=False, force=False)
-            check("identity-gate-refuses-mismatch", "identity gate refuses a mismatch", False, "it allowed one")
-        except SystemExit:
-            check("identity-gate-refuses-mismatch", "identity gate refuses a mismatch", True)
+    # -- behavioural, against the portable corpus (test/corpus/)
+    eng = corpus_engine()
+    name, team = "willow", "session-corpus-alpha"
+    check("rung-session-uuid", "rung: session uuid",
+          bool(eng.resolve_transcript(session_uuid="22222222-2222-4222-8222-222222222222", quick=True)))
+    res = eng.resolve_transcript(team=team, name=name)
+    check("rung-stamps", "rung: agentName+teamName stamps", bool(res) and res.via.startswith("agentName+teamName"))
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):  # the refusal is the point, not its noise
+            enforce_identity(res, eng.objections(res, "definitely-not-" + name, team),
+                             allow_team_change=False, force=False)
+        check("identity-gate-refuses-mismatch", "identity gate refuses a mismatch", False, "it allowed one")
+    except SystemExit:
+        check("identity-gate-refuses-mismatch", "identity gate refuses a mismatch", True)
 
-        # Judgement and enforcement are separate stages. Assembling an identity
-        # that contradicts its stamps must produce objections and nothing else:
-        # the guards that turn a run into a noop sit between here and the act,
-        # and a gate upstream of them refuses launches that never happen.
-        judged, raised = None, None
-        try:
-            with contextlib.redirect_stderr(io.StringIO()):
-                judged = RESOLVER.identity(agent_id=f"{name}@definitely-not-{team}")
-        except SystemExit as exc:
-            raised = exc
-        check("identity-judged-not-enforced", "an identity is judged without being enforced",
-              raised is None and judged is not None and bool(judged.get("objections")),
-              "assembly exited" if raised else f"objections={bool((judged or {}).get('objections'))}")
-    else:
-        check("rung-checks-skipped", "rung: stamps (no stamped transcript on this machine)", True, "skipped")
+    # Judgement and enforcement are separate stages. Assembling an identity
+    # that contradicts its stamps must produce objections and nothing else:
+    # the guards that turn a run into a noop sit between here and the act,
+    # and a gate upstream of them refuses launches that never happen.
+    judged, raised = None, None
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            judged = eng.identity(agent_id=f"{name}@definitely-not-{team}")
+    except SystemExit as exc:
+        raised = exc
+    check("identity-judged-not-enforced", "an identity is judged without being enforced",
+          raised is None and judged is not None and bool(judged.get("objections")),
+          "assembly exited" if raised else f"objections={bool((judged or {}).get('objections'))}")
 
     # --- an override is told which way the evidence runs
-    # Every ex-member lead on the box, so both directions are exercised wherever
-    # both exist: one whose payloads postdate its stamps and one that does not.
-    # Drawn from the transcripts that led a team and scanned in full, not from
-    # the stamp index: its window is the last 8KB, and the specimen that proves
-    # the newer direction carries its team stamp further up the file.
+    # Two corpus specimens, one per direction, rather than a search of
+    # whatever ex-member leads happen to be on this machine: session-corpus-new
+    # was claimed after REUSED_TEAMMATE_LEAD's stamp (newer), and
+    # session-corpus-rebound-old was claimed before REBOUND_LEAD's stamp
+    # (not newer). Both are exercised on every run instead of opportunistically.
+    eng = corpus_engine()
     seen_dirs, wrong = set(), []
-    candidates = []
-    for other in RESOLVER.led_teams():
-        found = RESOLVER.lead_transcript_for(other)
-        # A lead that led only one team cannot be this shape, and deciding that
-        # from the payload index costs nothing, where scanning every lead on the
-        # machine to find out costs megabytes each.
-        # The shape is a lead whose transcript is not the one the team is named
-        # after: an implicit team carries its minter's block, so a lead leading a
-        # team block it does not start is leading a team from a later life.
-        if found and found[0] and not found[0].stem.startswith(other.rsplit("-", 1)[-1]):
-            candidates.append((other, found[0]))
-    # Sorted, so the six that get scanned are the same six on every run. Taking
-    # them in dict order made the check sample a different population each time
-    # and pass by not finding the case rather than by testing it.
-    scans = 0
-    for other, path in sorted(candidates):
-        # Bounded by scans rather than by position: a full scan is the cost, and
-        # stopping at the sixth candidate stopped before the direction that
-        # matters. Stops as soon as both directions are covered.
-        if scans >= 14 or len(seen_dirs) == 2:
-            break
-        scans += 1
-        res = RESOLVER.resolve_transcript(session_uuid=path.stem)
+    for other, uuid in (("session-corpus-new", "55555555-5555-4555-8555-555555555555"),
+                        ("session-corpus-rebound-old", "7ebc7ebc-7ebc-47bc-87bc-7ebc7ebc7ebc")):
+        res = eng.resolve_transcript(session_uuid=uuid)
         steam = res.stamped("teamName") if res else None
-        if not steam or steam == other:
-            continue
-        why = next((w for kind, _s, _w2, w in RESOLVER.objections(res, None, other)
+        why = next((w for kind, _s, _w2, w in eng.objections(res, None, other)
                     if kind == "team_mismatch"), "")
         stamped_ts = res.fields.get("teamName", (None, 0))[1]
-        claimed_ts = max((stamp for stamp, payload in RESOLVER._log(path.stem)
+        claimed_ts = max((stamp for stamp, payload in eng._log(uuid)
                           if payload.get("team_name") == other), default=0)
         newer = bool(stamped_ts and claimed_ts > stamped_ts)
         seen_dirs.add(newer)
+        if steam == other or not steam:
+            wrong.append(f"{uuid[:8]} stamped {steam!r}, expected it to differ from {other!r}")
         if ("|newer" in why) != newer:
-            wrong.append(f"{path.stem[:8]} says {why!r} for newer={newer}")
-    if seen_dirs:
-        check("override-evidence-direction", "an override is told which way the evidence runs", not wrong,
-              "; ".join(wrong[:2]) or f"directions covered: {sorted(seen_dirs)}")
-    else:
-        check("override-evidence-direction", "recency (no ex-member lead on this machine)", True,
-              f"skipped: {len(candidates)} multi-team lead(s)")
+            wrong.append(f"{uuid[:8]} says {why!r} for newer={newer}")
+    check("override-evidence-direction", "an override is told which way the evidence runs",
+          seen_dirs == {True, False} and not wrong,
+          "; ".join(wrong[:2]) or f"directions covered: {sorted(seen_dirs)}")
 
-    lead = next((e for e in RESOLVER.scan_teams()
-                 if e["leadSessionId"] and RESOLVER.transcript_path(e["leadSessionId"])), None)
-    if lead:
-        res = RESOLVER.resolve_transcript(lead_session=lead["leadSessionId"], team=lead.get("team"),
-                                 is_lead=True, quick=True)
-        check("rung-lead-session-id", "rung: roster leadSessionId", bool(res) and res.via == "roster leadSessionId")
-    else:
-        check("rung-lead-session-id", "rung: leadSessionId (no lead transcript on this machine)", True, "skipped")
+    eng = corpus_engine()
+    res = eng.resolve_transcript(lead_session="11111111-1111-4111-8111-111111111111",
+                                 team="session-corpus-alpha", is_lead=True, quick=True)
+    check("rung-lead-session-id", "rung: roster leadSessionId", bool(res) and res.via == "roster leadSessionId")
 
-    ambiguous = [n for n in {e["member"].get("name") for e in RESOLVER.scan_teams()}
-                 if n and len(RESOLVER.name_rosters(n)) > 1]
-    if ambiguous:
-        check("ambiguous-name-refused", "ambiguous name is refused", not RESOLVER.resolve_transcript(name=ambiguous[0]))
-    else:
-        check("ambiguous-name-refused", "ambiguous name (none on this machine)", True, "skipped")
+    # "echo" is deliberately rostered on two corpus teams (session-corpus-alpha
+    # and session-corpus-contrasting): every team has a "team-lead", so an
+    # ambiguity check that could not tell a real name collision from that
+    # would prove nothing.
+    eng = corpus_engine()
+    check("ambiguous-name-refused", "ambiguous name is refused",
+          len(eng.name_rosters("echo")) > 1 and not eng.resolve_transcript(name="echo"))
 
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)

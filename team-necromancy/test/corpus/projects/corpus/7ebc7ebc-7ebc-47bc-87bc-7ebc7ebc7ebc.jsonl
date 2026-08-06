@@ -1,0 +1,4 @@
+{"type":"user","uuid":"rb-root","parentUuid":null,"timestamp":"2026-02-15T00:00:00Z","sessionId":"7ebc7ebc-7ebc-47bc-87bc-7ebc7ebc7ebc","message":{"role":"user","content":"spawn into rebound-old"}}
+{"type":"assistant","uuid":"rb-2","parentUuid":"rb-root","timestamp":"2026-02-15T00:00:05Z","sessionId":"7ebc7ebc-7ebc-47bc-87bc-7ebc7ebc7ebc","toolUseResult":{"status":"teammate_spawned","name":"heron","team_name":"session-corpus-rebound-old","agent_id":"heron@session-corpus-rebound-old"}}
+{"type":"user","uuid":"rb-3","parentUuid":"rb-2","timestamp":"2026-02-20T00:00:00Z","sessionId":"7ebc7ebc-7ebc-47bc-87bc-7ebc7ebc7ebc","agentName":"wanderer","teamName":"session-corpus-rebound-new","message":{"role":"user","content":"hello again"}}
+{"type":"assistant","uuid":"rb-4","parentUuid":"rb-3","timestamp":"2026-02-20T00:00:05Z","sessionId":"7ebc7ebc-7ebc-47bc-87bc-7ebc7ebc7ebc","agentName":"wanderer","teamName":"session-corpus-rebound-new"}

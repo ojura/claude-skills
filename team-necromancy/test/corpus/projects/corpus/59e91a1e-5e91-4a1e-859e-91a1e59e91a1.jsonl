@@ -1,0 +1,4 @@
+{"type":"user","uuid":"sl-root","parentUuid":null,"timestamp":"2026-02-10T00:00:00Z","sessionId":"59e91a1e-5e91-4a1e-859e-91a1e59e91a1","message":{"role":"user","content":"spawn into serial-a"}}
+{"type":"assistant","uuid":"sl-2","parentUuid":"sl-root","timestamp":"2026-02-10T00:00:05Z","sessionId":"59e91a1e-5e91-4a1e-859e-91a1e59e91a1","toolUseResult":{"status":"teammate_spawned","name":"ember","team_name":"session-corpus-serial-a","agent_id":"ember@session-corpus-serial-a"}}
+{"type":"user","uuid":"sl-3","parentUuid":"sl-2","timestamp":"2026-02-11T00:00:00Z","sessionId":"59e91a1e-5e91-4a1e-859e-91a1e59e91a1","message":{"role":"user","content":"spawn into serial-b"}}
+{"type":"assistant","uuid":"sl-4","parentUuid":"sl-3","timestamp":"2026-02-11T00:00:05Z","sessionId":"59e91a1e-5e91-4a1e-859e-91a1e59e91a1","toolUseResult":{"status":"teammate_spawned","name":"gust","team_name":"session-corpus-serial-b","agent_id":"gust@session-corpus-serial-b"}}

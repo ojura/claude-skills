@@ -1,0 +1,2 @@
+{"type":"user","uuid":"an-root","parentUuid":null,"timestamp":"2026-01-01T00:01:00Z","sessionId":"22222222-2222-4222-8222-222222222222","agentName":"willow","teamName":"session-corpus-alpha","message":{"role":"user","content":"go"}}
+{"type":"assistant","uuid":"an-2","parentUuid":"an-root","timestamp":"2026-01-01T00:01:05Z","sessionId":"22222222-2222-4222-8222-222222222222","agentName":"willow","teamName":"session-corpus-alpha"}

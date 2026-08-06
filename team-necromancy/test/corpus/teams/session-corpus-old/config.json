@@ -1,0 +1,16 @@
+{
+  "name": "session-corpus-old",
+  "leadAgentId": "team-lead@session-corpus-old",
+  "leadSessionId": "",
+  "members": [
+    {
+      "agentId": "team-lead@session-corpus-old",
+      "name": "team-lead"
+    },
+    {
+      "agentId": "drifter@session-corpus-old",
+      "name": "drifter"
+    }
+  ],
+  "createdAt": 1
+}

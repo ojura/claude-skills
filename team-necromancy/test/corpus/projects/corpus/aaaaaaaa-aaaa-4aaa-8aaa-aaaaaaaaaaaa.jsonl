@@ -1,0 +1,4 @@
+{"type":"user","uuid":"mt-root","parentUuid":null,"timestamp":"2026-04-01T00:00:00Z","sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","message":{"role":"user","content":"spawn into first"}}
+{"type":"assistant","uuid":"mt-2","parentUuid":"mt-root","timestamp":"2026-04-01T00:00:05Z","sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","toolUseResult":{"status":"teammate_spawned","name":"gale","team_name":"session-corpus-multiteam-a","agent_id":"gale@session-corpus-multiteam-a"}}
+{"type":"user","uuid":"mt-3","parentUuid":"mt-2","timestamp":"2026-04-02T00:00:00Z","sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","message":{"role":"user","content":"spawn into second"}}
+{"type":"assistant","uuid":"mt-4","parentUuid":"mt-3","timestamp":"2026-04-02T00:00:05Z","sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","toolUseResult":{"status":"teammate_spawned","name":"squall","team_name":"session-corpus-multiteam-b","agent_id":"squall@session-corpus-multiteam-b"}}

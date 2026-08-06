@@ -1,0 +1,16 @@
+{
+  "name": "session-corpus-contrasting",
+  "leadAgentId": "team-lead@session-corpus-contrasting",
+  "leadSessionId": "",
+  "members": [
+    {
+      "agentId": "team-lead@session-corpus-contrasting",
+      "name": "team-lead"
+    },
+    {
+      "agentId": "echo@session-corpus-contrasting",
+      "name": "echo"
+    }
+  ],
+  "createdAt": 1
+}

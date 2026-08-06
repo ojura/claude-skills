@@ -1,0 +1,3 @@
+{"type":"user","uuid":"rl-root","parentUuid":null,"timestamp":"2026-04-10T00:00:00Z","sessionId":"1e5701ed-1fe5-4701-8ed1-e5701ed1fe57","agentName":"team-lead","teamName":"session-corpus-alpha","message":{"role":"user","content":"resume"}}
+{"type":"assistant","uuid":"rl-leaf","parentUuid":"rl-root","timestamp":"2026-04-10T00:00:05Z","sessionId":"1e5701ed-1fe5-4701-8ed1-e5701ed1fe57","agentName":"team-lead","teamName":"session-corpus-alpha"}
+{"type":"last-prompt","leafUuid":"rl-leaf","sessionId":"1e5701ed-1fe5-4701-8ed1-e5701ed1fe57","lastPrompt":"resume"}

@@ -1,0 +1,5 @@
+{"type":"user","uuid":"seg1-root","parentUuid":null,"timestamp":"2026-05-01T00:00:00Z","sessionId":"bcbcbcbc-eeee-4eee-8eee-eeeeeeeeeeee","message":{"role":"user","content":"before the boundary"}}
+{"type":"last-prompt","leafUuid":"seg1-root","sessionId":"bcbcbcbc-eeee-4eee-8eee-eeeeeeeeeeee","lastPrompt":"before the boundary"}
+{"type":"user","uuid":"seg2-root","parentUuid":null,"timestamp":"2026-05-02T00:00:00Z","sessionId":"bcbcbcbc-eeee-4eee-8eee-eeeeeeeeeeee","agentName":"team-lead","teamName":"session-corpus-boundary","message":{"role":"user","content":"after the boundary"}}
+{"type":"assistant","uuid":"seg2-leaf","parentUuid":"seg2-root","timestamp":"2026-05-02T00:00:05Z","sessionId":"bcbcbcbc-eeee-4eee-8eee-eeeeeeeeeeee","agentName":"team-lead","teamName":"session-corpus-boundary"}
+{"type":"last-prompt","leafUuid":"seg2-leaf","sessionId":"bcbcbcbc-eeee-4eee-8eee-eeeeeeeeeeee","lastPrompt":"after the boundary"}
