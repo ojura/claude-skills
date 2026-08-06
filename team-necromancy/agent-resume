@@ -6697,8 +6697,12 @@ def run_selftest(live=False):
               ", ".join(faults))
 
     # And on real bytes: the smallest pointer fork on this machine round-trips
-    # exactly, ref and graft and trailer included.
-    pointers = [e for e in corpus if e["grammar"] == "pointer" and e["root"]]
+    # exactly, ref and graft and trailer included. The specimen must be
+    # quiescent: a file mid-write is evidence about the writer, not the
+    # transform, and it made this check flake once.
+    settled = int(time.time() * 1000) - 60_000
+    pointers = [e for e in corpus if e["grammar"] == "pointer" and e["root"]
+                and e["mtime"] < settled]
     if pointers:
         pick = min(pointers, key=lambda e: e["path"].stat().st_size)
         rplan = RESOLVER.conversion_plan(pick["path"], "promote")
