@@ -6,6 +6,16 @@ Claude and ChatGPT, turn Markdown or HTML into print-quality PDFs, and drive you
 browser or let Claude run admin commands on your machine, safely. Each one lives in its
 own folder with its own README.
 
+## Reviewing and fixing branches
+
+### review-decision-maker
+
+Takes a pile of reviewer claims through current-code verification, explicit Fix,
+Discuss, Defer, or Reject decisions, implementation, tests, and a final outcome
+ledger. It includes a reusable local HTML board with filtering, notes,
+persistence, import, JSON and CSV export, and standalone HTML snapshots with
+current decisions embedded. [Read more](review-decision-maker).
+
 ## Working with your conversations
 
 ### archive-conversation-forks
@@ -32,6 +42,14 @@ backtick-quoted stance markers, failure modes (execution-planning drops, dot
 ritualization, performative thinking), tool-call boundaries, and recovery. Seeded
 with real artifacts from the session where the technique was developed - including
 the DASH backronym, the Habsburg camel solicitor, and the Zagreb ATM ferrets.
+
+### borg-windows
+
+Keeps the terse Borg reasoning engine intact while putting glass around it.
+Separates operational `<analysis>` from reflective `<thinking>`, recovers escaped
+native reasoning under register-accurate provenance tags, and makes routing
+failures inspectable instead of polishing them away. A stricter successor to
+`open-thinking`, developed through fresh-instance adoption and recovery trials.
 
 ### recover-deleted-sessions-ext4
 Gets back Claude Code conversations you have already lost, whether to an

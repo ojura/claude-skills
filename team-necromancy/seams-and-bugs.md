@@ -62,8 +62,9 @@ good components that nobody introduced to each other.
    it with team flags also fixes it, since it reads the roster file on the
    way up. Editing that file from outside never does.
 
-   Everything operative follows the restored context, and every new line re-stamps it, so a flagless resume of
-   a stamped transcript runs as the stamped team forever, not the minted one.
+   Everything operative follows the restored context, and every new line
+   re-stamps it, so a flagless resume of a stamped transcript runs as the
+   stamped team forever, not the minted one.
    The mint record is a mint event that adoption then discards. Anything that
    answers "runs as" from the session id or the mint ledger overclaims for
    resumed transcripts; the window-start stamps are the operand the harness
