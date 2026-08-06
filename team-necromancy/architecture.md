@@ -218,6 +218,15 @@ still cheap. It has paid twice: a mail ledger's two unmatched states became
 five on first contact, and a promote's roster write dissolved into the
 receipt being the membership.
 
+A fourth, cheaper to state than to learn: a suite run is evidence only about
+a tree nobody is editing. Python reads a file to execute it and again to
+render a traceback, and this suite reads its own source for the structural
+checks, so an edit landing between those reads produces one run whose
+behavior and whose assertions disagree, and then vanishes. That is the
+quiescent-specimen rule from the conversion battery, one level up: do not
+write a file another writer owns, and do not trust a green from a tree in
+motion.
+
 A third rule earned its place the hard way: a refusal that names an unbuilt
 remedy is making a claim about that remedy, and claims in refusal strings
 deserve the same verification as claims in code. One refusal presented a
