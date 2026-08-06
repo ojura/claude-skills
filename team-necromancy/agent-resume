@@ -508,6 +508,10 @@ def fill(text, width=None, offset=0):
         got = textwrap.wrap(line.lstrip(" "), width=width,
                             initial_indent=pad + head, subsequent_indent=hang,
                             break_long_words=False, break_on_hyphens=False)
+        if len(got) > 1 and lead.strip() and got[0].strip() == lead.strip():
+            # A label orphaned above an overflowing value reads as a missing
+            # value; keep the pair together and let the line overflow.
+            got[:2] = [pad + lead + got[1].lstrip(" ")]
         out.extend([got[0][len(pad):], *got[1:]] if got else [""])
     return "\n".join(out)
 
@@ -3694,7 +3698,7 @@ def noop_outcome(ctx, args, prefix, why, socket=None, is_lead=False, pane=None,
     """
     # An agent already sitting where it was asked to sit is the run working,
     # not a hazard, so that one says so in the report's own grammar.
-    print(f"{prefix}noop     {why}") if report else warn(why)
+    print(fill(f"{prefix}noop     {why}")) if report else warn(why)
     if not is_lead:
         record_membership(ctx, args, pane)
     note_identity(ctx, prefix)
@@ -4277,9 +4281,12 @@ def launch(socket, want_pane, cwd, command, dry, replace_pane=None):
         argv += ["-c", cwd]
     argv.append(quoted)
 
+    # A record, not a paste form: it wraps at spaces even inside the quoted
+    # exec argument, and rejoining continuation lines with one space restores
+    # the exact string tmux was handed.
     rendered = f"tmux -L {socket} {' '.join(shlex.quote(a) for a in argv)}"
     if dry:
-        step(True, f"would run: {rendered}", "")
+        step(True, wrap_command(rendered, "  would run: ", "    "), "", indent="")
         return (replace_pane if action == "respawn" else None), action
     res = tmux(socket, *argv)
     if res.returncode != 0:
@@ -4289,7 +4296,7 @@ def launch(socket, want_pane, cwd, command, dry, replace_pane=None):
         # reclaims the whole window, so what fits is a property of the window
         # rather than of how many splits preceded it.
         tmux(socket, "select-layout", "-t", TMUX_SESSION, "tiled")
-    step(False, "", f"ran: {rendered}")
+    step(False, "", wrap_command(rendered, "  ran: ", "    "), indent="")
     # respawn-pane takes no -P/-F, so it prints nothing: the pane is the one we
     # aimed at. Everything else printed its new pane id.
     return (replace_pane if action == "respawn" else res.stdout.strip()), action
@@ -4906,17 +4913,21 @@ def report_launch(ctx, command, prefix="", role="agent", agent_id=None, extra=()
     mechanism - a pane and a socket, or taking over this terminal - so that
     is what `extra` carries, and everything common is answered here once.
     """
+    if not prefix:
+        # A single-agent run separates its report from whatever warned above
+        # it; a team run's [name] headers already do this.
+        print()
     print(f"{prefix}{role:<8} {agent_id or '(unknown)'}")
-    print(f"{prefix}session  {ctx['session_uuid']}  ({ctx['transcript'][0]})")
+    print(fill(f"{prefix}session  {ctx['session_uuid']}  ({ctx['transcript'][0]})"))
     print(f"{prefix}via      {ctx['via']}")
     if ctx.get("placed"):
-        print(f"{prefix}team     {ctx['placed'][0]}  ({ctx['placed'][1]})")
+        print(fill(f"{prefix}team     {ctx['placed'][0]}  ({ctx['placed'][1]})"))
     title = session_title(ctx["transcript"][0], limit=100)
     if title:
-        print(f"{prefix}title    {title}")
+        print(fill(f"{prefix}title    {title}"))
     for label, value in extra:
-        print(f"{prefix}{label:<8} {value}")
-    print(f"{prefix}command  {' '.join(shlex.quote(c) for c in command)}")
+        print(fill(f"{prefix}{label:<8} {value}"))
+    print(wrap_command(command, f"{prefix}command  ", f"{prefix}{'':11}", paste=True))
 
 
 def run_one(args, passthrough, table, prefix="", pending=()):
@@ -5007,7 +5018,8 @@ def run_one(args, passthrough, table, prefix="", pending=()):
                 # traceback through a tool that has already moved the cwd.
                 die(f"cannot exec {command[0]}: {exc}")
         print(f"{prefix}run this in your terminal (leads are not spawned into tmux):")
-        print(f"{prefix}  {' '.join(shlex.quote(c) for c in command)}")  # copy-paste form
+        # still pastes as one command however it wrapped
+        print(wrap_command(command, f"{prefix}  ", f"{prefix}    ", paste=True))
         return Outcome("manual", None, True, None)
 
     if args.to_team:
@@ -6724,10 +6736,10 @@ def run_team(args, passthrough, table):
     ordered = sorted(members, key=lambda m: 1 if m.get("agentId") == lead_id else 0)
     where = (f"socket {socket} ({socket_why}, {socket_state(socket)})" if socket
              else "socket resolved per member")
-    print(f"team     {args.team}  ({len(ordered)} members, {where})")
+    print(fill(f"team     {args.team}  ({len(ordered)} members, {where})"))
     note = former_members_note(former)
     if note:
-        print(f"         {note}")
+        print(fill(f"         {note}"))
 
     jobs = []
     for member in ordered:
@@ -7132,9 +7144,13 @@ def run_selftest(live=False):
     # wall said: a lost fact must never be the fix for an unreadable one.
     tale = ("pid 4242 holds team-lead's transcript in pane %7 and refuses; " * 8).strip()
     filled = fill(tale, width=72)
+    # A label whose value cannot fit beside it keeps the value anyway: the
+    # pair overflows together rather than the label sitting orphaned above it.
+    labelled = fill("cwd      /" + "x" * 90, width=72)
     check("a long message wraps inside the width and loses nothing",
           all(len(l) <= 72 for l in filled.splitlines())
-          and " ".join(filled.split()) == " ".join(tale.split()),
+          and " ".join(filled.split()) == " ".join(tale.split())
+          and labelled == "cwd      /" + "x" * 90,
           f"widest line {max(map(len, filled.splitlines()))} of width 72")
 
     # A command line is a record and sometimes a paste form. Wrapped either
@@ -7336,6 +7352,45 @@ def run_selftest(live=False):
     wrong = sorted(k for k, ok in legend.items() if not ok)
     check("the legend explains only the verdicts on screen", not wrong,
           ", ".join(wrong))
+
+    # The launch report at a narrow terminal: the block opens with its own
+    # blank line, every prose line fits, and the command block strips back
+    # to the exact argv it promises to run.
+    report_argv = ["/usr/local/bin/claude", "--resume", "1" * 36,
+                   "--agent-id", "someone@session-abcdef12",
+                   "--agent-name", "someone", "--team-name", "session-abcdef12",
+                   "--agent-color", "blue", "--model", "claude-opus-5",
+                   "--effort", "max", "--dangerously-skip-permissions"]
+    report_ctx = {"session_uuid": "1" * 36,
+                  "transcript": (Path("/nonexistent/for-the-width-check.jsonl"),),
+                  "via": "agentName+teamName stamps",
+                  "placed": ("session-abcdef12", "typed")}
+    real_columns = os.environ.get("COLUMNS")
+    os.environ["COLUMNS"] = "80"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as told_report:
+            report_launch(report_ctx, report_argv, prefix="", role="agent",
+                          agent_id="someone@session-abcdef12",
+                          extra=[("socket", "claude-swarm-4242  [lead pid 4242] (live)")])
+    finally:
+        if real_columns is None:
+            os.environ.pop("COLUMNS", None)
+        else:
+            os.environ["COLUMNS"] = real_columns
+    report_lines = told_report.getvalue().splitlines()
+    cmd_at = next((i for i, l in enumerate(report_lines) if l.startswith("command")), None)
+    cmd_back = " ".join(l[9 if i == cmd_at else 11:].rstrip("\\").rstrip()
+                        for i, l in enumerate(report_lines[cmd_at:], cmd_at)) \
+        if cmd_at is not None else ""
+    reported = {
+        "the block opens with a blank line": report_lines and report_lines[0] == "",
+        "every line fits the terminal": all(len(l) <= 80 for l in report_lines),
+        "the command strips back to its argv":
+            cmd_at is not None and shlex.split(cmd_back) == report_argv,
+    }
+    wrong = sorted(k for k, ok in reported.items() if not ok)
+    check("the launch report fits the terminal and keeps its command exact",
+          not wrong, ", ".join(wrong))
 
     # Classification, not position, decides what a token is. Every entry must
     # carry both facts, or a future flag is added half-specified and the walk
