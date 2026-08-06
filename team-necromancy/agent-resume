@@ -2385,6 +2385,25 @@ class Resolver:
         match = re.search(r"-L\s+(\S+)", cmdline(ppid))
         return match.group(1) if match else None
 
+    def crew_sockets(self, team, table):
+        """{socket: [agent ids]} for every live server this team's crew sits on.
+
+        Usually one. More than one is the split a revived lead produces by
+        existing: a server is named after its lead's pid, so a lead that comes
+        back with a new pid spawns onto a server its old crew is not on. The
+        seat question wants the first (crew_socket); a report that claims one
+        server while the crew is on two is the kind of half-answer this file
+        keeps deleting, so it is asked and answered whole.
+        """
+        seats = {}
+        for entry in sorted(self.live_sessions(), key=lambda e: e.get("agent") or ""):
+            if entry.get("team") != team or not entry.get("agent"):
+                continue
+            sock, _why = self.socket_hosting([entry["agent"]], table)
+            if sock:
+                seats.setdefault(sock, []).append(entry["agent"])
+        return seats
+
     def crew_socket(self, team, table):
         """(socket, why) for the server this team's crew is already sitting on.
 
@@ -4658,12 +4677,21 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         # so where its crew already sits is a launch fact for the lead too.
         # Becoming the lead makes this process that pid, which is why the line
         # says which server the crew is on rather than which one it will own.
-        crew_socket, crew_why = RESOLVER.crew_socket(
-            (ctx.get("placed") or (None,))[0] or RESOLVER.field(ctx, "teamName"), table)
+        lead_team = (ctx.get("placed") or (None,))[0] or RESOLVER.field(ctx, "teamName")
+        crew_socket, crew_why = RESOLVER.crew_socket(lead_team, table)
         seat = [("cwd", RESOLVER.field(ctx, "cwd") or "(inherit)")]
         if crew_socket:
+            seats = RESOLVER.crew_sockets(lead_team, table)
+            # A lead can sit across several servers at once, because becoming
+            # one gives this process a new pid and the next spawn creates a
+            # server named after it. Naming one of them as the socket would be
+            # a half-answer; the rest are named too, with what is on them.
+            elsewhere = {s: who for s, who in seats.items() if s != crew_socket}
             seat.insert(0, ("socket", f"{crew_socket}  [{crew_why}] "
                                       f"({socket_state(crew_socket)})"))
+            for other, who in sorted(elsewhere.items()):
+                seat.insert(1, ("also", f"{other} hosts {', '.join(who)} "
+                                        f"({socket_state(other)})"))
         report_launch(ctx, command, prefix, role="lead", agent_id=agent_id,
                       extra=seat)
         owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
@@ -7448,6 +7476,23 @@ def run_selftest(live=False):
         split.append("a lead report omits its command")
     check("a lead and a member report the same launch facts", not split,
           ", ".join(split))
+
+    # --- a crew on two servers is reported as two, not as one
+    # A revived lead has a new pid, and a server is named after it, so the
+    # next spawn lands somewhere its old crew is not. Naming one seat while
+    # the crew sits on two is the half-answer this file keeps deleting.
+    eng10 = Resolver()
+    eng10.live_sessions = lambda: [
+        {"pid": 1, "alive": True, "team": "t", "agent": "old@t", "session": None},
+        {"pid": 2, "alive": True, "team": "t", "agent": "new@t", "session": None},
+        {"pid": 3, "alive": True, "team": "other", "agent": "x@other", "session": None}]
+    eng10.socket_hosting = lambda ids, table: (
+        ("sock-old", "live pane of pid 1") if ids == ["old@t"] else
+        ("sock-new", "live pane of pid 2") if ids == ["new@t"] else (None, None))
+    seats = eng10.crew_sockets("t", [])
+    check("a crew on two servers is reported as two",
+          seats == {"sock-old": ["old@t"], "sock-new": ["new@t"]},
+          f"{ {k: v for k, v in seats.items()} }")
 
     # --- live members define the team; the record only stands in for them
     roster = [{"agentId": "team-lead@t", "name": "team-lead"},
