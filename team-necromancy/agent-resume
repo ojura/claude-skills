@@ -1617,6 +1617,68 @@ class Resolver:
         return (path, fields.get("agentName", (None,))[0],
                 fields.get("teamName", (None,))[0])
 
+    def restamp_plan(self, path, team, name=None):
+        """The two-field window-start restamp, proved before anyone writes.
+
+        Forbidden by construction, so the line cannot creep: content bytes
+        never, any field beyond teamName/agentName never, any line beyond
+        the located window-start never. The inverse is rebuilt in memory and
+        byte-compared before the plan may be applied.
+        """
+        start = self.window_start(path)
+        if not start:
+            return {"objections": ["no stamped window-start to restamp"],
+                    "proved": False}
+        old_name, old_team, uuid = start
+        if old_team == team and (name is None or name == old_name):
+            return {"objections": [f"the window-start already testifies {team}; "
+                                   "nothing to rewrite"], "proved": False}
+        try:
+            raws = path.read_text(errors="strict").split("\n")
+        except (OSError, UnicodeDecodeError) as err:
+            return {"objections": [f"unreadable: {err}"], "proved": False}
+        trailing = raws and raws[-1] == ""
+        if trailing:
+            raws.pop()
+        for i, raw in enumerate(raws):
+            if f'"{uuid}"' not in raw:
+                continue
+            loaded, why = self._codec_load(raw)
+            if loaded is None:
+                return {"objections": [f"the window-start line {why}"],
+                        "proved": False}
+            rec, style = loaded
+            if rec.get("uuid") != uuid:
+                continue
+            new = dict(rec)
+            new["teamName"] = team
+            if name:
+                new["agentName"] = name
+            allowed = {"teamName"} | ({"agentName"} if name else set())
+            changed = {k for k in set(rec) | set(new)
+                       if rec.get(k, _MISSING) != new.get(k, _MISSING)}
+            if changed - allowed:
+                return {"objections": [f"the edit set would need "
+                                       f"{sorted(changed - allowed)[0]}"],
+                        "proved": False}
+            back = dict(new)
+            back["teamName"] = old_team
+            if name:
+                back["agentName"] = old_name
+            if self._codec_dump(back, style) != raw:
+                return {"objections": ["the inverse does not restore the line"],
+                        "proved": False}
+            out = list(raws)
+            out[i] = self._codec_dump(new, style)
+            receipt = {"kind": "restamp", "stem": path.stem, "uuid": uuid,
+                       "old": {"teamName": old_team, "agentName": old_name},
+                       "new": {"teamName": team, "agentName": name or old_name},
+                       "at": int(time.time() * 1000)}
+            return {"path": path, "lines": out, "receipt": receipt,
+                    "objections": [], "proved": True}
+        return {"objections": [f"window-start {uuid} not found as a line"],
+                "proved": False}
+
     def rebind_fragility(self, stem, team):
         """The fragile sentence for a rebound transcript, or None.
 
@@ -3476,26 +3538,47 @@ def enforce_restore(ctx, args):
          f"inboxes polled")
 
 
-def already_running(ctx, args, is_lead):
-    """Why this run must not act, because the conversation is already live.
+def already_running(ctx, args, is_lead, agent_id=None, table=None, here=(), pane=None):
+    """(why, report) for a run that must not act, or None. One step, both paths.
 
-    One question, both paths: a lead must not be exec'd and a member must not
-    be spawned onto a transcript a process already holds. The acts differ, the
-    precondition does not, and it was asked twice in two spellings until the
-    lead's answer forgot to name the session it was talking about.
+    A lead must not be exec'd and a member must not be spawned onto a
+    conversation someone is already running: the acts differ, the precondition
+    does not. The shared core is the registry's owner of this transcript,
+    which is the only witness either way, since an in-process lead runs as
+    bare `claude` with no --agent-id to match. A member extends it with the
+    two questions only a seat raises: is it in the pane we meant to use, and
+    is it running under this id somewhere else.
 
-    An in-process lead runs as bare `claude` with no --agent-id to match, so
-    the session registry is the only witness in either case. A rebind is the
-    one exemption: --to-team replaces a live member deliberately, and its own
-    kill path owns that.
+    `report` marks the benign case - an agent already sitting where it was
+    asked to sit is the run working, so it is said in the report's grammar
+    rather than warned about.
+
+    One asymmetry, preserved rather than invented: an explicit --to-team
+    exempts all three, because that path kills the holder deliberately, while
+    a redirect chosen by the tool exempts only the owner and elsewhere pair.
+    A redirect never runs when anything is alive, so the seat question keeps
+    its say.
     """
-    if args.force or (not is_lead and ctx.get("to_team")):
+    if args.force:
+        return None
+    migrating = bool(ctx.get("to_team")) and not ctx.get("auto_redirect")
+    if not is_lead and here and not migrating:
+        return (f"{agent_id} is already running in pane {pane} "
+                f"(pid {here[0]}{state_note(here[0])})", True)
+    if not is_lead and ctx.get("to_team"):
         return None
     owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
-    if not (owner and owner[2]):
-        return None
-    return (f"session {ctx['session_uuid']} is live as pid {owner[0]}"
-            f"{state_note(owner[0])}; pass --force to run a second copy")
+    if owner and owner[2]:
+        return (f"session {ctx['session_uuid']} is live as pid {owner[0]}"
+                f"{state_note(owner[0])}; pass --force to run a second copy", False)
+    if not is_lead and agent_id:
+        live = RESOLVER.live_agent_procs(agent_id, table)
+        elsewhere = [pid for pid, _ in live if pid not in here]
+        if elsewhere:
+            return (f"{agent_id} is already running outside pane {pane or '?'} "
+                    f"(pid {', '.join(map(str, elsewhere))}); pass --force to "
+                    "start another instance", False)
+    return None
 
 
 def noop_outcome(ctx, args, prefix, why, socket=None, is_lead=False, pane=None,
@@ -4571,15 +4654,11 @@ def confirm_redirect(agent_id, pid, dest, source, prefix=""):
     """
     if RESOLVER.sole_mint_pairing(pid) != dest:
         return False
-    shape = RESOLVER.minted_by_a_resumed_life(dest)
     if not sys.stdin.isatty():
         warn(f"pid {pid} is this agent's lead and only {dest} matches its boot; "
              f"nothing here can ask, so it stays on {source}")
         return False
-    print(f"{prefix}pid {pid} is this agent's lead, and {dest} is the only team "
-          f"it could have minted"
-          + (" (its lead session names no transcript, the shape only a resumed "
-             "life leaves)" if shape else ""))
+    print(f"{prefix}pid {pid} is this agent's lead and runs as {dest}")
     try:
         answer = input(f"redirect {agent_id} onto {dest}? [Y/n] ").strip().lower()
     except EOFError:
@@ -4739,7 +4818,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         # for the same reason a member is not spawned onto one.
         running = already_running(ctx, args, is_lead=True)
         if running:
-            return noop_outcome(ctx, args, prefix, is_lead=True, why=running)
+            return noop_outcome(ctx, args, prefix, is_lead=True, why=running[0])
         # This run is about to become the lead, so the identity gate applies from
         # here down.
         enforce_ctx(ctx, args)
@@ -4853,28 +4932,19 @@ def run_one(args, passthrough, table, prefix="", pending=()):
                 if killed.returncode != 0 or pid_alive(pid):
                     warn(f"pid {pid} did not die ({(killed.stderr or b'').decode().strip() or 'still running'}); "
                          "it is still appending to this transcript")
-    elif here and not args.force:
-        if not args.no_color:
+    # One step for every way this agent could already be alive: in this pane,
+    # holding the transcript, or wearing this id elsewhere.
+    running = already_running(ctx, args, is_lead=False, agent_id=agent_id,
+                              table=table, here=here, pane=want_pane)
+    if running:
+        why, report = running
+        if report and not args.no_color:
             tint_pane(socket, want_pane, RESOLVER.field(ctx, "color"),
                       RESOLVER.field(ctx, "agentName"), args.dry_run)
         return noop_outcome(ctx, args, prefix, socket=socket, pane=want_pane,
-                            report=True, why=(
-                                f"{agent_id} is already running in pane {want_pane} "
-                                f"(pid {here[0]}{state_note(here[0])})"))
+                            report=report, why=why)
     if others and not replace_pane:
         warn(f"pane {want_pane} runs a different claude (pid {', '.join(map(str, others))}); using a new pane")
-
-    running = already_running(ctx, args, is_lead=False)
-    if running:
-        return noop_outcome(ctx, args, prefix, socket=socket, pane=want_pane,
-                            why=running)
-
-    live = RESOLVER.live_agent_procs(agent_id, table) if agent_id else []
-    elsewhere = [pid for pid, _ in live if pid not in here]
-    if elsewhere and not args.force and not ctx.get("to_team"):
-        return noop_outcome(ctx, args, prefix, socket=socket, pane=want_pane, why=(
-            f"{agent_id} is already running outside pane {want_pane or '?'} "
-            f"(pid {', '.join(map(str, elsewhere))}); pass --force to start another instance"))
 
     # Every guard that could still turn this into a noop has passed, so the run
     # is about to act and the identity gate applies.
@@ -5686,25 +5756,72 @@ def reap_team(team, archive_mail=False):
     return RECEIPTS_DIR / f"{team}.json"
 
 
-def rebind_reap(stamped, dest, args, prefix=""):
-    """Retire the stamped team so a rebind onto dest holds. Refuses first.
+def apply_restamp(plan):
+    """Apply a proved restamp. Receipt first, mandatorily: a restamp that
+    cannot write its confession refuses before touching the file."""
+    if plan["objections"] or not plan["proved"]:
+        raise ValueError("apply_restamp was handed an unproved plan")
+    path = plan["path"]
+    RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    replace_json(RECEIPTS_DIR / f"{path.stem}.restamp.json", plan["receipt"])
+    try:
+        keep_mode = path.stat().st_mode & 0o777
+    except OSError:
+        keep_mode = 0o600
+    replace_text(path, "\n".join(plan["lines"]) + "\n", mode=keep_mode)
 
-    --force never buys a reap: the flag means run anyway, never destroy
-    anyway. Guards failing is a refusal, full stop.
+
+def rebind_reap(stamped, dest, args, prefix="", path=None):
+    """Retire the stamped team so a rebind onto dest holds - or, on --force
+    against a living team, restamp the window-start instead.
+
+    --force never buys a reap: it buys the OTHER trade, two fields of
+    testimony rewritten in place with a receipt confessing the old values.
+    Mail objections keep their own remedy (--with-mail); a live holder of
+    the transcript itself is absolute either way - a whole-file replace
+    under a live appender is the lost-update disease, self-inflicted.
 
     Invariant, not accident: the destination team's roster must be readable
     at boot or the session comes up identity-less. The tool meets it because
     registration precedes launch; if that order ever changes, this sentence
-    is the tripwire. The reaped life also applies no teamAllowedPaths (hook
-    init is structurally unreachable with the stamped team absent).
+    is the tripwire. A reaped life also applies no teamAllowedPaths (hook
+    init is structurally unreachable with the stamped team absent); a
+    restamped life keeps its hooks, since the destination roster loads.
     """
-    objections = RESOLVER.reap_objections(stamped, RESOLVER.ps_table(),
+    table = RESOLVER.ps_table()
+    objections = RESOLVER.reap_objections(stamped, table,
                                           archive_mail=args.with_mail)
-    if objections:
+    alive = [o for o in objections
+             if "wears" in o or "operates" in o or "holds" in o]
+    mail = [o for o in objections if o not in alive]
+    if mail:
         die(f"a rebind onto {dest} needs {stamped} retired, and it refuses: "
-            + "; ".join(objections[:4])
-            + ("" if args.with_mail or not any("unread" in o for o in objections)
+            + "; ".join(mail[:4])
+            + ("" if args.with_mail
                else ". --with-mail archives the mail into the receipt"))
+    if alive and not args.force:
+        die(f"a rebind onto {dest} needs {stamped} retired, and it refuses: "
+            + "; ".join(alive[:4])
+            + ". --force restamps the window-start instead "
+              "(two fields, receipted, reversible)")
+    if alive:
+        strangers, ours = RESOLVER.transcript_holders(path.stem, table) if path else ([], [])
+        if strangers or ours:
+            pid = strangers[0][0] if strangers else ours[0]
+            die(f"pid {pid} holds this transcript; a restamp under a live "
+                "writer loses whatever it writes next. Stop it first, then "
+                "retry with --force")
+        plan = RESOLVER.restamp_plan(path, dest)
+        if plan["objections"] or not plan["proved"]:
+            die("; ".join(plan["objections"]) or "the restamp could not be proved")
+        print(f"{prefix}{'would restamp' if args.dry_run else 'restamped'} "
+              f"the window-start: {stamped} -> {dest}  "
+              f"(receipt: {RECEIPTS_DIR / (path.stem + '.restamp.json')})")
+        if not args.dry_run:
+            apply_restamp(plan)
+        print(f"{prefix}rebound  this transcript runs as {dest} from now on; "
+              "nothing further is needed")
+        return
     receipt = RECEIPTS_DIR / f"{stamped}.json"
     print(f"{prefix}{'would reap' if args.dry_run else 'reaped'}   {stamped}  "
           f"(roster archived: {receipt})")
@@ -7939,6 +8056,87 @@ def run_selftest(live=False):
     check("the reports carry what the mailbox file cannot show", not quiet,
           ", ".join(quiet))
 
+    # --- --force restamps the window-start instead of reaping a living team
+    with tempfile.TemporaryDirectory() as td:
+        proj = Path(td) / "proj"
+        proj.mkdir()
+        compact = lambda d: json.dumps(d, separators=(",", ":"))
+        rows = [
+            {"parentUuid": None, "agentName": "mate", "teamName": "OLD",
+             "type": "user", "uuid": "rs-root",
+             "timestamp": "2026-01-01T00:00:01Z",
+             "message": {"role": "user", "content": "hi"}},
+            {"parentUuid": "rs-root", "agentName": "mate", "teamName": "OLD",
+             "type": "assistant", "uuid": "rs-tail",
+             "timestamp": "2026-01-01T00:00:02Z"},
+        ]
+        rows.append({"type": "last-prompt", "leafUuid": "rs-tail",
+                     "sessionId": "RS"})
+        target = proj / "RS.jsonl"
+        target.write_text("".join(compact(r) + "\n" for r in rows))
+        target.chmod(0o600)
+        eng7 = Resolver()
+        eng7.projects_dir = Path(td)
+        real_receipts = RECEIPTS_DIR
+        globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
+        stray = []
+        try:
+            # locate + two-field closure, name-optional
+            plan = eng7.restamp_plan(target, "NEW")
+            if plan["objections"] or not plan["proved"]:
+                stray.append(f"no-rename plan: {plan['objections'] or 'unproved'}")
+            else:
+                loaded = json.loads(plan["lines"][0])
+                if loaded.get("teamName") != "NEW":
+                    stray.append("a no-rename restamp did not set teamName")
+                if loaded.get("agentName") != "mate":
+                    stray.append("a no-rename restamp touched agentName")
+                if plan["lines"][1] != compact(rows[1]):
+                    stray.append("the tail line changed under a window-start edit")
+            # renaming touches both fields
+            rplan = eng7.restamp_plan(target, "NEW", name="newmate")
+            if not rplan.get("proved"):
+                stray.append(f"rename plan: {rplan['objections']}")
+            else:
+                r0 = json.loads(rplan["lines"][0])
+                if r0.get("teamName") != "NEW" or r0.get("agentName") != "newmate":
+                    stray.append("a rename restamp did not touch both fields")
+            # already-agreeing is a no-op refusal
+            noop = eng7.restamp_plan(target, "OLD")
+            if noop["proved"] or not noop["objections"]:
+                stray.append("an already-agreeing restamp did not refuse")
+            # receipt is mandatory: apply, then verify, then verify the cycle
+            apply_restamp(plan)
+            stored = json.loads(
+                (Path(td) / "receipts" / f"{target.stem}.restamp.json").read_text())
+            if stored.get("old", {}).get("teamName") != "OLD":
+                stray.append("the receipt did not confess the old value")
+            if target.stat().st_mode & 0o777 != 0o600:
+                stray.append("the restamp did not preserve file mode")
+            back = eng7.restamp_plan(target, "OLD")
+            if not back["proved"]:
+                stray.append("the restamped file does not restamp back")
+            else:
+                apply_restamp(back)
+                if target.read_text() != "".join(compact(r) + "\n" for r in rows):
+                    stray.append("the round trip did not restore the original bytes")
+        finally:
+            globals()["RECEIPTS_DIR"] = real_receipts
+        # The live-holder guard: the composed question sees a lineage pid,
+        # and the writer is unreachable without it being asked first.
+        me = os.getpid()
+        alive_table = [(me, 0, f"claude --resume {target.stem} --agent-id mate@OLD")]
+        if not RESOLVER.transcript_holders(target.stem, alive_table)[1]:
+            stray.append("the holder question misses a live restamp target")
+        reap_src = ast.get_source_segment(source, funcs["rebind_reap"]) or ""
+        holder_at = reap_src.find("transcript_holders(")
+        if not (0 <= holder_at < reap_src.find("restamp_plan(", holder_at)):
+            stray.append("the restamp does not check holders first")
+        if "args.force" not in reap_src.split("restamp_plan(")[0]:
+            stray.append("the restamp is reachable without --force")
+        check("--force restamps a living team's window-start, receipted, "
+              "reversible, mode-preserved", not stray, ", ".join(stray))
+
     # --- a rebind retires the stamped team only when nothing would notice
     with tempfile.TemporaryDirectory() as td:
         eng6 = Resolver()
@@ -8066,14 +8264,18 @@ def run_selftest(live=False):
 
     try:
         RESOLVER.lead_pid_for = lambda uuid: (4242, "x", True)
+        def why_of(ctx_, args_, **kw):
+            answer = already_running(ctx_, args_, **kw)
+            return answer[0] if answer else ""
+
         stops = {
             "a live conversation stops an exec":
                 bool(already_running(live_ctx, _NoForce, is_lead=True)),
             "a live conversation stops a spawn":
                 bool(already_running(live_ctx, _NoForce, is_lead=False)),
             "and both name the session and the pid":
-                all("live-uuid" in (already_running(live_ctx, _NoForce, is_lead=k) or "")
-                    and "4242" in (already_running(live_ctx, _NoForce, is_lead=k) or "")
+                all("live-uuid" in why_of(live_ctx, _NoForce, is_lead=k)
+                    and "4242" in why_of(live_ctx, _NoForce, is_lead=k)
                     for k in (True, False)),
             "--force releases the exec":
                 already_running(live_ctx, _Forced, is_lead=True) is None,
@@ -8085,7 +8287,43 @@ def run_selftest(live=False):
             "a lead's is not":
                 bool(already_running({**live_ctx, "to_team": "t"}, _NoForce,
                                      is_lead=True)),
+            # The member-only extension: the seat questions live in the same
+            # step, and the pane one is said in the report's grammar.
+            "a member already in the pane stops the spawn":
+                already_running({"session_uuid": "u"}, _NoForce, is_lead=False,
+                                agent_id="a@t", here=[77], pane="%3")
+                == ("a@t is already running in pane %3 (pid 77)", True),
+            "an explicit rebind may take that pane":
+                already_running({"session_uuid": "u", "to_team": "t"}, _NoForce,
+                                is_lead=False, agent_id="a@t", here=[77],
+                                pane="%3") is None,
+            "a redirect chosen by the tool may not":
+                already_running({"session_uuid": "u", "to_team": "t",
+                                 "auto_redirect": True}, _NoForce, is_lead=False,
+                                agent_id="a@t", here=[77], pane="%3") is not None,
+            # A lead has no seat, so the pane never enters its answer: with
+            # the owner live it stops for that reason and no other.
+            "a lead asks no seat question":
+                "pane" not in why_of(live_ctx, _NoForce, is_lead=True,
+                                     agent_id="a@t", here=[77], pane="%3"),
         }
+        real_procs = RESOLVER.live_agent_procs
+        RESOLVER.live_agent_procs = lambda aid, tbl=None: [(99, "x")]
+        RESOLVER.lead_pid_for = lambda uuid: None
+        try:
+            # With no owner, the elsewhere question is the one left to answer.
+            stops["the same id running elsewhere stops the spawn"] = (
+                "outside pane %3" in why_of({"session_uuid": "u"}, _NoForce,
+                                            is_lead=False, agent_id="a@t", pane="%3"))
+            stops["and a lead never asks it"] = already_running(
+                {"session_uuid": "u"}, _NoForce, is_lead=True, agent_id="a@t",
+                pane="%3") is None
+            # Guarded: a missing answer must fail this line, not crash it.
+            stops["its own pane is not elsewhere"] = (already_running(
+                {"session_uuid": "u"}, _NoForce, is_lead=False, agent_id="a@t",
+                here=[99], pane="%3") or (None, None))[1] is True
+        finally:
+            RESOLVER.live_agent_procs = real_procs
         RESOLVER.lead_pid_for = lambda uuid: (4242, "x", False)
         stops["a dead owner stops nothing"] = all(
             already_running(live_ctx, _NoForce, is_lead=k) is None for k in (True, False))
@@ -8117,7 +8355,7 @@ def run_selftest(live=False):
     # Arbitrary-text whole-file writing stays with the writers of
     # transcript-shaped files; everything JSON-shaped uses the json spelling.
     texters = sorted(callers_of("replace_text")
-                     - {"materialize", "embed", "run_selftest"})
+                     - {"materialize", "embed", "apply_restamp", "run_selftest"})
     check("raw whole-file writes stay with the conversion writers", not texters,
           ", ".join(texters))
 
