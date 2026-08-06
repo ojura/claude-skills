@@ -744,6 +744,7 @@ class Resolver:
         solely mid-history. When it finds nothing, grep re-asks over whole files
         before the answer is allowed to be "no transcript".
         """
+        self._exercise(NEED.STAMPS)  # the grep fallback is stamps work too
         files = [p for p, (n, t) in self.stamp_index().items() if n == name and (not team or t == team)]
 
         if not verify:
@@ -7764,9 +7765,16 @@ def run_selftest(live=False):
             maybe_ok = True
         except RuntimeError:
             maybe_ok = False
+    side_refused = ""
+    try:
+        Resolver()._stamped_candidates("nobody")
+    except RuntimeError as err:
+        side_refused = str(err)
     contract = {
         "an undeclared compute refuses by name":
             "transcript identity stamps" in refused and "NEED.STAMPS" in refused,
+        "a side path refuses like the front door":
+            "transcript identity stamps" in side_refused,
         "a declared one answers, and a lean run audits clean": answered and lean_ok,
         "a fat declaration is refused at the end": "PROCS" in fat_refused
             and "STAMPS" not in fat_refused,
