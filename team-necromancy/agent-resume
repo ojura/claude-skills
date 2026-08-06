@@ -3394,10 +3394,9 @@ def enforce_restore(ctx, args):
     stamped, state = RESOLVER.restored_identity(path)
     if state != "restored":
         return
-    # The comparison is against the DESTINATION. The merged teamName echoes
+    # The comparison is against the DESTINATION: the merged teamName echoes
     # the stamps for a stamped transcript, so comparing it to the restored
-    # team is the guard comparing the stamps to themselves - the dead branch
-    # a verification caught behind a green suite.
+    # team compares the stamps to themselves.
     rebind = ctx.get("to_team") if ctx.get("to_team") not in (None, "live", "auto") else None
     dest = rebind or RESOLVER.field(ctx, "teamName")
     if not dest or stamped == dest:
@@ -5469,8 +5468,7 @@ def run_promote(args):
     defaulted = not name
     name = name or entry["name"] or entry["task_id"]
     if not team:
-        die("the destination team must be spoken: --as name@team. "
-            "An address only locates; a destination is typed")
+        die("the destination team must be typed: --as name@team")
     plan = RESOLVER.conversion_plan(entry["path"], "promote", cut=args.cut)
     if plan["objections"] or not plan["proved"]:
         die("; ".join(plan["objections"]) or "the inverse could not be proved")
@@ -5563,7 +5561,7 @@ def run_demote(args):
 def run_mail_ledger(selector=None):
     """A team's mail, send side joined against delivery side. Read-only."""
     if not selector:
-        die("--mail-ledger needs a team; the join is per-team evidence")
+        die("--mail-ledger needs a team, as session-<id> or a prefix of it")
     team = selector if selector.startswith("session-") else f"session-{selector[:8]}"
     ledger = RESOLVER.mail_ledger(team)
     if not ledger:
