@@ -475,12 +475,86 @@ def step(dry, would, did, indent="  "):
     Both strings sit at the call site, so a preview line always has a real
     counterpart and a real run prints the same set of steps a dry run promised.
     """
-    print(f"{indent}{would if dry else did}")
+    print(fill(f"{indent}{would if dry else did}"))
+
+
+def term_width():
+    """Columns to wrap output to: the terminal's, at most 100, at least 40.
+
+    100 is the design width. A narrower terminal wraps sooner; below 40 a
+    wrap would break more lines than it saves, so that is the floor.
+    """
+    return max(40, min(shutil.get_terminal_size((100, 24)).columns, 100))
+
+
+def fill(text, width=None, offset=0):
+    """`text` wrapped at spaces for a terminal. Facts reflow, never shrink.
+
+    Each input line wraps on its own, keeping its indent. A continuation
+    hangs under the line's own shape: past a `label   ` column or a `- `
+    bullet when the line opens with one, two spaces in when it does not. A
+    token is never split, so an identifier stays whole and greppable; one
+    wider than the terminal overflows rather than losing characters.
+    `offset` is room a prefix the caller prints (warn's tool name) takes
+    out of the first line.
+    """
+    width = width or term_width()
+    out = []
+    for line in str(text).split("\n"):
+        head = line[:len(line) - len(line.lstrip(" "))]
+        lead = re.match(r" *(?:- |\S+ {2,})?", line).group(0)
+        hang = " " * (len(lead) + (0 if lead.strip() else 2))
+        pad = " " * offset if not out else ""
+        got = textwrap.wrap(line.lstrip(" "), width=width,
+                            initial_indent=pad + head, subsequent_indent=hang,
+                            break_long_words=False, break_on_hyphens=False)
+        out.extend([got[0][len(pad):], *got[1:]] if got else [""])
+    return "\n".join(out)
+
+
+def wrap_command(command, label, hang, paste=False, width=None):
+    """One command as physical lines: `label`, then arguments, broken only
+    between them - or inside one at single spaces when it alone cannot fit
+    and the line is a record rather than something to paste. A paste form
+    takes the argv list, breaks only between arguments and ends each broken
+    line in a backslash, so the block pastes back as the same command.
+    Either way, replacing each newline and its indent with one space
+    restores the exact string: reflowed, never reworded.
+    """
+    width = width or term_width()
+    if isinstance(command, (list, tuple)):
+        tokens = [shlex.quote(c) for c in command]
+    else:
+        tokens = command.split(" ")  # split(" ") keeps runs of spaces exact
+    marker = " \\" if paste else ""
+    lines, chunk, prefix = [], [], label
+    for token in tokens:
+        trial = " ".join(chunk + [token])
+        if chunk and len(prefix) + len(trial) + len(marker) > width:
+            lines.append(prefix + " ".join(chunk) + marker)
+            prefix, chunk = hang, [token]
+        else:
+            chunk.append(token)
+    lines.append(prefix + " ".join(chunk))
+    return "\n".join(lines)
+
+
+def tint(text, sgr):
+    """`text` in an SGR colour when a person is looking, plain otherwise.
+
+    Plain when stdout is not a terminal, when --no-color or the NO_COLOR
+    convention asked for plain, and always for the words themselves: colour
+    only ever restates what the text already says, so nothing is lost with
+    it off.
+    """
+    if not sgr or NO_COLOR or not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        return text
+    return f"\033[{sgr}m{text}\033[0m"
 
 
 def warn(msg):
     sys.stdout.flush()  # keep warnings in order with the report block when piped
-    print(f"{TOOL}: {msg}", file=sys.stderr)
+    print(f"{TOOL}: {fill(msg, offset=len(TOOL) + 2)}", file=sys.stderr)
     sys.stderr.flush()
 
 
@@ -6978,6 +7052,37 @@ def run_selftest(live=False):
                 if "print(" in line and "would " in line and " else " not in line]
     check("every preview line has a real counterpart", not unpaired, "; ".join(unpaired))
 
+    # Wrapping serves the reader; the reader is not owed less. Every physical
+    # line fits the width, and the reflowed text says word for word what the
+    # wall said: a lost fact must never be the fix for an unreadable one.
+    tale = ("pid 4242 holds team-lead's transcript in pane %7 and refuses; " * 8).strip()
+    filled = fill(tale, width=72)
+    check("a long message wraps inside the width and loses nothing",
+          all(len(l) <= 72 for l in filled.splitlines())
+          and " ".join(filled.split()) == " ".join(tale.split()),
+          f"widest line {max(map(len, filled.splitlines()))} of width 72")
+
+    # A command line is a record and sometimes a paste form. Wrapped either
+    # way, replacing newline+indent with one space must give back the exact
+    # string, and the paste form must still parse as the same argv.
+    argv_case = ["claude", "--resume", "0" * 36, "--agent-id", "one@session-two",
+                 "--append-system-prompt", "two words  doubled", "--model", "m"]
+    pasted = wrap_command(argv_case, "command  ", " " * 11, paste=True, width=64)
+    lines = pasted.splitlines()
+    rejoined = " ".join([lines[0][len("command  "):].rstrip("\\").rstrip()]
+                        + [l[11:].rstrip("\\").rstrip() for l in lines[1:]])
+    record_case = "tmux -L s split-window 'exec env A=1  B=2 claude --long-flag'"
+    recorded = wrap_command(record_case, "  ran: ", "    ", width=24)
+    rec_lines = recorded.splitlines()
+    rec_joined = " ".join([rec_lines[0][len("  ran: "):]] + [l[4:] for l in rec_lines[1:]])
+    check("a wrapped command rejoins to the exact command",
+          shlex.split(rejoined) == argv_case and rec_joined == record_case
+          and len(lines) > 1 and all(len(l) <= 64 for l in lines)
+          # the paste form is only a paste form while every broken line
+          # still announces its continuation
+          and all(l.endswith(" \\") for l in lines[:-1]),
+          f"paste ok {shlex.split(rejoined) == argv_case}, record ok {rec_joined == record_case}")
+
     # Classification, not position, decides what a token is. Every entry must
     # carry both facts, or a future flag is added half-specified and the walk
     # silently treats its value as a name.
@@ -7474,7 +7579,9 @@ def run_selftest(live=False):
             apply_selector("session-deadbeef", _Args(resume=None, agent_id=None, team=None), {})
         except SystemExit:
             pass
-    said = diag.getvalue()
+    # Normalised before matching: the refusal wraps for the terminal, and this
+    # asserts what it says, not where its line breaks fall.
+    said = " ".join(diag.getvalue().split())
     named = all(kind in said for kind in ("roster on disk", "spawn payloads", "stamped"))
     check("an unknown team-shaped token names every evidence it lacks", named, said.strip()[:70])
 
@@ -9215,6 +9322,11 @@ def main():
     # forwarded flags (argparse can't know that --model takes a value).
     argv = sys.argv[1:]
     args, passthrough = parser.parse_known_args(argv)
+    # For every surface, not only completion: an abort listing under
+    # --no-color must be as plain as the candidates are. The NO_COLOR
+    # convention (any value set in the environment) asks the same thing.
+    global NO_COLOR
+    NO_COLOR = args.no_color or bool(os.environ.get("NO_COLOR"))
     check_passthrough(passthrough, parser)
     selector, passthrough = classify_passthrough(passthrough)
     check_identity_flags(args, passthrough)
@@ -9263,8 +9375,6 @@ def main():
         return run_install()
 
     if args.complete:
-        global NO_COLOR
-        NO_COLOR = args.no_color
         return run_complete(args.complete)
 
     if args.poison and args.unpoison:
