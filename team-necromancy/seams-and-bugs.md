@@ -50,6 +50,30 @@ good components that nobody introduced to each other.
    `capture-pane -p`. Check for `\x1b[2m` with `-e` before believing that a
    human (or anyone) typed something. Bitten twice in one night.
 
+8. **Mint is not adoption.** A boot with no `--agent-id` mints
+   `session-<sessionId[:8]>` and writes its config; at first render the
+   harness reads the loaded window's first entry, and when it carries both
+   `agentName` and `teamName` stamps it overwrites the team context from
+   them: stamped team, roster self-match by name, an empty in-RAM teammate
+   map, no idle hook for a restored lead. Everything operative follows the
+   restored context, and every new line re-stamps it, so a flagless resume of
+   a stamped transcript runs as the stamped team forever, not the minted one.
+   The mint record is a mint event that adoption then discards. Anything that
+   answers "runs as" from the session id or the mint ledger overclaims for
+   resumed transcripts; the window-start stamps are the operand the harness
+   actually consumes.
+
+   The unsettled half, code-read grade: the restore does not appear to be
+   gated on the absence of identity flags, which would let a stamped
+   window-start override an explicit `--agent-id`/`--team-name` while argv
+   keeps wearing the flags. Field counter-evidence exists on this box: one
+   life ran flag-bound at team A for three hours over a window-start stamped
+   team B, and its idle notifications routed to team A, so the flags governed
+   the one observable that fired. A two-minute experiment decides it
+   (synthetic stamped transcript, flag-bound launch, read the stamps on the
+   child's new lines); until it runs, treat rebinding a stamped transcript by
+   flags as unproven rather than safe.
+
 ## The bugs (file-worthy)
 
 1. **Teammate viewer accepts input it cannot deliver** (seam 4). Either route
