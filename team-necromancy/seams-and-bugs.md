@@ -91,6 +91,25 @@ good components that nobody introduced to each other.
    correction - is a trigger-frequency change in the existing lane, not
    architecture.
 
+   Sharpest form: delivery latency here is a scheduling policy, not a
+   transport cost. Measured on a verified specimen: file I/O contributed
+   microseconds, the poll cadence at most a second, and the idle gate
+   4m46s - over 99% of observed latency was policy. The achievable floor
+   for any mid-turn channel is the next tool-result boundary (nothing
+   interrupts mid-inference), which is where user corrections already sit;
+   the upstream design question is only ever which paths require the
+   recipient's attention to be whole.
+
+10. **The drain-then-die window.** Messages are marked read after being
+    "successfully delivered or reliably queued" (useInboxPoller.ts:861-863,
+    its own comment) - and the queue is AppState, which is RAM. A crash
+    between queueing and turn-end delivery loses mail the inbox file now
+    claims was read, and the loss is invisible to transcripts: the message
+    survives only as a successful send in the sender's transcript. The
+    protection comment documents the exact window it does not close. A
+    sender-vs-recipient transcript join (mail_ledger) is what surfaces this
+    shape as an "unexplained" unmatched send.
+
 ## The bugs (file-worthy)
 
 1. **Teammate viewer accepts input it cannot deliver** (seam 4). Either route
