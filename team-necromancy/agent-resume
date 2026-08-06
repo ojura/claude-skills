@@ -578,6 +578,16 @@ def ms_str(ts):
     return datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def said_when(iso):
+    """A stored ISO timestamp the way the ledger prints time, or itself unparsed.
+
+    One clock for every report: the inbox files store 2026-08-06T13:33:30.168Z
+    and the ledger prints local wall time, and a reader comparing the two
+    should not need to convert timezones in their head.
+    """
+    return ms_str(iso_ms(iso)) if iso_ms(iso) else str(iso)
+
+
 # ---------------------------------------------------------------- process table
 
 class Resolver:
@@ -1552,7 +1562,7 @@ class Resolver:
                 if count is None:
                     out.append(f"{name}'s inbox is {oldest}")
                 elif count:
-                    out.append(f"{count} unread for {name}, oldest {oldest}")
+                    out.append(f"{count} unread for {name}, oldest {said_when(oldest)}")
         return out
 
     def nameless_receipts(self):
@@ -1702,11 +1712,11 @@ class Resolver:
         """
         start = self.window_start(path)
         if not start:
-            return {"objections": ["no stamped window-start to restamp"],
-                    "proved": False}
+            return {"objections": ["this conversation carries no stamped identity "
+                                   "record to rewrite"], "proved": False}
         old_name, old_team, uuid = start
         if old_team == team and (name is None or name == old_name):
-            return {"objections": [f"the window-start already testifies {team}; "
+            return {"objections": [f"its identity record already says {team}; "
                                    "nothing to rewrite"], "proved": False}
         try:
             raws = path.read_text(errors="strict").split("\n")
@@ -1720,7 +1730,7 @@ class Resolver:
                 continue
             loaded, why = self._codec_load(raw)
             if loaded is None:
-                return {"objections": [f"the window-start line {why}"],
+                return {"objections": [f"its identity record {why}"],
                         "proved": False}
             rec, style = loaded
             if rec.get("uuid") != uuid:
@@ -1751,7 +1761,7 @@ class Resolver:
                        "at": int(time.time() * 1000)}
             return {"path": path, "lines": out, "receipt": receipt,
                     "objections": [], "proved": True}
-        return {"objections": [f"window-start {uuid} not found as a line"],
+        return {"objections": [f"identity record {uuid} not found as a line"],
                 "proved": False}
 
     def rebind_fragility(self, stem, team):
@@ -5897,9 +5907,14 @@ def apply_restamp(plan):
 
 
 def reap_blockers(stamped, args, table=None):
-    """Why this team cannot be retired: one line per class, each with its way
-    out. Read-only, so a caller can know it is blocked before it asks anyone
-    anything - the reason a redirect presents one decision and not three.
+    """Why this team cannot be retired: one line per objection, each class
+    closed by its way out. Read-only, so a caller can know it is blocked
+    before it asks anyone anything - the reason a redirect presents one
+    decision and not three.
+
+    The lines are shaped for warn/die: bullets under the caller's opening
+    sentence, so ten objections read as a list rather than a wall, and a
+    bounded list says how much it left out.
     """
     table = RESOLVER.ps_table() if table is None else table
     objections = RESOLVER.reap_objections(stamped, table,
@@ -5909,16 +5924,20 @@ def reap_blockers(stamped, args, table=None):
              and ("wears" in o or "operates" in o)]
     mail = [o for o in objections if o not in held and o not in alive]
     lines = []
+
+    def blocker(items, escape):
+        lines.extend(f"- {item}" for item in items[:4])
+        if len(items) > 4:
+            lines.append(f"- and {len(items) - 4} more like these")
+        lines.append(f"  ({escape})")
+
     if mail:
-        lines.append("; ".join(mail[:4])
-                     + " (--with-mail archives it into the receipt)")
+        blocker(mail, "--with-mail archives it into the receipt")
     if alive and not args.force:
-        lines.append("; ".join(alive[:4])
-                     + " (--force restamps the window-start instead: two "
-                       "fields, receipted, reversible)")
+        blocker(alive, "--force instead rewrites the team this conversation "
+                       "comes back as: two fields, receipted, reversible")
     if held:
-        lines.append("; ".join(held[:4])
-                     + " (stop it first; nothing forces this one)")
+        blocker(held, "stop it first; nothing forces this one")
     return lines
 
 
@@ -5943,7 +5962,7 @@ def rebind_reap(stamped, dest, args, prefix="", path=None, fatal=True):
     lines = reap_blockers(stamped, args, table)
     if lines:
         said = (f"a rebind onto {dest} needs {stamped} retired, and it "
-                "refuses: " + ". Also: ".join(lines))
+                "refuses:\n" + "\n".join(lines))
         # A redirect is a courtesy the run offers, so it reports and leaves
         # the agent where it is; an explicit --to-team was asked for, so it
         # stops the run.
@@ -5963,10 +5982,13 @@ def rebind_reap(stamped, dest, args, prefix="", path=None, fatal=True):
                 "retry with --force")
         plan = RESOLVER.restamp_plan(path, dest)
         if plan["objections"] or not plan["proved"]:
-            die("; ".join(plan["objections"]) or "the restamp could not be proved")
-        print(f"{prefix}{'would restamp' if args.dry_run else 'restamped'} "
-              f"the window-start: {stamped} -> {dest}  "
-              f"(receipt: {RECEIPTS_DIR / (path.stem + '.restamp.json')})")
+            die("; ".join(plan["objections"]) or "the rewrite could not be proved")
+        step(args.dry_run,
+             f"would rewrite the team this conversation comes back as: {stamped} "
+             f"-> {dest}  (receipt: {RECEIPTS_DIR / (path.stem + '.restamp.json')})",
+             f"rewrote the team this conversation comes back as: {stamped} "
+             f"-> {dest}  (receipt: {RECEIPTS_DIR / (path.stem + '.restamp.json')})",
+             indent=prefix)
         if not args.dry_run:
             apply_restamp(plan)
         print(f"{prefix}rebound  this transcript runs as {dest} from now on; "

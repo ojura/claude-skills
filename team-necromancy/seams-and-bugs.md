@@ -236,10 +236,9 @@ good components that nobody introduced to each other.
    cannot be answered at all: mail is deleted from the inbox file when a busy
    recipient picks it up into memory, and dies with the process if that turn
    never ends. One field per message would settle both: picked up at, and
-   delivered at. It also retires the guessing this costs everyone downstream,
-   where an idle notification gets read as a delivery receipt because nothing
-   better exists, and it is a proxy for the wrong event: a turn ending says
-   nothing about which messages were in it.
+   delivered at. The only signal that exists today is the idle notification,
+   which reaches leads and nobody else, and it answers a different question:
+   a turn ended, with no way to tell which messages were in it.
 
 2. **`teammateMode: bg`.** The daemon substrate already gives supervision,
    auto-respawn, truecolor, exit survival, attach/logs/stop, and resume built
