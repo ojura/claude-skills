@@ -2312,34 +2312,42 @@ class Resolver:
                 entry["agent_type"] = meta.get("agentType")
             except (OSError, ValueError):
                 pass
-            entry["grammar"], entry["detail"] = self._side_grammar(path)
+            entry["grammar"], entry["detail"], entry["root"] = self._side_grammar(path)
             out.append(entry)
         return out
 
     def _side_grammar(self, path):
-        """(grammar, detail) for one side transcript, from its first record.
+        """(grammar, detail, root) for one side transcript, from its first records.
 
-        pointer -> the ref record itself; rooted -> the root uuid;
-        unclassifiable -> a sentence naming what the first record actually is.
+        pointer -> the ref record itself; rooted -> the root uuid; either way
+        `root` is the chain root's uuid (for a pointer fork, the null-parent
+        record after the ref: 138 of 138 here carry one). unclassifiable ->
+        a sentence naming what the first record actually is, root None.
         """
         try:
             with path.open(errors="replace") as handle:
                 first = handle.readline().strip()
+                second = handle.readline().strip()
         except OSError as err:
-            return "unclassifiable", f"unreadable ({err.__class__.__name__})"
+            return "unclassifiable", f"unreadable ({err.__class__.__name__})", None
         if not first:
-            return "unclassifiable", "the file is empty"
+            return "unclassifiable", "the file is empty", None
         try:
             rec = json.loads(first)
         except ValueError:
-            return "unclassifiable", "the first line is not JSON"
+            return "unclassifiable", "the first line is not JSON", None
         if rec.get("type") == "fork-context-ref":
-            return "pointer", rec
+            try:
+                nxt = json.loads(second) if second else {}
+            except ValueError:
+                nxt = {}
+            root = nxt.get("uuid") if nxt.get("parentUuid") is None else None
+            return "pointer", rec, root
         if rec.get("parentUuid") is None and rec.get("isSidechain") is True and rec.get("uuid"):
-            return "rooted", rec["uuid"]
+            return "rooted", rec["uuid"], rec["uuid"]
         parent = "null" if rec.get("parentUuid") is None else "set"
         return "unclassifiable", (f"the first record is type={rec.get('type', '?')}, "
-                                  f"parentUuid={parent}, isSidechain={rec.get('isSidechain')}")
+                                  f"parentUuid={parent}, isSidechain={rec.get('isSidechain')}"), None
 
     def side_transcript(self, selector):
         """One side transcript for a typed selector, or (None, why not).
@@ -2355,13 +2363,19 @@ class Resolver:
                     and name_part in (e["name"], e["task_id"])]
         else:
             hits = [e for e in sides if e["task_id"] == selector]
-            hits = hits or [e for e in sides
-                            if e["grammar"] == "rooted" and e["detail"] == selector]
+            hits = hits or [e for e in sides if e["root"] == selector]
             hits = hits or [e for e in sides if e["name"] == selector]
         if not hits:
             return None, f"no side transcript matches {selector!r}"
         if len(hits) > 1:
-            shown = ", ".join(f"{e['parent'][:8]}/{e['name'] or e['task_id']}" for e in hits[:6])
+            # A refusal names what it refused between, in spellings that can
+            # actually be typed apart: when the pretty form collides, the
+            # colliding candidates are named by task id instead.
+            pretty = [f"{e['parent'][:8]}/{e['name'] or e['task_id']}" for e in hits]
+            tallies = collections.Counter(pretty)
+            named = [p if tallies[p] == 1 else f"{e['parent'][:8]}/{e['task_id']}"
+                     for p, e in zip(pretty, hits)]
+            shown = ", ".join(named[:6])
             more = f" and {len(hits) - 6} more" if len(hits) > 6 else ""
             return None, f"{len(hits)} side transcripts match {selector!r}: {shown}{more}"
         return hits[0], ""
@@ -6370,7 +6384,8 @@ def run_selftest(live=False):
         sub.mkdir(parents=True)
         ref = {"type": "fork-context-ref", "agentId": "p1", "parentSessionId":
                "PARENT-UUID", "parentLastUuid": "leaf-1", "contextLength": 5}
-        (sub / "agent-p1.jsonl").write_text(json.dumps(ref) + "\n")
+        proot = {"type": "user", "parentUuid": None, "isSidechain": True, "uuid": "proot-1"}
+        (sub / "agent-p1.jsonl").write_text(json.dumps(ref) + "\n" + json.dumps(proot) + "\n")
         root = {"type": "user", "parentUuid": None, "isSidechain": True, "uuid": "root-1"}
         (sub / "agent-r1.jsonl").write_text(json.dumps(root) + "\n")
         (sub / "agent-r1.meta.json").write_text(
@@ -6389,13 +6404,22 @@ def run_selftest(live=False):
             wrong.append("the meta name was not carried as display")
         if got.get("m1", {}).get("grammar") != "unclassifiable":
             wrong.append("a mid-chain start was classified")
-        for sel, want in (("p1", "p1"), ("PARENT-UUID/liar", "r1"), ("root-1", "r1")):
+        for sel, want in (("p1", "p1"), ("PARENT-UUID/liar", "r1"), ("root-1", "r1"),
+                          ("proot-1", "p1")):
             hit, _why = eng.side_transcript(sel)
             if not hit or hit["task_id"] != want:
                 wrong.append(f"selector {sel!r} missed")
         hit, why = eng.side_transcript("nobody")
         if hit or "no side transcript" not in why:
             wrong.append("an absent selector did not refuse")
+        for twin in ("d1", "d2"):
+            (sub / f"agent-{twin}.jsonl").write_text(json.dumps(
+                {"type": "user", "parentUuid": None, "isSidechain": True,
+                 "uuid": f"{twin}-root"}) + "\n")
+            (sub / f"agent-{twin}.meta.json").write_text(json.dumps({"name": "twin"}))
+        hit, why = eng.side_transcript("twin")
+        if hit or not ("d1" in why and "d2" in why):
+            wrong.append("a colliding refusal did not name typeable spellings")
         check("a side transcript is classified by its own bytes",
               not wrong, ", ".join(wrong))
 
