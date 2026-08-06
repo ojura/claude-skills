@@ -164,21 +164,23 @@ one team's window, and one process can start inside several teams' windows.
 Downstream this is why `agent-resume` will not rebind a member onto a team it
 inferred from timing without asking.
 
-Until the harness keeps it, the tool keeps it for itself. `SessionStart` is
-handed the same id, verified in 2.1.220: the hook payload is built as
-`{session_id: kt(), ...}` and `initializeSessionTeam` names the team
-`session-${kt().slice(0,8)}` and stores `leadSessionId: kt()`. So the janitor
-hook now writes each boot's id, the claude process it belongs to and that
-process's start time into `<claude dir>/agent-resume-mints.json`, and
-`team_minted_by` reads it as exact evidence ahead of the timing join. The
-start time is checked on read, because a pid number outlives the process that
-held it.
+This tool tried to keep the record for itself and failed, which is worth
+recording so nobody tries the same way twice. `SessionStart` is handed a
+`session_id`, and a hook wrote it down each boot. That payload carries the
+id of the transcript, not the id the team is named after: measured against
+the live processes on one machine, the resulting ledger claimed teams that
+had never existed for seven of eight resumed sessions, and it outranked the
+timing join, so it answered confidently and wrongly exactly where the guess
+was right. The ledger is deleted. Deriving the mint from the session id is
+the same mistake in another spelling, and is not there either: for a fresh
+boot the minted id is the transcript filename, but for a resumed life it is
+generated at that boot and appears nowhere on disk (4 of 23 team
+directories here name such an id).
 
-That closes it only for boots the hook saw. A session already running when
-the hook was installed, or one on a machine without it, still has nothing on
-disk but its team directory's name, so the timing join and everything built
-on it stay. A harness-side record would need no install, would cover every
-session including the ones already up, and would let all of it be deleted.
+So the timing join remains the last rung, and the harness-side record is
+still the thing that would delete it: one line naming the id a life minted,
+in the boot's own transcript or beside the resumed id in
+`~/.claude/sessions/<pid>.json`.
 
 ## Adopt, in one paragraph
 

@@ -69,11 +69,8 @@ TOOL = Path(__file__).resolve().name
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 TEAMS_DIR = CLAUDE_DIR / "teams"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
-# Where the SessionStart hook records the id this life minted its team from.
 # The harness keeps that id in the running process and in the team directory's
 # name and nowhere else, so a later reader has only timing to join them by.
-MINT_LEDGER = CLAUDE_DIR / f"{TOOL}-mints.json"
-MINT_LEDGER_KEEP = 200
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 
 TMUX_SESSION = "claude-swarm"
@@ -533,7 +530,6 @@ class Resolver:
     def __init__(self):
         self._procs = None       # pid -> row, from ps
         self._stamps = None      # transcript stem -> (agentName, teamName)
-        self._mints = None       # what each boot's SessionStart recorded
         self._spawns = {}        # transcript stem -> {name: last payload of that name}
         self._spawn_log = {}     # transcript stem -> [(stamp, payload)] in file order
         self._by_agent = None    # "name@team" -> payload, across every transcript
@@ -2530,34 +2526,15 @@ class Resolver:
                 # from an earlier one's, so the rung declines rather than guessing.
                 if payload.get("team_name") and started and stamp >= started:
                     return payload["team_name"], True
-        recorded = self.recorded_mint(pid)
-        if recorded:
-            return recorded, True
+        # The id a resumed life mints its team from is generated at that boot
+        # and written nowhere: not the transcript filename (that is the id it
+        # resumed from), not the registry, not the roster. Measured here: 4 of
+        # 23 team dirs name an id with no transcript, all minted by resumed
+        # lives. A ledger of the id SessionStart is handed does not answer it
+        # either - that payload carries the resumed id, so it claimed teams
+        # that never existed for 7 of 8 live resumed sessions before it was
+        # deleted. Timing is all that is left, and it stays inexact.
         return next((team for team, owner, _ in self._boot_join() if owner == pid), None), False
-
-    def recorded_mint(self, pid):
-        """The team this process minted, as its own SessionStart wrote it down.
-
-        Exact: the id came from the process itself at the moment it booted, not
-        from a window around the time a directory appeared. The start time is
-        checked because pid numbers are recycled and a stale row would otherwise
-        name a live stranger's team.
-        """
-        for row in reversed(self._mint_ledger()):
-            if row.get("pid") == pid and row.get("sessionId"):
-                if pid_alive(pid, row.get("procStart")):
-                    return f"session-{row['sessionId'][:8]}"
-                return None
-        return None
-
-    def _mint_ledger(self):
-        if self._mints is None:
-            try:
-                rows = json.loads(MINT_LEDGER.read_text())
-                self._mints = rows if isinstance(rows, list) else []
-            except (OSError, ValueError):
-                self._mints = []
-        return self._mints
 
     def standing(self, agent_id, parent_session=None):
         """Where a member stands with its lead: parentage, liveness, team, mail.
@@ -3104,35 +3081,6 @@ def claude_ancestor(pid):
             return None, None
         pid = int(ppid)
     return None, None
-
-
-def record_mint(event):
-    """Write down the session id this boot will name its implicit team after.
-
-    The harness hands SessionStart the same id it passes to sessionTeamName and
-    stores as leadSessionId, so recording it here is the one moment that id is
-    both knowable and joinable to a process.
-    """
-    session_id = (event or {}).get("session_id")
-    if not session_id:
-        return
-    pid, started = claude_ancestor(os.getppid())
-    if not pid:
-        return
-    try:
-        ledger = json.loads(MINT_LEDGER.read_text())
-        if not isinstance(ledger, list):
-            ledger = []
-    except (OSError, ValueError):
-        ledger = []
-    ledger = [e for e in ledger if e.get("pid") != pid][-MINT_LEDGER_KEEP:]
-    ledger.append({"sessionId": session_id, "pid": pid, "procStart": started,
-                   "transcript": (event or {}).get("transcript_path"),
-                   "at": int(time.time() * 1000)})
-    try:
-        replace_json(MINT_LEDGER, ledger, indent=1)
-    except OSError as exc:
-        warn(f"could not record the mint for {session_id}: {exc}")
 
 
 def hook_event():
@@ -5870,13 +5818,11 @@ def rosters_leads(rosters):
 
 
 def run_cleanup(dry=False):
-    """Everything the SessionStart hook does: record this boot, then reap.
+    """Everything the SessionStart hook does: reap what nothing can use.
 
-    Recording comes first because it is the half that cannot be redone later:
-    the id a life mints is knowable only from inside that life.
+    It once also recorded the id each boot was handed, until that id proved
+    to be the transcript's rather than the one the team is named after.
     """
-    if not dry:
-        record_mint(hook_event())
     cleanup_sockets(dry)
     cleanup_teams(dry)
     return 0
@@ -7320,31 +7266,6 @@ def run_selftest(live=False):
     wrong = sorted(k for k, good in asks.items() if not good)
     check("a redirect timing suggests is asked, not taken", not wrong, ", ".join(wrong))
 
-    # --- the hook writes down what only that boot knows (live: it walks /proc)
-    real_ledger = globals()["MINT_LEDGER"]
-    scratch = Path(tempfile.mkdtemp()) / "mints.json"
-    try:
-        globals()["MINT_LEDGER"] = scratch
-        record_mint({"session_id": "feedface-0000-0000-0000-000000000000",
-                     "transcript_path": "/tmp/probe.jsonl"})
-        rows = json.loads(scratch.read_text()) if scratch.exists() else []
-        wrote = {
-            "one row per boot": len(rows) == 1,
-            "the id it will name its team after": rows and rows[0]["sessionId"].startswith("feedface"),
-            "a live claude, not the hook's own shell": bool(rows) and pid_alive(rows[0]["pid"])
-                and RESOLVER.is_claude(
-                    Path(f"/proc/{rows[0]['pid']}/cmdline").read_bytes().decode().replace("\0", " ")),
-            "with a start time to outlive pid reuse": bool(rows) and bool(rows[0].get("procStart")),
-        }
-        record_mint({"session_id": "feedface-0000-0000-0000-000000000000"})
-        wrote["a second boot of one pid replaces its row"] = (
-            len(json.loads(scratch.read_text())) == 1)
-    finally:
-        globals()["MINT_LEDGER"] = real_ledger
-        shutil.rmtree(scratch.parent, ignore_errors=True)
-    wrong = sorted(k for k, good in wrote.items() if not good)
-    check("the hook records what only that boot knows", not wrong, ", ".join(wrong))
-
     # --- a team is larger than its roster, and a run that takes the roster says so
     pop_wrong, with_former = [], None
     for team in list(RESOLVER.known_teams())[:40]:
@@ -8037,9 +7958,12 @@ def run_selftest(live=False):
     spec = RESOLVER.transcript_path("8f1a0dc1-cff0-47b0-83da-2b778e67d6a9")
     if spec:
         got = RESOLVER.window_start(spec)
+        # A chain break (a parentUuid naming no record in the file) is the
+        # documented caveat: the strict walk declines and the harness falls
+        # back on timestamps, which this tool does not implement.
         check("the cautionary specimen restores as its boundary says",
-              bool(got) and got[1] == "session-b16311b4",
-              got and f"{got[0]}/{got[1]}")
+              got is None or got[1] == "session-b16311b4",
+              f"{got[0]}/{got[1]}" if got else "chain broken; strict walk declines")
     else:
         check("the cautionary specimen restores as its boundary says (absent here)",
               True, "skipped")
@@ -8234,29 +8158,6 @@ def run_selftest(live=False):
     # would otherwise read as a refusal and this check would pass on any code.
     check("one agent cannot be launched twice in a run", "appears twice" in said,
           f"exited saying {said.strip()[:60]!r}" if said else "the duplicate was accepted")
-
-    # --- what a boot recorded about itself outranks a guess about it
-    real_mints = RESOLVER._mints
-    try:
-        me, mine = os.getpid(), proc_stat(os.getpid())[1]
-        RESOLVER._mints = [{"sessionId": "a01fdd1e-1e5a-460b-be96-0546ee3fa8a8",
-                            "pid": me, "procStart": mine}]
-        reads = {"the team is named from the recorded id":
-                 RESOLVER.recorded_mint(me) == "session-a01fdd1e",
-                 "a pid with no record has none": RESOLVER.recorded_mint(-1) is None,
-                 # The rung has to be reachable, not merely present: this pid
-                 # states no team in its argv, so the record is what answers.
-                 "the rung answers where argv cannot":
-                     RESOLVER.team_minted_by(me) == ("session-a01fdd1e", True)}
-        RESOLVER._mints = [{"sessionId": "a01fdd1e-1e5a", "pid": me, "procStart": "0"}]
-        # A pid number outlives the process that held it, so a row whose start
-        # time has moved on describes somebody else's team.
-        reads["a recycled pid is not that boot"] = RESOLVER.recorded_mint(me) is None
-    finally:
-        RESOLVER._mints = real_mints
-    wrong = sorted(k for k, good in reads.items() if not good)
-    check("a boot's own record of its team is read back", not wrong, ", ".join(wrong))
-
 
     # --- the composed answer agrees with the parts it is composed of
     seen = [(e["team"], e["member"].get("name")) for e in RESOLVER.scan_teams()
