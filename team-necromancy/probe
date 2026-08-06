@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Break one thing in agent-resume, and say which checks noticed.
+
+A probe is only worth running if its result can be trusted, and reading a
+suite's output for a check's name is not trustworthy: a search matches
+comments and near-identical names, a crash prints nothing and reads as
+silence, and the run you are looking at may be the restore rather than the
+probe. This runs both, compares the sets of failures, and reports the
+difference, so no reading is involved.
+
+    ./probe --expect 'check name' 'old text' 'new text'
+    ./probe --live --expect 'check name' 'old text' 'new text'
+
+Name the check you expect to fail. Some check failing is not the same as
+the right one failing: a mutation can break structural checks that have
+nothing to do with what it was testing, and "bit" reads as success either
+way. Without --expect the difference is only reported, which is worth
+having while exploring but proves nothing.
+
+One thing it cannot measure: itself. It reads the suite's failure list, so
+a mutation to how that list is produced changes what the probe sees rather
+than what the suite found, and every check appears to bite. Verify changes
+to check_report by calling it directly with sample results.
+
+Exit 0 when the expected check bit (or, with no expectation, when anything
+did), 1 when it did not, 2 when the mutation could not be applied or a run
+produced no verdict at all. Nothing is written to the tree: the mutation is applied to a
+copy in a temporary directory, and the copy is removed either way.
+"""
+
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+TOOL = Path(__file__).resolve().parent / "agent-resume"
+
+
+def verdicts(path, live):
+    """({failed check names}, ok count) for one run, or (None, reason)."""
+    argv = [sys.executable, str(path), "--selftest", "--failed"]
+    if live:
+        argv.append("--live")
+    run = subprocess.run(argv, capture_output=True, text=True)
+    lines = [line.strip() for line in run.stdout.splitlines() if line.strip()]
+    summary = [line for line in lines if line.startswith("checks: ")]
+    if not summary:
+        # No summary means the suite never finished. A crash is not a bite,
+        # and it is not a pass either.
+        tail = (run.stderr or run.stdout).strip().splitlines()[-1:] or ["no output"]
+        return None, f"the suite did not finish: {tail[0][:120]}"
+    named = {line.split("  (")[0] for line in lines if line not in summary}
+    return named, summary[0]
+
+
+def main(argv):
+    live = "--live" in argv
+    argv = [a for a in argv if a != "--live"]
+    expect = None
+    if "--expect" in argv:
+        at = argv.index("--expect")
+        if at + 1 >= len(argv):
+            print("--expect takes the name of the check that should fail")
+            return 2
+        expect = argv[at + 1]
+        argv = argv[:at] + argv[at + 2:]
+    if len(argv) != 2:
+        print(__doc__.strip().splitlines()[0])
+        print("usage: probe [--live] 'old text' 'new text'")
+        return 2
+    old, new = argv
+
+    source = TOOL.read_text()
+    hits = source.count(old)
+    if hits != 1:
+        print(f"the text to replace appears {hits} times; a probe replaces "
+              "exactly one thing, so narrow it")
+        return 2
+
+    with tempfile.TemporaryDirectory() as scratch:
+        copy = Path(scratch) / TOOL.name
+        shutil.copy2(TOOL, copy)
+        # The suite reads its own source for the structural checks, so the
+        # copy must be what runs; nothing here touches the real file.
+        copy.write_text(source.replace(old, new, 1))
+        shutil.copy2(TOOL.parent / "_agent-resume", Path(scratch) / "_agent-resume")
+
+        before, before_said = verdicts(TOOL, live)
+        after, after_said = verdicts(copy, live)
+
+    if before is None:
+        print(f"before the probe, {before_said}")
+        return 2
+    if after is None:
+        print(f"with the probe applied, {after_said}")
+        print("a crash is not a bite: the probe must make a check fail, not "
+              "stop the suite from answering")
+        return 2
+
+    bit = sorted(after - before)
+    healed = sorted(before - after)
+    print(f"clean: {before_said}")
+    print(f"probed: {after_said}")
+    if healed:
+        print("\nstopped failing (the probe fixed something, which is worth "
+              "understanding before trusting the rest):")
+        for name in healed:
+            print(f"  {name}")
+    if not bit:
+        print("\nnothing bit. Every check passed with this broken, so nothing "
+              "here is testing it.")
+        return 1
+    print("\nbit:")
+    for name in bit:
+        print(f"  {name}")
+    if expect is None:
+        return 0
+    wanted = [name for name in bit if expect in name]
+    others = [name for name in bit if expect not in name]
+    if not wanted:
+        print(f"\nbut nothing matching {expect!r} bit. What failed above is "
+              "unrelated to what this was testing, so it proves nothing about "
+              "it.")
+        return 1
+    if others:
+        print(f"\n{expect!r} bit, and so did {len(others)} check(s) this "
+              "mutation was not aimed at; a probe that breaks more than its "
+              "subject is measuring more than one thing.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

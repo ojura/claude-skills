@@ -160,6 +160,7 @@ _agent-resume() {
     '--install[symlink into ~/.local/bin, install zsh tab completion, and add the Claude Code startup hook that runs --cleanup]' \
     '--cleanup[clean up dead swarm tmux sockets and team dirs with nothing left to resume; the installed Claude Code startup hook runs this]' \
     '--selftest[run the test suite against this machine; changes nothing]' \
+    '--failed[with --selftest, print only the checks that failed]' \
     '--live[with --selftest, also run the checks that launch real processes]' \
     '--doctor[say whether each team'"'"'s lead is connected to it; reports only]' \
     '--standing[where the named agent stands with its lead: liveness, team, whether its mail is read]' \

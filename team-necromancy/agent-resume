@@ -7229,7 +7229,26 @@ def live_checks():
     return out
 
 
-def run_selftest(live=False):
+def check_report(results, failed_only=False):
+    """The suite's verdicts as lines.
+
+    The failure list names one check per line and ends with a summary, so a
+    reader can diff two runs instead of searching one, and a run that died
+    has no summary to be mistaken for a clean one.
+    """
+    failed = sum(1 for _, ok, _ in results if not ok)
+    if failed_only:
+        lines = [f"{name}{'  (' + detail + ')' if detail else ''}"
+                 for name, ok, detail in results if not ok]
+        return lines + [f"checks: {len(results) - failed} ok, {failed} failed"]
+    width = max((len(name) for name, _, _ in results), default=0)
+    lines = [f"  {'PASS' if ok else 'FAIL'}  {name:<{width}}"
+             + (f"  ({detail})" if detail else "")
+             for name, ok, detail in results]
+    return lines + ["", f"{len(results) - failed}/{len(results)} checks passed"]
+
+
+def run_selftest(live=False, failed_only=False):
     """Assert the invariants this tool keeps rediscovering. Read-only.
 
     Two kinds: structural ones read from this file's own syntax tree, because
@@ -8677,6 +8696,21 @@ def run_selftest(live=False):
         RESOLVER.team_minted_by, RESOLVER.restored_identity = real_minted, real_restored
         RESOLVER.lead_pid_for, RESOLVER.live_agent_procs = real_owner2, real_live_procs
         RESOLVER.field = real_field
+    # --- a failure list is a list, and a summary says the suite finished
+    sample = [("a passing check", True, ""), ("a failing check", False, "why")]
+    brief, full = check_report(sample, failed_only=True), check_report(sample)
+    reporting = []
+    if [line for line in brief if line.startswith("checks: ")] != ["checks: 1 ok, 1 failed"]:
+        reporting.append("a run without exactly one summary cannot be told from one that died")
+    if any("a passing check" in line for line in brief):
+        reporting.append("the failure list carries passes")
+    if not any(line.startswith("a failing check") for line in brief):
+        reporting.append("the failure list drops the failure")
+    if not any("PASS" in line for line in full):
+        reporting.append("the full report lost its passes")
+    check("a failure list is a list, and a summary says the suite finished",
+          not reporting, ", ".join(reporting))
+
     # --- this terminal goes to one agent, and a resume by uuid needs no stamps
     terminal = []
 
@@ -10194,13 +10228,9 @@ def run_selftest(live=False):
     if live:
         results.extend(live_checks())
 
-    width = max(len(name) for name, _, _ in results)
-    for name, ok, detail in results:
-        note = f"  ({detail})" if detail else ""
-        print(f"  {'PASS' if ok else 'FAIL'}  {name:<{width}}{note}")
-    failed = sum(1 for _, ok, _ in results if not ok)
-    print(f"\n{len(results) - failed}/{len(results)} checks passed")
-    return 1 if failed else 0
+    for line in check_report(results, failed_only):
+        print(line)
+    return 1 if any(not ok for _, ok, _ in results) else 0
 
 
 def verb_needs(args, selector):
@@ -10303,6 +10333,9 @@ def main():
                              "starts")
     parser.add_argument("--no-tint", action="store_true",
                         help="do not tint the tmux pane")
+    parser.add_argument("--failed", action="store_true",
+                        help="with --selftest, print only the checks that "
+                             "failed, and a summary a reader can trust")
     parser.add_argument("--live", action="store_true",
                         help="with --selftest, also run the checks that spawn a process, "
                              "open a terminal or change directory (each cleans up after itself)")
@@ -10404,7 +10437,7 @@ def main():
             f"{'--agent-id' if args.agent_id else '--resume'} names one agent; pick one")
 
     if args.selftest:
-        return run_selftest(live=args.live)
+        return run_selftest(live=args.live, failed_only=args.failed)
     if args.live:
         die("--live extends --selftest; it does nothing on its own")
 
