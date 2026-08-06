@@ -3929,6 +3929,11 @@ def apply_selector(token, args, table):
             die(f"conflicting agents: {token} and --agent-id {args.agent_id}")
         args.agent_id = value
     elif kind == "team":
+        # Asked here because a bare token is only known to be a team once the
+        # engine has classified it; asking earlier reads a flag nobody set.
+        if getattr(args, "here", False):
+            die(f"--here gives this terminal to one agent, and {token} covers "
+                "every member of it; name the one agent to run here")
         if why != "a roster on disk":
             print(f"team     {token} has no roster on disk; rebuilding it from {why}")
         args.team = token
@@ -5199,6 +5204,39 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     else:
         forge_team(ctx, args.dry_run)
         auto_redirect(ctx, args, table, prefix)
+
+    if args.here:
+        # A member given this terminal takes the lead's route: exec, so the
+        # process becomes the agent. No seat is resolved because none is used,
+        # and nothing after this point in the run happens.
+        command = build_command(ctx, args, passthrough)
+        adopted = inherit_credentials(ctx)
+        cwd = RESOLVER.agent_cwd(ctx)
+        seat = [("runs", "in this terminal, not a tmux pane"),
+                ("cwd", cwd or "(inherit)")]
+        if adopted:
+            seat.append(("creds", f"inherited {', '.join(adopted)} from the lead"))
+        report_launch(ctx, command, prefix, role="agent", agent_id=agent_id, extra=seat)
+        running = already_running(ctx, args, is_lead=False, agent_id=agent_id,
+                                  table=table)
+        if running:
+            return noop_outcome(ctx, args, prefix, why=running[0], report=running[1])
+        enforce_ctx(ctx, args)
+        # Listed with no pane: a member that is running and reachable, which a
+        # later team run places in a pane like any other.
+        record_membership(ctx, args, None)
+        # One line, both tenses, so the preview cannot drift from the act.
+        print(f"{prefix}exec     this terminal "
+              f"{'would become' if args.dry_run else 'becomes'} {agent_id}")
+        if args.dry_run:
+            return Outcome("manual", None, False, None)
+        if not shutil.which(command[0]):
+            die(f"cannot exec {command[0]}: not found or not executable")
+        enter_agent_cwd(ctx, prefix)
+        try:
+            os.execvp(command[0], command)
+        except OSError as exc:
+            die(f"cannot exec {command[0]}: {exc}")
 
     socket, how = resolve_socket(ctx, args, table)
     if not socket:
@@ -8582,6 +8620,49 @@ def run_selftest(live=False):
         RESOLVER.team_minted_by, RESOLVER.restored_identity = real_minted, real_restored
         RESOLVER.lead_pid_for, RESOLVER.live_agent_procs = real_owner2, real_live_procs
         RESOLVER.field = real_field
+    # --- this terminal goes to one agent, and a resume by uuid needs no stamps
+    terminal = []
+
+    class _Here:
+        here = True
+        team = resume = agent_id = None
+        selftest = complete = cleanup = doctor = census = sides = False
+        promote = demote = mail_ledger = install = poison = unpoison = False
+        help = standing = stop = False
+
+    real_classify = RESOLVER.classify
+    try:
+        RESOLVER.classify = lambda token: ("team", token, "a roster on disk")
+        told = io.StringIO()
+        with contextlib.redirect_stderr(told), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                apply_selector("session-many", _Here, [])
+                terminal.append("a team selector took this terminal")
+            except SystemExit:
+                if "one agent" not in told.getvalue():
+                    terminal.append("the refusal does not say what it wants instead")
+        _Here.here = False
+        with contextlib.redirect_stdout(io.StringIO()):
+            apply_selector("session-many", _Here, [])
+        if _Here.team != "session-many":
+            terminal.append("a team selector stopped setting the team")
+    finally:
+        RESOLVER.classify = real_classify
+
+    class _ByUuid:
+        resume = "u"
+        here = team = agent_id = None
+        selftest = complete = cleanup = doctor = census = sides = False
+        promote = demote = mail_ledger = install = poison = unpoison = False
+        help = standing = stop = False
+
+    # The end-of-run audit refuses a declaration nobody used, so a resume that
+    # names a uuid must not declare stamps it will never read.
+    if NEED.STAMPS in verb_needs(_ByUuid, None):
+        terminal.append("a resume declares stamps it may never read")
+    check("this terminal goes to one agent, and a uuid needs no stamps",
+          not terminal, ", ".join(terminal))
+
     check("a blocked move does not become an unreachable launch", not orphan,
           ", ".join(orphan))
 
@@ -10078,7 +10159,9 @@ def verb_needs(args, selector):
         return {NEED.PROCS, NEED.STAMPS, NEED.SPAWNS, NEED.MAIL}
     if args.stop:
         return {NEED.PROCS, NEED.STAMPS, may(NEED.SPAWNS)}
-    return {NEED.PROCS, NEED.STAMPS, may(NEED.SPAWNS)}
+    # A session named by uuid resolves from the filename, so a resume reaches
+    # the stamps only when it has a name or a team to look one up by.
+    return {NEED.PROCS, may(NEED.STAMPS), may(NEED.SPAWNS)}
 
 
 def audited(entry):
@@ -10117,6 +10200,10 @@ def main():
     parser.add_argument("--no-color", "--no-colour", dest="no_color", action="store_true",
                         help="print without colour; the NO_COLOR environment variable "
                              "does the same")
+    parser.add_argument("--here", action="store_true",
+                        help="run this agent in this terminal instead of a tmux "
+                             "pane, the way a lead runs; this run ends when it "
+                             "starts")
     parser.add_argument("--no-tint", action="store_true",
                         help="do not tint the tmux pane")
     parser.add_argument("--live", action="store_true",

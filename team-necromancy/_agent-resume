@@ -154,6 +154,7 @@ _agent-resume() {
     '--no-update-config[do not write resumed agents into the team roster]' \
     '--attach[attach to the swarm tmux session even when another client is already attached]' \
     '--no-attach[never attach to the swarm tmux session; just report]' \
+    '--here[run this agent in this terminal instead of a tmux pane]' \
     '--no-tint[do not tint the tmux pane]' \
     '--no-color[print without colour (the NO_COLOR environment variable does the same)]' \
     '--install[symlink into ~/.local/bin, install zsh tab completion, and add the Claude Code startup hook that runs --cleanup]' \
