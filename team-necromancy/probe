@@ -8,14 +8,16 @@ silence, and the run you are looking at may be the restore rather than the
 probe. This runs both, compares the sets of failures, and reports the
 difference, so no reading is involved.
 
-    ./probe --expect 'check name' 'old text' 'new text'
-    ./probe --live --expect 'check name' 'old text' 'new text'
+    ./probe --expect check-id 'old text' 'new text'
+    ./probe --live --expect check-id 'old text' 'new text'
 
-Name the check you expect to fail. Some check failing is not the same as
-the right one failing: a mutation can break structural checks that have
-nothing to do with what it was testing, and "bit" reads as success either
-way. Without --expect the difference is only reported, which is worth
-having while exploring but proves nothing.
+Name the id of the check you expect to fail (--selftest --list prints every
+id this suite defines, alongside its prose). The id must match exactly: no
+substring, no prose search. Some check failing is not the same as the right
+one failing: a mutation can break structural checks that have nothing to do
+with what it was testing, and "bit" reads as success either way. Without
+--expect the difference is only reported, which is worth having while
+exploring but proves nothing.
 
 One thing it cannot measure: itself. It reads the suite's failure list, so
 a mutation to how that list is produced changes what the probe sees rather
@@ -23,8 +25,9 @@ than what the suite found, and every check appears to bite. Verify changes
 to check_report by calling it directly with sample results.
 
 Exit 0 when the expected check bit (or, with no expectation, when anything
-did), 1 when it did not, 2 when the mutation could not be applied or a run
-produced no verdict at all. Nothing is written to the tree: the mutation is applied to a
+did), 1 when it did not bite, 2 when --expect names an id this suite does
+not define at all, or when the mutation could not be applied or a run
+produced no verdict. Nothing is written to the tree: the mutation is applied to a
 copy in a temporary directory, and the copy is removed either way.
 """
 
@@ -38,7 +41,7 @@ TOOL = Path(__file__).resolve().parent / "agent-resume"
 
 
 def verdicts(path, live):
-    """({failed check names}, ok count) for one run, or (None, reason)."""
+    """({failed check ids}, ok count) for one run, or (None, reason)."""
     argv = [sys.executable, str(path), "--selftest", "--failed"]
     if live:
         argv.append("--live")
@@ -50,8 +53,17 @@ def verdicts(path, live):
         # and it is not a pass either.
         tail = (run.stderr or run.stdout).strip().splitlines()[-1:] or ["no output"]
         return None, f"the suite did not finish: {tail[0][:120]}"
-    named = {line.split("  (")[0] for line in lines if line not in summary}
-    return named, summary[0]
+    failed_ids = {line.split("  ", 1)[0] for line in lines if line not in summary}
+    return failed_ids, summary[0]
+
+
+def known_ids(path, live):
+    """Every check id this suite currently defines, from --selftest --list."""
+    argv = [sys.executable, str(path), "--selftest", "--list"]
+    if live:
+        argv.append("--live")
+    run = subprocess.run(argv, capture_output=True, text=True)
+    return {line.split("  ", 1)[0] for line in run.stdout.splitlines() if line.strip()}
 
 
 def main(argv):
@@ -61,15 +73,23 @@ def main(argv):
     if "--expect" in argv:
         at = argv.index("--expect")
         if at + 1 >= len(argv):
-            print("--expect takes the name of the check that should fail")
+            print("--expect takes the id of the check that should fail")
             return 2
         expect = argv[at + 1]
         argv = argv[:at] + argv[at + 2:]
     if len(argv) != 2:
         print(__doc__.strip().splitlines()[0])
-        print("usage: probe [--live] 'old text' 'new text'")
+        print("usage: probe [--live] [--expect check-id] 'old text' 'new text'")
         return 2
     old, new = argv
+
+    if expect is not None:
+        valid = known_ids(TOOL, live)
+        if expect not in valid:
+            examples = ", ".join(sorted(valid)[:5])
+            print(f"{expect!r} names no check this suite defines; "
+                  f"--selftest --list prints them all. Some real ids: {examples}")
+            return 2
 
     source = TOOL.read_text()
     hits = source.count(old)
@@ -105,21 +125,21 @@ def main(argv):
     if healed:
         print("\nstopped failing (the probe fixed something, which is worth "
               "understanding before trusting the rest):")
-        for name in healed:
-            print(f"  {name}")
+        for cid in healed:
+            print(f"  {cid}")
     if not bit:
         print("\nnothing bit. Every check passed with this broken, so nothing "
               "here is testing it.")
         return 1
     print("\nbit:")
-    for name in bit:
-        print(f"  {name}")
+    for cid in bit:
+        print(f"  {cid}")
     if expect is None:
         return 0
-    wanted = [name for name in bit if expect in name]
-    others = [name for name in bit if expect not in name]
+    wanted = [cid for cid in bit if cid == expect]
+    others = [cid for cid in bit if cid != expect]
     if not wanted:
-        print(f"\nbut nothing matching {expect!r} bit. What failed above is "
+        print(f"\nbut {expect!r} did not bite. What failed above is "
               "unrelated to what this was testing, so it proves nothing about "
               "it.")
         return 1

@@ -162,6 +162,7 @@ _agent-resume() {
     '--selftest[run the test suite against this machine; changes nothing]' \
     '--failed[with --selftest, print only the checks that failed]' \
     '--live[with --selftest, also run the checks that launch real processes]' \
+    '--list[with --selftest, print every check id and its prose, one per line]' \
     '--doctor[say whether each team'"'"'s lead is connected to it; reports only]' \
     '--standing[where the named agent stands with its lead: liveness, team, whether its mail is read]' \
     '--census[count what ~/.claude contains, through the tool'"'"'s own readers]' \

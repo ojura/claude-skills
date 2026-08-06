@@ -7061,9 +7061,13 @@ def live_checks():
     import pty
     import subprocess as sp
     out = []
+    seen_ids = set()
 
-    def check(name, ok, detail=""):
-        out.append((name, ok, detail))
+    def check(cid, name, ok, detail=""):
+        if cid in seen_ids:
+            raise RuntimeError(f"duplicate check id: {cid!r}")
+        seen_ids.add(cid)
+        out.append((cid, name, ok, detail))
 
     # read_one_key against a terminal, which is the only place it does anything.
     keys = {}
@@ -7087,7 +7091,7 @@ def live_checks():
         os.close(master)
         keys[label] = got == str(byte[0])
     wrong = sorted(k for k, good in keys.items() if not good)
-    check("a raw keypress is read from a real terminal", not wrong, ", ".join(wrong))
+    check("raw-keypress-terminal", "a raw keypress is read from a real terminal", not wrong, ", ".join(wrong))
 
     # enter_agent_cwd really moves the process, and refuses rather than exec from
     # the wrong place.
@@ -7119,7 +7123,7 @@ def live_checks():
                 "refuses a directory it cannot enter": refused,
                 "stands still when none is recorded": stood}
     wrong = sorted(k for k, good in entering.items() if not good)
-    check("a launch enters the agent's directory", not wrong, ", ".join(wrong))
+    check("launch-enters-agent-cwd", "a launch enters the agent's directory", not wrong, ", ".join(wrong))
 
     # Which carrier launch() consults. The predicate is pinned in the read-only
     # tier; this pins the decision, which is where it broke: asking only the
@@ -7165,7 +7169,7 @@ def live_checks():
         "a real url we would pass down is kept": keeps_inherited_real,
     }
     wrong = sorted(k for k, good in carriers.items() if not good)
-    check("a launch consults both carriers of a base url", not wrong, ", ".join(wrong))
+    check("launch-baseurl-carriers", "a launch consults both carriers of a base url", not wrong, ", ".join(wrong))
 
     # A team is larger than the splits a window affords. Fixed at 80x24 so the
     # check measures tiling rather than the room a real launch asks for.
@@ -7185,7 +7189,7 @@ def live_checks():
             if i == 0:
                 tmux(geom_sock, "resize-window", "-t", TMUX_SESSION, "-x", "80", "-y", "24")
         alive = {p["pane"] for p in list_panes(geom_sock)}
-        check(f"a team of {wanted} fits the window it is launched into",
+        check("team-fits-window", f"a team of {wanted} fits the window it is launched into",
               refused is None and len(placed) == wanted and set(placed) <= alive,
               refused or f"placed {len(placed)}/{wanted}, {len(alive)} alive")
     finally:
@@ -7199,9 +7203,9 @@ def live_checks():
         with contextlib.redirect_stdout(io.StringIO()) as said:
             killed = abort_agents(running, assume_yes=True)
         gone = all(not pid_alive(v.pid) for v in victims)
-        check("an abort stops what it listed", killed == 2 and gone,
+        check("abort-stops-listed", "an abort stops what it listed", killed == 2 and gone,
               f"killed {killed}, all gone: {gone}")
-        check("the abort listing says what each process is doing",
+        check("abort-listing-describes", "the abort listing says what each process is doing",
               "a sleep standing in for an agent" in said.getvalue()
               and "probe-0@check" in said.getvalue())
     finally:
@@ -7216,7 +7220,7 @@ def live_checks():
         globals()["input"] = lambda prompt="": "n"
         with contextlib.redirect_stdout(io.StringIO()):
             killed = abort_agents([(spared.pid, "spared@check", "still working", "")])
-        check("answering no leaves the process alone",
+        check("abort-refusal-spares", "answering no leaves the process alone",
               killed == 0 and pid_alive(spared.pid))
     finally:
         if real_input is None:
@@ -7236,19 +7240,20 @@ def check_report(results, failed_only=False):
     reader can diff two runs instead of searching one, and a run that died
     has no summary to be mistaken for a clean one.
     """
-    failed = sum(1 for _, ok, _ in results if not ok)
+    failed = sum(1 for _, _, ok, _ in results if not ok)
     if failed_only:
-        lines = [f"{name}{'  (' + detail + ')' if detail else ''}"
-                 for name, ok, detail in results if not ok]
+        lines = [f"{cid}  {name}{'  (' + detail + ')' if detail else ''}"
+                 for cid, name, ok, detail in results if not ok]
         return lines + [f"checks: {len(results) - failed} ok, {failed} failed"]
-    width = max((len(name) for name, _, _ in results), default=0)
-    lines = [f"  {'PASS' if ok else 'FAIL'}  {name:<{width}}"
+    idwidth = max((len(cid) for cid, _, _, _ in results), default=0)
+    width = max((len(name) for _, name, _, _ in results), default=0)
+    lines = [f"  {'PASS' if ok else 'FAIL'}  {cid:<{idwidth}}  {name:<{width}}"
              + (f"  ({detail})" if detail else "")
-             for name, ok, detail in results]
+             for cid, name, ok, detail in results]
     return lines + ["", f"{len(results) - failed}/{len(results)} checks passed"]
 
 
-def run_selftest(live=False, failed_only=False):
+def run_selftest(live=False, failed_only=False, list_only=False):
     """Assert the invariants this tool keeps rediscovering. Read-only.
 
     Two kinds: structural ones read from this file's own syntax tree, because
@@ -7260,9 +7265,13 @@ def run_selftest(live=False, failed_only=False):
     import tempfile
 
     results = []
+    seen_ids = set()
 
-    def check(name, ok, detail=""):
-        results.append((name, ok, detail))
+    def check(cid, name, ok, detail=""):
+        if cid in seen_ids:
+            raise RuntimeError(f"duplicate check id: {cid!r}")
+        seen_ids.add(cid)
+        results.append((cid, name, ok, detail))
 
     source = Path(__file__).resolve().read_text()
     tree = ast.parse(source)
@@ -7303,7 +7312,7 @@ def run_selftest(live=False, failed_only=False):
                          "stamp_index", "ps_table", "session_registry")
              if sum(1 for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
                     and f.name == n and not is_delegate(f)) != 1]
-    check("engine primitives defined exactly once", not dupes, ", ".join(dupes))
+    check("engine-primitives-once", "engine primitives defined exactly once", not dupes, ", ".join(dupes))
 
     # the checker itself is not a caller of the thing it checks
     # The engine is a class, so membership of it is the exemption, not a list of
@@ -7317,7 +7326,7 @@ def run_selftest(live=False, failed_only=False):
     # a caller picking a transcript for itself.
     pickers = (callers_of("transcript_path") - engine
                - {"team_keep_reason", "run_selftest", "run_census"})
-    check("only the engine picks a transcript", not pickers, ", ".join(sorted(pickers)))
+    check("transcript-pick-engine-only", "only the engine picks a transcript", not pickers, ", ".join(sorted(pickers)))
 
     # The boundary. Naming the functions allowed to reach the tree fails: a
     # picker need only avoid the named entry point and glob directly.
@@ -7352,7 +7361,7 @@ def run_selftest(live=False, failed_only=False):
         # "is this directory a valid team at all", and it needs the parse error
         # that rosters() swallows in order to answer it.
         and node.name not in {"edit_team_config", "cruft_reason", "run_selftest"})
-    check("a roster is read in one place", not roster_readers, ", ".join(roster_readers))
+    check("roster-read-one-place", "a roster is read in one place", not roster_readers, ", ".join(roster_readers))
 
     # Which roster is believed when several claim one agent is a policy, not a
     # filter: it decides whose conversation gets resumed. run_complete sorts for
@@ -7363,7 +7372,7 @@ def run_selftest(live=False, failed_only=False):
         and 'key=lambda e: e["ts"]' in (ast.get_source_segment(source, node) or "")
         # _complete sorts for display; run_selftest holds this check's own text.
         and node.name not in {"_complete", "run_selftest"})
-    check("one policy decides which roster claims an agent", not ts_sorters, ", ".join(ts_sorters))
+    check("roster-claim-one-policy", "one policy decides which roster claims an agent", not ts_sorters, ", ".join(ts_sorters))
 
     # A member the roster does not list is launched, inboxed, and invisible to its
     # own lead: it can write to the lead's inbox and never be read from it. The
@@ -7386,7 +7395,7 @@ def run_selftest(live=False, failed_only=False):
     finally:
         RESOLVER.teams_dir = real_teams_dir
         shutil.rmtree(reg_base, ignore_errors=True)
-    check("a member missing from its roster is added to it", "newcomer" in listed,
+    check("roster-add-missing-member", "a member missing from its roster is added to it", "newcomer" in listed,
           f"roster lists {listed}")
 
     # Reading the spawn log unfilled returns an empty list, which is also what a
@@ -7398,7 +7407,7 @@ def run_selftest(live=False, failed_only=False):
         and "_spawn_log" in (ast.get_source_segment(source, node) or "")
         and node.name not in {"__init__", "_ingest_spawn_lines", "_log", "_every_log",
                               "run_selftest"})
-    check("the spawn log is filled where it is read", not log_touchers, ", ".join(log_touchers))
+    check("spawn-log-fill-site", "the spawn log is filled where it is read", not log_touchers, ", ".join(log_touchers))
 
     # Attributes as well as calls: a cache read is a reach inside, same as a call.
     private_reach = sorted({
@@ -7406,7 +7415,7 @@ def run_selftest(live=False, failed_only=False):
         for node in tree.body if isinstance(node, ast.FunctionDef)
         and node.name != "run_selftest"
         for m in re.finditer(r"RESOLVER\.(_\w+)", ast.get_source_segment(source, node) or "")})
-    check("no module code reaches inside the engine", not private_reach,
+    check("no-module-reaches-engine", "no module code reaches inside the engine", not private_reach,
           "; ".join(private_reach))
 
     trespass = sorted({
@@ -7416,11 +7425,11 @@ def run_selftest(live=False, failed_only=False):
         and isinstance(node.ctx, ast.Load)   # the declaration is a Store; only a use is a reach
         and node.lineno not in engine_lines
         and node.lineno not in selftest_lines})
-    check("the tree is reached only through the engine", not trespass, "; ".join(trespass))
+    check("tree-reached-via-engine", "the tree is reached only through the engine", not trespass, "; ".join(trespass))
 
     writers = {n for n, node in funcs.items()
                if "os.replace" in ast.get_source_segment(source, node)}
-    check("one roster writer", writers <= {"edit_team_config", "replace_json", "run_selftest"},
+    check("roster-one-writer", "one roster writer", writers <= {"edit_team_config", "replace_json", "run_selftest"},
           ", ".join(sorted(writers - {"run_selftest"})))
 
     run_one_src = ast.get_source_segment(source, funcs["run_one"])
@@ -7429,14 +7438,14 @@ def run_selftest(live=False, failed_only=False):
     payload_readers = (callers_of("_spawn_by_agent") | callers_of("_spawn_records")) - {
         "spawn_payload", "_spawn_by_agent", "team_minted_by", "_pid_running_team",
         "members_spawned_into", "_log", "run_selftest"}
-    check("one lookup for an agent's spawn payload", not payload_readers, ", ".join(sorted(payload_readers)))
+    check("spawn-payload-one-lookup", "one lookup for an agent's spawn payload", not payload_readers, ", ".join(sorted(payload_readers)))
 
     # A preview must be printed through step(), which carries both tenses, or
     # inline as "would X if dry else did X". A bare print of a "would" line has
     # no real counterpart and silently makes a real run quieter than its preview.
     unpaired = [line.strip()[:60] for line in source.splitlines()
                 if "print(" in line and "would " in line and " else " not in line]
-    check("every preview line has a real counterpart", not unpaired, "; ".join(unpaired))
+    check("preview-line-counterpart", "every preview line has a real counterpart", not unpaired, "; ".join(unpaired))
 
     # Wrapping serves the reader; the reader is not owed less. Every physical
     # line fits the width, and the reflowed text says word for word what the
@@ -7450,7 +7459,7 @@ def run_selftest(live=False, failed_only=False):
     # companion comes down with it, and no word is lost either way.
     widowy = " ".join(["a" * 8] * 8 + ["tail"])
     dewidowed = fill(widowy, width=72)
-    check("a long message wraps inside the width and loses nothing",
+    check("wrap-width-lossless", "a long message wraps inside the width and loses nothing",
           all(len(l) <= 72 for l in filled.splitlines())
           and " ".join(filled.split()) == " ".join(tale.split())
           and labelled == "cwd      /" + "x" * 90
@@ -7472,7 +7481,7 @@ def run_selftest(live=False, failed_only=False):
     recorded = wrap_command(record_case, "  ran: ", "    ", width=24)
     rec_lines = recorded.splitlines()
     rec_joined = " ".join([rec_lines[0][len("  ran: "):]] + [l[4:] for l in rec_lines[1:]])
-    check("a wrapped command rejoins to the exact command",
+    check("wrap-command-rejoins", "a wrapped command rejoins to the exact command",
           shlex.split(rejoined) == argv_case and rec_joined == record_case
           and len(lines) > 1 and all(len(l) <= 64 for l in lines)
           # the paste form is only a paste form while every broken line
@@ -7506,7 +7515,7 @@ def run_selftest(live=False, failed_only=False):
         "nothing else rode along": len(blocked) == len(bullets) + len(ways_out),
     }
     wrong = sorted(k for k, ok in itemized.items() if not ok)
-    check("blockers arrive one per line, each class with its way out", not wrong,
+    check("blockers-listed-with-remedy", "blockers arrive one per line, each class with its way out", not wrong,
           ", ".join(wrong))
 
     # The inbox files store ISO instants; every report and refusal prints the
@@ -7522,7 +7531,7 @@ def run_selftest(live=False, failed_only=False):
         RESOLVER.inbox_state = real_inboxes
         RESOLVER.live_sessions, RESOLVER.stamp_index = real_live, real_stamps
     want_when = ms_str(iso_ms("2026-08-06T13:33:30.168Z"))
-    check("a refusal prints time the way the ledger does",
+    check("refusal-prints-ledger-time", "a refusal prints time the way the ledger does",
           told == [f"26 unread for team-lead, oldest {want_when}"],
           "; ".join(told) or "no objection composed")
 
@@ -7546,7 +7555,7 @@ def run_selftest(live=False, failed_only=False):
                      if isinstance(n, ast.Constant) and isinstance(n.value, str)
                      and id(n) not in doc_strings and n.lineno not in suite_lines
                      and "window-start" in n.value})
-    check("the project's own coinages stay out of printed strings", not spoken,
+    check("no-coinages-in-output", "the project's own coinages stay out of printed strings", not spoken,
           "; ".join(spoken))
 
     # The doctor says a shared fact once: members in one state get one note
@@ -7615,7 +7624,7 @@ def run_selftest(live=False, failed_only=False):
         "a live pid is said once": lines_live[0].count("pid 7717") == 1,
     }
     wrong = sorted(k for k, ok in solo.items() if not ok)
-    check("the doctor says a shared fact once", not wrong, ", ".join(wrong))
+    check("doctor-shared-fact-once", "the doctor says a shared fact once", not wrong, ", ".join(wrong))
 
     # A lead whose reading is in doubt is offered both ways to make it read:
     # starting any teammate (immediate, costs nothing) and the flag-bound
@@ -7648,7 +7657,7 @@ def run_selftest(live=False, failed_only=False):
             (ast.get_source_segment(source, funcs["auto_redirect"]) or ""),
     }
     wrong = sorted(k for k, ok in both.items() if not ok)
-    check("a lead whose reading is in doubt is offered both remedies", not wrong,
+    check("doubtful-lead-both-remedies", "a lead whose reading is in doubt is offered both remedies", not wrong,
           ", ".join(wrong))
 
     # Counts are per-recipient facts; the physics they share is said once.
@@ -7657,7 +7666,7 @@ def run_selftest(live=False, failed_only=False):
          "state": "in memory", "detail": ""},
         {"sender": "b", "to": "y", "summary": "", "sent": 2,
          "state": "in memory", "detail": ""}])
-    check("held mail is counted per recipient, its physics said once",
+    check("mail-count-per-recipient", "held mail is counted per recipient, its physics said once",
           sum(1 for l in grouped if "memory" in l) == 1
           and sum(1 for l in grouped if "turn boundary" in l) == 1
           and any("x's memory" in l and "y's memory" in l for l in grouped),
@@ -7674,7 +7683,7 @@ def run_selftest(live=False, failed_only=False):
         "a named team asks for no team census": not census_asked,
     }
     wrong = sorted(k for k, ok in legend.items() if not ok)
-    check("the legend explains only the verdicts on screen", not wrong,
+    check("legend-matches-verdicts", "the legend explains only the verdicts on screen", not wrong,
           ", ".join(wrong))
 
     # The launch report at a narrow terminal: the block opens with its own
@@ -7713,7 +7722,7 @@ def run_selftest(live=False, failed_only=False):
             cmd_at is not None and shlex.split(cmd_back) == report_argv,
     }
     wrong = sorted(k for k, ok in reported.items() if not ok)
-    check("the launch report fits the terminal and keeps its command exact",
+    check("launch-report-fits-exact", "the launch report fits the terminal and keeps its command exact",
           not wrong, ", ".join(wrong))
 
     # The zsh completion file is kept by hand beside the tool, so the two can
@@ -7728,7 +7737,7 @@ def run_selftest(live=False, failed_only=False):
     aliases = {"--no-colour", "--terminate", "--cleanup-sockets"}
     missing = sorted(parser_flags - comp_flags - {"--complete"})
     unknown = sorted(comp_flags - parser_flags - aliases)
-    check("completion offers every flag the parser takes, and nothing else",
+    check("completion-flag-parity", "completion offers every flag the parser takes, and nothing else",
           comp_text and not missing and not unknown,
           f"missing from completion: {missing}; unknown to the parser: {unknown}"
           if (missing or unknown) else "no completion file found")
@@ -7772,7 +7781,7 @@ def run_selftest(live=False, failed_only=False):
             and "...and" not in listed_text,
     }
     wrong = sorted(k for k, ok in folded.items() if not ok)
-    check("the sides sweep folds each session and says what it folded",
+    check("sides-sweep-folds", "the sides sweep folds each session and says what it folded",
           not wrong, ", ".join(wrong))
 
     # A typed side is one declared need: the task-id and parent/name
@@ -7812,7 +7821,7 @@ def run_selftest(live=False, failed_only=False):
             and by_root and by_root["root"] == "root-3",
     }
     wrong = sorted(k for k, ok in typed.items() if not ok)
-    check("one typed side classifies the hit alone", not wrong,
+    check("typed-side-classifies-alone", "one typed side classifies the hit alone", not wrong,
           ", ".join(wrong) or f"costs {task_cost}/{pair_cost}/{root_cost}")
 
     # Compute is a constructor contract: declared as an enum set, nothing by
@@ -7888,7 +7897,7 @@ def run_selftest(live=False, failed_only=False):
     contract["only the engine reads a declaration's buckets"] = not stray_readers
 
     wrong = sorted(k for k, ok in contract.items() if not ok)
-    check("compute is declared at construction and audited at the end",
+    check("compute-declared-and-audited", "compute is declared at construction and audited at the end",
           not wrong, ", ".join(wrong))
 
     # A pane id is per-server: a recorded one is a fact only while its server
@@ -7912,7 +7921,7 @@ def run_selftest(live=False, failed_only=False):
         "the member report asks it": "seat_note(" in run_one_src,
     }
     wrong = sorted(k for k, ok in seats_said.items() if not ok)
-    check("a recorded pane is a fact only while its server carries it",
+    check("pane-fact-needs-server", "a recorded pane is a fact only while its server carries it",
           not wrong, ", ".join(wrong))
 
     # The attach offer is made only where a server exists: a keypress whose
@@ -7939,7 +7948,7 @@ def run_selftest(live=False, failed_only=False):
         globals()["socket_alive"] = real_alive_fn
         globals()["confirm_attach"] = real_confirm_fn
         globals()["run_one"] = real_one_fn
-    check("an attach is offered only where a server exists",
+    check("attach-only-if-server", "an attach is offered only where a server exists",
           offered_at == ["sock-live"], f"offered at {offered_at or 'nowhere'}")
 
     # A noop on a live process says where that process actually sits, asked
@@ -7964,7 +7973,7 @@ def run_selftest(live=False, failed_only=False):
         "a real seat is named": seated and "sock-z" in seated[0],
     }
     wrong = sorted(k for k, ok in seat_says.items() if not ok)
-    check("a noop says where the live process actually sits", not wrong,
+    check("noop-says-live-location", "a noop says where the live process actually sits", not wrong,
           ", ".join(wrong))
 
     # Classification, not position, decides what a token is. Every entry must
@@ -7973,7 +7982,7 @@ def run_selftest(live=False, failed_only=False):
     shape = [f for f, spec in PASSTHROUGH_FLAGS.items()
              if not (isinstance(spec, Flag) and spec.scope in (ONE, MANY)
                      and isinstance(spec.valued, bool))]
-    check("every forwarded flag declares scope and arity", not shape, ", ".join(sorted(shape)))
+    check("flag-declares-scope-arity", "every forwarded flag declares scope and arity", not shape, ", ".join(sorted(shape)))
 
     with contextlib.redirect_stderr(io.StringIO()):
         two_selectors = False
@@ -7998,7 +8007,7 @@ def run_selftest(live=False, failed_only=False):
         "-- shields a bare word": classify_passthrough(["a@b", "--", "c@d"])[0] == "a@b",
     }
     wrong = sorted(k for k, good in classified.items() if not good)
-    check("a selector is found wherever it sits", not wrong, ", ".join(wrong))
+    check("selector-found-anywhere", "a selector is found wherever it sits", not wrong, ", ".join(wrong))
 
     # --stop resolves a selector that has already become args; shapes each
     # derived separately from a mangled argv all break at once.
@@ -8031,7 +8040,7 @@ def run_selftest(live=False, failed_only=False):
         RESOLVER.teams_dir, RESOLVER.holders_of = real_teams_dir, real_holders
         globals()["running_agents"] = real_running
         shutil.rmtree(stop_base, ignore_errors=True)
-    check("--stop resolves every selector shape", not bad, ", ".join(bad))
+    check("stop-resolves-selector-shapes", "--stop resolves every selector shape", not bad, ", ".join(bad))
 
     # --- forwarded flags: the allowlist, the scope rule, and whether a flag
     # could have applied at all. Each was a live defect before it was a check.
@@ -8057,7 +8066,7 @@ def run_selftest(live=False, failed_only=False):
         "past -- is not judged": not _dies(check_passthrough, ["--", "--anything"], _Parser())[0],
     }
     wrong = sorted(k for k, good in flags.items() if not good)
-    check("only flags the table knows are forwarded", not wrong, ", ".join(wrong))
+    check("forward-only-known-flags", "only flags the table knows are forwarded", not wrong, ", ".join(wrong))
 
     scope = {
         "one-agent flag refused for many": _dies(check_flag_scope, ["--agent-color", "red"], 4)[0],
@@ -8065,7 +8074,7 @@ def run_selftest(live=False, failed_only=False):
         "many-agent flag fine for many": not _dies(check_flag_scope, ["--effort", "low"], 4)[0],
     }
     wrong = sorted(k for k, good in scope.items() if not good)
-    check("a flag naming one agent is refused for a run of several", not wrong, ", ".join(wrong))
+    check("flag-single-agent-refused", "a flag naming one agent is refused for a run of several", not wrong, ", ".join(wrong))
 
     class _Args:
         def __init__(self, **kw):
@@ -8088,7 +8097,7 @@ def run_selftest(live=False, failed_only=False):
             check_flags_took_effect, ["--effort", "low"], [("x", "noop")], _Args(dry_run=True))[0],
     }
     wrong = sorted(k for k, good in took.items() if not good)
-    check("a flag that could not apply is not reported as applied", not wrong, ", ".join(wrong))
+    check("flag-inapplicable-not-reported", "a flag that could not apply is not reported as applied", not wrong, ", ".join(wrong))
 
     # A lead execs away mid-loop, so anything the run was still watching would go
     # unreported unless it is handed to the lead before it takes over.
@@ -8108,7 +8117,7 @@ def run_selftest(live=False, failed_only=False):
                        [("m1", job_args), ("m2", job_args), ("lead", job_args)], socket="s")
     finally:
         globals()["run_one"], globals()["report_transcript_writes"] = real_one, real_report
-    check("a lead is told what is still loading before it takes over",
+    check("lead-told-loading-before-takeover", "a lead is told what is still loading before it takes over",
           handed == [[], ["member1"], ["member1", "member2"]], str(handed))
 
     # Only Recipe 1's dead port is stripped from a revived agent's environment.
@@ -8124,7 +8133,7 @@ def run_selftest(live=False, failed_only=False):
         "unset": not base_url_is_poison(None),
     }
     wrong = sorted(k for k, good in poison_calls.items() if not good)
-    check("only the poison is stripped from a launch", not wrong, ", ".join(wrong))
+    check("launch-strips-only-poison", "only the poison is stripped from a launch", not wrong, ", ".join(wrong))
 
     # The merge is an engine internal: a caller reaching into it can assemble a
     # different answer than the engine did.
@@ -8132,7 +8141,7 @@ def run_selftest(live=False, failed_only=False):
         node.name for node in tree.body
         if isinstance(node, ast.FunctionDef)
         and re.search(r"\.pick\(|_Merged\(", ast.get_source_segment(source, node) or ""))
-    check("the merge is reached only through the engine", not reachers, ", ".join(reachers))
+    check("merge-reached-via-engine", "the merge is reached only through the engine", not reachers, ", ".join(reachers))
 
     # A roster writer takes the engine's description and reads no field itself.
     # The ban is total: no field read in a function that writes a roster.
@@ -8148,7 +8157,7 @@ def run_selftest(live=False, failed_only=False):
     assemblers = sorted(node.name for node in tree.body
                         if isinstance(node, ast.FunctionDef)
                         and writes_roster(node) and reads_a_field(node))
-    check("a roster writer reads no field of its own", not assemblers, ", ".join(assemblers))
+    check("roster-writer-no-own-read", "a roster writer reads no field of its own", not assemblers, ", ".join(assemblers))
 
     # The doctor composes answers and gathers nothing. A diagnosis assembled from
     # its own reads could reach a conclusion the tool would not reach when acting,
@@ -8168,7 +8177,7 @@ def run_selftest(live=False, failed_only=False):
                     gathered.append(f"{node.name} calls {fn.value.id}.{fn.attr}")
                 if fn.value.id == "RESOLVER" and fn.attr.startswith("_"):
                     gathered.append(f"{node.name} reaches {fn.attr}")
-    check("the doctor invents no evidence", not gathered, ", ".join(sorted(set(gathered))))
+    check("doctor-invents-no-evidence", "the doctor invents no evidence", not gathered, ", ".join(sorted(set(gathered))))
 
     # Assembly is exercised, not just its parts: a structural battery can pass
     # over a NameError in identity() while every real invocation dies, when
@@ -8184,10 +8193,10 @@ def run_selftest(live=False, failed_only=False):
             why = assembled.get("via")
         except Exception as exc:                      # the point is that it runs
             got, why = None, f"{type(exc).__name__}: {exc}"
-        check("an identity can actually be assembled", bool(got and why),
+        check("identity-can-assemble", "an identity can actually be assembled", bool(got and why),
               f"{name}@{team} -> {got or why}")
     else:
-        check("an identity can be assembled (no stamped agent here)", True, "skipped")
+        check("identity-can-assemble", "an identity can be assembled (no stamped agent here)", True, "skipped")
 
     # Supplying an id and a name that contradict describes an agent that cannot
     # exist, and the name is the routing key, so the wrong one reads a mailbox
@@ -8207,7 +8216,7 @@ def run_selftest(live=False, failed_only=False):
             allowed_match = True
         except SystemExit:
             allowed_match = False
-    check("an id and a name that disagree are refused", refused_mismatch and allowed_match,
+    check("id-name-mismatch-refused", "an id and a name that disagree are refused", refused_mismatch and allowed_match,
           f"mismatch refused: {refused_mismatch}, match allowed: {allowed_match}")
 
     # A launch must never wear two identities. --agent-id and --agent-name were
@@ -8240,7 +8249,7 @@ def run_selftest(live=False, failed_only=False):
                 mismatched.append(f"{wore} as {called}")
             if wore and on_team and on_team != team_half:
                 mismatched.append(f"{wore} on team {on_team}")
-    check("a launch wears one identity", not mismatched, "; ".join(mismatched[:2]))
+    check("launch-wears-one-identity", "a launch wears one identity", not mismatched, "; ".join(mismatched[:2]))
 
     # A stamp contradicting the roster is reported, never tolerated: it is
     # what catches a lead launched under a wrong name. The refusal
@@ -8268,11 +8277,11 @@ def run_selftest(live=False, failed_only=False):
                 except SystemExit:
                     pass
             spoken = said.getvalue()
-        check("a contradicted stamp is refused, with a way forward",
+        check("contradicted-stamp-refused", "a contradicted stamp is refused, with a way forward",
               bool(raised) and "--force resumes it" in spoken,
               f"raised={bool(raised)}, remedy={'--force resumes it' in spoken}")
     else:
-        check("a contradicted stamp is refused (none on this machine)", True, "skipped")
+        check("contradicted-stamp-refused", "a contradicted stamp is refused (none on this machine)", True, "skipped")
 
     # The reaper bets deletions on the soul count, and that count now consults
     # stamps as well as the roster. Too permissive and a dead directory is kept
@@ -8312,7 +8321,7 @@ def run_selftest(live=False, failed_only=False):
     finally:
         RESOLVER.teams_dir = real_teams_dir
         shutil.rmtree(reap_base, ignore_errors=True)
-    check("the reaper spares what can still be resurrected", reapable and kept,
+    check("reaper-spares-resurrectable", "the reaper spares what can still be resurrected", reapable and kept,
           f"dead reapable: {reapable}, live kept: {kept}")
 
     # Enumeration and the single-token question must not diverge: a team the
@@ -8320,14 +8329,14 @@ def run_selftest(live=False, failed_only=False):
     # revivable-but-undiscoverable, the mirror of advertised-then-deleted.
     known = RESOLVER.known_teams()
     disagreed = sorted(t for t in known if RESOLVER.team_evidence(t) != known[t])
-    check("what is a team is one answer", not disagreed, ", ".join(disagreed[:3]))
+    check("team-evidence-one-answer", "what is a team is one answer", not disagreed, ", ".join(disagreed[:3]))
 
     offered = io.StringIO()
     with contextlib.redirect_stdout(offered):
         run_complete("teams")
     listed = {line.split(":", 1)[0] for line in offered.getvalue().splitlines() if line}
     unlisted = sorted(set(known) - listed)
-    check("every team the engine knows is offered", not unlisted, ", ".join(unlisted[:3]))
+    check("completion-lists-every-team", "every team the engine knows is offered", not unlisted, ", ".join(unlisted[:3]))
 
     # A lead may carry a name of its own. An agent that ran with --agent-name and
     # no --team-name, then spawned teammates, is that team's lead while being
@@ -8346,12 +8355,12 @@ def run_selftest(live=False, failed_only=False):
         team, path = half
         with contextlib.redirect_stderr(io.StringIO()):
             assembled = RESOLVER.identity(session_uuid=path.stem, for_team=team)
-        check("a lead with a name of its own still leads its team",
+        check("named-lead-still-leads", "a lead with a name of its own still leads its team",
               assembled.get("leads_team") == team
               and assembled.get("lead_agent_id") == f"team-lead@{team}",
               f"{path.stem[:8]} -> {assembled.get('leads_team')}")
     else:
-        check("a lead with a name of its own (none on this machine)", True, "skipped")
+        check("named-lead-still-leads", "a lead with a name of its own (none on this machine)", True, "skipped")
 
     # The same lead one life later: stamped with a team it used to run as, asked
     # about a team it led afterwards. The stamps answer an older question, so the
@@ -8370,12 +8379,12 @@ def run_selftest(live=False, failed_only=False):
         other, path = multi
         with contextlib.redirect_stderr(io.StringIO()):
             assembled = RESOLVER.identity(session_uuid=path.stem, for_team=other)
-        check("a named team outranks the stamps of an earlier life",
+        check("named-team-outranks-stamps", "a named team outranks the stamps of an earlier life",
               assembled.get("lead_agent_id") == f"team-lead@{other}",
               f"{path.stem[:8]} stamped {stamped}, asked {other}, "
               f"got {assembled.get('lead_agent_id')}")
     else:
-        check("multi-team lead (none stamped with another team here)", True, "skipped")
+        check("named-team-outranks-stamps", "multi-team lead (none stamped with another team here)", True, "skipped")
 
     # A lead that ran several teams must rebuild the one that was named, not
     # whichever it ran as last. The fault has two spellings: a forge proposing
@@ -8394,18 +8403,18 @@ def run_selftest(live=False, failed_only=False):
                       if p.get("team_name") != t]
                   for t in teams}
         wrong = sorted(t for t, names in strays.items() if names)
-        check("a named team is rebuilt, not the lead's newest", not wrong,
+        check("named-team-not-newest", "a named team is rebuilt, not the lead's newest", not wrong,
               f"{len(teams)} teams from one lead; strays in {', '.join(wrong)}" if wrong
               else f"{len(teams)} teams from one lead, none crossed")
     else:
-        check("a named team is rebuilt (no multi-team lead here)", True, "skipped")
+        check("named-team-not-newest", "a named team is rebuilt (no multi-team lead here)", True, "skipped")
 
     # A dry run must promise what a real run does. They share one code path, so
     # the check is that the path really is shared: the forge hands back the same
     # roster in both modes rather than the preview enumerating separately.
     forge_src = ast.get_source_segment(source, funcs["forge_team"])
     returns_both = forge_src.count("return config") >= 2
-    check("a preview and a real forge return the same roster", returns_both,
+    check("forge-preview-matches-real", "a preview and a real forge return the same roster", returns_both,
           f"{forge_src.count('return config')} return sites")
 
     # A guess must not be written where it will later be read as a fact. Rung 1
@@ -8424,7 +8433,7 @@ def run_selftest(live=False, failed_only=False):
                    if e.get("leadSessionId")]
     finally:
         RESOLVER.rosters = real_rosters
-    check("a roster with no lead cannot corroborate one", not vouched,
+    check("roster-without-lead-refuses", "a roster with no lead cannot corroborate one", not vouched,
           f"{len(vouched)} entries vouched")
 
     # One classifier decides what a token names; a selector running its own
@@ -8439,7 +8448,7 @@ def run_selftest(live=False, failed_only=False):
         "an unknown name": RESOLVER.classify("no-such-agent-anywhere")[0] == "unknown",
     }
     wrong = sorted(k for k, good in kinds.items() if not good)
-    check("one classifier says what a selector names", not wrong, ", ".join(wrong))
+    check("classifier-one-answer", "one classifier says what a selector names", not wrong, ", ".join(wrong))
 
     # A team outlives its directory: a graceful lead exit removes the roster, so
     # existence alone reports a cleaned-up team as one that never existed.
@@ -8455,7 +8464,7 @@ def run_selftest(live=False, failed_only=False):
     finally:
         RESOLVER._by_team = real_by_team
     wrong = sorted(k for k, good in evidence.items() if not good)
-    check("a team is recognised without its directory", not wrong, ", ".join(wrong))
+    check("team-recognised-without-directory", "a team is recognised without its directory", not wrong, ", ".join(wrong))
 
     with contextlib.redirect_stderr(io.StringIO()) as diag:
         try:
@@ -8466,7 +8475,7 @@ def run_selftest(live=False, failed_only=False):
     # asserts what it says, not where its line breaks fall.
     said = " ".join(diag.getvalue().split())
     named = all(kind in said for kind in ("roster on disk", "spawn payloads", "stamped"))
-    check("an unknown team-shaped token names every evidence it lacks", named, said.strip()[:70])
+    check("unknown-team-names-lacking-evidence", "an unknown team-shaped token names every evidence it lacks", named, said.strip()[:70])
 
     # --- the attach prompt: which key does what, and when it is offered at all
     real_key, real_abort, real_stdin = read_one_key, abort_agents, sys.stdin
@@ -8494,7 +8503,7 @@ def run_selftest(live=False, failed_only=False):
         globals()["read_one_key"], globals()["abort_agents"] = real_key, real_abort
         sys.stdin = real_stdin
     wrong = sorted(k for k, good in keys.items() if not good)
-    check("the attach prompt does what each key says", not wrong, ", ".join(wrong))
+    check("attach-prompt-keys", "the attach prompt does what each key says", not wrong, ", ".join(wrong))
 
     # --- the observation a launch leaves open is finished, per agent
     watch = Path(tempfile.mkdtemp())
@@ -8521,7 +8530,7 @@ def run_selftest(live=False, failed_only=False):
     finally:
         shutil.rmtree(watch, ignore_errors=True)
     wrong = sorted(k for k, good in writes.items() if not good)
-    check("a launch is followed up per agent", not wrong, ", ".join(wrong))
+    check("launch-followup-per-agent", "a launch is followed up per agent", not wrong, ", ".join(wrong))
 
     # --- the swarm is offered unless the run already handed the user somewhere
     # The fixture's server counts as existing: whether a dead one gates the
@@ -8551,7 +8560,7 @@ def run_selftest(live=False, failed_only=False):
         globals()["run_one"], globals()["confirm_attach"] = real_one, real_confirm
         globals()["socket_alive"] = real_alive_gate
     wrong = sorted(k for k, good in offers.items() if not good)
-    check("the swarm is offered when nothing else took over", not wrong, ", ".join(wrong))
+    check("swarm-offer-fallback", "the swarm is offered when nothing else took over", not wrong, ", ".join(wrong))
 
     # --- a pairing timing alone suggests is offered, never taken
     real_input, real_stdin = globals().get("input"), sys.stdin
@@ -8589,7 +8598,7 @@ def run_selftest(live=False, failed_only=False):
         else:
             globals().pop("input", None)
     wrong = sorted(k for k, good in asks.items() if not good)
-    check("a corroborated redirect is offered, not taken silently", not wrong,
+    check("redirect-offered-not-silent", "a corroborated redirect is offered, not taken silently", not wrong,
           ", ".join(wrong))
 
     # --- Ctrl-C is answered with a sentence, not a stack dump
@@ -8598,7 +8607,7 @@ def run_selftest(live=False, failed_only=False):
         def _interrupted():
             raise KeyboardInterrupt
         code = interruptible(_interrupted)
-    check("an interrupt is answered, not dumped",
+    check("interrupt-answered-not-dumped", "an interrupt is answered, not dumped",
           code == 130 and "still running" in said.getvalue(),
           f"exit {code}, said {said.getvalue().strip()[:50]!r}")
 
@@ -8626,7 +8635,7 @@ def run_selftest(live=False, failed_only=False):
     for cls in ("--with-mail archives", "--force instead rewrites", "stop it first"):
         if cls not in blockers_src:
             futile.append(f"a blocker class has no remedy: {cls}")
-    check("a redirect a restart would undo is not offered", not futile,
+    check("redirect-not-futile", "a redirect a restart would undo is not offered", not futile,
           ", ".join(futile))
 
     # --- a blocked move does not become a launch nobody can reach
@@ -8697,18 +8706,19 @@ def run_selftest(live=False, failed_only=False):
         RESOLVER.lead_pid_for, RESOLVER.live_agent_procs = real_owner2, real_live_procs
         RESOLVER.field = real_field
     # --- a failure list is a list, and a summary says the suite finished
-    sample = [("a passing check", True, ""), ("a failing check", False, "why")]
+    sample = [("passing-check", "a passing check", True, ""),
+              ("failing-check", "a failing check", False, "why")]
     brief, full = check_report(sample, failed_only=True), check_report(sample)
     reporting = []
     if [line for line in brief if line.startswith("checks: ")] != ["checks: 1 ok, 1 failed"]:
         reporting.append("a run without exactly one summary cannot be told from one that died")
-    if any("a passing check" in line for line in brief):
+    if any("passing-check" in line for line in brief):
         reporting.append("the failure list carries passes")
-    if not any(line.startswith("a failing check") for line in brief):
+    if not any(line.startswith("failing-check") for line in brief):
         reporting.append("the failure list drops the failure")
     if not any("PASS" in line for line in full):
         reporting.append("the full report lost its passes")
-    check("a failure list is a list, and a summary says the suite finished",
+    check("report-list-and-summary", "a failure list is a list, and a summary says the suite finished",
           not reporting, ", ".join(reporting))
 
     # --- this terminal goes to one agent, and a resume by uuid needs no stamps
@@ -8772,10 +8782,10 @@ def run_selftest(live=False, failed_only=False):
             is not DECLARED.MAYBE,
     }
     terminal.extend(k for k, wrong in shapes.items() if wrong)
-    check("this terminal goes to one agent, and each input declares what it "
+    check("terminal-declares-reach", "this terminal goes to one agent, and each input declares what it "
           "can reach", not terminal, ", ".join(terminal))
 
-    check("a blocked move does not become an unreachable launch", not orphan,
+    check("blocked-move-not-unreachable", "a blocked move does not become an unreachable launch", not orphan,
           ", ".join(orphan))
 
     # --- shape, not timing, bounds which team a process could have minted
@@ -8816,7 +8826,7 @@ def run_selftest(live=False, failed_only=False):
         shapes["a stranger's fresh-boot team is not the answer"] = (
             eng9.team_minted_by(me) == (None, False))
         wrong = sorted(k for k, good in shapes.items() if not good)
-        check("shape bounds which team a process could have minted", not wrong,
+        check("mint-shape-bounds", "shape bounds which team a process could have minted", not wrong,
               ", ".join(wrong))
 
     # --- a team is larger than its roster, and a run that takes the roster says so
@@ -8835,7 +8845,7 @@ def run_selftest(live=False, failed_only=False):
         listed = {m.get("name") for m in (RESOLVER.roster_of(with_former) or {}).get("members", [])}
         if set(extras) & listed:
             pop_wrong.append(f"{with_former} calls a listed member former")
-    check("a team population contains its roster", not pop_wrong, "; ".join(pop_wrong[:2])
+    check("population-contains-roster", "a team population contains its roster", not pop_wrong, "; ".join(pop_wrong[:2])
           or f"{len(RESOLVER.known_teams())} teams, unrostered members on {with_former}")
 
     notes = {
@@ -8844,7 +8854,7 @@ def run_selftest(live=False, failed_only=False):
             former_members_note(["a", "b", "c"])),
     }
     wrong = sorted(k for k, good in notes.items() if not good)
-    check("a team run says what it left out", not wrong, ", ".join(wrong))
+    check("former-members-noted", "a team run says what it left out", not wrong, ", ".join(wrong))
 
     # --- a lead and a member report the same launch facts
     # Two hand-maintained report blocks in one function let a field exist in
@@ -8876,7 +8886,7 @@ def run_selftest(live=False, failed_only=False):
                       agent_id="team-lead@t")
     if "command  claude --resume s-1" not in printed.getvalue():
         split.append("a lead report omits its command")
-    check("a lead and a member report the same launch facts", not split,
+    check("lead-member-report-parity", "a lead and a member report the same launch facts", not split,
           ", ".join(split))
 
     # --- a crew on two servers is reported as two, not as one
@@ -8892,7 +8902,7 @@ def run_selftest(live=False, failed_only=False):
         ("sock-old", "live pane of pid 1") if ids == ["old@t"] else
         ("sock-new", "live pane of pid 2") if ids == ["new@t"] else (None, None))
     seats = eng10.crew_sockets("t", [])
-    check("a crew on two servers is reported as two",
+    check("crew-split-across-servers", "a crew on two servers is reported as two",
           seats == {"sock-old": ["old@t"], "sock-new": ["new@t"]},
           f"{ {k: v for k, v in seats.items()} }")
 
@@ -8920,7 +8930,7 @@ def run_selftest(live=False, failed_only=False):
     picks["--all takes everything once"] = (
         sorted(m["name"] for m in got) == ["a", "b", "c", "d", "team-lead"] and not left)
     wrong = sorted(k for k, good in picks.items() if not good)
-    check("a run takes the live team, or the record when none is live",
+    check("select-jobs-live-or-record", "a run takes the live team, or the record when none is live",
           not wrong, ", ".join(wrong))
 
     # --- a payload is a record the harness wrote, not JSON someone printed
@@ -8940,7 +8950,7 @@ def run_selftest(live=False, failed_only=False):
     # payload, and a line that genuinely carries two spawns must still yield two.
     buried = list(RESOLVER._walk_spawn_payloads({"toolUseResult": {"a": {"b": payload}}}))
     twin = list(RESOLVER._walk_spawn_payloads({"toolUseResult": [payload, dict(payload)]}))
-    check("a quoted payload is not evidence",
+    check("quoted-payload-not-evidence", "a quoted payload is not evidence",
           not admitted and len(genuine) == 1 and len(buried) == 1 and len(twin) == 2,
           ", ".join(admitted) or f"genuine={len(genuine)} buried={len(buried)} twin={len(twin)}")
 
@@ -8968,7 +8978,7 @@ def run_selftest(live=False, failed_only=False):
         hits = RESOLVER._grep_files(SPAWN_MARKER, [Path(td)], True) or []
         if any("subagents" in p.parts for p in hits):
             leaks.append("the recursive searcher")
-    check("a sidechain line is not evidence", not leaks, ", ".join(leaks))
+    check("sidechain-not-evidence", "a sidechain line is not evidence", not leaks, ", ".join(leaks))
 
     # --- side transcripts: the file classifies itself; the meta only decorates
     with tempfile.TemporaryDirectory() as td:
@@ -9012,7 +9022,7 @@ def run_selftest(live=False, failed_only=False):
         hit, why = eng.side_transcript("twin")
         if hit or not ("d1" in why and "d2" in why):
             wrong.append("a colliding refusal did not name typeable spellings")
-        check("a side transcript is classified by its own bytes",
+        check("side-classified-by-bytes", "a side transcript is classified by its own bytes",
               not wrong, ", ".join(wrong))
 
     # Every side transcript on this machine classifies without a crash, and the
@@ -9022,7 +9032,7 @@ def run_selftest(live=False, failed_only=False):
     stray = tallies.get("unclassifiable", 0)
     ok = sum(tallies.values()) == len(corpus) and \
         set(tallies) <= {"pointer", "rooted", "unclassifiable"}
-    check("the side-transcript census answers for every file", ok,
+    check("side-census-covers-every-file", "the side-transcript census answers for every file", ok,
           ", ".join(f"{n} {g}" for g, n in tallies.most_common()) or "none on this machine")
 
     # --- a conversion proves its inverse before anything may act on it
@@ -9129,7 +9139,7 @@ def run_selftest(live=False, failed_only=False):
                 continue
             if got["proved"] or not any(expect in o for o in got["objections"]):
                 faults.append(what)
-        check("a conversion proves its inverse before it acts", not faults,
+        check("conversion-proves-inverse", "a conversion proves its inverse before it acts", not faults,
               ", ".join(faults))
 
     # --- the writers move, and the receipt is the way back
@@ -9198,7 +9208,7 @@ def run_selftest(live=False, failed_only=False):
                 moved.append("the receipt did not carry its history")
         finally:
             globals()["RECEIPTS_DIR"] = real_receipts
-        check("the writers move, and the receipt is the way back", not moved,
+        check("writers-move-receipt-back", "the writers move, and the receipt is the way back", not moved,
               ", ".join(moved))
 
     # --- a demote cannot embed the conversation it runs inside. The holder
@@ -9215,7 +9225,7 @@ def run_selftest(live=False, failed_only=False):
     demote_src = ast.get_source_segment(source, funcs["run_demote"]) or ""
     if "RESOLVER.transcript_holders(" not in demote_src:
         blind.append("the demote gate does not ask the composed question")
-    check("a demote cannot embed the conversation it runs inside", not blind,
+    check("demote-cannot-embed-self", "a demote cannot embed the conversation it runs inside", not blind,
           ", ".join(blind))
 
     # Who holds a transcript is ONE question. Two consumers in one day
@@ -9224,7 +9234,7 @@ def run_selftest(live=False, failed_only=False):
     half_askers = sorted(
         (callers_of("procs_on_transcript") | callers_of("self_holds_transcript"))
         - {"transcript_holders"})
-    check("who holds a transcript is one question", not half_askers,
+    check("holder-one-question", "who holds a transcript is one question", not half_askers,
           ", ".join(half_askers))
 
     # --- the mail ledger joins sends against deliveries, four honest states
@@ -9270,7 +9280,7 @@ def run_selftest(live=False, failed_only=False):
                 "three": "unexplained", "four": "pending"}
         off = [f"{k}: {states.get(k)} (wanted {v})" for k, v in want.items()
                if states.get(k) != v]
-        check("the mail ledger joins sends against deliveries", not off,
+        check("mail-ledger-joins-deliveries", "the mail ledger joins sends against deliveries", not off,
               ", ".join(off) or ", ".join(f"{k}={v}" for k, v in want.items()))
 
         # A declared recipient gets the same rows the full join would give it,
@@ -9297,13 +9307,13 @@ def run_selftest(live=False, failed_only=False):
             "a sender's chatter is not parsed": to_bob < to_all,
         }
         wrong = sorted(k for k, ok in declared.items() if not ok)
-        check("a declared recipient narrows the ledger without changing it",
+        check("ledger-recipient-narrows-only", "a declared recipient narrows the ledger without changing it",
               not wrong, ", ".join(wrong) or f"{to_bob} parses vs {to_all}")
         # A torn inbox answers as itself; six real messages in a half-written
         # file must not read as no mail waiting.
         (boxdir / "carol.json").write_text('[{"text": "hal')
         got = eng5.inbox_state("TML").get("carol")
-        check("a torn inbox is reported, not skipped",
+        check("torn-inbox-reported", "a torn inbox is reported, not skipped",
               bool(got) and got[0] is None and "torn" in got[1],
               str(got))
 
@@ -9339,7 +9349,7 @@ def run_selftest(live=False, failed_only=False):
         quiet.append("standing does not warn a rebound agent")
     if "rebind_fragility(" not in doctor_src:
         quiet.append("the doctor does not warn a rebound team member")
-    check("the reports carry what the mailbox file cannot show", not quiet,
+    check("reports-carry-mailbox-gaps", "the reports carry what the mailbox file cannot show", not quiet,
           ", ".join(quiet))
 
     # --- --force restamps the window-start instead of reaping a living team
@@ -9449,7 +9459,7 @@ def run_selftest(live=False, failed_only=False):
                     stray.append(f"a blocker went unremedied: {owed}")
         finally:
             RESOLVER.teams_dir, RESOLVER.reap_objections = real_teams2, real_objs
-        check("--force restamps a living team's window-start, receipted, "
+        check("restamp-window-start", "--force restamps a living team's window-start, receipted, "
               "reversible, mode-preserved", not stray, ", ".join(stray))
 
     # --- a rebind retires the stamped team only when nothing would notice
@@ -9501,7 +9511,7 @@ def run_selftest(live=False, failed_only=False):
         reap_at = run_src.find("rebind_reap(")
         if not (0 <= reap_at < run_src.find("enforce_ctx(", reap_at)):
             gates.append("the reap does not precede the act boundary")
-        check("a rebind retires the stamped team only when nothing would notice",
+        check("rebind-retires-if-unnoticed", "a rebind retires the stamped team only when nothing would notice",
               not gates, ", ".join(gates))
 
     # --- the unread-mail refusal refuses instead of crashing (its first
@@ -9536,7 +9546,7 @@ def run_selftest(live=False, failed_only=False):
                     outcome = f"crashed: {err.__class__.__name__}"
         finally:
             RESOLVER.projects_dir, RESOLVER.teams_dir = real_projects, real_teams
-        check("the unread-mail refusal refuses instead of crashing",
+        check("unread-mail-refusal-no-crash", "the unread-mail refusal refuses instead of crashing",
               outcome is None, outcome or "")
 
     # A run that stops without launching says why, registers what is running,
@@ -9557,7 +9567,7 @@ def run_selftest(live=False, failed_only=False):
                             ("note_identity(", "does not state its objections")):
         if needed not in noop_src:
             noops.append(f"the noop path {missing}")
-    check("a noop is reported through one function", not noops, ", ".join(noops))
+    check("noop-one-function", "a noop is reported through one function", not noops, ", ".join(noops))
 
     # The acts differ (exec into your terminal, spawn into a pane); the
     # precondition does not. Neither path may ask the liveness question for
@@ -9648,7 +9658,7 @@ def run_selftest(live=False, failed_only=False):
     finally:
         RESOLVER.lead_pid_for = real_owner
     asks_own += sorted(k for k, good in stops.items() if not good)
-    check("a lead is not exec'd, nor a member spawned, onto a live conversation",
+    check("no-launch-onto-live-conversation", "a lead is not exec'd, nor a member spawned, onto a live conversation",
           not asks_own, ", ".join(asks_own))
 
     # Only the conversion writers apply a plan, and only the engine converts.
@@ -9664,21 +9674,21 @@ def run_selftest(live=False, failed_only=False):
         (applied.get("_convert", set()) - {"conversion_plan"}) |
         ((applied.get("materialize", set()) | applied.get("embed", set()))
          - {"run_promote", "run_demote", "run_selftest"}))
-    check("only the conversion writers apply a plan", not stray_writers,
+    check("conversion-writers-only", "only the conversion writers apply a plan", not stray_writers,
           ", ".join(stray_writers))
 
     # Arbitrary-text whole-file writing stays with the writers of
     # transcript-shaped files; everything JSON-shaped uses the json spelling.
     texters = sorted(callers_of("replace_text")
                      - {"materialize", "embed", "apply_restamp", "run_selftest"})
-    check("raw whole-file writes stay with the conversion writers", not texters,
+    check("raw-writes-stay-with-conversion", "raw whole-file writes stay with the conversion writers", not texters,
           ", ".join(texters))
 
     # One spelling of the launch line: the dry and real paths render the same
     # template, so the word-grep parity check above is belt, not the property.
     promote_src = ast.get_source_segment(source, funcs["run_promote"]) or ""
     templates = promote_src.count('f"launch   ')
-    check("the launch line has one spelling",
+    check("launch-line-one-spelling", "the launch line has one spelling",
           templates == 1 and promote_src.count("launch_line") >= 3,
           f"{templates} template(s)")
 
@@ -9786,7 +9796,7 @@ def run_selftest(live=False, failed_only=False):
         finally:
             RESOLVER.teams_dir = real_teams
             RESOLVER.projects_dir = real_projects
-        check("restore reads the window start, not the tail", not stray,
+        check("restore-reads-window-start", "restore reads the window start, not the tail", not stray,
               ", ".join(stray))
 
     # The live corpus agrees with itself: a process whose transcript restores
@@ -9806,7 +9816,7 @@ def run_selftest(live=False, failed_only=False):
             got_team, exact = RESOLVER.team_minted_by(e["pid"])
             if got_team != team or not exact:
                 torn.append(f"pid {e['pid']}: {got_team} != {team}")
-    check("a restored life runs as its window start says", not torn,
+    check("restored-life-window-start", "a restored life runs as its window start says", not torn,
           ", ".join(torn) or f"{restored_n} restored of {sighted} registry-complete "
           f"live sessions, {incomplete} incomplete skipped")
 
@@ -9818,11 +9828,11 @@ def run_selftest(live=False, failed_only=False):
         # A chain break (a parentUuid naming no record in the file) is the
         # documented caveat: the strict walk declines and the harness falls
         # back on timestamps, which this tool does not implement.
-        check("the cautionary specimen restores as its boundary says",
+        check("cautionary-specimen-restores", "the cautionary specimen restores as its boundary says",
               got is None or got[1] == "session-b16311b4",
               f"{got[0]}/{got[1]}" if got else "chain broken; strict walk declines")
     else:
-        check("the cautionary specimen restores as its boundary says (absent here)",
+        check("cautionary-specimen-restores", "the cautionary specimen restores as its boundary says (absent here)",
               True, "skipped")
 
     # And on real bytes: the smallest pointer fork on this machine round-trips
@@ -9835,20 +9845,20 @@ def run_selftest(live=False, failed_only=False):
     if pointers:
         pick = min(pointers, key=lambda e: e["path"].stat().st_size)
         rplan = RESOLVER.conversion_plan(pick["path"], "promote")
-        check("a real fork round-trips byte-exactly",
+        check("fork-roundtrip-byte-exact", "a real fork round-trips byte-exactly",
               rplan["proved"] and not rplan["objections"],
               f"{pick['parent'][:8]}/{pick['name'] or pick['task_id']}, "
               f"{len(rplan['lines'] or [])} lines"
               if rplan["proved"] else "; ".join(rplan["objections"])[:80])
     else:
-        check("a real fork round-trips byte-exactly (none on this machine)", True, "skipped")
+        check("fork-roundtrip-byte-exact", "a real fork round-trips byte-exactly (none on this machine)", True, "skipped")
 
     # Two counts of "contested" that mean different things, so both are named.
     claimed = {t: {path for _st, path in hits} for t, hits in RESOLVER.led_teams().items()}
     raw = {t for t, paths in claimed.items() if len(paths) > 1}
     with contextlib.redirect_stderr(io.StringIO()):
         unresolved = {t for t in raw if not RESOLVER.lead_transcript_for(t)[0]}
-    check("an unresolved team is a claimed team", unresolved <= raw,
+    check("unresolved-team-claimed", "an unresolved team is a claimed team", unresolved <= raw,
           f"raw {len(raw)}, unresolved {len(unresolved)}, "
           f"stray {sorted(t[-8:] for t in unresolved - raw)}")
 
@@ -9870,10 +9880,10 @@ def run_selftest(live=False, failed_only=False):
     # uncorroborated is what lets the forge record a real leadSessionId.
     launders = sorted(t for t, ok in live_kids.items() if ok and "uncorroborated" in
                       (RESOLVER.lead_transcript_for(t)[1] or ""))
-    check("a claimant is corroborated only by children that are running",
+    check("claimant-corroborated-by-children", "a claimant is corroborated only by children that are running",
           not wrong and not launders,
           ", ".join(wrong + launders) or f"{len(live_kids)} team(s) upgraded")
-    check("copies of one history still refuse", all(
+    check("copies-of-history-refuse", "copies of one history still refuse", all(
         not RESOLVER.lead_transcript_for(t)[0] for t in unresolved),
         f"{len(unresolved)} tie(s) held")
 
@@ -9903,9 +9913,9 @@ def run_selftest(live=False, failed_only=False):
             placed["a spoken destination wins"] = (
                 RESOLVER.place(res, stale, for_team="session-elsewhere")[0] == "session-elsewhere")
         wrong = sorted(k for k, ok in placed.items() if not ok)
-        check("an address locates an agent, evidence places it", not wrong, ", ".join(wrong))
+        check("address-locates-evidence-places", "an address locates an agent, evidence places it", not wrong, ", ".join(wrong))
     else:
-        check("placement (no multi-team lead with one live crew here)", True, "skipped")
+        check("address-locates-evidence-places", "placement (no multi-team lead with one live crew here)", True, "skipped")
 
     # And it is decided in one function, so the two-sites fault cannot regrow.
     # The led-and-live evidence pair has one holder (live_led); place() is the
@@ -9921,7 +9931,7 @@ def run_selftest(live=False, failed_only=False):
         if "live_teams()" in body and "teams_led_by(" in body:
             deciders.append(node.name)
     spread = sorted(callers_of("live_led") - {"place", "run_demote", "run_selftest"})
-    check("a team is placed in one function", not deciders and not spread,
+    check("placement-one-function", "a team is placed in one function", not deciders and not spread,
           ", ".join(sorted(deciders) + spread))
 
     # The socket follows the crew: every agent wearing the team, not the roster's
@@ -9954,10 +9964,10 @@ def run_selftest(live=False, failed_only=False):
                 not RESOLVER.socket_hosting(sorted(listed - wearers) or [absent], table)[0],
         }
         wrong = sorted(k for k, ok in seats.items() if not ok)
-        check("the socket follows the crew, not the roster", not wrong,
+        check("socket-follows-crew", "the socket follows the crew, not the roster", not wrong,
               ", ".join(wrong) or f"{crewed} on {seat}")
     else:
-        check("crew socket (no live crew on this machine)", True, "skipped")
+        check("socket-follows-crew", "crew socket (no live crew on this machine)", True, "skipped")
 
     # A named target is examined, not swept past. The doctor runs before the
     # selector is applied, so it resolves its own target; taking it from
@@ -9969,10 +9979,10 @@ def run_selftest(live=False, failed_only=False):
             run_doctor(_Args(team=None, agent_id=None, all_members=False), selector=one)
         verdicts = [ln for ln in out.getvalue().splitlines()
                     if ln[:1].isalpha() and ln.split()[:1] and ln.split()[0].isupper()]
-        check("a named team is the only one examined", len(verdicts) == 1,
+        check("doctor-target-honoured", "a named team is the only one examined", len(verdicts) == 1,
               f"{len(verdicts)} verdict(s) for {one}")
     else:
-        check("doctor target (no teams on this machine)", True, "skipped")
+        check("doctor-target-honoured", "doctor target (no teams on this machine)", True, "skipped")
 
     # A verdict names what an operator must act on. Pruned members are the trace
     # of finished work and an unrecorded one is fixed by running it, so neither
@@ -10000,7 +10010,7 @@ def run_selftest(live=False, failed_only=False):
         if verdict == "DEGRADED" and not (said_split or any(
                 ln.startswith("warning  ") and "worn by" in ln for ln in lines)):
             verdicts[team] = "degraded with nothing to act on"
-    check("a verdict names something to act on", not verdicts,
+    check("verdict-names-actionable", "a verdict names something to act on", not verdicts,
           "; ".join(f"{t}: {why}" for t, why in verdicts.items()))
 
     # --- one job per agent, whatever assembled the list
@@ -10013,7 +10023,7 @@ def run_selftest(live=False, failed_only=False):
         said = err.getvalue()
     # The reason, not merely that it exited: a run that died of something else
     # would otherwise read as a refusal and this check would pass on any code.
-    check("one agent cannot be launched twice in a run", "appears twice" in said,
+    check("no-duplicate-launch-in-run", "one agent cannot be launched twice in a run", "appears twice" in said,
           f"exited saying {said.strip()[:60]!r}" if said else "the duplicate was accepted")
 
     # --- the composed answer agrees with the parts it is composed of
@@ -10055,36 +10065,36 @@ def run_selftest(live=False, failed_only=False):
             not absent["listed"] and absent["reachable"][0] is False
             and bool(absent["remedies"]))
         wrong = sorted(k for k, good in agree.items() if not good)
-        check("a standing verdict follows from its own evidence", not wrong,
+        check("standing-follows-own-evidence", "a standing verdict follows from its own evidence", not wrong,
               ", ".join(wrong[:3]))
     else:
-        check("standing (no rostered member on this machine)", True, "skipped")
+        check("standing-follows-own-evidence", "standing (no rostered member on this machine)", True, "skipped")
 
-    check("a self-migrate is refused",
+    check("self-migrate-refused", "a self-migrate is refused",
           bool(RESOLVER.transcript_holders("selftest-uuid",
                [(os.getpid(), os.getppid(), "/usr/bin/claude --resume selftest-uuid --agent-id a@b")])[1]))
 
-    check("default path cannot kill",
+    check("default-path-cannot-kill", "default path cannot kill",
           'if ctx.get("to_team") and not ctx.get("auto_redirect"):' in run_one_src)
 
     body = source.split('"""', 2)[-1]
-    check("tool name not hardcoded", TOOL not in body, f"{body.count(TOOL)} literal(s)")
+    check("tool-name-not-hardcoded", "tool name not hardcoded", TOOL not in body, f"{body.count(TOOL)} literal(s)")
 
     # -- behavioural, against real data where it exists
     index = RESOLVER.stamp_index()
     stamped = next(((p, n, t) for p, (n, t) in index.items() if n and t and n != "team-lead"), None)
     if stamped:
         path, name, team = stamped
-        check("rung: session uuid", bool(RESOLVER.resolve_transcript(session_uuid=path.stem, quick=True)))
+        check("rung-session-uuid", "rung: session uuid", bool(RESOLVER.resolve_transcript(session_uuid=path.stem, quick=True)))
         res = RESOLVER.resolve_transcript(team=team, name=name)
-        check("rung: agentName+teamName stamps", bool(res) and res.via.startswith("agentName+teamName"))
+        check("rung-stamps", "rung: agentName+teamName stamps", bool(res) and res.via.startswith("agentName+teamName"))
         try:
             with contextlib.redirect_stderr(io.StringIO()):  # the refusal is the point, not its noise
                 enforce_identity(res, RESOLVER.objections(res, "definitely-not-" + name, team),
                                  allow_team_change=False, force=False)
-            check("identity gate refuses a mismatch", False, "it allowed one")
+            check("identity-gate-refuses-mismatch", "identity gate refuses a mismatch", False, "it allowed one")
         except SystemExit:
-            check("identity gate refuses a mismatch", True)
+            check("identity-gate-refuses-mismatch", "identity gate refuses a mismatch", True)
 
         # Judgement and enforcement are separate stages. Assembling an identity
         # that contradicts its stamps must produce objections and nothing else:
@@ -10096,11 +10106,11 @@ def run_selftest(live=False, failed_only=False):
                 judged = RESOLVER.identity(agent_id=f"{name}@definitely-not-{team}")
         except SystemExit as exc:
             raised = exc
-        check("an identity is judged without being enforced",
+        check("identity-judged-not-enforced", "an identity is judged without being enforced",
               raised is None and judged is not None and bool(judged.get("objections")),
               "assembly exited" if raised else f"objections={bool((judged or {}).get('objections'))}")
     else:
-        check("rung: stamps (no stamped transcript on this machine)", True, "skipped")
+        check("rung-checks-skipped", "rung: stamps (no stamped transcript on this machine)", True, "skipped")
 
     # --- an override is told which way the evidence runs
     # Every ex-member lead on the box, so both directions are exercised wherever
@@ -10145,10 +10155,10 @@ def run_selftest(live=False, failed_only=False):
         if ("|newer" in why) != newer:
             wrong.append(f"{path.stem[:8]} says {why!r} for newer={newer}")
     if seen_dirs:
-        check("an override is told which way the evidence runs", not wrong,
+        check("override-evidence-direction", "an override is told which way the evidence runs", not wrong,
               "; ".join(wrong[:2]) or f"directions covered: {sorted(seen_dirs)}")
     else:
-        check("recency (no ex-member lead on this machine)", True,
+        check("override-evidence-direction", "recency (no ex-member lead on this machine)", True,
               f"skipped: {len(candidates)} multi-team lead(s)")
 
     lead = next((e for e in RESOLVER.scan_teams()
@@ -10156,16 +10166,16 @@ def run_selftest(live=False, failed_only=False):
     if lead:
         res = RESOLVER.resolve_transcript(lead_session=lead["leadSessionId"], team=lead.get("team"),
                                  is_lead=True, quick=True)
-        check("rung: roster leadSessionId", bool(res) and res.via == "roster leadSessionId")
+        check("rung-lead-session-id", "rung: roster leadSessionId", bool(res) and res.via == "roster leadSessionId")
     else:
-        check("rung: leadSessionId (no lead transcript on this machine)", True, "skipped")
+        check("rung-lead-session-id", "rung: leadSessionId (no lead transcript on this machine)", True, "skipped")
 
     ambiguous = [n for n in {e["member"].get("name") for e in RESOLVER.scan_teams()}
                  if n and len(RESOLVER.name_rosters(n)) > 1]
     if ambiguous:
-        check("ambiguous name is refused", not RESOLVER.resolve_transcript(name=ambiguous[0]))
+        check("ambiguous-name-refused", "ambiguous name is refused", not RESOLVER.resolve_transcript(name=ambiguous[0]))
     else:
-        check("ambiguous name (none on this machine)", True, "skipped")
+        check("ambiguous-name-refused", "ambiguous name (none on this machine)", True, "skipped")
 
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
@@ -10194,7 +10204,7 @@ def run_selftest(live=False, failed_only=False):
         with contextlib.redirect_stderr(io.StringIO()):  # the refusal is the point
             removed = remove_if_cruft(race, False, "team")
         globals()["cruft_reason"], RESOLVER.teams_dir = real_reason, real_teams
-        check("mail arriving mid-removal is not deleted",
+        check("mail-mid-removal-not-deleted", "mail arriving mid-removal is not deleted",
               not removed and race.exists() and (race / "inboxes" / "team-lead.json").read_text() != "[]")
 
         # one row per agent, even when several rosters claim the name
@@ -10202,7 +10212,7 @@ def run_selftest(live=False, failed_only=False):
         with contextlib.redirect_stdout(buffer):
             run_complete("names")
         names = [line.split("\t")[1].split("@", 1)[0] for line in buffer.getvalue().splitlines() if line]
-        check("completion offers each agent once", len(names) == len(set(names)),
+        check("completion-agent-once", "completion offers each agent once", len(names) == len(set(names)),
               ", ".join(sorted({n for n in names if names.count(n) > 1})))
 
         for label, (inboxes, stray, expect) in cases.items():
@@ -10215,7 +10225,7 @@ def run_selftest(live=False, failed_only=False):
                 (team / stray).write_text("x")
             reason = cruft_reason(team)
             ok = (reason is None) if expect is None else (reason is not None and expect in reason)
-            check(f"cruft check: {label}", ok, reason or "considered empty")
+            check(f"cruft-{label}", f"cruft check: {label}", ok, reason or "considered empty")
 
     for topic in ("names", "teams", "leads", "sockets", "sessions", "sides"):
         buffer = io.StringIO()
@@ -10223,14 +10233,19 @@ def run_selftest(live=False, failed_only=False):
             run_complete(topic)
         lines = [line for line in buffer.getvalue().splitlines() if line]
         malformed = [line for line in lines if "\t" not in line and ":" not in line]
-        check(f"completion emits parseable {topic}", not malformed, f"{len(lines)} candidates")
+        check(f"completion-parses-{topic}", f"completion emits parseable {topic}", not malformed, f"{len(lines)} candidates")
 
     if live:
         results.extend(live_checks())
 
+    if list_only:
+        for cid, name, _ok, _detail in results:
+            print(f"{cid}  {name}")
+        return 0
+
     for line in check_report(results, failed_only):
         print(line)
-    return 1 if any(not ok for _, ok, _ in results) else 0
+    return 1 if any(not ok for _, _, ok, _ in results) else 0
 
 
 def verb_needs(args, selector):
@@ -10339,6 +10354,9 @@ def main():
     parser.add_argument("--live", action="store_true",
                         help="with --selftest, also run the checks that spawn a process, "
                              "open a terminal or change directory (each cleans up after itself)")
+    parser.add_argument("--list", action="store_true",
+                        help="with --selftest, print every check's id and prose, one per "
+                             "line, instead of running verdicts")
     parser.add_argument("--selftest", action="store_true",
                         help="run the test suite against this machine; changes nothing")
     parser.add_argument("--all", dest="all_members", action="store_true",
@@ -10437,7 +10455,7 @@ def main():
             f"{'--agent-id' if args.agent_id else '--resume'} names one agent; pick one")
 
     if args.selftest:
-        return run_selftest(live=args.live, failed_only=args.failed)
+        return run_selftest(live=args.live, failed_only=args.failed, list_only=args.list)
     if args.live:
         die("--live extends --selftest; it does nothing on its own")
 
