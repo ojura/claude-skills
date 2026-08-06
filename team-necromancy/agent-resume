@@ -1324,6 +1324,27 @@ class Resolver:
                 out[receipt["name"]] = receipt
         return out
 
+    def nameless_receipts(self):
+        """Roots of materialized receipts with no recorded identity.
+
+        Receipts written before the identity fields existed can never appear
+        as converted members; re-promoting records the identity.
+        """
+        out = []
+        try:
+            paths = sorted(RECEIPTS_DIR.glob("*.json"))
+        except OSError:
+            return out
+        for path in paths:
+            try:
+                receipt = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if receipt.get("state") == "materialized" and not (
+                    receipt.get("name") and receipt.get("team")):
+                out.append(path.stem)
+        return out
+
     def live_teams(self):
         """Teams a live process is currently running as, from its own argv."""
         return {e["team"] for e in self.live_sessions() if e.get("team")}
@@ -5018,7 +5039,10 @@ def run_standing(args):
     print(f"polls    {said}  ({s['polls'][1]})")
     print(f"listed   {'yes' if s['listed'] else 'no'}")
     reachable, why = s["reachable"]
-    verdict = {True: "reaches its lead", False: "does not reach its lead",
+    # "At its next turn boundary": delivery queues while a recipient's turn
+    # runs, so the dossier must not imply an immediacy nothing guarantees.
+    verdict = {True: "reaches its lead at its next turn boundary",
+               False: "does not reach its lead",
                None: "may not reach its lead"}[reachable]
     print(f"mail     {verdict}: {why}")
     for what, cost in s["remedies"]:
@@ -5145,6 +5169,9 @@ def run_doctor(args, selector=None):
     if skipped:
         print(f"\n{skipped} team(s) with nothing live and no waiting mail were not "
               f"examined; --all covers them")
+    for stem in RESOLVER.nameless_receipts():
+        print(f"\nnote     receipt {stem[:8]} is materialized without a recorded "
+              "identity, so no team can count it; re-promote to record one")
     if teams:
         print("\nverdicts")
         for name, meaning in DOCTOR_LEGEND:
@@ -5174,7 +5201,11 @@ def materialize(plan):
     if plan["objections"] or not plan["proved"]:
         raise ValueError("materialize was handed an unproved plan")
     dest, source = plan["dest_path"], plan["source"]
-    replace_text(dest, "\n".join(plan["lines"]) + "\n")
+    try:
+        keep_mode = source.stat().st_mode & 0o777
+    except OSError:
+        keep_mode = 0o600
+    replace_text(dest, "\n".join(plan["lines"]) + "\n", mode=keep_mode)
     receipt = dict(plan["receipt"])
     receipt.update({"source": str(source), "dest": str(dest),
                     "state": "materialized", "at": int(time.time() * 1000)})
@@ -5197,7 +5228,11 @@ def embed(plan):
         raise ValueError("embed was handed an unproved plan")
     dest, source = plan["dest_path"], plan["source"]
     dest.parent.mkdir(parents=True, exist_ok=True)
-    replace_text(dest, "\n".join(plan["lines"]) + "\n")
+    try:
+        keep_mode = source.stat().st_mode & 0o777
+    except OSError:
+        keep_mode = 0o600
+    replace_text(dest, "\n".join(plan["lines"]) + "\n", mode=keep_mode)
     receipt = dict(plan["receipt"])
     meta_path = dest.with_name(dest.stem + ".meta.json")
     if receipt.get("meta"):
@@ -5276,7 +5311,16 @@ def run_demote(args):
     if not path:
         die(f"no transcript for {args.demote!r}; name the session uuid")
     stored = load_receipt(path.stem)
-    holders = RESOLVER.procs_on_transcript(path.stem, RESOLVER.ps_table())
+    table = RESOLVER.ps_table()
+    # Self-hold first: procs_on_transcript excludes our own lineage, so an
+    # agent demoting the very transcript it is running is invisible to the
+    # holder gate - the one caller that gate most needs to stop. No --force:
+    # embedding the file one's own harness will next flush is never right.
+    selfhold = RESOLVER.self_holds_transcript(path.stem, table)
+    if selfhold:
+        die(f"you are demoting the transcript you are running (pid "
+            f"{selfhold[0]}); nothing can embed a conversation from inside it")
+    holders = RESOLVER.procs_on_transcript(path.stem, table)
     if holders and not args.force:
         die(f"pid {holders[0][0]} holds this transcript; demoting it would "
             "strand a live writer. --force overrides")
@@ -5303,7 +5347,7 @@ def run_demote(args):
         box = RESOLVER.teams_dir / mate_team / "inboxes" / f"{mate}.json"
         try:
             plan["receipt"]["mail"] = box.read_text()
-            replace_text(box, "[]")
+            replace_json(box, [])
         except OSError:
             pass
     embed(plan)
@@ -5439,25 +5483,34 @@ def run_cleanup(dry=False):
 HOOK_MARKER = "--cleanup"
 
 
-def replace_json(path, data, indent=2, raw=False):
+def replace_json(path, data, indent=2, raw=False, mode=None):
     """One implementation of the atomic whole-file-write guarantee; every
     writer routes through it.
 
     `raw` writes the text as given; the default serialises JSON. A reader can
     only ever see a whole file, and the guarantee lives here and nowhere else.
+    A replaced file keeps its mode rather than taking the umask; `mode` sets
+    one explicitly - a private transcript must not come back group-readable.
     """
+    if mode is None:
+        try:
+            mode = path.stat().st_mode & 0o777
+        except OSError:
+            mode = None
     if raw:
         tmp = path.with_suffix(path.suffix + f".tmp-{TOOL}")
         tmp.write_text(data)
     else:
         tmp = path.with_suffix(f".json.tmp-{TOOL}")
         tmp.write_text(json.dumps(data, indent=indent) + "\n")
+    if mode is not None:
+        os.chmod(tmp, mode)
     os.replace(tmp, path)
 
 
-def replace_text(path, text):
+def replace_text(path, text, mode=None):
     """Write text where a reader can only ever see a whole file."""
-    replace_json(path, text, raw=True)
+    replace_json(path, text, raw=True, mode=mode)
 
 
 def write_settings(settings, data):
@@ -7121,6 +7174,7 @@ def run_selftest(live=False):
         ]) + "\n"
         side = sub / "agent-x1.jsonl"
         side.write_text(body)
+        side.chmod(0o600)
         meta_body = '{"agentType":"fork","name":"xp"}'
         (sub / "agent-x1.meta.json").write_text(meta_body)
         eng4 = Resolver()
@@ -7135,6 +7189,8 @@ def run_selftest(live=False):
             dest = plan["dest_path"]
             if not dest.exists():
                 moved.append("no promoted transcript")
+            elif dest.stat().st_mode & 0o777 != 0o600:
+                moved.append("the promoted transcript lost its mode")
             if side.exists() or (sub / "agent-x1.meta.json").exists():
                 moved.append("the source did not leave subagents/")
             stored = load_receipt(dest.stem)
@@ -7157,6 +7213,8 @@ def run_selftest(live=False):
                 moved.append("an embedded receipt still counts as membership")
             if side.read_text() != body:
                 moved.append("the demoted bytes differ from the original")
+            if side.stat().st_mode & 0o777 != 0o600:
+                moved.append("a private transcript came back wider than it left")
             if (sub / "agent-x1.meta.json").read_text() != meta_body:
                 moved.append("the meta did not come back verbatim")
             if dest.exists():
@@ -7168,6 +7226,61 @@ def run_selftest(live=False):
             globals()["RECEIPTS_DIR"] = real_receipts
         check("the writers move, and the receipt is the way back", not moved,
               ", ".join(moved))
+
+    # --- a demote cannot embed the conversation it runs inside. The holder
+    # gate excludes our own lineage by design, so the invoking agent is the
+    # one holder it cannot see; self-hold is asked first for exactly that.
+    me = os.getpid()
+    fake_table = [(me, 0, "claude --resume FAKE-LINEAGE-UUID --agent-id x@t")]
+    blind = []
+    if RESOLVER.self_holds_transcript("FAKE-LINEAGE-UUID", fake_table) != [me]:
+        blind.append("self-hold does not see the invoking lineage")
+    if RESOLVER.procs_on_transcript("FAKE-LINEAGE-UUID", fake_table):
+        blind.append("the holder gate counts our own lineage")
+    # Call spellings, not bare words: a comment naming the other gate sits
+    # earlier in the function and a word-grep matched it instead of the code.
+    demote_src = ast.get_source_segment(source, funcs["run_demote"]) or ""
+    asked_self = demote_src.find("RESOLVER.self_holds_transcript(")
+    asked_rest = demote_src.find("RESOLVER.procs_on_transcript(")
+    if not (0 <= asked_self < asked_rest):
+        blind.append("the demote gate does not ask self-hold first")
+    check("a demote cannot embed the conversation it runs inside", not blind,
+          ", ".join(blind))
+
+    # --- the unread-mail refusal refuses instead of crashing (its first
+    # spelling raised NameError at exactly the moment it was needed)
+    with tempfile.TemporaryDirectory() as td:
+        proj = Path(td) / "proj"
+        proj.mkdir(parents=True)
+        compact = lambda d: json.dumps(d, separators=(",", ":"))
+        (proj / "MATEDEMO.jsonl").write_text(
+            compact({"parentUuid": None, "sessionId": "MATEDEMO", "agentName": "maily",
+                     "teamName": "TEAMM", "type": "user", "uuid": "md-root"}) + "\n")
+        boxdir = Path(td) / "teams" / "TEAMM" / "inboxes"
+        boxdir.mkdir(parents=True)
+        (boxdir / "maily.json").write_text(json.dumps(
+            [{"from": "team-lead", "timestamp": "2026-01-01T00:00:00Z", "text": "hi"}]))
+
+        class _DemoteArgs:
+            demote, force, with_mail, into, dry_run = "MATEDEMO", False, False, "PARENT", False
+
+        real_projects, real_teams = RESOLVER.projects_dir, RESOLVER.teams_dir
+        RESOLVER.projects_dir, RESOLVER.teams_dir = Path(td), Path(td) / "teams"
+        told, outcome = io.StringIO(), None
+        try:
+            with contextlib.redirect_stderr(told):
+                try:
+                    run_demote(_DemoteArgs)
+                    outcome = "returned without refusing"
+                except SystemExit:
+                    outcome = None if "wait in TEAMM's inbox for maily" \
+                        in told.getvalue() else f"refused oddly: {told.getvalue()[-80:]}"
+                except Exception as err:
+                    outcome = f"crashed: {err.__class__.__name__}"
+        finally:
+            RESOLVER.projects_dir, RESOLVER.teams_dir = real_projects, real_teams
+        check("the unread-mail refusal refuses instead of crashing",
+              outcome is None, outcome or "")
 
     # Only the conversion writers apply a plan, and only the engine converts.
     applied = {}
@@ -7185,10 +7298,10 @@ def run_selftest(live=False):
     check("only the conversion writers apply a plan", not stray_writers,
           ", ".join(stray_writers))
 
-    # Arbitrary-text whole-file writing must not quietly spread beyond the
-    # conversion writers; the json spelling stays open to roster writers.
+    # Arbitrary-text whole-file writing stays with the writers of
+    # transcript-shaped files; everything JSON-shaped uses the json spelling.
     texters = sorted(callers_of("replace_text")
-                     - {"materialize", "embed", "run_demote", "run_selftest"})
+                     - {"materialize", "embed", "run_selftest"})
     check("raw whole-file writes stay with the conversion writers", not texters,
           ", ".join(texters))
 
