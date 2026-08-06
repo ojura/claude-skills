@@ -2801,19 +2801,35 @@ class Resolver:
         elif lead_team is None:
             reachable, why = False, ("its lead is live, but no structural record says which "
                                      "team it runs as, so where its mail is read is unknown")
-            remedies = [("resume the lead under its own identity",
-                         "restarts it, and it then states its team in argv")]
+            # Both ways to make a lead read, always together: a lead learns of
+            # members only from its own spawns or a flag-bound boot, so writing
+            # the roster from outside reaches nothing, and a remedy list naming
+            # only the restart hides the fix that costs nothing.
+            remedies = [("have the lead start any teammate",
+                         "a spawn records the team it runs as and starts it "
+                         "reading mail; immediate, costs nothing"),
+                        ("resume the lead under its own identity",
+                         "restarts it, and it then states its team in argv, at "
+                         "the cost of its current turn")]
         elif not listed:
             reachable, why = False, (f"{lead_team} does not list it, so its lead has no record "
                                      "it exists")
+            remedies = [("resume this member once", "a launch; it registers itself")]
             if polls[0] is False:
                 why += "; that roster lists no members at all, so nothing is polled yet"
-            remedies = [("resume this member once", "a launch; it registers itself")]
+                remedies += [("have the lead start any teammate",
+                              "it starts reading mail immediately; costs nothing"),
+                             (f"resume the lead as team-lead@{lead_team}",
+                              "restarts it with team flags; it reads the roster on "
+                              "the way up and loses its current turn")]
         elif polls[0] is None:
             reachable, why = None, (f"listed in {lead_team}, but whether its lead is still "
                                     f"reading cannot be told from outside its process")
-            remedies = [(f"resume the lead as team-lead@{lead_team}",
-                         "restarts it, and it reads this roster again on the way up")]
+            remedies = [("have the lead start any teammate",
+                         "it starts reading mail immediately; costs nothing"),
+                        (f"resume the lead as team-lead@{lead_team}",
+                         "restarts it with team flags; it reads this roster on "
+                         "the way up and loses its current turn")]
         else:
             reachable, why = True, f"listed in {lead_team}, whose live lead polls it"
             remedies = []
@@ -5574,12 +5590,16 @@ def run_standing(args):
     s = RESOLVER.standing(agent_id)
     pid, alive, how, grade = s["lead"]
     print(f"agent    {s['agent_id']}")
-    print(f"parent   {s['parent'][0] or '(none)'}  ({s['parent'][1]})")
-    print(f"lead     {('pid ' + str(pid)) if pid else '(none)'}"
-          f"{'' if alive else ', not running'}  ({how}) [{grade}]")
-    print(f"runs as  {s['lead_team'][0] or '(unknown)'}  [{s['lead_team'][1]}]")
+    print(fill(f"parent   {s['parent'][0] or '(none)'}  ({s['parent'][1]})"))
+    if pid:
+        said_how = re.sub(rf"^pid {pid}, ", "", how) if how else None
+        print(fill(f"lead     pid {pid}{'' if alive else ', not running'}"
+                   + (f"  ({said_how})" if said_how else "") + f" [{grade}]"))
+    else:
+        print("lead     (none)")
+    print(fill(f"runs as  {s['lead_team'][0] or '(unknown)'}  [{s['lead_team'][1]}]"))
     said = {True: "yes", False: "no", None: "unknowable"}[s["polls"][0]]
-    print(f"polls    {said}  ({s['polls'][1]})")
+    print(fill(f"polls    {said}  ({s['polls'][1]})"))
     print(f"listed   {'yes' if s['listed'] else 'no'}")
     reachable, why = s["reachable"]
     # "At its next turn boundary": delivery queues while a recipient's turn
@@ -5587,21 +5607,21 @@ def run_standing(args):
     verdict = {True: "reaches its lead at its next turn boundary",
                False: "does not reach its lead",
                None: "may not reach its lead"}[reachable]
-    print(f"mail     {verdict}: {why}")
+    print(fill(f"mail     {verdict}: {why}"))
     name, _, team = s["agent_id"].partition("@")
     res = RESOLVER.resolve_transcript(name=name, team=team, quick=True)
     held = res.path.stem if res and getattr(res, "path", None) else None
     fragile = RESOLVER.rebind_fragility(held, team)
     if fragile:
-        print(f"fragile  {fragile}")
+        print(fill(f"fragile  {fragile}"))
     addressed = [r for r in RESOLVER.mail_ledger(team) if r["to"] == name]
     held = sum(r["state"] == "in memory" for r in addressed)
     lost = sum(r["state"] == "unexplained" for r in addressed)
     if held or lost:
-        print(f"ledger   {held} in its memory, {lost} unexplained, of "
-              f"{len(addressed)} sends addressed to it")
+        print(fill(f"ledger   {held} in its memory, {lost} unexplained, of "
+                   f"{len(addressed)} sends addressed to it"))
     for what, cost in s["remedies"]:
-        print(f"remedy   {what}  ({cost})")
+        print(fill(f"remedy   {what}  ({cost})"))
     return 0
 
 
@@ -5615,19 +5635,26 @@ DOCTOR_LEGEND = (
     ("SEVERED", "members are running or mail is waiting, and no live lead reads this team"),
 )
 
+# Colour restates a verdict for a glance; the word itself stays the carrier.
+VERDICT_SGR = {"CONNECTED": "32", "DEGRADED": "33", "UNKNOWABLE": "36", "SEVERED": "31"}
+
 
 def undelivered_mail_lines(rows):
     """Report lines for the ledger states a mailbox file cannot show.
 
     The inbox file is pruned the moment a busy recipient queues mail into
     memory, so the file's silence proves nothing; these lines carry the two
-    states only the send-vs-delivery join can see.
+    states only the send-vs-delivery join can see. The counts are
+    per-recipient facts and stay per-recipient; the physics is shared and
+    is said once, however many recipients hold mail.
     """
     out = []
     held = collections.Counter(r["to"] for r in rows if r["state"] == "in memory")
-    for to, count in held.most_common():
-        out.append(f"mail     {count} in {to}'s memory; delivery waits on its "
-                   "next turn boundary and dies with its process")
+    if held:
+        out.append("mail     " + ", ".join(f"{count} in {to}'s memory"
+                                           for to, count in held.most_common()))
+        out.append(f"{'':9}delivery waits on each holder's next turn boundary "
+                   "and dies with its process")
     for r in rows:
         if r["state"] == "unexplained":
             out.append(f"mail     unexplained: {r['sender']} -> {r['to']} at "
@@ -5659,8 +5686,14 @@ def diagnose_team(team, table=None, deep=False):
     live = {n: w for n, w in live.items() if w}
     doubled = sorted(n for n, w in live.items() if len({p for p, _t in w}) > 1)
 
-    lines = [f"lead     {'pid ' + str(pid) if pid else '(none)'}"
-             f"{'' if alive else ', not running'}  ({how})"]
+    if pid:
+        # The parenthetical is the evidence; it already led with the pid once,
+        # and the line says a fact once.
+        said_how = re.sub(rf"^pid {pid}, ", "", how) if how else None
+        lines = [f"lead     pid {pid}{'' if alive else ', not running'}"
+                 + (f"  ({said_how})" if said_how else "")]
+    else:
+        lines = ["lead     (none)"]
     # Through the helper that already answers this, so the engine still does the
     # picking. A team whose roster is gone has no recorded lead session and so no
     # title here, which is the honest gap rather than the doctor choosing a file.
@@ -5682,13 +5715,22 @@ def diagnose_team(team, table=None, deep=False):
     if split:
         lines.append(f"warning  its crew is seated on {len(seats)} servers: "
                      f"{', '.join(sorted(seats))}")
-    for name in sorted(unrecorded):
-        lines.append(f"note     {name} is running and in no roster; resuming it registers it")
-    for name in sorted(converted):
-        lines.append(f"note     {name} was promoted and has not launched; "
-                     "its receipt is its membership until then")
+    # One note per state, however many members share it: eight members in one
+    # state are one fact about eight names, not eight sentences.
+    if unrecorded:
+        one = len(unrecorded) == 1
+        lines.append(f"note     {', '.join(sorted(unrecorded))} "
+                     f"{'is' if one else 'are'} running and in no roster; "
+                     f"resuming {'it' if one else 'each'} registers it")
+    if converted:
+        one = len(converted) == 1
+        lines.append(f"note     {', '.join(sorted(converted))} "
+                     f"{'was' if one else 'were'} promoted and "
+                     f"{'has' if one else 'have'} not launched; "
+                     f"{'its receipt is its' if one else 'their receipts are their'} "
+                     "membership until then")
     for name, (count, oldest) in sorted(waiting.items()):
-        lines.append(f"mail     {count} waiting for {name}, oldest {oldest}")
+        lines.append(f"mail     {count} waiting for {name}, oldest {said_when(oldest)}")
     for name, why in sorted(torn.items()):
         lines.append(f"mail     {name}'s inbox is {why}; its contents are unknown")
     if deep:
@@ -5717,8 +5759,14 @@ def diagnose_team(team, table=None, deep=False):
         verdict = "DEGRADED"
     elif not worn:
         verdict = "UNKNOWABLE"
+        # Both ways to make the lead read, cheap one first: it learns of
+        # members only from its own spawns or a flag-bound boot, never from
+        # a roster written from outside.
+        remedies.append(("start any teammate from inside the lead",
+                         "it starts reading mail immediately; costs nothing"))
         remedies.append((f"{TOOL} team-lead@{team}",
-                         "restarts the lead, which reads this roster on the way up"))
+                         "restarts the lead with team flags; it reads this roster "
+                         "on the way up and loses its current turn"))
     elif doubled or split:
         # A verdict names what an operator must act on. Former members are the
         # trace of work that finished; an unrecorded one is fixed by the next run
@@ -5746,29 +5794,35 @@ def run_doctor(args, selector=None):
         interesting = RESOLVER.teams_with_live_evidence()
         teams = sorted(interesting) if not args.all_members else sorted(everything)
         skipped = 0 if args.all_members else len(everything) - len(teams)
-    worst = 0
+    worst, seen = 0, set()
     for team in teams:
         verdict, lines, remedies = diagnose_team(team, deep=bool(target))
-        print(f"\n{verdict:<11} {team}")
+        seen.add(verdict)
+        print("\n" + f"{verdict:<11} {team}".replace(
+            verdict, tint(verdict, VERDICT_SGR.get(verdict)), 1))
         for line in lines:
-            print(f"  {line}")
+            print(fill(f"  {line}"))
         for what, cost in remedies:
-            print(f"  remedy   {what}  ({cost})")
+            print(fill(f"  remedy   {what}  ({cost})"))
         if verdict == "SEVERED":
             worst = 1
     if skipped:
-        print(f"\n{skipped} team(s) with nothing live and no waiting mail were not "
-              f"examined; --all covers them")
+        print(fill(f"\n{skipped} team(s) with nothing live and no waiting mail "
+                   f"were not examined; --all covers them"))
     if not target and teams:
-        print("\nmail beyond the inbox files is joined for a named team only; "
-              "--mail-ledger <team> shows it for any team")
+        print(fill("\nmail beyond the inbox files is joined for a named team only; "
+                   "--mail-ledger <team> shows it for any team"))
     for stem in RESOLVER.nameless_receipts():
-        print(f"\nnote     receipt {stem[:8]} is materialized without a recorded "
-              "identity, so no team can count it; re-promote to record one")
-    if teams:
-        print("\nverdicts")
+        print(fill(f"\nnote     receipt {stem[:8]} is materialized without a recorded "
+                   "identity, so no team can count it; re-promote to record one"))
+    # The legend explains the verdicts on screen; a rulebook recited under a
+    # single-team report says three things that did not happen.
+    if seen:
+        print("\nverdict" + ("s" if len(seen) > 1 else ""))
         for name, meaning in DOCTOR_LEGEND:
-            print(f"  {name:<11} {meaning}")
+            if name in seen:
+                print(fill(f"  {name:<11} {meaning}").replace(
+                    name, tint(name, VERDICT_SGR.get(name)), 1))
     return worst
 
 
@@ -7172,6 +7226,116 @@ def run_selftest(live=False):
                      and "window-start" in n.value})
     check("the project's own coinages stay out of printed strings", not spoken,
           "; ".join(spoken))
+
+    # The doctor says a shared fact once: members in one state get one note
+    # naming all of them, a missing lead is one fact rather than three
+    # spellings of None, and a live pid is not echoed by its own evidence.
+    real_bits = {}
+
+    def _rewire(**kw):
+        for attr, value in kw.items():
+            real_bits.setdefault(attr, getattr(RESOLVER, attr))
+            setattr(RESOLVER, attr, value)
+
+    _rewire(ps_table=lambda refresh=False: [],
+            lead_pid=lambda parent, team: (None, False, None, False),
+            team_population=lambda team: {"alpha": ("unrecorded", None),
+                                          "beta": ("unrecorded", None),
+                                          "gamma": ("listed", None)},
+            inbox_state=lambda team: {},
+            wearers=lambda agent_id, table=None: [],
+            roster_entries=lambda **kw: [],
+            nameless_receipts=lambda: [],
+            known_teams=lambda: {})
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            _v, lines_none, _r = diagnose_team("session-probe")
+            _rewire(lead_pid=lambda parent, team: (
+                        7717, True, "pid 7717, whose session id names team session-probe", True),
+                    team_minted_by=lambda pid: ("session-probe", True),
+                    worn_team=lambda pid: None)
+            verdict_live, lines_live, rem_live = diagnose_team("session-probe")
+            _rewire(roster_of=lambda team: {"members": [
+                        {"name": "team-lead", "agentId": f"team-lead@{team}"},
+                        {"name": "gamma", "agentId": f"gamma@{team}"}]},
+                    _every_log=lambda: {})
+            plain = RESOLVER.standing("gamma@session-probe")
+            _rewire(roster_of=lambda team: {"members": []})
+            empty = RESOLVER.standing("gamma@session-probe")
+            _rewire(team_minted_by=lambda pid: (None, False))
+            unrecorded_team = RESOLVER.standing("gamma@session-probe")
+
+            class _DocArgs:
+                team, agent_id, all_members = "session-legend", None, False
+            real_diag = globals()["diagnose_team"]
+            globals()["diagnose_team"] = (
+                lambda team, table=None, deep=False: ("CONNECTED", [], []))
+            try:
+                with contextlib.redirect_stdout(io.StringIO()) as told_doc:
+                    run_doctor(_DocArgs())
+            finally:
+                globals()["diagnose_team"] = real_diag
+    finally:
+        for attr, value in real_bits.items():
+            setattr(RESOLVER, attr, value)
+
+    solo = {
+        "a missing lead is one fact": lines_none[0] == "lead     (none)"
+            and not any("(None)" in l for l in lines_none),
+        "members in one state share one note":
+            sum(1 for l in lines_none if l.startswith("note")) == 1
+            and any("alpha, beta" in l for l in lines_none),
+        "a live pid is said once": lines_live[0].count("pid 7717") == 1,
+    }
+    wrong = sorted(k for k, ok in solo.items() if not ok)
+    check("the doctor says a shared fact once", not wrong, ", ".join(wrong))
+
+    # A lead whose reading is in doubt is offered both ways to make it read:
+    # starting any teammate (immediate, costs nothing) and the flag-bound
+    # restart (reads the roster on the way up, costs the lead its turn).
+    # Registering from outside is named by neither, because it reaches no
+    # lead's memory.
+    def offers_both(remedies):
+        return (any("start any teammate" in what for what, _c in remedies)
+                and any("team flags" in cost or "own identity" in what
+                        for what, cost in remedies)
+                and all(cost for _w, cost in remedies))
+
+    both = {
+        "the doctor's unknowable verdict": verdict_live == "UNKNOWABLE"
+            and offers_both(rem_live),
+        "a plain lead in standing": plain["polls"][0] is None
+            and offers_both(plain["remedies"]),
+        "an empty roster in standing": offers_both(empty["remedies"])
+            and any("resume this member" in what for what, _c in empty["remedies"]),
+        "a lead with no recorded team": offers_both(unrecorded_team["remedies"]),
+    }
+    wrong = sorted(k for k, ok in both.items() if not ok)
+    check("a lead whose reading is in doubt is offered both remedies", not wrong,
+          ", ".join(wrong))
+
+    # Counts are per-recipient facts; the physics they share is said once.
+    grouped = undelivered_mail_lines([
+        {"sender": "a", "to": "x", "summary": "", "sent": 1,
+         "state": "in memory", "detail": ""},
+        {"sender": "b", "to": "y", "summary": "", "sent": 2,
+         "state": "in memory", "detail": ""}])
+    check("held mail is counted per recipient, its physics said once",
+          sum(1 for l in grouped if "memory" in l) == 1
+          and sum(1 for l in grouped if "turn boundary" in l) == 1
+          and any("x's memory" in l and "y's memory" in l for l in grouped),
+          "; ".join(grouped))
+
+    doc_out = told_doc.getvalue()
+    legend = {
+        "the shown verdict is explained":
+            "a live lead runs this team" in " ".join(doc_out.split()),
+        "an absent verdict is not": all(v not in doc_out for v in
+                                        ("SEVERED", "DEGRADED", "UNKNOWABLE")),
+    }
+    wrong = sorted(k for k, ok in legend.items() if not ok)
+    check("the legend explains only the verdicts on screen", not wrong,
+          ", ".join(wrong))
 
     # Classification, not position, decides what a token is. Every entry must
     # carry both facts, or a future flag is added half-specified and the walk
