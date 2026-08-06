@@ -191,3 +191,17 @@ the same process, and restarts agents that have no completion record from
 their saved transcripts. `CLAUDE_DISABLE_ADOPT=1` turns all of it off.
 Teammates are not in adopt's inventory, which is the missing piece that would
 make team resume a real feature instead of this skill.
+
+## Method, two rules
+
+Carried out of this file's construction rather than designed up front.
+Prove the inverse before acting: a conversion computes its own undo in
+memory and byte-compares against the source before any writer may touch
+disk. And its process-level analogue: design before field contact, field
+contact before consumers. A design that waits for specimens never ships;
+one that reaches consumers before specimens ships its collapse into their
+misdiagnoses. The middle is to ship with a field acceptance attached, so a
+wrong vocabulary collapses on the first live team while the correction is
+still cheap. It has paid twice: a mail ledger's two unmatched states became
+five on first contact, and a promote's roster write dissolved into the
+receipt being the membership.
