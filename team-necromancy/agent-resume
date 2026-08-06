@@ -1689,9 +1689,9 @@ class Resolver:
         path = self.transcript_path(stem) if stem else None
         stamped, state = (self.restored_identity(path) if path else (None, None))
         if state == "orphaned" and stamped and stamped != team:
-            return (f"rebound from {stamped}: restores as it again if that team "
-                    f"returns; compact under {team} to make this permanent, "
-                    "mail unaffected meanwhile")
+            return (f"was moved from {stamped} and goes back if that team is "
+                    f"recreated; run /compact in it to make {team} permanent. "
+                    "Mail works either way")
         return None
 
     def operative_team(self, path, worn):
@@ -5828,11 +5828,10 @@ def rebind_reap(stamped, dest, args, prefix="", path=None):
     if not args.dry_run:
         reap_team(stamped, archive_mail=args.with_mail)
     print(f"{prefix}rebound  this transcript now runs as {dest}")
-    print(f"{prefix}fragile  until a compaction under {dest} seals the window-start: "
-          f"if {stamped} returns (rebuild, re-mint), the next restart snaps back; "
-          "the receipt prevents only the stale-config path")
-    print(f"{prefix}quiet    until the first restart after a compaction under "
-          f"{dest}, this life sends no idle notifications; everything else works")
+    print(f"{prefix}fragile  it goes back to {stamped} if that team is ever "
+          f"recreated; run /compact in it to make {dest} permanent")
+    print(f"{prefix}quiet    until then it sends no idle notifications; "
+          "mail still works in both directions")
 
 
 def run_promote(args):
@@ -6034,7 +6033,8 @@ def run_census():
     print("\nleads")
     print(f"  rosters naming a lead session          {named}/{len(rosters)}")
     print(f"  ...whose session is a real transcript  {resolves}/{named}")
-    print("  ...which is the shape the roster rung answers; the rest need the payloads")
+    print("  ...which is the shape resolved from the roster alone; the rest are")
+    print("     found through the records of who spawned whom")
 
     known = RESOLVER.known_teams()
     by_evidence = collections.Counter(known.values())
@@ -8460,8 +8460,8 @@ def run_selftest(live=False):
         RESOLVER.projects_dir = Path(td)
         try:
             frag = RESOLVER.rebind_fragility("w", "teamZ")
-            if not (frag and "rebound from teamC" in frag
-                    and "compact under teamZ" in frag):
+            if not (frag and "moved from teamC" in frag
+                    and "/compact in it to make teamZ permanent" in frag):
                 stray.append("a rebound transcript did not warn fragile")
             if RESOLVER.rebind_fragility("w", "teamC") is not None:
                 stray.append("a same-team transcript warned fragile")
