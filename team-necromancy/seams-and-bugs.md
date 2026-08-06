@@ -230,26 +230,37 @@ good components that nobody introduced to each other.
 
 ## Feature requests (in order of leverage)
 
-1. **`teammateMode: bg`.** The daemon substrate already gives supervision,
+1. **Read receipts.** A sender is told its message was written to an inbox and
+   nothing more, so "did it arrive" is answered today by comparing the
+   sender's transcript against the recipient's, and "is it about to be lost"
+   cannot be answered at all: mail is deleted from the inbox file when a busy
+   recipient picks it up into memory, and dies with the process if that turn
+   never ends. One field per message would settle both: picked up at, and
+   delivered at. It also retires the guessing this costs everyone downstream,
+   where an idle notification gets read as a delivery receipt because nothing
+   better exists, and it is a proxy for the wrong event: a turn ending says
+   nothing about which messages were in it.
+
+2. **`teammateMode: bg`.** The daemon substrate already gives supervision,
    auto-respawn, truecolor, exit survival, attach/logs/stop, and resume built
    into the spawn verb. Wiring it into the backend registry plus roster and
    shutdown handling is a small patch; fixing transcript flushing (bug 3)
    makes it strictly better than the tmux backend.
 
-2. **Teams in adopt.** Adopt already recovers shells, agents, workflows and
+3. **Teams in adopt.** Adopt already recovers shells, agents, workflows and
    cron across process death. Teammates are the one omission. Stamping leader
    transcripts with team identity (they are currently unstamped, which is why
    leaders cannot be resumed as leaders) plus an adopt entry for members
    would turn this whole skill into a product feature.
 
-3. **Reconcile or watch the roster file** (seam 1). The file is tiny, the
+4. **Reconcile or watch the roster file** (seam 1). The file is tiny, the
    harness already watches inbox files, and six code paths already read it.
    Rendering is the only consumer that never looks.
 
-4. **A real `prompt <id>` verb** for driving bg sessions non-interactively.
+5. **A real `prompt <id>` verb** for driving bg sessions non-interactively.
    Today the only inputs are attach (interactive) and the team inbox, and the
    obvious spelling silently dispatches (bug 5).
 
-5. **A tint setting.** The pane tint is good identity signal (bug 2, now
+6. **A tint setting.** The pane tint is good identity signal (bug 2, now
    resolved); expose the window-style color, or at least an off switch, as
    configuration instead of a hardcoded constant.
