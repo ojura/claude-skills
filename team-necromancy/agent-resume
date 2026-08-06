@@ -3476,6 +3476,25 @@ def enforce_restore(ctx, args):
          f"inboxes polled")
 
 
+def noop_outcome(ctx, args, prefix, why, socket=None, is_lead=False, pane=None,
+                 report=False):
+    """A run that stops without launching: say why, register, state, return.
+
+    Four sites reached this state and each rebuilt the sequence by hand. The
+    parts are not optional and forgetting one is invisible: a noop that skips
+    registration leaves a running member unrecorded, which shipped once and
+    read as "will re-register" to everyone who saw it. One spelling now, so a
+    fifth site cannot arrive with a piece missing.
+    """
+    # An agent already sitting where it was asked to sit is the run working,
+    # not a hazard, so that one says so in the report's own grammar.
+    print(f"{prefix}noop     {why}") if report else warn(why)
+    if not is_lead:
+        record_membership(ctx, args, pane)
+    note_identity(ctx, prefix)
+    return Outcome("noop", socket, is_lead, None)
+
+
 def note_identity(ctx, prefix=""):
     """State the objections without acting on them, for a run that stops here.
 
@@ -4696,9 +4715,9 @@ def run_one(args, passthrough, table, prefix="", pending=()):
                       extra=seat)
         owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
         if owner and owner[2] and not args.force:
-            warn(f"already live as pid {owner[0]}{state_note(owner[0])}; pass --force to run a second copy")
-            note_identity(ctx, prefix)
-            return Outcome("noop", None, True, None)
+            return noop_outcome(ctx, args, prefix, is_lead=True, why=(
+                f"already live as pid {owner[0]}{state_note(owner[0])}; "
+                "pass --force to run a second copy"))
         # This run is about to become the lead, so the identity gate applies from
         # here down.
         enforce_ctx(ctx, args)
@@ -4813,12 +4832,13 @@ def run_one(args, passthrough, table, prefix="", pending=()):
                     warn(f"pid {pid} did not die ({(killed.stderr or b'').decode().strip() or 'still running'}); "
                          "it is still appending to this transcript")
     elif here and not args.force:
-        print(f"{prefix}noop     {agent_id} is already running in pane {want_pane} (pid {here[0]}{state_note(here[0])})")
         if not args.no_color:
-            tint_pane(socket, want_pane, RESOLVER.field(ctx, "color"), RESOLVER.field(ctx, "agentName"), args.dry_run)
-        record_membership(ctx, args, want_pane)
-        note_identity(ctx, prefix)
-        return Outcome("noop", socket, False, None)
+            tint_pane(socket, want_pane, RESOLVER.field(ctx, "color"),
+                      RESOLVER.field(ctx, "agentName"), args.dry_run)
+        return noop_outcome(ctx, args, prefix, socket=socket, pane=want_pane,
+                            report=True, why=(
+                                f"{agent_id} is already running in pane {want_pane} "
+                                f"(pid {here[0]}{state_note(here[0])})"))
     if others and not replace_pane:
         warn(f"pane {want_pane} runs a different claude (pid {', '.join(map(str, others))}); using a new pane")
 
@@ -4826,24 +4846,16 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     # ask the session registry who currently owns this transcript.
     owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
     if owner and owner[2] and not args.force and not ctx.get("to_team"):
-        warn(
-            f"session {ctx['session_uuid']} is live as pid {owner[0]}{state_note(owner[0])}; "
-            "pass --force to resume a second copy"
-        )
-        record_membership(ctx, args, want_pane)
-        note_identity(ctx, prefix)
-        return Outcome("noop", socket, False, None)
+        return noop_outcome(ctx, args, prefix, socket=socket, pane=want_pane, why=(
+            f"session {ctx['session_uuid']} is live as pid {owner[0]}"
+            f"{state_note(owner[0])}; pass --force to resume a second copy"))
 
     live = RESOLVER.live_agent_procs(agent_id, table) if agent_id else []
     elsewhere = [pid for pid, _ in live if pid not in here]
     if elsewhere and not args.force and not ctx.get("to_team"):
-        warn(
+        return noop_outcome(ctx, args, prefix, socket=socket, pane=want_pane, why=(
             f"{agent_id} is already running outside pane {want_pane or '?'} "
-            f"(pid {', '.join(map(str, elsewhere))}); pass --force to start another instance"
-        )
-        record_membership(ctx, args, want_pane)
-        note_identity(ctx, prefix)
-        return Outcome("noop", socket, False, None)
+            f"(pid {', '.join(map(str, elsewhere))}); pass --force to start another instance"))
 
     # Every guard that could still turn this into a noop has passed, so the run
     # is about to act and the identity gate applies.
@@ -7994,6 +8006,26 @@ def run_selftest(live=False):
             RESOLVER.projects_dir, RESOLVER.teams_dir = real_projects, real_teams
         check("the unread-mail refusal refuses instead of crashing",
               outcome is None, outcome or "")
+
+    # A run that stops without launching says why, registers what is running,
+    # and states its objections. The sequence is not optional and a missing
+    # piece is invisible, so it has one spelling and one construction site.
+    noops = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef) or fn.name in (
+                "noop_outcome", "run_selftest"):
+            continue
+        body = ast.get_source_segment(source, fn) or ""
+        if 'Outcome("noop"' in body:
+            noops.append(fn.name)
+    # Registration is the piece whose absence is invisible: a member running
+    # in its pane, unlisted, while the run reports success. Probed by removal.
+    noop_src = ast.get_source_segment(source, funcs["noop_outcome"]) or ""
+    for needed, missing in (("record_membership(", "does not register what is running"),
+                            ("note_identity(", "does not state its objections")):
+        if needed not in noop_src:
+            noops.append(f"the noop path {missing}")
+    check("a noop is reported through one function", not noops, ", ".join(noops))
 
     # Only the conversion writers apply a plan, and only the engine converts.
     applied = {}
