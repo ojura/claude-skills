@@ -1621,6 +1621,21 @@ class Resolver:
         return (path, fields.get("agentName", (None,))[0],
                 fields.get("teamName", (None,))[0])
 
+    def rebind_fragility(self, stem, team):
+        """The fragile sentence for a rebound transcript, or None.
+
+        A transcript whose window-start names an absent team runs as its
+        flags only for as long as that team stays absent; the reports say so
+        with the remedy, so nobody reads a working rebind as a finished one.
+        """
+        path = self.transcript_path(stem) if stem else None
+        stamped, state = (self.restored_identity(path) if path else (None, None))
+        if state == "orphaned" and stamped and stamped != team:
+            return (f"rebound from {stamped}: restores as it again if that team "
+                    f"returns; compact under {team} to make this permanent, "
+                    "mail unaffected meanwhile")
+        return None
+
     def operative_team(self, path, worn):
         """(team, exact, state) a resume of this transcript operates as.
 
@@ -5288,6 +5303,11 @@ def run_standing(args):
                None: "may not reach its lead"}[reachable]
     print(f"mail     {verdict}: {why}")
     name, _, team = s["agent_id"].partition("@")
+    res = RESOLVER.resolve_transcript(name=name, team=team, quick=True)
+    held = res.path.stem if res and getattr(res, "path", None) else None
+    fragile = RESOLVER.rebind_fragility(held, team)
+    if fragile:
+        print(f"fragile  {fragile}")
     addressed = [r for r in RESOLVER.mail_ledger(team) if r["to"] == name]
     held = sum(r["state"] == "in memory" for r in addressed)
     lost = sum(r["state"] == "unexplained" for r in addressed)
@@ -5386,6 +5406,15 @@ def diagnose_team(team, table=None, deep=False):
     for name, why in sorted(torn.items()):
         lines.append(f"mail     {name}'s inbox is {why}; its contents are unknown")
     if deep:
+        checked = set()
+        for name, procs in sorted(live.items()):
+            for _pid, held in procs:
+                if not held or held in checked:
+                    continue
+                checked.add(held)
+                fragile = RESOLVER.rebind_fragility(held, team)
+                if fragile:
+                    lines.append(f"note     {name} {fragile}")
         lines.extend(undelivered_mail_lines(RESOLVER.mail_ledger(team)))
     for name in doubled:
         lines.append(f"warning  {name} is worn by {len(live[name])} processes at once")
@@ -7750,6 +7779,10 @@ def run_selftest(live=False):
     standing_src = ast.get_source_segment(source, funcs["run_standing"]) or ""
     if "mail_ledger(" not in standing_src:
         quiet.append("standing does not consult the ledger")
+    if "rebind_fragility(" not in standing_src:
+        quiet.append("standing does not warn a rebound agent")
+    if "rebind_fragility(" not in doctor_src:
+        quiet.append("the doctor does not warn a rebound team member")
     check("the reports carry what the mailbox file cannot show", not quiet,
           ", ".join(quiet))
 
@@ -7873,7 +7906,8 @@ def run_selftest(live=False):
 
     # --- restore reads the window start: set-latest leaf, walk to null
     with tempfile.TemporaryDirectory() as td:
-        wt = Path(td) / "w.jsonl"
+        (Path(td) / "proj").mkdir()
+        wt = Path(td) / "proj" / "w.jsonl"
         rows = [
             {"parentUuid": None, "agentName": "lead", "teamName": "teamA",
              "type": "user", "uuid": "wa-root", "timestamp": "2026-01-01T00:00:01Z"},
@@ -7894,7 +7928,7 @@ def run_selftest(live=False):
         got = RESOLVER.window_start(wt)
         if not got or got[1] != "teamC":
             stray.append(f"walked to {got and got[1]}, not teamC")
-        un = Path(td) / "u.jsonl"
+        un = Path(td) / "proj" / "u.jsonl"
         un.write_text(json.dumps({"parentUuid": None, "type": "user", "uuid": "u-root",
                                   "timestamp": "2026-01-01T00:00:01Z"}) + "\n" +
                       json.dumps({"type": "last-prompt", "leafUuid": "u-root"}) + "\n")
@@ -7955,6 +7989,25 @@ def run_selftest(live=False):
             stray.append("argv did not survive the reaped-team bail")
         if eng3.operative_team(wt, None)[:2] != (None, False):
             stray.append("a flagless reaped-team resume was given an identity")
+        # The fragile sentence: a rebound transcript warns with the remedy,
+        # its own team does not, and a still-restoring one is not "fragile"
+        # (it is the refusal's territory, not this note's).
+        real_projects = RESOLVER.projects_dir
+        RESOLVER.teams_dir = eng3.teams_dir
+        RESOLVER.projects_dir = Path(td)
+        try:
+            frag = RESOLVER.rebind_fragility("w", "teamZ")
+            if not (frag and "rebound from teamC" in frag
+                    and "compact under teamZ" in frag):
+                stray.append("a rebound transcript did not warn fragile")
+            if RESOLVER.rebind_fragility("w", "teamC") is not None:
+                stray.append("a same-team transcript warned fragile")
+            (eng3.teams_dir / "teamC" / "config.json").write_text("{}")
+            if RESOLVER.rebind_fragility("w", "teamZ") is not None:
+                stray.append("a still-restoring transcript warned fragile")
+        finally:
+            RESOLVER.teams_dir = real_teams
+            RESOLVER.projects_dir = real_projects
         check("restore reads the window start, not the tail", not stray,
               ", ".join(stray))
 
