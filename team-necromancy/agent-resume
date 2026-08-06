@@ -2777,7 +2777,7 @@ class Resolver:
         return next((team for team, owner, _ in self._boot_join()
                      if owner == pid and team in pool), None), False
 
-    def standing(self, agent_id, parent_session=None):
+    def standing(self, agent_id, parent_session=None, dossier=True):
         """Where a member stands with its lead: parentage, liveness, team, mail.
 
         One composed answer, each part carrying the evidence it rests on. The
@@ -2788,11 +2788,16 @@ class Resolver:
         Only structural records count as evidence of the team a session runs as.
         A team name appearing in a transcript's prose is this tool's own printed
         guess read back, and would corroborate itself.
+
+        `dossier` is the caller's declared need: False answers only what the
+        reachability verdict and its remedies rest on, skipping the
+        who-spawned-it walk that only the printed dossier renders, so a
+        caller consulting the verdict does not buy the corpus's spawn log.
         """
         name, _, team = agent_id.partition("@")
         parent = next((stem for stem, entries in self._every_log().items()
                        for _stamp, payload in entries
-                       if payload.get("agent_id") == agent_id), None)
+                       if payload.get("agent_id") == agent_id), None) if dossier else None
         pid, alive, how, exact_lead = self.lead_pid(parent_session, team)
         lead_team, exact_team = self.team_minted_by(pid) if pid and alive else (None, False)
         roster = self.roster_of(lead_team) if lead_team else None
@@ -2862,8 +2867,11 @@ class Resolver:
             remedies = []
         return {
             "agent_id": agent_id, "name": name, "team": team,
-            "parent": (parent, "spawn payload naming it" if parent
-                       else "no spawn payload names this agent"),
+            # An unasked question must not answer "no": the caller declared
+            # no need, and "no payload names it" is a claim about the corpus.
+            "parent": (parent, ("spawn payload naming it" if parent else
+                                "no spawn payload names this agent") if dossier
+                       else "not asked"),
             "lead": (pid, alive, how, "exact" if exact_lead else "inferred"),
             "lead_team": (lead_team, "exact" if exact_team else
                           f"paired by a boot within {TEAM_MINT_WINDOW_MS}ms, not proven"),
@@ -4911,7 +4919,8 @@ def auto_redirect(ctx, args, table, prefix=""):
         # Alive: leave it to the liveness guards. Say what the move would cost
         # rather than making it, since restarting throws away its current turn.
         who = f"pid {holders[0][0]}" if holders else f"pid {owner[0]} (registry)"
-        standing = RESOLVER.standing(agent_id, RESOLVER.field(ctx, "parentSessionId"))
+        standing = RESOLVER.standing(agent_id, RESOLVER.field(ctx, "parentSessionId"),
+                                     dossier=False)
         fix = "".join(f"\n- {what}  ({cost})" for what, cost in standing["remedies"])
         warn(f"{agent_id} is running as {who}: {standing['reachable'][1]}{fix}")
         ctx["stale_team_warned"] = True
@@ -7399,11 +7408,15 @@ def run_selftest(live=False):
                     team_minted_by=lambda pid: ("session-probe", True),
                     worn_team=lambda pid: None)
             verdict_live, lines_live, rem_live = diagnose_team("session-probe")
+            log_walked = []
             _rewire(roster_of=lambda team: {"members": [
                         {"name": "team-lead", "agentId": f"team-lead@{team}"},
                         {"name": "gamma", "agentId": f"gamma@{team}"}]},
-                    _every_log=lambda: {})
+                    _every_log=lambda: (log_walked.append(1), {})[1])
             plain = RESOLVER.standing("gamma@session-probe")
+            walked_when_asked = len(log_walked)
+            verdictless = RESOLVER.standing("gamma@session-probe", dossier=False)
+            walked_undeclared = len(log_walked) - walked_when_asked
             _rewire(roster_of=lambda team: {"members": []})
             empty = RESOLVER.standing("gamma@session-probe")
             _rewire(team_minted_by=lambda pid: (None, False))
@@ -7453,6 +7466,16 @@ def run_selftest(live=False):
         "an empty roster in standing": offers_both(empty["remedies"])
             and any("resume this member" in what for what, _c in empty["remedies"]),
         "a lead with no recorded team": offers_both(unrecorded_team["remedies"]),
+        # The cost of an undeclared field is nothing by construction: the
+        # dossier walks the spawn log, the bare verdict never does, and the
+        # verdict it returns is the same one, with parent honestly unasked.
+        "the dossier asks, the verdict does not":
+            walked_when_asked == 1 and walked_undeclared == 0,
+        "the undeclared verdict still answers whole":
+            offers_both(verdictless["remedies"])
+            and verdictless["parent"] == (None, "not asked"),
+        "the redirect declares its need": "dossier=False" in
+            (ast.get_source_segment(source, funcs["auto_redirect"]) or ""),
     }
     wrong = sorted(k for k, ok in both.items() if not ok)
     check("a lead whose reading is in doubt is offered both remedies", not wrong,
