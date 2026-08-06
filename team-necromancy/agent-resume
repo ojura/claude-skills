@@ -125,6 +125,17 @@ STAMP_RE = re.compile(rb'"(agentName|teamName)":"([^"]*)"')
 LABEL_LINE = b'"type":"agent-name"'
 
 
+def _prompt_text(rec):
+    """The user text of one transcript record, as a picker would show it."""
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return " ".join(part.get("text", "").strip() for part in content
+                        if isinstance(part, dict) and part.get("type") == "text").strip()
+    return ""
+
+
 def _stamps_in(chunk):
     """{field: value} from a window, ignoring the harness's display-label lines.
 
@@ -1370,6 +1381,28 @@ class Resolver:
             loads = False
         return team, ("restored" if loads else "orphaned")
 
+    def live_led(self, stem):
+        """The teams this transcript led that have members running now.
+
+        Answers the pair, never chooses: a holder, not a second placer.
+        place() decides placement from it, and a demote refuses beheading
+        from it.
+        """
+        return [t for t in self.teams_led_by(stem) if t in self.live_teams()]
+
+    def demote_subject(self, selector):
+        """(path, name, team) for the transcript a demote names.
+
+        The engine picks the transcript and reads its identity; the verb only
+        consumes the answer.
+        """
+        path = self.transcript_path(selector)
+        if not path:
+            return None, None, None
+        fields, _ts = self._scan_transcript(path)
+        return (path, fields.get("agentName", (None,))[0],
+                fields.get("teamName", (None,))[0])
+
     def operative_team(self, path, worn):
         """(team, exact, state) a resume of this transcript operates as.
 
@@ -1538,8 +1571,7 @@ class Resolver:
         spoken = to_team or for_team
         if spoken:
             return spoken, "asked for"
-        led = self.teams_led_by(res.path.stem)
-        live_led = [t for t in led if t in self.live_teams()]
+        live_led = self.live_led(res.path.stem)
         if keep_team:
             if typed_team and live_led and typed_team not in live_led:
                 warn(f"--keep-team: staying on {typed_team}, though this transcript's "
@@ -2598,7 +2630,11 @@ class Resolver:
                              if '"uuid"' in line and json.loads(line).get("uuid")), None)
                 if leaf is None:
                     objections.append("no record carries a uuid, so there is no leaf")
-                trailer = {"type": "last-prompt", "lastPrompt": receipt.get("prompt", ""),
+                # The text the resume picker shows: the window's last user
+                # message, as the harness itself would have recorded it.
+                said = next((_prompt_text(rec) for _n, _raw, rec, _s in reversed(parsed)
+                             if rec.get("type") == "user" and _prompt_text(rec)), "")
+                trailer = {"type": "last-prompt", "lastPrompt": said,
                            "leafUuid": leaf, "sessionId": dest}
                 out.append(json.dumps(trailer, separators=(",", ":"), ensure_ascii=False))
                 receipt["trailer"] = out[-1]
@@ -2644,7 +2680,7 @@ class Resolver:
                 return key
         return None
 
-    def conversion_plan(self, source, direction, into=None, dest=None):
+    def conversion_plan(self, source, direction, into=None, dest=None, stored=None):
         """The full plan for one conversion, proved before anyone acts on it.
 
         Answers only: edit set (as the rendered lines), receipt, objections,
@@ -2677,11 +2713,18 @@ class Resolver:
             out, objections = self._convert(raws, "promote", receipt)
             dest_path = source.parent.parent.parent / f"{receipt['dest_stem']}.jsonl"
         else:
+            stored = stored or {}
+            into = into or stored.get("parent")
             if not into:
                 return {"objections": ["demote needs the parent session (--into)"],
                         "proved": False}
-            receipt = {"grammar": "rooted", "parent": into, "dest_stem": source.stem,
-                       "task_id": dest or source.stem, "root": None, "meta": None}
+            receipt = {"grammar": stored.get("grammar", "rooted"), "parent": into,
+                       "dest_stem": source.stem,
+                       "task_id": dest or stored.get("task_id") or source.stem,
+                       "root": stored.get("root"), "meta": stored.get("meta")}
+            for carried in ("ref", "graft", "inserted_sidechain"):
+                if stored.get(carried):
+                    receipt[carried] = stored[carried]
             out, objections = self._convert(raws, "demote", receipt)
             dest_path = (self.projects_dir / source.parent.name / into / "subagents"
                          / f"agent-{receipt['task_id']}.jsonl")
@@ -5067,6 +5110,160 @@ def run_doctor(args, selector=None):
     return worst
 
 
+RECEIPTS_DIR = CLAUDE_DIR / TOOL / "receipts"
+
+
+def load_receipt(stem):
+    """The stored conversion receipt for this root uuid, or None."""
+    try:
+        return json.loads((RECEIPTS_DIR / f"{stem}.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def materialize(plan):
+    """Apply a proved promote. The only mover of a side transcript.
+
+    Dest first, receipt second, and only then does the source leave: a crash
+    between steps leaves two copies on disk, never zero. The receipt is
+    load-bearing evidence and is never evicted; a re-conversion appends to
+    its history rather than replacing its story.
+    """
+    if plan["objections"] or not plan["proved"]:
+        raise ValueError("materialize was handed an unproved plan")
+    dest, source = plan["dest_path"], plan["source"]
+    replace_text(dest, "\n".join(plan["lines"]) + "\n")
+    receipt = dict(plan["receipt"])
+    receipt.update({"source": str(source), "dest": str(dest),
+                    "state": "materialized", "at": int(time.time() * 1000)})
+    RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    prior = load_receipt(receipt["root"] or dest.stem)
+    if prior:
+        receipt["history"] = prior.get("history", []) + [
+            {k: prior.get(k) for k in ("state", "at")}]
+    replace_json(RECEIPTS_DIR / f"{receipt['root'] or dest.stem}.json", receipt)
+    source.unlink()
+    meta = source.with_name(source.stem + ".meta.json")
+    if meta.exists():
+        meta.unlink()
+    return receipt
+
+
+def embed(plan):
+    """Apply a proved demote. The only mover of a teammate into subagents/."""
+    if plan["objections"] or not plan["proved"]:
+        raise ValueError("embed was handed an unproved plan")
+    dest, source = plan["dest_path"], plan["source"]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    replace_text(dest, "\n".join(plan["lines"]) + "\n")
+    receipt = dict(plan["receipt"])
+    meta_path = dest.with_name(dest.stem + ".meta.json")
+    if receipt.get("meta"):
+        replace_text(meta_path, receipt["meta"])
+    else:
+        # No stored meta means this teammate was born one; the synthesized
+        # meta says so instead of pretending a fork history.
+        replace_text(meta_path, json.dumps(
+            {"isFork": False, "description": f"demoted from session {source.stem}"}))
+    root = receipt.get("root") or source.stem
+    receipt.update({"source": str(source), "dest": str(dest),
+                    "state": "embedded", "at": int(time.time() * 1000)})
+    RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    prior = load_receipt(root)
+    if prior:
+        receipt["history"] = prior.get("history", []) + [
+            {k: prior.get(k) for k in ("state", "at")}]
+    replace_json(RECEIPTS_DIR / f"{root}.json", receipt)
+    source.unlink()
+    return receipt
+
+
+def run_promote(args):
+    """--promote <side> [--as name@team]: a side transcript becomes a teammate."""
+    entry, why = RESOLVER.side_transcript(args.promote)
+    if not entry:
+        die(why)
+    name, team = None, None
+    if args.as_:
+        name, _, team = args.as_.partition("@")
+        name, team = name or None, team or None
+    defaulted = not name
+    name = name or entry["name"] or entry["task_id"]
+    if not team:
+        die("the destination team must be spoken: --as name@team. "
+            "An address only locates; a destination is typed")
+    plan = RESOLVER.conversion_plan(entry["path"], "promote")
+    if plan["objections"] or not plan["proved"]:
+        die("; ".join(plan["objections"]) or "the inverse could not be proved")
+    dest = plan["dest_path"]
+    if dest.exists():
+        die(f"a transcript already exists at {dest}; refusing the collision")
+    settled = int(time.time() * 1000) - 60_000
+    if entry["mtime"] >= settled and not args.force:
+        die("this side transcript was written within the last minute; its task "
+            "may still be running. --force to convert it anyway")
+    print(f"promote  {entry['parent'][:8]}/{entry['name'] or entry['task_id']}  "
+          f"({entry['grammar']}, {len(plan['lines'])} lines)")
+    if defaulted:
+        print(f"name     {name}  (from the side transcript's meta)")
+    print(f"as       {name}@{team}")
+    print(f"into     {dest}")
+    print(f"receipt  {RECEIPTS_DIR / (plan['receipt']['root'] or dest.stem)}.json")
+    # One spelling of the launch line; the dry and real paths differ only in
+    # their annotation, so the preview cannot drift from what a run prints.
+    launch = [sys.argv[0], f"{name}@{team}", "--resume", dest.stem]
+    launch_line = f"launch   {shlex.join(launch)}"
+    if args.dry_run:
+        print(f"{launch_line}  (dry run; nothing written)")
+        return 0
+    materialize(plan)
+    if args.no_launch:
+        print(f"{launch_line}  (unregistered until launched; launching registers it)")
+        return 0
+    os.execvp(launch[0], launch)
+
+
+def run_demote(args):
+    """--demote <session> [--into <parent>]: a teammate becomes a side transcript."""
+    path, mate, mate_team = RESOLVER.demote_subject(args.demote)
+    if not path:
+        die(f"no transcript for {args.demote!r}; name the session uuid")
+    stored = load_receipt(path.stem)
+    holders = RESOLVER.procs_on_transcript(path.stem, RESOLVER.ps_table())
+    if holders and not args.force:
+        die(f"pid {holders[0][0]} holds this transcript; demoting it would "
+            "strand a live writer. --force overrides")
+    beheads = RESOLVER.live_led(path.stem)
+    if beheads and not args.force:
+        die(f"this transcript leads {', '.join(beheads)} with members running; "
+            "demoting it beheads them. --force overrides")
+    if mate_team and mate:
+        waiting = RESOLVER.inbox_state(mate_team).get(mate)
+        if waiting and waiting[0] and not args.with_mail:
+            die(f"{waiting[0]} message(s) wait in {team}'s inbox for {mate}, "
+                f"oldest {waiting[1]}; read them first or pass --with-mail "
+                "to archive them into the receipt")
+    plan = RESOLVER.conversion_plan(path, "demote", into=args.into, stored=stored)
+    if plan["objections"] or not plan["proved"]:
+        die("; ".join(plan["objections"]) or "the inverse could not be proved")
+    if plan["dest_path"].exists():
+        die(f"a side transcript already exists at {plan['dest_path']}; "
+            "refusing the collision")
+    print(f"demote   {path.stem[:8]}  ->  {plan['dest_path']}")
+    if args.dry_run:
+        return 0
+    if mate_team and mate and args.with_mail:
+        box = RESOLVER.teams_dir / mate_team / "inboxes" / f"{mate}.json"
+        try:
+            plan["receipt"]["mail"] = box.read_text()
+            replace_text(box, "[]")
+        except OSError:
+            pass
+    embed(plan)
+    print(f"receipt  {RECEIPTS_DIR}/{plan['receipt'].get('root') or path.stem}.json")
+    return 0
+
+
 def run_sides(selector=None):
     """List side transcripts, newest first. Read-only; the engine classifies.
 
@@ -5195,11 +5392,25 @@ def run_cleanup(dry=False):
 HOOK_MARKER = "--cleanup"
 
 
-def replace_json(path, data, indent=2):
-    """Write JSON where a reader can only ever see a whole file."""
-    tmp = path.with_suffix(f".json.tmp-{TOOL}")
-    tmp.write_text(json.dumps(data, indent=indent) + "\n")
+def replace_json(path, data, indent=2, raw=False):
+    """One implementation of the atomic whole-file-write guarantee; every
+    writer routes through it.
+
+    `raw` writes the text as given; the default serialises JSON. A reader can
+    only ever see a whole file, and the guarantee lives here and nowhere else.
+    """
+    if raw:
+        tmp = path.with_suffix(path.suffix + f".tmp-{TOOL}")
+        tmp.write_text(data)
+    else:
+        tmp = path.with_suffix(f".json.tmp-{TOOL}")
+        tmp.write_text(json.dumps(data, indent=indent) + "\n")
     os.replace(tmp, path)
+
+
+def replace_text(path, text):
+    """Write text where a reader can only ever see a whole file."""
+    replace_json(path, text, raw=True)
 
 
 def write_settings(settings, data):
@@ -6849,6 +7060,87 @@ def run_selftest(live=False):
         check("a conversion proves its inverse before it acts", not faults,
               ", ".join(faults))
 
+    # --- the writers move, and the receipt is the way back
+    with tempfile.TemporaryDirectory() as td:
+        sub = Path(td) / "proj" / "PARENT" / "subagents"
+        sub.mkdir(parents=True)
+        compact = lambda d: json.dumps(d, separators=(",", ":"))
+        body = "\n".join(compact(r) for r in [
+            {"type": "fork-context-ref", "agentId": "x1", "parentSessionId": "PARENT",
+             "parentLastUuid": "pl-leaf", "contextLength": 9},
+            {"parentUuid": None, "isSidechain": True, "sessionId": "PARENT",
+             "agentId": "x1", "type": "user", "uuid": "xr-root",
+             "message": {"role": "user", "content": "fork off"}},
+            {"parentUuid": "xr-root", "isSidechain": True, "sessionId": "PARENT",
+             "agentId": "x1", "type": "assistant", "uuid": "xr-2"},
+        ]) + "\n"
+        side = sub / "agent-x1.jsonl"
+        side.write_text(body)
+        meta_body = '{"agentType":"fork","name":"xp"}'
+        (sub / "agent-x1.meta.json").write_text(meta_body)
+        eng4 = Resolver()
+        eng4.projects_dir = Path(td)
+        real_receipts = RECEIPTS_DIR
+        globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
+        moved = []
+        try:
+            plan = eng4.conversion_plan(side, "promote")
+            materialize(plan)
+            dest = plan["dest_path"]
+            if not dest.exists():
+                moved.append("no promoted transcript")
+            if side.exists() or (sub / "agent-x1.meta.json").exists():
+                moved.append("the source did not leave subagents/")
+            stored = load_receipt(dest.stem)
+            if not stored or stored.get("state") != "materialized":
+                moved.append("no receipt, or the wrong state")
+            dplan = eng4.conversion_plan(dest, "demote", stored=stored)
+            embed(dplan)
+            if side.read_text() != body:
+                moved.append("the demoted bytes differ from the original")
+            if (sub / "agent-x1.meta.json").read_text() != meta_body:
+                moved.append("the meta did not come back verbatim")
+            if dest.exists():
+                moved.append("the promoted transcript lingered")
+            after = load_receipt(dest.stem)
+            if not after or after.get("state") != "embedded" or not after.get("history"):
+                moved.append("the receipt did not carry its history")
+        finally:
+            globals()["RECEIPTS_DIR"] = real_receipts
+        check("the writers move, and the receipt is the way back", not moved,
+              ", ".join(moved))
+
+    # Only the conversion writers apply a plan, and only the engine converts.
+    applied = {}
+    for fn in ast.walk(tree):
+        if isinstance(fn, ast.FunctionDef):
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Call):
+                    called = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+                    if called in ("_convert", "materialize", "embed"):
+                        applied.setdefault(called, set()).add(fn.name)
+    stray_writers = sorted(
+        (applied.get("_convert", set()) - {"conversion_plan"}) |
+        ((applied.get("materialize", set()) | applied.get("embed", set()))
+         - {"run_promote", "run_demote", "run_selftest"}))
+    check("only the conversion writers apply a plan", not stray_writers,
+          ", ".join(stray_writers))
+
+    # Arbitrary-text whole-file writing must not quietly spread beyond the
+    # conversion writers; the json spelling stays open to roster writers.
+    texters = sorted(callers_of("replace_text")
+                     - {"materialize", "embed", "run_demote", "run_selftest"})
+    check("raw whole-file writes stay with the conversion writers", not texters,
+          ", ".join(texters))
+
+    # One spelling of the launch line: the dry and real paths render the same
+    # template, so the word-grep parity check above is belt, not the property.
+    promote_src = ast.get_source_segment(source, funcs["run_promote"]) or ""
+    templates = promote_src.count('f"launch   ')
+    check("the launch line has one spelling",
+          templates == 1 and promote_src.count("launch_line") >= 3,
+          f"{templates} template(s)")
+
     # --- restore reads the window start: set-latest leaf, walk to null
     with tempfile.TemporaryDirectory() as td:
         wt = Path(td) / "w.jsonl"
@@ -7015,15 +7307,21 @@ def run_selftest(live=False):
         check("placement (no multi-team lead with one live crew here)", True, "skipped")
 
     # And it is decided in one function, so the two-sites fault cannot regrow.
+    # The led-and-live evidence pair has one holder (live_led); place() is the
+    # only decider consuming it, and a demote's beheading refusal only reads it.
+    # This allowlist was changed once, under consult (2026-08-06, ruled
+    # conform-with-amendment); the next edit to it needs the same second key.
     deciders = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef) or node.name in (
-                "place", "run_selftest", "diagnose_team", "run_census"):
+                "live_led", "run_selftest", "diagnose_team", "run_census"):
             continue
         body = ast.get_source_segment(source, node) or ""
         if "live_teams()" in body and "teams_led_by(" in body:
             deciders.append(node.name)
-    check("a team is placed in one function", not deciders, ", ".join(sorted(deciders)))
+    spread = sorted(callers_of("live_led") - {"place", "run_demote", "run_selftest"})
+    check("a team is placed in one function", not deciders and not spread,
+          ", ".join(sorted(deciders) + spread))
 
     # The socket follows the crew: every agent wearing the team, not the roster's
     # list and not the resumed agent alone. A member that is not running has no
@@ -7397,6 +7695,23 @@ def main():
     parser.add_argument("--sides", action="store_true",
                         help="list side transcripts (subagent conversations), each "
                              "classified by its own bytes; reports only")
+    parser.add_argument("--promote", metavar="SIDE",
+                        help="convert a side transcript into a resumable teammate "
+                             "(moves it; the receipt holds the way back)")
+    parser.add_argument("--demote", metavar="SESSION",
+                        help="convert a teammate transcript back into a side "
+                             "transcript under its parent's subagents/")
+    parser.add_argument("--as", dest="as_", metavar="NAME@TEAM",
+                        help="the identity a promoted teammate joins as; the team "
+                             "half must be typed")
+    parser.add_argument("--into", metavar="SESSION",
+                        help="the parent session a demoted transcript embeds under")
+    parser.add_argument("--no-launch", action="store_true",
+                        help="promote writes files and prints the launch line "
+                             "instead of launching")
+    parser.add_argument("--with-mail", action="store_true",
+                        help="demote archives unread inbox mail into the receipt "
+                             "instead of refusing")
     parser.add_argument("--cleanup", "--cleanup-sockets", dest="cleanup", action="store_true",
                         help="reap dead swarm sockets and team dirs with nothing resurrectable")
     parser.add_argument("--complete", metavar="TOPIC", help=argparse.SUPPRESS)
@@ -7453,6 +7768,13 @@ def main():
         # selector, and resolving its own target because args.team is not set
         # yet; a named session must not be silently swept into the machine.
         return run_sides(selector)
+
+    if args.promote and args.demote:
+        die("--promote and --demote are opposite verbs; pick one")
+    if args.promote:
+        return run_promote(args)
+    if args.demote:
+        return run_demote(args)
 
     if args.cleanup:
         return run_cleanup(args.dry_run)
