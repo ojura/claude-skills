@@ -138,28 +138,45 @@ _agent_resume_selector() {  # names/teams/leads in one call, widths shared
 _agent-resume() {
   zmodload -i zsh/complist 2>/dev/null  # list-colors renders through complist
   _arguments -S \
-    '--agent-id[resume this agent id]:agent id:{_agent_resume_topic agent-ids "agent id"}' \
-    '--resume[resume this session transcript]:session uuid:{_agent_resume_topic sessions "session uuid"}' \
-    '--team[resume every member of this team]:team:{_agent_resume_topic teams team}' \
-    '--no-lead[with --team, skip the lead]' \
-    '--to-team[migrate this member onto another team, restarting it (live = the live lead'"'"'s team)]:team:{_agent_resume_topic teams team}' \
-    '--keep-team[do not adopt the team the lead now runs as]' \
-    '--socket[swarm tmux socket]:socket:{_agent_resume_topic sockets socket}' \
-    '--tmux-session[tmux session to launch into]:session:' \
-    '--tmux-window[window to create if the session is missing]:window:' \
-    '--claude-bin[claude binary to launch]:binary:_files' \
-    '--force[override liveness guards]' \
+    '--agent-id[resume this agent (by its full id, name@team)]:agent id:{_agent_resume_topic agent-ids "agent id"}' \
+    '--resume[resume this session transcript (by uuid)]:session uuid:{_agent_resume_topic sessions "session uuid"}' \
+    '--team[resume this whole team by name: the members, then the lead]:team:{_agent_resume_topic teams team}' \
+    '--no-lead[skip the lead when bringing up the whole team]' \
+    '--to-team[move this agent onto another team (live = the team its live lead now runs as); a running one is restarted]:team:{_agent_resume_topic teams team}' \
+    '--keep-team[resume a member on its recorded team even when its lead now runs as another one]' \
+    '--socket[use this swarm tmux socket instead of detecting or creating one]:socket:{_agent_resume_topic sockets socket}' \
+    '--tmux-session[use this tmux session name instead of the default claude-swarm]:session:' \
+    '--tmux-window[use this tmux window name instead of the default swarm-view]:window:' \
+    '--claude-bin[launch this claude binary instead of the one on PATH]:binary:_files' \
+    '--force[override the running-copy and identity guards; with --to-team, take the rewrite route]' \
     '--dry-run[preview without launching]' \
-    '--explain[show per-field provenance]' \
-    '--no-update-config[leave the team roster untouched]' \
-    '--attach[attach even if the swarm already has a watcher]' \
-    '--no-attach[never attach; just print the command]' \
-    '--no-color[do not tint the pane; uncoloured completion]' \
-    '--install[symlink into ~/.local/bin, completion, cleanup hook]' \
-    '--cleanup[reap dead swarm sockets and empty team dirs]' \
-    '--selftest[check the tool'"'"'s invariants; changes nothing]' \
-    '--poison[poison the swarm server API (Recipe 1 step 0)]' \
-    '--unpoison[remove the API poison (Recipe 1 step 2)]' \
+    '--explain[say where each launch fact came from before launching]' \
+    '--no-update-config[do not write resumed agents into the team roster]' \
+    '--attach[attach to the swarm tmux session even when another client is already attached]' \
+    '--no-attach[never attach to the swarm tmux session; just report]' \
+    '--no-tint[do not tint the tmux pane]' \
+    '--no-color[print without colour (the NO_COLOR environment variable does the same)]' \
+    '--install[symlink into ~/.local/bin, install zsh tab completion, and add the Claude Code startup hook that runs --cleanup]' \
+    '--cleanup[clean up dead swarm tmux sockets and team dirs with nothing left to resume; the installed Claude Code startup hook runs this]' \
+    '--selftest[run the test suite against this machine; changes nothing]' \
+    '--live[with --selftest, also run the checks that launch real processes]' \
+    '--doctor[say whether each team'"'"'s lead is connected to it; reports only]' \
+    '--standing[where the named agent stands with its lead: liveness, team, whether its mail is read]' \
+    '--census[count what ~/.claude contains, through the tool'"'"'s own readers]' \
+    '--sides[list subagent side transcripts, each classified; reports only]' \
+    '--mail-ledger[join a team'"'"'s sends against its deliveries]' \
+    '--promote[convert a subagent side transcript into a resumable teammate]:side:{_agent_resume_topic sides side}' \
+    '--demote[convert a teammate transcript back into a side transcript]:session:{_agent_resume_topic sessions session}' \
+    '--as[the identity a promoted teammate joins as (name@team)]:identity:' \
+    '--into[the parent session a demoted transcript embeds under]:session:{_agent_resume_topic sessions session}' \
+    '--no-launch[promote writes files and prints the launch line instead of launching]' \
+    '--with-mail[archive unread inbox mail into the receipt instead of refusing]' \
+    '--cut[promote an unclassifiable side transcript as the chain from this record]:uuid:' \
+    '--stop[stop the agent, session or team instead of resuming it]' \
+    '--yes[do not ask before stopping]' \
+    '--all[with a team, also resume members the roster no longer lists]' \
+    '--poison[point the swarm server at a dead port so placeholder spawns die at connect instead of reaching the API]' \
+    '--unpoison[remove the dead-port override from the swarm server]' \
     '1:selector:_agent_resume_selector' \
     '*:forwarded to claude:'
 }

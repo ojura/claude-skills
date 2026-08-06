@@ -4952,6 +4952,13 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     # interactive session you drive, and a pane-backed lead would be reaped by
     # the next lead's exit anyway. No socket, no pane, no roster patch.
     if agent_id and agent_id == ctx.get("lead_agent_id"):
+        if args.to_team:
+            # This branch never reaches the rebind code, and a flag that
+            # silently does nothing reads as having worked.
+            die(f"--to-team moves a member between teams, and this agent is a "
+                f"lead; to have this conversation lead another team, resume it "
+                f"as that team's lead: {TOOL} team-lead@<team> --resume "
+                f"{ctx['session_uuid']}")
         command = build_command(ctx, args, passthrough)
         # A lead is the socket's namesake - a swarm server is named after the
         # lead's pid, and members resolve theirs by asking who their lead is -
@@ -5100,7 +5107,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
                               table=table, here=here, pane=want_pane)
     if running:
         why, report = running
-        if report and not args.no_color:
+        if report and not args.no_tint:
             tint_pane(socket, want_pane, RESOLVER.field(ctx, "color"),
                       RESOLVER.field(ctx, "agentName"), args.dry_run)
         return noop_outcome(ctx, args, prefix, socket=socket, pane=want_pane,
@@ -5144,7 +5151,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
                 warn("this shell carries the Recipe 1 poison; dropping it for the exec")
                 environ.pop("ANTHROPIC_BASE_URL", None)
             environ.update(dict(pair.split("=", 1) for pair in TEAM_ENV))
-            if not args.no_color:
+            if not args.no_tint:
                 tint_pane(socket, in_pane, RESOLVER.field(ctx, "color"), RESOLVER.field(ctx, "agentName"), False)
             enter_agent_cwd(ctx, prefix)
             try:
@@ -5170,7 +5177,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         warn(f"{prefix}{build_command_agent_id(ctx)} did not launch: {exc}")
         return Outcome("failed", socket, False, None)
     print(f"{prefix}{'would run' if args.dry_run else 'running'} in pane {pane or '<new>'} ({action})")
-    if not args.no_color:
+    if not args.no_tint:
         tint_pane(socket, pane, RESOLVER.field(ctx, "color"), RESOLVER.field(ctx, "agentName"), args.dry_run)
 
     alive, wrote = True, True
@@ -7392,6 +7399,23 @@ def run_selftest(live=False):
     check("the launch report fits the terminal and keeps its command exact",
           not wrong, ", ".join(wrong))
 
+    # The zsh completion file is kept by hand beside the tool, and it drifted:
+    # fifteen flags existed that completion had never heard of. Every long
+    # flag the parser takes must be offered (aliases and the hidden emitter
+    # excepted), and completion must offer nothing the parser would refuse.
+    comp_path = Path(__file__).resolve().parent / f"_{TOOL}"
+    comp_text = comp_path.read_text() if comp_path.exists() else ""
+    main_src = ast.get_source_segment(source, funcs["main"]) or ""
+    parser_flags = set(re.findall(r'add_argument\(\s*"(--[a-z-]+)"', main_src))
+    comp_flags = set(re.findall(r"'(--[a-z-]+)\[", comp_text))
+    aliases = {"--no-colour", "--terminate", "--cleanup-sockets"}
+    missing = sorted(parser_flags - comp_flags - {"--complete"})
+    unknown = sorted(comp_flags - parser_flags - aliases)
+    check("completion offers every flag the parser takes, and nothing else",
+          comp_text and not missing and not unknown,
+          f"missing from completion: {missing}; unknown to the parser: {unknown}"
+          if (missing or unknown) else "no completion file found")
+
     # Classification, not position, decides what a token is. Every entry must
     # carry both facts, or a future flag is added half-specified and the walk
     # silently treats its value as a name.
@@ -8194,13 +8218,19 @@ def run_selftest(live=False):
     # member block and nowhere else. Whatever else the two paths differ in,
     # they answer these questions alike.
     run_one_src = ast.get_source_segment(source, funcs["run_one"]) or ""
-    lead_block, _, member_block = run_one_src.partition("if args.to_team:")
+    # The anchor is the member path's own top-level branch (4-space indent);
+    # the lead branch also mentions the flag, one level deeper, to refuse it.
+    lead_block, _, member_block = run_one_src.partition("\n    if args.to_team:")
     reporters = sorted(callers_of("report_launch"))
     # Both halves report through the one function, so a field cannot exist in
     # one report and not the other: what differs is the seat, not the facts.
     split = [where for where, block in (("the lead path", lead_block),
                                         ("the member path", member_block))
              if "report_launch(" not in block]
+    # A flag the lead path cannot honour refuses before the report, instead
+    # of riding along silently and reading as having worked.
+    if not (0 <= lead_block.find("args.to_team") < lead_block.find("report_launch(")):
+        split.append("--to-team on a lead is not refused before the report")
     if set(reporters) - {"run_one", "run_selftest"}:
         split.append("reported from " + ", ".join(
             sorted(set(reporters) - {"run_one", "run_selftest"})))
@@ -9546,23 +9576,33 @@ def main():
         prog=TOOL, allow_abbrev=False, add_help=False,
         description="Resume a Claude Code teammate in its swarm tmux session.",
     )
-    parser.add_argument("--agent-id")
-    parser.add_argument("--resume", metavar="SESSION_UUID")
-    parser.add_argument("--team", metavar="TEAM", help="resume every member of this team")
-    parser.add_argument("--no-lead", action="store_true", help="with --team, skip the lead")
+    parser.add_argument("--agent-id", help="resume this agent (by its full id, name@team)")
+    parser.add_argument("--resume", metavar="SESSION_UUID",
+                        help="resume this session transcript (by uuid)")
+    parser.add_argument("--team", metavar="TEAM",
+                        help="resume this whole team by name: the members, then the lead")
+    parser.add_argument("--no-lead", action="store_true",
+                        help="skip the lead when bringing up the whole team")
     parser.add_argument("--keep-team", action="store_true",
-                        help="do not adopt the team the lead now runs as; stay on the recorded roster")
+                        help="resume a member on its recorded team even when its lead now "
+                             "runs as another one (skips the automatic move)")
     parser.add_argument("--to-team", metavar="TEAM|live",
-                        help="rebind the member onto another team (live = the live lead's implicit team)")
+                        help="move this agent onto another team (live = the team its live "
+                             "lead now runs as); a running one is restarted, a dead one "
+                             "comes up there")
     parser.add_argument("--install", action="store_true",
-                        help="symlink into ~/.local/bin, set up completion and the cleanup hook")
+                        help="symlink into ~/.local/bin, install zsh tab completion, and "
+                             "add the Claude Code startup hook that runs --cleanup")
     parser.add_argument("--no-color", "--no-colour", dest="no_color", action="store_true",
-                        help="do not tint the pane, and emit completion candidates uncoloured")
+                        help="print without colour; the NO_COLOR environment variable "
+                             "does the same")
+    parser.add_argument("--no-tint", action="store_true",
+                        help="do not tint the tmux pane")
     parser.add_argument("--live", action="store_true",
                         help="with --selftest, also run the checks that spawn a process, "
                              "open a terminal or change directory (each cleans up after itself)")
     parser.add_argument("--selftest", action="store_true",
-                        help="check the tool's invariants against this machine; changes nothing")
+                        help="run the test suite against this machine; changes nothing")
     parser.add_argument("--all", dest="all_members", action="store_true",
                         help="with a team, also resume members the roster no longer lists "
                              "but whose transcripts are stamped with it")
@@ -9602,30 +9642,40 @@ def main():
                         help="join a team's sends against its deliveries: "
                              "delivered, queued, pending, or unexplained")
     parser.add_argument("--cleanup", "--cleanup-sockets", dest="cleanup", action="store_true",
-                        help="reap dead swarm sockets and team dirs with nothing resurrectable")
+                        help="clean up dead swarm tmux sockets and team dirs with nothing "
+                             "left to resume; the installed Claude Code startup hook runs this")
     parser.add_argument("--complete", metavar="TOPIC", help=argparse.SUPPRESS)
     parser.add_argument("--poison", action="store_true",
-                        help="point the swarm server's ANTHROPIC_BASE_URL at a dead port (Recipe 1 step 0)")
+                        help="point the swarm server's ANTHROPIC_BASE_URL at a dead port, "
+                             "so placeholder spawns die at connect instead of reaching the API")
     parser.add_argument("--unpoison", action="store_true",
-                        help="remove the poison from the swarm server (Recipe 1 step 2)")
-    parser.add_argument("--socket")
+                        help="remove the dead-port override from the swarm server")
+    parser.add_argument("--socket",
+                        help="use this swarm tmux socket instead of detecting or creating one")
     parser.add_argument("--tmux-session", metavar="NAME",
-                        help=f"tmux session to launch into (default {TMUX_SESSION})")
+                        help=f"use this tmux session name instead of the default {TMUX_SESSION}")
     parser.add_argument("--tmux-window", metavar="NAME",
-                        help=f"window to create when the session is missing (default {TMUX_WINDOW})")
-    parser.add_argument("--claude-bin")
-    parser.add_argument("--force", action="store_true")
+                        help=f"use this tmux window name instead of the default {TMUX_WINDOW}")
+    parser.add_argument("--claude-bin",
+                        help="launch this claude binary instead of the one on PATH")
+    parser.add_argument("--force", action="store_true",
+                        help="override the running-copy and identity guards; with --to-team, "
+                             "also take the rewrite route when the old team cannot be retired")
     parser.add_argument("--stop", "--terminate", action="store_true", dest="stop",
                         help="stop the agent, session or team instead of resuming it")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="do not ask before stopping")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--explain", action="store_true")
-    parser.add_argument("--no-update-config", action="store_true")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="preview without launching")
+    parser.add_argument("--explain", action="store_true",
+                        help="say where each launch fact came from before launching")
+    parser.add_argument("--no-update-config", action="store_true",
+                        help="do not write resumed agents into the team roster")
     parser.add_argument("--attach", action="store_true",
-                        help="attach even if the swarm already has a watcher")
+                        help="attach to the swarm tmux session even when another client "
+                             "is already attached")
     parser.add_argument("--no-attach", action="store_true",
-                        help="never attach; just print the command")
+                        help="never attach to the swarm tmux session; just report")
     parser.add_argument("-h", "--help", action="store_true")
     # Only a *leading* bare word is the selector; later bare words belong to
     # forwarded flags (argparse can't know that --model takes a value).
