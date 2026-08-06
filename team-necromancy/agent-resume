@@ -673,6 +673,15 @@ class Resolver:
                 for data in self.session_registry():
                     if str(data.get("sessionId", "")).startswith(block.group(1)):
                         if pid_alive(data["pid"], data.get("procStart")):
+                            # The registry records the id a life resumed from,
+                            # not the identity restore gave it: a transcript
+                            # whose window-start restores to another team makes
+                            # this pid that team's lead, not this one's.
+                            joined = self.transcript_path(str(data.get("sessionId", "")))
+                            if joined:
+                                rteam, state = self.restored_identity(joined)
+                                if state == "restored" and rteam != team:
+                                    continue
                             return data["pid"], True, f"pid {data['pid']}, whose session id names team {team}", True
             # A masqueraded lead writes no sessions/<pid>.json at all (the registry
             # is for unbound launches), so every rung above it is blind to one.
@@ -1274,10 +1283,111 @@ class Resolver:
     def worn_team(self, pid):
         """The team this live process names in its own argv, or None.
 
-        A lead that states its team read the roster when it booted. One that
-        does not is reading a projection nothing outside it can see.
+        Worn is not operative. A launch onto a transcript whose window-start
+        carries stamps runs as the stamped team (line stamps, spawns, future
+        resolution) while idle notifications still go to the worn team and
+        both teams' inboxes are polled - measured on 2.1.220, all three
+        carriers on one process. Argv remains the answer for holder matching
+        and for where idles land; restored_identity answers the operative half.
         """
         return next((e.get("team") for e in self.live_sessions() if e["pid"] == pid), None)
+
+    def window_start(self, path):
+        """(agentName, teamName, uuid) of the entry restore reads, else None.
+
+        The loader picks the timestamp-latest user or assistant record whose
+        uuid any last-prompt line names (the set, not merely the final line),
+        walks parentUuid to null - never logicalParentUuid - and adopts the
+        stamps of the entry it stops at, when it carries BOTH. One walk, one
+        implementation: the restored-identity rung and the launch guard both
+        read here. Triple-witnessed against 2.1.220: stale source, bundle,
+        live sandbox. Cautionary specimen: transcript 8f1a0dc1 on this box
+        answers team-lead/session-b16311b4 from its pseudocompact boundary,
+        which is the fact the session-id rung overclaimed past when it graded
+        a redirect exact on 2026-08-05. A corrupt chain may restore through
+        the harness's timestamp fallback instead of this walk; that is a
+        caveat on the answer, not part of it.
+        """
+        records, leaves = {}, []
+        try:
+            handle = path.open(errors="replace")
+        except OSError:
+            return None
+        with handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("type") == "last-prompt":
+                    # Order kept so a wrong final-wins reading stays writable
+                    # as a probe; the set-latest rule below is the loader's.
+                    if rec.get("leafUuid") and rec["leafUuid"] not in leaves:
+                        leaves.append(rec["leafUuid"])
+                    continue
+                if rec.get("uuid"):
+                    records[rec["uuid"]] = (rec.get("parentUuid"),
+                                            rec.get("agentName"), rec.get("teamName"),
+                                            iso_ms(rec.get("timestamp")), rec.get("type"))
+        candidates = [(ts, uuid) for uuid, (_p, _a, _t, ts, kind) in records.items()
+                      if uuid in leaves and kind in ("user", "assistant")]
+        if not candidates:
+            return None
+        cursor = max(candidates)[1]
+        seen = set()
+        while cursor in records and cursor not in seen:
+            seen.add(cursor)
+            parent = records[cursor][0]
+            if parent is None:
+                _p, name, team, _ts, _k = records[cursor]
+                return (name, team, cursor) if name and team else None
+            cursor = parent
+        return None
+
+    def restored_identity(self, path):
+        """(team, state) for what a resume of this transcript will run as.
+
+        states: "restored"  - stamped window-start naming a team whose roster
+                              loads; overrides flags (line stamps, spawns,
+                              future window-starts all follow it)
+                "orphaned"  - stamped window-start naming a team with no
+                              roster; argv survives if worn, otherwise the
+                              session comes up as nobody and writes unstamped
+                              lines until the team dir exists again
+                None        - unstamped window-start; flags and the mint
+                              behave as recorded
+        """
+        start = self.window_start(path)
+        if not start:
+            return None, None
+        _name, team, _uuid = start
+        try:
+            loads = self.roster_path(team).exists()
+        except OSError:
+            loads = False
+        return team, ("restored" if loads else "orphaned")
+
+    def operative_team(self, path, worn):
+        """(team, exact, state) a resume of this transcript operates as.
+
+        The five measured arms, one answer: a stamped window-start whose team
+        loads overrides the flags; stamped for an absent team, the flags
+        survive when worn and nobody answers when not; unstamped, the flags
+        are the answer and the mint rungs keep their standing.
+        """
+        team, state = self.restored_identity(path) if path else (None, None)
+        if state == "restored":
+            return team, True, "restored"
+        if state == "orphaned":
+            if worn:
+                return worn, True, "orphaned, argv stands"
+            return None, False, "orphaned, runs as nobody"
+        if worn:
+            return worn, True, "worn"
+        return None, None, None
 
     def teams_with_live_evidence(self):
         """Teams with a live lead, a live member, or mail nobody has read.
@@ -2114,6 +2224,18 @@ class Resolver:
         only ever a last resort.
         """
         entry = next((e for e in self.live_sessions() if e["pid"] == pid), None)
+        if entry:
+            path = self.transcript_path(entry["session"]) if entry.get("session") else None
+            team, exact, state = self.operative_team(path, entry.get("team"))
+            if state == "restored":
+                # Restore overrides flags: the stamped window-start is what
+                # this life stamps, spawns into, and resolves as next time.
+                # Idles still land on the worn team; worn_team answers that.
+                return team, True
+            if state == "orphaned, runs as nobody":
+                # A mint record must not be read as the team an identity-less
+                # session operates as.
+                return None, False
         if entry and entry.get("team"):
             # A flag-bound lead states the team it runs as, in its own argv.
             return entry["team"], True
@@ -2953,6 +3075,35 @@ def enforce_ctx(ctx, args):
     """The identity gate, at the boundary where this run starts acting."""
     enforce_identity(ctx["resolution"], ctx["objections"],
                      allow_team_change=bool(args.to_team), force=args.force)
+    enforce_restore(ctx, args)
+
+
+def enforce_restore(ctx, args):
+    """Refuse a rebind, and name a launch, that restore would override.
+
+    A launch onto a transcript whose window-start stamps name a team with a
+    loadable roster runs as that team whatever the flags say: lines and
+    spawns follow the stamped team, idle notifications follow the worn one,
+    and both teams' inboxes are polled. A --to-team rebind into that state
+    undoes itself at every restart, because the transcript restores the
+    stamped team into each future window-start; the durable mechanism is a
+    re-stamped boundary graft, which is not built.
+    """
+    path = getattr(ctx["resolution"], "path", None)
+    team = RESOLVER.field(ctx, "teamName")
+    if not path or not team:
+        return
+    stamped, state = RESOLVER.restored_identity(path)
+    if state != "restored" or stamped == team:
+        return
+    if args.to_team and not args.force:
+        die(f"restored from window-start stamps: this transcript restores as "
+            f"{stamped}, so a rebind onto {team} undoes itself at the next "
+            f"restart. The durable move is a re-stamped boundary graft, which "
+            f"is not built; --force launches the split anyway")
+    warn(f"restored from window-start stamps: this launch runs split - lines "
+         f"and spawns as {stamped}, idle notifications as {team}, both "
+         f"inboxes polled")
 
 
 def note_identity(ctx, prefix=""):
@@ -6558,7 +6709,9 @@ def run_selftest(live=False):
           not admitted and len(genuine) == 1 and len(buried) == 1 and len(twin) == 2,
           ", ".join(admitted) or f"genuine={len(genuine)} buried={len(buried)} twin={len(twin)}")
 
-    # --- a sidechain line is not evidence, whatever container it sits in
+    # --- a sidechain line is not evidence, whatever container it sits in.
+    # Present tense, not only future demotes: the 2.1.220 sidechain writer
+    # stamps teamName/agentName on sidechain lines when team context exists.
     side = {"isSidechain": True, "agentName": "ghost", "teamName": "t",
             "timestamp": "2026-01-01T00:00:00.000Z", "toolUseResult": dict(payload)}
     leaks = []
@@ -6695,6 +6848,89 @@ def run_selftest(live=False):
             faults.append("an unstable line did not refuse")
         check("a conversion proves its inverse before it acts", not faults,
               ", ".join(faults))
+
+    # --- restore reads the window start: set-latest leaf, walk to null
+    with tempfile.TemporaryDirectory() as td:
+        wt = Path(td) / "w.jsonl"
+        rows = [
+            {"parentUuid": None, "agentName": "lead", "teamName": "teamA",
+             "type": "user", "uuid": "wa-root", "timestamp": "2026-01-01T00:00:01Z"},
+            {"parentUuid": "wa-root", "agentName": "lead", "teamName": "teamB",
+             "type": "assistant", "uuid": "wa-leaf", "timestamp": "2026-01-01T00:00:02Z"},
+            {"parentUuid": None, "agentName": "lead", "teamName": "teamC",
+             "type": "user", "uuid": "wc-root", "timestamp": "2026-01-01T00:00:03Z"},
+            {"parentUuid": "wc-root", "agentName": "lead", "teamName": "teamB",
+             "type": "assistant", "uuid": "wc-leaf", "timestamp": "2026-01-01T00:00:04Z"},
+            # the FINAL trailer names the older chain; the set-latest rule
+            # picks wc-leaf, so tail-first answers teamB, final-wins answers
+            # teamA, and only the harness's own walk answers teamC
+            {"type": "last-prompt", "leafUuid": "wc-leaf", "sessionId": "w"},
+            {"type": "last-prompt", "leafUuid": "wa-leaf", "sessionId": "w"},
+        ]
+        wt.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        stray = []
+        got = RESOLVER.window_start(wt)
+        if not got or got[1] != "teamC":
+            stray.append(f"walked to {got and got[1]}, not teamC")
+        un = Path(td) / "u.jsonl"
+        un.write_text(json.dumps({"parentUuid": None, "type": "user", "uuid": "u-root",
+                                  "timestamp": "2026-01-01T00:00:01Z"}) + "\n" +
+                      json.dumps({"type": "last-prompt", "leafUuid": "u-root"}) + "\n")
+        if RESOLVER.window_start(un) is not None:
+            stray.append("an unstamped window start restored")
+        eng3 = Resolver()
+        eng3.teams_dir = Path(td) / "teams"
+        (eng3.teams_dir / "teamC").mkdir(parents=True)
+        (eng3.teams_dir / "teamC" / "config.json").write_text("{}")
+        if eng3.restored_identity(wt) != ("teamC", "restored"):
+            stray.append("a loadable stamped team did not read as restored")
+        # The five measured arms, driven as one unit: stamped-and-loadable
+        # overrides the worn team; stamped-for-absent falls back to the worn
+        # team or to nobody; unstamped leaves the flags standing.
+        if eng3.operative_team(wt, "teamZ")[:2] != ("teamC", True):
+            stray.append("a worn team out-ranked a loadable window start")
+        if eng3.operative_team(un, "teamZ")[0] != "teamZ":
+            stray.append("an unstamped window start did not leave argv standing")
+        (eng3.teams_dir / "teamC" / "config.json").unlink()
+        if eng3.restored_identity(wt) != ("teamC", "orphaned"):
+            stray.append("an absent stamped team did not read as orphaned")
+        if eng3.operative_team(wt, "teamZ")[0] != "teamZ":
+            stray.append("argv did not survive the reaped-team bail")
+        if eng3.operative_team(wt, None)[:2] != (None, False):
+            stray.append("a flagless reaped-team resume was given an identity")
+        check("restore reads the window start, not the tail", not stray,
+              ", ".join(stray))
+
+    # The live corpus agrees with itself: a process whose transcript restores
+    # is reported as running the restored team.
+    torn, sighted, restored_n = [], 0, 0
+    for e in RESOLVER.live_sessions():
+        if not (e.get("alive") and e.get("session")):
+            continue
+        sighted += 1
+        lived = RESOLVER.transcript_path(e["session"])
+        if not lived:
+            continue
+        team, state = RESOLVER.restored_identity(lived)
+        if state == "restored":
+            restored_n += 1
+            got_team, exact = RESOLVER.team_minted_by(e["pid"])
+            if got_team != team or not exact:
+                torn.append(f"pid {e['pid']}: {got_team} != {team}")
+    check("a restored life runs as its window start says", not torn,
+          ", ".join(torn) or f"{restored_n} restored of {sighted} live sessions")
+
+    # The cautionary specimen: the transcript whose session-id rung overclaim
+    # mis-aimed a redirect. Skipped wherever it does not exist.
+    spec = RESOLVER.transcript_path("8f1a0dc1-cff0-47b0-83da-2b778e67d6a9")
+    if spec:
+        got = RESOLVER.window_start(spec)
+        check("the cautionary specimen restores as its boundary says",
+              bool(got) and got[1] == "session-b16311b4",
+              got and f"{got[0]}/{got[1]}")
+    else:
+        check("the cautionary specimen restores as its boundary says (absent here)",
+              True, "skipped")
 
     # And on real bytes: the smallest pointer fork on this machine round-trips
     # exactly, ref and graft and trailer included. The specimen must be

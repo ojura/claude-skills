@@ -63,16 +63,17 @@ good components that nobody introduced to each other.
    resumed transcripts; the window-start stamps are the operand the harness
    actually consumes.
 
-   The unsettled half, code-read grade: the restore does not appear to be
-   gated on the absence of identity flags, which would let a stamped
-   window-start override an explicit `--agent-id`/`--team-name` while argv
-   keeps wearing the flags. Field counter-evidence exists on this box: one
-   life ran flag-bound at team A for three hours over a window-start stamped
-   team B, and its idle notifications routed to team A, so the flags governed
-   the one observable that fired. A two-minute experiment decides it
-   (synthetic stamped transcript, flag-bound launch, read the stamps on the
-   child's new lines); until it runs, treat rebinding a stamped transcript by
-   flags as unproven rather than safe.
+   Settled, triple-witnessed (stale source, bundle trace, live sandbox):
+   restore is not gated on flags. A flag-bound launch onto a
+   stamped-disagreeing transcript runs split: it writes transcript lines as
+   the stamped team, sends idle notifications as the worn team, and polls
+   both teams' inboxes. The transcript half wins every future resume, so a
+   rebind by flags silently undoes itself at each restart; the durable
+   mechanism is an appended re-stamped boundary entry (pseudocompact shape),
+   which changes exactly the entry restore consumes. Two reaped-team edges:
+   stamped for an absent team and flagless, the session comes up as nobody
+   and writes unstamped lines until the team dir exists again; flag-bound,
+   argv survives but hook init is skipped (that half is code-read grade).
 
 ## The bugs (file-worthy)
 
