@@ -4712,6 +4712,18 @@ def auto_redirect(ctx, args, table, prefix=""):
         ctx["stale_team_warned"] = True
         return
 
+    # A conversation that restores as its own team ignores these flags, so a
+    # redirect would be a lie the next restart undoes. The durable move exists
+    # and is named; asking permission to fail is not the alternative.
+    path = getattr(ctx["resolution"], "path", None)
+    stamped, state = RESOLVER.restored_identity(path) if path else (None, None)
+    if state == "restored" and stamped != dest:
+        warn(f"{agent_id} comes back as {stamped} whatever these flags say, so "
+             f"pointing it at {dest} would not survive a restart; "
+             f"{TOOL} {agent_id} --to-team {dest} moves it for good")
+        ctx["stale_team_warned"] = True
+        return
+
     # Asked last, so a run that was going to decline anyway never puts a question
     # in front of anyone.
     if not exact_team and not confirm_redirect(agent_id, pid, dest, source, prefix):
@@ -7529,6 +7541,18 @@ def run_selftest(live=False):
     check("an interrupt is answered, not dumped",
           code == 130 and "still running" in said.getvalue(),
           f"exit {code}, said {said.getvalue().strip()[:50]!r}")
+
+    # --- a redirect that a restart would undo is not offered
+    redirect_src = ast.get_source_segment(source, funcs["auto_redirect"]) or ""
+    asked_at = redirect_src.find("confirm_redirect(")
+    restore_at = redirect_src.find("restored_identity(")
+    futile = []
+    if not (0 <= restore_at < asked_at):
+        futile.append("the restore question is asked after the operator is")
+    if "--to-team" not in redirect_src:
+        futile.append("the durable move is not named")
+    check("a redirect a restart would undo is not offered", not futile,
+          ", ".join(futile))
 
     # --- shape, not timing, bounds which team a process could have minted
     with tempfile.TemporaryDirectory() as td:
