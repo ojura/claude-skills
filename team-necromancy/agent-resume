@@ -2655,12 +2655,35 @@ class Resolver:
         if direction == "promote":
             root_uuid = receipt.get("root")
             inserted = set(receipt.get("inserted_sidechain") or [])
+            body = None
+            if receipt.get("cut"):
+                # The body is the chain from the named record to the file's
+                # leaf; everything else leaves verbatim through the receipt.
+                cut_id = receipt["cut"]
+                recs = {rec["uuid"]: rec for _n, _raw, rec, _s in parsed
+                        if rec.get("uuid")}
+                if cut_id not in recs:
+                    return None, [f"{cut_id} is not in this file"]
+                leaf_id = next((rec["uuid"] for _n, _raw, rec, _s in reversed(parsed)
+                                if rec.get("uuid")), None)
+                chain, cursor = [], leaf_id
+                while cursor in recs and cursor not in chain:
+                    chain.append(cursor)
+                    cursor = recs[cursor].get("parentUuid")
+                if cut_id not in chain:
+                    return None, [f"the leaf's chain does not pass through {cut_id}"]
+                body = set(chain[:chain.index(cut_id) + 1])
+            cut_lines = []
             for n, raw, rec, style in parsed:
                 if (n == 1 and receipt["grammar"] == "pointer"
                         and rec.get("type") == "fork-context-ref"):
                     receipt["ref"] = raw
                     continue
+                if body is not None and rec.get("uuid") not in body:
+                    cut_lines.append((len(out) + len(cut_lines), raw))
+                    continue
                 new = dict(rec)
+                extra = ()
                 if new.get("sessionId") == parent:
                     new["sessionId"] = dest
                 if new.get("uuid") in inserted and new.get("isSidechain") is True:
@@ -2674,10 +2697,21 @@ class Resolver:
                     graft = json.loads(receipt["ref"])["parentLastUuid"]
                     new = self._insert_after(new, "parentUuid", "logicalParentUuid", graft)
                     receipt["graft"] = graft
-                bad = self._edit_closure(rec, new)
+                if body is not None and new.get("uuid") == receipt["cut"]:
+                    # Re-root: the severed ancestry rides as a graft, so a cut
+                    # promote emits the same grammar a pointer promote does.
+                    receipt["cut_parent"] = new.get("parentUuid")
+                    new["parentUuid"] = None
+                    new = self._insert_after(new, "parentUuid", "logicalParentUuid",
+                                             receipt["cut_parent"])
+                    receipt["graft"] = receipt["cut_parent"]
+                    extra = ("parentUuid",)
+                bad = self._edit_closure(rec, new, extra)
                 if bad:
                     objections.append(f"line {n}: the edit set would need {bad}")
                 out.append(self._codec_dump(new, style))
+            if cut_lines:
+                receipt["cut_lines"] = cut_lines
             if receipt.get("stripped"):
                 # Undoing a demote: the harness's own trailers come back
                 # verbatim where they sat; a fresh one would forge history.
@@ -2705,6 +2739,7 @@ class Resolver:
                     trailers.append((len(out) + len(trailers), raw))
                     continue
                 new = dict(rec)
+                extra = ()
                 if new.get("sessionId") == dest:
                     new["sessionId"] = parent
                 if new.get("isSidechain") is False:
@@ -2717,20 +2752,29 @@ class Resolver:
                         inserted.append(new["uuid"])
                 if receipt.get("graft") and new.get("logicalParentUuid") == receipt["graft"]:
                     new.pop("logicalParentUuid")
-                bad = self._edit_closure(rec, new)
+                if receipt.get("cut") and new.get("uuid") == receipt["cut"]:
+                    new["parentUuid"] = receipt.get("cut_parent")
+                    extra = ("parentUuid",)
+                bad = self._edit_closure(rec, new, extra)
                 if bad:
                     objections.append(f"line {n}: the edit set would need {bad}")
                 out.append(self._codec_dump(new, style))
             if receipt.get("ref"):
                 out.insert(0, receipt["ref"])
+            for pos, raw in receipt.get("cut_lines") or []:
+                out.insert(pos, raw)
             receipt["stripped"] = trailers
             receipt["inserted_sidechain"] = inserted
         return out, objections
 
     @staticmethod
-    def _edit_closure(before, after):
-        """The first field outside the conversion vocabulary, or None."""
-        allowed = {"sessionId", "isSidechain", "logicalParentUuid"}
+    def _edit_closure(before, after, extra=()):
+        """The first field outside the conversion vocabulary, or None.
+
+        `extra` widens the vocabulary for exactly one record: a cut chain's
+        root also changes parentUuid, and nothing else ever does.
+        """
+        allowed = {"sessionId", "isSidechain", "logicalParentUuid", *extra}
         for key in set(before) | set(after):
             if key in allowed:
                 continue
@@ -2738,7 +2782,8 @@ class Resolver:
                 return key
         return None
 
-    def conversion_plan(self, source, direction, into=None, dest=None, stored=None):
+    def conversion_plan(self, source, direction, into=None, dest=None, stored=None,
+                        cut=None):
         """The full plan for one conversion, proved before anyone acts on it.
 
         Answers only: edit set (as the rendered lines), receipt, objections,
@@ -2757,12 +2802,24 @@ class Resolver:
 
         if direction == "promote":
             grammar, detail, root = self._side_grammar(source)
-            if grammar == "unclassifiable":
-                return {"objections": [f"not convertible: {detail}"], "proved": False}
+            if cut and grammar != "unclassifiable":
+                # A flag that would do nothing says so rather than being
+                # ignored.
+                return {"objections": [f"this file classifies as {grammar}; "
+                                       "--cut is for files the classifier refuses"],
+                        "proved": False}
+            if grammar == "unclassifiable" and not cut:
+                return {"objections": [f"not convertible: {detail}; --cut <uuid> "
+                                       "converts the chain from that record"],
+                        "proved": False}
+            if cut:
+                grammar, root = "cut", cut
             parent = source.parent.parent.name
             receipt = {"grammar": grammar, "parent": parent, "root": root,
                        "dest_stem": dest or root,
                        "task_id": source.stem[len("agent-"):]}
+            if cut:
+                receipt["cut"] = cut
             meta = source.with_name(source.stem + ".meta.json")
             try:
                 receipt["meta"] = meta.read_text()
@@ -2780,7 +2837,8 @@ class Resolver:
                        "dest_stem": source.stem,
                        "task_id": dest or stored.get("task_id") or source.stem,
                        "root": stored.get("root"), "meta": stored.get("meta")}
-            for carried in ("ref", "graft", "inserted_sidechain"):
+            for carried in ("ref", "graft", "inserted_sidechain",
+                            "cut", "cut_parent", "cut_lines"):
                 if stored.get(carried):
                     receipt[carried] = stored[carried]
             out, objections = self._convert(raws, "demote", receipt)
@@ -5269,7 +5327,7 @@ def run_promote(args):
     if not team:
         die("the destination team must be spoken: --as name@team. "
             "An address only locates; a destination is typed")
-    plan = RESOLVER.conversion_plan(entry["path"], "promote")
+    plan = RESOLVER.conversion_plan(entry["path"], "promote", cut=args.cut)
     if plan["objections"] or not plan["proved"]:
         die("; ".join(plan["objections"]) or "the inverse could not be proved")
     # The receipt carries the spoken identity: until the first launch
@@ -7155,6 +7213,54 @@ def run_selftest(live=False):
         wplan = eng.conversion_plan(wonky, "promote")
         if wplan["proved"] or not any("reproduces" in o for o in wplan["objections"]):
             faults.append("an unstable line did not refuse")
+
+        # --cut: the named record's chain converts; everything else rides the
+        # receipt; the round trip stays byte-exact; and every misuse refuses.
+        messy = sub / "agent-c1.jsonl"
+        messy.write_text("".join(compact(r) + "\n" for r in [
+            {"parentUuid": "ghost-above", "isSidechain": True, "sessionId": "PARENT",
+             "type": "user", "uuid": "cut-here",
+             "message": {"role": "user", "content": "salvage me"}},
+            {"parentUuid": "elsewhere", "isSidechain": True, "sessionId": "PARENT",
+             "type": "assistant", "uuid": "stray-1"},
+            {"parentUuid": "cut-here", "isSidechain": True, "sessionId": "PARENT",
+             "type": "assistant", "uuid": "cut-tail"},
+        ]))
+        bare = eng.conversion_plan(messy, "promote")
+        if "--cut" not in "".join(bare["objections"]):
+            faults.append("the unclassifiable refusal does not name --cut")
+        cplan = eng.conversion_plan(messy, "promote", cut="cut-here")
+        if cplan["objections"] or not cplan["proved"]:
+            faults.append(f"cut: {cplan['objections'] or 'unproved'}")
+        else:
+            joined = "\n".join(cplan["lines"])
+            if '"stray-1"' in joined:
+                faults.append("a stray record rode into the cut body")
+            root_line = cplan["lines"][0]
+            if '"parentUuid":null,"logicalParentUuid":"ghost-above"' not in root_line:
+                faults.append("the cut root was not re-rooted with the graft")
+            if not (cplan["receipt"].get("cut_lines")
+                    and cplan["receipt"]["cut_lines"][0][0] == 1):
+                faults.append("the stray did not ride the receipt at its position")
+        # Each misuse must refuse with its DESIGNED sentence: a refusal for
+        # the wrong reason once slipped past an any-objection assertion here,
+        # and a crash is a failure, not a skip.
+        wrongs = [
+            ("a classifiable file accepted --cut", "classifies as",
+             lambda: eng.conversion_plan(rooted, "promote", cut="cv-root")),
+            ("an absent cut uuid converted", "is not in this file",
+             lambda: eng.conversion_plan(messy, "promote", cut="nope")),
+            ("a cut off the leaf's chain converted", "does not pass through",
+             lambda: eng.conversion_plan(messy, "promote", cut="stray-1")),
+        ]
+        for what, expect, attempt in wrongs:
+            try:
+                got = attempt()
+            except Exception as err:
+                faults.append(f"{what} (crashed: {err.__class__.__name__})")
+                continue
+            if got["proved"] or not any(expect in o for o in got["objections"]):
+                faults.append(what)
         check("a conversion proves its inverse before it acts", not faults,
               ", ".join(faults))
 
@@ -7921,6 +8027,10 @@ def main():
     parser.add_argument("--with-mail", action="store_true",
                         help="demote archives unread inbox mail into the receipt "
                              "instead of refusing")
+    parser.add_argument("--cut", metavar="UUID",
+                        help="promote an unclassifiable side transcript as the "
+                             "chain from this record; everything else rides the "
+                             "receipt")
     parser.add_argument("--cleanup", "--cleanup-sockets", dest="cleanup", action="store_true",
                         help="reap dead swarm sockets and team dirs with nothing resurrectable")
     parser.add_argument("--complete", metavar="TOPIC", help=argparse.SUPPRESS)
