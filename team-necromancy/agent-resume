@@ -1101,7 +1101,9 @@ class Resolver:
         """{name: (undelivered count, oldest timestamp)} for this team's mailboxes.
 
         Mail nobody has read is the symptom a severed team shows first, and it
-        is on disk whether or not anything is running.
+        is on disk whether or not anything is running. An unparseable inbox
+        answers (None, why) rather than vanishing: a torn file holding six
+        real messages must not read as no mail waiting.
         """
         state = {}
         try:
@@ -1113,9 +1115,13 @@ class Resolver:
                 continue
             try:
                 mail = json.loads(box.read_text() or "[]")
-            except (OSError, ValueError):
+            except OSError:
+                continue
+            except ValueError:
+                state[box.stem] = (None, "unreadable, possibly torn mid-write")
                 continue
             if not isinstance(mail, list):
+                state[box.stem] = (None, f"not a mailbox shape ({type(mail).__name__})")
                 continue
             stamps = sorted(m.get("timestamp") or "" for m in mail if isinstance(m, dict))
             state[box.stem] = (len(mail), stamps[0] if stamps else None)
@@ -1338,6 +1344,8 @@ class Resolver:
 
         Harness-emitted traffic (idle notifications) has no send side, so it
         never appears here; protocol-object sends are counted, not joined.
+        The transcript join is also the durable record: inbox files are
+        deletable by routine cleanup (code-read grade), transcripts are not.
         """
         people = {}
         for path, (name, stamped) in self.stamp_index().items():
@@ -1605,7 +1613,8 @@ class Resolver:
             if team in teams:
                 continue
             pid, alive, _how, _exact = self.lead_pid(None, team)
-            if (pid and alive) or any(n for n, _o in self.inbox_state(team).values() if n):
+            if (pid and alive) or any(n is None or n
+                                      for n, _o in self.inbox_state(team).values()):
                 teams.add(team)
         return teams
 
@@ -5250,6 +5259,7 @@ def diagnose_team(team, table=None):
     converted = [n for n, (state, _w) in population.items() if state == "converted"]
     mail = RESOLVER.inbox_state(team)
     waiting = {n: v for n, v in mail.items() if v[0]}
+    torn = {n: v[1] for n, v in mail.items() if v[0] is None}
     live = {n: RESOLVER.wearers(f"{n}@{team}") for n in population}
     live = {n: w for n, w in live.items() if w}
     doubled = sorted(n for n, w in live.items() if len({p for p, _t in w}) > 1)
@@ -5284,6 +5294,8 @@ def diagnose_team(team, table=None):
                      "its receipt is its membership until then")
     for name, (count, oldest) in sorted(waiting.items()):
         lines.append(f"mail     {count} waiting for {name}, oldest {oldest}")
+    for name, why in sorted(torn.items()):
+        lines.append(f"mail     {name}'s inbox is {why}; its contents are unknown")
     for name in doubled:
         lines.append(f"warning  {name} is worn by {len(live[name])} processes at once")
 
@@ -5502,6 +5514,10 @@ def run_demote(args):
             "demoting it beheads them. --force overrides")
     if mate_team and mate:
         waiting = RESOLVER.inbox_state(mate_team).get(mate)
+        if waiting and waiting[0] is None and not args.with_mail:
+            die(f"{mate}'s inbox in {mate_team} is {waiting[1]}; it may hold "
+                "mail this demote would orphan. Repair it, or pass --with-mail "
+                "to archive its bytes into the receipt")
         if waiting and waiting[0] and not args.with_mail:
             die(f"{waiting[0]} message(s) wait in {mate_team}'s inbox for {mate}, "
                 f"oldest {waiting[1]}; read them first or pass --with-mail "
@@ -7526,6 +7542,13 @@ def run_selftest(live=False):
                if states.get(k) != v]
         check("the mail ledger joins sends against deliveries", not off,
               ", ".join(off) or ", ".join(f"{k}={v}" for k, v in want.items()))
+        # A torn inbox answers as itself; six real messages in a half-written
+        # file must not read as no mail waiting.
+        (boxdir / "carol.json").write_text('[{"text": "hal')
+        got = eng5.inbox_state("TML").get("carol")
+        check("a torn inbox is reported, not skipped",
+              bool(got) and got[0] is None and "torn" in got[1],
+              str(got))
 
     # --- the unread-mail refusal refuses instead of crashing (its first
     # spelling raised NameError at exactly the moment it was needed)
