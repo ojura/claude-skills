@@ -3170,19 +3170,26 @@ def enforce_restore(ctx, args):
     re-stamped boundary graft, which is not built.
     """
     path = getattr(ctx["resolution"], "path", None)
-    team = RESOLVER.field(ctx, "teamName")
-    if not path or not team:
+    if not path:
         return
     stamped, state = RESOLVER.restored_identity(path)
-    if state != "restored" or stamped == team:
+    if state != "restored":
         return
-    if args.to_team and not args.force:
+    # The comparison is against the DESTINATION. The merged teamName echoes
+    # the stamps for a stamped transcript, so comparing it to the restored
+    # team is the guard comparing the stamps to themselves - the dead branch
+    # a verification caught behind a green suite.
+    rebind = ctx.get("to_team") if ctx.get("to_team") not in (None, "live", "auto") else None
+    dest = rebind or RESOLVER.field(ctx, "teamName")
+    if not dest or stamped == dest:
+        return
+    if rebind and not args.force:
         die(f"restored from window-start stamps: this transcript restores as "
-            f"{stamped}, so a rebind onto {team} undoes itself at the next "
+            f"{stamped}, so a rebind onto {dest} undoes itself at the next "
             f"restart. The durable move is a re-stamped boundary graft, which "
             f"is not built; --force launches the split anyway")
     warn(f"restored from window-start stamps: this launch runs split - lines "
-         f"and spawns as {stamped}, idle notifications as {team}, both "
+         f"and spawns as {stamped}, idle notifications as {dest}, both "
          f"inboxes polled")
 
 
@@ -5287,7 +5294,7 @@ def run_demote(args):
     if mate_team and mate:
         waiting = RESOLVER.inbox_state(mate_team).get(mate)
         if waiting and waiting[0] and not args.with_mail:
-            die(f"{waiting[0]} message(s) wait in {team}'s inbox for {mate}, "
+            die(f"{waiting[0]} message(s) wait in {mate_team}'s inbox for {mate}, "
                 f"oldest {waiting[1]}; read them first or pass --with-mail "
                 "to archive them into the receipt")
     plan = RESOLVER.conversion_plan(path, "demote", into=args.into, stored=stored)
@@ -7244,6 +7251,41 @@ def run_selftest(live=False):
             stray.append("a worn team out-ranked a loadable window start")
         if eng3.operative_team(un, "teamZ")[0] != "teamZ":
             stray.append("an unstamped window start did not leave argv standing")
+        # The rebind guard fires against the DESTINATION, not against the
+        # merge (which echoes the stamps and made the guard compare the
+        # stamps to themselves - a dead branch behind a green suite).
+        class _RebindRes:
+            def __init__(self, path):
+                self.path = path
+
+        class _RebindArgs:
+            to_team, force = "teamZ", False
+
+        real_teams = RESOLVER.teams_dir
+        RESOLVER.teams_dir = eng3.teams_dir
+        try:
+            said = io.StringIO()
+            fired = False
+            with contextlib.redirect_stderr(said):
+                try:
+                    enforce_restore({"resolution": _RebindRes(wt), "to_team": "teamZ"},
+                                    _RebindArgs)
+                except SystemExit:
+                    fired = True
+                except Exception as err:  # a guard that crashes is not a guard
+                    stray.append(f"the rebind guard crashed: {err.__class__.__name__}")
+            if not (fired and "restores as teamC" in said.getvalue()):
+                stray.append("a rebind onto a restoring transcript was not refused")
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    enforce_restore({"resolution": _RebindRes(wt), "to_team": "teamC"},
+                                    _RebindArgs)
+                except SystemExit:
+                    stray.append("a rebind onto the restored team itself was refused")
+                except Exception as err:
+                    stray.append(f"the matching-team path crashed: {err.__class__.__name__}")
+        finally:
+            RESOLVER.teams_dir = real_teams
         (eng3.teams_dir / "teamC" / "config.json").unlink()
         if eng3.restored_identity(wt) != ("teamC", "orphaned"):
             stray.append("an absent stamped team did not read as orphaned")
@@ -7256,9 +7298,10 @@ def run_selftest(live=False):
 
     # The live corpus agrees with itself: a process whose transcript restores
     # is reported as running the restored team.
-    torn, sighted, restored_n = [], 0, 0
+    torn, sighted, restored_n, incomplete = [], 0, 0, 0
     for e in RESOLVER.live_sessions():
         if not (e.get("alive") and e.get("session")):
+            incomplete += 1
             continue
         sighted += 1
         lived = RESOLVER.transcript_path(e["session"])
@@ -7271,7 +7314,8 @@ def run_selftest(live=False):
             if got_team != team or not exact:
                 torn.append(f"pid {e['pid']}: {got_team} != {team}")
     check("a restored life runs as its window start says", not torn,
-          ", ".join(torn) or f"{restored_n} restored of {sighted} live sessions")
+          ", ".join(torn) or f"{restored_n} restored of {sighted} registry-complete "
+          f"live sessions, {incomplete} incomplete skipped")
 
     # The cautionary specimen: the transcript whose session-id rung overclaim
     # mis-aimed a redirect. Skipped wherever it does not exist.
