@@ -1211,6 +1211,15 @@ class Resolver:
             hits = self._stamped_candidates(name, team, verify=not quick)
             if hits:
                 return Resolution(*hits[0], via="agentName+teamName stamps", strength=STAMPS, others=hits[1:])
+            # A promoted member has no stamps until its first turn; its
+            # conversion receipt names its transcript structurally.
+            receipt = self.converted_members(team).get(name)
+            if receipt:
+                found = self.transcript_path(Path(receipt["dest"]).stem)
+                if found:
+                    fields, last = ({}, 0) if quick else self._scan_transcript(found)
+                    return Resolution(found, fields, last, via="conversion receipt",
+                                      strength=EXACT)
 
         if name:
             rosters = self.name_rosters(name)
@@ -1285,7 +1294,35 @@ class Resolver:
                 people[name] = (("unrecorded", "running, and in no roster")
                                 if self.wearers(f"{name}@{team}")
                                 else ("former", "a transcript stamped with this team"))
+        for name in self.converted_members(team):
+            if name not in people:
+                people[name] = ("converted",
+                                "a conversion receipt; registers on first launch")
         return people
+
+    def converted_members(self, team):
+        """{name: receipt} for promoted members whose membership is a receipt.
+
+        A promote records the spoken identity; until the first launch registers
+        the member, the receipt is its membership. Only receipts whose promoted
+        transcript still exists answer: a receipt whose dest vanished describes
+        nothing resumable.
+        """
+        out = {}
+        try:
+            paths = sorted(RECEIPTS_DIR.glob("*.json"))
+        except OSError:
+            return out
+        for path in paths:
+            try:
+                receipt = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if (receipt.get("state") == "materialized"
+                    and receipt.get("team") == team and receipt.get("name")
+                    and receipt.get("dest") and Path(receipt["dest"]).exists()):
+                out[receipt["name"]] = receipt
+        return out
 
     def live_teams(self):
         """Teams a live process is currently running as, from its own argv."""
@@ -2406,7 +2443,7 @@ class Resolver:
         return [team for _, team in mine]
 
     def transcript_path(self, session_uuid):
-        hits = sorted(PROJECTS_DIR.glob(f"*/{session_uuid}.jsonl"))
+        hits = sorted(self.projects_dir.glob(f"*/{session_uuid}.jsonl"))
         if not hits:
             return None
         if len(hits) > 1:
@@ -5014,6 +5051,7 @@ def diagnose_team(team, table=None):
     listed = [n for n, (state, _w) in population.items() if state == "listed"]
     unrecorded = [n for n, (state, _w) in population.items() if state == "unrecorded"]
     former = [n for n, (state, _w) in population.items() if state == "former"]
+    converted = [n for n, (state, _w) in population.items() if state == "converted"]
     mail = RESOLVER.inbox_state(team)
     waiting = {n: v for n, v in mail.items() if v[0]}
     live = {n: RESOLVER.wearers(f"{n}@{team}") for n in population}
@@ -5032,7 +5070,8 @@ def diagnose_team(team, table=None):
         lines.append(f"runs as  {lead_team or '(unknown)'}"
                      f"  [{'exact' if exact_team else 'inferred from boot timing'}]")
     lines.append(f"members  {len(listed)} listed, {len(unrecorded)} unrecorded, "
-                 f"{len(former)} former, {len(live)} live")
+                 f"{len(former)} former, {len(live)} live"
+                 + (f", {len(converted)} converted" if converted else ""))
     # A lead never sits in a pane, so it is not part of the seat count. Counting
     # it would call every team with a live masqueraded lead split.
     seats = {RESOLVER.socket_hosting([f"{n}@{team}"], table)[0]
@@ -5044,6 +5083,9 @@ def diagnose_team(team, table=None):
                      f"{', '.join(sorted(seats))}")
     for name in sorted(unrecorded):
         lines.append(f"note     {name} is running and in no roster; resuming it registers it")
+    for name in sorted(converted):
+        lines.append(f"note     {name} was promoted and has not launched; "
+                     "its receipt is its membership until then")
     for name, (count, oldest) in sorted(waiting.items()):
         lines.append(f"mail     {count} waiting for {name}, oldest {oldest}")
     for name in doubled:
@@ -5195,6 +5237,9 @@ def run_promote(args):
     plan = RESOLVER.conversion_plan(entry["path"], "promote")
     if plan["objections"] or not plan["proved"]:
         die("; ".join(plan["objections"]) or "the inverse could not be proved")
+    # The receipt carries the spoken identity: until the first launch
+    # registers this member, the receipt is its membership.
+    plan["receipt"]["name"], plan["receipt"]["team"] = name, team
     dest = plan["dest_path"]
     if dest.exists():
         die(f"a transcript already exists at {dest}; refusing the collision")
@@ -5218,7 +5263,9 @@ def run_promote(args):
         return 0
     materialize(plan)
     if args.no_launch:
-        print(f"{launch_line}  (unregistered until launched; launching registers it)")
+        print("member   recorded in the receipt; the population and the doctor "
+              "see it, and the first launch registers it")
+        print(f"{launch_line}")
         return 0
     os.execvp(launch[0], launch)
 
@@ -7085,6 +7132,7 @@ def run_selftest(live=False):
         moved = []
         try:
             plan = eng4.conversion_plan(side, "promote")
+            plan["receipt"]["name"], plan["receipt"]["team"] = "xp", "TEAMX"
             materialize(plan)
             dest = plan["dest_path"]
             if not dest.exists():
@@ -7094,8 +7142,21 @@ def run_selftest(live=False):
             stored = load_receipt(dest.stem)
             if not stored or stored.get("state") != "materialized":
                 moved.append("no receipt, or the wrong state")
+            # Until launch, the receipt is the membership: the population
+            # carries the member as converted, the roster stays silent, and
+            # the ladder resolves the name to the promoted transcript.
+            pop = eng4.team_population("TEAMX")
+            if pop.get("xp", ("",))[0] != "converted":
+                moved.append("an unlaunched promote is missing from the population")
+            if eng4.converted_members("TEAMX").get("xp", {}).get("dest") != str(dest):
+                moved.append("the receipt does not name its transcript")
+            res = eng4.resolve_transcript(name="xp", team="TEAMX", quick=True)
+            if not res or res.via != "conversion receipt" or res.path != dest:
+                moved.append("the ladder does not reach an unlaunched promote")
             dplan = eng4.conversion_plan(dest, "demote", stored=stored)
             embed(dplan)
+            if eng4.converted_members("TEAMX"):
+                moved.append("an embedded receipt still counts as membership")
             if side.read_text() != body:
                 moved.append("the demoted bytes differ from the original")
             if (sub / "agent-x1.meta.json").read_text() != meta_body:
