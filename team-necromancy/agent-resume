@@ -1448,6 +1448,42 @@ class Resolver:
             ledger.append(entry)
         return ledger
 
+    def reap_objections(self, team, table, archive_mail=False):
+        """Why this team must not be reaped for a rebind, or [].
+
+        The cleanup bar, asked before a rebind may retire the stamped team:
+        nobody live runs as it (worn argv, a holder of any transcript stamped
+        with it, or a restored life operating as it), and no mail waits
+        unless the caller archives it. Moving a member out of a live team by
+        deleting the team is a beheading with extra steps.
+        """
+        out = []
+        for entry in self.live_sessions():
+            if not entry.get("alive"):
+                continue
+            if entry.get("team") == team:
+                out.append(f"pid {entry['pid']} wears it "
+                           f"({entry.get('agent') or 'in argv'})")
+            elif entry.get("session"):
+                lived = self.transcript_path(entry["session"])
+                if lived and self.restored_identity(lived) == (team, "restored"):
+                    out.append(f"pid {entry['pid']} operates as it (restored)")
+        for path, (name, stamped) in self.stamp_index().items():
+            if stamped != team:
+                continue
+            strangers, ours = self.transcript_holders(path.stem, table)
+            for pid, _t in strangers:
+                out.append(f"pid {pid} holds {name}'s transcript")
+            for pid in ours:
+                out.append(f"this process (pid {pid}) holds {name}'s transcript")
+        if not archive_mail:
+            for name, (count, oldest) in self.inbox_state(team).items():
+                if count is None:
+                    out.append(f"{name}'s inbox is {oldest}")
+                elif count:
+                    out.append(f"{count} unread for {name}, oldest {oldest}")
+        return out
+
     def nameless_receipts(self):
         """Roots of materialized receipts with no recorded identity.
 
@@ -4634,6 +4670,14 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         dest = resolve_to_team(args, ctx)
         ctx["to_team"] = dest
         ctx["to_lead"] = RESOLVER.team_lead_session(dest)
+        # A transcript that restores as another team un-does this rebind at
+        # every restart; retiring that team (guards willing) makes the flags
+        # win, the whole conversation intact.
+        rebinding = getattr(ctx["resolution"], "path", None)
+        stamped, state = (RESOLVER.restored_identity(rebinding)
+                          if rebinding else (None, None))
+        if state == "restored" and stamped != dest:
+            rebind_reap(stamped, dest, args, prefix)
     else:
         forge_team(ctx, args.dry_run)
         auto_redirect(ctx, args, table, prefix)
@@ -5487,6 +5531,74 @@ def embed(plan):
     replace_json(RECEIPTS_DIR / f"{root}.json", receipt)
     source.unlink()
     return receipt
+
+
+def reap_team(team, archive_mail=False):
+    """Retire a team so restore can no longer adopt it. The rebind's one act.
+
+    Everything leaves through the receipt first: the roster verbatim, every
+    inbox's bytes when archiving. Then the known files go, and the emptied
+    directory is handed to remove_if_cruft, whose rename-then-reprove refuses
+    anything that landed mid-reap. A refused directory still rebinds - the
+    bail needs only the roster gone - and is said, not hidden.
+    """
+    team_dir = RESOLVER.teams_dir / team
+    receipt = {"kind": "rebind-reap", "team": team, "at": int(time.time() * 1000),
+               "config": None, "mail": {}}
+    cfg = RESOLVER.roster_path(team)
+    try:
+        receipt["config"] = cfg.read_text()
+    except OSError:
+        pass
+    boxes = sorted((team_dir / "inboxes").glob("*.json")) if (
+        team_dir / "inboxes").is_dir() else []
+    for box in boxes:
+        try:
+            receipt["mail"][box.name] = box.read_text()
+        except OSError:
+            receipt["mail"][box.name] = None
+    RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    replace_json(RECEIPTS_DIR / f"{team}.json", receipt)
+    for path in [cfg, *cfg.parent.glob("config.json.bak*"), *boxes]:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    if (team_dir / "inboxes").is_dir():
+        try:
+            (team_dir / "inboxes").rmdir()
+        except OSError:
+            pass
+    if team_dir.is_dir() and not remove_if_cruft(team_dir, dry=False, kind="team"):
+        warn(f"{team}'s directory would not empty; the roster is archived and "
+             "gone, which is what the rebind needs")
+    return RECEIPTS_DIR / f"{team}.json"
+
+
+def rebind_reap(stamped, dest, args, prefix=""):
+    """Retire the stamped team so a rebind onto dest holds. Refuses first.
+
+    --force never buys a reap: the flag means run anyway, never destroy
+    anyway. Guards failing is a refusal, full stop.
+    """
+    objections = RESOLVER.reap_objections(stamped, RESOLVER.ps_table(),
+                                          archive_mail=args.with_mail)
+    if objections:
+        die(f"a rebind onto {dest} needs {stamped} retired, and it refuses: "
+            + "; ".join(objections[:4])
+            + ("" if args.with_mail or not any("unread" in o for o in objections)
+               else ". --with-mail archives the mail into the receipt"))
+    receipt = RECEIPTS_DIR / f"{stamped}.json"
+    print(f"{prefix}{'would reap' if args.dry_run else 'reaped'}   {stamped}  "
+          f"(roster archived: {receipt})")
+    if not args.dry_run:
+        reap_team(stamped, archive_mail=args.with_mail)
+    print(f"{prefix}rebound  this transcript now runs as {dest}")
+    print(f"{prefix}fragile  until a compaction under {dest} seals the window-start: "
+          f"if {stamped} returns (rebuild, re-mint), the next restart snaps back; "
+          "the receipt prevents only the stale-config path")
+    print(f"{prefix}quiet    this life emits no idle notifications; "
+          "mail in and out flows normally")
 
 
 def run_promote(args):
@@ -7634,6 +7746,58 @@ def run_selftest(live=False):
         quiet.append("standing does not consult the ledger")
     check("the reports carry what the mailbox file cannot show", not quiet,
           ", ".join(quiet))
+
+    # --- a rebind retires the stamped team only when nothing would notice
+    with tempfile.TemporaryDirectory() as td:
+        eng6 = Resolver()
+        eng6.projects_dir, eng6.teams_dir = Path(td), Path(td) / "teams"
+        adir = eng6.teams_dir / "TEAMA"
+        (adir / "inboxes").mkdir(parents=True)
+        eng6.roster_path("TEAMA").write_text('{"name": "TEAMA", "members": []}')
+        (adir / "inboxes" / "mate.json").write_text(
+            json.dumps([{"text": "hi", "timestamp": "2026-01-01T00:00:00Z"}]))
+        compact = lambda d: json.dumps(d, separators=(",", ":"))
+        proj = Path(td) / "proj"
+        proj.mkdir()
+        (proj / "MATE-A.jsonl").write_text(compact(
+            {"parentUuid": None, "agentName": "mate", "teamName": "TEAMA",
+             "type": "user", "uuid": "ra-root",
+             "timestamp": "2026-01-01T00:00:01Z"}) + "\n")
+        me = os.getpid()
+        alive_table = [(me, 0, "claude --resume MATE-A --agent-id mate@TEAMA")]
+        gates = []
+        said = eng6.reap_objections("TEAMA", alive_table)
+        if not any("holds mate's transcript" in o for o in said):
+            gates.append("a live holder of a stamped transcript did not object")
+        said = eng6.reap_objections("TEAMA", [])
+        if not any("unread for mate" in o for o in said):
+            gates.append("unread mail did not object")
+        if eng6.reap_objections("TEAMA", [], archive_mail=True):
+            gates.append("archiving did not clear the mail objection")
+        real_receipts = RECEIPTS_DIR
+        globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
+        real_teams = RESOLVER.teams_dir
+        RESOLVER.teams_dir = eng6.teams_dir
+        try:
+            reap_team("TEAMA", archive_mail=True)
+            stored = load_receipt("TEAMA")
+            if not stored or stored.get("config") != '{"name": "TEAMA", "members": []}':
+                gates.append("the roster did not ride the receipt verbatim")
+            if (stored or {}).get("mail", {}).get("mate.json") is None:
+                gates.append("the mail bytes did not ride the receipt")
+            if eng6.roster_path("TEAMA").exists():
+                gates.append("the roster survived the reap")
+        finally:
+            globals()["RECEIPTS_DIR"] = real_receipts
+            RESOLVER.teams_dir = real_teams
+        # run_one holds two act boundaries (lead first); the reap must precede
+        # the MEMBER one, so the comparison starts searching from the reap.
+        run_src = ast.get_source_segment(source, funcs["run_one"]) or ""
+        reap_at = run_src.find("rebind_reap(")
+        if not (0 <= reap_at < run_src.find("enforce_ctx(", reap_at)):
+            gates.append("the reap does not precede the act boundary")
+        check("a rebind retires the stamped team only when nothing would notice",
+              not gates, ", ".join(gates))
 
     # --- the unread-mail refusal refuses instead of crashing (its first
     # spelling raised NameError at exactly the moment it was needed)

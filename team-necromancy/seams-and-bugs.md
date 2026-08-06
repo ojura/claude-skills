@@ -85,10 +85,16 @@ good components that nobody introduced to each other.
    boundary graft was ruled as the fix and retracted on this theorem. The
    real fix is upstream: a dedicated rebind record that restore consumes
    without it being the window-start (fork-context-ref precedent), or
-   flags outranking stamps. Two reaped-team edges:
-   stamped for an absent team and flagless, the session comes up as nobody
-   and writes unstamped lines until the team dir exists again; flag-bound,
-   argv survives but hook init is skipped (that half is code-read grade).
+   flags outranking stamps - or retiring the stamped team, which makes the
+   restore bail and the flags win with the conversation intact (the
+   reap-rebind, measured live). Two reaped-team edges: stamped for an
+   absent team and flagless, the session comes up as nobody and writes
+   unstamped lines until the team dir exists again; flag-bound, argv
+   survives, mail flows both ways and replies work, but the Stop/idle hook
+   is skipped, so that life announces no idleness (observed across two
+   turns; the second ended near collection, so the sentence carries this
+   caveat). A compaction under the new team then a restart restores the
+   hooks and seals the identity.
 
 9. **Delivery is a turn-boundary event.** Teammate mail is three-tier by
    design: an idle recipient gets an immediate turn; a busy one queues in
