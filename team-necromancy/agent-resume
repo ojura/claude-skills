@@ -4653,8 +4653,19 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     # the next lead's exit anyway. No socket, no pane, no roster patch.
     if agent_id and agent_id == ctx.get("lead_agent_id"):
         command = build_command(ctx, args, passthrough)
+        # A lead is the socket's namesake - a swarm server is named after the
+        # lead's pid, and members resolve theirs by asking who their lead is -
+        # so where its crew already sits is a launch fact for the lead too.
+        # Becoming the lead makes this process that pid, which is why the line
+        # says which server the crew is on rather than which one it will own.
+        crew_socket, crew_why = RESOLVER.crew_socket(
+            (ctx.get("placed") or (None,))[0] or RESOLVER.field(ctx, "teamName"), table)
+        seat = [("cwd", RESOLVER.field(ctx, "cwd") or "(inherit)")]
+        if crew_socket:
+            seat.insert(0, ("socket", f"{crew_socket}  [{crew_why}] "
+                                      f"({socket_state(crew_socket)})"))
         report_launch(ctx, command, prefix, role="lead", agent_id=agent_id,
-                      extra=[("cwd", RESOLVER.field(ctx, "cwd") or "(inherit)")])
+                      extra=seat)
         owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
         if owner and owner[2] and not args.force:
             warn(f"already live as pid {owner[0]}{state_note(owner[0])}; pass --force to run a second copy")
