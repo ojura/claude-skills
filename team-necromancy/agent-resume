@@ -512,6 +512,14 @@ def fill(text, width=None, offset=0):
             # A label orphaned above an overflowing value reads as a missing
             # value; keep the pair together and let the line overflow.
             got[:2] = [pad + lead + got[1].lstrip(" ")]
+        if len(got) > 1 and len(got[-1].split()) == 1:
+            # A single word stranded on the last line reads as an accident;
+            # pull a companion down with it, when one can come and the line
+            # above keeps more than its label.
+            body, _, last = got[-2].rpartition(" ")
+            widowed = f"{hang}{last} {got[-1].strip()}"
+            if last and len(body.split()) > 1 and len(widowed) <= width:
+                got[-2:] = [body.rstrip(), widowed]
         out.extend([got[0][len(pad):], *got[1:]] if got else [""])
     return "\n".join(out)
 
@@ -2871,6 +2879,15 @@ class Resolver:
             hits.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
             warn(f"{len(hits)} transcripts named {session_uuid}; using {hits[0]}")
         return hits[0]
+
+    def transcript_title(self, session_uuid):
+        """The displayable title of the transcript this id names, or None.
+
+        The engine finds the file and reads its title in one answer, so a
+        reporter renders sessions without ever touching the tree itself.
+        """
+        path = self.transcript_path(session_uuid)
+        return session_title(path, limit=90) if path else None
 
     def _walk_spawn_payloads(self, node, depth=0):
         """Yield genuine spawn payloads inside a parsed transcript line.
@@ -6250,14 +6267,18 @@ def run_sides(selector=None):
         by_parent.setdefault(e["parent"], []).append(e)
     shown_parents = list(by_parent) if named else list(by_parent)[:15]
     if not named:
-        print(fill(f"side transcripts under {len(by_parent)} session(s), "
+        plural = "s" if len(by_parent) != 1 else ""
+        print(fill(f"side transcripts under {len(by_parent)} session{plural}, "
                    "most recently active first; --sides <session> lists one in full"))
     cap = None if named else 3
     for parent in shown_parents:
         entries = by_parent[parent]
         breakdown = collections.Counter(e["grammar"] for e in entries)
         said = ", ".join(f"{n} {g}" for g, n in breakdown.most_common())
-        print(f"\n{parent[:8]}  ({said})")
+        print(f"\n{parent}  ({said})")
+        title = RESOLVER.transcript_title(parent)
+        if title:
+            print(fill(f"  {title}"))
         for e in entries[:cap]:
             name = e["name"] or e["task_id"]
             kind = e["agent_type"] or "?"
@@ -6270,11 +6291,12 @@ def run_sides(selector=None):
     folded_parents = len(by_parent) - len(shown_parents)
     if folded_parents:
         folded_count = sum(len(by_parent[p]) for p in list(by_parent)[15:])
-        print(fill(f"\n...and {folded_parents} older session(s) holding "
-                   f"{folded_count} side transcript(s); --sides <session> "
-                   "lists any of them"))
+        print(fill(f"\n...and {folded_parents} older "
+                   f"session{'s' if folded_parents != 1 else ''} holding "
+                   f"{folded_count} side transcript{'s' if folded_count != 1 else ''}; "
+                   "--sides <session> lists any of them"))
     total = sum(counts.values())
-    print(f"\n{total} side transcript(s): " +
+    print(f"\n{total} side transcript{'s' if total != 1 else ''}: " +
           ", ".join(f"{n} {g}" for g, n in counts.most_common()))
     return 0
 
@@ -7209,11 +7231,18 @@ def run_selftest(live=False):
     # A label whose value cannot fit beside it keeps the value anyway: the
     # pair overflows together rather than the label sitting orphaned above it.
     labelled = fill("cwd      /" + "x" * 90, width=72)
+    # A sentence one word over the width does not strand that word alone: a
+    # companion comes down with it, and no word is lost either way.
+    widowy = " ".join(["a" * 8] * 8 + ["tail"])
+    dewidowed = fill(widowy, width=72)
     check("a long message wraps inside the width and loses nothing",
           all(len(l) <= 72 for l in filled.splitlines())
           and " ".join(filled.split()) == " ".join(tale.split())
-          and labelled == "cwd      /" + "x" * 90,
-          f"widest line {max(map(len, filled.splitlines()))} of width 72")
+          and labelled == "cwd      /" + "x" * 90
+          and len(dewidowed.splitlines()[-1].split()) == 2
+          and " ".join(dewidowed.split()) == widowy,
+          f"widest line {max(map(len, filled.splitlines()))} of width 72; "
+          f"widow line {dewidowed.splitlines()[-1]!r}")
 
     # A command line is a record and sometimes a paste form. Wrapped either
     # way, replacing newline+indent with one space must give back the exact
@@ -7474,6 +7503,7 @@ def run_selftest(live=False):
     # The sides sweep groups under each parent session and bounds itself,
     # saying what it folded and how to see it; a named parent lists in full.
     real_sides_fn = RESOLVER.side_transcripts
+    real_title_fn = RESOLVER.transcript_title
     RESOLVER.side_transcripts = lambda parent=None: (
         [{"parent": "aaaa1111-fixture", "name": f"side{n}", "task_id": f"t{n}",
           "agent_type": "fork", "grammar": "pointer", "mtime": 1000 - n,
@@ -7481,6 +7511,8 @@ def run_selftest(live=False):
         + [{"parent": "bbbb2222-fixture", "name": "only-one", "task_id": "t9",
             "agent_type": "Explore", "grammar": "rooted", "mtime": 500,
             "detail": ""}])
+    RESOLVER.transcript_title = lambda stem: (
+        "Fixture Parent Title" if stem == "aaaa1111-fixture" else None)
     try:
         with contextlib.redirect_stdout(io.StringIO()) as swept:
             run_sides()
@@ -7488,10 +7520,15 @@ def run_selftest(live=False):
             run_sides("aaaa1111")
     finally:
         RESOLVER.side_transcripts = real_sides_fn
+        RESOLVER.transcript_title = real_title_fn
     sweep_text, listed_text = swept.getvalue(), listed_out.getvalue()
     folded = {
         "one header per session": sweep_text.count("aaaa1111") == 2  # header + remedy
             and sweep_text.count("bbbb2222") == 1,
+        "the header names the whole transcript":
+            "aaaa1111-fixture  (5 pointer)" in sweep_text,
+        "the parent wears its title": "Fixture Parent Title" in sweep_text
+            and sweep_text.index("aaaa1111-fixture") < sweep_text.index("Fixture Parent Title"),
         "newest few shown, rest counted": "side2" in sweep_text
             and "side3" not in sweep_text
             and "...and 2 more  (--sides aaaa1111 lists them)" in sweep_text,
