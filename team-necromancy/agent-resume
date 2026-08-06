@@ -4727,10 +4727,27 @@ def auto_redirect(ctx, args, table, prefix=""):
 
     if needs_durable and not rebind_reap(stamped, dest, args, prefix,
                                          path=path, fatal=False):
-        # Reported by rebind_reap, with a remedy per blocker. The agent stays
-        # where its own conversation says it is rather than launching a move
-        # the next restart would undo.
+        # rebind_reap has named each blocker with its remedy. What is left is
+        # the consequence: this member's lead runs as another team, so its
+        # mail on the team it would launch with is read by nobody. Being
+        # reachable is what a resume is for, so the run stops rather than
+        # starting an agent whose reports go nowhere. --keep-team is the way
+        # to ask for that state on purpose.
         ctx["stale_team_warned"] = True
+        if getattr(args, "keep_team", False):
+            return
+        if not sys.stdin.isatty():
+            die(f"so {agent_id} can only start on {source}, whose mail its lead "
+                f"(running as {dest}) does not read, and nothing here can ask. "
+                "Clear the blockers above, or pass --keep-team")
+        print(f"{prefix}{agent_id} can only start on {source}, and its lead "
+              f"(running as {dest}) does not read that team's mail")
+        try:
+            answer = input("start it there anyway? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if not answer.startswith("y"):
+            die("stopped; clear the blockers above, or pass --keep-team")
         return
 
     print(f"{prefix}redirect the lead now runs as {dest}, not {source}; "
@@ -7581,6 +7598,76 @@ def run_selftest(live=False):
             futile.append(f"a blocker class has no remedy: {cls}")
     check("a redirect a restart would undo is not offered", not futile,
           ", ".join(futile))
+
+    # --- a blocked move does not become a launch nobody can reach
+    orphan = []
+    real_reap = globals()["rebind_reap"]
+    real_lead, real_holders = RESOLVER.lead_pid, RESOLVER.transcript_holders
+    real_minted, real_restored = RESOLVER.team_minted_by, RESOLVER.restored_identity
+    real_owner2, real_live_procs = RESOLVER.lead_pid_for, RESOLVER.live_agent_procs
+    real_field = RESOLVER.field
+    try:
+        globals()["rebind_reap"] = lambda *a, **k: False   # every blocker refused
+        RESOLVER.lead_pid = lambda parent, team: (7, True, "pid 7", True)
+        RESOLVER.team_minted_by = lambda pid: ("session-new", True)
+        RESOLVER.restored_identity = lambda path: ("session-old", "restored")
+        RESOLVER.transcript_holders = lambda uuid, table: ([], [])
+        RESOLVER.live_agent_procs = lambda aid, table: []
+        RESOLVER.lead_pid_for = lambda uuid: None
+        RESOLVER.field = lambda ctx, name, **k: {
+            "agentId": "m@session-old", "teamName": "session-old",
+            "parentSessionId": "p"}.get(name)
+
+        class _RedirArgs:
+            keep_team = False
+            force = with_mail = dry_run = False
+
+        ctx = {"session_uuid": "u", "resolution": types.SimpleNamespace(path=Path("/x"))}
+        real_stdin2, real_input2 = sys.stdin, globals().get("input")
+        sys.stdin = types.SimpleNamespace(isatty=lambda: True)
+
+        def asked(reply, **over):
+            globals()["input"] = lambda prompt="", _r=reply: _r
+            for k, v in over.items():
+                setattr(_RedirArgs, k, v)
+            said = io.StringIO()
+            with contextlib.redirect_stderr(said), contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    auto_redirect(dict(ctx), _RedirArgs, [], "")
+                    return "launched", said.getvalue()
+                except SystemExit:
+                    return "stopped", said.getvalue()
+                except Exception as err:
+                    return f"crashed: {err.__class__.__name__}", said.getvalue()
+
+        try:
+            verdict, said = asked("")
+            if verdict != "stopped" or "keep-team" not in said:
+                orphan.append(f"a bare return did not stop it ({verdict})")
+            if asked("n")[0] != "stopped":
+                orphan.append("no did not stop it")
+            if asked("y")[0] != "launched":
+                orphan.append("yes could not ask for the unreachable launch")
+            if asked("", keep_team=True)[0] != "launched":
+                orphan.append("--keep-team could not ask for it either")
+            _RedirArgs.keep_team = False
+            sys.stdin = types.SimpleNamespace(isatty=lambda: False)
+            if asked("y")[0] != "stopped":
+                orphan.append("with no terminal to ask at, it launched anyway")
+        finally:
+            sys.stdin = real_stdin2
+            if real_input2 is not None:
+                globals()["input"] = real_input2
+            else:
+                globals().pop("input", None)
+    finally:
+        globals()["rebind_reap"] = real_reap
+        RESOLVER.lead_pid, RESOLVER.transcript_holders = real_lead, real_holders
+        RESOLVER.team_minted_by, RESOLVER.restored_identity = real_minted, real_restored
+        RESOLVER.lead_pid_for, RESOLVER.live_agent_procs = real_owner2, real_live_procs
+        RESOLVER.field = real_field
+    check("a blocked move does not become an unreachable launch", not orphan,
+          ", ".join(orphan))
 
     # --- shape, not timing, bounds which team a process could have minted
     with tempfile.TemporaryDirectory() as td:
