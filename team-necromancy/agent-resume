@@ -4712,24 +4712,25 @@ def auto_redirect(ctx, args, table, prefix=""):
         ctx["stale_team_warned"] = True
         return
 
-    # A conversation that restores as its own team ignores these flags, so a
-    # redirect would be a lie the next restart undoes. The durable move exists
-    # and is named; asking permission to fail is not the alternative.
+    # A conversation that restores as its own team ignores these flags, so the
+    # redirect has to make the move durable or not claim it. Both halves are
+    # rebind_reap's: retiring a team nothing is using is cheap, and anything
+    # that objects is reported with its own way out.
     path = getattr(ctx["resolution"], "path", None)
     stamped, state = RESOLVER.restored_identity(path) if path else (None, None)
-    if state == "restored" and stamped != dest:
-        blockers = RESOLVER.reap_objections(stamped, table)
-        warn(f"{agent_id} comes back as {stamped} whatever these flags say, so "
-             f"pointing it at {dest} would not survive a restart. "
-             f"{TOOL} {agent_id} --to-team {dest} moves it for good"
-             + (f", once {stamped} can be retired: {'; '.join(blockers[:2])}"
-                if blockers else ""))
-        ctx["stale_team_warned"] = True
-        return
+    needs_durable = state == "restored" and stamped != dest
 
     # Asked last, so a run that was going to decline anyway never puts a question
     # in front of anyone.
     if not exact_team and not confirm_redirect(agent_id, pid, dest, source, prefix):
+        return
+
+    if needs_durable and not rebind_reap(stamped, dest, args, prefix,
+                                         path=path, fatal=False):
+        # Reported by rebind_reap, with a remedy per blocker. The agent stays
+        # where its own conversation says it is rather than launching a move
+        # the next restart would undo.
+        ctx["stale_team_warned"] = True
         return
 
     print(f"{prefix}redirect the lead now runs as {dest}, not {source}; "
@@ -5786,7 +5787,7 @@ def apply_restamp(plan):
     replace_text(path, "\n".join(plan["lines"]) + "\n", mode=keep_mode)
 
 
-def rebind_reap(stamped, dest, args, prefix="", path=None):
+def rebind_reap(stamped, dest, args, prefix="", path=None, fatal=True):
     """Retire the stamped team so a rebind onto dest holds - or, on --force
     against a living team, restamp the window-start instead.
 
@@ -5825,8 +5826,15 @@ def rebind_reap(stamped, dest, args, prefix="", path=None):
             lines.append("; ".join(held[:4])
                          + " (stop it first; nothing forces this one)")
         if lines:
-            die(f"a rebind onto {dest} needs {stamped} retired, and it refuses: "
-                + ". Also: ".join(lines))
+            said = (f"a rebind onto {dest} needs {stamped} retired, and it "
+                    "refuses: " + ". Also: ".join(lines))
+            # A redirect is a courtesy the run offers, so it reports and leaves
+            # the agent where it is; an explicit --to-team was asked for, so it
+            # stops the run.
+            if fatal:
+                die(said)
+            warn(said)
+            return False
     if alive:
         strangers, ours = RESOLVER.transcript_holders(path.stem, table) if path else ([], [])
         if strangers or ours:
@@ -5844,7 +5852,7 @@ def rebind_reap(stamped, dest, args, prefix="", path=None):
             apply_restamp(plan)
         print(f"{prefix}rebound  this transcript runs as {dest} from now on; "
               "nothing further is needed")
-        return
+        return True
     receipt = RECEIPTS_DIR / f"{stamped}.json"
     print(f"{prefix}{'would reap' if args.dry_run else 'reaped'}   {stamped}  "
           f"(roster archived: {receipt})")
@@ -5855,6 +5863,7 @@ def rebind_reap(stamped, dest, args, prefix="", path=None):
           f"recreated; run /compact in it to make {dest} permanent")
     print(f"{prefix}quiet    until then it sends no idle notifications; "
           "mail still works in both directions")
+    return True
 
 
 def run_promote(args):
@@ -7560,12 +7569,12 @@ def run_selftest(live=False):
     futile = []
     if not (0 <= restore_at < asked_at):
         futile.append("the restore question is asked after the operator is")
-    if "--to-team" not in redirect_src:
-        futile.append("the durable move is not named")
-    # And named honestly: a remedy advertised without its preconditions is a
-    # prescription ahead of its treatment.
-    if "reap_objections(" not in redirect_src:
-        futile.append("the durable move is promised without checking it is available")
+    # It performs the durable move rather than advertising one: a remedy an
+    # operator has to retype is a prescription where an action belongs.
+    if "rebind_reap(" not in redirect_src:
+        futile.append("the redirect does not make the move durable")
+    if "fatal=False" not in redirect_src:
+        futile.append("a declined redirect stops the run instead of reporting")
     reap_src = ast.get_source_segment(source, funcs["rebind_reap"]) or ""
     for cls in ("--with-mail archives", "--force restamps", "stop it first"):
         if cls not in reap_src:
@@ -8177,6 +8186,35 @@ def run_selftest(live=False):
             stray.append("the restamp does not check holders first")
         if "args.force" not in reap_src.split("restamp_plan(")[0]:
             stray.append("the restamp is reachable without --force")
+        # A redirect makes its own move durable: nothing objecting means the
+        # team is retired without asking, and anything objecting is reported
+        # with its remedy while the agent stays where its conversation says.
+        quiet_dir = Path(td) / "quiet"
+        (quiet_dir / "OLD").mkdir(parents=True)
+        eng7.roster_path = lambda t: quiet_dir / t / "config.json"
+        (quiet_dir / "OLD" / "config.json").write_text('{"name": "OLD", "members": []}')
+        real_teams2, real_objs = RESOLVER.teams_dir, RESOLVER.reap_objections
+        RESOLVER.teams_dir = quiet_dir
+        try:
+            class _Quiet:
+                force, dry_run, with_mail = False, True, False
+            RESOLVER.reap_objections = lambda *a, **k: []
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                took = rebind_reap("OLD", "NEW", _Quiet, path=target, fatal=False)
+            if not (took and "reap" in out.getvalue()):
+                stray.append("an unobjected team was not reaped for the redirect")
+            RESOLVER.reap_objections = lambda *a, **k: [
+                "3 unread for m, oldest x", "pid 9 wears it"]
+            told = io.StringIO()
+            with contextlib.redirect_stderr(told), contextlib.redirect_stdout(io.StringIO()):
+                took = rebind_reap("OLD", "NEW", _Quiet, path=target, fatal=False)
+            if took is not False:
+                stray.append("a blocked redirect claimed the move")
+            for owed in ("--with-mail", "--force restamps"):
+                if owed not in told.getvalue():
+                    stray.append(f"a blocker went unremedied: {owed}")
+        finally:
+            RESOLVER.teams_dir, RESOLVER.reap_objections = real_teams2, real_objs
         check("--force restamps a living team's window-start, receipted, "
               "reversible, mode-preserved", not stray, ", ".join(stray))
 
