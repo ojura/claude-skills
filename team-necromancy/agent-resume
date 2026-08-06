@@ -3674,8 +3674,14 @@ def already_running(ctx, args, is_lead, agent_id=None, table=None, here=(), pane
         return None
     owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
     if owner and owner[2]:
+        # Where that process actually sits, asked of the process rather than
+        # echoed from a roster: a member can be live outside tmux entirely.
+        where = ""
+        if not is_lead and agent_id and table is not None:
+            sock, s_why = RESOLVER.socket_hosting([agent_id], table)
+            where = f", in a {s_why} on {sock}" if sock else ", outside any tmux pane"
         return (f"session {ctx['session_uuid']} is live as pid {owner[0]}"
-                f"{state_note(owner[0])}; pass --force to run a second copy", False)
+                f"{state_note(owner[0])}{where}; pass --force to run a second copy", False)
     if not is_lead and agent_id:
         live = RESOLVER.live_agent_procs(agent_id, table)
         elsewhere = [pid for pid, _ in live if pid not in here]
@@ -4058,10 +4064,12 @@ def socket_state(socket):
     """
     if not socket:
         return "unresolved"
+    # The state, not a promise: whether anything gets created is the launch's
+    # to say, and a run that noops creates nothing.
     if not socket_alive(socket):
-        return "no server, will be created"
+        return "no server"
     if not swarm_session_live(socket):
-        return f"server up, no {TMUX_SESSION} session, will be created"
+        return f"server up, no {TMUX_SESSION} session"
     clients = attached_clients(socket)
     return f"live, {clients} client{'' if clients == 1 else 's'} attached"
 
@@ -4189,6 +4197,21 @@ def tint_pane(socket, pane, colour, name, dry):
         for action in actions:
             tmux(socket, *action)
     step(dry, f"would tint {where}", f"tinted {where}")
+
+
+def seat_note(recorded, socket):
+    """(pane to aim at, pane line for the report), from a roster's memory.
+
+    A pane id is per-server: a recorded one is a fact only while its server
+    runs and still carries it. Anything else aims the launch at nothing and
+    reads as a seat the agent does not have, so the report says what became
+    of the record instead of echoing it.
+    """
+    if recorded and any(p["pane"] == recorded for p in list_panes(socket)):
+        return recorded, recorded
+    if recorded:
+        return None, f"(none: recorded {recorded} is gone from {socket})"
+    return None, "(none recorded)"
 
 
 def pane_of_pid(socket, pid, table):
@@ -5054,12 +5077,13 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     want_pane = RESOLVER.field(ctx, "tmuxPaneId")
     if want_pane and not re.fullmatch(r"%\d+", str(want_pane)):
         want_pane = None  # e.g. the lead's "leader" placeholder
+    want_pane, pane_said = seat_note(want_pane, socket)
 
     command = build_command(ctx, args, passthrough)
     adopted = inherit_credentials(ctx)
 
     seat = [("socket", f"{socket}  [{how}] ({socket_state(socket)})"),
-            ("pane", want_pane or "(none recorded)"),
+            ("pane", pane_said),
             ("cwd", cwd or "(inherit)")]
     if adopted:
         seat.append(("creds", f"inherited {', '.join(adopted)} from the lead"))
@@ -6663,7 +6687,11 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
         # run: a lead that was already up leaves this shell with nothing to look
         # at, so the swarm is the only thing left to offer.
         return 1 if any(s == "failed" for _, s in results) else 0
-    if not args.dry_run and socket and any(s in ("launched", "noop") for _, s in results):
+    # Offered only where a server exists to attach to: after a launch one
+    # does, and a noop on a dead socket must not promise a keypress whose
+    # only outcome is "nothing to attach to".
+    if (not args.dry_run and socket and socket_alive(socket)
+            and any(s in ("launched", "noop") for _, s in results)):
         print()
         targets = [a.agent_id for _, a in jobs if a is not None and getattr(a, "agent_id", None)]
         if confirm_attach(targets, table, socket):
@@ -7477,6 +7505,82 @@ def run_selftest(live=False):
     check("the sides sweep folds each session and says what it folded",
           not wrong, ", ".join(wrong))
 
+    # A pane id is per-server: a recorded one is a fact only while its server
+    # runs and still carries it. Anything else must not be echoed as a seat
+    # the agent has, nor aimed at by the launch.
+    real_list_panes = globals()["list_panes"]
+    globals()["list_panes"] = lambda sock: (
+        [{"session": "s", "window": "@1", "pane": "%2", "pid": 1}]
+        if sock == "sock-carrying" else [])
+    try:
+        kept = seat_note("%2", "sock-carrying")
+        gone = seat_note("%2", "sock-dead")
+        blank = seat_note(None, "sock-carrying")
+    finally:
+        globals()["list_panes"] = real_list_panes
+    seats_said = {
+        "a carried pane is aimed at and said": kept == ("%2", "%2"),
+        "a gone pane is aimed at nothing and says what became of it":
+            gone[0] is None and "%2" in gone[1] and "gone" in gone[1],
+        "no record reads as no record": blank == (None, "(none recorded)"),
+        "the member report asks it": "seat_note(" in run_one_src,
+    }
+    wrong = sorted(k for k, ok in seats_said.items() if not ok)
+    check("a recorded pane is a fact only while its server carries it",
+          not wrong, ", ".join(wrong))
+
+    # The attach offer is made only where a server exists: a keypress whose
+    # only outcome is "nothing to attach to" is not an offer.
+    real_alive_fn = globals()["socket_alive"]
+    real_confirm_fn = globals()["confirm_attach"]
+    real_one_fn = globals()["run_one"]
+    offered_at = []
+    try:
+        globals()["socket_alive"] = lambda s: s == "sock-live"
+        globals()["confirm_attach"] = (
+            lambda targets, table, sock: (offered_at.append(sock), False)[1])
+        globals()["run_one"] = (
+            lambda a, p, t, prefix="", pending=(): Outcome("noop", a.socket, False, None))
+
+        class _AttachJob:
+            dry_run, no_attach, attach, agent_id = False, False, False, None
+        with contextlib.redirect_stdout(io.StringIO()):
+            for sock in ("sock-dead", "sock-live"):
+                job = _AttachJob()
+                job.socket = sock
+                run_agents(job, [], {}, [(None, job)], socket=sock)
+    finally:
+        globals()["socket_alive"] = real_alive_fn
+        globals()["confirm_attach"] = real_confirm_fn
+        globals()["run_one"] = real_one_fn
+    check("an attach is offered only where a server exists",
+          offered_at == ["sock-live"], f"offered at {offered_at or 'nowhere'}")
+
+    # A noop on a live process says where that process actually sits, asked
+    # of the process (socket_hosting), never echoed from a roster.
+    class _NoForceSeat:
+        force = False
+    real_owner_fn, real_hosting_fn = RESOLVER.lead_pid_for, RESOLVER.socket_hosting
+    RESOLVER.lead_pid_for = lambda uuid: (777, "x", True)
+    RESOLVER.socket_hosting = lambda ids, table: (None, None)
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            unseated = already_running({"session_uuid": "seat-uuid"}, _NoForceSeat,
+                                       is_lead=False, agent_id="m@t", table=[])
+            RESOLVER.socket_hosting = lambda ids, table: ("sock-z", "live pane of pid 9")
+            seated = already_running({"session_uuid": "seat-uuid"}, _NoForceSeat,
+                                     is_lead=False, agent_id="m@t", table=[])
+    finally:
+        RESOLVER.lead_pid_for = real_owner_fn
+        RESOLVER.socket_hosting = real_hosting_fn
+    seat_says = {
+        "outside tmux is said": unseated and "outside any tmux pane" in unseated[0],
+        "a real seat is named": seated and "sock-z" in seated[0],
+    }
+    wrong = sorted(k for k, ok in seat_says.items() if not ok)
+    check("a noop says where the live process actually sits", not wrong,
+          ", ".join(wrong))
+
     # Classification, not position, decides what a token is. Every entry must
     # carry both facts, or a future flag is added half-specified and the walk
     # silently treats its value as a name.
@@ -8035,9 +8139,13 @@ def run_selftest(live=False):
     check("a launch is followed up per agent", not wrong, ", ".join(wrong))
 
     # --- the swarm is offered unless the run already handed the user somewhere
+    # The fixture's server counts as existing: whether a dead one gates the
+    # offer is its own check, and this one asks only who took the terminal.
     real_one, real_confirm = globals()["run_one"], globals()["confirm_attach"]
+    real_alive_gate = globals()["socket_alive"]
     asked = []
     try:
+        globals()["socket_alive"] = lambda s: s == "sock" or real_alive_gate(s)
         globals()["confirm_attach"] = lambda targets, table, sock: asked.append(sock) and False
         offers = {}
         for label, status in (("a lead already up", "noop"), ("a lead handed over", "manual")):
@@ -8056,6 +8164,7 @@ def run_selftest(live=False):
             offers[label] = bool(asked) == (status == "noop")
     finally:
         globals()["run_one"], globals()["confirm_attach"] = real_one, real_confirm
+        globals()["socket_alive"] = real_alive_gate
     wrong = sorted(k for k, good in offers.items() if not good)
     check("the swarm is offered when nothing else took over", not wrong, ", ".join(wrong))
 
