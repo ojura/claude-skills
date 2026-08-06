@@ -4595,7 +4595,8 @@ def run_standing(args):
 # What each verdict claims, in the order of how much is wrong.
 DOCTOR_LEGEND = (
     ("CONNECTED", "a live lead runs this team, its members are listed, no mail is waiting"),
-    ("DEGRADED", "reachable, but carrying former members or with nothing running"),
+    ("DEGRADED", "nothing is lost yet, but a person must act: the team is dormant, "
+                 "one agent is worn by two processes, or the crew sits on two servers"),
     ("UNKNOWABLE", "a plain lead reads the roster from its own memory, which cannot be "
                    "seen from outside"),
     ("SEVERED", "members are running or mail is waiting, and no live lead reads this team"),
