@@ -110,20 +110,24 @@ good components that nobody introduced to each other.
     sender-vs-recipient transcript join (mail_ledger) is what surfaces this
     shape as an "unexplained" unmatched send.
 
-11. **The mailbox writer was lock-free RMW; fixed in the running binary.**
-    Version-bounded, historical: the stale source did plain writeFile
-    read-modify-write on the shared inbox (teammateMailbox.ts:180, 247, 320,
-    1126) plus a truncate-in-place `[]` write (`flag: 'r+'`, :358) - torn
-    reads, lost updates, and the zero-byte wedges this box's lore records
-    are exactly what that predicts. The 2.1.220 bundle closes all of it:
+11. **The mailbox writer was lock-free RMW; fixed in the running binary,
+    and no casualty was ever produced.** Version-bounded, historical: the
+    stale source did plain writeFile read-modify-write on the shared inbox
+    (teammateMailbox.ts:180, 247, 320, 1126) plus a truncate-in-place `[]`
+    write (`flag: 'r+'`, :358) - a real but theoretical window for torn
+    reads and lost updates. The 2.1.220 bundle closes all of it:
     lockfile-guarded RMW, a named atomicWrite primitive, schema-invalid
-    pruning. Wedged inboxes found on disk are attributable to older eras,
-    and the readers here report an unparseable inbox distinctly instead of
-    skipping it, because old wedges and hand-written files exist regardless
-    of what the current writer does. Carved on this entry because its first
-    draft was graded live off the stale source by two verifiers in a row:
-    measure the artifact that runs - stale source only ever testifies about
-    a binary that no longer does.
+    pruning. No on-disk casualty of the old window was ever produced (97 of
+    97 inboxes on this box parse clean); the docs' zero-byte rule guards
+    HAND-creation of inboxes, a different mistake, which the current
+    harness also guards upstream via writeExclusive(path, "[]") - the same
+    constitutional rule, converged on independently. The readers here still
+    report an unparseable inbox distinctly instead of skipping it, because
+    hand-written files exist regardless of what any writer does. Carved on
+    this entry, whose first draft was graded live off the stale source by
+    two verifiers in a row and whose lore clause chained two inferences
+    into an observation nobody made: measure the artifact that runs - stale
+    source only ever testifies about a binary that no longer does.
 
 ## The bugs (file-worthy)
 

@@ -840,7 +840,8 @@ class Resolver:
         caller resolve a path for itself.
         """
         path = self.transcript_path(session_uuid) if session_uuid else None
-        return [(pid, path) for pid, _ in self.procs_on_transcript(session_uuid, table)]
+        strangers, _ours = self.transcript_holders(session_uuid, table)
+        return [(pid, path) for pid, _ in strangers]
 
     def wearer_transcripts(self, agent_id, table=None):
         """[(pid, transcript path or None)] for every live process wearing this id.
@@ -1430,12 +1431,11 @@ class Resolver:
             elif (last_write.get(to) or 0) <= (send["sent"] or 0):
                 entry.update(state="pending", detail="the recipient has not "
                              "written since the send")
-            elif (self.procs_on_transcript(people[to].stem, self.ps_table())
-                  or self.self_holds_transcript(people[to].stem, self.ps_table())):
+            elif any(self.transcript_holders(people[to].stem, self.ps_table())):
                 # Marked read on queueing, held in the recipient's RAM: the
                 # drain-then-die window is open until its turn ends. Both
-                # holder questions, because the recipient may be the very
-                # process asking - the self-lineage blindness's second victim.
+                # halves of the holder question, because the recipient may be
+                # the very process asking.
                 entry.update(state="in memory", detail="the recipient is live "
                              "mid-turn; delivery waits on its next boundary "
                              "and dies with its process")
@@ -2246,6 +2246,19 @@ class Resolver:
         if cwds:
             fields["_cwds"] = (cwds, last_ts or mtime)  # underscore keys stay out of the merge
         return fields, (last_ts or mtime)
+
+    def transcript_holders(self, session_uuid, table):
+        """(others, ours): every live pid holding this conversation, split.
+
+        Two halves of one question. procs_on_transcript excludes our own
+        lineage so a search cannot match its own argv; self_holds_transcript
+        is exactly that excluded remainder. Two consumers in one day
+        consulted one half and misread the world, so the halves are no
+        longer separately consultable: a caller takes both and visibly
+        discards what it does not need.
+        """
+        return (self.procs_on_transcript(session_uuid, table),
+                self.self_holds_transcript(session_uuid, table))
 
     def self_holds_transcript(self, session_uuid, table):
         """Are we ourselves the process holding this transcript?
@@ -4488,7 +4501,8 @@ def auto_redirect(ctx, args, table, prefix=""):
     # argv is not enough: a session resumed from the in-app picker runs as bare
     # `claude` and is visible only to the registry.
     owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
-    holders = RESOLVER.procs_on_transcript(ctx["session_uuid"], table) + RESOLVER.live_agent_procs(agent_id, table)
+    strangers, _ours = RESOLVER.transcript_holders(ctx["session_uuid"], table)
+    holders = strangers + RESOLVER.live_agent_procs(agent_id, table)
     if holders or (owner and owner[2]):
         # Alive: leave it to the liveness guards. Say what the move would cost
         # rather than making it, since restarting throws away its current turn.
@@ -4655,7 +4669,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     here = [pid for pid, _cmd in occupants if pid in worn]
     others = [pid for pid, _ in occupants if pid not in here]
 
-    held_by_us = RESOLVER.self_holds_transcript(ctx["session_uuid"], table)
+    strangers_hold, held_by_us = RESOLVER.transcript_holders(ctx["session_uuid"], table)
     if held_by_us and not args.force:
         die(f"you are running this transcript yourself (pid {held_by_us[0]}); "
             "nothing can replace a process from inside it. Exit first, or have "
@@ -4668,7 +4682,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         # Never guess a pane here: pane ids are per-server, so a recorded id
         # from another socket names an unrelated pane on this one, and killing
         # it would take out a stranger while the old holder kept writing.
-        for index, (pid, _) in enumerate(RESOLVER.procs_on_transcript(ctx["session_uuid"], table)):
+        for index, (pid, _) in enumerate(strangers_hold):
             holder_pane = pane_of_pid(socket, pid, table)
             if index == 0 and holder_pane:
                 replace_pane = holder_pane
@@ -5496,15 +5510,14 @@ def run_demote(args):
         die(f"no transcript for {args.demote!r}; name the session uuid")
     stored = load_receipt(path.stem)
     table = RESOLVER.ps_table()
-    # Self-hold first: procs_on_transcript excludes our own lineage, so an
-    # agent demoting the very transcript it is running is invisible to the
-    # holder gate - the one caller that gate most needs to stop. No --force:
-    # embedding the file one's own harness will next flush is never right.
-    selfhold = RESOLVER.self_holds_transcript(path.stem, table)
+    # Both halves of the holder question, self first: the agent demoting the
+    # very transcript it is running is the caller this gate most needs to
+    # stop. No --force: embedding the file one's own harness will next flush
+    # is never right.
+    holders, selfhold = RESOLVER.transcript_holders(path.stem, table)
     if selfhold:
         die(f"you are demoting the transcript you are running (pid "
             f"{selfhold[0]}); nothing can embed a conversation from inside it")
-    holders = RESOLVER.procs_on_transcript(path.stem, table)
     if holders and not args.force:
         die(f"pid {holders[0][0]} holds this transcript; demoting it would "
             "strand a live writer. --force overrides")
@@ -7488,19 +7501,25 @@ def run_selftest(live=False):
     me = os.getpid()
     fake_table = [(me, 0, "claude --resume FAKE-LINEAGE-UUID --agent-id x@t")]
     blind = []
-    if RESOLVER.self_holds_transcript("FAKE-LINEAGE-UUID", fake_table) != [me]:
-        blind.append("self-hold does not see the invoking lineage")
-    if RESOLVER.procs_on_transcript("FAKE-LINEAGE-UUID", fake_table):
-        blind.append("the holder gate counts our own lineage")
-    # Call spellings, not bare words: a comment naming the other gate sits
-    # earlier in the function and a word-grep matched it instead of the code.
+    strangers, ours = RESOLVER.transcript_holders("FAKE-LINEAGE-UUID", fake_table)
+    if ours != [me]:
+        blind.append("the composed question does not see the invoking lineage")
+    if strangers:
+        blind.append("the composed question counts our own lineage as a stranger")
     demote_src = ast.get_source_segment(source, funcs["run_demote"]) or ""
-    asked_self = demote_src.find("RESOLVER.self_holds_transcript(")
-    asked_rest = demote_src.find("RESOLVER.procs_on_transcript(")
-    if not (0 <= asked_self < asked_rest):
-        blind.append("the demote gate does not ask self-hold first")
+    if "RESOLVER.transcript_holders(" not in demote_src:
+        blind.append("the demote gate does not ask the composed question")
     check("a demote cannot embed the conversation it runs inside", not blind,
           ", ".join(blind))
+
+    # Who holds a transcript is ONE question. Two consumers in one day
+    # consulted half of it, the second within hours of the first fix, so the
+    # halves stopped being separately consultable at all.
+    half_askers = sorted(
+        (callers_of("procs_on_transcript") | callers_of("self_holds_transcript"))
+        - {"transcript_holders"})
+    check("who holds a transcript is one question", not half_askers,
+          ", ".join(half_askers))
 
     # --- the mail ledger joins sends against deliveries, four honest states
     with tempfile.TemporaryDirectory() as td:
@@ -7995,8 +8014,8 @@ def run_selftest(live=False):
         check("standing (no rostered member on this machine)", True, "skipped")
 
     check("a self-migrate is refused",
-          bool(RESOLVER.self_holds_transcript("selftest-uuid",
-               [(os.getpid(), os.getppid(), "/usr/bin/claude --resume selftest-uuid --agent-id a@b")])))
+          bool(RESOLVER.transcript_holders("selftest-uuid",
+               [(os.getpid(), os.getppid(), "/usr/bin/claude --resume selftest-uuid --agent-id a@b")])[1]))
 
     check("default path cannot kill",
           'if ctx.get("to_team") and not ctx.get("auto_redirect"):' in run_one_src)
