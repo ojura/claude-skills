@@ -29,16 +29,16 @@ recent value wins.
 
 Flags for the resumed session are an allowlist, PASSTHROUGH_FLAGS, not a
 passthrough, and a forwarded flag overrides the value this tool would have
-derived. Anything the table does not know is refused with the nearest match
-named, so an unknown flag never reaches claude and a misspelling of one of
-this tool's own flags cannot forward while the run proceeds as if the flag
-had been honoured.
+derived. Anything not in the list is refused with the nearest match named, so an
+unknown flag never reaches claude and a misspelling of one of this tool's
+own flags cannot forward while the run proceeds as if the flag had been
+honoured.
 
-The table is hand-held on purpose: `claude --help` omits --agent-id,
+The list is kept by hand, deliberately: `claude --help` omits --agent-id,
 --agent-name, --team-name and --parent-session-id, the flags this tool
-exists to set, and asking it costs most of a second per run. So the list
-derives from nothing, and a flag claude grows is refused here until the
-table learns it.
+exists to set, and asking it costs most of a second per run. So nothing
+derives the list, and a flag claude grows is refused here until it is
+added.
 """
 
 import difflib
@@ -1232,10 +1232,9 @@ class Resolver:
     def lead_session_for(self, team):
         """The session id of this team's lead, or None.
 
-        Three places used to answer this differently: a roster read, a payload
-        lookup, and a glob over transcripts sharing the team name's block. They
-        disagree exactly when it matters, so they are one ladder here, strongest
-        first: what a roster records, what the payloads prove, and only then the
+        A roster read, a payload lookup, and a glob over transcripts sharing
+        the team name's block disagree exactly when it matters, so they are
+        one ladder here, strongest first: what a roster records, what the payloads prove, and only then the
         block, which is a guess about a name rather than evidence about a session.
         """
         for entry in self.scan_teams():
@@ -2370,8 +2369,8 @@ class Resolver:
         whether a team change was asked for, and those are the caller's to weigh:
         this says what is true, enforce_identity says what to do about it.
 
-        Splitting them is also what stops the check from being optional. It used to
-        run only where a caller remembered to call it, which was one site out of
+        Splitting them is also what stops the check from being optional: a
+        check a caller must remember to call runs at one site out of the
         several that resolve identities.
         """
         stamped_name, stamped_team = res.stamped("agentName"), res.stamped("teamName")
@@ -2384,11 +2383,10 @@ class Resolver:
             return objections
 
         if want_name and stamped_name != want_name:
-            # Never relaxed. This objection once fired because this tool had
-            # launched a lead under the wrong name and the harness stamped the
-            # transcript with it; teaching the guard to accept that would have
-            # converted corruption detection into permanent silence, and the next
-            # identity-corrupting bug would pass unremarked.
+            # Never relaxed. A lead launched under a wrong name gets every
+            # line stamped with it by the harness; a guard taught to accept
+            # that converts corruption detection into permanent silence, and
+            # the next identity-corrupting bug passes unremarked.
             #
             # What the roster and the payloads say is reported alongside, so the
             # refusal can name the remedy instead of only the contradiction.
@@ -2419,10 +2417,10 @@ class Resolver:
     def classify(self, token):
         """What kind of thing this token names: (kind, value, why).
 
-        kind is one of uuid, agent_id, team, name, ambiguous, unknown. The
-        selector used to decide this itself, running its own roster-name scan and
-        its own several-rosters refusal beside the engine's rung 3 - the same rule
-        written twice, answering in two different voices.
+        kind is one of uuid, agent_id, team, name, ambiguous, unknown. One
+        classifier, because a selector deciding this for itself writes the
+        same rule twice, a roster-name scan and a several-rosters refusal
+        beside the engine's own, answering in two voices.
 
         The caller still does the talking: an ambiguous token comes back with its
         candidates so the refusal can annotate them with live state, which is
@@ -3560,9 +3558,8 @@ COLOR_ANSI = {
     "magenta": "35", "cyan": "36", "orange": "38;5;208", "pink": "38;5;205",
 }
 
-# The harness's titler sometimes echoes a name instead of titling: a 559-line
-# session titled "claude" six times, a 16728-line one titled
-# "resume-background-agent" 1091 times. Real ai titles are natural language, so
+# The harness's titler sometimes echoes an agent name instead of titling,
+# and repeats it down the file. Real ai titles are natural language, so
 # any whitespace-free ai title is treated as absent; this set catches multiword
 # junk. Custom titles are exempt: the user typed those deliberately.
 JUNK_TITLES = {"new session"}
@@ -3839,11 +3836,11 @@ def noop_outcome(ctx, args, prefix, why, socket=None, is_lead=False, pane=None,
                  report=False):
     """A run that stops without launching: say why, register, state, return.
 
-    Four sites reached this state and each rebuilt the sequence by hand. The
-    parts are not optional and forgetting one is invisible: a noop that skips
-    registration leaves a running member unrecorded, which shipped once and
-    read as "will re-register" to everyone who saw it. One spelling now, so a
-    fifth site cannot arrive with a piece missing.
+    Every site that stops without launching comes through here. The parts
+    are not optional and forgetting one is invisible: a noop that skips
+    registration leaves a running member unrecorded while reading as though
+    it will re-register. One spelling, so no site can arrive with a piece
+    missing.
     """
     # An agent already sitting where it was asked to sit is the run working,
     # not a hazard, so that one says so in the report's own grammar.
@@ -4201,9 +4198,8 @@ def swarm_session_live(socket):
 def socket_state(socket):
     """What is actually true of this socket right now.
 
-    The `how` label only says where the name came from. Printing that alone
-    invites reading a derived name as a running server, which is how a socket
-    that had just been killed still read as live.
+    The `how` label only says where the name came from. Printed alone, a
+    derived name reads as a running server that may already be gone.
     """
     if not socket:
         return "unresolved"
@@ -5073,9 +5069,9 @@ def record_membership(ctx, args, pane, alive=True):
 def report_launch(ctx, command, prefix="", role="agent", agent_id=None, extra=()):
     """The facts a launch reports, whichever way it launches.
 
-    One block, because two were kept by hand and drifted: a lead exec'd
-    without ever printing its command, since the field lived in the member
-    block and nowhere else. What genuinely differs between the paths is the
+    One block, because two kept by hand drift apart: a field living in only
+    the member block leaves a lead to exec without ever printing its command.
+    What genuinely differs between the paths is the
     mechanism - a pane and a socket, or taking over this terminal - so that
     is what `extra` carries, and everything common is answered here once.
     """
@@ -6434,11 +6430,10 @@ def run_census():
     """Count what this machine's ~/.claude actually contains. Read-only.
 
     Every number comes from the readers the tool itself resolves with, which is
-    the point. Each reading defect found so far came from a probe that
-    re-implemented a reader and then judged the behaviour by its own answer: a
-    regex that could not tell a label record from an identity stamp reported
-    damage that did not exist, and a bounded window read as if it were the whole
-    file reported an identity that was a session title. A census built on the
+    the point. A probe that re-implements a reader judges the behaviour by
+    its own answer: a regex that cannot tell a label record from an identity
+    stamp reports damage that does not exist, and a bounded window read as if
+    it were the whole file reports a session title as an identity. A census built on the
     engine cannot disagree with the engine; if a reader is wrong, the census
     reports something implausible instead of accusing the tool.
 
@@ -6518,8 +6513,8 @@ def rosters_leads(rosters):
 def run_cleanup(dry=False):
     """Everything the SessionStart hook does: reap what nothing can use.
 
-    It once also recorded the id each boot was handed, until that id proved
-    to be the transcript's rather than the one the team is named after.
+    No record is kept of the id a boot is handed: it names the transcript,
+    not the team the boot mints.
     """
     cleanup_sockets(dry)
     cleanup_teams(dry)
@@ -6853,8 +6848,8 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
 def rebuild_roster(team, args, passthrough, table):
     """Forge a reaped team's roster from its lead's transcript, or die saying why.
 
-    The error this replaces told the reader to forge it first and gave them no
-    way to do so. Everything needed is already here: the lead is found through
+    Nothing here sends the reader off to forge a roster by hand, because
+    everything needed is already here: the lead is found through
     the corroboration ladder, build adopts its identity from the payloads, and
     forge_team's lead branch rebuilds the members with the colours and models
     those payloads recorded.
@@ -6988,8 +6983,8 @@ def live_checks():
     contract. Everything here undoes itself: processes are killed, the cwd is
     restored, temporary trees are removed.
 
-    They exist because the alternative was leaving these paths to one-off
-    scripts, and the paths a script tested once are the ones that broke.
+    They exist because the alternative is leaving these paths to one-off
+    scripts, and a path only a one-off script ever tested is an untested path.
     """
     import pty
     import subprocess as sp
@@ -7199,9 +7194,9 @@ def run_selftest(live=False):
 
     def callers_of(target):
         """Callers by either spelling: a module function calls `target(...)`, an
-        engine method calls `self.target(...)`. Matching only the first would
-        make every invariant below pass by vacuity once the engine became a
-        class, which is the opposite of what they are for."""
+        engine method calls `self.target(...)`. Matching only the first lets
+        every invariant below pass by vacuity for an engine that is a class,
+        which is the opposite of what they are for."""
         out = set()
         for name, node in funcs.items():
             for sub in ast.walk(node):
@@ -7221,8 +7216,8 @@ def run_selftest(live=False):
 
     # the checker itself is not a caller of the thing it checks
     # The engine is a class, so membership of it is the exemption, not a list of
-    # names. Enumerating names is what let a caller add a picker without tripping
-    # this: a new engine method had to be remembered, and one was not.
+    # names. Enumerating names lets a caller add a picker without tripping
+    # this, because a new engine method has to be remembered.
     engine_node = next(node for node in ast.walk(tree)
                        if isinstance(node, ast.ClassDef) and node.name == "Resolver")
     engine = {m.name for m in engine_node.body if isinstance(m, ast.FunctionDef)}
@@ -7233,10 +7228,10 @@ def run_selftest(live=False):
                - {"team_keep_reason", "run_selftest", "run_census"})
     check("only the engine picks a transcript", not pickers, ", ".join(sorted(pickers)))
 
-    # The boundary. Naming the functions allowed to reach the tree was the form
-    # that failed: a picker only had to avoid the named entry point, and one did,
-    # by globbing directly. Membership of the class is checkable and cannot be
-    # sidestepped by choosing a different spelling.
+    # The boundary. Naming the functions allowed to reach the tree fails: a
+    # picker need only avoid the named entry point and glob directly.
+    # Membership of the class is checkable and cannot be sidestepped by
+    # choosing a different spelling.
     ambient = {"PROJECTS_DIR", "SESSIONS_DIR", "TEAMS_DIR",
                "_ps", "_stamps", "_spawns", "_spawn_log", "_by_agent", "_by_team"}
     engine_lines = set(range(engine_node.lineno, engine_node.end_lineno + 1))
@@ -7245,13 +7240,13 @@ def run_selftest(live=False):
     selftest_node = next(n for n in ast.walk(tree)
                          if isinstance(n, ast.FunctionDef) and n.name == "run_selftest")
     selftest_lines = set(range(selftest_node.lineno, selftest_node.end_lineno + 1))
-    # The evidence ban stopped raw tree access. These stop the decisions: a roster
+    # The evidence ban stops raw tree access. These stop the decisions: a roster
     # parsed by hand, an argv matched by hand, and the underscore convention going
-    # quietly hollow. Every regression so far took the same route, which was that
-    # the raw form was still reachable, so somebody reached.
+    # quietly hollow. Every such regression shares one route: the raw form
+    # stays reachable, so somebody reaches.
     # Narrowly: reading a roster file. Parsing a transcript line or a settings
-    # file is a different question and stays where it is; what regressed five
-    # times was several functions each deciding for themselves what a roster is.
+    # file is a different question and stays where it is; the regression shape
+    # is several functions each deciding for themselves what a roster is.
     def reads_a_roster(node):
         body = ast.get_source_segment(source, node) or ""
         return ("loads" in body
@@ -7630,10 +7625,10 @@ def run_selftest(live=False):
     check("the launch report fits the terminal and keeps its command exact",
           not wrong, ", ".join(wrong))
 
-    # The zsh completion file is kept by hand beside the tool, and it drifted:
-    # fifteen flags existed that completion had never heard of. Every long
-    # flag the parser takes must be offered (aliases and the hidden emitter
-    # excepted), and completion must offer nothing the parser would refuse.
+    # The zsh completion file is kept by hand beside the tool, so the two can
+    # drift apart by whole verbs. Every long flag the parser takes must be
+    # offered (aliases and the hidden emitter excepted), and completion must
+    # offer nothing the parser would refuse.
     comp_path = Path(__file__).resolve().parent / f"_{TOOL}"
     comp_text = comp_path.read_text() if comp_path.exists() else ""
     main_src = ast.get_source_segment(source, funcs["main"]) or ""
@@ -7898,8 +7893,8 @@ def run_selftest(live=False):
     wrong = sorted(k for k, good in classified.items() if not good)
     check("a selector is found wherever it sits", not wrong, ", ".join(wrong))
 
-    # --stop resolves a selector that has already become args; every shape of it
-    # was broken at once because each was derived separately from a mangled argv.
+    # --stop resolves a selector that has already become args; shapes each
+    # derived separately from a mangled argv all break at once.
     stop_base = Path(tempfile.mkdtemp())
     stop_team = "session-selftest"
     (stop_base / stop_team / "inboxes").mkdir(parents=True)
@@ -8068,10 +8063,9 @@ def run_selftest(live=False):
                     gathered.append(f"{node.name} reaches {fn.attr}")
     check("the doctor invents no evidence", not gathered, ", ".join(sorted(set(gathered))))
 
-    # Assembly is exercised, not just its parts. A NameError in identity() once
-    # passed a full battery of structural checks while every real invocation of
-    # the tool died: nothing in the suite called the function that answers who an
-    # agent is.
+    # Assembly is exercised, not just its parts: a structural battery can pass
+    # over a NameError in identity() while every real invocation dies, when
+    # nothing in the suite calls the function that answers who an agent is.
     stamped = next(((name, team) for name, team in RESOLVER.stamp_index().values()
                     if name and team and name != "team-lead"), None)
     if stamped:
@@ -8141,8 +8135,8 @@ def run_selftest(live=False):
                 mismatched.append(f"{wore} on team {on_team}")
     check("a launch wears one identity", not mismatched, "; ".join(mismatched[:2]))
 
-    # A stamp contradicting the roster is reported, never tolerated: it is how
-    # this tool caught itself launching a lead under the wrong name. The refusal
+    # A stamp contradicting the roster is reported, never tolerated: it is
+    # what catches a lead launched under a wrong name. The refusal
     # carries the remedy when the roster and the payloads agree on the identity
     # being asked for, so a corrupted stamp is recoverable without being ignored.
     contradicted = None
@@ -8277,18 +8271,18 @@ def run_selftest(live=False):
         check("multi-team lead (none stamped with another team here)", True, "skipped")
 
     # A lead that ran several teams must rebuild the one that was named, not
-    # whichever it ran as last. Both spellings of that fault shipped once: the
-    # forge proposed the newest team's name over the right members, and an agent
-    # id resolved the right transcript under the wrong team.
+    # whichever it ran as last. The fault has two spellings: a forge proposing
+    # the newest team's name over the right members, and an agent id resolving
+    # the right transcript under the wrong team.
     multi = next(((stem, teams) for stem, teams in
                   ((path.stem, RESOLVER.teams_led_by(path.stem))
                    for hits in RESOLVER.led_teams().values() for _stamp, path in hits)
                   if len(teams) > 1), None)
     if multi:
         stem, teams = multi
-        # Every payload handed back for a team must belong to that team. The fault
-        # was that a lead's newest team answered for an older one, which shows up
-        # here as a payload stamped with a team nobody asked about.
+        # Every payload handed back for a team must belong to that team. The
+        # fault shape is a lead's newest team answering for an older one, which
+        # shows up here as a payload stamped with a team nobody asked about.
         strays = {t: [p["name"] for p in RESOLVER.members_spawned_into(stem, t)
                       if p.get("team_name") != t]
                   for t in teams}
@@ -8326,9 +8320,9 @@ def run_selftest(live=False):
     check("a roster with no lead cannot corroborate one", not vouched,
           f"{len(vouched)} entries vouched")
 
-    # One classifier decides what a token names. apply_selector used to run its
-    # own roster-name scan and its own several-rosters refusal beside the
-    # engine's rung 3: one rule, two implementations, two voices.
+    # One classifier decides what a token names; a selector running its own
+    # roster-name scan and several-rosters refusal beside the engine's is one
+    # rule in two implementations, answering in two voices.
     kinds = {
         "a uuid": RESOLVER.classify("2a38de2d-bd34-4c7f-8f9a-000000000000")[0] == "uuid",
         "an agent id": RESOLVER.classify("someone@session-abcdef12")[0] == "agent_id",
@@ -8667,10 +8661,10 @@ def run_selftest(live=False):
     check("a team run says what it left out", not wrong, ", ".join(wrong))
 
     # --- a lead and a member report the same launch facts
-    # Two hand-maintained report blocks in one function is why the lead once
-    # exec'd without ever printing its command: the field existed in the
-    # member block and nowhere else. Whatever else the two paths differ in,
-    # they answer these questions alike.
+    # Two hand-maintained report blocks in one function let a field exist in
+    # the member block and nowhere else, and a lead then execs without ever
+    # printing its command. Whatever else the two paths differ in, they
+    # answer these questions alike.
     run_one_src = ast.get_source_segment(source, funcs["run_one"]) or ""
     # The anchor is the member path's own top-level branch (4-space indent);
     # the lead branch also mentions the flag, one level deeper, to refuse it.
