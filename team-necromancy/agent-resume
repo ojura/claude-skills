@@ -8649,6 +8649,13 @@ def run_selftest(live=False):
     finally:
         RESOLVER.classify = real_classify
 
+    class _ByName:
+        resume = None
+        here = team = agent_id = None
+        selftest = complete = cleanup = doctor = census = sides = False
+        promote = demote = mail_ledger = install = poison = unpoison = False
+        help = standing = stop = False
+
     class _ByUuid:
         resume = "u"
         here = team = agent_id = None
@@ -8656,12 +8663,30 @@ def run_selftest(live=False):
         promote = demote = mail_ledger = install = poison = unpoison = False
         help = standing = stop = False
 
-    # The end-of-run audit refuses a declaration nobody used, so a resume that
-    # names a uuid must not declare stamps it will never read.
-    if NEED.STAMPS in verb_needs(_ByUuid, None):
-        terminal.append("a resume declares stamps it may never read")
-    check("this terminal goes to one agent, and a uuid needs no stamps",
-          not terminal, ", ".join(terminal))
+    # The end-of-run audit refuses a declaration nobody used, so each input
+    # shape declares what that shape can reach: a uuid resolves from the
+    # filename, a bare name and a team are found through the stamps and
+    # nothing else, and an agent id reaches them only when nothing live wears
+    # it, which no input can say.
+    shapes = {
+        "a uuid declares stamps it can never read":
+            NEED.STAMPS in verb_needs(_ByUuid, None),
+        "a bare name does not declare the stamps that find it":
+            NEED.STAMPS not in verb_needs(_ByName, "unslop-docs"),
+        "a team does not declare the stamps that find its members":
+            NEED.STAMPS not in verb_needs(_ByName, "session-abc12345"),
+        # Read the way the engine reads a declaration, since Maybe carries no
+        # equality: a set-membership test cannot tell conditional from absent.
+        "an agent id hardens a need its live rung may skip":
+            NEED.STAMPS in Resolver(
+                needs=verb_needs(_ByName, "a@session-abc12345")).hard_needs,
+        "an agent id cannot reach the stamps at all":
+            NEED.STAMPS not in Resolver(
+                needs=verb_needs(_ByName, "a@session-abc12345")).needs,
+    }
+    terminal.extend(k for k, wrong in shapes.items() if wrong)
+    check("this terminal goes to one agent, and each input declares what it "
+          "can reach", not terminal, ", ".join(terminal))
 
     check("a blocked move does not become an unreachable launch", not orphan,
           ", ".join(orphan))
@@ -10159,9 +10184,17 @@ def verb_needs(args, selector):
         return {NEED.PROCS, NEED.STAMPS, NEED.SPAWNS, NEED.MAIL}
     if args.stop:
         return {NEED.PROCS, NEED.STAMPS, may(NEED.SPAWNS)}
-    # A session named by uuid resolves from the filename, so a resume reaches
-    # the stamps only when it has a name or a team to look one up by.
-    return {NEED.PROCS, may(NEED.STAMPS), may(NEED.SPAWNS)}
+    # The input decides which resolution rungs can run. A uuid resolves from
+    # the filename and never reaches the stamps. A bare name or a team can be
+    # found through the stamps and nothing else. An agent id reaches them only
+    # when nothing live wears it, which is the run's own liveness rather than
+    # anything the input says.
+    by_uuid = bool(args.resume) or bool(selector and UUID_RE.match(selector))
+    if args.agent_id or (selector and "@" in selector):
+        return {NEED.PROCS, NEED.SPAWNS, may(NEED.STAMPS)}
+    if by_uuid and not args.team:
+        return {NEED.PROCS, NEED.SPAWNS}
+    return {NEED.PROCS, NEED.SPAWNS, NEED.STAMPS}
 
 
 def audited(entry):
