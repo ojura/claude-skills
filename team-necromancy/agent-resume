@@ -1667,6 +1667,45 @@ class Resolver:
                 teams.add(team)
         return teams
 
+    def minted_by_a_resumed_life(self, team):
+        """Whether only a resumed life could have minted this team. From disk.
+
+        A team is named after its minting boot's session id and records that
+        id as leadSessionId. A fresh boot's id is also its transcript's
+        filename, so its team's leadSessionId names a file. A resumed life's
+        id is generated at that boot and names nothing. So a team whose
+        leadSessionId has no transcript was minted by a resumed life, and one
+        whose leadSessionId has a transcript belongs to that transcript's
+        boot - whatever any timing window says. Measured here: 19 of 23 teams
+        carry the fresh shape, 4 the resumed one.
+        """
+        data = self.roster_of(team) or {}
+        lead_session = data.get("leadSessionId")
+        if not lead_session:
+            return None
+        return self.transcript_path(lead_session) is None
+
+    def mint_candidates(self, pid):
+        """(teams this process could have minted, why) - structure, then time.
+
+        Structure first: a fresh boot's team is derivable and confirmable, so
+        it needs no window at all. A resumed life's is not, but the teams it
+        could possibly have minted are still bounded by shape, which is what
+        keeps a stranger's fresh-boot team out of the answer.
+        """
+        entry = next((e for e in self.live_sessions() if e["pid"] == pid), None)
+        session = (entry or {}).get("session")
+        if session:
+            derived = f"session-{session[:8]}"
+            data = self.roster_of(derived) or {}
+            if data.get("leadSessionId") == session:
+                # Its own id names the team and the roster agrees: a fresh
+                # boot, answered from disk with nothing inferred.
+                return [derived], "its own session id names this team"
+        pool = [t for t in self.known_teams()
+                if self.minted_by_a_resumed_life(t)]
+        return pool, "the teams a resumed life could have minted"
+
     def sole_mint_pairing(self, pid):
         """The team only this process could have minted, or None if ambiguous.
 
@@ -1675,7 +1714,8 @@ class Resolver:
         one process falls inside several teams' windows, so neither direction is
         established by appearing in that list.
         """
-        pairs = self._boot_join()
+        pool, _why = self.mint_candidates(pid)
+        pairs = [p for p in self._boot_join() if p[0] in pool]
         mine = {team for team, owner, _ in pairs if owner == pid}
         if len(mine) != 1:
             return None
@@ -2526,15 +2566,23 @@ class Resolver:
                 # from an earlier one's, so the rung declines rather than guessing.
                 if payload.get("team_name") and started and stamp >= started:
                     return payload["team_name"], True
-        # The id a resumed life mints its team from is generated at that boot
-        # and written nowhere: not the transcript filename (that is the id it
-        # resumed from), not the registry, not the roster. Measured here: 4 of
-        # 23 team dirs name an id with no transcript, all minted by resumed
-        # lives. A ledger of the id SessionStart is handed does not answer it
-        # either - that payload carries the resumed id, so it claimed teams
-        # that never existed for 7 of 8 live resumed sessions before it was
-        # deleted. Timing is all that is left, and it stays inexact.
-        return next((team for team, owner, _ in self._boot_join() if owner == pid), None), False
+        # Structure before time. A fresh boot's team is derivable from its own
+        # session id and confirmable against the roster, so it is exact. A
+        # resumed life's minted id is generated at that boot and written
+        # nowhere - not the transcript filename (that is the id it resumed
+        # from), not the registry, not the roster - so its team is bounded by
+        # shape and then, only within that bound, paired by boot timing. The
+        # bound is what keeps a stranger's fresh-boot team out of the answer;
+        # the residual is coverage, not ambiguity, since a team minted at the
+        # first spawn falls outside any window centred on boot.
+        pool, why = self.mint_candidates(pid)
+        if why.startswith("its own"):
+            return pool[0], True
+        paired = self.sole_mint_pairing(pid)
+        if paired:
+            return paired, False
+        return next((team for team, owner, _ in self._boot_join()
+                     if owner == pid and team in pool), None), False
 
     def standing(self, agent_id, parent_session=None):
         """Where a member stands with its lead: parentage, liveness, team, mail.
@@ -4450,27 +4498,36 @@ def build_command_agent_id(ctx):
 
 
 def confirm_redirect(agent_id, pid, dest, source, prefix=""):
-    """Offer a redirect the mint window suggests. True to take it.
+    """Offer a redirect the evidence corroborates. True to take it.
 
-    The pairing is corroborated rather than proven, so it is offered instead of
-    acted on, and only when it is the only pairing in either direction. No
-    terminal means no answer, and the launch stays on the team it names.
+    Corroborated means three facts agreeing: this team could only have been
+    minted by a resumed life (from disk - a fresh boot's team names its own
+    transcript), it is the only such team paired with this process's boot,
+    and that process is the only one paired with it. That is why the offer
+    defaults to yes; what it still cannot see is a team minted late, outside
+    any window centred on boot, which is a gap in coverage rather than a
+    choice between candidates. No terminal means no answer, and a launch
+    that cannot ask stays on the team it names.
     """
     if RESOLVER.sole_mint_pairing(pid) != dest:
         return False
+    shape = RESOLVER.minted_by_a_resumed_life(dest)
     if not sys.stdin.isatty():
-        warn(f"pid {pid} is this agent's lead and only {dest} matches its boot, "
-             f"but that is timing rather than evidence; staying on {source}")
+        warn(f"pid {pid} is this agent's lead and only {dest} matches its boot; "
+             f"nothing here can ask, so it stays on {source}")
         return False
-    print(f"{prefix}pid {pid} is this agent's lead, and exactly one team matches "
-          f"its boot: {dest}")
+    print(f"{prefix}pid {pid} is this agent's lead, and {dest} is the only team "
+          f"it could have minted"
+          + (" (its lead session names no transcript, the shape only a resumed "
+             "life leaves)" if shape else ""))
     try:
-        answer = input(f"redirect {agent_id} onto {dest}? [y/N] ").strip().lower()
+        answer = input(f"redirect {agent_id} onto {dest}? [Y/n] ").strip().lower()
     except EOFError:
         answer = ""
-    if answer != "y":
+    if answer.startswith("n"):
         print(f"{prefix}staying on {source}")
-    return answer == "y"
+        return False
+    return True
 
 
 def auto_redirect(ctx, args, table, prefix=""):
@@ -7237,9 +7294,11 @@ def run_selftest(live=False):
         asks = {}
         RESOLVER.sole_mint_pairing = lambda pid: "session-dest"
         sys.stdin = types.SimpleNamespace(isatty=lambda: True)
+        # Corroborated, so the offer defaults to yes: only an explicit no
+        # keeps a launch on a team its own evidence contradicts.
         for label, reply, want in (("yes redirects", "y", True),
                                    ("no stays put", "n", False),
-                                   ("a bare return stays put", "", False)):
+                                   ("a bare return takes the offer", "", True)):
             globals()["input"] = lambda prompt="", _r=reply: _r
             with contextlib.redirect_stdout(io.StringIO()):
                 asks[label] = confirm_redirect("a@src", 1, "session-dest", "src") is want
@@ -7264,7 +7323,49 @@ def run_selftest(live=False):
         else:
             globals().pop("input", None)
     wrong = sorted(k for k, good in asks.items() if not good)
-    check("a redirect timing suggests is asked, not taken", not wrong, ", ".join(wrong))
+    check("a corroborated redirect is offered, not taken silently", not wrong,
+          ", ".join(wrong))
+
+    # --- shape, not timing, bounds which team a process could have minted
+    with tempfile.TemporaryDirectory() as td:
+        eng9 = Resolver()
+        eng9.projects_dir, eng9.teams_dir = Path(td) / "proj", Path(td) / "teams"
+        (eng9.projects_dir / "p").mkdir(parents=True)
+        (eng9.projects_dir / "p" / "aaaaaaaa-1111.jsonl").write_text("{}\n")
+        for name, lead in (("session-aaaaaaaa", "aaaaaaaa-1111"),
+                           ("session-bbbbbbbb", "bbbbbbbb-2222")):
+            (eng9.teams_dir / name).mkdir(parents=True)
+            eng9.roster_path(name).write_text(json.dumps(
+                {"name": name, "leadSessionId": lead, "members": []}))
+        shapes = {
+            "a team whose lead session names a transcript is a fresh boot's":
+                eng9.minted_by_a_resumed_life("session-aaaaaaaa") is False,
+            "a team whose lead session names nothing is a resumed life's":
+                eng9.minted_by_a_resumed_life("session-bbbbbbbb") is True,
+        }
+        me = os.getpid()
+        eng9.live_sessions = lambda: [{"pid": me, "alive": True, "team": None,
+                                       "session": "aaaaaaaa-1111", "started": 0,
+                                       "agent": None}]
+        pool, why = eng9.mint_candidates(me)
+        shapes["a fresh boot needs no window at all"] = (
+            pool == ["session-aaaaaaaa"] and why.startswith("its own"))
+        shapes["and it answers exact"] = eng9.team_minted_by(me) == (
+            "session-aaaaaaaa", True)
+        eng9.live_sessions = lambda: [{"pid": me, "alive": True, "team": None,
+                                       "session": "cccccccc-3333", "started": 0,
+                                       "agent": None}]
+        pool, _why = eng9.mint_candidates(me)
+        # The fresh-boot team is provably somebody else's, so it cannot be
+        # paired with a resumed life however the timing falls.
+        shapes["a resumed life's pool holds only resumed-shape teams"] = (
+            pool == ["session-bbbbbbbb"])
+        eng9._boot_join = lambda: [("session-aaaaaaaa", me, 0)]
+        shapes["a stranger's fresh-boot team is not the answer"] = (
+            eng9.team_minted_by(me) == (None, False))
+        wrong = sorted(k for k, good in shapes.items() if not good)
+        check("shape bounds which team a process could have minted", not wrong,
+              ", ".join(wrong))
 
     # --- a team is larger than its roster, and a run that takes the roster says so
     pop_wrong, with_former = [], None

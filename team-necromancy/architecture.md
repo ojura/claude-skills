@@ -177,11 +177,21 @@ boot the minted id is the transcript filename, but for a resumed life it is
 generated at that boot and appears nowhere on disk (4 of 23 team
 directories here name such an id).
 
-So the timing join remains the last rung, and the harness-side record is
-still the thing that would delete it: one line naming the id a life minted,
-in the boot's own transcript or beside the resumed id in
-`~/.claude/sessions/<pid>.json`.
+What is provable from disk bounds the guess, which was the missing half.
+A team records its minting boot's session id as `leadSessionId`. For a fresh
+boot that id is also the transcript's filename, so the team is derivable and
+confirmable and needs no window at all. For a resumed life the id names no
+file, which is a signature only a resumed life leaves. So a resumed process
+could only have minted a team of that second shape (4 of 23 here), and every
+fresh-boot team is provably somebody else's however the timing falls.
 
+That leaves three grades rather than two: exact for a fresh boot, corroborated
+for a resumed life uniquely paired, both directions, with a resumed-shape team,
+and nothing at all when neither holds. Corroborated is offered rather than
+taken, and the offer defaults to yes. The residual is coverage, not ambiguity:
+a team minted at the first spawn falls outside any window centred on boot, so
+it never enters the pool to be chosen between. A harness-side record is what
+would close that, and it is still the ask:
 ## Adopt, in one paragraph
 
 Adopt is the orphaned-work recovery system: on exit or backgrounding, running
