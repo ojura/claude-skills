@@ -90,11 +90,11 @@ good components that nobody introduced to each other.
    reap-rebind, measured live). Two reaped-team edges: stamped for an
    absent team and flagless, the session comes up as nobody and writes
    unstamped lines until the team dir exists again; flag-bound, argv
-   survives, mail flows both ways and replies work, but the Stop/idle hook
-   is skipped, so that life announces no idleness (observed across two
-   turns; the second ended near collection, so the sentence carries this
-   caveat). A compaction under the new team then a restart restores the
-   hooks and seals the identity.
+   survives, mail flows both ways and replies work, but hook init is
+   structurally unreachable (bundle-confirmed, behaviorally corroborated:
+   zero idle notifications across two turns), so that life announces no
+   idleness and applies no teamAllowedPaths. A compaction under the new
+   team then a restart restores the hooks and seals the identity.
 
 9. **Delivery is a turn-boundary event.** Teammate mail is three-tier by
    design: an idle recipient gets an immediate turn; a busy one queues in

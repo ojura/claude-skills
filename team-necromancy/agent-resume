@@ -5580,6 +5580,12 @@ def rebind_reap(stamped, dest, args, prefix=""):
 
     --force never buys a reap: the flag means run anyway, never destroy
     anyway. Guards failing is a refusal, full stop.
+
+    Invariant, not accident: the destination team's roster must be readable
+    at boot or the session comes up identity-less. The tool meets it because
+    registration precedes launch; if that order ever changes, this sentence
+    is the tripwire. The reaped life also applies no teamAllowedPaths (hook
+    init is structurally unreachable with the stamped team absent).
     """
     objections = RESOLVER.reap_objections(stamped, RESOLVER.ps_table(),
                                           archive_mail=args.with_mail)
@@ -5597,8 +5603,8 @@ def rebind_reap(stamped, dest, args, prefix=""):
     print(f"{prefix}fragile  until a compaction under {dest} seals the window-start: "
           f"if {stamped} returns (rebuild, re-mint), the next restart snaps back; "
           "the receipt prevents only the stale-config path")
-    print(f"{prefix}quiet    this life emits no idle notifications; "
-          "mail in and out flows normally")
+    print(f"{prefix}quiet    until the first restart after a compaction under "
+          f"{dest}, this life sends no idle notifications; everything else works")
 
 
 def run_promote(args):
