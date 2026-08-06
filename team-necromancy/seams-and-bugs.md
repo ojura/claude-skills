@@ -65,9 +65,17 @@ good components that nobody introduced to each other.
 
    Settled, triple-witnessed (stale source, bundle trace, live sandbox):
    restore is not gated on flags. A flag-bound launch onto a
-   stamped-disagreeing transcript runs split: it writes transcript lines as
-   the stamped team, sends idle notifications as the worn team, and polls
-   both teams' inboxes. The transcript half wins every future resume, so a
+   stamped-disagreeing transcript runs split, four carriers measured: it
+   writes transcript lines as the stamped team, sends idle notifications
+   as the worn team, resolves its OUTBOUND SendMessage against the worn
+   team (full round trip demonstrated with a live worn-team lead; the
+   stamped team's inboxes never gain a file), and polls both teams'
+   inboxes. Spawn-registration is the one unpinned carrier: the only field
+   evidence was a flagless lead, which cannot discriminate, so it stays
+   code-read/unknown. In short: a split agent writes history as the
+   stamped team but speaks, notifies, and is addressed as the worn team -
+   considerably more functional than first thought, and wrong only where
+   it matters most. The transcript half wins every future resume, so a
    rebind by flags silently undoes itself at each restart - and no appended
    entry can fix it. The theorem: an appended entry either has a null
    parent, in which case restore reads it but the loaded window truncates
