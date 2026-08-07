@@ -3366,7 +3366,7 @@ class Resolver:
             # own parameters had no such line, and the inverse restores bytes
             # rather than improving on them.
             if receipt.get("in_file", True):
-                out.append(self._receipt_line(receipt))
+                out.append(receipt.get("carried_raw") or self._receipt_line(receipt))
         else:
             trailers, inserted = [], []
             last_n = parsed[-1][0] if parsed else None
@@ -3377,8 +3377,13 @@ class Resolver:
                     # line. Anywhere else it is a line this conversion did not
                     # author, so it rides through untouched rather than being
                     # re-keyed or given a sidechain field it never had.
-                    if n == last_n:
-                        consumed = True
+                    if n == last_n and receipt.get("undo", True):
+                        # Only going back where it came from is an undo, and
+                        # only an undo consumes the record. Kept verbatim
+                        # rather than re-derived, the way the ref line and the
+                        # trailers are, since rebuilding it from fields would
+                        # rebuild it from ones this demote may have changed.
+                        consumed, receipt["carried_raw"] = True, raw
                         continue
                     out.append(raw)
                     continue
@@ -3525,13 +3530,18 @@ class Resolver:
                     stored.pop(key, None)
                 stored.update(carried)
             into = into or stored.get("parent")
+            # Going back where it came from is the undo, and undoes to the
+            # original bytes. Anywhere else is a move, and the record of the
+            # promote survives it, because a move is not an undo.
+            undo = carried is None or into == carried.get("parent")
             if not into:
                 return {"objections": ["demote needs the parent session (--into)"],
                         "proved": False}
             receipt = {"grammar": stored.get("grammar", "rooted"), "parent": into,
                        "dest_stem": source.stem,
                        "task_id": dest or stored.get("task_id") or source.stem,
-                       "root": stored.get("root"), "meta": stored.get("meta")}
+                       "root": stored.get("root"), "meta": stored.get("meta"),
+                       "undo": undo}
             for carried in ("ref", "graft", "inserted_sidechain",
                             "cut", "cut_parent", "cut_lines", "name", "team"):
                 if stored.get(carried):
@@ -9692,6 +9702,19 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             faults.append(f"the carried receipt lost the task id: {alone['dest_path'].name}")
         elif "\n".join(alone["lines"]) + "\n" != rooted_bytes:
             faults.append("a carried demote did not restore the original bytes")
+
+        # --into names a parent other than the one it came from, which is the
+        # only reason the flag exists. The carried record is consumed either
+        # way and goes back verbatim, because rebuilding it from fields this
+        # demote deliberately changed would refuse the operation it is for.
+        elsewhere = eng.conversion_plan(carried, "demote", into="ELSEWHERE")
+        if elsewhere["objections"] or not elsewhere["proved"]:
+            faults.append(f"a demote into another parent refused: "
+                          f"{elsewhere['objections'] or 'unproved'}")
+        elif elsewhere["dest_path"].parent.parent.name != "ELSEWHERE":
+            faults.append("a demote into another parent landed elsewhere")
+        elif not any(RECEIPT_RECORD in line for line in elsewhere["lines"]):
+            faults.append("a demote into another parent ate the receipt")
 
         # Last means last. With a turn written past it the record is history,
         # so the demote leaves it where it sits instead of eating it.
