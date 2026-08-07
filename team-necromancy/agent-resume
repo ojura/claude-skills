@@ -2854,6 +2854,26 @@ class Resolver:
         return (self.procs_on_transcript(session_uuid, table),
                 self.self_holds_transcript(session_uuid, table))
 
+    def lead_holders(self, session_uuid, table):
+        """(others, ours): every live pid running this lead's conversation.
+
+        Both witnesses, because a lead is the one identity that can be invisible
+        to either. A masqueraded lead carries --resume in its argv and never
+        writes a session file; a lead resumed from the in-app picker runs as
+        bare `claude` and is visible only in the registry. Asking one of them is
+        how a move ends up exec'ing a second copy onto a live conversation.
+
+        The argv half excludes our own lineage by construction and the registry
+        does not, so the same split is applied to what the registry adds, here
+        rather than left for a caller's kill to discover.
+        """
+        strangers, ours = self.transcript_holders(session_uuid, table)
+        others = [pid for pid, _t in strangers]
+        owner = self.lead_pid_for(session_uuid)
+        if owner and owner[2] and owner[0] not in others and owner[0] not in ours:
+            (ours if owner[0] in own_lineage(table) else others).append(owner[0])
+        return others, ours
+
     def self_holds_transcript(self, session_uuid, table):
         """Are we ourselves the process holding this transcript?
 
@@ -5652,26 +5672,6 @@ def lead_move(ctx, args, dest):
     return source, bool(args.to_team) or state == "restored"
 
 
-def lead_holders(ctx, table):
-    """(others, ours): every live pid running this lead's conversation.
-
-    Both witnesses, because a lead is the one identity that can be invisible
-    to either. A masqueraded lead carries --resume in its argv and never
-    writes a session file; a lead resumed from the in-app picker runs as bare
-    `claude` and is visible only in the registry. Asking one of them is how a
-    move ends up exec'ing a second copy onto a live conversation.
-    """
-    strangers, ours = RESOLVER.transcript_holders(ctx["session_uuid"], table)
-    others = [pid for pid, _t in strangers]
-    owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
-    if owner and owner[2] and owner[0] not in others and owner[0] not in ours:
-        # Our own lineage is excluded from the argv half by construction, and
-        # the registry does no such thing, so the same exclusion is applied to
-        # it here rather than left for the kill to discover.
-        (ours if owner[0] in own_lineage(table) else others).append(owner[0])
-    return others, ours
-
-
 def lead_kill_gate(ctx, args, table, prefix=""):
     """Clear whatever is running this lead's conversation, before anything else.
     True when nothing holds it any more, or in a dry run when nothing would.
@@ -5683,7 +5683,7 @@ def lead_kill_gate(ctx, args, table, prefix=""):
     retiring its team dissolves with it, which is why this runs first rather
     than as a special case inside the reap.
     """
-    others, ours = lead_holders(ctx, table)
+    others, ours = RESOLVER.lead_holders(ctx["session_uuid"], table)
     if ours:
         die(f"you are running this transcript yourself (pid {ours[0]}); nothing "
             "can replace a process from inside it. Run this from another "
@@ -10961,12 +10961,11 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # precondition does not. Neither path may ask the liveness question for
     # itself, or the two answers drift as they did when the lead's forgot to
     # name the session it was refusing to take over.
-    # lead_holders is the exception that proves it: it does not decide whether
-    # to launch, it names the processes a move has to end first, and the launch
-    # decision is still already_running's.
-    asks_own = sorted(callers_of("lead_pid_for")
-                      - {"already_running", "auto_redirect", "lead_pid",
-                         "lead_holders", "run_selftest"})
+    # Membership of the engine is the exemption rather than a list of names:
+    # composing its own answers is what the engine is for, and what this
+    # forbids is a verb asking the question for itself.
+    asks_own = sorted(callers_of("lead_pid_for") - engine
+                      - {"already_running", "auto_redirect", "run_selftest"})
     # And the guarantee itself, not merely its address: the same live
     # conversation stops both acts, --force releases both, and only a
     # member's rebind is exempt (its own kill path owns that).
