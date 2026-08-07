@@ -12412,6 +12412,105 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         check("restamp-window-start", "--force restamps a living team's window-start, receipted, "
               "reversible, mode-preserved", not stray, ", ".join(stray))
 
+    # --- the closure guard: the edit set stays inside the two named fields.
+    #
+    # What can honestly reach it, having read restamp_plan: the edit set is
+    # two assignments onto a copy of the record, so every other key still
+    # holds the object it held before, and no rewrite this code performs can
+    # make a third field differ. The one value a copy compares unequal to is
+    # NaN, which json.loads accepts and json.dumps writes back unchanged, so
+    # a line carrying one is the only input that reaches the comparison at
+    # all, and it reaches it without any third field having changed. Which
+    # means this check cannot show a real rewrite earning that objection:
+    # through these seams none can. What it does hold is both directions of
+    # the guard's presence. Remove the comparison against the allowed set and
+    # the trip arm stops seeing its objection; make a rewrite touch a third
+    # field and the control arm stops proving. (Neither the guard's line nor
+    # the byte compare below is quoted here: a probe replaces text that
+    # appears once, and a comment quoting the line it discusses would take
+    # that away.)
+    with tempfile.TemporaryDirectory() as td:
+        proj = Path(td) / "proj"
+        proj.mkdir()
+        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def one_window(stem, extra=None):
+            """A transcript whose window-start carries both stamps, plus extra."""
+            start = {"parentUuid": None, "agentName": "mate", "teamName": "OLD",
+                     "type": "user", "uuid": f"{stem}-root",
+                     "timestamp": "2026-01-01T00:00:01Z"}
+            start.update(extra or {})
+            path = proj / f"{stem}.jsonl"
+            path.write_text(compact(start) + "\n" + compact(
+                {"type": "last-prompt", "leafUuid": f"{stem}-root",
+                 "sessionId": stem}) + "\n")
+            return path
+
+        eng8 = Resolver(needs=Needs(maybe=set(NEED)))
+        eng8.projects_dir = Path(td)
+        closed = []
+        plain = eng8.restamp_plan(one_window("CLOSED"), "NEW")
+        if not plain["proved"] or plain["objections"]:
+            closed.append(f"an ordinary rewrite did not prove: "
+                          f"{plain['objections'] or 'unproved'}")
+        third = eng8.restamp_plan(one_window("CLOSEDNAN", {"costUSD": float("nan")}), "NEW")
+        if "the edit set would need costUSD" not in third["objections"]:
+            closed.append(f"a third changed field did not object: {third['objections']}")
+        if third["proved"]:
+            closed.append("a third changed field was proved anyway")
+        check("restamp-refuses-a-third-field",
+              "a restamp refuses when the edit set would change a third field",
+              not closed, ", ".join(closed))
+
+    # --- the inverse proof: the undo is rebuilt and byte-compared first.
+    #
+    # One uuid on two lines is what reaches this honestly. window_start keys
+    # its records by uuid, so the last line to carry one wins, while the
+    # restamp scans lines in order and edits the first that carries it: the
+    # stamps it read and the line it edits are then different lines, and
+    # putting back the stamps it read leaves a teamName on a line that never
+    # had one. Measured with the compare removed: the unstamped line gains
+    # "teamName":"NEW", the stamped line still says OLD so the conversation
+    # has not moved anywhere, the receipt says it has, and the restamp back
+    # refuses as already-agreeing, so the file cannot be put back with this
+    # tool at all. That is the case this guard exists for.
+    with tempfile.TemporaryDirectory() as td:
+        proj = Path(td) / "proj"
+        proj.mkdir()
+        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def twinned(stem, first_uuid):
+            """Two records under one window, the earlier one unstamped."""
+            rows = [{"parentUuid": None, "type": "user", "uuid": first_uuid,
+                     "timestamp": "2026-01-01T00:00:01Z",
+                     "message": {"role": "user", "content": "hi"}},
+                    {"parentUuid": None, "agentName": "mate", "teamName": "OLD",
+                     "type": "user", "uuid": f"{stem}-root",
+                     "timestamp": "2026-01-01T00:00:02Z"},
+                    {"type": "last-prompt", "leafUuid": f"{stem}-root",
+                     "sessionId": stem}]
+            path = proj / f"{stem}.jsonl"
+            path.write_text("".join(compact(r) + "\n" for r in rows))
+            return path
+
+        eng9 = Resolver(needs=Needs(maybe=set(NEED)))
+        eng9.projects_dir = Path(td)
+        undone = []
+        twin = eng9.restamp_plan(twinned("TWIN", "TWIN-root"), "NEW")
+        if "the inverse does not restore the line" not in twin["objections"]:
+            undone.append(f"an unrestorable line did not object: {twin['objections']}")
+        if twin["proved"]:
+            undone.append("an unrestorable line was proved anyway")
+        # The control, one uuid apart: the line the plan locates is the line
+        # its stamps came from, and the undo restores its bytes.
+        apart = eng9.restamp_plan(twinned("APART", "APART-other"), "NEW")
+        if not apart["proved"] or apart["objections"]:
+            undone.append(f"an ordinary rewrite did not prove: "
+                          f"{apart['objections'] or 'unproved'}")
+        check("restamp-refuses-an-unrestorable-line",
+              "a restamp refuses when its inverse would not restore the line",
+              not undone, ", ".join(undone))
+
     # --- a rebind retires the stamped team only when nothing would notice
     with tempfile.TemporaryDirectory() as td:
         eng6 = Resolver(needs=Needs(maybe=set(NEED)))
