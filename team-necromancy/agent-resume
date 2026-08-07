@@ -361,6 +361,14 @@ def running_agents(targets, table):
     return found
 
 
+def some_of(names, most=6):
+    """`names` for a sentence, bounded, saying how many it left out."""
+    names = list(names)
+    if len(names) <= most:
+        return ", ".join(names)
+    return ", ".join(names[:most]) + f", and {len(names) - most} more"
+
+
 def stop_targets(args, table):
     """What --stop was pointed at, as [(pid, label, description, colour)].
 
@@ -368,18 +376,37 @@ def stop_targets(args, table):
     stops that agent wherever it runs, and a session stops whoever holds that
     transcript. The last is not an agent question, so it is answered from the
     transcript rather than by inventing an id for it.
+
+    A miss stops the run here rather than downstream, because this is where the
+    difference between the misses is still known. "nothing running for that"
+    covered a team that does not exist, a team that lists nobody and a team
+    whose members are all dead, and a reader had no way to tell which they
+    were looking at. Exit code is unchanged: die's 1 is what returning no
+    targets already produced.
     """
     if args.team:
         if not RESOLVER.has_roster(args.team):
             die(f"no team config at {RESOLVER.roster_path(args.team)}")
         members = (RESOLVER.roster_of(args.team) or {}).get("members", [])
-        return running_agents([m["agentId"] for m in members if m.get("agentId")], table)
+        listed = [m["agentId"] for m in members if m.get("agentId")]
+        running = running_agents(listed, table)
+        if not running:
+            die(f"nothing running for {args.team}: its roster lists no members"
+                if not listed else
+                f"nothing running for {args.team}: none of its {len(listed)} listed "
+                f"member(s) is running ({some_of(listed)})")
+        return running
     if not (args.agent_id or args.resume):
         die("--stop needs an agent, a session or a team to stop")
 
     if args.agent_id:
-        return running_agents([args.agent_id], table)
+        running = running_agents([args.agent_id], table)
+        if not running:
+            die(f"nothing running for {args.agent_id}: no live process wears that agent id")
+        return running
     held = RESOLVER.holders_of(args.resume, table) if args.resume else []
+    if not held:
+        die(f"nothing running for {args.resume}: no live process holds that transcript")
     return [(pid, args.resume[:8],
              session_title(path, limit=ABORT_TITLE) if path else "(no title)", "")
             for pid, path in held]
@@ -9354,6 +9381,88 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         shutil.rmtree(stop_base, ignore_errors=True)
     check("stop-resolves-selector-shapes", "--stop resolves every selector shape", not bad, ", ".join(bad))
 
+    # A stop that finds nothing said "nothing running for that", which covered
+    # a team that does not exist, a team listing nobody, and a team whose
+    # members are all dead. Each of those wants a different thing done next,
+    # so each says which one it is, against the name the run was pointed at.
+    miss_base = Path(tempfile.mkdtemp())
+    real_teams_dir, real_projects = RESOLVER.teams_dir, RESOLVER.projects_dir
+    misses = {}
+    try:
+        RESOLVER.teams_dir = miss_base
+        RESOLVER.projects_dir = miss_base / "projects"
+        (miss_base / "projects").mkdir()
+        for name, members in (("session-miss-empty", []),
+                              ("session-miss-dead",
+                               [{"agentId": f"m{n}@session-miss-dead", "name": f"m{n}"}
+                                for n in range(1, 6)])):
+            (miss_base / name).mkdir()
+            (miss_base / name / "config.json").write_text(json.dumps(
+                {"name": name, "leadAgentId": f"team-lead@{name}",
+                 "leadSessionId": "x", "members": members}))
+
+        def missed(**kw):
+            """What --stop says, and its exit code, when nothing is running."""
+            with contextlib.redirect_stderr(io.StringIO()) as told:
+                try:
+                    stop_targets(_Sel(**kw), [])
+                    return "", 0
+                except SystemExit as exc:
+                    return " ".join(told.getvalue().split()), exc.code
+
+        no_team, code_no_team = missed(team="session-miss-absent")
+        empty, code_empty = missed(team="session-miss-empty")
+        dead, code_dead = missed(team="session-miss-dead")
+        agent, code_agent = missed(agent_id="ghost@session-miss-dead")
+        session, code_session = missed(resume="4dd0b13c-0000-4000-8000-000000000000")
+        misses = {
+            "no such team names the file it looked for":
+                "session-miss-absent/config.json" in no_team,
+            "an empty roster says so": "session-miss-empty" in empty
+                and "lists no members" in empty,
+            "dead members are counted and named": "session-miss-dead" in dead
+                and "5 listed" in dead and "m1@session-miss-dead" in dead,
+            "the three team misses read differently":
+                len({no_team, empty, dead}) == 3,
+            "a dead agent names the id and what was looked for":
+                "ghost@session-miss-dead" in agent and "wears" in agent,
+            "a dead session names the uuid and what was looked for":
+                "4dd0b13c-0000-4000-8000-000000000000" in session and "holds" in session,
+            "every miss carries the tool's name": all(
+                said.startswith(f"{TOOL}: ")
+                for said in (no_team, empty, dead, agent, session)),
+            # A miss exited 1 before this said anything useful, and moving the
+            # sentence must not move the code.
+            "a miss still exits 1": {code_no_team, code_empty, code_dead,
+                                     code_agent, code_session} == {1},
+        }
+    finally:
+        RESOLVER.teams_dir, RESOLVER.projects_dir = real_teams_dir, real_projects
+        shutil.rmtree(miss_base, ignore_errors=True)
+    wrong = sorted(k for k, ok in misses.items() if not ok)
+    check("stop-miss-names-target", "a stop that finds nothing names what it looked for",
+          not wrong, ", ".join(wrong))
+
+    # --stop reads the stamps only to find a bare selector; pointed at a flag it
+    # never asks them, and declaring them hard ended the verb in the audit's
+    # RuntimeError rather than in its own report.
+    class _StopArgs:
+        stop = True
+        selftest = complete = cleanup = doctor = census = sides = False
+        promote = demote = mail_ledger = install = poison = unpoison = help = False
+        standing = to_team = False
+        agent_id, resume, team = "a@session-x", None, None
+
+    stop_engine = Resolver(needs=verb_needs(_StopArgs, None))
+    stop_engine.ps_table()      # what a stop really does compute
+    audited_clean = True
+    try:
+        stop_engine.audit_needs()
+    except RuntimeError:
+        audited_clean = False
+    check("stop-declares-what-it-reads", "--stop pointed at a flag ends in its report, not the audit",
+          audited_clean, "the end-of-run audit refused --stop's own declaration")
+
     # --- forwarded flags: the allowlist, the scope rule, and whether a flag
     # could have applied at all. Each was a live defect before it was a check.
     class _Parser:
@@ -12043,8 +12152,10 @@ def verb_needs(args, selector):
     if args.standing:
         return Needs(hard={NEED.PROCS, NEED.STAMPS, NEED.SPAWNS, NEED.MAIL})
     if args.stop:
-        # payloads only when a target has to be found by parentage
-        return Needs(hard={NEED.PROCS, NEED.STAMPS}, maybe={NEED.SPAWNS})
+        # the stamps only when a bare selector has to be found through them,
+        # payloads only when a target has to be found by parentage; pointed at
+        # --agent-id, --team or --resume a stop asks neither
+        return Needs(hard={NEED.PROCS}, maybe={NEED.STAMPS, NEED.SPAWNS})
     # The input decides which resolution rungs can run. A uuid resolves from
     # the filename and never reaches the stamps. A bare name or a team can be
     # found through the stamps and nothing else. An agent id reaches them only
