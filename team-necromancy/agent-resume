@@ -2496,6 +2496,52 @@ class Resolver:
 
     def identity(self, session_uuid=None, agent_id=None, for_team=None, to_team=None,
                  keep_team=False):
+        """Who this agent is and what it was running as, from every source at once.
+
+        resolve_transcript picks the conversation; this decides what identity to
+        wear on it. Each source is added to one merge with the timestamp of
+        whatever it was read from, and pick() answers per field: most recent
+        wins, and on equal timestamps the source added first.
+
+        In that order: the roster entry, at the member's joinedAt, or the team's
+        createdAt, or the config's mtime; the agent's own transcript, field by
+        field at the timestamps _scan_transcript gives them, with agentId
+        derived from the two stamps if nothing else supplied one; the identity a
+        live process is wearing, when a live pid is what found this transcript;
+        the lead transcript's record of spawning this agent; and last,
+        parentSessionId from the engine's lead-session lookup when nothing above
+        named one. Underscore keys stay out, so the harness's display label
+        never reaches the merge as a name.
+
+        Recency is not the whole rule in three places. The spawn record is added
+        at timestamp 0 and added last, so it loses to every dated source and
+        loses ties as well; it is read on every run rather than only where a
+        field is missing, because present is not good, and a roster holding
+        claude-opus-5 beside a spawn record holding claude-opus-5[1m] would
+        otherwise keep the lossier one forever. A worn identity is pinned a
+        millisecond past the transcript's last activity, which outranks anything
+        the transcript itself can say: argv is frozen at exec, stamps are older
+        lines on the same file, and a rebind is what puts the two out of step.
+        It pins agentId, agentName and teamName together so no launch can take
+        the id from one source and the team from another; every other field
+        keeps the ordinary merge. And pick(prefer_specific=True) prefers a
+        bracketed extension of the value that won, longest first, which is the
+        model reads and nothing else: only a bracket counts, so a stale roster
+        cannot revert a model changed mid-session.
+
+        place() runs between locating and merging, and a team change clears the
+        roster entry, which is what stops a stale roster contributing the team
+        it described a life ago. A lead whose team dir is gone has no entry to
+        clear and writes no stamps, so its own spawn payloads say who it is; ctx
+        carries that out as leads_team and lead_agent_id rather than leaving it
+        to the merge, since a structural fact that must win a timestamp race is
+        one waiting to lose it.
+
+        Callers read fields through field() and provenance(), not the merge.
+        Losing candidates are kept, so conflicts() still holds what disagreed,
+        which is what --explain prints. The objections come back judged and not
+        enforced: enforce_ctx weighs them where the run is about to act.
+        """
         merged = self._Merged()
         leads_team = None
         team_entry = None
