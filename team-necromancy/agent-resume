@@ -4805,6 +4805,84 @@ def register_member(record, pane, dry, alive=True):
         ensure_inbox(team, name, dry)
 
 
+def reserve_member(record, dry):
+    """Claim this member's roster entry before its process starts.
+
+    The harness spawns this way too, verified in the 2.1.220 bundle: a bare
+    entry pushed under the roster lock, then a second locked write patching in
+    the pane and backend once the seat exists. Its reason is atomic identity
+    allocation, so two concurrent spawns cannot claim one name, with the
+    reservation rolled back if the spawn dies. The reason here is different and
+    also real: the harness looks a member up by name in the roster as it boots,
+    and a boot that does not find itself listed initialises no idle hook, so
+    the member runs and answers mail but never reports itself idle. Writing the
+    entry only after the spawn leaves that lookup racing the launch.
+
+    Bare means without the two facts that do not exist yet, the pane and the
+    backend. Everything already known travels now.
+
+    Returns True only when this run actually inserted the entry. That is what
+    makes the rollback safe: an entry that was already there is not ours to
+    remove.
+    """
+    agent_id = record["agentId"]
+    cfg = RESOLVER.roster_path(record.get("team"))
+    inserted = []
+
+    def mutate(data):
+        if agent_id == data.get("leadAgentId"):
+            return None  # a lead is not a pane-backed member; the commit phase says so
+        if any(m.get("agentId") == agent_id for m in data.get("members", [])):
+            return None  # already listed: nothing to claim, and nothing to roll back
+        data.setdefault("members", []).append({
+            "agentId": agent_id,
+            "name": record.get("name"),
+            "joinedAt": int(time.time() * 1000),
+            "subscriptions": [],
+            "planModeRequired": bool(record.get("planModeRequired")),
+            **({"cwd": record["cwd"]} if record.get("cwd") else {}),
+            **{k: record[k] for k in SYNCED_FIELDS if record.get(k)},
+            "agentType": record.get("agentType") or DEFAULT_AGENT_TYPE,
+        })
+        inserted.append(agent_id)
+        return data
+
+    if dry:
+        # Stated even though most runs re-resume an already listed member and
+        # write nothing here, because a preview that hides a write is worse
+        # than one that mentions a write that turns out to be unnecessary.
+        step(True, f"would claim {agent_id} in {cfg} before the launch, "
+                   f"if it is not listed yet", "")
+        return False
+    edit_team_config(cfg, mutate, f"claimed {agent_id} in")
+    return bool(inserted)
+
+
+def release_member(record, dry):
+    """Take back a reservation whose launch never happened.
+
+    Only ever called for an entry this run inserted, so it removes rather than
+    marking inactive: the member did not fail, it never existed. A launch that
+    fails after the process is up keeps its entry instead and records what it
+    found, which is the harness's rule too.
+    """
+    agent_id = record["agentId"]
+    cfg = RESOLVER.roster_path(record.get("team"))
+
+    def mutate(data):
+        members = data.get("members", [])
+        kept = [m for m in members if m.get("agentId") != agent_id]
+        if len(kept) == len(members):
+            return None
+        data["members"] = kept
+        return data
+
+    if dry:
+        step(True, f"would release the claim on {agent_id} in {cfg}", "")
+        return
+    edit_team_config(cfg, mutate, f"released the claim on {agent_id} in")
+
+
 def retire_member(ctx, dry):
     """Mark the source-team entry inactive after a rebind, so the abandoned
     roster stops claiming a live member."""
@@ -5125,6 +5203,34 @@ def record_membership(ctx, args, pane, alive=True):
         register_member(RESOLVER.roster_record(ctx, team=team), pane, args.dry_run, alive)
 
 
+def reserve_membership(ctx, args):
+    """The claim half of record_membership, taken before the spawn.
+
+    Routed the same way as the commit, so the two phases cannot disagree about
+    which roster this member belongs in. Returns the record that was claimed,
+    or None when nothing was, which is exactly what a rollback needs to know.
+    """
+    if getattr(args, "bare", False):
+        return None
+    team = ctx.get("to_team")
+    if not team:
+        # Nothing to claim when the caller asked for no roster write, or when
+        # the member is already listed and the commit will patch that entry.
+        if args.no_update_config or ctx.get("team_entry"):
+            return None
+        team = RESOLVER.field(ctx, "teamName")
+        if not team or not RESOLVER.roster_path(team).exists():
+            return None
+    record = RESOLVER.roster_record(ctx, team=team)
+    return record if reserve_member(record, args.dry_run) else None
+
+
+def release_membership(record, args):
+    """Give back a claim whose launch never happened. No record, nothing to give."""
+    if record:
+        release_member(record, args.dry_run)
+
+
 def report_launch(ctx, command, prefix="", role="agent", agent_id=None, extra=()):
     """The facts a launch reports, whichever way it launches.
 
@@ -5439,12 +5545,18 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         launched_at = ctx["transcript"][0].stat().st_mtime
     except OSError:
         launched_at = 0.0
+    # Claimed before the spawn, patched with its pane below. The boot looks
+    # itself up in the roster on the way in, so an entry written only afterwards
+    # is racing the launch it describes.
+    claimed = reserve_membership(ctx, args)
     try:
         pane, action = launch(socket, want_pane, cwd, command, args.dry_run, replace_pane)
     except LaunchFailed as exc:
         # A member's pane is that member's problem. The run continues, so the
         # summary, the flag check and the write report still reach every agent
-        # that did launch.
+        # that did launch. The claim goes back first: nothing started, so the
+        # roster must not be left describing a member that never existed.
+        release_membership(claimed, args)
         warn(f"{prefix}{build_command_agent_id(ctx)} did not launch: {exc}")
         return Outcome("failed", socket, False, None)
     # At the steps' indent, not flush left: this is one of the things the launch
@@ -7475,6 +7587,169 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         shutil.rmtree(reg_base, ignore_errors=True)
     check("roster-add-missing-member", "a member missing from its roster is added to it", "newcomer" in listed,
           f"roster lists {listed}")
+
+    # The roster entry is written in two phases, the shape the harness itself
+    # spawns with: claimed before the process starts, because a boot that cannot
+    # find itself listed initialises no idle hook, then patched with the pane
+    # once the seat exists.
+    two_base = Path(tempfile.mkdtemp())
+    real_teams_dir = RESOLVER.teams_dir
+    try:
+        RESOLVER.teams_dir = two_base
+        pteam = "session-twophase"
+        (two_base / pteam / "inboxes").mkdir(parents=True)
+        RESOLVER.roster_path(pteam).write_text(json.dumps({
+            "name": pteam, "leadAgentId": f"team-lead@{pteam}", "leadSessionId": "x",
+            "members": [{"agentId": f"team-lead@{pteam}", "name": "team-lead"}]}))
+        prec = {"name": "claimant", "team": pteam, "agentId": f"claimant@{pteam}",
+                "color": "blue", "model": "claude-opus-5"}
+
+        def claimant_entry():
+            members = json.loads(RESOLVER.roster_path(pteam).read_text()).get("members", [])
+            return next((m for m in members if m.get("agentId") == prec["agentId"]), None)
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            claimed_new = reserve_member(prec, False)
+            on_claim = claimant_entry()
+            claimed_again = reserve_member(prec, False)
+            register_member(prec, "%7", False, True)
+            on_commit = claimant_entry()
+            release_member(prec, False)
+            after_release = claimant_entry()
+    finally:
+        RESOLVER.teams_dir = real_teams_dir
+        shutil.rmtree(two_base, ignore_errors=True)
+
+    check("claim-carries-identity-not-seat",
+          "a claim writes what is known and leaves the seat to the commit",
+          claimed_new and on_claim is not None and on_claim.get("color") == "blue"
+          and "tmuxPaneId" not in on_claim and "backendType" not in on_claim
+          and (on_commit or {}).get("tmuxPaneId") == "%7"
+          and (on_commit or {}).get("backendType") == "tmux",
+          f"on claim {on_claim}, on commit {on_commit}")
+
+    # Whether the rollback is safe rests entirely on this: a claim that inserted
+    # nothing must say so, or a failed launch would delete an entry that was
+    # already there and belonged to somebody else's run.
+    check("claim-on-a-listed-member-claims-nothing",
+          "claiming an already listed member reports nothing claimed",
+          claimed_new and not claimed_again,
+          f"first claim {claimed_new}, second {claimed_again}")
+
+    check("release-gives-the-claim-back",
+          "releasing a claim removes the entry it inserted",
+          after_release is None, f"after release {after_release}")
+
+    # An entry written after the launch races the boot it describes, and one
+    # left behind after a failed launch describes a member that never existed.
+    one_src = ast.get_source_segment(source, funcs["run_one"]) or ""
+    claim_at = one_src.find("reserve_membership(")
+    spawn_at = one_src.find("pane, action = launch(")
+    failed_at = one_src.find("except LaunchFailed")
+    handler = one_src[failed_at:failed_at + 500] if failed_at >= 0 else ""
+    check("claim-precedes-spawn-and-is-given-back",
+          "the claim is taken before the spawn and released when the spawn fails",
+          0 <= claim_at < spawn_at and "release_membership(" in handler,
+          f"claim at {claim_at}, spawn at {spawn_at}, "
+          f"released in handler: {'release_membership(' in handler}")
+
+    # And the same thing driven rather than read: run_one against a writable
+    # copy of the corpus, once with a spawn that fails and once with one that
+    # works. The failing arm must leave the roster as it found it; the working
+    # arm proves the fixture can tell the difference, without which the failing
+    # arm would pass on a run that never claimed anything at all.
+    class _Run:
+        def __init__(self, **kw):
+            self.__dict__.update({"resume": None, "agent_id": None, "to_team": None,
+                                  "for_team": None, "no_tint": True})
+            self.__dict__.update(kw)
+
+        def __getattr__(self, _name):
+            return False  # every other flag is off; explicit ones above win
+
+    def drive_run_one(spawn):
+        """(status, entry as the spawn saw it, entry afterwards) for one spawn.
+
+        The middle one is the point. Read at the moment the spawn is called, it
+        is the only evidence that the claim landed before the process started
+        rather than after it. Without it a failing arm would pass whether the
+        claim happened or not, since either way the roster ends up empty.
+        """
+        base = Path(tempfile.mkdtemp())
+        shutil.copytree(Path(__file__).resolve().parent / "test" / "corpus", base / "corpus")
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
+        eng.projects_dir, eng.teams_dir = base / "corpus" / "projects", base / "corpus" / "teams"
+        who, team = "willow", "session-corpus-alpha"
+        cfg = eng.roster_path(team)
+        roster = json.loads(cfg.read_text())
+        # Unlisted, so the claim inserts and there is something to give back.
+        roster["members"] = [m for m in roster["members"] if m.get("name") != who]
+        cfg.write_text(json.dumps(roster))
+
+        saved = {name: globals()[name] for name in
+                 ("RESOLVER", "resolve_socket", "seat_note", "socket_state", "launch",
+                  "inherit_credentials", "report_launch", "forge_team", "auto_redirect",
+                  "already_running", "enforce_ctx", "current_tmux", "tint_pane",
+                  "launch_survived", "pane_occupants")}
+        globals().update(
+            RESOLVER=eng,
+            resolve_socket=lambda *a, **k: ("sock-test", "test"),
+            seat_note=lambda pane, sock: (None, "(none)"),
+            socket_state=lambda *a, **k: "live",
+            launch=spawn,
+            inherit_credentials=lambda *a, **k: [],
+            report_launch=lambda *a, **k: None,
+            forge_team=lambda *a, **k: None,
+            auto_redirect=lambda *a, **k: None,
+            already_running=lambda *a, **k: None,
+            enforce_ctx=lambda *a, **k: None,
+            current_tmux=lambda *a, **k: (None, None),
+            tint_pane=lambda *a, **k: None,
+            launch_survived=lambda *a, **k: (True, "wrote to its transcript"),
+            pane_occupants=lambda *a, **k: (False, []))
+        eng.transcript_holders = lambda *a, **k: ([], [])
+        eng.wearers = lambda *a, **k: []
+        eng.agent_cwd = lambda *a, **k: None
+
+        def listed():
+            members = json.loads(cfg.read_text()).get("members", [])
+            return next((m for m in members if m.get("name") == who), None)
+
+        seen = {}
+
+        def watched_spawn(*a, **k):
+            seen["at_spawn"] = listed()
+            return spawn(*a, **k)
+
+        globals()["launch"] = watched_spawn
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                out = run_one(_Run(agent_id=f"{who}@{team}"), [], [])
+            return out.status, seen.get("at_spawn"), listed()
+        finally:
+            globals().update(saved)
+            shutil.rmtree(base, ignore_errors=True)
+
+    def _boom(*_a, **_k):
+        raise LaunchFailed("the pane did not open")
+
+    failed_status, failed_at_spawn, failed_entry = drive_run_one(_boom)
+    ok_status, ok_at_spawn, ok_entry = drive_run_one(lambda *a, **k: ("%5", "split"))
+
+    check("claim-is-listed-before-the-process-starts",
+          "the member is in the roster, without a seat, by the time the spawn runs",
+          failed_at_spawn is not None and "tmuxPaneId" not in failed_at_spawn
+          and ok_at_spawn is not None and "tmuxPaneId" not in ok_at_spawn,
+          f"failing arm saw {failed_at_spawn}, working arm saw {ok_at_spawn}")
+
+    check("failed-spawn-leaves-no-claim-behind",
+          "a spawn that never starts leaves the roster as it found it",
+          failed_status == "failed" and failed_entry is None
+          and ok_status == "launched" and ok_entry is not None
+          and ok_entry.get("tmuxPaneId") == "%5",
+          f"failed arm: {failed_status}, entry {failed_entry}; "
+          f"working arm: {ok_status}, entry {ok_entry}")
 
     # Reading the spawn log unfilled returns an empty list, which is also what a
     # transcript that spawned nobody returns, so a missed fill is a false negative
