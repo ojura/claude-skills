@@ -3158,6 +3158,33 @@ class Resolver:
                     warn(f"pid {pid} looked like a pane on {sock}, but that server is gone")
         return None, None
 
+    def seat_of(self, agent_id, table=None):
+        """(where this member's own process is, socket) for one agent id.
+
+        Three answers, because three different things follow from them:
+        "seated" with the socket whose pane it sits in, "unseated" for a
+        process running in no pane at all, and "not running" for an id nothing
+        wears. team_population answers the other question about the same
+        member, roster against transcript, and neither answer implies the
+        other: a listed member can be unseated, and an unrecorded one can be
+        sitting in a pane.
+
+        Composed from the two answers that already exist rather than testing
+        anything itself, so there is still one seating classifier and one
+        liveness test. The socket is asked first because a socket is the proof
+        of a seat, and wearers is only needed to separate the two answers that
+        have no socket; that order is also what keeps the doctor's sweep at the
+        one lookup per live member it already paid.
+
+        Not seat_note, which says what became of the pane id a roster wrote
+        down. That is a record. This is where the process is.
+        """
+        table = self.ps_table() if table is None else table
+        sock, _why = self.socket_hosting([agent_id], table)
+        if sock:
+            return "seated", sock
+        return ("unseated" if self.wearers(agent_id, table) else "not running"), None
+
     def _spawn_by_agent(self):
         """{"name@team": payload} for every teammate any lead ever spawned.
 
@@ -6436,6 +6463,13 @@ def run_standing(args):
     print(f"agent    {s['agent_id']}")
     parent = RESOLVER.spawn_parent_of(agent_id)
     print(fill(f"parent   {parent[0] or '(none)'}  ({parent[1]})"))
+    # Where its own process is, which the roster's pane id does not answer: a
+    # member can be live and in no pane at all. Its own question, asked by the
+    # verb that prints it, so a caller reading the verdict never buys a seat.
+    seat, seat_socket = RESOLVER.seat_of(agent_id)
+    print(fill("seat     " + {"seated": f"in a pane on {seat_socket}",
+                              "unseated": "none; it is live and in no tmux pane",
+                              "not running": "none; it is not running"}[seat]))
     if pid:
         said_how = re.sub(rf"^pid {pid}, ", "", how) if how else None
         print(fill(f"lead     pid {pid}{'' if alive else ', not running'}"
@@ -6563,13 +6597,34 @@ def diagnose_team(team, table=None, deep=False):
                  + (f", {len(converted)} converted" if converted else ""))
     # A lead never sits in a pane, so it is not part of the seat count. Counting
     # it would call every team with a live masqueraded lead split.
-    seats = {RESOLVER.socket_hosting([f"{n}@{team}"], table)[0]
-             for n in live if n != "team-lead"}
-    seats.discard(None)
+    # One seat answer per live member, read twice: the split wants the sockets,
+    # the warning below wants the names that have none. Asking the seat question
+    # again for the second of those would double what this sweep pays per member.
+    seating = {n: RESOLVER.seat_of(f"{n}@{team}", table)
+               for n in live if n != "team-lead"}
+    seats = {sock for _state, sock in seating.values() if sock}
     split = len(seats) > 1
     if split:
         lines.append(f"warning  its crew is seated on {len(seats)} servers: "
                      f"{', '.join(sorted(seats))}")
+    # Said, never judged. Running a member outside tmux is a deliberate way to
+    # run one (the bg substrate this skill's own docs describe), so demoting the
+    # verdict for it would call a working arrangement broken. What is owed is
+    # what changes operationally, and every clause below is what this file's own
+    # code does with such a member: select_jobs keeps it, already_running turns
+    # its launch into a noop, and no pane lookup can return a process that is a
+    # descendant of no pane.
+    unseated = sorted(n for n, (state, _s) in seating.items() if state == "unseated")
+    if unseated:
+        one = len(unseated) == 1
+        it = "it" if one else "them"
+        stop = f"{unseated[0]}@{team}" if one else "each of them"
+        lines.append(f"warning  {', '.join(unseated)} {'is' if one else 'are'} live "
+                     f"and in no tmux pane; a run of this team leaves {it} there, "
+                     f"because a live member makes that run a noop rather than a "
+                     f"relaunch, and nothing that looks for {it} in a pane finds "
+                     f"{it}. To seat {it}: {TOOL} --stop {stop}, then run the team "
+                     f"again, at the cost of {'its turn' if one else 'their turns'}")
     # One note per state, however many members share it: eight members in one
     # state are one fact about eight names, not eight sentences.
     if unrecorded:
@@ -11501,6 +11556,79 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("degraded-arms-named-and-remedied",
           "every degraded state says which one it is and how to leave it",
           not arms, "; ".join(f"{arm}: {why}" for arm, why in sorted(arms.items())))
+
+    # A live member in no tmux pane is information, not a fault: running one
+    # outside tmux is a deliberate way to run it, so a demotion would call a
+    # working arrangement broken. Both halves are asserted, and the second is
+    # what stops this passing on a report that simply demoted everything: the
+    # same crew is driven seated and unseated, differing in the seating alone,
+    # and the two verdicts must be the same one. Seating is stubbed here for the
+    # same reason the arms above stub it - a suite cannot stand up a tmux server
+    # - and both arms name one socket, so nothing here is a split either.
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = eng = corpus_engine()
+    eng.session_registry = lambda: []
+    eng.team_minted_by = lambda pid: (crew, True)
+    crew_rows = [lead_row, _wearing(771002, "petrel"), _wearing(771004, "sparrow")]
+    eng.ps_table = lambda refresh=False: crew_rows
+    blocks = {}
+    try:
+        for arm, hosting in (
+                ("seated", lambda ids, table: ("sock-one", "the crew's seat")),
+                ("unseated", lambda ids, table: (("sock-one", "the crew's seat")
+                                                 if any("petrel" in i for i in ids)
+                                                 else (None, None)))):
+            eng.socket_hosting = hosting
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    blocks[arm] = diagnose_team(crew, crew_rows)
+            except BaseException as exc:  # a diagnosis that crashes is a failed one
+                blocks[arm] = (f"diagnosis raised {type(exc).__name__}", [], [])
+    finally:
+        globals()["RESOLVER"] = real_resolver
+    said = [ln for ln in blocks["unseated"][1]
+            if ln.startswith("warning  ") and "in no tmux pane" in ln]
+    seat_facts = {
+        "the unseated member is named": bool(said) and "sparrow" in said[0],
+        "the seated one is not blamed with it": bool(said) and "petrel" not in said[0],
+        "a fully seated crew says nothing new": not [
+            ln for ln in blocks["seated"][1] if "in no tmux pane" in ln],
+        # The fixture has to be one where a demotion would have shown, or the
+        # equality below would hold for a report that judges nothing at all.
+        "the seated crew is a healthy team": blocks["seated"][0] == "CONNECTED",
+        "seating alone does not move the verdict":
+            blocks["seated"][0] == blocks["unseated"][0],
+    }
+    wrong = sorted(k for k, ok in seat_facts.items() if not ok)
+    check("unseated-member-said-not-judged",
+          "a live member in no pane is said in the block and changes no verdict",
+          not wrong, ", ".join(wrong) or f"{blocks['seated'][0]} either way")
+
+    # The seat row on one member's dossier, driven through the reporter that
+    # prints it. Nothing is stubbed in this arm: the wearer's parent is pid 0,
+    # which is no process at all, so the real seat question finds no tmux server
+    # over it on any machine, rather than depending on what /proc/1 happens to
+    # be running.
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = eng = corpus_engine()
+    eng.session_registry = lambda: []
+    eng.ps_table = lambda refresh=False: [
+        (771005, 0, f"{FAKE_AGENT_BIN} --resume "
+                    f"22222222-2222-4222-8222-222222222222 --agent-id petrel@{crew}")]
+    dossier = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(io.StringIO()), \
+                contextlib.redirect_stdout(dossier):
+            run_standing(_Args(agent_id=f"petrel@{crew}"))
+    except BaseException as exc:  # a dossier that crashes is a failed one
+        dossier.write(f"seat     dossier raised {type(exc).__name__}\n")
+    finally:
+        globals()["RESOLVER"] = real_resolver
+    seat_row = next((ln for ln in dossier.getvalue().splitlines()
+                     if ln.startswith("seat ")), "")
+    check("standing-says-the-seat",
+          "the dossier says where the member's own process sits",
+          "live and in no tmux pane" in seat_row, f"said {seat_row!r}")
 
     # Mail in a mailbox does not demote a team whose lead is live and reading
     # it: that mail arrives at the lead's next turn boundary and needs nobody.

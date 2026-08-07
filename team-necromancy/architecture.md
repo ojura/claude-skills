@@ -27,6 +27,13 @@ The bg substrate is not in it; we assembled it by hand from shipped parts
 care who reads it). It arguably beats the tmux backend on every axis except
 transcript flushing, and would make a fine fifth mode.
 
+Because that is a deliberate way to run a member rather than a fault,
+`agent-resume` states a live member that is in no tmux pane and never demotes a
+verdict for it: the doctor adds a warning line naming the member and what
+changes operationally, and `--standing` prints its seat. A verdict answers only
+whether a live lead reads the team, so demoting one for an unseated member would
+report a working arrangement as broken.
+
 A subagent can never get a pane: the Agent tool without `name` runs a query
 loop inside the leader, and its sidechain transcript is not a session, so no
 CLI could adopt it. The SendMessage resurrection path converts a dead tmux
