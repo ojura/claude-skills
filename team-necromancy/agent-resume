@@ -10629,7 +10629,8 @@ def run_selftest(live=False, failed_only=False, list_only=False):
 
     check("self-migrate-refused", "a self-migrate is refused",
           bool(RESOLVER.transcript_holders("selftest-uuid",
-               [(os.getpid(), os.getppid(), "/usr/bin/claude --resume selftest-uuid --agent-id a@b")])[1]))
+               [(os.getpid(), os.getppid(),
+                 f"{FAKE_AGENT_BIN} --resume selftest-uuid --agent-id a@b")])[1]))
 
     check("default-path-cannot-kill", "default path cannot kill",
           'if ctx.get("to_team") and not ctx.get("auto_redirect"):' in run_one_src)
