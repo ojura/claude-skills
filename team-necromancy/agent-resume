@@ -3558,15 +3558,21 @@ class Resolver:
             ref_raw = stored.get("ref")
             if ref_raw and not undo:
                 try:
-                    anchor = json.loads(ref_raw).get("parentLastUuid")
+                    ref = json.loads(ref_raw)
                 except ValueError:
-                    anchor = None
-                if anchor and not self._carries_uuid(into, anchor):
+                    ref = {}
+                anchor, from_session = ref.get("parentLastUuid"), ref.get("parentSessionId")
+                # Against the session the ref names, which a move does not
+                # change, and never against the destination: where the file
+                # sits is not an input to the loader. The move is safe while
+                # that session still holds the entry, and the project
+                # directory cannot change here, since a demote builds its
+                # destination under the source's own.
+                if anchor and not self._carries_uuid(from_session, anchor):
                     return {"objections": [
                         f"this fork inherits its context by reference from "
-                        f"{json.loads(ref_raw).get('parentSessionId')}, and {into} "
-                        f"does not carry {anchor}; moved there it would wake with "
-                        f"none of it"], "proved": False}
+                        f"{from_session}, which no longer carries {anchor}; moving "
+                        f"it would leave that prefix unresolvable"], "proved": False}
             if not into:
                 return {"objections": ["demote needs the parent session (--into)"],
                         "proved": False}
@@ -9772,11 +9778,30 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         pplan = eng.conversion_plan(pref, "promote", identity=("p2", "T"))
         pdest = Path(td) / "proj" / "p2-root.jsonl"
         pdest.write_text("\n".join(pplan["lines"]) + "\n")
-        if not eng.conversion_plan(pdest, "demote", into="HASIT")["proved"]:
-            faults.append("a move to a parent carrying the referenced entry refused")
-        lost = eng.conversion_plan(pdest, "demote", into="LACKS")
-        if lost["proved"] or "does not carry" not in "".join(lost["objections"]):
-            faults.append("a move to a parent without the referenced entry was allowed")
+        # The case the feature exists for: a genuinely new parent, which does
+        # not hold the referenced entry and does not need to. The ref still
+        # names PARENT and PARENT still holds it, so the prefix resolves and
+        # the move proves.
+        if not eng.conversion_plan(pdest, "demote", into="LACKS")["proved"]:
+            faults.append("a move to a genuinely new parent was refused")
+        # And the case that is really broken: the session the ref names has
+        # lost the entry, so the prefix resolves nowhere wherever it is moved.
+        orphan = sub / "agent-p3.jsonl"
+        orphan.write_text(compact({"type": "fork-context-ref", "agentId": "p3",
+                                   "parentSessionId": "LACKS",
+                                   "parentLastUuid": "anchor-1",
+                                   "contextLength": 3}) + "\n" +
+                          compact({"parentUuid": None, "isSidechain": True,
+                                   "sessionId": "PARENT", "type": "user",
+                                   "uuid": "p3-root",
+                                   "message": {"role": "user", "content": "go"}}) + "\n")
+        (sub / "agent-p3.meta.json").write_text('{"agentType":"fork","isFork":true}')
+        oplan = eng.conversion_plan(orphan, "promote", identity=("p3", "T"))
+        odest = Path(td) / "proj" / "p3-root.jsonl"
+        odest.write_text("\n".join(oplan["lines"]) + "\n")
+        lost = eng.conversion_plan(odest, "demote", into="HASIT")
+        if lost["proved"] or "no longer carries" not in "".join(lost["objections"]):
+            faults.append("a fork whose referenced prefix is gone was moved anyway")
 
         # Last means last. With a turn written past it the record is history,
         # so the demote leaves it where it sits instead of eating it.
