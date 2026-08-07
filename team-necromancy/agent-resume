@@ -4,10 +4,11 @@
 --to-team TEAM|live moves an agent onto another team: it relaunches it with that
 team's identity, replaces whichever process still holds the transcript,
 registers it in the destination roster and retires the source entry. On a lead
-it moves the lead alone, which is what the masquerade spelling (team-lead@TEAM
---resume <uuid>) does too: the crew stays on the old team and is named in the
+it moves the lead alone: the crew stays on the old team and is named in the
 report, and the team the conversation comes back as is retired, or under --force
-restamped, so the move is still there after the next restart.
+restamped, so the move is still there after the next restart. The team inside an
+agent id is an address and never a destination: the masquerade spelling
+(team-lead@TEAM --resume <uuid>) launches under that name and moves nothing.
 
 --install sets up the ~/.local/bin symlink, zsh tab completion, and the
 Claude Code startup hook that runs --cleanup.
@@ -4589,7 +4590,13 @@ def enforce_identity(res, objections, allow_team_change, force):
                     message += (f"; the payloads naming {wanted} were written after those "
                                 f"stamps, so --force ratifies the newer evidence rather than "
                                 f"overriding the older")
-                die(f"{message}; --force to override")
+                # The team in an agent id says which agent this is, not where to
+                # send it, so a reader who wanted the move has to be told the
+                # flag that performs one. --force only lets this launch past the
+                # contradiction; the stamps still bring it back as they were.
+                die(f"{message}. --to-team {wanted} moves it there instead, retiring "
+                    f"{stamped} so the move is still there after the next restart; "
+                    f"--force to override")
             else:
                 warn(f"--force: {res.path.name} is stamped team={stamped}, resuming as {wanted}")
 
@@ -5868,13 +5875,12 @@ def lead_move(ctx, args, dest):
     Either way the answer is a team this conversation was running as and dest is
     not, which is what makes the crew it leaves behind nameable.
 
-    Taking over is the narrower half, and it is where the guards change. Asked
-    for by flag, or stamps that would otherwise win: those are the two launches
-    that are not the launch that would have happened anyway, so those are the
-    two that end whoever holds the conversation and retire what the stamps name.
-    An unstamped lead pointed at another team is the ordinary masquerade, whose
-    guards stay exactly as they were; the flags already win by themselves and
-    the report is all this adds.
+    Taking over is the narrower half, and only --to-team asks for it. The team
+    inside an agent id is an address: it says which agent this is, not where to
+    put it, so naming another team there launches under that name and moves
+    nothing. Only the flag ends whoever holds the conversation and retires what
+    the stamps name; without it this is the launch that would have happened
+    anyway, with the guards it would have had.
     """
     path = getattr(ctx["resolution"], "path", None)
     if not path or not dest:
@@ -5883,7 +5889,7 @@ def lead_move(ctx, args, dest):
     source = stamped if state else next(iter(RESOLVER.teams_led_by(path.stem)), None)
     if not source or source == dest:
         return None, False
-    return source, bool(args.to_team) or state == "restored"
+    return source, bool(args.to_team)
 
 
 def lead_kill_gate(ctx, args, table, prefix=""):
@@ -5949,12 +5955,11 @@ def crew_left_behind(source, dest, prefix=""):
 def lead_rebind(ctx, args, source, dest, prefix=""):
     """Move this lead onto dest: the whole act, and the only route to it.
 
-    Both spellings arrive here. --to-team names the destination as a flag and
-    the masquerade names it inside the agent id; by this point the run cannot
-    tell them apart, and neither can the conversation, which comes back as
-    whatever its window-start says whichever way it was asked for.
+    Only --to-team arrives here, because only --to-team asks for a move. A team
+    named inside the agent id addresses this lead and never sends it, so that
+    spelling launches without ever reaching this.
 
-    So the durable half is rebind_reap's, unchanged and shared with the member
+    The durable half is rebind_reap's, unchanged and shared with the member
     path: retire the team the stamps name, or on --force against a living team
     rewrite those two fields instead. A conversation whose window-start carries
     no stamps needs neither - the flags already win - and only the crew report
@@ -6004,9 +6009,9 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     # the next lead's exit anyway. No socket, no pane, no roster patch.
     if agent_id and agent_id == ctx.get("lead_agent_id"):
         # Where a lead is being moved, the destination is resolved before
-        # anything is built from it: --to-team spells it as a flag and the
-        # masquerade spells it inside the agent id, and the command below is
-        # the same command either way once this has run.
+        # anything is built from it, so the command below is the one that runs.
+        # A team named inside the agent id is not a destination and needs none
+        # of this: it is already part of the identity being resumed.
         if args.to_team:
             ctx["to_team"] = resolve_to_team(args, ctx)
             # A member rebind points at the destination's recorded lead; a lead
@@ -6052,8 +6057,10 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             return noop_outcome(ctx, args, prefix, is_lead=True, why=running[0])
         # Every guard that could still turn this into a noop has passed, so the
         # team the stamps name may now be retired (or restamped) for a launch
-        # that is really going to happen.
-        if source:
+        # that is really going to happen. Only a move gets here: a launch that
+        # spells its team inside the agent id is addressed, not sent, so it
+        # retires nothing and leaves the crew report to the runs that do move.
+        if taking_over:
             lead_rebind(ctx, args, source, dest, prefix)
         # This run is about to become the lead, so the identity gate applies from
         # here down.
@@ -8791,6 +8798,51 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             gate.append("with nothing to ask at, it killed anyway")
         check("lead-rebind-kill-gate", "a lead move ends the holder only after it is agreed to",
               not gate, ", ".join(gate[:3]))
+
+        # The other spelling. A team named inside an agent id says which agent
+        # this is, not where to put it, so the run refuses the contradiction,
+        # names the flag that would move it, and touches neither the team the
+        # stamps name nor whoever is holding the conversation.
+        #
+        # The destination roster is dated after this conversation's last line,
+        # which is what a team created later looks like. Every roster in the
+        # shared corpus is dated 1, and at that date the stamps win the merge
+        # and the launch resolves back onto the team it came from, which is a
+        # different case: there is nothing for the two to disagree about.
+        def dated_crew(root):
+            cfg = root / "teams" / "session-corpus-crew" / "config.json"
+            data = json.loads(cfg.read_text())
+            data["createdAt"] = 1780000000000
+            for member in data["members"]:
+                member["joinedAt"] = 1780000000000
+            cfg.write_text(json.dumps(data))
+
+        addressed, _e, _s, addressed_said = resume_run(
+            "team-lead@session-corpus-crew", resume=LEAD_STAMPED, prepare=dated_crew)
+        told = " ".join(addressed_said.split())
+        # The same launch with something holding the conversation, because the
+        # kill gate is the first thing a move reaches and this is the only run
+        # where a kill would have anything to end. The pid it names is read off
+        # the table after the point a move would have killed it, so the guard
+        # saying it is live is this fixture's witness that the row survived.
+        _held, _e, _s, held_said = resume_run(
+            "team-lead@session-corpus-crew", resume=LEAD_STAMPED, table=holder,
+            dry_run=True, yes=True, prepare=dated_crew)
+        held = " ".join(held_said.split())
+        addresses = []
+        if addressed != "refused":
+            addresses.append(f"the address spelling was not refused ({addressed})")
+        if "--to-team session-corpus-crew" not in told:
+            addresses.append("the refusal does not name --to-team as the move")
+        if (lead_receipts / "session-corpus-alpha.json").exists():
+            addresses.append("the team the stamps name was retired anyway")
+        if f"kill pid {GHOST}" in held:
+            addresses.append("the holder was ended for a launch that moves nothing")
+        if f"is live as pid {GHOST}" not in held:
+            addresses.append(f"the guard no longer reads pid {GHOST} off the table")
+        check("lead-address-spelling-moves-nothing",
+              "a team named inside an agent id addresses a lead without moving it",
+              not addresses, ", ".join(addresses[:3]))
     finally:
         globals()["RECEIPTS_DIR"] = real_receipts
         sys.stdin = real_stdin
@@ -10935,7 +10987,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
           ", ".join(split))
 
     # --- a lead moves teams one way, and it is the member path's way
-    # Two spellings reach one branch, so what is left to show is that the branch
+    # One flag reaches one branch, so what is left to show is that the branch
     # retires or restamps through rebind_reap and through nothing else, and that
     # neither half is performed anywhere but there.
     one_way = []
