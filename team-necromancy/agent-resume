@@ -5435,15 +5435,41 @@ def build_command(ctx, args, passthrough):
     return cmd + passthrough
 
 
+# How wide the value column may grow before a long value is allowed to push
+# the tag and time out of line on its own row. A cwd or a system prompt is
+# longer than every other value put together, and padding to it would leave
+# the table mostly blanks.
+EXPLAIN_VALUE = 46
+
+
 def explain(ctx):
+    """Every assembled field, where it came from, and what disagreed.
+
+    Sources are tagged rather than repeated. Two sources answered twelve of
+    thirteen fields on the run this was written for, so the column that exists
+    for comparing sources was the same two paths written down the page; the
+    legend carries each source's full text once and the rows carry a letter.
+    """
     merged = ctx["merged"]
     print("resolved fields (most recent source wins):")
-    width = max((len(f) for f in merged.cands), default=8)
+    tags, rows = {}, []
     for field in sorted(merged.cands):
         value, ts, source = RESOLVER.provenance(ctx, field)
+        source = str(source)
+        if source not in tags:
+            # Letters while there are letters. More than 26 distinct sources
+            # has never happened; a numbered tag is what it would get.
+            tags[source] = chr(ord("A") + len(tags)) if len(tags) < 26 else f"S{len(tags)}"
         conflict = merged.conflicts(field)
         mark = "  <- conflict: " + ", ".join(sorted(str(c) for c in conflict)) if len(conflict) > 1 else ""
-        print(f"  {field:<{width}}  {value}   [{source} @ {ms_str(ts)}]{mark}")
+        rows.append((field, "-" if value is None else str(value), tags[source], ts, mark))
+    label = max((len(tag) for tag in tags.values()), default=1)
+    for at, (source, tag) in enumerate(tags.items()):
+        print(f"  {'sources' if not at else '':<7}  {tag:<{label}}  {source}")
+    width = max((len(field) for field, *_ in rows), default=8)
+    value_width = min(max((len(value) for _f, value, *_ in rows), default=8), EXPLAIN_VALUE)
+    for field, value, tag, ts, mark in rows:
+        print(f"  {field:<{width}}  {value:<{value_width}}  {tag:<{label}}  {ms_str(ts)}{mark}")
     for path, _, last_ts in ctx["other_transcripts"]:
         print(f"  (older transcript ignored: {path.name} @ {ms_str(last_ts)})")
 
@@ -8980,6 +9006,73 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     }
     wrong = sorted(k for k, ok in once.items() if not ok)
     check("refusal-names-a-pid-once", "a refusal names each process once, with all it objects",
+          not wrong, ", ".join(wrong))
+
+    # --explain's source column exists so a reader can compare where fields
+    # came from. Two sources answer most of them, so printing the path on
+    # every row made the column two constants written down the page and
+    # pushed the timestamps out of line. Each source is named once, above.
+    class _Cands:
+        """Exactly what explain() consumes from a merge, and nothing else.
+
+        A stand-in rather than the engine's own _Merged, because reaching into
+        the merge is what merge-reached-via-engine bars, and this check is
+        about how the table is printed.
+        """
+
+        def __init__(self):
+            self.cands = defaultdict(list)
+
+        def add(self, field, value, ts, source):
+            self.cands[field].append((value, ts, source))
+
+        def pick(self, field, prefer_specific=False):
+            return max(self.cands[field], key=lambda cand: cand[1])
+
+        def conflicts(self, field):
+            return {cand[0] for cand in self.cands.get(field, [])}
+
+    merged_fake = _Cands()
+    roster_source = "team:/home/somebody/.claude/teams/session-explain/config.json"
+    jsonl_source = "jsonl:11111111-1111-4111-8111-111111111111.jsonl"
+    for field, value in (("agentId", "who@session-explain"),
+                         ("agentType", "general-purpose"),
+                         ("tmuxPaneId", "%0")):
+        merged_fake.add(field, value, 1_700_000_000_000, roster_source)
+    for field, value in (("agentName", "who"), ("model", "claude-fable-5"),
+                         ("cwd", "/tmp")):
+        merged_fake.add(field, value, 1_700_000_100_000, jsonl_source)
+    merged_fake.add("model", "fable", 1_600_000_000_000, roster_source)  # a conflict
+    with contextlib.redirect_stdout(io.StringIO()) as explained:
+        explain({"merged": merged_fake,
+                 "other_transcripts": [(Path("/nowhere/older.jsonl"), None, 1_500_000_000_000)]})
+    told = explained.getvalue()
+    field_rows = [l for l in told.splitlines()
+                  if l.startswith("  ") and l.split() and l.split()[0] in merged_fake.cands]
+
+    def tag_column(line):
+        """Where this row's source tag sits, or None when it carries no tag."""
+        parts = re.split(r" {2,}", line.strip())
+        return line.rfind(f"  {parts[2]}  ") if len(parts) > 3 else None
+
+    tagged = {
+        "every field has a row": len(field_rows) == len(merged_fake.cands),
+        "a source is spelled out once": told.count(roster_source) == 1
+            and told.count(jsonl_source) == 1,
+        "no row repeats a source": not any(
+            roster_source in l or jsonl_source in l for l in field_rows),
+        "the legend says which tag is which": any(
+            l.strip().startswith("sources") and roster_source in l
+            for l in told.splitlines()),
+        "the tags line up": len({tag_column(l) for l in field_rows}) == 1
+            and None not in {tag_column(l) for l in field_rows},
+        "two sources get two tags": len({re.split(r" {2,}", l.strip())[2]
+                                         for l in field_rows}) == 2,
+        "the conflict is still marked": "<- conflict: claude-fable-5, fable" in told,
+        "the ignored transcript is still named": "older transcript ignored" in told,
+    }
+    wrong = sorted(k for k, ok in tagged.items() if not ok)
+    check("explain-tags-its-sources", "--explain names each source once and tags its rows",
           not wrong, ", ".join(wrong))
 
     # The inbox files store ISO instants; every report and refusal prints the
