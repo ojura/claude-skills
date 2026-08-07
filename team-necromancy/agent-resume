@@ -72,13 +72,20 @@ TOOL = Path(__file__).resolve().name
 # a reap has no transcript to write into and membership must be enumerable
 # without opening every transcript on the machine.
 RECEIPT_RECORD = f"{TOOL}-receipt"
+# A restamp leaves its own trace in the file it rewrote, under its own type so
+# a demote reading the last line cannot mistake one kind of record for the
+# other. It is the cheapest thing in this file: the write was happening anyway,
+# and a conversation that had two of its identity fields rewritten should say
+# so where the rewriting happened.
+RESTAMP_RECORD = f"{TOOL}-restamp"
 # Rendered from a fixed, sorted key list so that both directions of the
 # conversion emit the same bytes for the same conversion. Anything a single
 # direction fills (the stripped trailers, the sidechain fields a demote
 # inserted) is left out: it would make the line depend on which way it was
 # written, and the inverse proof compares bytes.
 RECEIPT_KEYS = ("cut", "cut_lines", "cut_parent", "dest_stem", "graft",
-                "grammar", "meta", "parent", "ref", "root", "task_id")
+                "grammar", "meta", "name", "parent", "ref", "root", "task_id",
+                "team")
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 TEAMS_DIR = CLAUDE_DIR / "teams"
@@ -720,6 +727,7 @@ class Resolver:
         self.exercised = set()
         self._procs = None       # pid -> row, from ps
         self._stamps = None      # transcript stem -> (agentName, teamName)
+        self._carried = None     # transcript path -> the receipt it carries
         self._spawns = {}        # transcript stem -> {name: last payload of that name}
         self._spawn_log = {}     # transcript stem -> [(stamp, payload)] in file order
         self._by_agent = None    # "name@team" -> payload, across every transcript
@@ -1438,7 +1446,9 @@ class Resolver:
             # conversion receipt names its transcript structurally.
             receipt = self.converted_members(team).get(name)
             if receipt:
-                found = self.transcript_path(Path(receipt["dest"]).stem)
+                # The record sits in the transcript it describes, so the file
+                # is the answer rather than a path field that could go stale.
+                found = self.transcript_path(receipt["dest_stem"])
                 if found:
                     fields, last = ({}, 0) if quick else self._scan_transcript(found)
                     return Resolution(found, fields, last, via="conversion receipt",
@@ -1526,26 +1536,14 @@ class Resolver:
     def converted_members(self, team):
         """{name: receipt} for promoted members whose membership is a receipt.
 
-        A promote records the spoken identity; until the first launch registers
-        the member, the receipt is its membership. Only receipts whose promoted
-        transcript still exists answer: a receipt whose dest vanished describes
-        nothing resumable.
+        A promote records the spoken identity in the line the transcript
+        carries, so the transcript's own existence is the evidence: a demote
+        takes the file away, and there is nothing left to describe. That is
+        read off the same pass as the stamps, which a promoted transcript has
+        none of, and is why its membership has to be asked for separately.
         """
-        out = {}
-        try:
-            paths = sorted(RECEIPTS_DIR.glob("*.json"))
-        except OSError:
-            return out
-        for path in paths:
-            try:
-                receipt = json.loads(path.read_text())
-            except (OSError, ValueError):
-                continue
-            if (receipt.get("state") == "materialized"
-                    and receipt.get("team") == team and receipt.get("name")
-                    and receipt.get("dest") and Path(receipt["dest"]).exists()):
-                out[receipt["name"]] = receipt
-        return out
+        return {r["name"]: r for path, r in sorted(self.carried_receipts().items())
+                if r.get("team") == team and r.get("name") and path.exists()}
 
     def mail_ledger(self, team, to=None):
         """[{sender, to, summary, sent, state, detail}] for a team's authored mail.
@@ -1876,6 +1874,15 @@ class Resolver:
         trailing = raws and raws[-1] == ""
         if trailing:
             raws.pop()
+        # Same rule as the conversion record: while it is still the last line
+        # it belongs to this tool, so a second restamp replaces it rather than
+        # stacking. Once anything is written past it, it is history and stays.
+        if raws:
+            try:
+                if json.loads(raws[-1]).get("type") == RESTAMP_RECORD:
+                    raws.pop()
+            except (ValueError, AttributeError):
+                pass
         for i, raw in enumerate(raws):
             if f'"{uuid}"' not in raw:
                 continue
@@ -1910,6 +1917,9 @@ class Resolver:
                        "old": {"teamName": old_team, "agentName": old_name},
                        "new": {"teamName": team, "agentName": name or old_name},
                        "at": int(time.time() * 1000)}
+            out.append(json.dumps({"type": RESTAMP_RECORD, "restamp": receipt},
+                                  separators=(",", ":"), ensure_ascii=False,
+                                  sort_keys=True))
             return {"path": path, "lines": out, "receipt": receipt,
                     "objections": [], "proved": True}
         return {"objections": [f"identity record {uuid} not found as a line"],
@@ -2817,7 +2827,7 @@ class Resolver:
         self._exercise(NEED.STAMPS)
         if self._stamps is not None:
             return self._stamps
-        index = {}
+        index, carried = {}, {}
         for path in self.projects_dir.glob("*/*.jsonl"):
             try:
                 size = path.stat().st_size
@@ -2825,19 +2835,32 @@ class Resolver:
                     tail_at = max(0, size - INDEX_CHUNK)
                     if tail_at:
                         handle.seek(tail_at)
-                    stamps = _stamps_in(handle.read(INDEX_CHUNK))
+                    tail = handle.read(INDEX_CHUNK)
+                    stamps = _stamps_in(tail)
                     if not stamps and tail_at:  # a session stamped only after a resume
                         handle.seek(0)
                         stamps = _stamps_in(handle.read(INDEX_CHUNK))
             except OSError:
                 continue
+            # Off the same bytes, and recorded whether or not stamps were found:
+            # a promoted transcript fabricates no stamps, which is precisely why
+            # its membership needs asking for separately.
+            found = self.carried_receipt(tail.decode("utf-8", "replace").splitlines())
+            if found:
+                carried[path] = found
             if stamps:
                 index[path] = (
                     (stamps.get(b"agentName") or b"").decode("utf-8", "replace") or None,
                     (stamps.get(b"teamName") or b"").decode("utf-8", "replace") or None,
                 )
-        self._stamps = index
+        self._stamps, self._carried = index, carried
         return self._stamps
+
+    def carried_receipts(self):
+        """{path: receipt} for every transcript carrying its own conversion
+        parameters. Built by the same pass and the same read as the stamps."""
+        self.stamp_index()
+        return self._carried
 
     def team_lead_session(self, team):
         """The session id a team names as its lead's, via the roster reader."""
@@ -3428,7 +3451,7 @@ class Resolver:
         return None
 
     def conversion_plan(self, source, direction, into=None, dest=None, stored=None,
-                        cut=None):
+                        cut=None, identity=None):
         """The full plan for one conversion, proved before anyone acts on it.
 
         Answers only: edit set (as the rendered lines), receipt, objections,
@@ -3465,6 +3488,11 @@ class Resolver:
                        "task_id": source.stem[len("agent-"):]}
             if cut:
                 receipt["cut"] = cut
+            if identity:
+                # Before the line is rendered, not after: until a launch
+                # registers this member the transcript is the only thing that
+                # says who it is.
+                receipt["name"], receipt["team"] = identity
             meta = source.with_name(source.stem + ".meta.json")
             try:
                 receipt["meta"] = meta.read_text()
@@ -3477,7 +3505,16 @@ class Resolver:
             # travels with them, and answers even when the receipts directory
             # is gone. The stored one still answers for anything promoted
             # before transcripts carried their own.
-            stored = {**(stored or {}), **(self.carried_receipt(raws) or {})}
+            carried = self.carried_receipt(raws)
+            stored = dict(stored or {})
+            if carried is not None:
+                # The file's own record is the whole truth about these fields,
+                # not a set of defaults to fill gaps in. A stored receipt can
+                # carry values the line never had, and rendering those back
+                # would emit bytes the source never contained.
+                for key in RECEIPT_KEYS:
+                    stored.pop(key, None)
+                stored.update(carried)
             into = into or stored.get("parent")
             if not into:
                 return {"objections": ["demote needs the parent session (--into)"],
@@ -3487,7 +3524,7 @@ class Resolver:
                        "task_id": dest or stored.get("task_id") or source.stem,
                        "root": stored.get("root"), "meta": stored.get("meta")}
             for carried in ("ref", "graft", "inserted_sidechain",
-                            "cut", "cut_parent", "cut_lines"):
+                            "cut", "cut_parent", "cut_lines", "name", "team"):
                 if stored.get(carried):
                     receipt[carried] = stored[carried]
             out, objections = self._convert(raws, "demote", receipt)
@@ -6572,12 +6609,13 @@ def run_promote(args):
     name = name or entry["name"] or entry["task_id"]
     if not team:
         die("the destination team must be typed: --as name@team")
-    plan = RESOLVER.conversion_plan(entry["path"], "promote", cut=args.cut)
+    # The spoken identity goes in before the plan is built, because until the
+    # first launch registers this member the promoted transcript is the only
+    # thing that says who it is, and it says so in the line it carries.
+    plan = RESOLVER.conversion_plan(entry["path"], "promote", cut=args.cut,
+                                    identity=(name, team))
     if plan["objections"] or not plan["proved"]:
         die("; ".join(plan["objections"]) or "the inverse could not be proved")
-    # The receipt carries the spoken identity: until the first launch
-    # registers this member, the receipt is its membership.
-    plan["receipt"]["name"], plan["receipt"]["team"] = name, team
     dest = plan["dest_path"]
     if dest.exists():
         die(f"a transcript already exists at {dest}; refusing the collision")
@@ -9742,8 +9780,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
         moved = []
         try:
-            plan = eng4.conversion_plan(side, "promote")
-            plan["receipt"]["name"], plan["receipt"]["team"] = "xp", "TEAMX"
+            plan = eng4.conversion_plan(side, "promote", identity=("xp", "TEAMX"))
             materialize(plan)
             dest = plan["dest_path"]
             if not dest.exists():
@@ -9761,8 +9798,8 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             pop = eng4.team_population("TEAMX")
             if pop.get("xp", ("",))[0] != "converted":
                 moved.append("an unlaunched promote is missing from the population")
-            if eng4.converted_members("TEAMX").get("xp", {}).get("dest") != str(dest):
-                moved.append("the receipt does not name its transcript")
+            if eng4.converted_members("TEAMX").get("xp", {}).get("root") != dest.stem:
+                moved.append("the carried receipt does not name its own transcript")
             res = eng4.resolve_transcript(name="xp", team="TEAMX", quick=True)
             if not res or res.via != "conversion receipt" or res.path != dest:
                 moved.append("the ladder does not reach an unlaunched promote")
@@ -9989,8 +10026,14 @@ def run_selftest(live=False, failed_only=False, list_only=False):
                 stray.append("the restamped file does not restamp back")
             else:
                 apply_restamp(back)
-                if target.read_text() != "".join(compact(r) + "\n" for r in rows):
-                    stray.append("the round trip did not restore the original bytes")
+                # A restamp leaves a trace on purpose, so the round trip
+                # restores the identity rather than the bytes: every original
+                # line back as it was, and one trace line saying what happened.
+                came_back = target.read_text().splitlines(keepends=True)
+                if came_back[:len(rows)] != [compact(r) + "\n" for r in rows]:
+                    stray.append("the round trip did not restore the original lines")
+                if sum(RESTAMP_RECORD in line for line in came_back) != 1:
+                    stray.append("a restamped file does not carry exactly one trace")
         finally:
             globals()["RECEIPTS_DIR"] = real_receipts
         # The live-holder guard: the composed question sees a lineage pid,
