@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
 """agent-resume: resurrect a Claude Code teammate into its swarm tmux session.
 
-Usage: agent-resume [<selector>] [options] [-- ...forwarded to claude]
-
-The selector may sit anywhere among the flags: flags that take a value keep
-their values, so a bare token elsewhere is the selector, and position carries
-no meaning. Two bare tokens are an error naming both, since one of them would
-otherwise reach the resumed session as an unasked-for prompt. Put anything
-genuinely meant for claude after `--`, which ends classification.
-
-The bare argument is classified by shape:
-    2a38de2d-bd34-...   session UUID       -> --resume
-    teammate@session-x  full agent id      -> --agent-id
-    session-a52cb2af    a dir under teams/ -> --team (whole roster, lead last)
-    teammate            bare agent name    -> resolved, or refused if several rosters claim it
-
 --to-team TEAM|live moves an agent onto another team: it relaunches it with that
 team's identity, replaces whichever process still holds the transcript,
 registers it in the destination roster and retires the source entry. On a lead
@@ -26,7 +12,8 @@ restamped, so the move is still there after the next restart.
 --install sets up the ~/.local/bin symlink, zsh tab completion, and the
 Claude Code startup hook that runs --cleanup.
 
-Or select explicitly with --agent-id (as claude spells it) and/or --resume <session-uuid>.
+Instead of a bare selector you can select explicitly with --agent-id (as claude
+spells it) and/or --resume <session-uuid>.
 Everything the harness needs to relaunch it (team, type, color, model, effort,
 permission mode, cwd, parent session, tmux socket + pane) is reconstructed from
 what is recorded on disk plus the live process table; when the records
@@ -65,6 +52,29 @@ from pathlib import Path
 # The tool's name has exactly one source: this file. Renaming the file renames
 # the command, its completion, its install targets and its backup suffixes.
 TOOL = Path(__file__).resolve().name
+
+# The parser's description, so --help says this before the flags; the module
+# docstring above is what it says after them. This is the half a reader needs
+# first, because without it a bare token in the command line has no meaning,
+# and it used to print underneath all forty-four flags. Wrapped by hand: the
+# formatter keeps a description verbatim, which is what holds the table's
+# columns together.
+SELECTOR_HELP = f"""Resume a Claude Code teammate in its swarm tmux session.
+
+The bare argument is the selector, classified by its shape:
+    2a38de2d-bd34-...   session UUID       -> --resume
+    teammate@session-x  full agent id      -> --agent-id
+    session-a52cb2af    a dir under teams/ -> --team (whole roster, lead last)
+    teammate            bare agent name    -> resolved, or refused if several rosters claim it
+
+It may sit anywhere among the flags: flags that take a value keep their values,
+so a bare token elsewhere is the selector, and position carries no meaning. Two
+bare tokens are an error naming both, since one of them would otherwise reach
+the resumed session as an unasked-for prompt. Put anything genuinely meant for
+claude after `--`, which ends classification.
+
+The flags follow, in groups; the notes after them go into moves, forwarding and
+what {TOOL} reconstructs for a launch."""
 
 # A promoted transcript carries the parameters of its own undo, as its last
 # line. The harness parses every line and acts on the ones it recognises: the
@@ -571,6 +581,20 @@ def fill(text, width=None, offset=0):
                 got[-2:] = [body.rstrip(), widowed]
         out.extend([got[0][len(pad):], *got[1:]] if got else [""])
     return "\n".join(out)
+
+
+class HelpLayout(argparse.RawDescriptionHelpFormatter):
+    """--help laid out the way the rest of the tool prints.
+
+    Two things the default does not. It wraps to the real terminal, so at a
+    wide one every flag's help is one long line and the group headings stop
+    standing out; this uses the same width everything else here does. And it
+    reflows the description, which would fold the selector-shape table into a
+    paragraph; the raw base keeps the table's columns.
+    """
+
+    def __init__(self, prog, **kw):
+        super().__init__(prog, width=term_width(), **kw)
 
 
 def clip(text, width):
@@ -9512,8 +9536,25 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # offer nothing the parser would refuse.
     comp_path = Path(__file__).resolve().parent / f"_{TOOL}"
     comp_text = comp_path.read_text() if comp_path.exists() else ""
+    # Read out of the tree rather than by regex over main's text. The flags are
+    # declared on argument groups, so the receiver differs from call to call,
+    # and a regex that matched add_argument( wherever it appeared would still
+    # find them but could not say which group each went to. One walk answers
+    # both questions, so the grouping check below is not a second scrape that
+    # can drift away from this one.
     main_src = ast.get_source_segment(source, funcs["main"]) or ""
-    parser_flags = set(re.findall(r'add_argument\(\s*"(--[a-z-]+)"', main_src))
+    declared = []          # (option strings of one call, the object it was called on)
+    for node in ast.walk(funcs["main"]):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_argument"):
+            continue
+        opts = [a.value for a in node.args
+                if isinstance(a, ast.Constant) and str(a.value).startswith("-")]
+        if opts:
+            declared.append((opts, getattr(node.func.value, "id", "?")))
+    # The first option string of each call, as the regex before it took: the
+    # rest are aliases, which completion is not asked to offer.
+    parser_flags = {opts[0] for opts, _on in declared if opts[0].startswith("--")}
     comp_flags = set(re.findall(r"'(--[a-z-]+)\[", comp_text))
     aliases = {"--no-colour", "--terminate", "--cleanup-sockets"}
     missing = sorted(parser_flags - comp_flags - {"--complete"})
@@ -9522,6 +9563,24 @@ def run_selftest(live=False, failed_only=False, list_only=False):
           comp_text and not missing and not unknown,
           f"missing from completion: {missing}; unknown to the parser: {unknown}"
           if (missing or unknown) else "no completion file found")
+
+    # Forty-four flags in one list printed a nine-line usage and put --failed,
+    # --live and --list, which do nothing without --selftest, between --bare
+    # and --all. Every one now sits on a group, and on one, so a flag added
+    # later cannot land back in an ungrouped pile without failing here.
+    group_names = {node.targets[0].id for node in ast.walk(funcs["main"])
+                   if isinstance(node, ast.Assign) and len(node.targets) == 1
+                   and isinstance(node.targets[0], ast.Name)
+                   and isinstance(node.value, ast.Call)
+                   and getattr(node.value.func, "attr", None) == "add_argument_group"}
+    ungrouped = sorted(opts[0] for opts, on in declared if on not in group_names)
+    said_twice = sorted(opt for opt, n in collections.Counter(
+        opt for opts, _on in declared for opt in opts).items() if n > 1)
+    check("every-flag-in-one-group", "every flag is declared on exactly one group",
+          bool(group_names) and bool(declared) and not ungrouped and not said_twice,
+          f"not on a group: {ungrouped}; declared more than once: {said_twice}"
+          if (ungrouped or said_twice) else
+          f"{len(group_names)} group(s), {len(declared)} declaration(s)")
 
     # The sides sweep groups under each parent session and bounds itself,
     # saying what it folded and how to see it; a named parent lists in full.
@@ -12817,120 +12876,139 @@ def audited(entry):
 def main():
     parser = argparse.ArgumentParser(
         prog=TOOL, allow_abbrev=False, add_help=False,
-        description="Resume a Claude Code teammate in its swarm tmux session.",
+        formatter_class=HelpLayout,
+        # The generated usage was nine lines of forty-six flags in declaration
+        # order, which said nothing a reader could act on. This is the one
+        # spelling of how the tool is called; the groups below say the rest.
+        usage=f"{TOOL} [<selector>] [options] [-- ...forwarded to claude]",
+        description=SELECTOR_HELP,
     )
-    parser.add_argument("--agent-id", help="resume this agent (by its full id, name@team)")
-    parser.add_argument("--resume", metavar="SESSION_UUID",
-                        help="resume this session transcript (by uuid)")
-    parser.add_argument("--team", metavar="TEAM",
-                        help="resume this whole team by name: the members, then the lead")
-    parser.add_argument("--no-lead", action="store_true",
-                        help="skip the lead when bringing up the whole team")
-    parser.add_argument("--keep-team", action="store_true",
-                        help="resume a member on its recorded team even when its lead now "
-                             "runs as another one (skips the automatic move)")
-    parser.add_argument("--to-team", metavar="TEAM|live",
-                        help="move this agent onto another team (live = the team its live "
-                             "lead now runs as); a running one is restarted, a dead one "
-                             "comes up there")
-    parser.add_argument("--install", action="store_true",
-                        help="symlink into ~/.local/bin, install zsh tab completion, and "
-                             "add the Claude Code startup hook that runs --cleanup")
-    parser.add_argument("--no-color", "--no-colour", dest="no_color", action="store_true",
+    # Grouped in the order a reader wants them: who comes back, what to do
+    # instead of resuming it, where it comes up, what to check before it acts,
+    # what it prints, the tmux server, and last the four that do nothing
+    # without --selftest. In declaration order those four sat between --bare
+    # and --all, where nothing said they were unusable on their own.
+    picking = parser.add_argument_group("selecting who comes back")
+    verbs = parser.add_argument_group("instead of resuming it")
+    placing = parser.add_argument_group("where and as what it comes up")
+    careful = parser.add_argument_group("before it acts")
+    saying = parser.add_argument_group("what it prints")
+    swarm = parser.add_argument_group("the swarm tmux server")
+    suite = parser.add_argument_group("with --selftest only")
+    picking.add_argument("--agent-id", help="resume this agent (by its full id, name@team)")
+    picking.add_argument("--resume", metavar="SESSION_UUID",
+                         help="resume this session transcript (by uuid)")
+    picking.add_argument("--team", metavar="TEAM",
+                         help="resume this whole team by name: the members, then the lead")
+    picking.add_argument("--all", dest="all_members", action="store_true",
+                         help="with a team, also resume members the roster no longer lists "
+                              "but whose transcripts are stamped with it")
+    picking.add_argument("--no-lead", action="store_true",
+                         help="skip the lead when bringing up the whole team")
+    verbs.add_argument("--doctor", action="store_true",
+                       help="say whether each team's lead is connected to it; reports only")
+    verbs.add_argument("--standing", action="store_true",
+                       help="say where the named agent stands with its lead: parentage, "
+                            "liveness, the team the lead runs as, and whether its mail is read")
+    verbs.add_argument("--census", action="store_true",
+                       help="count what this machine's ~/.claude contains, through the "
+                            "same readers the tool resolves with")
+    verbs.add_argument("--sides", action="store_true",
+                       help="list side transcripts (subagent conversations), each "
+                            "classified by its own bytes; reports only")
+    verbs.add_argument("--mail-ledger", action="store_true",
+                       help="join a team's sends against its deliveries: "
+                            "delivered, queued, pending, or unexplained")
+    verbs.add_argument("--stop", "--terminate", action="store_true", dest="stop",
+                       help="stop the agent, session or team instead of resuming it")
+    verbs.add_argument("--promote", metavar="SIDE",
+                       help="convert a side transcript into a resumable teammate "
+                            "(moves it; the receipt holds the way back)")
+    verbs.add_argument("--demote", metavar="SESSION",
+                       help="convert a teammate transcript back into a side "
+                            "transcript under its parent's subagents/")
+    verbs.add_argument("--as", dest="as_", metavar="NAME@TEAM",
+                       help="the identity a promoted teammate joins as; the team "
+                            "half must be typed")
+    verbs.add_argument("--into", metavar="SESSION",
+                       help="the parent session a demoted transcript embeds under")
+    verbs.add_argument("--no-launch", action="store_true",
+                       help="promote writes files and prints the launch line "
+                            "instead of launching")
+    verbs.add_argument("--with-mail", action="store_true",
+                       help="demote archives unread inbox mail into the receipt "
+                            "instead of refusing")
+    verbs.add_argument("--cleanup", "--cleanup-sockets", dest="cleanup", action="store_true",
+                       help="clean up dead swarm tmux sockets and team dirs with nothing "
+                            "left to resume; the installed Claude Code startup hook runs this")
+    verbs.add_argument("--install", action="store_true",
+                       help="symlink into ~/.local/bin, install zsh tab completion, and "
+                            "add the Claude Code startup hook that runs --cleanup")
+    verbs.add_argument("--poison", action="store_true",
+                       help="point the swarm server's ANTHROPIC_BASE_URL at a dead port, "
+                            "so placeholder spawns die at connect instead of reaching the API")
+    verbs.add_argument("--unpoison", action="store_true",
+                       help="remove the dead-port override from the swarm server")
+    placing.add_argument("--to-team", metavar="TEAM|live",
+                         help="move this agent onto another team (live = the team its live "
+                              "lead now runs as); a running one is restarted, a dead one "
+                              "comes up there")
+    placing.add_argument("--keep-team", action="store_true",
+                         help="resume a member on its recorded team even when its lead now "
+                              "runs as another one (skips the automatic move)")
+    placing.add_argument("--here", action="store_true",
+                         help="run this agent in this terminal instead of a tmux "
+                              "pane, the way a lead runs; this run ends when it "
+                              "starts")
+    placing.add_argument("--bare", action="store_true",
+                         help="resume the conversation with no identity: claude --resume "
+                              "<uuid> and nothing else, no team, name, model, effort or "
+                              "permission flags, and no roster entry")
+    placing.add_argument("--claude-bin",
+                         help="launch this claude binary instead of the one on PATH")
+    careful.add_argument("--dry-run", action="store_true",
+                         help="preview without launching")
+    careful.add_argument("--force", action="store_true",
+                         help="override the running-copy and identity guards; with --to-team, "
+                              "also take the rewrite route when the old team cannot be retired")
+    careful.add_argument("--yes", "-y", action="store_true",
+                         help="do not ask before ending a process: a --stop, or the "
+                              "one holding the conversation a move takes over")
+    careful.add_argument("--no-update-config", action="store_true",
+                         help="do not write resumed agents into the team roster")
+    saying.add_argument("--explain", action="store_true",
+                        help="say where each launch fact came from before launching")
+    saying.add_argument("--no-color", "--no-colour", dest="no_color", action="store_true",
                         help="print without colour; the NO_COLOR environment variable "
                              "does the same")
-    parser.add_argument("--here", action="store_true",
-                        help="run this agent in this terminal instead of a tmux "
-                             "pane, the way a lead runs; this run ends when it "
-                             "starts")
-    parser.add_argument("--bare", action="store_true",
-                        help="resume the conversation with no identity: claude --resume "
-                             "<uuid> and nothing else, no team, name, model, effort or "
-                             "permission flags, and no roster entry")
-    parser.add_argument("--no-tint", action="store_true",
-                        help="do not tint the tmux pane")
-    parser.add_argument("--failed", action="store_true",
-                        help="with --selftest, print only the checks that "
-                             "failed, and a summary a reader can trust")
-    parser.add_argument("--live", action="store_true",
-                        help="with --selftest, also run the checks that spawn a process, "
-                             "open a terminal or change directory (each cleans up after itself)")
-    parser.add_argument("--list", action="store_true",
-                        help="with --selftest, print every check's id and prose, one per "
-                             "line, instead of running verdicts")
-    parser.add_argument("--selftest", action="store_true",
-                        help="run the test suite against this machine; changes nothing")
-    parser.add_argument("--all", dest="all_members", action="store_true",
-                        help="with a team, also resume members the roster no longer lists "
-                             "but whose transcripts are stamped with it")
-    parser.add_argument("--doctor", action="store_true",
-                        help="say whether each team's lead is connected to it; reports only")
-    parser.add_argument("--standing", action="store_true",
-                        help="say where the named agent stands with its lead: parentage, "
-                             "liveness, the team the lead runs as, and whether its mail is read")
-    parser.add_argument("--census", action="store_true",
-                        help="count what this machine's ~/.claude contains, through the "
-                             "same readers the tool resolves with")
-    parser.add_argument("--sides", action="store_true",
-                        help="list side transcripts (subagent conversations), each "
-                             "classified by its own bytes; reports only")
-    parser.add_argument("--promote", metavar="SIDE",
-                        help="convert a side transcript into a resumable teammate "
-                             "(moves it; the receipt holds the way back)")
-    parser.add_argument("--demote", metavar="SESSION",
-                        help="convert a teammate transcript back into a side "
-                             "transcript under its parent's subagents/")
-    parser.add_argument("--as", dest="as_", metavar="NAME@TEAM",
-                        help="the identity a promoted teammate joins as; the team "
-                             "half must be typed")
-    parser.add_argument("--into", metavar="SESSION",
-                        help="the parent session a demoted transcript embeds under")
-    parser.add_argument("--no-launch", action="store_true",
-                        help="promote writes files and prints the launch line "
-                             "instead of launching")
-    parser.add_argument("--with-mail", action="store_true",
-                        help="demote archives unread inbox mail into the receipt "
-                             "instead of refusing")
-    parser.add_argument("--mail-ledger", action="store_true",
-                        help="join a team's sends against its deliveries: "
-                             "delivered, queued, pending, or unexplained")
-    parser.add_argument("--cleanup", "--cleanup-sockets", dest="cleanup", action="store_true",
-                        help="clean up dead swarm tmux sockets and team dirs with nothing "
-                             "left to resume; the installed Claude Code startup hook runs this")
-    parser.add_argument("--complete", metavar="TOPIC", help=argparse.SUPPRESS)
-    parser.add_argument("--poison", action="store_true",
-                        help="point the swarm server's ANTHROPIC_BASE_URL at a dead port, "
-                             "so placeholder spawns die at connect instead of reaching the API")
-    parser.add_argument("--unpoison", action="store_true",
-                        help="remove the dead-port override from the swarm server")
-    parser.add_argument("--socket",
-                        help="use this swarm tmux socket instead of detecting or creating one")
-    parser.add_argument("--tmux-session", metavar="NAME",
-                        help=f"use this tmux session name instead of the default {TMUX_SESSION}")
-    parser.add_argument("--tmux-window", metavar="NAME",
-                        help=f"use this tmux window name instead of the default {TMUX_WINDOW}")
-    parser.add_argument("--claude-bin",
-                        help="launch this claude binary instead of the one on PATH")
-    parser.add_argument("--force", action="store_true",
-                        help="override the running-copy and identity guards; with --to-team, "
-                             "also take the rewrite route when the old team cannot be retired")
-    parser.add_argument("--stop", "--terminate", action="store_true", dest="stop",
-                        help="stop the agent, session or team instead of resuming it")
-    parser.add_argument("--yes", "-y", action="store_true",
-                        help="do not ask before ending a process: a --stop, or the "
-                             "one holding the conversation a move takes over")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="preview without launching")
-    parser.add_argument("--explain", action="store_true",
-                        help="say where each launch fact came from before launching")
-    parser.add_argument("--no-update-config", action="store_true",
-                        help="do not write resumed agents into the team roster")
-    parser.add_argument("--attach", action="store_true",
-                        help="attach to the swarm tmux session even when another client "
-                             "is already attached")
-    parser.add_argument("--no-attach", action="store_true",
-                        help="never attach to the swarm tmux session; just report")
-    parser.add_argument("-h", "--help", action="store_true")
+    saying.add_argument("-h", "--help", action="store_true",
+                        help="print this: the selector shapes, these flags in "
+                             "groups, then the notes")
+    saying.add_argument("--complete", metavar="TOPIC", help=argparse.SUPPRESS)
+    swarm.add_argument("--socket",
+                       help="use this swarm tmux socket instead of detecting or creating one")
+    swarm.add_argument("--tmux-session", metavar="NAME",
+                       help=f"use this tmux session name instead of the default {TMUX_SESSION}")
+    swarm.add_argument("--tmux-window", metavar="NAME",
+                       help=f"use this tmux window name instead of the default {TMUX_WINDOW}")
+    swarm.add_argument("--no-tint", action="store_true",
+                       help="do not tint the tmux pane")
+    swarm.add_argument("--attach", action="store_true",
+                       help="attach to the swarm tmux session even when another client "
+                            "is already attached")
+    swarm.add_argument("--no-attach", action="store_true",
+                       help="never attach to the swarm tmux session; just report")
+    suite.add_argument("--selftest", action="store_true",
+                       help="run the test suite against this machine; changes nothing")
+    suite.add_argument("--failed", action="store_true",
+                       help="with --selftest, print only the checks that "
+                            "failed, and a summary a reader can trust")
+    suite.add_argument("--live", action="store_true",
+                       help="with --selftest, also run the checks that spawn a process, "
+                            "open a terminal or change directory (each cleans up after itself)")
+    suite.add_argument("--list", action="store_true",
+                       help="with --selftest, print every check's id and prose, one per "
+                            "line, instead of running verdicts")
     # Only a *leading* bare word is the selector; later bare words belong to
     # forwarded flags (argparse can't know that --model takes a value).
     argv = sys.argv[1:]
@@ -13003,8 +13081,11 @@ def main():
         return run_poison(args)
 
     if args.help or not (selector or args.agent_id or args.resume or args.team):
+        # Order unchanged: the flags, then the notes. The blank line is new,
+        # because the last group's last flag and the notes' first line used to
+        # touch, and the notes read as a continuation of that group.
         parser.print_help()
-        print(__doc__)
+        print("\n" + __doc__)
         return 0 if args.help else 2
 
     if args.tmux_session or args.tmux_window:
