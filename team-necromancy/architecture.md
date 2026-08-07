@@ -206,16 +206,32 @@ make team resume a real feature instead of this skill.
 
 ## The engine owns the environment
 
-The environment this tool reasons about is five realms:
+The environment this tool reasons about is eight realms:
 
 - transcripts, both main sessions and the side transcripts under `subagents/`
-- team configs
+- team configs, the rosters at `teams/<team>/config.json`
+- mailboxes, the message files at `teams/<team>/inboxes/<name>.json`
 - claude sessions
 - running processes
 - tmux servers, sessions and panes
+- settings, `~/.claude/settings.json`
+- the claude binary, both which one a launch uses and the pattern that decides
+  whether a process on the table is a claude at all
 
 Only the engine may examine a realm and draw a conclusion from what it finds.
 Everything else asks the engine a question and consumes the answer.
+
+Mailboxes are their own realm rather than part of a team's config, because they
+answer a different question and answer it worse: the file is pruned the moment a
+busy recipient takes a message into memory, so an empty mailbox is not evidence
+that nothing was sent. Reading one and concluding is exactly where this tool has
+already been wrong, which is why `mail_ledger` exists to answer from the
+transcripts instead.
+
+The tool's own receipts are deliberately not a realm. A realm is something the
+world owns and this tool observes; a receipt is this tool's own writing. The
+engine does read receipts and conclude membership from them, so the exclusion is
+a decision rather than an oversight.
 
 The rule is about reading and concluding, not about acting. A launch runs
 `tmux split-window`, a reap removes a directory, a stop signals a pid: none of
@@ -228,8 +244,13 @@ by a timing coincidence while the stamps said otherwise.
 
 Enforcement is per realm and incomplete. Transcripts and sessions are law, held
 by `transcript-pick-engine-only`, `tree-reached-via-engine` and their siblings.
-Team configs, processes and tmux are not yet, and the largest single offender is
-`cruft_reason`, which reads a team directory and decides what it is.
+The other six are not yet. The largest single offender is `cruft_reason`, which
+reads a team directory and decides what it is. Settings are read outside the
+engine by `check_substrate`, which decides from `teammateMode` whether the
+configured substrate is one this tool can serve. The binary realm is examined in
+two places at once: `claude_binary` chooses what to launch, which is acting, and
+`CLAUDE_PROC` decides whether a process is a claude at all, which is not, and
+which every liveness answer depends on.
 
 ## Method
 
