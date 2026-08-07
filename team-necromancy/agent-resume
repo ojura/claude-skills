@@ -8092,6 +8092,33 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         and node.lineno not in selftest_lines})
     check("tree-reached-via-engine", "the tree is reached only through the engine", not trespass, "; ".join(trespass))
 
+    # The same mechanism for a different realm, which is why it is a separate
+    # check rather than another name in `ambient`: CLAUDE_PROC is not the
+    # transcript tree, it is what decides whether a process on the table is a
+    # claude at all. Every liveness answer this tool gives rests on it, so a
+    # second reader would be a second definition of "a claude is running", and
+    # the definitions would drift the way two mail readers already did. Choosing
+    # which binary to launch is the other half of this realm and stays outside:
+    # claude_binary acts, it concludes nothing about a process.
+    #
+    # Neither the suite nor live_checks is exempted, and neither needs to be:
+    # the suite exercises the real matcher through RESOLVER.is_claude, and its
+    # fake process rows wear FAKE_AGENT_BIN, which is a different name. An
+    # exemption here would be a standing permission for the one place most
+    # likely to want a shortcut.
+    #
+    # What this cannot see is a hand-rolled second matcher that never says
+    # CLAUDE_PROC. The compiled pattern being the only one in the file is what
+    # makes the name worth guarding: there is nothing else to reach for.
+    claude_matchers = sorted({
+        f"{node.id} at line {node.lineno}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id == "CLAUDE_PROC"
+        and isinstance(node.ctx, ast.Load)   # the declaration is a Store; only a use is a reach
+        and node.lineno not in engine_lines})
+    check("claude-pattern-engine-only", "what counts as a claude process is read only inside the engine",
+          not claude_matchers, "; ".join(claude_matchers))
+
     writers = {n for n, node in funcs.items()
                if "os.replace" in ast.get_source_segment(source, node)}
     check("roster-one-writer", "one roster writer", writers <= {"edit_team_config", "replace_json", "run_selftest"},
