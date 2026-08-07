@@ -587,7 +587,7 @@ def fill(text, width=None, offset=0):
             # value; keep the pair together and let the line overflow.
             got[:2] = [pad + lead + got[1].lstrip(" ")]
         if len(got) > 1 and len(got[-1].split()) == 1:
-            # A single word stranded on the last line reads as an accident;
+            # A single word alone on the last line reads as an accident;
             # pull a companion down with it, when one can come and the line
             # above keeps more than its label.
             body, _, last = got[-2].rpartition(" ")
@@ -1051,7 +1051,7 @@ class Resolver:
 
         Exactly one corroborated claimant is the answer. A sole claimant with no
         corroboration is still taken, because the ordinary dead-team case is exactly
-        that and refusing would strand every legitimately orphaned lead; it says so
+        that and refusing would leave every legitimately orphaned lead unresumable; it says so
         in its provenance instead. Anything else refuses and names what it refused
         between: choosing without evidence buys a resumed stranger's conversation
         wearing this team's lead identity.
@@ -7495,8 +7495,9 @@ def run_demote(args):
         die(f"you are demoting the transcript you are running (pid "
             f"{selfhold[0]}); nothing can embed a conversation from inside it")
     if holders and not args.force:
-        die(f"pid {holders[0][0]} holds this transcript; demoting it would "
-            "strand a live writer. --force overrides")
+        die(f"pid {holders[0][0]} is running this conversation and appending to "
+            "its file; a demote copies that file and then deletes it, so "
+            "whatever the process writes after the copy is lost. --force overrides")
     beheads = RESOLVER.live_led(path.stem)
     if beheads and not args.force:
         die(f"this transcript leads {', '.join(beheads)} with members running; "
@@ -9393,7 +9394,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # A label whose value cannot fit beside it keeps the value anyway: the
     # pair overflows together rather than the label sitting orphaned above it.
     labelled = fill("cwd      /" + "x" * 90, width=72)
-    # A sentence one word over the width does not strand that word alone: a
+    # A sentence one word over the width does not leave that word by itself: a
     # companion comes down with it, and no word is lost either way.
     widowy = " ".join(["a" * 8] * 8 + ["tail"])
     dewidowed = fill(widowy, width=72)
@@ -9691,6 +9692,12 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # The project's coinages live in docstrings and commit messages; a person
     # at a terminal gets plain words. Docstrings and the suite's own strings
     # are the exemption, and nothing else is.
+    #
+    # A word earns a place in this list by having been printed at a terminal
+    # and taken back out again. "strand" reached a demote refusal while this
+    # check watched for one word only and could not see it, so the list is the
+    # only thing that keeps each of them from coming back.
+    coinages = ("window-start", "strand")
     doc_strings = set()
     for node in ast.walk(tree):
         body = getattr(node, "body", None)
@@ -9704,10 +9711,10 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         suite_fn = funcs.get(suite_name)
         if suite_fn:
             suite_lines.update(range(suite_fn.lineno, suite_fn.end_lineno + 1))
-    spoken = sorted({f"line {n.lineno}" for n in ast.walk(tree)
+    spoken = sorted({f"line {n.lineno}: {word!r}" for n in ast.walk(tree)
                      if isinstance(n, ast.Constant) and isinstance(n.value, str)
                      and id(n) not in doc_strings and n.lineno not in suite_lines
-                     and "window-start" in n.value})
+                     for word in coinages if word in n.value})
     check("no-coinages-in-output", "the project's own coinages stay out of printed strings", not spoken,
           "; ".join(spoken))
 
