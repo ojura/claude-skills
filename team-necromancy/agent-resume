@@ -12313,37 +12313,57 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             noop = eng7.restamp_plan(target, "OLD")
             if noop["proved"] or not noop["objections"]:
                 stray.append("an already-agreeing restamp did not refuse")
+            def provable(made, what):
+                """Whether this plan may be applied, recording why when not.
+
+                apply_restamp raises on an unproved plan, and a traceback
+                ends the whole suite instead of failing this check, so a
+                probe against either of restamp_plan's guards would prove
+                nothing here. Every step below needs the write before it, so
+                a plan that cannot be applied stops the sequence rather than
+                leaving the next step to read a file nobody wrote.
+                """
+                if made["objections"] or not made["proved"]:
+                    stray.append(f"{what}: {made['objections'] or 'unproved'}")
+                    return False
+                return True
+
             # receipt is mandatory: apply, then verify, then verify the cycle
-            apply_restamp(plan)
-            stored = json.loads(
-                (Path(td) / "receipts" / f"{target.stem}.restamp.json").read_text())
-            if stored.get("old", {}).get("teamName") != "OLD":
-                stray.append("the receipt did not confess the old value")
-            if target.stat().st_mode & 0o777 != 0o600:
-                stray.append("the restamp did not preserve file mode")
-            back = eng7.restamp_plan(target, "OLD")
-            if not back["proved"]:
-                stray.append("the restamped file does not restamp back")
-            else:
-                apply_restamp(back)
-                # The trace records the net change from where the conversation
-                # started, so coming back to the origin leaves nothing to
-                # record and the bytes are the ones it had before any of it.
-                was = "".join(compact(r) + "\n" for r in rows)
-                if target.read_text() != was:
-                    stray.append("the round trip did not restore the original bytes")
-                # And three moves leave one record of the net change, not two
-                # records of two hops, and not a hop that forgot the origin.
-                apply_restamp(eng7.restamp_plan(target, "MID"))
-                apply_restamp(eng7.restamp_plan(target, "FAR"))
-                lines = target.read_text().splitlines()
-                traces = [json.loads(l)["restamp"] for l in lines
-                          if RESTAMP_RECORD in l]
-                if len(traces) != 1:
-                    stray.append(f"three moves left {len(traces)} traces")
-                elif (traces[0]["old"]["teamName"], traces[0]["new"]["teamName"]) != ("OLD", "FAR"):
-                    stray.append(f"the trace forgot the origin: {traces[0]['old']} "
-                                 f"-> {traces[0]['new']}")
+            if provable(plan, "the first restamp did not apply"):
+                apply_restamp(plan)
+                stored = json.loads(
+                    (Path(td) / "receipts" / f"{target.stem}.restamp.json").read_text())
+                if stored.get("old", {}).get("teamName") != "OLD":
+                    stray.append("the receipt did not confess the old value")
+                if target.stat().st_mode & 0o777 != 0o600:
+                    stray.append("the restamp did not preserve file mode")
+                back = eng7.restamp_plan(target, "OLD")
+                if provable(back, "the restamped file does not restamp back"):
+                    apply_restamp(back)
+                    # The trace records the net change from where the conversation
+                    # started, so coming back to the origin leaves nothing to
+                    # record and the bytes are the ones it had before any of it.
+                    was = "".join(compact(r) + "\n" for r in rows)
+                    if target.read_text() != was:
+                        stray.append("the round trip did not restore the original bytes")
+                    # And three moves leave one record of the net change, not two
+                    # records of two hops, and not a hop that forgot the origin.
+                    hopped = True
+                    for team, which in (("MID", "the second hop"), ("FAR", "the third hop")):
+                        hop = eng7.restamp_plan(target, team)
+                        if not provable(hop, f"{which} did not apply"):
+                            hopped = False
+                            break
+                        apply_restamp(hop)
+                    if hopped:
+                        lines = target.read_text().splitlines()
+                        traces = [json.loads(l)["restamp"] for l in lines
+                                  if RESTAMP_RECORD in l]
+                        if len(traces) != 1:
+                            stray.append(f"three moves left {len(traces)} traces")
+                        elif (traces[0]["old"]["teamName"], traces[0]["new"]["teamName"]) != ("OLD", "FAR"):
+                            stray.append(f"the trace forgot the origin: {traces[0]['old']} "
+                                         f"-> {traces[0]['new']}")
         finally:
             globals()["RECEIPTS_DIR"] = real_receipts
         # The live-holder guard: the composed question sees a lineage pid,
