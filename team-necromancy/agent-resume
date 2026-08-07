@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """agent-resume: resurrect a Claude Code teammate into its swarm tmux session.
 
---to-team TEAM|live moves an agent onto another team: it relaunches it with that
+--into-team TEAM|live moves an agent onto another team: it relaunches it with that
 team's identity, replaces whichever process still holds the transcript,
 registers it in the destination roster and retires the source entry. On a lead
 it moves the lead alone: the crew stays on the old team and is named in the
@@ -9,6 +9,11 @@ report, and the team the conversation comes back as is retired, or under --force
 restamped, so the move is still there after the next restart. The team inside an
 agent id is an address and never a destination: the masquerade spelling
 (team-lead@TEAM --resume <uuid>) launches under that name and moves nothing.
+
+The --into- flags are the destinations, and only they are: --into-team is the
+team an agent comes up on, --into-session is the parent a demoted transcript
+embeds under. --team says which agents a run is about and --as gives a promoted
+transcript its identity, so neither is spelled that way.
 
 --install sets up the ~/.local/bin symlink, zsh tab completion, and the
 Claude Code startup hook that runs --cleanup.
@@ -2458,7 +2463,7 @@ class Resolver:
         An address locates an agent; it does not place one. Completion collapses
         an agent to a single entry, so a stale team can be the only spelling
         available to type, and honouring it puts an agent where its own evidence
-        says it is not. Moving an agent is what --to-team says and rebuilding a
+        says it is not. Moving an agent is what --into-team says and rebuilding a
         named team is what for_team says: destinations are spoken. A team inside
         an agent id is not spoken, it is how the agent was found.
 
@@ -3460,7 +3465,7 @@ class Resolver:
             # was running as. Only payloads from THIS life count: a resumed lead
             # keeps appending to the same transcript, so an older life's payload
             # names a team this process no longer runs as, and rebinding onto it
-            # would cause exactly the orphaning --to-team exists to prevent.
+            # would cause exactly the orphaning --into-team exists to prevent.
             started = entry.get("started")
             for stamp, payload in reversed(self._log(entry["session"])):
                 # Without a start time there is no way to tell this life's payloads
@@ -3531,7 +3536,7 @@ class Resolver:
         elif lead_team and lead_team != team:
             reachable, why = False, (f"its lead is live but runs as {lead_team}, so mail sent "
                                      f"to {team} is read by nobody")
-            remedies = [("--to-team live", "restarts this member, losing its in-flight turn")]
+            remedies = [("--into-team live", "restarts this member, losing its in-flight turn")]
             if not exact_team:
                 remedies.append(("ask before redirecting", "needs a terminal to ask at"))
         elif lead_team is None:
@@ -3996,12 +4001,12 @@ class Resolver:
     def _demote_parent_objection(self, source, carried, had_stored):
         """Why this demote could not default its parent, and what could serve.
 
-        "demote needs the parent session (--into)" was the whole refusal, which
-        left the reader to guess whether the tool had looked anywhere. Two
-        halves are said instead: which record was missing or silent, and
-        whether anything on disk offers a candidate. The spawn corpus is
-        walked only here, on the way out, and only when the transcript carries
-        stamps to look an agent up by.
+        "demote needs the parent session (--into-session)" was the whole
+        refusal, which left the reader to guess whether the tool had looked
+        anywhere. Two halves are said instead: which record was missing or
+        silent, and whether anything on disk offers a candidate. The spawn
+        corpus is walked only here, on the way out, and only when the
+        transcript carries stamps to look an agent up by.
         """
         if carried is not None:
             why = "the promote record it carries names no parent session"
@@ -4012,15 +4017,15 @@ class Resolver:
                    "it, so nothing on disk says where it came from")
         name, team = self.stamp_index().get(Path(source)) or (None, None)
         if not (name and team):
-            return (f"demote needs the parent session (--into): {why}, and it "
+            return (f"demote needs the parent session (--into-session): {why}, and it "
                     "carries no agent stamps to look a spawn payload up by")
         agent_id = f"{name}@{team}"
         parent, _how = self.spawn_parent_of(agent_id)
         if parent:
-            return (f"demote needs the parent session (--into): {why}. The spawn "
+            return (f"demote needs the parent session (--into-session): {why}. The spawn "
                     f"payload naming {agent_id} is in {parent}, so that is the "
-                    "likely --into")
-        return (f"demote needs the parent session (--into): {why}, and no spawn "
+                    "likely --into-session")
+        return (f"demote needs the parent session (--into-session): {why}, and no spawn "
                 f"payload names {agent_id}")
 
     def conversion_plan(self, source, direction, into=None, dest=None, stored=None,
@@ -4408,7 +4413,7 @@ def build(args):
 
 def enforce_ctx(ctx, args):
     """The identity gate, at the boundary where this run starts acting."""
-    # A lead move is a team change asked for by name, the same as --to-team is
+    # A lead move is a team change asked for by name, the same as --into-team is
     # for a member, so the stamp it contradicts is the point of the run rather
     # than a contradiction to refuse. It is set only by the lead path, and only
     # once that path has been through the rebind step.
@@ -4424,7 +4429,7 @@ def enforce_restore(ctx, args):
     A launch onto a transcript whose window-start stamps name a team with a
     loadable roster runs as that team whatever the flags say: lines and
     spawns follow the stamped team, idle notifications follow the worn one,
-    and both teams' inboxes are polled. A --to-team rebind into that state
+    and both teams' inboxes are polled. A --into-team rebind into that state
     undoes itself at every restart, and no appended entry can fix it: one
     with a null parent is what restore reads but truncates the window to
     itself (compact-style amnesia), one that chains preserves the window
@@ -4475,7 +4480,7 @@ def already_running(ctx, args, is_lead, agent_id=None, table=None, here=(), pane
     asked to sit is the run working, so it is said in the report's grammar
     rather than warned about.
 
-    One asymmetry, preserved rather than invented: an explicit --to-team
+    One asymmetry, preserved rather than invented: an explicit --into-team
     exempts all three, because that path kills the holder deliberately, while
     a redirect chosen by the tool exempts only the owner and elsewhere pair.
     A redirect never runs when anything is alive, so the seat question keeps
@@ -4594,7 +4599,7 @@ def enforce_identity(res, objections, allow_team_change, force):
                 # send it, so a reader who wanted the move has to be told the
                 # flag that performs one. --force only lets this launch past the
                 # contradiction; the stamps still bring it back as they were.
-                die(f"{message}. --to-team {wanted} moves it there instead, retiring "
+                die(f"{message}. --into-team {wanted} moves it there instead, retiring "
                     f"{stamped} so the move is still there after the next restart; "
                     f"--force to override")
             else:
@@ -4651,7 +4656,7 @@ def apply_selector(token, args, table):
 
 
 def resolve_to_team(args, ctx):
-    """--to-team live -> the team this agent's own lead is currently running as.
+    """--into-team live -> the team this agent's own lead is currently running as.
 
     Pure ~/.claude hops, no process tree: the agent's roster names its lead
     session, the session registry maps that to a live pid, and that pid's boot
@@ -4665,10 +4670,10 @@ def resolve_to_team(args, ctx):
     source = RESOLVER.field(ctx, "teamName")
     pid, alive, how, _exact = RESOLVER.lead_pid(RESOLVER.field(ctx, "parentSessionId"), source)
     if not (pid and alive):
-        die(f"no live lead for team {source}; pass --to-team <name> explicitly")
+        die(f"no live lead for team {source}; pass --into-team <name> explicitly")
     dest, _ = RESOLVER.team_minted_by(pid)
     if not dest:
-        die(f"cannot tell which team pid {pid} runs as; pass --to-team <name> explicitly")
+        die(f"cannot tell which team pid {pid} runs as; pass --into-team <name> explicitly")
     print(f"rebind   {how}, now running as team {dest}")
     return dest
 
@@ -5689,7 +5694,7 @@ def auto_redirect(ctx, args, table, prefix=""):
     and restart, because identity is frozen in argv at exec and two processes
     must never append to one transcript.
 
-    The default may redirect. Only an explicit --to-team may migrate, so that
+    The default may redirect. Only an explicit --into-team may migrate, so that
     every killed process traces back to something the user actually asked for.
     Redirect also requires exact evidence: the mint-window join is a heuristic,
     and acting on a heuristic unasked is how "pick the newest" comes back.
@@ -5875,7 +5880,7 @@ def lead_move(ctx, args, dest):
     Either way the answer is a team this conversation was running as and dest is
     not, which is what makes the crew it leaves behind nameable.
 
-    Taking over is the narrower half, and only --to-team asks for it. The team
+    Taking over is the narrower half, and only --into-team asks for it. The team
     inside an agent id is an address: it says which agent this is, not where to
     put it, so naming another team there launches under that name and moves
     nothing. Only the flag ends whoever holds the conversation and retires what
@@ -5947,7 +5952,7 @@ def crew_left_behind(source, dest, prefix=""):
             lines.append(f"mail     {count} waiting for {name} on {source}, "
                          f"oldest {said_when(oldest)}; nothing here delivers it")
     if said:
-        lines.append(f"remedy   --to-team live on each member moves it onto {dest} "
+        lines.append(f"remedy   --into-team live on each member moves it onto {dest} "
                      "once this lead is running as it, one restart each")
     return [fill(f"{prefix}{line}") for line in lines]
 
@@ -5955,7 +5960,7 @@ def crew_left_behind(source, dest, prefix=""):
 def lead_rebind(ctx, args, source, dest, prefix=""):
     """Move this lead onto dest: the whole act, and the only route to it.
 
-    Only --to-team arrives here, because only --to-team asks for a move. A team
+    Only --into-team arrives here, because only --into-team asks for a move. A team
     named inside the agent id addresses this lead and never sends it, so that
     spelling launches without ever reaching this.
 
@@ -6047,7 +6052,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         # A move takes this conversation over, so whoever is running it goes
         # first. The guard below then asks about processes this run has already
         # ended, which is the same exemption the member path takes on an
-        # explicit --to-team and for the same reason; a kill that did not work
+        # explicit --into-team and for the same reason; a kill that did not work
         # leaves it un-exempt and the guard stops the run.
         cleared = taking_over and lead_kill_gate(ctx, args, table, prefix)
         # A lead is not exec'd onto a conversation someone is already running,
@@ -6190,7 +6195,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
 
     replace_pane = None
     if ctx.get("to_team") and not ctx.get("auto_redirect"):
-        # Explicit --to-team only: this is the migrate half, and it kills.
+        # Explicit --into-team only: this is the migrate half, and it kills.
         # A redirected launch never reaches here, so the default cannot kill.
         # Never guess a pane here: pane ids are per-server, so a recorded id
         # from another socket names an unrelated pane on this one, and killing
@@ -6858,7 +6863,7 @@ def diagnose_team(team, table=None, deep=False):
         verdict = "SEVERED"
         remedies.append((f"{TOOL} {team}", "rebuilds the roster and places its members"))
         if pid and alive and lead_team and lead_team != team:
-            remedies.append(("--to-team live on each member", "restarts them onto {lead_team}"
+            remedies.append(("--into-team live on each member", "restarts them onto {lead_team}"
                              .format(lead_team=lead_team)))
     elif not reads:
         # Dormant, and the block so far has only said what is there. A reader of
@@ -7188,7 +7193,7 @@ def rebind_reap(stamped, dest, args, prefix="", path=None, fatal=True):
         said = (f"a rebind onto {dest} needs {stamped} retired, and it "
                 "refuses:\n" + "\n".join(lines))
         # A redirect is a courtesy the run offers, so it reports and leaves
-        # the agent where it is; an explicit --to-team was asked for, so it
+        # the agent where it is; an explicit --into-team was asked for, so it
         # stops the run.
         if fatal:
             die(said)
@@ -7282,7 +7287,7 @@ def run_promote(args):
 
 
 def run_demote(args):
-    """--demote <session> [--into <parent>]: a teammate becomes a side transcript."""
+    """--demote <session> [--into-session <parent>]: a teammate becomes a side transcript."""
     path, mate, mate_team = RESOLVER.demote_subject(args.demote)
     if not path:
         die(f"no transcript for {args.demote!r}; name the session uuid")
@@ -8741,7 +8746,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             missing.append("the lead itself is listed as staying behind")
         if "1 waiting for drift" not in told:
             missing.append("the mail waiting on the old team is not named")
-        if "--to-team live on each member" not in told:
+        if "--into-team live on each member" not in told:
             missing.append("the way to move one is not named")
         check("lead-rebind-crew-report", "a lead move names the crew it leaves behind",
               not missing, ", ".join(missing[:3]))
@@ -8832,8 +8837,8 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         addresses = []
         if addressed != "refused":
             addresses.append(f"the address spelling was not refused ({addressed})")
-        if "--to-team session-corpus-crew" not in told:
-            addresses.append("the refusal does not name --to-team as the move")
+        if "--into-team session-corpus-crew" not in told:
+            addresses.append("the refusal does not name --into-team as the move")
         if (lead_receipts / "session-corpus-alpha.json").exists():
             addresses.append("the team the stamps name was retired anyway")
         if f"kill pid {GHOST}" in held:
@@ -9299,8 +9304,8 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("explain-tags-its-sources", "--explain names each source once and tags its rows",
           not wrong, ", ".join(wrong))
 
-    # "demote needs the parent session (--into)" was the whole refusal, so a
-    # reader could not tell whether the tool had looked for one. It now says
+    # "demote needs the parent session (--into-session)" was the whole refusal,
+    # so a reader could not tell whether the tool had looked for one. It now says
     # which record was missing or silent, and either names the candidate the
     # spawn corpus offers or says there is none.
     with tempfile.TemporaryDirectory() as td:
@@ -9351,8 +9356,8 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         from_receipt = refused(lonely, stored={"grammar": "rooted", "root": "y"})
         told_why = {
             "every refusal still names the flag": all(
-                "--into" in said for said in (with_payload, without, nameless,
-                                              borne, from_receipt)),
+                "--into-session" in said for said in (with_payload, without,
+                                                      nameless, borne, from_receipt)),
             "a candidate is named when one exists":
                 "LEADER" in with_payload and "mate@TEAMX" in with_payload,
             "no candidate is said plainly":
@@ -10971,7 +10976,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # the command that runs. Reported first and resolved after, the lead would
     # print the team it is leaving and then launch onto another one.
     if not (0 <= lead_block.find("args.to_team") < lead_block.find("report_launch(")):
-        split.append("--to-team on a lead is not resolved before the report")
+        split.append("--into-team on a lead is not resolved before the report")
     if set(reporters) - {"run_one", "run_selftest"}:
         split.append("reported from " + ", ".join(
             sorted(set(reporters) - {"run_one", "run_selftest"})))
@@ -11247,8 +11252,8 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         elif "\n".join(alone["lines"]) + "\n" != rooted_bytes:
             faults.append("a carried demote did not restore the original bytes")
 
-        # --into names a parent other than the one it came from, which is the
-        # only reason the flag exists. The carried record is consumed either
+        # --into-session names a parent other than the one it came from, which
+        # is the only reason the flag exists. The carried record is consumed either
         # way and goes back verbatim, because rebuilding it from fields this
         # demote deliberately changed would refuse the operation it is for.
         elsewhere = eng.conversion_plan(carried, "demote", into="ELSEWHERE")
@@ -12982,7 +12987,10 @@ def main():
     verbs.add_argument("--as", dest="as_", metavar="NAME@TEAM",
                        help="the identity a promoted teammate joins as; the team "
                             "half must be typed")
-    verbs.add_argument("--into", metavar="SESSION",
+    # dest pinned here and on --into-team: the option string is what a person
+    # types, the attribute is what the rest of the file reads, and renaming one
+    # must not rename the other.
+    verbs.add_argument("--into-session", dest="into", metavar="SESSION",
                        help="the parent session a demoted transcript embeds under")
     verbs.add_argument("--no-launch", action="store_true",
                        help="promote writes files and prints the launch line "
@@ -13001,7 +13009,7 @@ def main():
                             "so placeholder spawns die at connect instead of reaching the API")
     verbs.add_argument("--unpoison", action="store_true",
                        help="remove the dead-port override from the swarm server")
-    placing.add_argument("--to-team", metavar="TEAM|live",
+    placing.add_argument("--into-team", dest="to_team", metavar="TEAM|live",
                          help="move this agent onto another team (live = the team its live "
                               "lead now runs as); a running one is restarted, a dead one "
                               "comes up there")
@@ -13021,7 +13029,7 @@ def main():
     careful.add_argument("--dry-run", action="store_true",
                          help="preview without launching")
     careful.add_argument("--force", action="store_true",
-                         help="override the running-copy and identity guards; with --to-team, "
+                         help="override the running-copy and identity guards; with --into-team, "
                               "also take the rewrite route when the old team cannot be retired")
     careful.add_argument("--yes", "-y", action="store_true",
                          help="do not ask before ending a process: a --stop, or the "

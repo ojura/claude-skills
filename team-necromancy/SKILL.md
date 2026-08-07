@@ -65,8 +65,8 @@ agent-resume NAME@session-xxxx               # exact agent id
 agent-resume <session-uuid>                  # exact transcript
 agent-resume session-xxxx                    # whole team: members into panes, lead last
 agent-resume session-xxxx --no-lead          # members only, lead already alive
-agent-resume NAME --to-team live             # rebind onto the team the lead now runs as
-agent-resume <lead-uuid> --to-team TEAM      # move the lead itself; its crew stays put
+agent-resume NAME --into-team live           # rebind onto the team the lead now runs as
+agent-resume <lead-uuid> --into-team TEAM    # move the lead itself; its crew stays put
 agent-resume NAME --stop                     # stop it, listing what it is working on first
 agent-resume session-xxxx --stop             # stop the whole team
 ```
@@ -89,7 +89,12 @@ A bare name is resolved only when it is unambiguous; if several rosters carry
 it (every team has a `team-lead`) the tool lists the candidates and refuses
 rather than picking one for you.
 
-`--to-team TEAM|live` exists because a plain `claude --resume` boots the lead
+The `--into-` flags are the destinations, and only they are: `--into-team` is the
+team an agent comes up on, `--into-session` the parent a demoted transcript
+embeds under. `--team` says which agents a run is about and `--as` gives a
+promoted transcript its identity, so neither is spelled that way.
+
+`--into-team TEAM|live` exists because a plain `claude --resume` boots the lead
 into a **brand new implicit team**, orphaning the members registered under the
 old one: the lead's SendMessage resolves against the team it is now running as,
 so the old roster is unreachable. The rebind relaunches the member with the
@@ -107,7 +112,7 @@ It composes with `--team`, which is the one-command answer to "I resumed my
 lead and my team is orphaned":
 
 ```bash
-agent-resume session-<old-team> --to-team live   # whole roster, redirected
+agent-resume session-<old-team> --into-team live   # whole roster, redirected
 ```
 
 Two operations hide behind the word rebind, and the tool separates them:
@@ -116,27 +121,27 @@ Two operations hide behind the word rebind, and the tool separates them:
   and writes the roster entries. It kills nothing.
 - **migrate** changes a *live* member's team, which is necessarily kill and
   restart: identity is frozen in argv at exec, and two processes must never
-  append to one transcript. That is what `--to-team`'s kills are, the mechanism
+  append to one transcript. That is what `--into-team`'s kills are, the mechanism
   rather than a policy.
 
-A lead moves the same way, and `--to-team TEAM` is the only way to ask for it:
+A lead moves the same way, and `--into-team TEAM` is the only way to ask for it:
 the run ends whoever is running that conversation (asking first, `--yes` to
 skip), retires the team its window-start stamps name so the flags win after the
 next restart, and execs it as TEAM's lead. Under `--force` against a team
 something is still running as, it restamps those two fields instead and the old
 team stays up. The lead moves alone: no member is restarted or re-stamped, so
 the report names who stays behind, what mail waits for them there, and that
-`--to-team live` on each member is what moves one.
+`--into-team live` on each member is what moves one.
 
 The team inside an agent id is an address, never a destination. Writing
 `agent-resume team-lead@TEAM --resume <uuid>` says which agent to come back as;
 it never moves one. Where the stamps on that conversation name a different team,
-the run refuses and names `--to-team TEAM` as the flag that performs the move
+the run refuses and names `--into-team TEAM` as the flag that performs the move
 (`--force` launches it as it stands, split between the two teams). Where the
 conversation carries no stamps, it is the plain masquerade it always was: a
 launch, with no crew report and nothing retired.
 
-So the default may redirect, and only `--to-team` may migrate. Reviving a dead
+So the default may redirect, and only `--into-team` may migrate. Reviving a dead
 member while its lead is live under a different team redirects automatically,
 saying so, and `--keep-team` opts out. A member that is still running is left
 alone with a hint, because restarting it costs its in-flight turn. Redirect
@@ -159,7 +164,7 @@ Leads are never spawned into a pane. Selecting one builds the Recipe 3
 masquerade command and execs it in your terminal (or prints it, under
 `--team`, `--dry-run`, or a non-tty), because a masqueraded lead is an
 interactive session you drive, and a pane-backed one would be reaped by the
-next lead's exit. `--to-team` moves it onto a team it did not lead; naming that
+next lead's exit. `--into-team` moves it onto a team it did not lead; naming that
 team inside the agent id instead only addresses it, and where the conversation's
 stamps disagree the run refuses and points at the flag (see the rebind section
 below). Members come up first: the mailbox is a directory, not a

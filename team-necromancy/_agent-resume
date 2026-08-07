@@ -142,13 +142,13 @@ _agent-resume() {
     '--resume[resume this session transcript (by uuid)]:session uuid:{_agent_resume_topic sessions "session uuid"}' \
     '--team[resume this whole team by name: the members, then the lead]:team:{_agent_resume_topic teams team}' \
     '--no-lead[skip the lead when bringing up the whole team]' \
-    '--to-team[move this agent onto another team (live = the team its live lead now runs as); a running one is restarted]:team:{_agent_resume_topic teams team}' \
+    '--into-team[move this agent onto another team (live = the team its live lead now runs as); a running one is restarted]:team:{_agent_resume_topic teams team}' \
     '--keep-team[resume a member on its recorded team even when its lead now runs as another one]' \
     '--socket[use this swarm tmux socket instead of detecting or creating one]:socket:{_agent_resume_topic sockets socket}' \
     '--tmux-session[use this tmux session name instead of the default claude-swarm]:session:' \
     '--tmux-window[use this tmux window name instead of the default swarm-view]:window:' \
     '--claude-bin[launch this claude binary instead of the one on PATH]:binary:_files' \
-    '--force[override the running-copy and identity guards; with --to-team, take the rewrite route]' \
+    '--force[override the running-copy and identity guards; with --into-team, take the rewrite route]' \
     '--dry-run[preview without launching]' \
     '--explain[say where each launch fact came from before launching]' \
     '--no-update-config[do not write resumed agents into the team roster]' \
@@ -172,7 +172,7 @@ _agent-resume() {
     '--promote[convert a subagent side transcript into a resumable teammate]:side:{_agent_resume_topic sides side}' \
     '--demote[convert a teammate transcript back into a side transcript]:session:{_agent_resume_topic sessions session}' \
     '--as[the identity a promoted teammate joins as (name@team)]:identity:' \
-    '--into[the parent session a demoted transcript embeds under]:session:{_agent_resume_topic sessions session}' \
+    '--into-session[the parent session a demoted transcript embeds under]:session:{_agent_resume_topic sessions session}' \
     '--no-launch[promote writes files and prints the launch line instead of launching]' \
     '--with-mail[archive unread inbox mail into the receipt instead of refusing]' \
     '--stop[stop the agent, session or team instead of resuming it]' \
