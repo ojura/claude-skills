@@ -4440,11 +4440,13 @@ def enforce_restore(ctx, args):
     path = getattr(ctx["resolution"], "path", None)
     if not path:
         return
-    # A lead move has already been through the rebind step, which retired the
-    # team the stamps name or rewrote them. Asking again here would re-refuse a
-    # move this run has just made, and in a dry run, where neither has happened
-    # yet, would refuse the preview of it. Nothing on the member path sets this.
-    if ctx.get("lead_moving"):
+    # A move has already been through the rebind step, which retired the team
+    # the stamps name or rewrote them. Asking again here would re-refuse a move
+    # this run has just made, and in a dry run, where neither has happened yet,
+    # would refuse the preview of it. Both paths record it, and both record it
+    # only once the rebind came back with the route it took: a blocked one
+    # records nothing, so a launch that never moved still meets the refusal.
+    if ctx.get("lead_moving") or ctx.get("member_moving"):
         return
     stamped, state = RESOLVER.restored_identity(path)
     if state != "restored":
@@ -6122,7 +6124,14 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         stamped, state = (RESOLVER.restored_identity(rebinding)
                           if rebinding else (None, None))
         if state == "restored" and stamped != dest:
-            rebind_reap(stamped, dest, args, prefix)
+            # The route it took comes back truthy, and recording it is what
+            # keeps the identity gate below from re-refusing the move this run
+            # has just made - or, in a dry run, where the reap only printed its
+            # would-lines, from refusing the preview of a launch that works.
+            # A blocked rebind stops the run here rather than returning, so the
+            # record is written only where the move really was taken.
+            if rebind_reap(stamped, dest, args, prefix):
+                ctx["member_moving"] = dest
     else:
         forge_team(ctx, args.dry_run)
         auto_redirect(ctx, args, table, prefix)
@@ -8856,6 +8865,101 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         else:
             globals().pop("input", None)
         shutil.rmtree(lead_receipts, ignore_errors=True)
+
+    # --- the member move, and the preview of it, driven through run_one
+    # The member path retires the team the stamps name before the identity
+    # gate, so a real run has already made the two agree by the time the gate
+    # re-reads the file. A dry run prints the same lines and changes nothing,
+    # and the gate then read the untouched file and refused the preview of a
+    # launch that works. The move now says it was taken, and only a move that
+    # was taken says so, which is what the last arm here is for.
+    MEMBER_STAMPED = "22222222-2222-4222-8222-222222222222"
+
+    def closed_member(root):
+        """willow's conversation, closed by a last-prompt trailer so its window
+        start resolves and reads session-corpus-alpha. Unclosed it restores as
+        nobody, and then a rebind onto another team has nothing to contradict.
+        Planted per run rather than in the shared corpus, which every other
+        check reads."""
+        held = root / "projects" / "corpus" / f"{MEMBER_STAMPED}.jsonl"
+        held.write_text(held.read_text() + json.dumps(
+            {"type": "last-prompt", "leafUuid": "an-2", "sessionId": MEMBER_STAMPED,
+             "lastPrompt": "go"}, separators=(",", ":")) + "\n")
+
+    def member_move(**over):
+        return resume_run("willow@session-corpus-alpha", to_team="session-corpus-crew",
+                          prepare=closed_member, **over)
+
+    real_receipts = RECEIPTS_DIR
+    member_receipts = Path(tempfile.mkdtemp())
+    globals()["RECEIPTS_DIR"] = member_receipts
+    real_reap = globals()["rebind_reap"]
+    retired = member_receipts / "session-corpus-alpha.json"
+    previews = []
+    try:
+        drawn, _e, _s, drawn_said = member_move(dry_run=True)
+        told = " ".join(drawn_said.split())
+        if drawn != "launched":
+            previews.append(f"the preview did not reach its launch ({drawn})")
+        for owed in ("would reap session-corpus-alpha", "would run in pane"):
+            if owed not in told:
+                previews.append(f"the preview does not say {owed!r}")
+        if "undoes itself" in told:
+            previews.append("the preview refused the move it had just previewed")
+        if retired.exists():
+            previews.append("the dry run retired the team anyway")
+
+        # Blocked, and the run stops where it always did: a live wearer of the
+        # team the stamps name, with no --force to buy the restamp instead.
+        wearer = [(4242, 1, f"{FAKE_AGENT_BIN} --agent-id echo@session-corpus-alpha")]
+        for tense, over in (("preview", {"dry_run": True}), ("run", {})):
+            stopped, _e, _s, stopped_said = member_move(table=wearer, **over)
+            blocked_told = " ".join(stopped_said.split())
+            if stopped != "refused":
+                previews.append(f"a blocked {tense} was not refused ({stopped})")
+            if "pid 4242 wears it" not in blocked_told:
+                previews.append(f"a blocked {tense} does not name the wearer")
+            if retired.exists():
+                previews.append(f"a blocked {tense} retired the team anyway")
+
+        # A move that did not happen, and the gate that catches it. The member
+        # path stops the run on a blocker rather than carrying on, so the only
+        # way to reach the gate with the move untaken is to hand the run a
+        # rebind that declines: the launch must then meet the refusal, which is
+        # also what makes this check fail if the gate's body ever goes.
+        globals()["rebind_reap"] = lambda *a, **k: False
+        try:
+            ungated, _e, _s, ungated_said = member_move(dry_run=True)
+        finally:
+            globals()["rebind_reap"] = real_reap
+        if ungated != "refused":
+            previews.append(f"a launch that never moved was not refused ({ungated})")
+        if "undoes itself" not in " ".join(ungated_said.split()):
+            previews.append("a launch that never moved lost the refusal")
+
+        # And the real run, unchanged: it retires the team and reaches its
+        # spawn. The roster the harness reads back afterwards is the one the
+        # reap took, so the server it spawned on is what answers here.
+        server = _FakeTmux()
+        try:
+            ran = member_move(server=server)[0]
+        except OSError:
+            ran = "launched"  # the roster is gone, which is the reap working
+        if ran != "launched":
+            previews.append(f"the real move did not reach its launch ({ran})")
+        if not any(a[0] in ("split-window", "new-window", "new-session")
+                   for a in server.ran):
+            previews.append("the real move never reached tmux")
+        if not retired.exists():
+            previews.append("the real move retired nothing")
+    finally:
+        globals()["RECEIPTS_DIR"] = real_receipts
+        globals()["rebind_reap"] = real_reap
+        shutil.rmtree(member_receipts, ignore_errors=True)
+    check("member-rebind-preview-launches",
+          "a member's move previews the launch it would make, and a launch that "
+          "did not move is still refused",
+          not previews, ", ".join(previews[:3]))
 
     # Reading the spawn log unfilled returns an empty list, which is also what a
     # transcript that spawned nobody returns, so a missed fill is a false negative
