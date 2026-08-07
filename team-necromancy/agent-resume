@@ -62,6 +62,24 @@ from pathlib import Path
 # the command, its completion, its install targets and its backup suffixes.
 TOOL = Path(__file__).resolve().name
 
+# A promoted transcript carries the parameters of its own undo, as its last
+# line. The harness parses every line and acts on the ones it recognises: the
+# type dispatch in 2.1.220 is a chain of equality tests with no final branch,
+# the line splitter is a bare try/JSON.parse/catch with no schema, and a record
+# that is not a message never enters the map the parent walk reads. So this is
+# inert to it and readable by us. Only the transform parameters ride here; the
+# lifecycle record (state, history, the spoken identity) stays a file, because
+# a reap has no transcript to write into and membership must be enumerable
+# without opening every transcript on the machine.
+RECEIPT_RECORD = f"{TOOL}-receipt"
+# Rendered from a fixed, sorted key list so that both directions of the
+# conversion emit the same bytes for the same conversion. Anything a single
+# direction fills (the stripped trailers, the sidechain fields a demote
+# inserted) is left out: it would make the line depend on which way it was
+# written, and the inverse proof compares bytes.
+RECEIPT_KEYS = ("cut", "cut_lines", "cut_parent", "dest_stem", "graft",
+                "grammar", "meta", "parent", "ref", "root", "task_id")
+
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 TEAMS_DIR = CLAUDE_DIR / "teams"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
@@ -3250,6 +3268,11 @@ class Resolver:
                 body = set(chain[:chain.index(cut_id) + 1])
             cut_lines = []
             for n, raw, rec, style in parsed:
+                if rec.get("type") == RECEIPT_RECORD:
+                    # A receipt left behind by an earlier cycle, which the
+                    # growth rule kept. It is content now, not vocabulary.
+                    out.append(raw)
+                    continue
                 if (n == 1 and receipt["grammar"] == "pointer"
                         and rec.get("type") == "fork-context-ref"):
                     receipt["ref"] = raw
@@ -3305,9 +3328,28 @@ class Resolver:
                            "leafUuid": leaf, "sessionId": dest}
                 out.append(json.dumps(trailer, separators=(",", ":"), ensure_ascii=False))
                 receipt["trailer"] = out[-1]
+            # Last, after the trailer the harness needs, so that a demote with
+            # nothing in between finds it where it left it. Undoing a demote is
+            # the exception: a file promoted before transcripts carried their
+            # own parameters had no such line, and the inverse restores bytes
+            # rather than improving on them.
+            if receipt.get("in_file", True):
+                out.append(self._receipt_line(receipt))
         else:
             trailers, inserted = [], []
+            last_n = parsed[-1][0] if parsed else None
+            consumed = False
             for n, raw, rec, style in parsed:
+                if rec.get("type") == RECEIPT_RECORD:
+                    # Ours, and only consumed while it is still the file's last
+                    # line. Anywhere else it is a line this conversion did not
+                    # author, so it rides through untouched rather than being
+                    # re-keyed or given a sidechain field it never had.
+                    if n == last_n:
+                        consumed = True
+                        continue
+                    out.append(raw)
+                    continue
                 if rec.get("type") == "last-prompt":
                     # Positions count earlier trailers too, so the undo can
                     # reinsert sequentially and land every line where it sat.
@@ -3340,7 +3382,35 @@ class Resolver:
                 out.insert(pos, raw)
             receipt["stripped"] = trailers
             receipt["inserted_sidechain"] = inserted
+            receipt["in_file"] = consumed
         return out, objections
+
+    @staticmethod
+    def _receipt_line(receipt):
+        """The trailing record a promoted transcript carries about itself."""
+        carried = {k: receipt[k] for k in RECEIPT_KEYS if receipt.get(k) is not None}
+        return json.dumps({"type": RECEIPT_RECORD, "receipt": carried},
+                          separators=(",", ":"), ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def carried_receipt(raws):
+        """The transform parameters a promoted file carries, when they are still
+        its last line, else None.
+
+        Last means last. Once the harness has written anything past it the
+        record is history rather than this file's undo, and the conversion
+        treats it as any other line it did not author.
+        """
+        if not raws:
+            return None
+        try:
+            rec = json.loads(raws[-1])
+        except ValueError:
+            return None
+        if not isinstance(rec, dict) or rec.get("type") != RECEIPT_RECORD:
+            return None
+        carried = rec.get("receipt")
+        return carried if isinstance(carried, dict) else None
 
     @staticmethod
     def _edit_closure(before, after, extra=()):
@@ -3403,7 +3473,11 @@ class Resolver:
             out, objections = self._convert(raws, "promote", receipt)
             dest_path = source.parent.parent.parent / f"{receipt['dest_stem']}.jsonl"
         else:
-            stored = stored or {}
+            # The file's own trailing record first: it describes these bytes,
+            # travels with them, and answers even when the receipts directory
+            # is gone. The stored one still answers for anything promoted
+            # before transcripts carried their own.
+            stored = {**(stored or {}), **(self.carried_receipt(raws) or {})}
             into = into or stored.get("parent")
             if not into:
                 return {"objections": ["demote needs the parent session (--into)"],
@@ -9520,7 +9594,8 @@ def run_selftest(live=False, failed_only=False, list_only=False):
              "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}},
         ]
         rooted = sub / "agent-t1.jsonl"
-        rooted.write_text("".join(compact(r) + "\n" for r in rows))
+        rooted_bytes = "".join(compact(r) + "\n" for r in rows)
+        rooted.write_text(rooted_bytes)
         (sub / "agent-t1.meta.json").write_text('{"agentType":"x","name":"t"}')
         eng = Resolver(needs=Needs(maybe=set(NEED)))
         eng.projects_dir = Path(td)
@@ -9532,7 +9607,9 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             body = "\n".join(plan["lines"])
             if '"isSidechain":true' in body or '"sessionId":"PARENT"' in body.rsplit("\n", 1)[0]:
                 faults.append("rooted promote left side fields")
-            if not plan["lines"][-1].startswith('{"type":"last-prompt"'):
+            if not plan["lines"][-1].startswith('{"receipt":'):
+                faults.append("rooted promote carries no receipt as its last line")
+            if not plan["lines"][-2].startswith('{"type":"last-prompt"'):
                 faults.append("rooted promote appended no trailer")
             if plan["dest_path"].stem != "cv-root":
                 faults.append("the stem is not the chain root")
@@ -9555,6 +9632,33 @@ def run_selftest(live=False, failed_only=False, list_only=False):
                 faults.append("demote left a trailer in the side file")
             if sum('"isSidechain":true' in line for line in dplan["lines"]) != 2:
                 faults.append("demote did not sidechain every record")
+        # The promoted file carries its own undo. Demoted with nothing stored
+        # anywhere, it still knows where it came from, which is the whole point
+        # of the record riding the bytes it describes.
+        carried = Path(td) / "proj" / "cv-root.jsonl"
+        carried.write_text("\n".join(plan["lines"]) + "\n")
+        alone = eng.conversion_plan(carried, "demote")
+        if alone["objections"] or not alone["proved"]:
+            faults.append(f"a carried receipt did not answer its own demote: "
+                          f"{alone['objections'] or 'unproved'}")
+        elif alone["dest_path"].name != "agent-t1.jsonl":
+            faults.append(f"the carried receipt lost the task id: {alone['dest_path'].name}")
+        elif "\n".join(alone["lines"]) + "\n" != rooted_bytes:
+            faults.append("a carried demote did not restore the original bytes")
+
+        # Last means last. With a turn written past it the record is history,
+        # so the demote leaves it where it sits instead of eating it.
+        grown = Path(td) / "proj" / "cv-grown.jsonl"
+        grown.write_text("\n".join(plan["lines"]) + "\n" + compact(
+            {"parentUuid": "cv-2", "sessionId": "cv-root", "type": "assistant",
+             "uuid": "cv-3"}) + "\n")
+        after = eng.conversion_plan(grown, "demote", into="PARENT", dest="t1")
+        if after["objections"] or not after["proved"]:
+            faults.append(f"a grown file did not demote: "
+                          f"{after['objections'] or 'unproved'}")
+        elif sum(RECEIPT_RECORD in line for line in after["lines"]) != 1:
+            faults.append("a receipt with a turn after it was not kept as growth")
+
         # a line the codec cannot reproduce is a refusal, not a best effort
         wonky = sub / "agent-w1.jsonl"
         wonky.write_text('{"parentUuid": null, "isSidechain": true, '
