@@ -66,6 +66,7 @@ agent-resume <session-uuid>                  # exact transcript
 agent-resume session-xxxx                    # whole team: members into panes, lead last
 agent-resume session-xxxx --no-lead          # members only, lead already alive
 agent-resume NAME --to-team live             # rebind onto the team the lead now runs as
+agent-resume <lead-uuid> --to-team TEAM      # move the lead itself; its crew stays put
 agent-resume NAME --stop                     # stop it, listing what it is working on first
 agent-resume session-xxxx --stop             # stop the whole team
 ```
@@ -118,6 +119,16 @@ Two operations hide behind the word rebind, and the tool separates them:
   append to one transcript. That is what `--to-team`'s kills are, the mechanism
   rather than a policy.
 
+A lead moves the same way, and `--to-team TEAM` on one is the same operation as
+the masquerade spelling `agent-resume team-lead@TEAM --resume <uuid>`: whichever
+you type, the run ends whoever is running that conversation (asking first,
+`--yes` to skip), retires the team its window-start stamps name so the flags win
+after the next restart, and execs it as TEAM's lead. Under `--force` against a
+team something is still running as, it restamps those two fields instead and the
+old team stays up. The lead moves alone: no member is restarted or re-stamped,
+so the report names who stays behind, what mail waits for them there, and that
+`--to-team live` on each member is what moves one.
+
 So the default may redirect, and only `--to-team` may migrate. Reviving a dead
 member while its lead is live under a different team redirects automatically,
 saying so, and `--keep-team` opts out. A member that is still running is left
@@ -141,7 +152,9 @@ Leads are never spawned into a pane. Selecting one builds the Recipe 3
 masquerade command and execs it in your terminal (or prints it, under
 `--team`, `--dry-run`, or a non-tty), because a masqueraded lead is an
 interactive session you drive, and a pane-backed one would be reaped by the
-next lead's exit. Members come up first: the mailbox is a directory, not a
+next lead's exit. Naming a team it did not lead, either with `--to-team` or
+inside the agent id, moves it there rather than launching it split between the
+two (see the rebind section below). Members come up first: the mailbox is a directory, not a
 process, so nobody has to wait for the lead.
 
 `--dry-run` previews (it does not cover `--install`/`--poison`, which refuse

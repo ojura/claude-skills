@@ -15,9 +15,13 @@ The bare argument is classified by shape:
     session-a52cb2af    a dir under teams/ -> --team (whole roster, lead last)
     teammate            bare agent name    -> resolved, or refused if several rosters claim it
 
---to-team TEAM|live rebinds a member onto another team: it relaunches the agent
-with that team's identity, replaces whichever process still holds the
-transcript, registers it in the destination roster and retires the source entry.
+--to-team TEAM|live moves an agent onto another team: it relaunches it with that
+team's identity, replaces whichever process still holds the transcript,
+registers it in the destination roster and retires the source entry. On a lead
+it moves the lead alone, which is what the masquerade spelling (team-lead@TEAM
+--resume <uuid>) does too: the crew stays on the old team and is named in the
+report, and the team the conversation comes back as is retired, or under --force
+restamped, so the move is still there after the next restart.
 
 --install sets up the ~/.local/bin symlink, zsh tab completion, and the
 Claude Code startup hook that runs --cleanup.
@@ -11914,7 +11918,8 @@ def main():
     parser.add_argument("--stop", "--terminate", action="store_true", dest="stop",
                         help="stop the agent, session or team instead of resuming it")
     parser.add_argument("--yes", "-y", action="store_true",
-                        help="do not ask before stopping")
+                        help="do not ask before ending a process: a --stop, or the "
+                             "one holding the conversation a move takes over")
     parser.add_argument("--dry-run", action="store_true",
                         help="preview without launching")
     parser.add_argument("--explain", action="store_true",

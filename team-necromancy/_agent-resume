@@ -176,7 +176,7 @@ _agent-resume() {
     '--no-launch[promote writes files and prints the launch line instead of launching]' \
     '--with-mail[archive unread inbox mail into the receipt instead of refusing]' \
     '--stop[stop the agent, session or team instead of resuming it]' \
-    '--yes[do not ask before stopping]' \
+    '--yes[do not ask before ending a process: a --stop, or the holder a move takes over]' \
     '--all[with a team, also resume members the roster no longer lists]' \
     '--poison[point the swarm server at a dead port so placeholder spawns die at connect instead of reaching the API]' \
     '--unpoison[remove the dead-port override from the swarm server]' \
