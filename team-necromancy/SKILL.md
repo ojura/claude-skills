@@ -14,9 +14,12 @@ seams-and-bugs.md for what is broken around it).
 ## agent-resume: Recipes 1b and 3, scripted
 
 `agent-resume` in this directory automates the
-common cases: finding the soul, merging identity from three sources (the
-roster, the agent's own transcript, and the lead transcript's record of
-spawning it) with the most recent winning, except that spawn records always
+common cases: finding the soul, merging identity from six sources (the
+roster, the agent's own transcript, the lead transcript's record of
+spawning it, and three conditional ones: the identity a live process wears
+when a live pid is what found the transcript, a dead-team lead's own spawn
+payloads, and the engine's lead-session lookup for a missing parent) with
+the most recent winning, except that spawn records always
 lose ties and a bracketed model variant beats a plainer newer one, resolving
 the swarm socket (the session registry feeds that, not identity), forging the
 team dir if a graceful lead exit deleted it (see Forging below), and
