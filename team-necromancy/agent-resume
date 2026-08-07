@@ -10,10 +10,11 @@ restamped, so the move is still there after the next restart. The team inside an
 agent id is an address and never a destination: the masquerade spelling
 (team-lead@TEAM --resume <uuid>) launches under that name and moves nothing.
 
-The --into- flags are the destinations, and only they are: --into-team is the
-team an agent comes up on, --into-session is the parent a demoted transcript
-embeds under. --team says which agents a run is about and --as gives a promoted
-transcript its identity, so neither is spelled that way.
+Three flags name a destination, and they are the only ones that do: --into-team
+is the team an agent comes up on, --into-session the parent a demoted transcript
+embeds under, --as-agent the identity a promoted transcript comes up as. --team
+is not one of them: it says which agents a run is about, so it is not spelled
+that way.
 
 --install sets up the ~/.local/bin symlink, zsh tab completion, and the
 Claude Code startup hook that runs --cleanup.
@@ -7249,7 +7250,7 @@ def rebind_reap(stamped, dest, args, prefix="", path=None, fatal=True):
 
 
 def run_promote(args):
-    """--promote <side> [--as name@team]: a side transcript becomes a teammate."""
+    """--promote <side> [--as-agent name@team]: a side transcript becomes a teammate."""
     entry, why = RESOLVER.side_transcript(args.promote)
     if not entry:
         die(why)
@@ -7260,7 +7261,7 @@ def run_promote(args):
     defaulted = not name
     name = name or entry["name"] or entry["task_id"]
     if not team:
-        die("the destination team must be typed: --as name@team")
+        die("the destination team must be typed: --as-agent name@team")
     # The spoken identity goes in before the plan is built, because until the
     # first launch registers this member the promoted transcript is the only
     # thing that says who it is, and it says so in the line it carries.
@@ -13100,12 +13101,15 @@ def main():
     verbs.add_argument("--demote", metavar="SESSION",
                        help="convert a teammate transcript back into a side "
                             "transcript under its parent's subagents/")
-    verbs.add_argument("--as", dest="as_", metavar="NAME@TEAM",
+    # dest pinned here and on --into-session and --into-team: the option string
+    # is what a person types, the attribute is what the rest of the file reads,
+    # and renaming one must not rename the other. as_ started out as a way
+    # around "as" being a Python keyword; --as-agent would derive a usable
+    # as_agent, so the explicit dest is now only here to keep args.as_ the same
+    # while the option string changes.
+    verbs.add_argument("--as-agent", dest="as_", metavar="NAME@TEAM",
                        help="the identity a promoted teammate joins as; the team "
                             "half must be typed")
-    # dest pinned here and on --into-team: the option string is what a person
-    # types, the attribute is what the rest of the file reads, and renaming one
-    # must not rename the other.
     verbs.add_argument("--into-session", dest="into", metavar="SESSION",
                        help="the parent session a demoted transcript embeds under")
     verbs.add_argument("--no-launch", action="store_true",

@@ -171,7 +171,7 @@ _agent-resume() {
     '--mail-ledger[join a team'"'"'s sends against its deliveries]' \
     '--promote[convert a subagent side transcript into a resumable teammate]:side:{_agent_resume_topic sides side}' \
     '--demote[convert a teammate transcript back into a side transcript]:session:{_agent_resume_topic sessions session}' \
-    '--as[the identity a promoted teammate joins as (name@team)]:identity:' \
+    '--as-agent[the identity a promoted teammate joins as (name@team)]:identity:' \
     '--into-session[the parent session a demoted transcript embeds under]:session:{_agent_resume_topic sessions session}' \
     '--no-launch[promote writes files and prints the launch line instead of launching]' \
     '--with-mail[archive unread inbox mail into the receipt instead of refusing]' \

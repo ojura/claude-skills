@@ -89,10 +89,11 @@ A bare name is resolved only when it is unambiguous; if several rosters carry
 it (every team has a `team-lead`) the tool lists the candidates and refuses
 rather than picking one for you.
 
-The `--into-` flags are the destinations, and only they are: `--into-team` is the
-team an agent comes up on, `--into-session` the parent a demoted transcript
-embeds under. `--team` says which agents a run is about and `--as` gives a
-promoted transcript its identity, so neither is spelled that way.
+Three flags name a destination, and they are the only ones that do: `--into-team`
+is the team an agent comes up on, `--into-session` the parent a demoted
+transcript embeds under, `--as-agent` the identity a promoted transcript comes up
+as. `--team` is not one of them: it says which agents a run is about, so it is
+not spelled that way.
 
 `--into-team TEAM|live` exists because a plain `claude --resume` boots the lead
 into a **brand new implicit team**, orphaning the members registered under the
