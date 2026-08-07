@@ -409,9 +409,9 @@ def abort_agents(running, assume_yes=False):
         # that was merely still on its way out.
         for _ in range(10):
             time.sleep(0.15)
-            if not pid_alive(pid):
+            if not RESOLVER.pid_alive(pid):
                 break
-        if result.returncode == 0 and not pid_alive(pid):
+        if result.returncode == 0 and not RESOLVER.pid_alive(pid):
             killed += 1
             continue
         warn(f"pid {pid} ({agent_id}) did not stop"
@@ -904,7 +904,7 @@ class Resolver:
             if block:
                 for data in self.session_registry():
                     if str(data.get("sessionId", "")).startswith(block.group(1)):
-                        if pid_alive(data["pid"], data.get("procStart")):
+                        if self.pid_alive(data["pid"], data.get("procStart")):
                             # The registry records the id a life resumed from,
                             # not the identity restore gave it: a transcript
                             # whose window-start restores to another team makes
@@ -1120,7 +1120,7 @@ class Resolver:
                 "team": None,
                 "updated": data.get("updatedAt") or 0,
                 "started": data.get("startedAt") or 0,
-                "alive": pid_alive(pid, data.get("procStart")),
+                "alive": self.pid_alive(pid, data.get("procStart")),
             }
         for pid, _, args in self.ps_table():
             if not self.is_claude(args):
@@ -1241,6 +1241,74 @@ class Resolver:
         appending to one JSONL is the thing to never allow, and a rebind changes the
         agent-id, so identity is the wrong key here."""
         return self._claude_procs(f"--resume {session_uuid}", table)
+
+    def _proc_stat(self, pid):
+        """(state, starttime) from /proc/pid/stat, fields 3 and 22.
+
+        The rawest read of the process realm, so it stays private: what a
+        state letter means is pid_alive's and state_note's to say, and a
+        caller left to interpret one for itself would be the second opinion
+        this whole fence is against.
+        """
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return None, None
+        try:
+            rest = stat[stat.rindex(")") + 2:].split()
+            return rest[0], rest[19]
+        except (ValueError, IndexError):
+            return None, None
+
+    def pid_alive(self, pid, procstart=None):
+        """Is this process still running, and still the one that was meant?
+
+        A zombie is not alive. A ctrl-z'd process is: it still owns its
+        session and will pick up where it left off; callers nudge instead of
+        stepping on it. `procstart` is what stops a recycled pid number from
+        answering yes for a stranger.
+        """
+        state, st = self._proc_stat(pid)
+        if st is None or state in ("Z", "X"):
+            return False
+        return procstart in (None, "", st)
+
+    def state_note(self, pid):
+        """Suffix for a pid we are reporting as alive, when it needs a nudge."""
+        state = self._proc_stat(pid)[0]
+        if state in ("T", "t"):
+            return f", suspended; `kill -CONT {pid}` (or fg) to wake it"
+        return ""
+
+    def proc_env(self, pid, names):
+        """The values this process was given for these environment variables.
+
+        Env is fixed at exec, so this is what the process is actually running
+        with rather than what anyone since has set. Nothing outside can read
+        it and stay honest: /proc/<pid>/environ is the only source.
+        """
+        try:
+            raw = Path(f"/proc/{pid}/environ").read_bytes()
+        except OSError:
+            return {}
+        found = {}
+        for item in raw.split(b"\0"):
+            if b"=" not in item:
+                continue
+            key, value = item.split(b"=", 1)
+            key = key.decode("utf-8", "replace")
+            if key in names:
+                found[key] = value.decode("utf-8", "replace")
+        return found
+
+    def _cmdline(self, pid):
+        """One process's argv as a string, for a pid the process table did not
+        carry. Private: the table is how everything else asks."""
+        try:
+            return Path(f"/proc/{pid}/cmdline").read_bytes().replace(
+                b"\0", b" ").decode(errors="replace").strip()
+        except OSError:
+            return ""
 
     def ps_table(self, refresh=False):
         """[(pid, ppid, args)] for every process we can see, snapshotted once.
@@ -1591,7 +1659,7 @@ class Resolver:
         live = [
             (data["pid"], data.get("startedAt") or 0)
             for data in self.session_registry()
-            if pid_alive(data["pid"], data.get("procStart"))
+            if self.pid_alive(data["pid"], data.get("procStart"))
         ]
         pairs = []
         for cfg, data, _mtime in self.rosters():
@@ -3009,7 +3077,7 @@ class Resolver:
         ppid = parents.get(pid)
         if not ppid:
             return None
-        match = re.search(r"-L\s+(\S+)", cmdline(ppid))
+        match = re.search(r"-L\s+(\S+)", self._cmdline(ppid))
         return match.group(1) if match else None
 
     def crew_sockets(self, team, table):
@@ -3877,28 +3945,6 @@ RESOLVER = Resolver()
 
 
 
-def proc_stat(pid):
-    """(state, starttime) from /proc/pid/stat, fields 3 and 22."""
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return None, None
-    try:
-        rest = stat[stat.rindex(")") + 2:].split()
-        return rest[0], rest[19]
-    except (ValueError, IndexError):
-        return None, None
-
-
-def pid_alive(pid, procstart=None):
-    """A zombie is not alive. A ctrl-z'd process is: it still owns its session
-    and will pick up where it left off; callers nudge instead of stepping on it."""
-    state, st = proc_stat(pid)
-    if st is None or state in ("Z", "X"):
-        return False
-    return procstart in (None, "", st)
-
-
 def hook_event():
     """The SessionStart payload on stdin, or None when there is nothing to read.
 
@@ -3913,14 +3959,6 @@ def hook_event():
         return json.loads(sys.stdin.read() or "null")
     except (OSError, ValueError):
         return None
-
-
-def state_note(pid):
-    """Suffix for a pid we are reporting as alive, when it needs a nudge."""
-    state = proc_stat(pid)[0]
-    if state in ("T", "t"):
-        return f", suspended; `kill -CONT {pid}` (or fg) to wake it"
-    return ""
 
 
 # What a revived pane needs from the lead's environment. The harness's swarm
@@ -3938,24 +3976,6 @@ AUTH_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKE
 INHERIT_ENV = AUTH_ENV + ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",)
 
 
-def proc_env(pid, names):
-    try:
-        raw = Path(f"/proc/{pid}/environ").read_bytes()
-    except OSError:
-        return {}
-    found = {}
-    for item in raw.split(b"\0"):
-        if b"=" not in item:
-            continue
-        key, value = item.split(b"=", 1)
-        key = key.decode("utf-8", "replace")
-        if key in names:
-            found[key] = value.decode("utf-8", "replace")
-    return found
-
-
-
-
 
 
 def inherit_credentials(ctx):
@@ -3968,7 +3988,7 @@ def inherit_credentials(ctx):
     if not (pid and alive):
         return []
     adopted = []
-    for key, value in proc_env(pid, INHERIT_ENV).items():
+    for key, value in RESOLVER.proc_env(pid, INHERIT_ENV).items():
         if not os.environ.get(key):
             os.environ[key] = value
             adopted.append(key)
@@ -3980,13 +4000,6 @@ def inherit_credentials(ctx):
         warn("no auth env var on this lead and no ~/.claude/.credentials.json; "
              "the revived agent will have nothing to authenticate with")
     return sorted(adopted)
-
-
-def cmdline(pid):
-    try:
-        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
-    except OSError:
-        return ""
 
 
 # ---------------------------------------------------------------- disk scanners
@@ -4255,7 +4268,7 @@ def already_running(ctx, args, is_lead, agent_id=None, table=None, here=(), pane
     migrating = bool(ctx.get("to_team")) and not ctx.get("auto_redirect")
     if not is_lead and here and not migrating:
         return (f"{agent_id} is already running in pane {pane} "
-                f"(pid {here[0]}{state_note(here[0])})", True)
+                f"(pid {here[0]}{RESOLVER.state_note(here[0])})", True)
     if not is_lead and ctx.get("to_team"):
         return None
     owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
@@ -4267,7 +4280,7 @@ def already_running(ctx, args, is_lead, agent_id=None, table=None, here=(), pane
             sock, s_why = RESOLVER.socket_hosting([agent_id], table)
             where = f", in a {s_why} on {sock}" if sock else ", outside any tmux pane"
         return (f"session {ctx['session_uuid']} is live as pid {owner[0]}"
-                f"{state_note(owner[0])}{where}; pass --force to run a second copy", False)
+                f"{RESOLVER.state_note(owner[0])}{where}; pass --force to run a second copy", False)
     if not is_lead and agent_id:
         live = RESOLVER.live_agent_procs(agent_id, table)
         elsewhere = [pid for pid, _ in live if pid not in here]
@@ -4398,7 +4411,7 @@ def apply_selector(token, args, table):
         for entry in value:
             agent_id = entry["member"].get("agentId")
             procs = RESOLVER.live_agent_procs(agent_id, table)
-            state = f"running{state_note(procs[0][0])}" if procs else "not running"
+            state = f"running{RESOLVER.state_note(procs[0][0])}" if procs else "not running"
             warn(f"    {agent_id:<44} joined {ms_str(entry['ts'])}  [{state}]")
         die("pass one of those ids, or a session uuid")
     else:
@@ -5741,7 +5754,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
                 # Two processes appending to one transcript is the state this
                 # prevents, so a kill that did not work has to be said out loud
                 # rather than reported as a clean rebind.
-                if killed.returncode != 0 or pid_alive(pid):
+                if killed.returncode != 0 or RESOLVER.pid_alive(pid):
                     warn(f"pid {pid} did not die ({(killed.stderr or b'').decode().strip() or 'still running'}); "
                          "it is still appending to this transcript")
     # One step for every way this agent could already be alive: in this pane,
@@ -7594,7 +7607,7 @@ def live_checks():
     try:
         with contextlib.redirect_stdout(io.StringIO()) as said:
             killed = abort_agents(running, assume_yes=True)
-        gone = all(not pid_alive(v.pid) for v in victims)
+        gone = all(not RESOLVER.pid_alive(v.pid) for v in victims)
         check("abort-stops-listed", "an abort stops what it listed", killed == 2 and gone,
               f"killed {killed}, all gone: {gone}")
         check("abort-listing-describes", "the abort listing says what each process is doing",
@@ -7613,7 +7626,7 @@ def live_checks():
         with contextlib.redirect_stdout(io.StringIO()):
             killed = abort_agents([(spared.pid, "spared@check", "still working", "")])
         check("abort-refusal-spares", "answering no leaves the process alone",
-              killed == 0 and pid_alive(spared.pid))
+              killed == 0 and RESOLVER.pid_alive(spared.pid))
     finally:
         if real_input is None:
             globals().pop("input", None)
@@ -8264,6 +8277,35 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         and node.lineno not in selftest_lines})
     check("pane-question-engine-only", "which panes exist and where we sit is asked only inside the engine",
           not pane_askers, "; ".join(pane_askers))
+
+    # The process realm has two sources and both are the engine's: the ps
+    # snapshot every run judges against, and /proc for the three questions ps
+    # does not answer (is this the same process, is it suspended, what
+    # environment is it running with). A second reader is how a pid comes back
+    # alive in one place and dead in another.
+    #
+    # Two spellings, because a rogue liveness test does not need /proc: signal
+    # 0 is the other idiom, and it disagrees with pid_alive in exactly the
+    # cases pid_alive was written for, a zombie and a recycled pid. Killing
+    # for real is untouched: it takes a signal that is not 0, and it verifies
+    # afterwards by asking the engine.
+    #
+    # live_checks is not exempted and needs no exemption: it kills real
+    # processes and asks RESOLVER.pid_alive whether they died, which is the
+    # shape every actor in this file uses.
+    proc_readers = set()
+    for node in ast.walk(tree):
+        line = getattr(node, "lineno", None)
+        if line is None or line in engine_lines or line in selftest_lines:
+            continue
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and "/proc/" in node.value:
+            proc_readers.add(f"a /proc path at line {line}")
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "kill" and len(node.args) == 2
+                and isinstance(node.args[1], ast.Constant) and node.args[1].value == 0):
+            proc_readers.add(f"a signal-0 liveness test at line {line}")
+    check("proc-read-engine-only", "a process is read only inside the engine",
+          not proc_readers, "; ".join(sorted(proc_readers)))
 
     # Wrapping serves the reader; the reader is not owed less. Every physical
     # line fits the width, and the reflowed text says word for word what the
