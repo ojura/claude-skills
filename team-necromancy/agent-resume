@@ -1699,7 +1699,7 @@ class Resolver:
             return "config.json is not a roster"
         return None
 
-    def receipt_contents(self, team_dir):
+    def receipt_contents(self, team_dir, only=None):
         """What a receipt taken from this team directory would hold, verbatim.
 
         The roster's bytes and every mailbox's bytes, each with the stat facts
@@ -1717,20 +1717,24 @@ class Resolver:
 
         A directory rather than a team name, because a reap reads the same team
         twice, once where it lives and once at the staged path it was renamed
-        to, and that path is nobody's team name.
+        to, and that path is nobody's team name. `only` narrows the question to
+        one mailbox, for the demote that archives a single inbox.
 
         A file that cannot be read answers with no text and the reason, so a
         torn roster is a stated fact rather than a missing entry.
 
         This answers and does not act: no rename, no write, no delete. What is
         done with the answer - preparing a receipt, making the cut, deleting
-        what was archived - belongs to reap_team.
+        what was archived - belongs to reap_team and archive_inbox.
         """
-        wanted = [team_dir / "config.json"]
-        try:
-            wanted += sorted((team_dir / "inboxes").glob("*.json"))
-        except OSError:
-            pass
+        if only is not None:
+            wanted = [team_dir / "inboxes" / only]
+        else:
+            wanted = [team_dir / "config.json"]
+            try:
+                wanted += sorted((team_dir / "inboxes").glob("*.json"))
+            except OSError:
+                pass
         reads = {}
         for path in wanted:
             key = ("config.json" if path.parent == team_dir
@@ -7570,6 +7574,76 @@ def reap_team(team, dry=False, prefix=""):
     return receipt_at
 
 
+def archive_inbox(team, name):
+    """Take one mailbox's bytes for a receipt without losing what lands mid-take.
+
+    reap_team's shape scaled to one file, and the cut is the same primitive one
+    level down: the rename of the inbox itself. Reading the file and then
+    writing [] over it loses whatever arrived in between, because that write is
+    a whole-file replace and knows nothing about the message it covers. A
+    rename takes the old bytes out of reach in one step, so a sender either
+    landed before the cut, and is read off the staged file into the receipt, or
+    lands after it and keeps what it wrote.
+
+    What is different one level down is that a directory can be vacated and a
+    mailbox cannot: an absent inbox is a name a sender may remake, and a
+    zero-byte one wedges reader and writer both. So an empty mailbox goes
+    straight back at the name, installed by a link from a file already holding
+    [], because a link is atomic and fails rather than overwriting. A sender
+    that got there first in that gap keeps its file and its mail; this takes
+    nothing from it.
+
+    Returns (the bytes for the receipt, the staged file). The caller unlinks
+    the staged file once the receipt naming those bytes is on disk, so a crash
+    in between leaves the mail in the staged copy rather than nowhere.
+    """
+    team_dir = RESOLVER.teams_dir / team
+    box = RESOLVER.inbox_path(team, name)
+    key = f"inboxes/{box.name}"
+    live = RESOLVER.receipt_contents(team_dir, only=box.name)
+    if live[key]["size"] is None:
+        return None, None      # no mailbox here to archive
+
+    staged = staged_path(box)
+    try:
+        os.rename(box, staged)
+    except OSError as exc:
+        die(f"cannot move {name}'s inbox aside to archive it: {exc}")
+    seed = staged.with_name(staged.name + ".seed")
+    try:
+        seed.write_text("[]")
+        os.link(seed, box)
+    except FileExistsError:
+        warn(f"{box} was remade while its mail was being archived; whatever is "
+             "in it now belongs to whoever wrote it and is left alone")
+    except OSError as exc:
+        warn(f"{box} could not be put back as an empty mailbox: {exc}; a sender "
+             "finds no inbox there until something seeds one")
+    finally:
+        try:
+            seed.unlink()
+        except OSError:
+            pass
+
+    caught = RESOLVER.receipt_contents(team_dir, only=staged.name)
+    taken = caught[key]["text"] if differing(live, caught) else live[key]["text"]
+
+    again = RESOLVER.receipt_contents(team_dir, only=staged.name)
+    if differing(caught, again):
+        # Same refusal as the reap's, for the same reason: one write past the
+        # cut is enough to say the file is not ours to take.
+        back = RESOLVER.receipt_contents(team_dir, only=box.name)
+        if back[key]["text"] == "[]":
+            os.rename(staged, box)   # the cut, run backwards
+            where = box
+        else:
+            where = staged           # a sender is using the name; leave it be
+        die(f"{name}'s inbox changed after it was moved aside, so something is "
+            f"still writing to it. Nothing was archived and nothing was emptied; "
+            f"the mail is at {where}")
+    return taken, staged
+
+
 def apply_restamp(plan):
     """Apply a proved restamp. Receipt first, mandatorily: a restamp that
     cannot write its confession refuses before touching the file."""
@@ -7796,14 +7870,14 @@ def run_demote(args):
     print(f"demote   {path.stem[:8]}  ->  {plan['dest_path']}")
     if args.dry_run:
         return 0
+    staged_mail = None
     if mate_team and mate and args.with_mail:
-        box = RESOLVER.teams_dir / mate_team / "inboxes" / f"{mate}.json"
-        try:
-            plan["receipt"]["mail"] = box.read_text()
-            replace_json(box, [])
-        except OSError:
-            pass
+        plan["receipt"]["mail"], staged_mail = archive_inbox(mate_team, mate)
     embed(plan)
+    if staged_mail is not None:
+        # The receipt naming those bytes is on disk now, so the copy they were
+        # read from can go. Until this point a crash leaves the mail in it.
+        staged_mail.unlink()
     print(f"receipt  {RECEIPTS_DIR}/{plan['receipt'].get('root') or path.stem}.json")
     return 0
 
@@ -9566,12 +9640,11 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     team_peekers = sorted(
         hit
         for node in tree.body if isinstance(node, ast.FunctionDef)
-        # The reads the reap used to do for itself are now the engine's
-        # receipt_contents, which hands back the bytes and the stat facts they
-        # were read under. run_demote still opens a mailbox for itself.
-        # run_selftest stages team dirs as fixtures and holds this check's own
-        # text.
-        and node.name not in {"run_demote", "run_selftest"}
+        # The reads the reap and the demote used to do for themselves are now
+        # the engine's receipt_contents, which hands back the bytes and the
+        # stat facts they were read under. run_selftest stages team dirs as
+        # fixtures and holds this check's own text.
+        and node.name not in {"run_selftest"}
         for hit in team_dir_reads(node))
     check("team-dir-read-engine-only", "a team directory is read only inside the engine",
           not team_peekers, "; ".join(team_peekers))
