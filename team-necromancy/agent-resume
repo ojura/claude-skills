@@ -3899,29 +3899,6 @@ def pid_alive(pid, procstart=None):
     return procstart in (None, "", st)
 
 
-def claude_ancestor(pid):
-    """The nearest claude process at or above this one, with its start time.
-
-    The hook runs as a grandchild of the session it belongs to, so the pid that
-    matters is up the tree rather than the one calling.
-    """
-    seen = 0
-    while pid and pid > 1 and seen < 8:
-        seen += 1
-        try:
-            argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode().replace("\0", " ")
-        except OSError:
-            return None, None
-        if RESOLVER.is_claude(argv):
-            return pid, proc_stat(pid)[1]
-        try:
-            ppid = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1]
-        except (OSError, IndexError):
-            return None, None
-        pid = int(ppid)
-    return None, None
-
-
 def hook_event():
     """The SessionStart payload on stdin, or None when there is nothing to read.
 
