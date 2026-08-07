@@ -242,15 +242,42 @@ report that judged mail from the inbox file while the ledger judged it from the
 transcripts, a liveness gate that could not see its own caller, a redirect aimed
 by a timing coincidence while the stamps said otherwise.
 
-Enforcement is per realm and incomplete. Transcripts and sessions are law, held
-by `transcript-pick-engine-only`, `tree-reached-via-engine` and their siblings.
-The other six are not yet. The largest single offender is `cruft_reason`, which
-reads a team directory and decides what it is. Settings are read outside the
-engine by `check_substrate`, which decides from `teammateMode` whether the
-configured substrate is one this tool can serve. The binary realm is examined in
-two places at once: `claude_binary` chooses what to launch, which is acting, and
-`CLAUDE_PROC` decides whether a process is a claude at all, which is not, and
-which every liveness answer depends on.
+Enforcement is per realm, and every realm now has a check that fails by name.
+Transcripts and sessions are held by `transcript-pick-engine-only`,
+`tree-reached-via-engine` and their siblings: the tree's names cannot be loaded
+outside the engine, and the picking happens in one place. Team configs and
+mailboxes are held together by `team-dir-read-engine-only`, because both live in
+one directory; it follows the engine's own path answers through local variables
+and attribute chains, and fails on a filesystem read applied to one, with
+`roster-read-one-place` still keeping the parse in a single reader. Settings are
+held by `settings-read-engine-only`, which bars the file's name and the key's.
+Processes are held by `proc-read-engine-only`, which bars `/proc` paths and
+signal-0 kills, the two ways a second liveness test gets written. tmux is held
+by two checks rather than one, because a server nobody can find and a seat
+nobody confirmed are different bugs: `server-liveness-engine-only` bars an
+AF_UNIX probe and the subcommands that answer whether a server, a session or a
+client is there, and `pane-question-engine-only` bars the subcommands that
+answer which panes exist and the environment variables that say which pane we
+are in. The binary is held by `claude-pattern-engine-only`, which bars
+`CLAUDE_PROC` outside the engine; that realm never had a violation, so the check
+records a state rather than repairing one.
+
+Every check stops where acting begins, and the line is worth naming because that
+is what each of them is drawn around. `claude_binary` still chooses what a
+launch runs. `launch` still picks its tmux subcommand, from a pane list the
+engine handed it. A reap still stages a directory, re-proves it and unlinks it,
+asking the engine for the verdict both times. An archive still copies a roster's
+or a mailbox's bytes into a receipt before deleting them, and the installer
+still reads `settings.json`, adds its hook and writes it back. An actor that
+kills a process still checks it died, by asking the engine the same question
+every other liveness answer comes from.
+
+Each check is narrower than the rule above it, and the gaps are worth stating. A
+team path handed to a helper as an argument and read there is not seen. A
+matcher written out by hand rather than reached for by name is not seen. What
+makes the narrow checks worth having is that every route this file actually has
+runs through the engine's own answers, so a second reader would have to be
+written oddly on purpose to avoid them.
 
 ## Method
 
