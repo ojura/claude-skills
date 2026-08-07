@@ -708,6 +708,30 @@ def said_when(iso):
     return ms_str(iso_ms(iso)) if iso_ms(iso) else str(iso)
 
 
+STAGING = ".reaping-"
+
+
+def staged_path(path):
+    """Where this process puts something while it is removing it.
+
+    One convention for the whole file, the one remove_if_cruft has always
+    used: the name it had, plus the pid doing the removing. A crash between
+    the rename and the delete leaves the copy under a name the team sweep
+    still walks as an ordinary directory, so it is kept while anything in it
+    can be resurrected and removed once nothing can.
+    """
+    return path.with_name(f"{path.name}{STAGING}{os.getpid()}")
+
+
+def unstaged(name):
+    """The name a staged copy came from.
+
+    A read taken before a cut and a read taken after it are compared entry
+    for entry, so the entries have to answer under one name.
+    """
+    return re.sub(re.escape(STAGING) + r"\d+$", "", name)
+
+
 # ---------------------------------------------------------------- process table
 
 class NEED(enum.Enum):
@@ -1674,6 +1698,58 @@ class Resolver:
         if not isinstance(data, dict) or not isinstance(data.get("members", []), list):
             return "config.json is not a roster"
         return None
+
+    def receipt_contents(self, team_dir):
+        """What a receipt taken from this team directory would hold, verbatim.
+
+        The roster's bytes and every mailbox's bytes, each with the stat facts
+        it was read under: size, mtime in nanoseconds, and inode. The facts come
+        off the same descriptor the bytes came off, so they describe this read
+        rather than a second lookup that could land on a different file. Inode
+        is in there because a writer that replaces a file by rename can leave
+        the same size and the same text behind on a new one.
+
+        Keyed by where a receipt files each entry - "config.json" for the
+        roster, "inboxes/<name>.json" for a mailbox - with any staging suffix
+        cut off the name, so a read taken before a cut and a read taken after
+        it line up entry for entry although the directory was renamed between
+        them.
+
+        A directory rather than a team name, because a reap reads the same team
+        twice, once where it lives and once at the staged path it was renamed
+        to, and that path is nobody's team name.
+
+        A file that cannot be read answers with no text and the reason, so a
+        torn roster is a stated fact rather than a missing entry.
+
+        This answers and does not act: no rename, no write, no delete. What is
+        done with the answer - preparing a receipt, making the cut, deleting
+        what was archived - belongs to reap_team.
+        """
+        wanted = [team_dir / "config.json"]
+        try:
+            wanted += sorted((team_dir / "inboxes").glob("*.json"))
+        except OSError:
+            pass
+        reads = {}
+        for path in wanted:
+            key = ("config.json" if path.parent == team_dir
+                   else f"inboxes/{unstaged(path.name)}")
+            try:
+                with open(path, "rb") as handle:
+                    raw = handle.read()
+                    facts = os.fstat(handle.fileno())
+            except OSError as exc:
+                reads[key] = {"text": None, "why": str(exc),
+                              "size": None, "mtime_ns": None, "ino": None}
+                continue
+            try:
+                text, why = raw.decode(), None
+            except UnicodeDecodeError as exc:
+                text, why = None, f"not text ({exc})"
+            reads[key] = {"text": text, "why": why, "size": facts.st_size,
+                          "mtime_ns": facts.st_mtime_ns, "ino": facts.st_ino}
+        return reads
 
     def transcripts_by_mtime(self):
         """Every transcript, newest first."""
@@ -6832,7 +6908,7 @@ def remove_if_cruft(path, dry, kind):
     # Take the directory out of reach with an atomic rename, THEN re-prove it,
     # so a writer racing us either lands before the rename (and is seen) or
     # finds the path gone. Anything unexpected is put straight back.
-    staged = path.with_name(f"{path.name}.reaping-{os.getpid()}")
+    staged = staged_path(path)
     try:
         os.rename(path, staged)
     except OSError as exc:
@@ -7366,46 +7442,132 @@ def embed(plan):
     return receipt
 
 
-def reap_team(team, archive_mail=False):
+def differing(before, after):
+    """Which entries changed between two reads of the same files.
+
+    A name on one side only is a change; so is a byte difference; and so is a
+    stat fact moving under identical bytes, because a writer that replaces a
+    file by rename leaves the same text on a new inode.
+    """
+    return sorted(name for name in set(before) | set(after)
+                  if before.get(name) != after.get(name))
+
+
+def said_reads(reads):
+    """What a read covered, and the facts each entry was read under.
+
+    The facts are the honest part of a preview: they say which version of the
+    file the reader was looking at, so a line about what a receipt would hold
+    can be checked against what is on disk now.
+    """
+    return ", ".join(
+        (f"{name} ({read['size']} bytes, last written "
+         f"{ms_str(read['mtime_ns'] // 1_000_000)})") if read["size"] is not None
+        else f"{name} ({read['why']})"
+        for name, read in sorted(reads.items()))
+
+
+def reap_team(team, dry=False, prefix=""):
     """Retire a team so restore can no longer adopt it. The rebind's one act.
 
-    Everything leaves through the receipt first: the roster verbatim, every
-    inbox's bytes when archiving. Then the known files go, and the emptied
-    directory is handed to remove_if_cruft, whose rename-then-reprove refuses
-    anything that landed mid-reap. A refused directory still rebinds - the
-    bail needs only the roster gone - and is said, not hidden.
+    Claim, then catch. The receipt is prepared from a read of the live
+    directory and held in memory; the directory is then renamed aside in one
+    step, and the staged copy is read again. Whatever landed between the first
+    read and the rename is in that second read, and it goes into the receipt
+    instead of under the delete. The rename is the cut and sits as late as it
+    can, which is what makes that window small rather than absent.
+
+    Nothing is left at the vacated name. A tombstone there was considered and
+    dropped: it would stop the next writer, and stopping writers is not what
+    this is for. This catches late mail up to the last moment and never stands
+    in anybody's way. A sender arriving after the cut writes where it likes and
+    keeps what it wrote, and if it remakes the directory this says where its
+    mail ended up and leaves it there.
+
+    One verification read follows the catch, and one is enough. A difference at
+    that point means something is still writing past the cut, which the reap's
+    own preconditions said was not so: the directory goes back under its own
+    name, the receipt is not written, nothing is deleted, and the refusal names
+    the file that moved. Retrying would only ask the same broken question again.
+
+    A dry run cannot claim anything, because it makes no cut. It reads the live
+    directory once and says what a receipt taken at that moment would hold;
+    anything written after that read is in no preview.
     """
     team_dir = RESOLVER.teams_dir / team
-    receipt = {"kind": "rebind-reap", "team": team, "at": int(time.time() * 1000),
-               "config": None, "mail": {}}
-    cfg = RESOLVER.roster_path(team)
+    # Where it goes at the cut. The name is settled here; the rename that uses
+    # it is the last thing before the staged read.
+    staged = staged_path(team_dir)
+    receipt_at = RECEIPTS_DIR / f"{team}.json"
+
+    def prepared(reads):
+        """The receipt these bytes make, held in memory until it is earned."""
+        return {"kind": "rebind-reap", "team": team, "at": int(time.time() * 1000),
+                "config": reads.get("config.json", {}).get("text"),
+                "mail": {name.split("/", 1)[1]: read["text"]
+                         for name, read in sorted(reads.items())
+                         if name.startswith("inboxes/")}}
+
+    if dry:
+        step(True, f"would archive {said_reads(RESOLVER.receipt_contents(team_dir))}, "
+                   "as they read just now; a dry run makes no cut, so anything "
+                   "written after that read is in no preview", "", indent=prefix)
+        return receipt_at
+
+    live = RESOLVER.receipt_contents(team_dir)
+    receipt = prepared(live)
+
+    # The cut. After this the name is free and the bytes are out of reach, in
+    # one step: a writer either landed before it, and is in the staged copy, or
+    # lands after it, and keeps what it wrote.
     try:
-        receipt["config"] = cfg.read_text()
-    except OSError:
-        pass
-    boxes = sorted((team_dir / "inboxes").glob("*.json")) if (
-        team_dir / "inboxes").is_dir() else []
-    for box in boxes:
+        os.rename(team_dir, staged)
+    except OSError as exc:
+        die(f"cannot move {team}'s directory aside to reap it: {exc}")
+
+    caught = RESOLVER.receipt_contents(staged)
+    late = differing(live, caught)
+    if late:
+        # Something landed between the read and the cut. It is in the staged
+        # copy, so the receipt is prepared again from there.
+        receipt = prepared(caught)
+
+    again = RESOLVER.receipt_contents(staged)
+    moved = differing(caught, again)
+    if moved:
+        changed = ", ".join(moved)
         try:
-            receipt["mail"][box.name] = box.read_text()
-        except OSError:
-            receipt["mail"][box.name] = None
+            os.rename(staged, team_dir)
+        except OSError as exc:
+            die(f"{changed} changed after {team} was moved aside, and moving it "
+                f"back failed: {exc}. Nothing was deleted; the directory is at "
+                f"{staged}")
+        die(f"{changed} changed after {team} was moved aside, so something is "
+            f"still writing to this team. Nothing was deleted and the directory "
+            f"is back at {team_dir}; stop that writer, then run this again")
+
     RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
-    replace_json(RECEIPTS_DIR / f"{team}.json", receipt)
-    for path in [cfg, *cfg.parent.glob("config.json.bak*"), *boxes]:
-        try:
-            path.unlink()
-        except OSError:
-            pass
-    if (team_dir / "inboxes").is_dir():
-        try:
-            (team_dir / "inboxes").rmdir()
-        except OSError:
-            pass
-    if team_dir.is_dir() and not remove_if_cruft(team_dir, dry=False, kind="team"):
-        warn(f"{team}'s directory would not empty; the roster is archived and "
-             "gone, which is what the rebind needs")
-    return RECEIPTS_DIR / f"{team}.json"
+    replace_json(receipt_at, receipt)
+    try:
+        # The whole directory in one act, receipt first. It is already out of
+        # reach under a staged name, so an interrupted delete leaves the staged
+        # team the sweep understands rather than a headless live one.
+        shutil.rmtree(staged)
+    except OSError as exc:
+        warn(f"{team}'s bytes are in {receipt_at}, but the staged copy at "
+             f"{staged} could not be removed: {exc}")
+    step(False, "", f"archived {said_reads(caught)}" + (
+        f", including {', '.join(late)}, written after the first read" if late else ""),
+        indent=prefix)
+
+    if team in {d.name for d in RESOLVER.team_dirs()}:
+        waiting = [f"{RESOLVER.inbox_path(team, name)} ({count})"
+                   for name, (count, _oldest) in sorted(RESOLVER.inbox_state(team).items())
+                   if count]
+        warn(f"{team_dir} is there again: something resolved the name and remade "
+             "it after the reap. It is left alone" +
+             (f", and its mail is waiting at {', '.join(waiting)}" if waiting else ""))
+    return receipt_at
 
 
 def apply_restamp(plan):
@@ -7523,8 +7685,9 @@ def rebind_reap(stamped, dest, args, prefix="", path=None, fatal=True):
     receipt = RECEIPTS_DIR / f"{stamped}.json"
     print(f"{prefix}{'would reap' if args.dry_run else 'reaped'}   {stamped}  "
           f"(roster archived: {receipt})")
-    if not args.dry_run:
-        reap_team(stamped, archive_mail=args.with_mail)
+    # One call for both tenses, so the preview is the same read the real run
+    # starts from rather than a second account of it.
+    reap_team(stamped, dry=args.dry_run, prefix=prefix + "         ")
     print(f"{prefix}rebound  this transcript now runs as {dest}")
     print(fill(f"{prefix}fragile  it goes back to {stamped} if that team is ever "
                f"recreated; run /compact in it to make {dest} permanent"))
@@ -9403,12 +9566,12 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     team_peekers = sorted(
         hit
         for node in tree.body if isinstance(node, ast.FunctionDef)
-        # reap_team and run_demote copy the bytes of a roster or a mailbox into
-        # a receipt and then delete what they copied. That is the archive half
-        # of an act, not a reading of the realm: neither concludes anything
-        # from what it read. run_selftest stages team dirs as fixtures and
-        # holds this check's own text.
-        and node.name not in {"reap_team", "run_demote", "run_selftest"}
+        # The reads the reap used to do for itself are now the engine's
+        # receipt_contents, which hands back the bytes and the stat facts they
+        # were read under. run_demote still opens a mailbox for itself.
+        # run_selftest stages team dirs as fixtures and holds this check's own
+        # text.
+        and node.name not in {"run_demote", "run_selftest"}
         for hit in team_dir_reads(node))
     check("team-dir-read-engine-only", "a team directory is read only inside the engine",
           not team_peekers, "; ".join(team_peekers))
@@ -12891,8 +13054,9 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         real_teams = RESOLVER.teams_dir
         RESOLVER.teams_dir = eng6.teams_dir
         try:
-            with contextlib.redirect_stderr(io.StringIO()):
-                reap_team("TEAMA", archive_mail=True)
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                reap_team("TEAMA")
             stored = load_receipt("TEAMA")
             if not stored or stored.get("config") != '{"name": "TEAMA", "members": []}':
                 gates.append("the roster did not ride the receipt verbatim")
