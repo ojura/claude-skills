@@ -3910,6 +3910,15 @@ class Resolver:
                 hits = [e for e in sides if e["root"] == selector]
                 hits = hits or [e for e in sides if e["name"] == selector]
         if not hits:
+            # The file is agent-<task id>.jsonl, so a listing shows the one
+            # spelling this does not take, and a person reads it off the
+            # listing and types it. When dropping the prefix (and the suffix,
+            # for a name copied whole) lands on a real task id, say that id
+            # rather than a flat no-match against a name that plainly exists.
+            bare = selector.removesuffix(".jsonl").removeprefix("agent-")
+            if bare != selector and any(e["task_id"] == bare for e in sides):
+                return None, (f"{selector!r} is the file's name; this takes the "
+                              f"task id inside it, so type {bare}")
             return None, f"no side transcript matches {selector!r}"
         if len(hits) > 1:
             # A refusal names what it refused between, in spellings that can
@@ -7441,7 +7450,15 @@ def run_promote(args):
     defaulted = not name
     name = name or entry["name"] or entry["task_id"]
     if not team:
-        die("the destination team must be typed: --as-agent name@team")
+        # By here the name is settled either way, and only the team half is
+        # missing. Printing the whole "name@team" spelling read as though
+        # neither half had arrived, so somebody who had typed a name retyped
+        # it. Say which half is absent, and hand back the half we hold.
+        half = (f"--as-agent {args.as_} gives a name and no team" if args.as_
+                else f"no --as-agent was passed, so no team was named; {name} "
+                     "is the name this would take from the side transcript")
+        die(f"{half}. A promote has to be told which team it joins: "
+            f"type --as-agent {name}@<team>")
     # The spoken identity goes in before the plan is built, because until the
     # first launch registers this member the promoted transcript is the only
     # thing that says who it is, and it says so in the line it carries.
@@ -11485,6 +11502,63 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         if hit or not ("d1" in why and "d2" in why):
             wrong.append("a colliding refusal did not name typeable spellings")
         check("side-classified-by-bytes", "a side transcript is classified by its own bytes",
+              not wrong, ", ".join(wrong))
+
+    # --- the two spellings a promote gets wrong first, and what each refusal owes
+    with tempfile.TemporaryDirectory() as td:
+        sub = Path(td) / "proj" / "PARENT" / "subagents"
+        sub.mkdir(parents=True)
+        (sub / "agent-t9.jsonl").write_text(json.dumps(
+            {"type": "user", "parentUuid": None, "isSidechain": True,
+             "uuid": "t9-root"}) + "\n")
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
+        eng.projects_dir = Path(td)
+        stem_hit, stem_why = eng.side_transcript("agent-t9")
+        file_hit, file_why = eng.side_transcript("agent-t9.jsonl")
+        gone_hit, gone_why = eng.side_transcript("agent-nothing")
+        # The bare id, not the one inside 'agent-t9': a refusal that only echoes
+        # what was typed has named nothing, and quoting the selector back would
+        # satisfy a plain substring test.
+        bare = lambda why: bool(re.search(r"(?<![\w.-])t9(?![\w.-])", why))
+        spelled = {
+            "the file's stem is refused": stem_hit is None,
+            "and the stem's refusal names the task id": bare(stem_why),
+            "the whole file name is refused": file_hit is None,
+            "and that refusal names the task id too": bare(file_why),
+            "the task id itself still resolves": (eng.side_transcript("t9")[0] or {})
+                .get("task_id") == "t9",
+            "a real miss keeps the plain refusal": gone_hit is None
+                and gone_why == "no side transcript matches 'agent-nothing'",
+        }
+        wrong = sorted(k for k, ok in spelled.items() if not ok)
+        check("side-selector-names-the-task-id",
+              "a file name typed at a side transcript is told the task id to use",
+              not wrong, ", ".join(wrong))
+
+        # --as-agent settles the name before the team is looked at, so the team
+        # is the only half that can be missing here. The refusal used to print
+        # "name@team" whole, which reads as both halves missing, and a caller
+        # who had typed a name retyped it.
+        flat = lambda text: " ".join(text.split())
+        real_resolver = globals()["RESOLVER"]
+        globals()["RESOLVER"] = eng
+        try:
+            typed_died, typed_msg = _dies(run_promote, _Args(promote="t9", as_="revived"))
+            bare_died, bare_msg = _dies(run_promote, _Args(promote="t9", as_=None))
+        finally:
+            globals()["RESOLVER"] = real_resolver
+        halves = {
+            "a name with no team is refused": typed_died,
+            "and the refusal says the team is the missing half":
+                "gives a name and no team" in flat(typed_msg),
+            "and hands the typed name back": "--as-agent revived@<team>" in flat(typed_msg),
+            "no --as-agent at all is refused": bare_died,
+            "and that refusal names the name it would have taken":
+                "--as-agent t9@<team>" in flat(bare_msg),
+        }
+        wrong = sorted(k for k, ok in halves.items() if not ok)
+        check("promote-says-which-half-is-missing",
+              "a promote missing the team half says so, and keeps the name it has",
               not wrong, ", ".join(wrong))
 
     # Every side transcript on this machine classifies without a crash, and the
