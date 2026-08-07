@@ -9720,10 +9720,19 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     aliases = {"--no-colour", "--terminate", "--cleanup-sockets"}
     missing = sorted(parser_flags - comp_flags - {"--complete"})
     unknown = sorted(comp_flags - parser_flags - aliases)
+    # Three states, and each says which one it is. An absent file already fails
+    # here, because every flag then reads as missing, but the list of all of
+    # them is a wall that does not say the file is not there. A pass used to
+    # print "no completion file found", which is the one thing that cannot have
+    # happened: nothing can be offered by a file that was never read.
+    if not comp_text:
+        said = f"no completion file at {comp_path}"
+    elif missing or unknown:
+        said = f"missing from completion: {missing}; unknown to the parser: {unknown}"
+    else:
+        said = f"{len(parser_flags)} flags compared against {comp_path.name}"
     check("completion-flag-parity", "completion offers every flag the parser takes, and nothing else",
-          comp_text and not missing and not unknown,
-          f"missing from completion: {missing}; unknown to the parser: {unknown}"
-          if (missing or unknown) else "no completion file found")
+          comp_text and not missing and not unknown, said)
 
     # Forty-four flags in one list printed a nine-line usage and put --failed,
     # --live and --list, which do nothing without --selftest, between --bare
