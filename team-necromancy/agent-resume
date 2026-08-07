@@ -11978,7 +11978,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
               ", ".join(blind))
 
         holding = []
-        theirs = f"pid {me + 1} holds this transcript"
+        theirs = f"pid {me + 1} is running this conversation"
         if theirs not in outside:
             holding.append(f"a demote under a live holder said: {outside or 'nothing'}")
         if went_through not in outside_forced:
