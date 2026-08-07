@@ -1327,7 +1327,7 @@ class Resolver:
             "planModeRequired": self.field(ctx, "permissionMode") == "plan",
             "cwd": self.agent_cwd(ctx),
             "color": self.field(ctx, "color"),
-            "model": self.field(ctx, "model", prefer_specific=True),
+            "model": self.field(ctx, "model"),
         }
 
     def spawn_payloads(self):
@@ -2510,21 +2510,49 @@ class Resolver:
                 return
             self.cands[field].append((value, ts or 0, source))
 
-        def pick(self, field, prefer_specific=False):
+        def pick(self, field):
+            """The winning candidate: newest, then the fullest spelling of it.
+
+            e.g. the jsonl records "claude-opus-5" where the team config kept
+            "claude-opus-5[1m]": the same model, one of them lossier.
+
+            The second step is a refinement of the first, not a second ladder
+            and not a caller's option. Recency chooses the value; this can only
+            swap it for a candidate that is that same value followed by "[",
+            longest first, so it can never reach a different value. That holds
+            of the strings themselves, so it needs no field to be named and no
+            argument to be passed. It used to be an argument: build_command and
+            the roster writer passed it and --explain did not, so --explain
+            printed claude-opus-5 for the field the launch emitted as
+            claude-opus-5[1m].
+
+            Applying it to every field would go wrong on a field where
+            "<value>[..." means something other than a fuller spelling of
+            <value>. Nothing merged is like that: agentId, agentName, teamName,
+            colour, type, effort, backend type, pane id, permission mode,
+            version and branch are plain tokens with no bracket in them, and a
+            cwd reaches pick() only from agent_cwd's fallback, which runs when
+            neither the transcript nor the roster recorded one and so has
+            nothing to prefer between.
+
+            Only a bracket counts. A longer string that is not a bracketed
+            extension is a different value, and taking it would let a stale
+            roster revert a model the user changed mid-session.
+            """
             cands = self.cands.get(field)
             if not cands:
                 return None, None, None
             value, ts, source = max(cands, key=lambda c: c[1])
-            if prefer_specific and isinstance(value, str):
-                # e.g. jsonl records "claude-opus-5" but the team config kept
-                # "claude-opus-5[1m]", same model, one is simply lossier.
-                # Only a bracketed variant counts (claude-opus-5 -> claude-opus-5[1m]).
-                # Any longer string would let a stale roster silently revert a model
-                # the user changed mid-session.
-                richer = [c for c in cands if isinstance(c[0], str) and c[0].startswith(value + "[")]
-                if richer:
-                    value, ts, source = max(richer, key=lambda c: len(c[0]))
-                    source += " (more specific)"
+            richer = ([c for c in cands if isinstance(c[0], str) and c[0].startswith(value + "[")]
+                      if isinstance(value, str) else [])
+            if richer:
+                # The source says which value it beat, because that is what a
+                # reader of --explain is asking when a newer value lost. Said
+                # here rather than worked out again by the reporter: deciding it
+                # twice is how the two came apart in the first place.
+                plainer = value
+                value, ts, source = max(richer, key=lambda c: len(c[0]))
+                source += f" (more specific than {plainer})"
             return value, ts, source
 
         def conflicts(self, field):
@@ -2593,10 +2621,15 @@ class Resolver:
         lines on the same file, and a rebind is what puts the two out of step.
         It pins agentId, agentName and teamName together so no launch can take
         the id from one source and the team from another; every other field
-        keeps the ordinary merge. And pick(prefer_specific=True) prefers a
-        bracketed extension of the value that won, longest first, which is the
-        model reads and nothing else: only a bracket counts, so a stale roster
-        cannot revert a model changed mid-session.
+        keeps the ordinary merge. And pick() prefers a bracketed extension of
+        the value that won, longest first: only a bracket counts, so a stale
+        roster cannot revert a model changed mid-session. That last one refines
+        recency rather than competing with it - recency picks the value, and
+        specificity can only upgrade that value to a longer spelling of itself,
+        never to a different one - so it is a property of the candidates and not
+        something a caller asks for, and every reader of the merge gets the same
+        answer. In practice it is the model: nothing else merged carries a
+        bracket.
 
         place() runs between locating and merging, and a team change clears the
         roster entry, which is what stops a stale roster contributing the team
@@ -2865,17 +2898,22 @@ class Resolver:
                  "dir of that directory, so it may not find its own conversation")
         return fallback or None
 
-    def field(self, ctx, name, prefer_specific=False):
+    def field(self, ctx, name):
         """One assembled field's value, or None.
 
         The accessor consumers use, so the merge stays an engine internal. Every
         caller reaching into it directly was a caller that could have assembled a
         different answer than the engine did.
         """
-        return ctx["merged"].pick(name, prefer_specific=prefer_specific)[0]
+        return ctx["merged"].pick(name)[0]
 
     def provenance(self, ctx, name):
-        """(value, timestamp, source) for a field, for --explain."""
+        """(value, timestamp, source) for a field, for --explain.
+
+        The same pick() the launch reads, so the value --explain prints is the
+        value the run uses, and there is no option either side could set
+        differently.
+        """
         return ctx["merged"].pick(name)
 
     def objections(self, res, want_name, want_team):
@@ -5664,7 +5702,7 @@ def build_command(ctx, args, passthrough):
     for flag, field in DERIVED_FLAGS.items():
         if flag in user_flags:
             continue
-        value = RESOLVER.field(ctx, field, prefer_specific=(field == "model"))
+        value = RESOLVER.field(ctx, field)
         if dest:  # rebinding onto a live lead's implicit team
             if field == "teamName":
                 value = dest
@@ -9604,7 +9642,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         def add(self, field, value, ts, source):
             self.cands[field].append((value, ts, source))
 
-        def pick(self, field, prefer_specific=False):
+        def pick(self, field):
             return max(self.cands[field], key=lambda cand: cand[1])
 
         def conflicts(self, field):
@@ -10646,6 +10684,126 @@ def run_selftest(live=False, failed_only=False, list_only=False):
           and [t for t in stripped if t.startswith("--")] == ["--resume"]
           and carried[-1] == "--verbose",
           f"dressed {dressed_flags}, bare {[t for t in stripped if t.startswith('--')]}")
+
+    # --explain's value column says what the run resolved and the launch emits
+    # what the run resolved, so they are one read of one merge. They were two:
+    # the preference for a bracketed model was an argument build_command and the
+    # roster writer passed and --explain did not, so the report printed
+    # claude-opus-5 for the field the command carried as claude-opus-5[1m].
+    #
+    # Driven through a real assembly, because what is being checked is the
+    # engine's own pick and a hand-built merge would be handed its answer.
+    # Two members, because each arm stays green under the break the other one
+    # catches, so one of them alone proves half of this. tern's
+    # plain spelling is the newer candidate, so recency alone answers
+    # claude-opus-5 and the preference is the only reason the run comes out
+    # bracketed; delete the preference and this is the arm that fails. gull's
+    # older candidate is longer but carries no bracket, so it is a different
+    # model and must lose; loosen the test to startswith(value) and this is the
+    # arm that fails.
+    def explained_row(told, want):
+        """(value, source, time, mark) for one field of a printed --explain.
+
+        The source is the legend's full text rather than the row's letter: the
+        letter is a tag for the page, and the text is what a reader compares.
+        """
+        lines = told.splitlines()
+        legend = dict(re.split(r" {2,}", line.strip())[-2:] for line in lines
+                      if re.match(r"  (sources)? +[A-Z]  \S", line))
+        for line in lines:
+            parts = re.split(r" {2,}", line.strip())
+            if parts[0] == want and len(parts) > 3 and parts[2] in legend:
+                return (parts[1], legend[parts[2]], parts[3],
+                        parts[4] if len(parts) > 4 else "")
+        return None, None, None, None
+
+    with tempfile.TemporaryDirectory() as td:
+        fx = Path(td)
+        # The stamps are read off the bytes, and the pattern the reader uses has
+        # no space after the colon, which is how the harness writes them.
+        dense = lambda record: json.dumps(record, separators=(",", ":"))
+        fx_team, fx_lead = "session-lossy", "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        fx_mates = {"tern": ("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "claude-opus-5[1m]"),
+                    "gull": ("ffffffff-ffff-4fff-8fff-ffffffffffff", "claude-opus-5-20260101")}
+        (fx / "projects" / "lossy").mkdir(parents=True)
+        (fx / "teams" / fx_team).mkdir(parents=True)
+        (fx / "teams" / fx_team / "config.json").write_text(json.dumps({
+            "name": fx_team,
+            "leadAgentId": f"team-lead@{fx_team}",
+            "leadSessionId": fx_lead,
+            "createdAt": 1,
+            # The roster is the newer source of a model here, and it is the one
+            # holding the plain spelling. Dated past both transcripts so the
+            # fixture does not depend on which of them a reader looks at first.
+            "members": [{"agentId": f"team-lead@{fx_team}", "name": "team-lead"}]
+            + [{"agentId": f"{mate}@{fx_team}", "name": mate, "model": "claude-opus-5",
+                "agentType": "general-purpose", "joinedAt": 1_767_398_400_000}
+               for mate in fx_mates]}))
+        # The spawn records are merged at timestamp 0, so each is the older
+        # candidate for its member whatever date the roster carries.
+        spawns = [dense({"type": "user", "uuid": "lossy-root", "parentUuid": None,
+                         "timestamp": "2026-01-01T00:00:00Z", "sessionId": fx_lead,
+                         "message": {"role": "user", "content": "spawn them"}})]
+        for mate, (uuid, spawn_model) in fx_mates.items():
+            spawns.append(dense({
+                "type": "assistant", "uuid": f"lossy-{mate}", "parentUuid": "lossy-root",
+                "timestamp": "2026-01-01T00:00:05Z", "sessionId": fx_lead,
+                "toolUseResult": {"status": "teammate_spawned", "name": mate,
+                                  "team_name": fx_team, "agent_id": f"{mate}@{fx_team}",
+                                  "agent_type": "general-purpose", "model": spawn_model}}))
+            # Stamped, so the engine resolves it by name and team, and carrying
+            # no model of its own, so the merge holds the two candidates the
+            # check is about and no third one.
+            (fx / "projects" / "lossy" / f"{uuid}.jsonl").write_text("\n".join([
+                dense({"type": "user", "uuid": f"{mate}-1", "parentUuid": None,
+                       "timestamp": "2026-01-02T00:00:00Z", "sessionId": uuid,
+                       "agentName": mate, "teamName": fx_team,
+                       "message": {"role": "user", "content": "go"}}),
+                dense({"type": "assistant", "uuid": f"{mate}-2",
+                       "parentUuid": f"{mate}-1",
+                       "timestamp": "2026-01-02T00:00:05Z", "sessionId": uuid,
+                       "agentName": mate, "teamName": fx_team}),
+            ]) + "\n")
+        (fx / "projects" / "lossy" / f"{fx_lead}.jsonl").write_text("\n".join(spawns) + "\n")
+        lossy_eng = Resolver(needs=Needs(maybe=set(NEED)))
+        lossy_eng.projects_dir, lossy_eng.teams_dir = fx / "projects", fx / "teams"
+        real_resolver = globals()["RESOLVER"]
+        globals()["RESOLVER"] = lossy_eng
+        printed, launched = {}, {}
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                for mate in fx_mates:
+                    lossy_ctx = lossy_eng.identity(agent_id=f"{mate}@{fx_team}")
+                    with contextlib.redirect_stdout(io.StringIO()) as lossy_out:
+                        explain(lossy_ctx)
+                    printed[mate] = explained_row(lossy_out.getvalue(), "model")
+                    emitted = build_command(lossy_ctx, _Emit(f"{mate}@{fx_team}"), [])
+                    launched[mate] = dict(zip(emitted, emitted[1:])).get("--model")
+        finally:
+            globals()["RESOLVER"] = real_resolver
+    tern_value, tern_source, tern_time, tern_mark = printed["tern"]
+    gull_value, _gull_src, _gull_time, gull_mark = printed["gull"]
+    agreed = {
+        # The winning row prints no time because the spawn record is merged
+        # undated, which is the same fact as "the roster was the newer one".
+        "the older bracketed spelling wins the row":
+            tern_value == "claude-opus-5[1m]" and tern_time == "-",
+        "and the row names the newer plain spelling it beat":
+            str(tern_source).endswith("(more specific than claude-opus-5)"),
+        "both spellings are still marked as disagreeing":
+            tern_mark == "<- conflict: claude-opus-5, claude-opus-5[1m]",
+        "the launch emits a model at all": bool(launched["tern"]),
+        "--explain prints the value the launch emits": tern_value == launched["tern"],
+        "a longer candidate that is not bracketed loses":
+            gull_value == "claude-opus-5" and launched["gull"] == "claude-opus-5",
+        "and the fixture really offered one":
+            "claude-opus-5-20260101" in gull_mark,
+    }
+    wrong = sorted(k for k, ok in agreed.items() if not ok)
+    check("explain-value-is-what-the-launch-emits",
+          "--explain prints the value the launch emits, on the field the merge "
+          "prefers a fuller spelling of", not wrong,
+          ", ".join(wrong + [f"model rows {printed}, launched {launched}"]))
 
     # And it joins nothing: a roster entry would record a membership the command
     # does not carry. The writers are stubbed rather than trusted to a dry run,
