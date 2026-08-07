@@ -4877,6 +4877,16 @@ def build_command(ctx, args, passthrough):
     user_flags = {a.split("=", 1)[0] for a in passthrough if a.startswith("-")}
     cmd = [claude_binary(args), "--resume", ctx["session_uuid"]]
 
+    # --bare stops here: the conversation and nothing the tool decided. Not only
+    # the identity flags but the model, the effort and the permission mode too,
+    # since a resume asked for bare should be what a person would type, and
+    # inheriting a permission bypass nobody asked for is the worst of them to
+    # add silently. Explicit passthrough still applies: that is typed, not
+    # derived. What the harness does with a stamped conversation is its own
+    # business and reported at the launch, not fought with here.
+    if getattr(args, "bare", False):
+        return cmd + passthrough
+
     dest = ctx.get("to_team")
     for flag, field in DERIVED_FLAGS.items():
         if flag in user_flags:
@@ -5095,6 +5105,11 @@ def record_membership(ctx, args, pane, alive=True):
     much as of one this run started, and a run that noops has still established
     that the agent is there.
     """
+    # A bare resume joins no team, so writing it into a roster would record a
+    # membership the launch does not carry. Its inbox is left alone for the
+    # same reason: nothing is going to read it under that name.
+    if getattr(args, "bare", False):
+        return
     if ctx.get("to_team"):
         register_member(RESOLVER.roster_record(ctx, team=ctx["to_team"]), pane, args.dry_run, alive)
         if ctx["to_team"] != RESOLVER.field(ctx, "teamName"):
@@ -5133,6 +5148,18 @@ def report_launch(ctx, command, prefix="", role="agent", agent_id=None, extra=()
         print(fill(f"{prefix}title    {title}"))
     for label, value in extra:
         print(fill(f"{prefix}{label:<8} {value}"))
+    # Read off the command rather than a flag, so the row describes the launch
+    # actually being reported. Passing no identity is not the same as having
+    # none: a conversation whose window start carries stamps is adopted by the
+    # harness on the way up, and a reader who typed --bare has every reason to
+    # expect otherwise.
+    if "--agent-id" not in command:
+        said = "no team, name, model or effort is passed"
+        path = ctx.get("transcript", (None,))[0]
+        stamped, state = RESOLVER.restored_identity(path) if path else (None, None)
+        if state == "restored":
+            said += f"; the harness still brings it back as {stamped}, from its own stamps"
+        print(fill(f"{prefix}identity {said}"))
     print(wrap_command(command, f"{prefix}command  ", f"{prefix}{'':11}", paste=True))
 
 
@@ -8290,6 +8317,54 @@ def run_selftest(live=False, failed_only=False, list_only=False):
                 mismatched.append(f"{wore} on team {on_team}")
     check("launch-wears-one-identity", "a launch wears one identity", not mismatched, "; ".join(mismatched[:2]))
 
+    # --bare is the conversation and nothing the tool chose. Measured against
+    # the same launch without it, so a bare command cannot pass by being short
+    # for some other reason: the dressed one has to carry the identity that the
+    # bare one drops, or neither half of this proves anything.
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = corpus_engine()
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            who = "willow@session-corpus-alpha"
+            dressed = build_command(RESOLVER.identity(agent_id=who), _Emit(who), [])
+            stripped_args = _Emit(who)
+            stripped_args.bare = True
+            stripped = build_command(RESOLVER.identity(agent_id=who), stripped_args, [])
+            carried = build_command(RESOLVER.identity(agent_id=who), stripped_args,
+                                    ["--verbose"])
+    finally:
+        globals()["RESOLVER"] = real_resolver
+    dressed_flags = [t for t in dressed if t.startswith("--")]
+    check("bare-passes-only-the-conversation",
+          "--bare passes the conversation and nothing the tool chose",
+          "--agent-id" in dressed_flags and len(dressed_flags) > 1
+          and [t for t in stripped if t.startswith("--")] == ["--resume"]
+          and carried[-1] == "--verbose",
+          f"dressed {dressed_flags}, bare {[t for t in stripped if t.startswith('--')]}")
+
+    # And it joins nothing: a roster entry would record a membership the command
+    # does not carry. The writers are stubbed rather than trusted to a dry run,
+    # so the check sees the attempt itself. Its probe is what proves this is not
+    # vacuous: with the guard gone, the same call writes.
+    wrote = []
+    real_reg, real_inbox = globals()["register_member"], globals()["ensure_inbox"]
+    real_update = globals()["update_team_config"]
+    globals()["register_member"] = lambda *a, **k: wrote.append("roster")
+    globals()["ensure_inbox"] = lambda *a, **k: wrote.append("inbox")
+    globals()["update_team_config"] = lambda *a, **k: wrote.append("config")
+    globals()["RESOLVER"] = corpus_engine()
+    try:
+        joining = _Emit(who)
+        joining.bare, joining.no_update_config = True, False
+        with contextlib.redirect_stderr(io.StringIO()):
+            record_membership(RESOLVER.identity(agent_id=who), joining, None)
+    finally:
+        globals()["register_member"], globals()["ensure_inbox"] = real_reg, real_inbox
+        globals()["update_team_config"] = real_update
+        globals()["RESOLVER"] = real_resolver
+    check("bare-joins-no-team", "a bare resume writes into no roster", not wrote,
+          f"wrote {wrote}")
+
     # A stamp contradicting the roster is reported, never tolerated: it is
     # what catches a lead launched under a wrong name. The refusal
     # carries the remedy when the roster and the payloads agree on the identity
@@ -10413,6 +10488,10 @@ def main():
                         help="run this agent in this terminal instead of a tmux "
                              "pane, the way a lead runs; this run ends when it "
                              "starts")
+    parser.add_argument("--bare", action="store_true",
+                        help="resume the conversation with no identity: claude --resume "
+                             "<uuid> and nothing else, no team, name, model, effort or "
+                             "permission flags, and no roster entry")
     parser.add_argument("--no-tint", action="store_true",
                         help="do not tint the tmux pane")
     parser.add_argument("--failed", action="store_true",
