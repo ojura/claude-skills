@@ -13149,6 +13149,239 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         check("rebind-retires-if-unnoticed", "a rebind retires the stamped team only when nothing would notice",
               not gates, ", ".join(gates))
 
+    # --- where the cut sits, read out of the code rather than watched.
+    # The two behavioural checks below drive the reap and read the result; this
+    # one reads the order the reap is written in, because an order that only
+    # holds while a fixture is watching is not an order. It follows the names:
+    # the read the receipt is prepared from must be a read of the live
+    # directory taken before the rename, the read it is compared against must
+    # be a read of the staged copy taken after it, and the receipt must be
+    # prepared again from that second read.
+    reap_node = funcs["reap_team"]
+    reap_reads = {}     # variable -> (line, the name it was read from)
+    folds = []          # (line, the name the receipt was re-prepared from)
+    for sub in ast.walk(reap_node):
+        if not isinstance(sub, ast.Assign) or len(sub.targets) != 1:
+            continue
+        target, value = sub.targets[0], sub.value
+        if not (isinstance(target, ast.Name) and isinstance(value, ast.Call)
+                and value.args):
+            continue
+        if (isinstance(value.func, ast.Attribute)
+                and value.func.attr == "receipt_contents"):
+            reap_reads[target.id] = (sub.lineno, getattr(value.args[0], "id", None))
+        elif target.id == "receipt" and getattr(value.func, "id", None) == "prepared":
+            folds.append((sub.lineno, getattr(value.args[0], "id", None)))
+    cuts = [sub.lineno for sub in ast.walk(reap_node)
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr == "rename"
+            and [getattr(a, "id", None) for a in sub.args] == ["team_dir", "staged"]]
+    compares = sorted((sub for sub in ast.walk(reap_node)
+                       if isinstance(sub, ast.Call)
+                       and getattr(sub.func, "id", None) == "differing"),
+                      key=lambda sub: sub.lineno)
+    out_of_order = []
+    if not cuts:
+        out_of_order.append("nothing renames team_dir aside")
+    elif not compares:
+        out_of_order.append("nothing compares a read against a later one")
+    else:
+        cut = min(cuts)
+        held, against = [getattr(a, "id", None) for a in compares[0].args][:2]
+        before, after = reap_reads.get(held), reap_reads.get(against)
+        if not before or before[1] != "team_dir" or before[0] > cut:
+            out_of_order.append(
+                f"the receipt is not prepared from a read of the live directory "
+                f"before the cut ({held} = {before})")
+        if not after or after[1] != "staged" or after[0] < cut:
+            out_of_order.append(
+                f"it is not compared against a read of the staged copy after the "
+                f"cut ({against} = {after})")
+        if after and not any(line > after[0] and name == against
+                             for line, name in folds):
+            out_of_order.append("nothing prepares the receipt again from the staged read")
+    check("reap-cut-before-the-staged-read",
+          "the reap reads the staged copy after the cut and folds it into the receipt",
+          not out_of_order, "; ".join(out_of_order))
+
+    # --- and the catch itself, driven: a message that lands after the reap has
+    # read the live directory, but before the rename takes it out of reach, is
+    # in the committed receipt. The fixture writes from inside the engine
+    # answer the reap asked for, which is the only honest place to stand: it
+    # puts the write in the real window rather than pretending one.
+    with tempfile.TemporaryDirectory() as td:
+        teams = Path(td) / "teams"
+        tdir = teams / "TEAMLATE"
+        (tdir / "inboxes").mkdir(parents=True)
+        (tdir / "config.json").write_text('{"name": "TEAMLATE", "members": []}')
+        (tdir / "inboxes" / "mate.json").write_text("[]")
+        late_mail = json.dumps([{"id": "m9", "from": "team-lead", "text": "one more",
+                                 "timestamp": "2026-05-05T00:00:00Z"}])
+        real_reads, calls = RESOLVER.receipt_contents, []
+
+        def landing_late(team_dir, only=None):
+            """The engine's answer, and then a message into the live directory.
+
+            The reap's first read is of the directory where it still lives, and
+            the very next thing it does is the rename. So writing here puts the
+            message in the window the whole design is about.
+            """
+            answer = real_reads(team_dir, only=only)
+            calls.append(str(team_dir))
+            if len(calls) == 1:
+                (tdir / "inboxes" / "mate.json").write_text(late_mail)
+            return answer
+
+        real_teams, real_receipts = RESOLVER.teams_dir, RECEIPTS_DIR
+        RESOLVER.teams_dir, RESOLVER.receipt_contents = teams, landing_late
+        globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                reap_team("TEAMLATE")
+            stored = load_receipt("TEAMLATE")
+        finally:
+            del RESOLVER.receipt_contents
+            RESOLVER.teams_dir = real_teams
+            globals()["RECEIPTS_DIR"] = real_receipts
+        missed = []
+        if len(calls) < 2:
+            missed.append(f"the reap read {len(calls)} time(s); the catch needs a "
+                          "second read, of the staged copy")
+        if not stored:
+            missed.append("no receipt was written")
+        elif (stored.get("mail") or {}).get("mate.json") != late_mail:
+            missed.append("the receipt holds "
+                          f"{(stored.get('mail') or {}).get('mate.json')!r} for mate, "
+                          "not the message that landed before the cut")
+        if tdir.exists():
+            missed.append("the team directory outlived the reap")
+        check("reap-catches-a-late-write",
+              "a message landing between the read and the cut is in the receipt",
+              not missed, ", ".join(missed))
+
+    # --- and the other side of the same read: a change that shows up at the
+    # verification read means a writer is still attached to the copy after the
+    # cut, which no reap precondition allows. One occurrence aborts.
+    with tempfile.TemporaryDirectory() as td:
+        teams = Path(td) / "teams"
+        tdir = teams / "TEAMHELD"
+        (tdir / "inboxes").mkdir(parents=True)
+        roster = '{"name": "TEAMHELD", "members": []}'
+        (tdir / "config.json").write_text(roster)
+        (tdir / "inboxes" / "mate.json").write_text("[]")
+        real_reads, seen = RESOLVER.receipt_contents, []
+
+        def writing_past_the_cut(team_dir, only=None):
+            """A writer that did not stop at the cut: it writes into the staged
+            copy right after the read that caught up with it, so the
+            verification read that follows is the one that differs."""
+            answer = real_reads(team_dir, only=only)
+            seen.append(str(team_dir))
+            if len(seen) == 2:
+                (Path(team_dir) / "inboxes" / "mate.json").write_text(
+                    '[{"from": "still-writing"}]')
+            return answer
+
+        real_teams, real_receipts = RESOLVER.teams_dir, RECEIPTS_DIR
+        RESOLVER.teams_dir, RESOLVER.receipt_contents = teams, writing_past_the_cut
+        globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
+        said, outcome = io.StringIO(), "returned without refusing"
+        try:
+            with contextlib.redirect_stderr(said), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    reap_team("TEAMHELD")
+                except SystemExit:
+                    outcome = "refused"
+        finally:
+            del RESOLVER.receipt_contents
+            RESOLVER.teams_dir = real_teams
+            globals()["RECEIPTS_DIR"] = real_receipts
+        told = " ".join(said.getvalue().split())
+        kept = []
+        if outcome != "refused":
+            kept.append(f"a write past the cut did not stop the reap: it {outcome}")
+        if "inboxes/mate.json" not in told:
+            kept.append(f"the refusal does not name the file that changed: "
+                        f"{told or 'nothing'}")
+        if not (tdir / "config.json").is_file() or (tdir / "config.json").read_text() != roster:
+            kept.append("the directory is not back under its own name with its roster")
+        if list(teams.glob("TEAMHELD" + STAGING + "*")):
+            kept.append("the staged copy was left behind")
+        if (Path(td) / "receipts" / "TEAMHELD.json").exists():
+            kept.append("the receipt was committed anyway")
+        check("reap-aborts-on-a-write-past-the-cut",
+              "a write after the cut puts the directory back and deletes nothing",
+              not kept, ", ".join(kept))
+
+    # --- the same catch one file down, through the demote that archives a
+    # single inbox. The window there is between reading the mailbox and putting
+    # an empty one back, and the cut that closes it is the rename of the inbox.
+    with tempfile.TemporaryDirectory() as td:
+        proj = Path(td) / "proj"
+        proj.mkdir(parents=True)
+        compact = lambda d: json.dumps(d, separators=(",", ":"))
+        (proj / "MATELATE.jsonl").write_text(
+            compact({"parentUuid": None, "sessionId": "MATELATE", "agentName": "posty",
+                     "teamName": "TEAMP", "type": "user", "uuid": "ml-root"}) + "\n" +
+            compact({"type": "last-prompt", "lastPrompt": "hi", "leafUuid": "ml-root",
+                     "sessionId": "MATELATE"}) + "\n")
+        box = Path(td) / "teams" / "TEAMP" / "inboxes" / "posty.json"
+        box.parent.mkdir(parents=True)
+        (box.parent.parent / "config.json").write_text(
+            '{"name": "TEAMP", "members": [{"name": "posty"}]}')
+        box.write_text("[]")
+        arrived = json.dumps([{"id": "p1", "from": "team-lead", "text": "just in time",
+                               "timestamp": "2026-05-05T00:00:00Z"}])
+
+        class _MailArgs:
+            demote, force, with_mail = "MATELATE", False, True
+            into, dry_run = "PARENT", False
+
+        real_reads, posted = RESOLVER.receipt_contents, []
+
+        def landing_on_the_inbox(team_dir, only=None):
+            """A send that arrives after the demote has read the mailbox and
+            before the rename takes those bytes out of reach."""
+            answer = real_reads(team_dir, only=only)
+            posted.append(only)
+            if len(posted) == 1:
+                box.write_text(arrived)
+            return answer
+
+        real_projects, real_teams = RESOLVER.projects_dir, RESOLVER.teams_dir
+        real_receipts = RECEIPTS_DIR
+        RESOLVER.projects_dir, RESOLVER.teams_dir = Path(td), Path(td) / "teams"
+        RESOLVER.receipt_contents = landing_on_the_inbox
+        globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    run_demote(_MailArgs)
+                except SystemExit:
+                    pass
+            posted_receipt = load_receipt("MATELATE")
+        finally:
+            del RESOLVER.receipt_contents
+            RESOLVER.projects_dir, RESOLVER.teams_dir = real_projects, real_teams
+            globals()["RECEIPTS_DIR"] = real_receipts
+        lost = []
+        if not posted_receipt:
+            lost.append("the demote wrote no receipt")
+        elif posted_receipt.get("mail") != arrived:
+            lost.append(f"the receipt holds {posted_receipt.get('mail')!r} for posty, "
+                        "not the message that landed before the cut")
+        if not box.is_file() or box.read_text() != "[]":
+            lost.append(f"the mailbox left behind is "
+                        f"{box.read_text() if box.is_file() else 'missing'}, not []")
+        if list(box.parent.glob("posty.json" + STAGING + "*")):
+            lost.append("the staged mailbox was left behind")
+        check("demote-catches-a-late-send",
+              "mail landing while a demote archives an inbox is in the receipt",
+              not lost, ", ".join(lost))
+
     # --- the unread-mail refusal refuses instead of crashing (its first
     # spelling raised NameError at exactly the moment it was needed)
     with tempfile.TemporaryDirectory() as td:
