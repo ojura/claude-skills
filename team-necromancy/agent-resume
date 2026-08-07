@@ -6312,7 +6312,8 @@ def cleanup_sockets(dry=False):
     Which those are is the engine's answer (dead_sockets, a connect() per
     socket rather than a tmux spawn, because this runs from a SessionStart
     hook and has to be measured in milliseconds). What is left here is the
-    unlinking and the line it prints.
+    unlinking; run_cleanup prints, so the outcome can be said before the
+    per-item detail rather than after it.
     """
     removed = []
     for path in RESOLVER.dead_sockets():
@@ -6324,9 +6325,7 @@ def cleanup_sockets(dry=False):
             removed.append(path.name)
         except OSError as exc:
             warn(f"cannot remove {path}: {exc}")
-    if removed:
-        print(f"{'would remove' if dry else 'removed'} {len(removed)} dead socket(s): {', '.join(removed)}")
-    return 0
+    return removed
 
 
 # A team dir is created before the things that prove its session is alive: the
@@ -6441,22 +6440,24 @@ def team_keep_reason(cfg, table):
 
 
 def cleanup_teams(dry=False):
-    """Remove team dirs that hold nothing resurrectable, and their task dirs."""
-    removed = []
+    """Remove team dirs that hold nothing resurrectable, and their task dirs.
+
+    Returns (removed names, [(team, why it was kept)]). The kept list is
+    answered rather than printed so the caller can lead with the outcome; it
+    is still only rendered under --dry-run, since the hook wants silence.
+    """
+    removed, kept = [], []
     table = RESOLVER.ps_table()
     for cfg in sorted(RESOLVER.roster_path(d.name) for d in RESOLVER.team_dirs()):
         keep = team_keep_reason(cfg, table)
         if keep:
-            if dry:  # auditable, but not noise in the hook
-                print(f"  keeping {cfg.parent.name}: {keep}")
+            kept.append((cfg.parent.name, keep))
             continue
         if not remove_if_cruft(cfg.parent, dry, "team"):
             continue
         remove_if_cruft(CLAUDE_DIR / "tasks" / cfg.parent.name, dry, "tasks")
         removed.append(cfg.parent.name)
-    if removed:
-        print(f"{'would remove' if dry else 'removed'} {len(removed)} empty team(s): {', '.join(removed)}")
-    return removed
+    return removed, kept
 
 
 def run_standing(args):
@@ -7274,9 +7275,24 @@ def run_cleanup(dry=False):
 
     No record is kept of the id a boot is handed: it names the transcript,
     not the team the boot mints.
+
+    The outcome is said first and the per-team reasons after it, because a
+    preview whose first line is its twenty-ninth "keeping" makes the reader
+    scroll to learn that nothing happened. In the hook the whole sweep is
+    still silent unless something was actually removed.
     """
-    cleanup_sockets(dry)
-    cleanup_teams(dry)
+    sockets = cleanup_sockets(dry)
+    removed, kept = cleanup_teams(dry)
+    said = "would remove" if dry else "removed"
+    if sockets:
+        print(fill(f"{said} {len(sockets)} dead socket(s): {', '.join(sockets)}"))
+    if removed:
+        print(fill(f"{said} {len(removed)} empty team(s): {', '.join(removed)}"))
+    if dry:
+        if not (sockets or removed):
+            print(f"nothing to clean up: {len(kept)} team(s) kept, no dead sockets")
+        for team, why in kept:
+            print(fill(f"  keeping {team}: {why}"))
     return 0
 
 
@@ -9654,6 +9670,65 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         shutil.rmtree(reap_base, ignore_errors=True)
     check("reaper-spares-resurrectable", "the reaper spares what can still be resurrected", reapable and kept,
           f"dead reapable: {reapable}, live kept: {kept}")
+
+    # The sweep's preview says what it did before it says what it left alone.
+    # It used to print only the kept lines, so the one thing a reader wanted -
+    # whether anything is about to be deleted - was not on the page at all.
+    # The hook path stays silent unless something was really removed.
+    sweep_base = Path(tempfile.mkdtemp())
+    real_teams_dir, real_sockets = RESOLVER.teams_dir, RESOLVER.dead_sockets
+    aged = time.time() - 86400
+    sweep = {}
+    try:
+        RESOLVER.teams_dir = sweep_base
+        RESOLVER.dead_sockets = lambda: []   # this fixture is about team dirs
+
+        def sweep_stage(name, backdate):
+            directory = sweep_base / name
+            (directory / "inboxes").mkdir(parents=True)
+            (directory / "inboxes" / "team-lead.json").write_text("[]")
+            (directory / "config.json").write_text(json.dumps(
+                {"name": name, "leadAgentId": f"team-lead@{name}",
+                 "leadSessionId": "no-such-session-uuid",
+                 "members": [{"agentId": f"team-lead@{name}", "name": "team-lead"},
+                             {"agentId": f"nobody@{name}", "name": "nobody-here-at-all"}]}))
+            if not backdate:
+                return
+            for path in (directory / "config.json", directory / "inboxes" / "team-lead.json",
+                         directory / "inboxes", directory):
+                os.utime(path, (aged, aged))
+
+        # One of each state the sweep can be in, without asking this machine
+        # for anything: nothing resurrectable and old enough to say so, and a
+        # directory too young for its emptiness to mean anything.
+        sweep_stage("session-sweep-empty", True)
+        sweep_stage("session-sweep-kept", False)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with contextlib.redirect_stdout(io.StringIO()) as previewed:
+                run_cleanup(dry=True)
+            with contextlib.redirect_stdout(io.StringIO()) as swept:
+                run_cleanup(dry=False)
+            with contextlib.redirect_stdout(io.StringIO()) as again:
+                run_cleanup(dry=False)
+        preview = [l for l in previewed.getvalue().splitlines() if l.strip()]
+        acted = [l for l in swept.getvalue().splitlines() if l.strip()]
+        sweep = {
+            "the preview opens with its outcome":
+                bool(preview) and preview[0].startswith("would remove ")
+                and "session-sweep-empty" in preview[0],
+            "the reasons come after it":
+                any(l.lstrip().startswith("keeping ") for l in preview[1:])
+                and not any(l.lstrip().startswith("keeping ") for l in preview[:1]),
+            "a removal says so without --dry-run":
+                len(acted) == 1 and acted[0].startswith("removed "),
+            "the hook stays silent with nothing to do": again.getvalue() == "",
+        }
+    finally:
+        RESOLVER.teams_dir, RESOLVER.dead_sockets = real_teams_dir, real_sockets
+        shutil.rmtree(sweep_base, ignore_errors=True)
+    wrong = sorted(k for k, ok in sweep.items() if not ok)
+    check("cleanup-opens-with-outcome", "the sweep says its outcome before its reasons",
+          not wrong, ", ".join(wrong))
 
     # Enumeration and the single-token question must not diverge: a team the
     # selector accepts and rebuilds was missing from the list of teams, which is
