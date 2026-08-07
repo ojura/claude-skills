@@ -9084,10 +9084,15 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     field_rows = [l for l in told.splitlines()
                   if l.startswith("  ") and l.split() and l.split()[0] in merged_fake.cands]
 
+    def tag_of(line):
+        """This row's source tag, or None when the row carries no tag column."""
+        parts = re.split(r" {2,}", line.strip())
+        return parts[2] if len(parts) > 3 else None
+
     def tag_column(line):
         """Where this row's source tag sits, or None when it carries no tag."""
-        parts = re.split(r" {2,}", line.strip())
-        return line.rfind(f"  {parts[2]}  ") if len(parts) > 3 else None
+        tag = tag_of(line)
+        return line.rfind(f"  {tag}  ") if tag else None
 
     tagged = {
         "every field has a row": len(field_rows) == len(merged_fake.cands),
@@ -9100,8 +9105,8 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             for l in told.splitlines()),
         "the tags line up": len({tag_column(l) for l in field_rows}) == 1
             and None not in {tag_column(l) for l in field_rows},
-        "two sources get two tags": len({re.split(r" {2,}", l.strip())[2]
-                                         for l in field_rows}) == 2,
+        "two sources get two tags": len({tag_of(l) for l in field_rows}) == 2
+            and None not in {tag_of(l) for l in field_rows},
         "the conflict is still marked": "<- conflict: claude-fable-5, fable" in told,
         "the ignored transcript is still named": "older transcript ignored" in told,
     }
@@ -9144,8 +9149,15 @@ def run_selftest(live=False, failed_only=False, list_only=False):
                   "team_name": "TEAMX", "agent_id": "mate@TEAMX"}]}]}}) + "\n")
 
         def refused(path, stored=None):
-            return " ".join(eng_demote.conversion_plan(
-                path, "demote", into=None, stored=stored)["objections"][0].split())
+            """What this demote refuses with, or "" when it refuses nothing.
+
+            Never indexed blind: a demote that stopped objecting at all would
+            end the whole suite in an IndexError, and a crash reads as silence
+            rather than as this check failing.
+            """
+            said = eng_demote.conversion_plan(
+                path, "demote", into=None, stored=stored)["objections"]
+            return " ".join(said[0].split()) if said else ""
 
         with_payload = refused(spawned)
         without = refused(lonely)
