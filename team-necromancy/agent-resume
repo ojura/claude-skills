@@ -6303,7 +6303,23 @@ def diagnose_team(team, table=None, deep=False):
             remedies.append(("--to-team live on each member", "restarts them onto {lead_team}"
                              .format(lead_team=lead_team)))
     elif not reads:
+        # Dormant, and the block so far has only said what is there. A reader of
+        # one block cannot tell which of the three degraded states it is looking
+        # at unless a line says, so this arm says it too.
         verdict = "DEGRADED"
+        lines.append("warning  this team is dormant: no member of it is running, "
+                     "no mail is waiting, and no live lead reads it")
+        if listed:
+            remedies.append((f"{TOOL} {team}", "starts the members its roster lists"))
+        else:
+            # A run of a team with nothing listed either forges a roster from the
+            # transcript that spawned into it, or refuses naming what it could
+            # not find. Which one happens is a transcript walk this sweep does
+            # not pay for, so the remedy names both outcomes rather than
+            # promising the one it cannot know it will get.
+            remedies.append((f"{TOOL} {team}",
+                             "rebuilds a roster from the transcripts and starts what "
+                             "it recovers, or refuses saying what it could not find"))
     elif not worn:
         verdict = "UNKNOWABLE"
         # Both ways to make the lead read, cheap one first: it learns of
@@ -6322,6 +6338,14 @@ def diagnose_team(team, table=None, deep=False):
         verdict = "DEGRADED"
         if split:
             remedies.append((f"{TOOL} {team}", "reseats the crew together"))
+        for name in doubled:
+            # Two steps, because --stop resolves an agent id to every process
+            # wearing it and ends each one; the id names both wearers, so the
+            # stop cannot be aimed at one of them and the resume is what leaves
+            # exactly one behind.
+            remedies.append((f"{TOOL} --stop {name}@{team}",
+                             f"ends all {len(live[name])} processes wearing that id"))
+            remedies.append((f"{TOOL} {name}@{team}", "starts one of them again"))
     else:
         verdict = "CONNECTED"
     return verdict, lines, remedies
@@ -10769,6 +10793,60 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         globals()["RESOLVER"] = real_resolver
     check("verdict-names-actionable", "a verdict names something to act on", not verdicts,
           "; ".join(f"{t}: {why}" for t, why in verdicts.items()))
+
+    # DEGRADED is the verdict that means a person must act, and three different
+    # states reach it. Each is driven here as its own fixture over one corpus
+    # team, and the verdict is asserted as well as the block: a fixture that
+    # drifts to SEVERED fails here rather than quietly testing nothing. The
+    # process table is faked the way the scenarios above fake it, and the
+    # seating is stubbed, because two servers cannot be stood up from a suite.
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = eng = corpus_engine()
+    crew = "session-corpus-crew"
+    lead_row = (771001, 1, f"{FAKE_AGENT_BIN} --resume "
+                           f"11111111-1111-4111-8111-111111111111 --agent-id team-lead@{crew}")
+
+    def _wearing(pid, name):
+        return (pid, 1, f"{FAKE_AGENT_BIN} --resume "
+                        f"22222222-2222-4222-8222-222222222222 --agent-id {name}@{crew}")
+
+    eng.session_registry = lambda: []
+    # A lead that reads this team, so the doubled and split fixtures differ from
+    # the dormant one in the crew alone.
+    eng.team_minted_by = lambda pid: (crew, True)
+    fixtures = {
+        # nothing running and nothing waiting, so no lead reads it either
+        "dormant": ([], lambda ids, table: (None, None), "dormant"),
+        # one name, two processes, one seat between them
+        "doubled": ([lead_row, _wearing(771002, "petrel"), _wearing(771003, "petrel")],
+                    lambda ids, table: ("sock-one", "the crew's seat"), "worn by"),
+        # two names, a seat each
+        "split": ([lead_row, _wearing(771002, "petrel"), _wearing(771004, "sparrow")],
+                  lambda ids, table: (("sock-a" if any("petrel" in i for i in ids)
+                                       else "sock-b"), "a seat"), "seated on"),
+    }
+    arms = {}
+    try:
+        for arm, (rows, hosting, said_word) in fixtures.items():
+            eng.ps_table = lambda refresh=False, rows=rows: rows
+            eng.socket_hosting = hosting
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    verdict, lines, rem = diagnose_team(crew, rows)
+            except BaseException as exc:  # a diagnosis that crashes is a failed one
+                arms[arm] = f"diagnosis raised {type(exc).__name__}"
+                continue
+            if verdict != "DEGRADED":
+                arms[arm] = f"came out {verdict}, so this fixture no longer tests the arm"
+            elif not any(ln.startswith("warning  ") and said_word in ln for ln in lines):
+                arms[arm] = f"no line says {said_word!r}, so the block does not say which state it is"
+            elif not rem or not all(what and cost for what, cost in rem):
+                arms[arm] = f"{len(rem)} remedy(ies), so nothing here says what to do"
+    finally:
+        globals()["RESOLVER"] = real_resolver
+    check("degraded-arms-named-and-remedied",
+          "every degraded state says which one it is and how to leave it",
+          not arms, "; ".join(f"{arm}: {why}" for arm, why in sorted(arms.items())))
 
     # Mail in a mailbox does not demote a team whose lead is live and reading
     # it: that mail arrives at the lead's next turn boundary and needs nobody.
