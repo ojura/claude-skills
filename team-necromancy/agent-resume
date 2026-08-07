@@ -92,6 +92,14 @@ what {TOOL} reconstructs for a launch."""
 # lifecycle record (state, history, the spoken identity) stays a file, because
 # a reap has no transcript to write into and membership must be enumerable
 # without opening every transcript on the machine.
+#
+# Both this record and the restamp one below were traced through the harness's
+# own handling of the file and come out unchanged: parsing, compaction,
+# relocation and retention all keep a line they do not recognise, and the one
+# path that does not is remote hydration, which re-serializes the server's
+# entries over the local file with a truncating write, so a local-only line
+# does not survive resuming a session addressed by URL with an ingress URL
+# configured, which an ordinary local resume never does.
 RECEIPT_RECORD = f"{TOOL}-receipt"
 # A restamp leaves its own trace in the file it rewrote, under its own type so
 # a demote reading the last line cannot mistake one kind of record for the
