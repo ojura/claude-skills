@@ -3422,6 +3422,21 @@ class Resolver:
             receipt["in_file"] = consumed
         return out, objections
 
+    def _carries_uuid(self, stem, uuid):
+        """Whether that session's transcript holds an entry with this uuid.
+
+        The question a fork's by-reference prefix turns on, asked the cheap
+        way: the loader needs the entry to exist before it can walk from it,
+        and a substring hit is enough to know it does not.
+        """
+        path = self.transcript_path(stem) if stem else None
+        if not path:
+            return False
+        try:
+            return f'"{uuid}"' in path.read_text(errors="replace")
+        except OSError:
+            return False
+
     @staticmethod
     def _receipt_line(receipt):
         """The trailing record a promoted transcript carries about itself."""
@@ -3534,6 +3549,24 @@ class Resolver:
             # original bytes. Anywhere else is a move, and the record of the
             # promote survives it, because a move is not an undo.
             undo = carried is None or into == carried.get("parent")
+            # A fork inherits its prefix by reference, and the harness resolves
+            # that reference against the session the ref names rather than the
+            # directory the file sits in. Land it somewhere that does not carry
+            # the referenced entry and it wakes with an empty prefix and a line
+            # in a log nobody reads, so the same lookup happens here, before the
+            # move, where it can still be refused.
+            ref_raw = stored.get("ref")
+            if ref_raw and not undo:
+                try:
+                    anchor = json.loads(ref_raw).get("parentLastUuid")
+                except ValueError:
+                    anchor = None
+                if anchor and not self._carries_uuid(into, anchor):
+                    return {"objections": [
+                        f"this fork inherits its context by reference from "
+                        f"{json.loads(ref_raw).get('parentSessionId')}, and {into} "
+                        f"does not carry {anchor}; moved there it would wake with "
+                        f"none of it"], "proved": False}
             if not into:
                 return {"objections": ["demote needs the parent session (--into)"],
                         "proved": False}
@@ -9715,6 +9748,35 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             faults.append("a demote into another parent landed elsewhere")
         elif not any(RECEIPT_RECORD in line for line in elsewhere["lines"]):
             faults.append("a demote into another parent ate the receipt")
+
+        # A fork's inherited prefix is resolved against the session its ref
+        # names, not the directory it sits in, so a move is safe exactly when
+        # the destination carries the referenced entry. Both answers, against
+        # one specimen, or the refusal could pass by refusing everything.
+        pref = sub / "agent-p2.jsonl"
+        pref.write_text(compact({"type": "fork-context-ref", "agentId": "p2",
+                                 "parentSessionId": "PARENT",
+                                 "parentLastUuid": "anchor-1",
+                                 "contextLength": 3}) + "\n" +
+                        compact({"parentUuid": None, "isSidechain": True,
+                                 "sessionId": "PARENT", "type": "user",
+                                 "uuid": "p2-root",
+                                 "message": {"role": "user", "content": "go"}}) + "\n")
+        (sub / "agent-p2.meta.json").write_text('{"agentType":"fork","isFork":true}')
+        (Path(td) / "proj" / "PARENT.jsonl").write_text(
+            compact({"uuid": "anchor-1", "type": "assistant"}) + "\n")
+        (Path(td) / "proj" / "HASIT.jsonl").write_text(
+            compact({"uuid": "anchor-1", "type": "assistant"}) + "\n")
+        (Path(td) / "proj" / "LACKS.jsonl").write_text(
+            compact({"uuid": "not-it", "type": "assistant"}) + "\n")
+        pplan = eng.conversion_plan(pref, "promote", identity=("p2", "T"))
+        pdest = Path(td) / "proj" / "p2-root.jsonl"
+        pdest.write_text("\n".join(pplan["lines"]) + "\n")
+        if not eng.conversion_plan(pdest, "demote", into="HASIT")["proved"]:
+            faults.append("a move to a parent carrying the referenced entry refused")
+        lost = eng.conversion_plan(pdest, "demote", into="LACKS")
+        if lost["proved"] or "does not carry" not in "".join(lost["objections"]):
+            faults.append("a move to a parent without the referenced entry was allowed")
 
         # Last means last. With a turn written past it the record is history,
         # so the demote leaves it where it sits instead of eating it.
