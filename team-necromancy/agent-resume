@@ -7176,13 +7176,23 @@ def run_doctor(args, selector=None):
         for _what, cost, shape in shaped:
             by_shape[(shape, cost)].add(team)
     shared = {pair for pair, wanting in by_shape.items() if len(wanting) > 1}
+    # Which explanation a block's remedy means. Three of the shared ones on
+    # this machine open with the same command, the plain rebuild with the team
+    # blanked to <team>, so a bare command in a block matched all three and
+    # pointed at none of them. A letter ties the
+    # two ends, the way --explain ties a field's row to its source, and it goes
+    # where the explanation would have gone, so the remedy column still reads
+    # as command-then-parenthesis whichever kind of block it is.
+    tag = {pair: (chr(ord("A") + at) if at < 26 else f"S{at}")
+           for at, pair in enumerate(sorted(shared))}
     for team, verdict, lines, shaped in blocks:
         print("\n" + f"{verdict:<11} {team}".replace(
             verdict, tint(verdict, VERDICT_SGR.get(verdict)), 1))
         for line in lines:
             print(fill(f"  {line}"))
         for what, cost, shape in shaped:
-            print(fill(f"  remedy   {what}" if (shape, cost) in shared
+            print(fill(f"  remedy   {what}  ({tag[(shape, cost)]})"
+                       if (shape, cost) in shared
                        else f"  remedy   {what}  ({cost})"))
     if skipped:
         print(fill(f"\n{skipped} team(s) with nothing live and no waiting mail "
@@ -7205,9 +7215,9 @@ def run_doctor(args, selector=None):
         # The half the blocks above left out, beside the other legend, with
         # <team> where each block prints its own name.
         column = max(len(shape) for shape, _cost in shared)
-        print("\nremedies")
+        print("\nremedies  (each block's remedy line ends with its letter)")
         for shape, cost in sorted(shared):
-            print(fill(f"  {shape:<{column}}  {cost}"))
+            print(fill(f"  {tag[(shape, cost)]}  {shape:<{column}}  {cost}"))
     return worst
 
 
@@ -12970,6 +12980,43 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     wrong = sorted(k for k, ok in shared_remedy.items() if not ok)
     check("sweep-shared-remedy-once", "the sweep states a shared remedy explanation once",
           not wrong, ", ".join(wrong) + (f"; repeated: {twice}" if twice else ""))
+
+    # Moving the explanation down is only half of it. Several of the shared
+    # explanations open with the same blanked command, so a block printing that
+    # command and nothing else matched all of them and named none, and a reader
+    # could not get from a block to the sentence meant for it. Read off the
+    # printed sweep rather than off the tag table, because what is being
+    # asserted is that the two ends of the tie reached the screen.
+    joined = []
+    for line in swept_doc.getvalue().splitlines():
+        # fill() hangs a continuation under the label; nothing that starts a
+        # line here is indented that far.
+        if joined and line.startswith("     "):
+            joined[-1] += " " + line.strip()
+        else:
+            joined.append(line)
+    remedy_lines = [ln for ln in joined if ln.startswith("  remedy   ")]
+    at = next((n for n, ln in enumerate(joined) if ln.startswith("remedies")), None)
+    region = [ln for ln in joined[at + 1:] if ln.startswith("  ")] if at is not None else []
+    letters = re.compile(r"^  ([A-Z]|S\d+)  \S")
+    defined = {m.group(1) for m in map(letters.match, region) if m}
+    used = {m.group(1) for m in
+            (re.search(r"\(([A-Z]|S\d+)\)$", ln.rstrip()) for ln in remedy_lines) if m}
+    tied = {
+        # Two blocks asking the same act is what the letters are for, and a
+        # fixture without one would pass this rule by never testing it.
+        "the fixture shares a remedy": len(defined) > 0,
+        "several shared explanations open with the same command": len(
+            {ln.split("  ")[2] for ln in region if letters.match(ln)}) < len(defined),
+        "every letter a block carries is defined below": used <= defined,
+        "every letter defined below is carried by a block": defined <= used,
+        "no remedy line is left without one or the other": all(
+            ln.rstrip().endswith(")") for ln in remedy_lines),
+    }
+    wrong = sorted(k for k, ok in tied.items() if not ok)
+    check("sweep-remedy-tied-to-its-explanation",
+          "each swept block's remedy says which shared explanation it means",
+          not wrong, ", ".join(wrong) + f"; defined {sorted(defined)}, used {sorted(used)}")
 
     # A verdict names what an operator must act on. Pruned members are the trace
     # of finished work and an unrecorded one is fixed by running it, so neither
