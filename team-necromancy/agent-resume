@@ -929,7 +929,13 @@ class Resolver:
                 return pid, True, f"pid {pid}, which spawned into team {team}", True
             pid = self._pid_that_minted(team)
             if pid:
-                return pid, True, f"pid {pid}, which is running as team {team}", False
+                # The pairing says why this pid was picked, and nothing more. What
+                # a process runs as comes from its window-start stamps and its
+                # argv, which team_minted_by reads and the "runs as" line prints;
+                # a boot time inside a team's window is only the reason this pid
+                # was the candidate. Naming a team here put a claim on the line
+                # above the one that answers it, and the two disagreed on screen.
+                return pid, True, f"pid {pid}, whose boot pairs with this team's creation", False
         return None, False, None, False
 
     def lead_pid_for(self, session_id):
@@ -9418,6 +9424,49 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         wrong = sorted(k for k, good in shapes.items() if not good)
         check("mint-shape-bounds", "shape bounds which team a process could have minted", not wrong,
               ", ".join(wrong))
+
+    # --- the boot-timing rung says why it picked a pid, not what that pid runs as
+    # The rung is the one answer graded inexact, and its evidence is printed one
+    # line above the runs-as line, which answers the same question from the
+    # stamps and argv. So the evidence may name no team at all: naming one made
+    # the doctor contradict itself on adjacent lines of the same block.
+    # The fixture is built so only that rung can answer. The team name is
+    # session-shaped, so a wording that leaked it would be caught by shape as
+    # well as by the literal, and the pid is asserted too, so a rung that never
+    # fired fails here rather than passing on an empty string.
+    with tempfile.TemporaryDirectory() as td:
+        eng10 = Resolver(needs=Needs(maybe=set(NEED)))
+        eng10.projects_dir, eng10.teams_dir = Path(td) / "proj", Path(td) / "teams"
+        eng10.projects_dir.mkdir(parents=True)
+        paired = "session-deadbee1"
+        (eng10.teams_dir / paired).mkdir(parents=True)
+        eng10.roster_path(paired).write_text(json.dumps(
+            # leadSessionId names no transcript, and no registry sessionId opens
+            # with deadbee1, so the exact join above has nothing to join on.
+            {"name": paired, "leadSessionId": "9d9d9d9d-9d9d-49d9-89d9-9d9d9d9d9d9d",
+             "createdAt": 1000,
+             "members": [{"name": "team-lead", "agentId": f"team-lead@{paired}"}]}))
+        me = os.getpid()
+        # Our own pid, because the rung asks the kernel whether the process is
+        # alive and a made-up number would drop out of the pairing.
+        eng10.session_registry = lambda: [
+            {"pid": me, "sessionId": "fedcba98-fedc-4ba9-8fed-cba98fedcba9",
+             "startedAt": 1000 + TEAM_MINT_WINDOW_MS - 1, "updatedAt": 0}]
+        eng10.ps_table = lambda refresh=False: []      # no masquerade to find in argv
+        got_pid, got_alive, got_how, got_exact = eng10.lead_pid(None, paired)
+        picked = {
+            "the timing pairing is what answered": got_pid == me and got_alive,
+            "and it is graded inexact": got_exact is False,
+            "the evidence names no team of this shape":
+                bool(got_how) and not re.search(r"session-[0-9a-f]{8}", got_how),
+            "nor this team by name": bool(got_how) and paired not in got_how,
+            "and it still leads with the pid its readers strip":
+                bool(got_how) and got_how.startswith(f"pid {me}, "),
+        }
+        wrong = sorted(k for k, good in picked.items() if not good)
+        check("pick-evidence-names-no-team",
+              "the boot-timing pick says why it picked, not what the pid runs as",
+              not wrong, ", ".join(wrong) or f"said {got_how!r}")
 
     # --- a team is larger than its roster, and a run that takes the roster says so
     pop_wrong, with_former = [], None
