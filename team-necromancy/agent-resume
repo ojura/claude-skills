@@ -573,6 +573,26 @@ def fill(text, width=None, offset=0):
     return "\n".join(out)
 
 
+def clip(text, width):
+    """`text` cut to fit `width`, at a space, ending in ... when anything went.
+
+    For a column that cannot reflow. A hard slice ends mid-word and reads as
+    a damaged value rather than a shortened one, so the cut lands on a word
+    boundary and the ... is what says more was written. A single token longer
+    than the column has no boundary to land on and is cut where it must be;
+    the ... says that too.
+    """
+    text = " ".join(str(text or "").split())
+    if len(text) <= width:
+        return text
+    room = max(width - 3, 1)
+    # One character past the cut, so a cut that already lands on a space keeps
+    # the last whole word instead of dropping it.
+    ahead = text[:room + 1]
+    head = ahead.rsplit(" ", 1)[0] if " " in ahead[1:] else text[:room]
+    return head.rstrip() + "..."
+
+
 def wrap_command(command, label, hang, paste=False, width=None):
     """One command as physical lines: `label`, then arguments, broken only
     between them - or inside one at single spaces when it alone cannot fit
@@ -7283,8 +7303,21 @@ def run_demote(args):
     return 0
 
 
+# One layout for the ledger's header and its rows, so a label cannot drift
+# off the column it names. The state column is as wide as the longest state
+# ("unknown recipient"), which used to run into the summary beside it.
+MAIL_ROW = "{sent:<19}  {sender:>14} -> {to:<14} {state:<17} {summary}"
+
+
 def run_mail_ledger(selector=None):
-    """A team's mail, send side joined against delivery side. Read-only."""
+    """A team's mail, send side joined against delivery side. Read-only.
+
+    A row is a per-send fact and stays one. The explanation attached to a row
+    is not: seventeen sends to one unknown name printed the same sentence
+    seventeen times. So the explanations are grouped by addressee and state
+    and said once under the rows, each carrying how many sends it covers.
+    The states themselves stay on their own rows, where they were asked for.
+    """
     if not selector:
         die("--mail-ledger needs a team, as session-<id> or a prefix of it")
     team = selector if selector.startswith("session-") else f"session-{selector[:8]}"
@@ -7292,11 +7325,39 @@ def run_mail_ledger(selector=None):
     if not ledger:
         die(f"no authored mail found for {team} (no stamped transcripts, or "
             "nobody used SendMessage)")
+    print(MAIL_ROW.format(sent="sent", sender="from", to="to", state="state",
+                          summary="summary"))
+    # What the fixed columns leave. Formatting the row with every field empty
+    # measures the layout rather than restating its widths here.
+    room = max(term_width() - len(MAIL_ROW.format(
+        sent="", sender="", to="", state="", summary="")), 24)
+    notes = {}
     for entry in ledger:
-        print(f"{ms_str(entry['sent'])}  {entry['sender']:>14} -> {entry['to'] or '?':<14} "
-              f"{entry['state']:<12} {(entry['summary'] or '')[:44]}")
+        print(MAIL_ROW.format(
+            sent=ms_str(entry["sent"]), sender=entry["sender"],
+            to=entry["to"] or "?", state=entry["state"],
+            summary=clip(entry["summary"], room)))
         if entry["state"] not in ("delivered", "protocol"):
-            print(f"{'':22}{entry['detail']}")
+            # Keyed on the detail too: within a group it is the same sentence
+            # every time, and a group whose detail ever differed gets its own
+            # note rather than losing one of them.
+            key = (entry["to"] or "?", entry["state"], entry["detail"])
+            notes[key] = notes.get(key, 0) + 1
+    if notes:
+        print(fill("\nnotes    one per addressee and state, however many sends "
+                   "repeat it"))
+        counted = {key: f"{n} send{'' if n == 1 else 's'}, {key[1]}"
+                   for key, n in notes.items()}
+        column = max(len(said) for said in counted.values())
+        for key in notes:
+            to, _state, detail = key
+            head = f"  {to:<14} {counted[key]:<{column}}  "
+            # fill hangs a continuation under the first column of a line, which
+            # here is the addressee. The detail is the last column, so a long
+            # one is indented back to it rather than into the counts.
+            body = fill(detail, width=max(term_width() - len(head), 24)).split("\n")
+            print("\n".join([head + body[0]]
+                            + [" " * len(head) + line for line in body[1:]]))
     tallies = collections.Counter(e["state"] for e in ledger)
     print("\n" + ", ".join(f"{n} {state}" for state, n in tallies.most_common()))
     return 1 if tallies.get("unexplained") else 0
@@ -11333,6 +11394,100 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         check("torn-inbox-reported", "a torn inbox is reported, not skipped",
               bool(got) and got[0] is None and "torn" in got[1],
               str(got))
+
+    # --- the printed ledger reads as a table, and says a repeated fact once
+    # Its own fixture rather than the one above: the shape under test is what
+    # happens when several sends to ONE name carry the same explanation, and
+    # the join fixture deliberately gives every send a different state.
+    with tempfile.TemporaryDirectory() as td:
+        proj = Path(td) / "proj"
+        proj.mkdir(parents=True)
+        compact = lambda d: json.dumps(d, separators=(",", ":"))
+        fx_team = "session-ledgerfx"
+        wordy = ("a summary long enough to run off the end of the column the "
+                 "ledger leaves for it")
+
+        def fx_send(to, summary, n):
+            return compact({"type": "assistant", "agentName": "alice",
+                            "teamName": fx_team, "uuid": f"fx-{n}",
+                            "timestamp": f"2026-01-01T00:00:{n:02d}Z",
+                            "parentUuid": None, "message": {"content": [
+                                {"type": "tool_use", "name": "SendMessage",
+                                 "input": {"to": to, "summary": summary,
+                                           "message": f"body-{n}"}}]}})
+        (proj / "alice.jsonl").write_text("\n".join([
+            fx_send("nowhere", wordy, 1),
+            fx_send("nowhere", wordy, 2),
+            fx_send("nowhere", "a third send to the same name", 3),
+            fx_send("elsewhere", "one send to a different unknown name", 4),
+        ]) + "\n")
+        eng6 = Resolver(needs=Needs(maybe=set(NEED)))
+        eng6.projects_dir, eng6.teams_dir = Path(td), Path(td) / "teams"
+        fx_rows = eng6.mail_ledger(fx_team)
+        # The design width, pinned: the summary column is what the terminal
+        # leaves, so a suite run in some other terminal would measure a
+        # different table. Restored the way the launch report's check does.
+        real_resolver, real_columns = globals()["RESOLVER"], os.environ.get("COLUMNS")
+        globals()["RESOLVER"], os.environ["COLUMNS"] = eng6, "100"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as ledger_out:
+                run_mail_ledger(fx_team)
+        finally:
+            globals()["RESOLVER"] = real_resolver
+            if real_columns is None:
+                os.environ.pop("COLUMNS", None)
+            else:
+                os.environ["COLUMNS"] = real_columns
+        told = ledger_out.getvalue()
+        said = " ".join(told.split())
+        sent_lines = [l for l in told.splitlines() if l.startswith("2026-")]
+        repeated = [r for r in fx_rows if r["to"] == "nowhere"]
+        alone = next((r for r in fx_rows if r["to"] == "elsewhere"), None)
+        # Defaulted rather than indexed, so a fixture that stops producing
+        # these rows fails this check instead of dying inside it.
+        repeat_said = " ".join((repeated[0]["detail"] if repeated else "").split())
+        alone_said = " ".join((alone["detail"] if alone else "").split())
+        grouped = {
+            # Without this the rule passes over a fixture that repeats
+            # nothing, which is the one case it is not about.
+            "the fixture repeats one addressee's explanation":
+                len(repeated) > 1 and len({r["detail"] for r in repeated}) == 1,
+            "a repeated explanation is said once":
+                bool(repeat_said) and said.count(repeat_said) == 1,
+            "a second addressee still gets its own":
+                bool(alone_said) and said.count(alone_said) == 1,
+            # The grouping is the renderer's; the states are per-send facts and
+            # every send keeps its own row saying one.
+            "every send still shows its state":
+                len(sent_lines) == len(fx_rows)
+                and all("unknown recipient" in l for l in sent_lines),
+        }
+        wrong = sorted(k for k, ok in grouped.items() if not ok)
+        check("ledger-detail-once-per-addressee",
+              "the ledger says a repeated explanation once per addressee",
+              not wrong, ", ".join(wrong))
+
+        cut = clip(wordy, 30)
+        table = {
+            "the rows carry a header": told.splitlines()[0].split() ==
+                ["sent", "from", "->", "to", "state", "summary"],
+            "an overlong summary is cut with ...":
+                cut.endswith("...") and len(cut) <= 30,
+            "and cut at a word, not inside one": wordy.startswith(cut[:-3])
+                and wordy[len(cut) - 3:len(cut) - 2] in (" ", ""),
+            "a summary that fits is left alone": clip("a short one", 30) == "a short one",
+            "the printed rows are cut the same way":
+                any(l.rstrip().endswith("...") for l in sent_lines),
+            # The summary's column is whatever the fixed columns leave, so a
+            # miscounted layout shows up as rows past the width. Names are not
+            # cut, so this holds for names that fit their column, as these do.
+            "the rows fit the design width":
+                all(len(l) <= 100 for l in told.splitlines()),
+        }
+        wrong = sorted(k for k, ok in table.items() if not ok)
+        check("ledger-rows-read-as-a-table",
+              "the ledger's rows are headed and cut at a word", not wrong,
+              ", ".join(wrong))
 
     # --- the reports carry what the mailbox file cannot show
     sample = [
