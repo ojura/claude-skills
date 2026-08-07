@@ -2871,7 +2871,7 @@ class Resolver:
         others = [pid for pid, _t in strangers]
         owner = self.lead_pid_for(session_uuid)
         if owner and owner[2] and owner[0] not in others and owner[0] not in ours:
-            (ours if owner[0] in own_lineage(table) else others).append(owner[0])
+            (ours if owner[0] in self._own_lineage(table) else others).append(owner[0])
         return others, ours
 
     def self_holds_transcript(self, session_uuid, table):
@@ -5450,10 +5450,10 @@ def kill_holder(pid, where, args, indent="  "):
     # A healthy claude takes a moment to shut down cleanly, so poll rather than
     # call it a failure while it is still on its way out.
     for _ in range(10):
-        if not pid_alive(pid):
+        if not RESOLVER.pid_alive(pid):
             break
         time.sleep(0.15)
-    if killed.returncode != 0 or pid_alive(pid):
+    if killed.returncode != 0 or RESOLVER.pid_alive(pid):
         # Two processes appending to one transcript is the state this prevents,
         # so a kill that did not work has to be said out loud rather than
         # reported as a clean move.

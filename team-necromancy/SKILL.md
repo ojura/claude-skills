@@ -123,7 +123,10 @@ A lead moves the same way, and `--to-team TEAM` on one is the same operation as
 the masquerade spelling `agent-resume team-lead@TEAM --resume <uuid>`: whichever
 you type, the run ends whoever is running that conversation (asking first,
 `--yes` to skip), retires the team its window-start stamps name so the flags win
-after the next restart, and execs it as TEAM's lead. Under `--force` against a
+after the next restart, and execs it as TEAM's lead. One asymmetry between the
+spellings: placement puts a lead back with its running crew, so with the old
+crew still live the agent-id spelling resolves back to the old team and nothing
+moves; `--to-team` states the destination and always reaches the move. Under `--force` against a
 team something is still running as, it restamps those two fields instead and the
 old team stays up. The lead moves alone: no member is restarted or re-stamped,
 so the report names who stays behind, what mail waits for them there, and that
