@@ -1875,11 +1875,17 @@ class Resolver:
         if trailing:
             raws.pop()
         # Same rule as the conversion record: while it is still the last line
-        # it belongs to this tool, so a second restamp replaces it rather than
+        # it belongs to this tool, so a further restamp replaces it rather than
         # stacking. Once anything is written past it, it is history and stays.
+        # What it carries forward is where this conversation started, not the
+        # hop before: three moves leave one record of the net change, and a
+        # move back to the origin leaves none.
+        origin = None
         if raws:
             try:
-                if json.loads(raws[-1]).get("type") == RESTAMP_RECORD:
+                prior = json.loads(raws[-1])
+                if prior.get("type") == RESTAMP_RECORD:
+                    origin = (prior.get("restamp") or {}).get("old") or None
                     raws.pop()
             except (ValueError, AttributeError):
                 pass
@@ -1913,13 +1919,16 @@ class Resolver:
                         "proved": False}
             out = list(raws)
             out[i] = self._codec_dump(new, style)
+            was = origin or {"teamName": old_team, "agentName": old_name}
+            now = {"teamName": team, "agentName": name or old_name}
             receipt = {"kind": "restamp", "stem": path.stem, "uuid": uuid,
-                       "old": {"teamName": old_team, "agentName": old_name},
-                       "new": {"teamName": team, "agentName": name or old_name},
-                       "at": int(time.time() * 1000)}
-            out.append(json.dumps({"type": RESTAMP_RECORD, "restamp": receipt},
-                                  separators=(",", ":"), ensure_ascii=False,
-                                  sort_keys=True))
+                       "old": was, "new": now, "at": int(time.time() * 1000)}
+            # Back where it started is not a change to record, and the file
+            # returns to the bytes it had before any of this.
+            if now != was:
+                out.append(json.dumps({"type": RESTAMP_RECORD, "restamp": receipt},
+                                      separators=(",", ":"), ensure_ascii=False,
+                                      sort_keys=True))
             return {"path": path, "lines": out, "receipt": receipt,
                     "objections": [], "proved": True}
         return {"objections": [f"identity record {uuid} not found as a line"],
@@ -10026,14 +10035,24 @@ def run_selftest(live=False, failed_only=False, list_only=False):
                 stray.append("the restamped file does not restamp back")
             else:
                 apply_restamp(back)
-                # A restamp leaves a trace on purpose, so the round trip
-                # restores the identity rather than the bytes: every original
-                # line back as it was, and one trace line saying what happened.
-                came_back = target.read_text().splitlines(keepends=True)
-                if came_back[:len(rows)] != [compact(r) + "\n" for r in rows]:
-                    stray.append("the round trip did not restore the original lines")
-                if sum(RESTAMP_RECORD in line for line in came_back) != 1:
-                    stray.append("a restamped file does not carry exactly one trace")
+                # The trace records the net change from where the conversation
+                # started, so coming back to the origin leaves nothing to
+                # record and the bytes are the ones it had before any of it.
+                was = "".join(compact(r) + "\n" for r in rows)
+                if target.read_text() != was:
+                    stray.append("the round trip did not restore the original bytes")
+                # And three moves leave one record of the net change, not two
+                # records of two hops, and not a hop that forgot the origin.
+                apply_restamp(eng7.restamp_plan(target, "MID"))
+                apply_restamp(eng7.restamp_plan(target, "FAR"))
+                lines = target.read_text().splitlines()
+                traces = [json.loads(l)["restamp"] for l in lines
+                          if RESTAMP_RECORD in l]
+                if len(traces) != 1:
+                    stray.append(f"three moves left {len(traces)} traces")
+                elif (traces[0]["old"]["teamName"], traces[0]["new"]["teamName"]) != ("OLD", "FAR"):
+                    stray.append(f"the trace forgot the origin: {traces[0]['old']} "
+                                 f"-> {traces[0]['new']}")
         finally:
             globals()["RECEIPTS_DIR"] = real_receipts
         # The live-holder guard: the composed question sees a lineage pid,
