@@ -4201,8 +4201,13 @@ def build(args):
 
 def enforce_ctx(ctx, args):
     """The identity gate, at the boundary where this run starts acting."""
+    # A lead move is a team change asked for by name, the same as --to-team is
+    # for a member, so the stamp it contradicts is the point of the run rather
+    # than a contradiction to refuse. It is set only by the lead path, and only
+    # once that path has been through the rebind step.
     enforce_identity(ctx["resolution"], ctx["objections"],
-                     allow_team_change=bool(args.to_team), force=args.force)
+                     allow_team_change=bool(args.to_team) or bool(ctx.get("lead_move")),
+                     force=args.force)
     enforce_restore(ctx, args)
 
 
@@ -4222,6 +4227,12 @@ def enforce_restore(ctx, args):
     """
     path = getattr(ctx["resolution"], "path", None)
     if not path:
+        return
+    # A lead move has already been through the rebind step, which retired the
+    # team the stamps name or rewrote them. Asking again here would re-refuse a
+    # move this run has just made, and in a dry run, where neither has happened
+    # yet, would refuse the preview of it. Nothing on the member path sets this.
+    if ctx.get("lead_move"):
         return
     stamped, state = RESOLVER.restored_identity(path)
     if state != "restored":
@@ -4827,12 +4838,14 @@ SPAWN_FIELDS = {
 
 
 
-def forge_team(ctx, dry, evidence=None):
+def forge_team(ctx, dry, evidence=None, team=None):
     """Recreate a team dir the graceful lead exit rm -rf'd, from merged fields.
 
     The roster is scaffolding; the transcript is the identity. Everything the
-    config needs is already in the merge, so a missing team is not fatal."""
-    record = RESOLVER.roster_record(ctx)
+    config needs is already in the merge, so a missing team is not fatal.
+    `team` names a destination, the same way roster_record's does: a lead being
+    moved forges the team it is going to, not the one its history names."""
+    record = RESOLVER.roster_record(ctx, team=team)
     team, name = record["team"], record["name"]
     if not team or not (name or ctx.get("leads_team")):
         return
@@ -5374,6 +5387,60 @@ def decline_unreachable(ctx, args, agent_id, source, dest, prefix=""):
         die("stopped; clear the blockers above, or pass --keep-team")
 
 
+def kill_holder(pid, where, args, indent="  "):
+    """End the process holding the conversation this run is about to take over.
+    True when it is gone.
+
+    One spelling for both paths. A member migrating to another team and a lead
+    moving to one do the same thing to the same obstacle: identity is frozen in
+    argv at exec, so a move is kill and restart, and two processes must never
+    append to one transcript. Written twice, the two would drift, and the one
+    that drifted would be the one nobody was watching.
+
+    Ending a conversation cannot be undone, so it is asked for the way --stop
+    asks: y/N, --yes skips the question, and nothing to ask at stops the run
+    rather than killing something nobody was told about. A dry run prints the
+    line and asks nothing, because nothing happens.
+    """
+    said = f"pid {pid}, which holds this transcript{where}"
+    # Asked before the line that says it is happening, so the tense on screen is
+    # never ahead of the act.
+    if not (args.dry_run or getattr(args, "yes", False)):
+        if not sys.stdin.isatty():
+            die(f"this move has to end {said}, and nothing here can ask; "
+                "pass --yes, or stop it yourself first")
+        try:
+            answer = input(f"kill {said}? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if not answer.startswith("y"):
+            die(f"left alone; stop pid {pid} yourself, or pass --yes")
+    step(args.dry_run, f"would kill {said}", f"killing {said}", indent=indent)
+    if args.dry_run:
+        # Every answer below this point comes from a table this run did not
+        # change, so the preview says whose liveness it is still counting.
+        print(fill(f"{indent}a dry run ends nothing, so what follows is measured "
+                   f"with pid {pid} still running"))
+        return False
+    killed = subprocess.run(["kill", str(pid)], capture_output=True)
+    # A healthy claude takes a moment to shut down cleanly, so poll rather than
+    # call it a failure while it is still on its way out.
+    for _ in range(10):
+        if not pid_alive(pid):
+            break
+        time.sleep(0.15)
+    if killed.returncode != 0 or pid_alive(pid):
+        # Two processes appending to one transcript is the state this prevents,
+        # so a kill that did not work has to be said out loud rather than
+        # reported as a clean move.
+        warn(f"pid {pid} did not die ({(killed.stderr or b'').decode().strip() or 'still running'}); "
+             "it is still appending to this transcript")
+        return False
+    # Nothing may answer a liveness question from a table taken before this.
+    RESOLVER.refresh_procs()
+    return True
+
+
 def auto_redirect(ctx, args, table, prefix=""):
     """Give a launch the identity of the team the lead actually runs as.
 
@@ -5552,6 +5619,136 @@ def report_launch(ctx, command, prefix="", role="agent", agent_id=None, extra=()
     print()
 
 
+def lead_source_team(ctx, dest):
+    """The team a lead is moving off, or None when this launch is not a move.
+
+    Two shapes of lead, one question. A lead that was itself launched
+    flag-bound carries team stamps on its window-start, and restored_identity
+    reads them; a plain lead stamps nothing at all, and the only identity it
+    leaves on disk is the spawn payloads teams_led_by reads. Either way the
+    answer is a team this conversation was running as and dest is not, which
+    is what makes the crew it is leaving behind nameable.
+    """
+    path = getattr(ctx["resolution"], "path", None)
+    if not path or not dest:
+        return None
+    stamped, state = RESOLVER.restored_identity(path)
+    source = stamped if state else next(iter(RESOLVER.teams_led_by(path.stem)), None)
+    return source if source and source != dest else None
+
+
+def lead_holders(ctx, table):
+    """(others, ours): every live pid running this lead's conversation.
+
+    Both witnesses, because a lead is the one identity that can be invisible
+    to either. A masqueraded lead carries --resume in its argv and never
+    writes a session file; a lead resumed from the in-app picker runs as bare
+    `claude` and is visible only in the registry. Asking one of them is how a
+    move ends up exec'ing a second copy onto a live conversation.
+    """
+    strangers, ours = RESOLVER.transcript_holders(ctx["session_uuid"], table)
+    others = [pid for pid, _t in strangers]
+    owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
+    if owner and owner[2] and owner[0] not in others and owner[0] not in ours:
+        # Our own lineage is excluded from the argv half by construction, and
+        # the registry does no such thing, so the same exclusion is applied to
+        # it here rather than left for the kill to discover.
+        (ours if owner[0] in own_lineage(table) else others).append(owner[0])
+    return others, ours
+
+
+def lead_kill_gate(ctx, args, table, prefix=""):
+    """Clear whatever is running this lead's conversation, before anything else.
+    True when nothing holds it any more, or in a dry run when nothing would.
+
+    A move was asked for by name, and one conversation cannot be in two
+    processes at once, so the holder goes first: through the same kill a member
+    migration uses, before the liveness guard reads the process table, and
+    before any reap objection is counted. The dead lead's own objection to
+    retiring its team dissolves with it, which is why this runs first rather
+    than as a special case inside the reap.
+    """
+    others, ours = lead_holders(ctx, table)
+    if ours:
+        die(f"you are running this transcript yourself (pid {ours[0]}); nothing "
+            "can replace a process from inside it. Run this from another "
+            "terminal, or exit that session first")
+    cleared = True
+    for pid in others:
+        # A dry run named the kill and did nothing, which is the preview of a
+        # run that would have cleared it; a real kill that did not work has
+        # already said so, and leaves the guard below to stop the run.
+        cleared = (kill_holder(pid, "", args, indent=prefix + "  ")
+                   or args.dry_run) and cleared
+    return cleared
+
+
+def crew_left_behind(source, dest, prefix=""):
+    """The report lines for the crew a lead move does not take with it.
+
+    A lead moves alone: nothing here restarts a member, moves its mail or
+    rewrites its stamps, so every one of them keeps writing to the team this
+    conversation just left. Their states are the doctor's words for the same
+    states, since it is the same question asked at a different moment, and
+    the way to move one is named because nothing else in this run will.
+    """
+    population = RESOLVER.team_population(source)
+    said = []
+    for name, (state, _why) in sorted(population.items()):
+        if name == "team-lead":
+            continue
+        live = RESOLVER.wearers(f"{name}@{source}")
+        said.append(f"{name} ({state}"
+                    + (f", running as pid {live[0][0]}" if live else "") + ")")
+    lines = [f"crew     {len(said)} stay on {source}"
+             + (": " + ", ".join(said) if said else "")]
+    for name, (count, oldest) in sorted(RESOLVER.inbox_state(source).items()):
+        if count is None:
+            lines.append(f"mail     {name}'s inbox is {oldest}; it stays where it is")
+        elif count:
+            lines.append(f"mail     {count} waiting for {name} on {source}, "
+                         f"oldest {said_when(oldest)}; nothing here delivers it")
+    if said:
+        lines.append(f"remedy   --to-team live on each member moves it onto {dest} "
+                     "once this lead is running as it, one restart each")
+    return [fill(f"{prefix}{line}") for line in lines]
+
+
+def lead_rebind(ctx, args, source, dest, prefix=""):
+    """Move this lead onto dest: the whole act, and the only route to it.
+
+    Both spellings arrive here. --to-team names the destination as a flag and
+    the masquerade names it inside the agent id; by this point the run cannot
+    tell them apart, and neither can the conversation, which comes back as
+    whatever its window-start says whichever way it was asked for.
+
+    So the durable half is rebind_reap's, unchanged and shared with the member
+    path: retire the team the stamps name, or on --force against a living team
+    rewrite those two fields instead. A conversation whose window-start carries
+    no stamps needs neither - the flags already win - and only the crew report
+    is left to do.
+    """
+    ctx["lead_move"] = dest
+    path = getattr(ctx["resolution"], "path", None)
+    stamped, state = RESOLVER.restored_identity(path) if path else (None, None)
+    # Gathered before the reap, because the reap takes the roster and the
+    # inboxes it is read from into a receipt, and a report that ran afterwards
+    # would call every listed member former and every mailbox empty.
+    crew = crew_left_behind(source, dest, prefix)
+    route = True
+    if state == "restored" and stamped != dest:
+        route = rebind_reap(stamped, dest, args, prefix, path=path)
+    for line in crew:
+        print(line)
+    if route == "reaped":
+        print(fill(f"{prefix}note     their conversations still say {source}; until "
+                   f"something recreates that team, a plain resume of one comes "
+                   f"back as nobody, and a run of {TOOL} gives it flags again"))
+    elif route == "restamped":
+        print(fill(f"{prefix}note     {source} keeps its roster, its mail and its "
+                   "members; this conversation is the only thing that moved"))
+
+
 def run_one(args, passthrough, table, prefix="", pending=()):
     """Resume one agent. Returns Outcome(status, socket, is_lead), status being
     'noop' | 'launched' | 'manual' | 'failed'.
@@ -5574,13 +5771,19 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     # interactive session you drive, and a pane-backed lead would be reaped by
     # the next lead's exit anyway. No socket, no pane, no roster patch.
     if agent_id and agent_id == ctx.get("lead_agent_id"):
+        # Where a lead is being moved, the destination is resolved before
+        # anything is built from it: --to-team spells it as a flag and the
+        # masquerade spells it inside the agent id, and the command below is
+        # the same command either way once this has run.
         if args.to_team:
-            # This branch never reaches the rebind code, and a flag that
-            # silently does nothing reads as having worked.
-            die(f"--to-team moves a member between teams, and this agent is a "
-                f"lead; to have this conversation lead another team, resume it "
-                f"as that team's lead: {TOOL} team-lead@<team> --resume "
-                f"{ctx['session_uuid']}")
+            ctx["to_team"] = resolve_to_team(args, ctx)
+            # A member rebind points at the destination's recorded lead; a lead
+            # rebind is about to become it, and build_command drops a parent
+            # flag that names this session. Without this the launch would carry
+            # the lead session of the team it is leaving.
+            ctx["to_lead"] = ctx["session_uuid"]
+        dest = ctx.get("to_team") or RESOLVER.field(ctx, "teamName")
+        source = lead_source_team(ctx, dest)
         command = build_command(ctx, args, passthrough)
         # A lead is the socket's namesake - a swarm server is named after the
         # lead's pid, and members resolve theirs by asking who their lead is -
@@ -5604,11 +5807,22 @@ def run_one(args, passthrough, table, prefix="", pending=()):
                                         f"({RESOLVER.socket_state(other)})"))
         report_launch(ctx, command, prefix, role="lead", agent_id=agent_id,
                       extra=seat)
+        # A move takes this conversation over, so whoever is running it goes
+        # first. The guard below then asks about processes this run has already
+        # ended, which is the same exemption the member path takes on an
+        # explicit --to-team and for the same reason; a kill that did not work
+        # leaves it un-exempt and the guard stops the run.
+        cleared = bool(source) and lead_kill_gate(ctx, args, table, prefix)
         # A lead is not exec'd onto a conversation someone is already running,
         # for the same reason a member is not spawned onto one.
-        running = already_running(ctx, args, is_lead=True)
+        running = None if cleared else already_running(ctx, args, is_lead=True)
         if running:
             return noop_outcome(ctx, args, prefix, is_lead=True, why=running[0])
+        # Every guard that could still turn this into a noop has passed, so the
+        # team the stamps name may now be retired (or restamped) for a launch
+        # that is really going to happen.
+        if source:
+            lead_rebind(ctx, args, source, dest, prefix)
         # This run is about to become the lead, so the identity gate applies from
         # here down.
         enforce_ctx(ctx, args)
@@ -5620,8 +5834,10 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             die(f"cannot exec {command[0]}: not found or not executable")
         # The masquerade reads the roster on boot, so the team dir has to exist
         # before the exec, and a lead whose team was reaped is the ordinary case
-        # here rather than an edge one.
-        forge_team(ctx, args.dry_run)
+        # here rather than an edge one. Named rather than merged: after a move
+        # the merge still answers with the team this conversation is leaving,
+        # and forging that one back is the reap undone.
+        forge_team(ctx, args.dry_run, team=dest)
         # The lead runs last, after every member is already in its pane, so there is
         # nothing left for this process to stay alive for. A lead is an interactive
         # session you drive rather than a pane you watch, so the run ends by becoming
@@ -5746,17 +5962,8 @@ def run_one(args, passthrough, table, prefix="", pending=()):
                 replace_pane = holder_pane
                 print(f"{prefix}rebind   replacing pid {pid} in pane {holder_pane}")
                 continue
-            where = f"in pane {holder_pane}" if holder_pane else f"outside {socket}"
-            step(args.dry_run, f"would kill pid {pid}, which also holds this transcript {where}",
-                 f"killing pid {pid}, which also holds this transcript {where}")
-            if not args.dry_run:
-                killed = subprocess.run(["kill", str(pid)], capture_output=True)
-                # Two processes appending to one transcript is the state this
-                # prevents, so a kill that did not work has to be said out loud
-                # rather than reported as a clean rebind.
-                if killed.returncode != 0 or RESOLVER.pid_alive(pid):
-                    warn(f"pid {pid} did not die ({(killed.stderr or b'').decode().strip() or 'still running'}); "
-                         "it is still appending to this transcript")
+            where = f" in pane {holder_pane}" if holder_pane else f" outside {socket}"
+            kill_holder(pid, where, args)
     # One step for every way this agent could already be alive: in this pane,
     # holding the transcript, or wearing this id elsewhere.
     running = already_running(ctx, args, is_lead=False, agent_id=agent_id,
@@ -6652,7 +6859,8 @@ def reap_blockers(stamped, args, table=None):
 
 def rebind_reap(stamped, dest, args, prefix="", path=None, fatal=True):
     """Retire the stamped team so a rebind onto dest holds - or, on --force
-    against a living team, restamp the window-start instead.
+    against a living team, restamp the window-start instead. Returns which of
+    the two it took, or False when it was blocked and the caller lives.
 
     --force never buys a reap: it buys the OTHER trade, two fields of
     testimony rewritten in place with a receipt confessing the old values.
@@ -6702,7 +6910,7 @@ def rebind_reap(stamped, dest, args, prefix="", path=None, fatal=True):
             apply_restamp(plan)
         print(f"{prefix}rebound  this transcript runs as {dest} from now on; "
               "nothing further is needed")
-        return True
+        return "restamped"
     receipt = RECEIPTS_DIR / f"{stamped}.json"
     print(f"{prefix}{'would reap' if args.dry_run else 'reaped'}   {stamped}  "
           f"(roster archived: {receipt})")
@@ -6713,7 +6921,7 @@ def rebind_reap(stamped, dest, args, prefix="", path=None, fatal=True):
                f"recreated; run /compact in it to make {dest} permanent"))
     print(fill(f"{prefix}quiet    until then it sends no idle notifications; "
                "mail still works in both directions"))
-    return True
+    return "reaped"
 
 
 def run_promote(args):
@@ -7937,7 +8145,8 @@ def run_selftest(live=False, failed_only=False, list_only=False):
                 return done(pane)
             return done()
 
-    def resume_run(agent_id, *, listed=True, server=None, table=(), watch=None, **flags):
+    def resume_run(agent_id, *, listed=True, server=None, table=(), watch=None,
+                   prepare=None, **flags):
         """Run the real resume path against a writable copy of the corpus.
 
         Only the world outside the process is faked: one tmux server and the
@@ -7945,13 +8154,16 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         resolution, the guards, the placement, the roster writes and the
         report, executes. `watch` is called between the claim and the spawn,
         the one moment that shows whether a write landed before the process
-        started or after it.
+        started or after it. `prepare` is handed the copy before anything reads
+        it, for a case the shared corpus should not carry for everyone.
 
         Returns (outcome, roster entry afterwards, the fake server, printed
         output), or ("refused", ...) when the run died on a refusal.
         """
         base = Path(tempfile.mkdtemp())
         shutil.copytree(Path(__file__).resolve().parent / "test" / "corpus", base / "corpus")
+        if prepare:
+            prepare(base / "corpus")
         eng = Resolver(needs=Needs(maybe=set(NEED)))
         eng.projects_dir, eng.teams_dir = base / "corpus" / "projects", base / "corpus" / "teams"
         # The process table is the other half of the outside world, and it is
@@ -8066,13 +8278,117 @@ def run_selftest(live=False, failed_only=False, list_only=False):
           bare_status == "launched" and bare_entry is None,
           f"{bare_status}, entry {bare_entry}")
 
-    lead_status, _entry, _srv, lead_said = resume_run(
-        "team-lead@session-corpus-alpha", to_team="session-corpus-crew")
+    # --- the lead move, driven end to end through run_one
+    # Nothing below may end a real process: the arms that reach the kill either
+    # preview it or answer no, and the pid they name is one no machine has.
+    GHOST = 999999999
+    STRANGER = "d00fd00f-d00f-4d0f-8d0f-d00fd00fd00f"
+    LEAD_STAMPED = "1e5701ed-1fe5-4701-8ed1-e5701ed1fe57"
 
-    check("lead-rebind-refuses-with-the-working-spelling",
-          "--to-team on a lead refuses and names what does work",
-          lead_status == "refused" and "resume it as that team's lead" in lead_said,
-          f"{lead_status}: {lead_said.strip().splitlines()[-1][:70] if lead_said.strip() else ''}")
+    def stamped_stranger(root):
+        """A member of session-corpus-alpha the roster does not list, with mail
+        waiting for it, so neither report line can be answered from the roster.
+        Planted per run rather than in the shared corpus, which every other
+        check counts."""
+        (root / "projects" / "corpus" / f"{STRANGER}.jsonl").write_text("\n".join(
+            json.dumps(rec, separators=(",", ":")) for rec in (
+                {"type": "user", "uuid": "dr-root", "parentUuid": None,
+                 "timestamp": "2026-04-01T00:00:00Z", "sessionId": STRANGER,
+                 "agentName": "drift", "teamName": "session-corpus-alpha",
+                 "message": {"role": "user", "content": "hi"}},
+                {"type": "last-prompt", "leafUuid": "dr-root", "sessionId": STRANGER,
+                 "lastPrompt": "hi"})) + "\n")
+        (root / "teams" / "session-corpus-alpha" / "inboxes" / "drift.json").write_text(
+            json.dumps([{"id": "m1", "from": "team-lead", "text": "still there?",
+                         "timestamp": "2026-04-02T00:00:00Z"}]))
+
+    real_receipts = RECEIPTS_DIR
+    lead_receipts = Path(tempfile.mkdtemp())
+    globals()["RECEIPTS_DIR"] = lead_receipts
+    real_stdin, real_input = sys.stdin, globals().get("input")
+    try:
+        moved, _entry, _srv, moved_said = resume_run(
+            "team-lead@session-corpus-alpha", to_team="session-corpus-crew",
+            prepare=stamped_stranger)
+        # Everyone the engine says session-corpus-alpha has, plus the member
+        # this run planted into the copy. The lead is the one that moves, so it
+        # is the one name that must not be listed as staying.
+        expected = (set(corpus_engine().team_population("session-corpus-alpha"))
+                    | {"drift"}) - {"team-lead"}
+        crew_line = next((l for l in moved_said.splitlines() if l.startswith("crew ")), "")
+        missing = sorted(n for n in expected if n not in crew_line)
+        told = " ".join(moved_said.split())
+        if moved != "manual":
+            missing.append(f"the move did not reach its launch ({moved})")
+        if "team-lead" in crew_line:
+            missing.append("the lead itself is listed as staying behind")
+        if "1 waiting for drift" not in told:
+            missing.append("the mail waiting on the old team is not named")
+        if "--to-team live on each member" not in told:
+            missing.append("the way to move one is not named")
+        check("lead-rebind-crew-report", "a lead move names the crew it leaves behind",
+              not missing, ", ".join(missing[:3]))
+
+        # The guards, unchanged, reached through the lead path: one live member
+        # of the team the stamps name, and the reap it would need refuses.
+        alive_member = [(4242, 1, f"{FAKE_AGENT_BIN} --agent-id willow@session-corpus-alpha")]
+        try:
+            blocked, _e, _s, blocked_said = resume_run(
+                "team-lead@session-corpus-alpha", resume=LEAD_STAMPED,
+                to_team="session-corpus-crew", table=alive_member)
+        except OSError as err:
+            # A reap that happened anyway takes the roster the harness reads
+            # back; say so as a failure rather than as a traceback.
+            blocked, blocked_said = f"crashed: {err.__class__.__name__}", ""
+        told = " ".join(blocked_said.split())
+        held = []
+        if blocked != "refused":
+            held.append(f"a live-membered team did not block the move ({blocked})")
+        for owed in ("pid 4242 wears it", "--force instead rewrites"):
+            if owed not in told:
+                held.append(f"the refusal does not say {owed!r}")
+        if (lead_receipts / "session-corpus-alpha.json").exists():
+            held.append("the team was retired anyway")
+        check("lead-rebind-guards", "a live-membered team still blocks a lead's reap",
+              not held, ", ".join(held[:3]))
+
+        # The kill gate: a live holder of the lead's own conversation, and the
+        # three answers it can get. None of them kills.
+        holder = [(GHOST, 1, f"{FAKE_AGENT_BIN} --resume {LEAD_STAMPED}")]
+
+        def moved_onto_holder(**over):
+            _st, _e, _s, out = resume_run(
+                "team-lead@session-corpus-alpha", resume=LEAD_STAMPED,
+                to_team="session-corpus-crew", table=holder, **over)
+            return " ".join(out.split())
+
+        gate = []
+        sys.stdin = types.SimpleNamespace(isatty=lambda: True)
+        globals()["input"] = lambda prompt="": "n"
+        answered_no = moved_onto_holder()
+        globals()["input"] = lambda prompt="": "y"
+        previewed = moved_onto_holder(dry_run=True)
+        sys.stdin = types.SimpleNamespace(isatty=lambda: False)
+        globals().pop("input", None)
+        unasked = moved_onto_holder()
+        if f"would kill pid {GHOST}" not in previewed:
+            gate.append("a dry run does not say what it would kill")
+        if "dry run ends nothing" not in previewed:
+            gate.append("a dry run does not say the rest is measured with it alive")
+        if f"killing pid {GHOST}" in answered_no or "left alone" not in answered_no:
+            gate.append("no did not stop it")
+        if f"killing pid {GHOST}" in unasked or "pass --yes" not in unasked:
+            gate.append("with nothing to ask at, it killed anyway")
+        check("lead-rebind-kill-gate", "a lead move ends the holder only after it is agreed to",
+              not gate, ", ".join(gate[:3]))
+    finally:
+        globals()["RECEIPTS_DIR"] = real_receipts
+        sys.stdin = real_stdin
+        if real_input is not None:
+            globals()["input"] = real_input
+        else:
+            globals().pop("input", None)
+        shutil.rmtree(lead_receipts, ignore_errors=True)
 
     # Reading the spawn log unfilled returns an empty list, which is also what a
     # transcript that spawned nobody returns, so a missed fill is a false negative
@@ -9629,17 +9945,20 @@ def run_selftest(live=False, failed_only=False, list_only=False):
 
     class _ByName:
         resume = None
-        here = team = agent_id = None
+        here = team = agent_id = to_team = None
         selftest = complete = cleanup = doctor = census = sides = False
         promote = demote = mail_ledger = install = poison = unpoison = False
         help = standing = stop = False
 
     class _ByUuid:
         resume = "u"
-        here = team = agent_id = None
+        here = team = agent_id = to_team = None
         selftest = complete = cleanup = doctor = census = sides = False
         promote = demote = mail_ledger = install = poison = unpoison = False
         help = standing = stop = False
+
+    class _ByUuidRebind(_ByUuid):
+        to_team = "session-elsewhere"
 
     # The end-of-run audit refuses a declaration nobody used, so each input
     # shape declares what that shape can reach: a uuid resolves from the
@@ -9649,6 +9968,10 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     shapes = {
         "a uuid declares stamps it can never read":
             verb_needs(_ByUuid, None)[NEED.STAMPS] is not DECLARED.ABSENT,
+        # The rebind is the one thing typed against a uuid that does read them:
+        # it asks which transcripts are stamped with the team it is retiring.
+        "a uuid rebind does not declare the stamps its reap reads":
+            verb_needs(_ByUuidRebind, None)[NEED.STAMPS] is not DECLARED.MAYBE,
         "a bare name does not declare the stamps that find it":
             verb_needs(_ByName, "unslop-docs")[NEED.STAMPS] is not DECLARED.HARD,
         "a team does not declare the stamps that find its members":
@@ -9791,10 +10114,11 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     split = [where for where, block in (("the lead path", lead_block),
                                         ("the member path", member_block))
              if "report_launch(" not in block]
-    # A flag the lead path cannot honour refuses before the report, instead
-    # of riding along silently and reading as having worked.
+    # The destination is resolved before the report, so the command in it is
+    # the command that runs. Reported first and resolved after, the lead would
+    # print the team it is leaving and then launch onto another one.
     if not (0 <= lead_block.find("args.to_team") < lead_block.find("report_launch(")):
-        split.append("--to-team on a lead is not refused before the report")
+        split.append("--to-team on a lead is not resolved before the report")
     if set(reporters) - {"run_one", "run_selftest"}:
         split.append("reported from " + ", ".join(
             sorted(set(reporters) - {"run_one", "run_selftest"})))
@@ -9808,6 +10132,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         split.append("a lead report omits its command")
     check("lead-member-report-parity", "a lead and a member report the same launch facts", not split,
           ", ".join(split))
+
 
     # --- a crew on two servers is reported as two, not as one
     # A revived lead has a new pid, and a server is named after it, so the
@@ -10570,8 +10895,12 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # precondition does not. Neither path may ask the liveness question for
     # itself, or the two answers drift as they did when the lead's forgot to
     # name the session it was refusing to take over.
+    # lead_holders is the exception that proves it: it does not decide whether
+    # to launch, it names the processes a move has to end first, and the launch
+    # decision is still already_running's.
     asks_own = sorted(callers_of("lead_pid_for")
-                      - {"already_running", "auto_redirect", "lead_pid", "run_selftest"})
+                      - {"already_running", "auto_redirect", "lead_pid",
+                         "lead_holders", "run_selftest"})
     # And the guarantee itself, not merely its address: the same live
     # conversation stops both acts, --force releases both, and only a
     # member's rebind is exempt (its own kill path owns that).
@@ -10606,7 +10935,10 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             "a member's rebind is exempt":
                 already_running({**live_ctx, "to_team": "t"}, _NoForce,
                                 is_lead=False) is None,
-            "a lead's is not":
+            # A lead move is exempted by its kill gate having ended the holder,
+            # not by this step forgiving one: what reaches here with something
+            # still live is a move whose kill did not work, and it stops.
+            "a lead's rebind is not exempt here":
                 bool(already_running({**live_ctx, "to_team": "t"}, _NoForce,
                                      is_lead=True)),
             # The member-only extension: the seat questions live in the same
@@ -11412,7 +11744,11 @@ def verb_needs(args, selector):
         # an agent id reaches the stamps only when nothing live wears it
         return Needs(hard={NEED.PROCS, NEED.SPAWNS}, maybe={NEED.STAMPS})
     if by_uuid and not args.team:
-        return Needs(hard={NEED.PROCS, NEED.SPAWNS})
+        # A uuid resolves without the stamps, but a rebind typed against one
+        # still asks them who else is stamped with the team it is retiring,
+        # which used to end the run in the loader's refusal instead.
+        return Needs(hard={NEED.PROCS, NEED.SPAWNS},
+                     maybe={NEED.STAMPS} if args.to_team else set())
     return Needs(hard={NEED.PROCS, NEED.SPAWNS, NEED.STAMPS})
 
 
