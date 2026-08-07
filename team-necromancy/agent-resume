@@ -10133,6 +10133,54 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("lead-member-report-parity", "a lead and a member report the same launch facts", not split,
           ", ".join(split))
 
+    # --- a lead moves teams one way, and it is the member path's way
+    # Two spellings reach one branch, so what is left to show is that the branch
+    # retires or restamps through rebind_reap and through nothing else, and that
+    # neither half is performed anywhere but there.
+    one_way = []
+    if "lead_rebind(" not in lead_block:
+        one_way.append("the lead path does not reach the move")
+    for direct in ("rebind_reap(", "reap_team(", "apply_restamp(", "restamp_plan(",
+                   "reap_blockers("):
+        if direct in lead_block:
+            one_way.append(f"the lead path reaches {direct[:-1]} for itself")
+    if "rebind_reap(" not in (ast.get_source_segment(source, funcs["lead_rebind"]) or ""):
+        one_way.append("the lead move does not go through rebind_reap")
+    for act in ("reap_team", "apply_restamp"):
+        stray = callers_of(act) - engine - {"rebind_reap", "run_selftest"}
+        if stray:
+            one_way.append(f"{act} is called from " + ", ".join(sorted(stray)))
+    check("lead-rebind-one-mechanism", "a lead moves teams only through the step a member moves by",
+          not one_way, ", ".join(one_way))
+
+    # --- and ends a holder one way, whichever path is doing the moving
+    def ends_a_process(node):
+        """Whether this function hands `kill` a pid, however the argv is spelled."""
+        for sub in ast.walk(node):
+            if not (isinstance(sub, ast.Call) and sub.args
+                    and isinstance(sub.args[0], ast.List) and sub.args[0].elts):
+                continue
+            first = sub.args[0].elts[0]
+            if isinstance(first, ast.Constant) and first.value == "kill":
+                return True
+        return False
+
+    # abort_agents is --stop, the verb whose whole job is ending processes; it
+    # asks its own question, of a list, before it ends anything.
+    killers = {n for n, node in funcs.items() if ends_a_process(node)} - {"abort_agents"}
+    reached = callers_of("kill_holder") - {"run_selftest"}
+    sites = []
+    if killers != {"kill_holder"}:
+        sites.append("a holder is killed in " + (", ".join(sorted(killers)) or "nowhere"))
+    if reached != {"run_one", "lead_kill_gate"}:
+        sites.append("reached from " + (", ".join(sorted(reached)) or "nowhere"))
+    if "kill_holder(" not in member_block:
+        sites.append("the member migration does not reach it")
+    if "lead_kill_gate(" not in lead_block:
+        sites.append("the lead move does not reach it")
+    check("holder-kill-one-site", "a migration and a lead move end the holder through one function",
+          not sites, ", ".join(sites))
+
 
     # --- a crew on two servers is reported as two, not as one
     # A revived lead has a new pid, and a server is named after it, so the
