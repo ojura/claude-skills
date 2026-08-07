@@ -3523,6 +3523,11 @@ def state_note(pid):
 # transient tmux client argv, which is why that path only runs for variables the
 # server is actually missing.
 AUTH_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+# The traffic variable's name reads like a preference, so it invites being
+# dropped from this set as "not a credential". It belongs: when the credential
+# arrives as an OAuth access token in the environment rather than from a normal
+# login, it has to travel with the token, so the two move together or neither
+# works. The report calls the whole set creds for that reason.
 INHERIT_ENV = AUTH_ENV + ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",)
 
 
@@ -5852,7 +5857,11 @@ def run_standing(args):
                    + (f"  ({said_how})" if said_how else "") + f" [{grade}]"))
     else:
         print("lead     (none)")
-    print(fill(f"runs as  {s['lead_team'][0] or '(unknown)'}  [{s['lead_team'][1]}]"))
+    # A grade rates an answer. With no team to rate, the boot-timing grade would
+    # describe a pairing that never happened, so an unknown says only that.
+    said_team, said_grade = s["lead_team"]
+    print(fill(f"runs as  {said_team}  [{said_grade}]" if said_team
+               else "runs as  (unknown)"))
     said = {True: "yes", False: "no", None: "unknowable"}[s["polls"][0]]
     print(fill(f"polls    {said}  ({s['polls'][1]})"))
     print(f"listed   {'yes' if s['listed'] else 'no'}")
@@ -5882,7 +5891,11 @@ def run_standing(args):
 
 # What each verdict claims, in the order of how much is wrong.
 DOCTOR_LEGEND = (
-    ("CONNECTED", "a live lead runs this team, its members are listed, no mail is waiting"),
+    # Only what the verdict tests. Mail waiting in a mailbox does not demote a
+    # team whose lead is live and reading it, and an unrecorded member is a note
+    # rather than a fault, so claiming either here would describe a state this
+    # verdict never asked about.
+    ("CONNECTED", "a live lead runs this team and reads its mail, and nothing here needs a person"),
     ("DEGRADED", "nothing is lost yet, but a person must act: the team is dormant, "
                  "one agent is worn by two processes, or the crew sits on two servers"),
     ("UNKNOWABLE", "a plain lead reads the roster from its own memory, which cannot be "
@@ -5956,8 +5969,10 @@ def diagnose_team(team, table=None, deep=False):
     if title:
         lines.append(f"title    {title}")
     if pid and alive:
-        lines.append(f"runs as  {lead_team or '(unknown)'}"
-                     f"  [{'exact' if exact_team else 'inferred from boot timing'}]")
+        # Same rule as the dossier: no answer, no grade for it.
+        grade = "exact" if exact_team else "inferred from boot timing"
+        lines.append(f"runs as  {lead_team}  [{grade}]" if lead_team
+                     else "runs as  (unknown)")
     lines.append(f"members  {len(listed)} listed, {len(unrecorded)} unrecorded, "
                  f"{len(former)} former, {len(live)} live"
                  + (f", {len(converted)} converted" if converted else ""))
@@ -7068,6 +7083,18 @@ def live_checks():
             raise RuntimeError(f"duplicate check id: {cid!r}")
         seen_ids.add(cid)
         out.append((cid, name, ok, detail))
+
+    # A warning printed while the suite runs is the tool talking to an operator
+    # who is not there, and it lands in the middle of the results. The read-only
+    # tier is run as a child rather than captured in this process, because
+    # capturing our own stderr would swallow a traceback and let a crash read as
+    # a clean run. The child is passed no --live, so this does not nest.
+    quiet = sp.run([sys.executable, str(Path(__file__).resolve()), "--selftest", "--failed"],
+                   capture_output=True, text=True, timeout=900)
+    stray = [line for line in quiet.stderr.splitlines() if line.strip()]
+    check("suite-prints-no-stray-warnings",
+          "the suite says nothing to an operator who is not there", not stray,
+          f"{len(stray)} line(s), first: {stray[0].strip()[:60]!r}" if stray else "")
 
     # read_one_key against a terminal, which is the only place it does anything.
     keys = {}
@@ -8360,7 +8387,8 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # went on to lead another cannot be rebuilt at all.
     eng = corpus_engine()
     other, uuid = "session-corpus-new", "55555555-5555-4555-8555-555555555555"
-    stamped = eng.stamp_index().get(eng.lead_transcript_for(other)[0], (None, None))[1]
+    with contextlib.redirect_stderr(io.StringIO()):
+        stamped = eng.stamp_index().get(eng.lead_transcript_for(other)[0], (None, None))[1]
     with contextlib.redirect_stderr(io.StringIO()):
         assembled = eng.identity(session_uuid=uuid, for_team=other)
     check("named-team-outranks-stamps", "a named team outranks the stamps of an earlier life",
@@ -9474,7 +9502,8 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         real_teams = RESOLVER.teams_dir
         RESOLVER.teams_dir = eng6.teams_dir
         try:
-            reap_team("TEAMA", archive_mail=True)
+            with contextlib.redirect_stderr(io.StringIO()):
+                reap_team("TEAMA", archive_mail=True)
             stored = load_receipt("TEAMA")
             if not stored or stored.get("config") != '{"name": "TEAMA", "members": []}':
                 gates.append("the roster did not ride the receipt verbatim")
@@ -10034,6 +10063,52 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("verdict-names-actionable", "a verdict names something to act on", not verdicts,
           "; ".join(f"{t}: {why}" for t, why in verdicts.items()))
 
+    # Mail in a mailbox does not demote a team whose lead is live and reading
+    # it: that mail arrives at the lead's next turn boundary and needs nobody.
+    # The legend has to claim no more than the verdict tested, so this pins the
+    # semantics and the sentence against one state. No corpus mailbox holds
+    # mail, so the state is stubbed the way this scenario stubs the process
+    # table; reading the mail line back is what keeps the legend clause from
+    # passing on a run that never contradicted it.
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = eng = corpus_engine()
+    eng.session_registry = lambda: []
+    eng.ps_table = lambda refresh=False: [
+        (424242, 0, "claude --resume aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa "
+                    "--agent-id team-lead@session-corpus-multiteam-b")]
+    eng.inbox_state = lambda team: {"team-lead": (3, "2026-01-01T00:00:00Z")}
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            verdict, lines, _rem = diagnose_team("session-corpus-multiteam-b")
+    finally:
+        globals()["RESOLVER"] = real_resolver
+    legend_said = dict(DOCTOR_LEGEND)["CONNECTED"]
+    mail_said = any(ln.startswith("mail     3 waiting for team-lead") for ln in lines)
+    check("connected-legend-claims-what-it-tested",
+          "the CONNECTED legend claims nothing the same screen denies",
+          verdict == "CONNECTED" and mail_said and "no mail is waiting" not in legend_said,
+          f"verdict {verdict}, mail line {mail_said}, legend {legend_said!r}")
+
+    # A live pid whose team cannot be told: the line says unknown and stops.
+    # A grade rates an answer, so printing one here would rate a pairing that
+    # was never made.
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = eng = corpus_engine()
+    eng.session_registry = lambda: []
+    eng.ps_table = lambda refresh=False: [
+        (424242, 0, "claude --resume aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa "
+                    "--agent-id team-lead@session-corpus-multiteam-b")]
+    eng.team_minted_by = lambda pid: (None, False)
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            _v, ungraded, _r = diagnose_team("session-corpus-multiteam-b")
+    finally:
+        globals()["RESOLVER"] = real_resolver
+    runs_said = next((ln for ln in ungraded if ln.startswith("runs as")), "")
+    check("no-grade-without-an-answer",
+          "an unknown team is given no confidence grade",
+          runs_said == "runs as  (unknown)", f"said {runs_said!r}")
+
     # --- one job per agent, whatever assembled the list
     said = ""
     try:
@@ -10138,7 +10213,8 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     seen_dirs, wrong = set(), []
     for other, uuid in (("session-corpus-new", "55555555-5555-4555-8555-555555555555"),
                         ("session-corpus-rebound-old", "7ebc7ebc-7ebc-47bc-87bc-7ebc7ebc7ebc")):
-        res = eng.resolve_transcript(session_uuid=uuid)
+        with contextlib.redirect_stderr(io.StringIO()):
+            res = eng.resolve_transcript(session_uuid=uuid)
         steam = res.stamped("teamName") if res else None
         why = next((w for kind, _s, _w2, w in eng.objections(res, None, other)
                     if kind == "team_mismatch"), "")
