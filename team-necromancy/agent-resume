@@ -2175,10 +2175,21 @@ class Resolver:
                 pairs.add(f"{token} {tokens[index + 1]}")
         return pairs
 
+    def _own_lineage(self, table):
+        """Our own pid and ancestors, whose cmdlines quote the agent id we
+        searched for. A transform over a table already in hand, not a second
+        reading of the process realm."""
+        parents = {p: pp for p, pp, _ in table}
+        pid, chain = os.getpid(), set()
+        while pid and pid not in chain:
+            chain.add(pid)
+            pid = parents.get(pid)
+        return chain
+
     def _claude_procs(self, needle, table):
         """Live claude processes whose argv contains this exact flag/value pair,
         excluding our own lineage (whose cmdline quotes what we searched for)."""
-        mine = own_lineage(table)
+        mine = self._own_lineage(table)
         return [
             (pid, args)
             for pid, _, args in table
@@ -2779,7 +2790,7 @@ class Resolver:
         never sees itself, so nothing is replaced and the launch becomes a second
         writer on one transcript, created by this tool.
         """
-        mine = own_lineage(table)
+        mine = self._own_lineage(table)
         return [pid for pid, _, args in table
                 if pid in mine and self.is_claude(args)
                 and f"--resume {session_uuid}" in self._argv_pairs(args)]
@@ -2899,6 +2910,98 @@ class Resolver:
             return f"server up, no {TMUX_SESSION} session"
         clients = self.attached_clients(socket)
         return f"live, {clients} client{'' if clients == 1 else 's'} attached"
+
+    def list_panes(self, socket):
+        """Every pane on this server, as {session, window, pane, pid}.
+
+        The one place tmux is asked what panes exist. A server that refuses
+        the question has no panes to report, which is the same answer a
+        server with none gives, and neither is a reason to guess.
+        """
+        res = tmux(socket, "list-panes", "-a", "-F",
+                   "#{session_name}\t#{window_id}\t#{pane_id}\t#{pane_pid}")
+        if res.returncode != 0:
+            return []
+        panes = []
+        for line in res.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 4 and parts[3].isdigit():
+                panes.append({"session": parts[0], "window": parts[1],
+                              "pane": parts[2], "pid": int(parts[3])})
+        return panes
+
+    def pane_exists(self, socket, pane):
+        """Is this pane id on this server right now?
+
+        A pane id is per-server, so a remembered one means nothing until a
+        server confirms it. Three callers had this same `any(...)` written
+        out, which is three chances for one of them to answer differently.
+        """
+        return bool(pane) and any(p["pane"] == pane for p in self.list_panes(socket))
+
+    def _descendants(self, root_pid, table):
+        """Every pid under this one, from a table already in hand. A transform,
+        not a reading: nothing here goes back to the process realm."""
+        kids = defaultdict(list)
+        for pid, ppid, _ in table:
+            kids[ppid].append(pid)
+        seen, stack = set(), [root_pid]
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            stack.extend(kids.get(pid, []))
+        return seen
+
+    def pane_occupants(self, socket, pane_id, table):
+        """(pane_exists, [(pid, args)] of claude processes running in it)."""
+        by_pid = {pid: args for pid, _, args in table}
+        for pane in self.list_panes(socket):
+            if pane["pane"] != pane_id:
+                continue
+            procs = [(pid, by_pid.get(pid, "")) for pid in self._descendants(pane["pid"], table)]
+            return True, [(pid, args) for pid, args in procs if self.is_claude(args)]
+        return False, []
+
+    def pane_of_pid(self, socket, pid, table):
+        """Which pane on this server this process is sitting in, if any."""
+        for pane in self.list_panes(socket):
+            if pid in self._descendants(pane["pid"], table):
+                return pane["pane"]
+        return None
+
+    def seat_note(self, recorded, socket):
+        """(pane to aim at, pane line for the report), from a roster's memory.
+
+        A pane id is per-server: a recorded one is a fact only while its server
+        runs and still carries it. Anything else aims the launch at nothing and
+        reads as a seat the agent does not have, so the report says what became
+        of the record instead of echoing it. The two halves travel together for
+        that reason: a caller handed only the id could print a seat nothing
+        confirmed.
+        """
+        if self.pane_exists(socket, recorded):
+            return recorded, recorded
+        if recorded:
+            return None, f"(none: recorded {recorded} is gone from {socket})"
+        return None, "(none recorded)"
+
+    def current_tmux(self):
+        """(socket name, pane id) of the pane we are running in, or (None, None).
+
+        $TMUX is "<socket path>,<server pid>,<session index>", so the socket we
+        are inside is knowable without asking tmux anything.
+        """
+        inside = os.environ.get("TMUX")
+        if not inside:
+            return None, None
+        return Path(inside.split(",")[0]).name, os.environ.get("TMUX_PANE")
+
+    def inside_tmux(self):
+        """Are we inside a tmux pane at all? The cheap half of current_tmux,
+        for a caller that needs the yes or no and not the names."""
+        return bool(os.environ.get("TMUX"))
 
     def _socket_from_pane_pid(self, pid, table):
         """A pane process's parent is the tmux server; its cmdline carries -L <socket>."""
@@ -4390,32 +4493,6 @@ def tmux(socket, *args):
     return subprocess.run(["tmux", "-L", socket, *args], capture_output=True, text=True)
 
 
-def list_panes(socket):
-    res = tmux(socket, "list-panes", "-a", "-F", "#{session_name}\t#{window_id}\t#{pane_id}\t#{pane_pid}")
-    if res.returncode != 0:
-        return []
-    panes = []
-    for line in res.stdout.splitlines():
-        parts = line.split("\t")
-        if len(parts) == 4 and parts[3].isdigit():
-            panes.append({"session": parts[0], "window": parts[1], "pane": parts[2], "pid": int(parts[3])})
-    return panes
-
-
-def descendants(root_pid, table):
-    kids = defaultdict(list)
-    for pid, ppid, _ in table:
-        kids[ppid].append(pid)
-    seen, stack = set(), [root_pid]
-    while stack:
-        pid = stack.pop()
-        if pid in seen:
-            continue
-        seen.add(pid)
-        stack.extend(kids.get(pid, []))
-    return seen
-
-
 CLAUDE_PROC = re.compile(r"(^|/)claude$|/versions/[\d.]+$")
 
 # The binary the suite's fake process table claims to be running. It matches
@@ -4425,27 +4502,6 @@ CLAUDE_PROC = re.compile(r"(^|/)claude$|/versions/[\d.]+$")
 FAKE_AGENT_BIN = f"/nonexistent/{TOOL}-selftest/versions/0.0.0"
 
 
-
-
-def pane_occupants(socket, pane_id, table):
-    """(pane_exists, [(pid, args)] of claude processes running in it)."""
-    by_pid = {pid: args for pid, _, args in table}
-    for pane in list_panes(socket):
-        if pane["pane"] != pane_id:
-            continue
-        procs = [(pid, by_pid.get(pid, "")) for pid in descendants(pane["pid"], table)]
-        return True, [(pid, args) for pid, args in procs if RESOLVER.is_claude(args)]
-    return False, []
-
-
-def own_lineage(table):
-    """Our own pid and ancestors, whose cmdlines quote the agent id we searched for."""
-    parents = {p: pp for p, pp, _ in table}
-    pid, chain = os.getpid(), set()
-    while pid and pid not in chain:
-        chain.add(pid)
-        pid = parents.get(pid)
-    return chain
 
 
 
@@ -4523,18 +4579,6 @@ def resolve_socket(ctx, args, table):
     return None, None
 
 
-def current_tmux():
-    """(socket name, pane id) of the pane we are running in, or (None, None).
-
-    $TMUX is "<socket path>,<server pid>,<session index>", so the socket we are
-    inside is knowable without asking tmux anything.
-    """
-    inside = os.environ.get("TMUX")
-    if not inside:
-        return None, None
-    return Path(inside.split(",")[0]).name, os.environ.get("TMUX_PANE")
-
-
 def maybe_attach(args, socket):
     """Attach to the swarm unless something says not to, then say why not.
 
@@ -4559,7 +4603,7 @@ def maybe_attach(args, socket):
         reason = "a Claude Code tool is driving"
     elif not sys.stdout.isatty():
         reason = "not a terminal"
-    elif os.environ.get("TMUX"):
+    elif RESOLVER.inside_tmux():
         reason = "already inside tmux"
     elif not args.attach and RESOLVER.attached_clients(socket):
         reason = "someone is already watching it"
@@ -4588,7 +4632,7 @@ def launch_present(socket, pane, agent_id):
     if agent_id and RESOLVER.wearers(agent_id, fresh):
         return True
     if pane:
-        _, occupants = pane_occupants(socket, pane, fresh)
+        _, occupants = RESOLVER.pane_occupants(socket, pane, fresh)
         if occupants:
             return True
     return False
@@ -4653,28 +4697,6 @@ def tint_pane(socket, pane, colour, name, dry):
         for action in actions:
             tmux(socket, *action)
     step(dry, f"would tint {where}", f"tinted {where}")
-
-
-def seat_note(recorded, socket):
-    """(pane to aim at, pane line for the report), from a roster's memory.
-
-    A pane id is per-server: a recorded one is a fact only while its server
-    runs and still carries it. Anything else aims the launch at nothing and
-    reads as a seat the agent does not have, so the report says what became
-    of the record instead of echoing it.
-    """
-    if recorded and any(p["pane"] == recorded for p in list_panes(socket)):
-        return recorded, recorded
-    if recorded:
-        return None, f"(none: recorded {recorded} is gone from {socket})"
-    return None, "(none recorded)"
-
-
-def pane_of_pid(socket, pid, table):
-    for pane in list_panes(socket):
-        if pid in descendants(pane["pid"], table):
-            return pane["pane"]
-    return None
 
 
 class LaunchFailed(Exception):
@@ -4743,13 +4765,13 @@ def launch(socket, want_pane, cwd, command, dry, replace_pane=None):
         argv = ["new-session", "-d", "-s", TMUX_SESSION, "-n", TMUX_WINDOW,
                 "-x", str(SWARM_COLS), "-y", str(SWARM_ROWS), "-P", "-F", "#{pane_id}"]
         action = "new-session"
-    elif want_pane and any(p["pane"] == want_pane for p in list_panes(socket)):
+    elif want_pane and RESOLVER.pane_exists(socket, want_pane):
         argv = ["split-window", "-t", want_pane, "-P", "-F", "#{pane_id}"]
         action = "split"
     else:
         if want_pane:
             warn(f"recorded pane {want_pane} no longer exists on {socket}")
-        panes = [p for p in list_panes(socket) if p["session"] == TMUX_SESSION]
+        panes = [p for p in RESOLVER.list_panes(socket) if p["session"] == TMUX_SESSION]
         if panes:
             argv = ["split-window", "-t", panes[0]["pane"], "-P", "-F", "#{pane_id}"]
             action = "split"
@@ -5697,7 +5719,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     want_pane = RESOLVER.field(ctx, "tmuxPaneId")
     if want_pane and not re.fullmatch(r"%\d+", str(want_pane)):
         want_pane = None  # e.g. the lead's "leader" placeholder
-    want_pane, pane_said = seat_note(want_pane, socket)
+    want_pane, pane_said = RESOLVER.seat_note(want_pane, socket)
 
     command = build_command(ctx, args, passthrough)
     adopted = inherit_credentials(ctx)
@@ -5710,7 +5732,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     report_launch(ctx, command, prefix, role="agent", agent_id=agent_id, extra=seat)
 
     # Same agent already in that pane -> nothing to do. Anything else in it -> new pane.
-    _, occupants = pane_occupants(socket, want_pane, table) if want_pane else (False, [])
+    _, occupants = RESOLVER.pane_occupants(socket, want_pane, table) if want_pane else (False, [])
     worn = {pid for pid, _ in RESOLVER.wearers(agent_id, table)} if agent_id else set()
     here = [pid for pid, _cmd in occupants if pid in worn]
     others = [pid for pid, _ in occupants if pid not in here]
@@ -5729,7 +5751,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         # from another socket names an unrelated pane on this one, and killing
         # it would take out a stranger while the old holder kept writing.
         for index, (pid, _) in enumerate(strangers_hold):
-            holder_pane = pane_of_pid(socket, pid, table)
+            holder_pane = RESOLVER.pane_of_pid(socket, pid, table)
             if index == 0 and holder_pane:
                 replace_pane = holder_pane
                 print(f"{prefix}rebind   replacing pid {pid} in pane {holder_pane}")
@@ -5766,14 +5788,13 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     # Already standing in the right place: run the agent in this pane instead of
     # splitting a new one and leaving the shell we were invoked from idle beside
     # it. Bookkeeping has to happen first, since exec never returns.
-    in_socket, in_pane = current_tmux()
+    in_socket, in_pane = RESOLVER.current_tmux()
     # Never when a tool is driving (its shell would be swallowed), never inside
     # --team (the loop would end), and never when a live holder has to be killed
     # first: exec cannot respawn the pane, so that case belongs to launch().
     if (in_socket == socket and in_pane and not replace_pane
             and not getattr(args, "in_team", False) and not os.environ.get("CLAUDECODE")):
-        pane_exists = any(p["pane"] == want_pane for p in list_panes(socket)) if want_pane else False
-        if in_pane == want_pane or not pane_exists:
+        if in_pane == want_pane or not RESOLVER.pane_exists(socket, want_pane):
             print(f"{prefix}exec     you are in {in_pane} on {socket}; running here rather than splitting")
             if ctx.get("to_team"):
                 register_member(RESOLVER.roster_record(ctx, team=ctx["to_team"]), in_pane, args.dry_run)
@@ -7524,9 +7545,9 @@ def live_checks():
     # server misses a poison that a server about to be created will inherit.
     def scrubs(socket, shell_value):
         had = os.environ.get("ANTHROPIC_BASE_URL")
-        real_panes = globals()["list_panes"]
+        real_panes = RESOLVER.list_panes
         try:
-            globals()["list_panes"] = lambda _sock: []
+            RESOLVER.list_panes = lambda _sock: []
             os.environ.pop("ANTHROPIC_BASE_URL", None)
             if shell_value:
                 os.environ["ANTHROPIC_BASE_URL"] = shell_value
@@ -7535,7 +7556,7 @@ def live_checks():
                 launch(socket, "%0", "/tmp", ["claude", "--resume", "x"], True)
             return "-u ANTHROPIC_BASE_URL" in said.getvalue()
         finally:
-            globals()["list_panes"] = real_panes
+            RESOLVER.list_panes = real_panes
             os.environ.pop("ANTHROPIC_BASE_URL", None)
             if had is not None:
                 os.environ["ANTHROPIC_BASE_URL"] = had
@@ -7582,7 +7603,7 @@ def live_checks():
                 break
             if i == 0:
                 tmux(geom_sock, "resize-window", "-t", TMUX_SESSION, "-x", "80", "-y", "24")
-        alive = {p["pane"] for p in list_panes(geom_sock)}
+        alive = {p["pane"] for p in RESOLVER.list_panes(geom_sock)}
         check("team-fits-window", f"a team of {wanted} fits the window it is launched into",
               refused is None and len(placed) == wanted and set(placed) <= alive,
               refused or f"placed {len(placed)}/{wanted}, {len(alive)} alive")
@@ -8245,6 +8266,28 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("server-liveness-engine-only", "whether a tmux server is up is asked only inside the engine",
           not asked_outside, "; ".join(sorted(asked_outside)))
 
+    # Its sibling, one level down: which panes exist on a server, and which
+    # pane this process is sitting in. Kept apart from the liveness check
+    # rather than folded into it because they fail for different reasons: a
+    # server nobody can find and a seat nobody confirmed are different bugs,
+    # and a check that says which one bit is worth two that say "tmux".
+    #
+    # Barred by the subcommands that answer the pane question and by the two
+    # environment variables that answer the seat one. Placing a pane is
+    # untouched: split-window, new-window, respawn-pane and select-layout all
+    # act, and launch decides among them from a pane list the engine handed
+    # it. TMUX_TMPDIR is not here: where socket files live is a path question,
+    # and the engine's socket_dir is the only caller of it either way.
+    pane_questions = {"list-panes", "list-windows", "display-message", "TMUX", "TMUX_PANE"}
+    pane_askers = sorted({
+        f"{node.value} at line {node.lineno}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and node.value in pane_questions
+        and node.lineno not in engine_lines
+        and node.lineno not in selftest_lines})
+    check("pane-question-engine-only", "which panes exist and where we sit is asked only inside the engine",
+          not pane_askers, "; ".join(pane_askers))
+
     # Wrapping serves the reader; the reader is not owed less. Every physical
     # line fits the width, and the reflowed text says word for word what the
     # wall said: a lost fact must never be the fix for an unreadable one.
@@ -8705,16 +8748,16 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # A pane id is per-server: a recorded one is a fact only while its server
     # runs and still carries it. Anything else must not be echoed as a seat
     # the agent has, nor aimed at by the launch.
-    real_list_panes = globals()["list_panes"]
-    globals()["list_panes"] = lambda sock: (
+    real_list_panes = RESOLVER.list_panes
+    RESOLVER.list_panes = lambda sock: (
         [{"session": "s", "window": "@1", "pane": "%2", "pid": 1}]
         if sock == "sock-carrying" else [])
     try:
-        kept = seat_note("%2", "sock-carrying")
-        gone = seat_note("%2", "sock-dead")
-        blank = seat_note(None, "sock-carrying")
+        kept = RESOLVER.seat_note("%2", "sock-carrying")
+        gone = RESOLVER.seat_note("%2", "sock-dead")
+        blank = RESOLVER.seat_note(None, "sock-carrying")
     finally:
-        globals()["list_panes"] = real_list_panes
+        RESOLVER.list_panes = real_list_panes
     seats_said = {
         "a carried pane is aimed at and said": kept == ("%2", "%2"),
         "a gone pane is aimed at nothing and says what became of it":
