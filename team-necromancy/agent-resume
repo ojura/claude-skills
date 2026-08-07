@@ -366,9 +366,8 @@ def stop_targets(args, table):
     transcript rather than by inventing an id for it.
     """
     if args.team:
-        cfg = RESOLVER.roster_path(args.team)
-        if not cfg.exists():
-            die(f"no team config at {cfg}")
+        if not RESOLVER.has_roster(args.team):
+            die(f"no team config at {RESOLVER.roster_path(args.team)}")
         members = (RESOLVER.roster_of(args.team) or {}).get("members", [])
         return running_agents([m["agentId"] for m in members if m.get("agentId")], table)
     if not (args.agent_id or args.resume):
@@ -1323,9 +1322,33 @@ class Resolver:
         answers where things are so writers never have to know the layout."""
         return self.teams_dir / team / "config.json"
 
+    def has_roster(self, team):
+        """Is there a roster on disk for this team?
+
+        The cheapest question about the team-config realm, and the one most
+        callers actually have: a die() that wants to name a missing team, a
+        membership write that has nowhere to land, a completion listing that
+        should not offer a team twice. One stat, and no parse: whether the
+        file reads as a roster is scaffolding_objection's question.
+        """
+        return bool(team) and self.roster_path(team).exists()
+
     def inbox_path(self, team, name):
         """Where this member's mailbox lives."""
         return self.teams_dir / team / "inboxes" / f"{name}.json"
+
+    def inbox_seeded(self, team, name):
+        """Does this member already have a mailbox file with something in it?
+
+        Zero bytes is the state that matters: an empty file is a parse error
+        that wedges both reader and writer, so it counts as no mailbox at all
+        and the seeder writes `[]` over it.
+        """
+        try:
+            path = self.inbox_path(team, name)
+            return path.exists() and path.stat().st_size > 0
+        except OSError:
+            return False
 
     def inbox_state(self, team):
         """{name: (undelivered count, oldest timestamp)} for this team's mailboxes.
@@ -1360,6 +1383,84 @@ class Resolver:
     def team_dirs(self):
         """Every team directory on disk, roster or not."""
         return [d for d in self.teams_dir.glob("*") if d.is_dir()]
+
+    def made_moments_ago(self, team_dir):
+        """Was this directory made too recently for its emptiness to mean anything?
+
+        A team dir is created before the things that prove its session is
+        alive: the registry entry, the first spawn payload, the masquerade's
+        argv. Inside that window an empty team is a team being born, not a
+        dead one.
+        """
+        try:
+            return time.time() - team_dir.stat().st_mtime < TEAM_GRACE_S
+        except OSError:
+            return False
+
+    def scaffolding_objection(self, team_dir):
+        """What in this directory is NOT pure scaffolding, or None if nothing is.
+
+        Both halves of what a team dir holds, answered together because the
+        reaper needs one verdict: the roster arm (is there a config.json, and
+        does it read as a roster) and the mailbox arm (is every inbox a real
+        mailbox, and is every mailbox empty). Every entry must be something
+        this tool or the harness is known to create, and known to be
+        contentless. Anything unrecognised, anything nested, any symlink, and
+        any inbox holding mail means the directory is spared.
+        """
+        known = {
+            "config.json",
+            "inboxes",
+            f"config.json.bak-{TOOL}",
+            f"config.json.tmp-{TOOL}",
+            "config.json.lock",
+        }
+        try:
+            entries = list(team_dir.iterdir())
+        except OSError as exc:
+            return f"unreadable ({exc})"
+
+        for item in entries:
+            if item.is_symlink():
+                return f"{item.name} is a symlink"
+            if item.name not in known:
+                return f"unexpected entry {item.name!r}"
+            if item.name != "inboxes":
+                if not item.is_file():
+                    return f"{item.name} is not a regular file"
+                continue
+
+            if not item.is_dir():
+                return "inboxes is not a directory"
+            for inbox in item.iterdir():
+                if inbox.is_symlink():
+                    return f"inboxes/{inbox.name} is a symlink"
+                if not inbox.is_file():
+                    return f"inboxes/{inbox.name} is not a regular file"
+                if inbox.suffix != ".json":
+                    return f"inboxes/{inbox.name} is not a .json file"
+                try:
+                    mail = json.loads(inbox.read_text() or "[]")
+                except (OSError, ValueError) as exc:
+                    return f"inboxes/{inbox.name} is unreadable or not JSON ({exc})"
+                if not isinstance(mail, list):
+                    return f"inboxes/{inbox.name} is not a message array"
+                if mail:
+                    return f"inboxes/{inbox.name} holds {len(mail)} undelivered message(s)"
+            # This loop reads the files rather than reusing inbox_state's counts.
+            # A deletion gate re-proves the structure itself: a count is not proof
+            # that what it counted is a mailbox.
+
+        config = team_dir / "config.json"
+        if not config.is_file():
+            return "no config.json"
+        try:
+            data = json.loads(config.read_text())
+        except (OSError, ValueError) as exc:
+            return f"config.json unreadable ({exc})"
+        if not isinstance(data, dict) or not isinstance(data.get("members", []), list):
+            return "config.json is not a roster"
+        return None
 
     def transcripts_by_mtime(self):
         """Every transcript, newest first."""
@@ -4138,9 +4239,8 @@ def resolve_to_team(args, ctx):
     timestamp identifies the team it minted.
     """
     if args.to_team not in ("live", "auto"):
-        cfg = RESOLVER.roster_path(args.to_team)
-        if not cfg.exists():
-            die(f"no team config at {cfg}")
+        if not RESOLVER.has_roster(args.to_team):
+            die(f"no team config at {RESOLVER.roster_path(args.to_team)}")
         return args.to_team
 
     source = RESOLVER.field(ctx, "teamName")
@@ -4681,9 +4781,9 @@ def forge_team(ctx, dry, evidence=None):
     team, name = record["team"], record["name"]
     if not team or not (name or ctx.get("leads_team")):
         return
-    cfg = RESOLVER.roster_path(team)
-    if cfg.exists():
+    if RESOLVER.has_roster(team):
         return
+    cfg = RESOLVER.roster_path(team)
     now = int(time.time() * 1000)
     lead_sid = record["parentSession"]
     if name == "team-lead" or ctx.get("leads_team"):
@@ -4880,12 +4980,9 @@ def ensure_inbox(team, name, dry):
     """A zero-byte inbox is a parse error that wedges both reader and writer."""
     if not team or not name:
         return
+    if RESOLVER.inbox_seeded(team, name):
+        return
     path = RESOLVER.inbox_path(team, name)
-    try:
-        if path.exists() and path.stat().st_size > 0:
-            return
-    except OSError:
-        pass
     if dry:
         step(True, f"would seed {path} with []", "")
         return
@@ -5329,7 +5426,7 @@ def record_membership(ctx, args, pane, alive=True):
         return
     if ctx.get("team_entry"):
         update_team_config(ctx, RESOLVER.roster_record(ctx), pane, args.dry_run, alive)
-    elif team and RESOLVER.roster_path(team).exists():
+    elif RESOLVER.has_roster(team):
         register_member(RESOLVER.roster_record(ctx, team=team), pane, args.dry_run, alive)
 
 
@@ -5349,7 +5446,7 @@ def reserve_membership(ctx, args):
         if args.no_update_config or ctx.get("team_entry"):
             return None
         team = RESOLVER.field(ctx, "teamName")
-        if not team or not RESOLVER.roster_path(team).exists():
+        if not RESOLVER.has_roster(team):
             return None
     record = RESOLVER.roster_record(ctx, team=team)
     return record if reserve_member(record, args.dry_run) else None
@@ -5821,7 +5918,7 @@ def _complete(topic):
             joined = f"joined {ms_str(entry['ts'])}"
             print(f"{agent_id}\t{title + ', ' + joined if title else joined}\t")
         for team, evidence in sorted(RESOLVER.known_teams().items()):
-            if f"team-lead@{team}" in seen or RESOLVER.roster_path(team).exists():
+            if f"team-lead@{team}" in seen or RESOLVER.has_roster(team):
                 continue
             path, why = RESOLVER.lead_transcript_for(team)
             if not path:
@@ -5942,68 +6039,6 @@ ABORT_TITLE = 60
 NO_COLOR = False  # zsh truncates to the real terminal width
 
 
-def cruft_reason(team_dir):
-    """Why this directory is NOT pure scaffolding, or None if it is.
-
-    Every entry must be something this tool or the harness is known to create,
-    and known to be contentless. Anything unrecognised, anything nested, any
-    symlink, and any inbox holding mail means the directory is spared.
-    """
-    known = {
-        "config.json",
-        "inboxes",
-        f"config.json.bak-{TOOL}",
-        f"config.json.tmp-{TOOL}",
-        "config.json.lock",
-    }
-    try:
-        entries = list(team_dir.iterdir())
-    except OSError as exc:
-        return f"unreadable ({exc})"
-
-    for item in entries:
-        if item.is_symlink():
-            return f"{item.name} is a symlink"
-        if item.name not in known:
-            return f"unexpected entry {item.name!r}"
-        if item.name != "inboxes":
-            if not item.is_file():
-                return f"{item.name} is not a regular file"
-            continue
-
-        if not item.is_dir():
-            return "inboxes is not a directory"
-        for inbox in item.iterdir():
-            if inbox.is_symlink():
-                return f"inboxes/{inbox.name} is a symlink"
-            if not inbox.is_file():
-                return f"inboxes/{inbox.name} is not a regular file"
-            if inbox.suffix != ".json":
-                return f"inboxes/{inbox.name} is not a .json file"
-            try:
-                mail = json.loads(inbox.read_text() or "[]")
-            except (OSError, ValueError) as exc:
-                return f"inboxes/{inbox.name} is unreadable or not JSON ({exc})"
-            if not isinstance(mail, list):
-                return f"inboxes/{inbox.name} is not a message array"
-            if mail:
-                return f"inboxes/{inbox.name} holds {len(mail)} undelivered message(s)"
-        # This loop reads the files rather than asking inbox_state for counts.
-        # A deletion gate re-proves the structure itself: a count is not proof
-        # that what it counted is a mailbox.
-
-    config = team_dir / "config.json"
-    if not config.is_file():
-        return "no config.json"
-    try:
-        data = json.loads(config.read_text())
-    except (OSError, ValueError) as exc:
-        return f"config.json unreadable ({exc})"
-    if not isinstance(data, dict) or not isinstance(data.get("members", []), list):
-        return "config.json is not a roster"
-    return None
-
-
 def remove_if_cruft(path, dry, kind):
     """Delete a directory only after re-proving it holds nothing.
 
@@ -6018,7 +6053,7 @@ def remove_if_cruft(path, dry, kind):
         warn(f"refusing to remove {path}: outside the directories this tool owns")
         return False
     if kind == "team":
-        reason = cruft_reason(path)
+        reason = RESOLVER.scaffolding_objection(path)
         if reason:
             warn(f"not removing {path.name}: {reason}")
             return False
@@ -6042,7 +6077,7 @@ def remove_if_cruft(path, dry, kind):
         warn(f"cannot stage {path} for removal: {exc}")
         return False
 
-    reason = cruft_reason(staged) if kind == "team" else (
+    reason = RESOLVER.scaffolding_objection(staged) if kind == "team" else (
         f"holds {', '.join(p.name for p in list(staged.iterdir())[:3])}" if any(staged.iterdir()) else None
     )
     if reason:
@@ -6073,6 +6108,9 @@ def remove_if_cruft(path, dry, kind):
 def team_keep_reason(cfg, table):
     """Why this team must be kept, or None if nothing in it is resurrectable.
 
+    Every fact here is an engine answer; what is left is the order they are
+    asked in and the words the sweep prints.
+
     Empty means provably unresurrectable: no live process running as it, no
     lead transcript, and not one member with a transcript. Teams in that state
     are the residue of a Claude launch that registered a team at startup and
@@ -6085,7 +6123,7 @@ def team_keep_reason(cfg, table):
         return "unreadable or memberless roster"
     team, lead_session = entries[0]["team"], entries[0]["leadSessionId"]
 
-    if time.time() - cfg.parent.stat().st_mtime < TEAM_GRACE_S:
+    if RESOLVER.made_moments_ago(cfg.parent):
         return "created moments ago"
     pid, alive, _, _exact = RESOLVER.lead_pid(lead_session, team)
     if pid and alive:
@@ -6096,7 +6134,7 @@ def team_keep_reason(cfg, table):
     souls = RESOLVER.team_souls(team, entries)
     if souls:
         return f"still resurrectable: {', '.join(sorted(souls))}"
-    return cruft_reason(cfg.parent)
+    return RESOLVER.scaffolding_objection(cfg.parent)
 
 
 def cleanup_teams(dry=False):
@@ -7255,7 +7293,7 @@ def rebuild_roster(team, args, passthrough, table):
     config = forge_team(ctx, args.dry_run, evidence=why)
     if not config:
         die(f"could not rebuild a roster for {team}")
-    if not args.dry_run and not RESOLVER.roster_path(team).exists():
+    if not args.dry_run and not RESOLVER.has_roster(team):
         die(f"forged a roster for {team} but it is not on disk")
     return config
 
@@ -7702,10 +7740,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         node.name for node in tree.body
         if isinstance(node, ast.FunctionDef) and reads_a_roster(node)
         # edit_team_config is the writer and re-reads under its own lock.
-        # cruft_reason asks a different question: not "give me the rosters" but
-        # "is this directory a valid team at all", and it needs the parse error
-        # that rosters() swallows in order to answer it.
-        and node.name not in {"edit_team_config", "cruft_reason", "run_selftest"})
+        and node.name not in {"edit_team_config", "run_selftest"})
     check("roster-read-one-place", "a roster is read in one place", not roster_readers, ", ".join(roster_readers))
 
     # Which roster is believed when several claim one agent is a policy, not a
@@ -8049,6 +8084,71 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     unpaired = [line.strip()[:60] for line in source.splitlines()
                 if "print(" in line and "would " in line and " else " not in line]
     check("preview-line-counterpart", "every preview line has a real counterpart", not unpaired, "; ".join(unpaired))
+
+    # A team directory is the engine's to read. Its roster and its mailboxes
+    # are two of the eight realms, and both live inside one directory, so a
+    # caller that opens either for itself becomes a second answer to a
+    # question the engine already answers: is this team there, is this mailbox
+    # empty, does this directory hold anything worth keeping.
+    #
+    # Every route into a team dir starts at one of the engine's path answers
+    # (roster_path, inbox_path, teams_dir), at TEAMS_DIR, or at CLAUDE_DIR
+    # joined to "teams". So the roots are followed through local variables and
+    # attribute chains, and a filesystem read applied to one fails here. What
+    # this does not see is a path handed to a helper as an argument and read
+    # there, and a path spelled from a literal home directory; nothing in this
+    # file does either, and TEAMS_DIR is barred outside the engine already.
+    team_reads = {"exists", "is_file", "is_dir", "is_symlink", "stat", "open",
+                  "read_text", "read_bytes", "iterdir", "glob", "rglob"}
+
+    def in_a_team_dir(node, tainted):
+        """Does this expression name something inside a team directory?"""
+        if isinstance(node, ast.Name):
+            return node.id in tainted or node.id == "TEAMS_DIR"
+        if isinstance(node, ast.Call):
+            return (isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"roster_path", "inbox_path"})
+        if isinstance(node, ast.Attribute):
+            return node.attr == "teams_dir" or in_a_team_dir(node.value, tainted)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            if (isinstance(node.left, ast.Name) and node.left.id == "CLAUDE_DIR"
+                    and isinstance(node.right, ast.Constant) and node.right.value == "teams"):
+                return True
+            return in_a_team_dir(node.left, tainted)
+        if isinstance(node, ast.Subscript):
+            return in_a_team_dir(node.value, tainted)
+        return False
+
+    def team_dir_reads(node):
+        """The reads this function performs on a team directory, by line."""
+        tainted, grew = set(), True
+        while grew:   # a name can be bound from another name bound earlier
+            grew = False
+            for sub in ast.walk(node):
+                if not isinstance(sub, ast.Assign) or not in_a_team_dir(sub.value, tainted):
+                    continue
+                for target in sub.targets:
+                    if isinstance(target, ast.Name) and target.id not in tainted:
+                        tainted.add(target.id)
+                        grew = True
+        return sorted({
+            f"{node.name} reads a team dir at line {sub.lineno}"
+            for sub in ast.walk(node)
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr in team_reads and in_a_team_dir(sub.func.value, tainted)})
+
+    team_peekers = sorted(
+        hit
+        for node in tree.body if isinstance(node, ast.FunctionDef)
+        # reap_team and run_demote copy the bytes of a roster or a mailbox into
+        # a receipt and then delete what they copied. That is the archive half
+        # of an act, not a reading of the realm: neither concludes anything
+        # from what it read. run_selftest stages team dirs as fixtures and
+        # holds this check's own text.
+        and node.name not in {"reap_team", "run_demote", "run_selftest"}
+        for hit in team_dir_reads(node))
+    check("team-dir-read-engine-only", "a team directory is read only inside the engine",
+          not team_peekers, "; ".join(team_peekers))
 
     # Wrapping serves the reader; the reader is not owed less. Every physical
     # line fits the width, and the reflowed text says word for word what the
@@ -11043,7 +11143,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         (race / "inboxes").mkdir(parents=True)
         (race / "config.json").write_text(json.dumps({"name": "race", "members": []}))
         (race / "inboxes" / "team-lead.json").write_text("[]")
-        real_reason, fired = cruft_reason, []
+        real_reason, fired = RESOLVER.scaffolding_objection, []
 
         def racing(target):
             reason = real_reason(target)
@@ -11053,10 +11153,10 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             return reason
 
         real_teams = RESOLVER.teams_dir
-        globals()["cruft_reason"], RESOLVER.teams_dir = racing, base
+        RESOLVER.scaffolding_objection, RESOLVER.teams_dir = racing, base
         with contextlib.redirect_stderr(io.StringIO()):  # the refusal is the point
             removed = remove_if_cruft(race, False, "team")
-        globals()["cruft_reason"], RESOLVER.teams_dir = real_reason, real_teams
+        RESOLVER.scaffolding_objection, RESOLVER.teams_dir = real_reason, real_teams
         check("mail-mid-removal-not-deleted", "mail arriving mid-removal is not deleted",
               not removed and race.exists() and (race / "inboxes" / "team-lead.json").read_text() != "[]")
 
@@ -11076,7 +11176,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
                 (team / "inboxes" / fname).write_text(content)
             if stray:
                 (team / stray).write_text("x")
-            reason = cruft_reason(team)
+            reason = RESOLVER.scaffolding_objection(team)
             ok = (reason is None) if expect is None else (reason is not None and expect in reason)
             check(f"cruft-{label}", f"cruft check: {label}", ok, reason or "considered empty")
 
