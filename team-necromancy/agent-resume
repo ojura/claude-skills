@@ -2733,8 +2733,18 @@ class Resolver:
                         )
 
         # ---- team config contributions
+        # One rule for every source name added below, because --explain prints
+        # them verbatim in its legend, above a report whose own rows read
+        # `agent name@team` and `session <uuid>`: a source is named for the
+        # object it is, in the spelling the rest of the report uses for that
+        # object. A team by its name, a transcript by its session id, and
+        # nothing by a path or a file name. The legend used to carry
+        # team:<full path to config.json> beside jsonl:<uuid>.jsonl, which was
+        # two spellings of two things the reader had already been handed, in
+        # two different shapes.
         if team_entry:
-            member, ts, src = team_entry["member"], team_entry["ts"], f"team:{team_entry['cfg']}"
+            member, ts, src = (team_entry["member"], team_entry["ts"],
+                               f"roster of {team_entry['team']}")
             merged.add("agentId", member.get("agentId"), ts, src)
             merged.add("agentName", member.get("name"), ts, src)
             merged.add("teamName", team_entry["team"], ts, src)
@@ -2750,7 +2760,7 @@ class Resolver:
 
         # ---- transcript contributions
         path, fields, last_ts = transcript
-        src = f"jsonl:{path.name}"
+        src = f"transcript {path.stem}"
         for field, (value, ts) in fields.items():
             if not field.startswith("_"):
                 merged.add(field, value, ts, src)
@@ -5709,8 +5719,12 @@ def explain(ctx):
 
     Sources are tagged rather than repeated. Two sources answered twelve of
     thirteen fields on the run this was written for, so the column that exists
-    for comparing sources was the same two paths written down the page; the
+    for comparing sources was the same two names written down the page; the
     legend carries each source's full text once and the rows carry a letter.
+
+    The legend prints whatever the merge called each source. What that is
+    follows one rule, stated where the sources are added: the object, in the
+    spelling the rest of this report uses for it.
     """
     merged = ctx["merged"]
     print("resolved fields (most recent source wins):")
@@ -5733,7 +5747,9 @@ def explain(ctx):
     for field, value, tag, ts, mark in rows:
         print(f"  {field:<{width}}  {value:<{value_width}}  {tag:<{label}}  {ms_str(ts)}{mark}")
     for path, _, last_ts in ctx["other_transcripts"]:
-        print(f"  (older transcript ignored: {path.name} @ {ms_str(last_ts)})")
+        # Named the way a source is named, since it is a transcript that could
+        # have been one: the session id, not the file it sits in.
+        print(f"  (older transcript ignored: {path.stem} @ {ms_str(last_ts)})")
 
 
 def check_substrate():
@@ -6014,9 +6030,9 @@ def report_launch(ctx, command, prefix="", role="agent", agent_id=None, extra=()
     # The uuid alone, not the file it lives in. A transcript path is one token
     # fill() cannot break, so it stayed whole and ran far past every other row
     # here, and it only repeated the report: the file is named for the uuid on
-    # this row, in a projects directory named for the cwd a few rows below. A
-    # reader who wants the file by name has it from --explain, which says which
-    # transcript every resolved field was read out of.
+    # this row, in a projects directory named for the cwd a few rows below.
+    # --explain says which transcript each resolved field was read out of, and
+    # names it by this same uuid.
     print(f"{prefix}session  {ctx['session_uuid']}")
     print(f"{prefix}via      {ctx['via']}")
     if ctx.get("placed"):
@@ -9570,8 +9586,8 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             return {cand[0] for cand in self.cands.get(field, [])}
 
     merged_fake = _Cands()
-    roster_source = "team:/home/somebody/.claude/teams/session-explain/config.json"
-    jsonl_source = "jsonl:11111111-1111-4111-8111-111111111111.jsonl"
+    roster_source = "roster of session-explain"
+    jsonl_source = "transcript 11111111-1111-4111-8111-111111111111"
     for field, value in (("agentId", "who@session-explain"),
                          ("agentType", "general-purpose"),
                          ("tmuxPaneId", "%0")):
@@ -10500,6 +10516,33 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         got, why = None, f"{type(exc).__name__}: {exc}"
     check("identity-can-assemble", "an identity can actually be assembled", bool(got and why),
           f"{name}@{team} -> {got or why}")
+
+    # And the legend that assembly prints names its sources by the objects the
+    # rest of the report names, not by where they sit on disk. Driven through a
+    # real assembly rather than a fake merge, because the rule is about what the
+    # engine calls a source and a fake merge is handed its source names.
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = eng
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as legend_out:
+            explain(assembled)
+    finally:
+        globals()["RESOLVER"] = real_resolver
+    legend = [re.split(r" {2,}", line.strip())[-1]
+              for line in legend_out.getvalue().splitlines()
+              if re.match(r"  (sources)? +[A-Z]  \S", line)]
+    named = {
+        "the legend has sources to judge": len(legend) > 1,
+        "no source is a path": not any("/" in src for src in legend),
+        "no source is a file name": not any(src.endswith(".jsonl") for src in legend),
+        "the roster is named by its team": f"roster of {team}" in legend,
+        "the transcript is named by its session id":
+            f"transcript {assembled['session_uuid']}" in legend,
+    }
+    wrong = sorted(k for k, ok in named.items() if not ok)
+    check("explain-sources-named-as-objects",
+          "--explain's legend names each source the way the report names it",
+          not wrong, ", ".join(wrong + [f"legend: {legend}"]))
 
     # Supplying an id and a name that contradict describes an agent that cannot
     # exist, and the name is the routing key, so the wrong one reads a mailbox
