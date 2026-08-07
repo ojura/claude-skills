@@ -2159,6 +2159,15 @@ class Resolver:
                     rec = json.loads(line)
                 except ValueError:
                     continue
+                if not isinstance(rec, dict):
+                    # A line that parses to an array, a string or a number is
+                    # not a record: it has no type, no uuid and no parentUuid,
+                    # so it can be neither a last-prompt nor a step in the
+                    # walk. Skipped like a line that is not JSON at all, which
+                    # leaves the same answer the file would give without it.
+                    # This function has no objections channel and its callers
+                    # read only the tuple, so refusing here is not available.
+                    continue
                 if rec.get("type") == "last-prompt":
                     # Order kept so a wrong final-wins reading stays writable
                     # as a probe; the set-latest rule below is the loader's.
@@ -2275,6 +2284,20 @@ class Resolver:
                 return {"objections": [f"its identity record {why}"],
                         "proved": False}
             rec, style = loaded
+            # The codec proves bytes round-trip, not that the line is a
+            # record: an array, a string or a number dumps back unchanged and
+            # arrives here as one. It refuses rather than walking on, for the
+            # same reason the codec failure above refuses. The skip below
+            # means "a different record, keep looking", which needs a uuid
+            # field to have been read; a non-record has none, so the scan
+            # cannot tell whether the line it wants is this one or a later
+            # one. Two lines answering to one uuid is the case the byte
+            # compare further down exists for, and it cannot reach that
+            # compare from here, so this is where it stops.
+            if not isinstance(rec, dict):
+                return {"objections": [f"line {i + 1} carries {uuid} but is a "
+                                       f"{type(rec).__name__}, not a record"],
+                        "proved": False}
             if rec.get("uuid") != uuid:
                 continue
             new = dict(rec)
@@ -12766,6 +12789,75 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         check("restamp-refuses-an-unrestorable-line",
               "a restamp refuses when its inverse would not restore the line",
               not undone, ", ".join(undone))
+
+    # --- a line that is JSON but not an object refuses instead of crashing.
+    #
+    # What reaches this honestly: a bare JSON array carrying the window-start
+    # uuid, placed before the record that owns it. json.loads accepts it,
+    # json.dumps writes it back byte for byte, so the codec waves it through
+    # and hands the scan a list where every other line hands it a record. The
+    # array has to come first or the scan returns on the real record before
+    # ever seeing it, and window_start has to walk past it or the plan never
+    # starts: both halves of the path are in this one arm, and the measured
+    # answer before the fix was AttributeError out of window_start, then
+    # AttributeError out of the scan once window_start was taught to skip.
+    #
+    # The arms carry each other. Assert only "unproved" and every other
+    # refusal this function can return satisfies it, so the objection's own
+    # words are asserted, line number included. Catch the crash and call it a
+    # refusal and the blind .get passes, so a raise is recorded as a failure
+    # with the exception named. And with no control arm, a restamp that
+    # refused every transcript would pass the tripping arm, so the same file
+    # minus the one array line has to still prove.
+    with tempfile.TemporaryDirectory() as td:
+        proj = Path(td) / "proj"
+        proj.mkdir()
+        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def with_array(stem, lead):
+            """A stamped window-start, optionally preceded by a bare array."""
+            rows = [{"parentUuid": None, "agentName": "mate", "teamName": "OLD",
+                     "type": "user", "uuid": f"{stem}-root",
+                     "timestamp": "2026-01-01T00:00:01Z",
+                     "message": {"role": "user", "content": "hi"}},
+                    {"type": "last-prompt", "leafUuid": f"{stem}-root",
+                     "sessionId": stem}]
+            body = "".join(compact(r) + "\n" for r in rows)
+            if lead:
+                body = compact([f"{stem}-root"]) + "\n" + body
+            path = proj / f"{stem}.jsonl"
+            path.write_text(body)
+            return path
+
+        eng10 = Resolver(needs=Needs(maybe=set(NEED)))
+        eng10.projects_dir = Path(td)
+        shaped = []
+
+        def planned(path):
+            """The plan, or the exception it raised dressed as one."""
+            try:
+                return eng10.restamp_plan(path, "NEW")
+            except Exception as err:
+                return {"objections": [f"raised {err.__class__.__name__}"],
+                        "proved": False, "raised": True}
+
+        bare = planned(with_array("ARRAYLINE", lead=True))
+        if bare.get("raised"):
+            shaped.append(f"a non-record line crashed the plan: {bare['objections'][0]}")
+        elif bare["proved"]:
+            shaped.append("a non-record line carrying the uuid was proved anyway")
+        elif "line 1 carries ARRAYLINE-root but is a list, not a record" \
+                not in bare["objections"]:
+            shaped.append(f"a non-record line did not object by name: {bare['objections']}")
+        # The control, one line apart: the same transcript without the array
+        # still locates its window-start and proves.
+        clean = planned(with_array("ARRAYNONE", lead=False))
+        if clean.get("raised") or not clean["proved"] or clean["objections"]:
+            shaped.append(f"an ordinary rewrite did not prove: "
+                          f"{clean['objections'] or 'unproved'}")
+        check("restamp-refuses-a-non-record-line",
+              "a restamp refuses a line that is JSON but not a record, instead of crashing",
+              not shaped, ", ".join(shaped))
 
     # --- a rebind retires the stamped team only when nothing would notice
     with tempfile.TemporaryDirectory() as td:
