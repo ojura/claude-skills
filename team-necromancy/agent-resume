@@ -1063,6 +1063,19 @@ class Resolver:
         live_here = {e.get("session") for e in self.live_sessions() if e.get("team") == team}
         block = re.fullmatch(r"session-([0-9a-f]{8})", team)
 
+        def any_child_running(names):
+            """Is any of these members of this team running right now?
+
+            Both halves: a member whose process is this command's own ancestor
+            is running as plainly as any other, and dropping it would leave a
+            claimant uncorroborated exactly when the asker is its own child.
+            """
+            for name in names:
+                others, ours = self.wearers(f"{name}@{team}")
+                if others or ours:
+                    return True
+            return False
+
         def corroboration(path):
             if path.stem in live_here:
                 return f"live process running as {team}"
@@ -1077,7 +1090,7 @@ class Resolver:
             # a lead of it in the only sense that acts on anything. Fork siblings
             # share their children, so this separates claimants with different
             # payloads and never breaks a tie between copies of one history.
-            if spawned and any(self.wearers(f"{name}@{team}") for name in spawned):
+            if spawned and any_child_running(name for name in spawned if name):
                 return "live members it spawned"
             if block and path.stem.startswith(block.group(1)):
                 return "team-name block"
@@ -1140,7 +1153,29 @@ class Resolver:
         return self._by_team
 
     def live_agent_procs(self, agent_id, table):
+        """Every live process wearing this id except our own lineage.
+
+        One half of wearers, and not consultable on its own. The exclusion is
+        right: a launch that counted the process it is running inside would
+        refuse to spawn past itself. It is wrong for anything that reports,
+        which is why the other half exists and why both are taken together.
+        """
         return self._claude_procs(f"--agent-id {agent_id}", table)
+
+    def self_wears(self, agent_id, table):
+        """Are we ourselves, or an ancestor of ours, wearing this agent id?
+
+        live_agent_procs drops our own lineage, so the run asking about the
+        agent it is sitting inside got an empty list back and every report
+        built on it said that agent was not running. The same argv match,
+        applied to exactly the pids that exclusion removed. Written out here
+        rather than routed through _claude_procs, because the filter is what
+        this half is recovering from.
+        """
+        mine = self._own_lineage(table)
+        return [(pid, args) for pid, _, args in table
+                if pid in mine and self.is_claude(args)
+                and f"--agent-id {agent_id}" in self._argv_pairs(args)]
 
     def holders_of(self, session_uuid, table):
         """[(pid, transcript path or None)] for whoever holds this transcript.
@@ -1159,12 +1194,35 @@ class Resolver:
         wearers() gives the session id from argv; this resolves it to a file, so
         a caller wanting to say what a process is working on never has to pick a
         transcript for itself.
+
+        The strangers half only: this is the listing --stop prints before it
+        kills, and a kill list must not name the process running the command.
         """
+        others, _ours = self.wearers(agent_id, table)
         return [(pid, self.transcript_path(held) if held else None)
-                for pid, held in self.wearers(agent_id, table)]
+                for pid, held in others]
+
+    def _wearer_pairs(self, procs):
+        """[(pid, its --resume value or None)] for rows of [(pid, cmdline)].
+
+        Both halves of wearers go through this, so the two are the same shape
+        and a caller cannot tell them apart by how they read.
+        """
+        return [(pid, next((pair.partition(" ")[2] for pair in self._argv_pairs(args)
+                            if pair.startswith("--resume ")), None))
+                for pid, args in procs]
 
     def wearers(self, agent_id, table=None):
-        """(pid, transcript) for every live process wearing this agent-id.
+        """(others, ours): every live process wearing this agent-id, split.
+
+        Two halves of one question, the split transcript_holders already makes
+        for the transcript. live_agent_procs excludes our own lineage, which a
+        launch needs and a report must not have: consulted alone it returned an
+        empty list for an agent whose process was this command's own ancestor,
+        and seat_of turned that into "not running" about a live process.
+        self_wears is exactly that excluded remainder, so neither half is
+        separately consultable: a caller takes both and visibly discards what
+        it does not need.
 
         A running process is the agent now. Identity is frozen in argv at exec and
         a migration is kill-and-restart, so argv cannot be stale the way a roster
@@ -1173,12 +1231,9 @@ class Resolver:
         carries no transcript evidence and is reported with None rather than
         dropped, so a caller can still see it is there.
         """
-        out = []
-        for pid, args in self.live_agent_procs(agent_id, table or self.ps_table()):
-            held = next((pair.partition(" ")[2] for pair in self._argv_pairs(args)
-                         if pair.startswith("--resume ")), None)
-            out.append((pid, held))
-        return out
+        table = self.ps_table() if table is None else table
+        return (self._wearer_pairs(self.live_agent_procs(agent_id, table)),
+                self._wearer_pairs(self.self_wears(agent_id, table)))
 
     def live_sessions(self):
         """Every claude process and what it is: {pid, session, agent, team, ...}.
@@ -1664,7 +1719,10 @@ class Resolver:
         # frozen at exec and a migration is kill-and-restart, so a roster entry or a
         # stamp says what was true when it was written, while argv says what is true.
         if name and team:
-            seen = self.wearers(f"{name}@{team}")
+            # Both halves: argv is the strongest evidence this tool has, and our
+            # own lineage carries the same argv as anyone else's process.
+            others, ours = self.wearers(f"{name}@{team}")
+            seen = others + ours
             held = {transcript for _, transcript in seen if transcript}
             if len(held) > 1:
                 return Resolution(reason=(
@@ -1780,8 +1838,11 @@ class Resolver:
                 # Running and absent from the roster is not former: former is the
                 # trace of work that finished, and this agent has not. The run
                 # path drew that line already; this is the same word, one reader.
+                # Both halves, because this states what an agent is: filing the
+                # asker's own process under former is the same false report.
+                others, ours = self.wearers(f"{name}@{team}")
                 people[name] = (("unrecorded", "running, and in no roster")
-                                if self.wearers(f"{name}@{team}")
+                                if others or ours
                                 else ("former", "a transcript stamped with this team"))
         for name in self.converted_members(team):
             if name not in people:
@@ -3316,6 +3377,21 @@ class Resolver:
                       if e.get("team") == team and e.get("agent"))
         return self.socket_hosting(crew, table)
 
+    def socket_of_pid(self, pid, table):
+        """The live tmux server this one process is sitting on, or None.
+
+        The per-pid half of socket_hosting, split out because it takes a bare
+        pid: seat_of has a wearer that no agent-id search returns (our own
+        lineage) and still has to say where it sits, and asking that here keeps
+        one answer to "which server is this process on" rather than two.
+        """
+        sock = self._socket_from_pane_pid(pid, table)
+        if sock and self.socket_alive(sock):
+            return sock
+        if sock:
+            warn(f"pid {pid} looked like a pane on {sock}, but that server is gone")
+        return None
+
     def socket_hosting(self, agent_ids, table):
         """(socket, why) for the live server already hosting any of these agents.
 
@@ -3323,16 +3399,20 @@ class Resolver:
         name, which is why it comes first and why both callers have to be the same
         code. Answered separately, a team can be sent to a socket derived from its
         lead's pid while its members sit on another server entirely.
+
+        The strangers half only. This is where a launch is placed, and placing
+        one on the server the asker happens to be sitting on would move the
+        crew for a reason nobody asked for; seat_of asks about our own lineage
+        separately, per pid.
         """
         for agent_id in agent_ids:
             if not agent_id:
                 continue
-            for pid, _ in self.live_agent_procs(agent_id, table):
-                sock = self._socket_from_pane_pid(pid, table)
-                if sock and self.socket_alive(sock):
-                    return sock, f"live pane of pid {pid}"
+            worn, _worn_by_us = self.wearers(agent_id, table)
+            for pid, _held in worn:
+                sock = self.socket_of_pid(pid, table)
                 if sock:
-                    warn(f"pid {pid} looked like a pane on {sock}, but that server is gone")
+                    return sock, f"live pane of pid {pid}"
         return None, None
 
     def seat_of(self, agent_id, table=None):
@@ -3353,6 +3433,14 @@ class Resolver:
         have no socket; that order is also what keeps the doctor's sweep at the
         one lookup per live member it already paid.
 
+        Both halves of the wearer question, because this reports. A wearer in
+        our own lineage is live, and answering "not running" about the process
+        the command is running inside is the report this whole split exists to
+        stop. socket_hosting cannot see that wearer either, so its seat is
+        asked per pid instead: socket_of_pid takes a bare pid, so a process
+        excluded from every agent-id search still gets a truthful seated or
+        unseated.
+
         Not seat_note, which says what became of the pane id a roster wrote
         down. That is a record. This is where the process is.
         """
@@ -3360,7 +3448,12 @@ class Resolver:
         sock, _why = self.socket_hosting([agent_id], table)
         if sock:
             return "seated", sock
-        return ("unseated" if self.wearers(agent_id, table) else "not running"), None
+        others, ours = self.wearers(agent_id, table)
+        for pid, _held in ours:
+            mine = self.socket_of_pid(pid, table)
+            if mine:
+                return "seated", mine
+        return ("unseated" if others or ours else "not running"), None
 
     def _spawn_by_agent(self):
         """{"name@team": payload} for every teammate any lead ever spawned.
@@ -4557,7 +4650,10 @@ def already_running(ctx, args, is_lead, agent_id=None, table=None, here=(), pane
         return (f"session {ctx['session_uuid']} is live as pid {owner[0]}"
                 f"{RESOLVER.state_note(owner[0])}{where}; pass --force to run a second copy", False)
     if not is_lead and agent_id:
-        live = RESOLVER.live_agent_procs(agent_id, table)
+        # The strangers half only: this decides whether to launch, and a launch
+        # that counted the process it is running inside could never spawn past
+        # itself. Running this transcript ourselves is refused in run_one.
+        live, _worn_by_us = RESOLVER.wearers(agent_id, table)
         elsewhere = [pid for pid, _ in live if pid not in here]
         if elsewhere:
             return (f"{agent_id} is already running outside pane {pane or '?'} "
@@ -4691,7 +4787,11 @@ def apply_selector(token, args, table):
         warn(f"{token!r} is {why}, so it names nobody; pick one:")
         for entry in value:
             agent_id = entry["member"].get("agentId")
-            procs = RESOLVER.live_agent_procs(agent_id, table)
+            # Both halves: this line states whether a candidate is running and
+            # then the run stops, so a candidate we are sitting inside must not
+            # be offered as the dead one.
+            others, ours = RESOLVER.wearers(agent_id, table)
+            procs = others + ours
             state = f"running{RESOLVER.state_note(procs[0][0])}" if procs else "not running"
             warn(f"    {agent_id:<44} joined {ms_str(entry['ts'])}  [{state}]")
         die("pass one of those ids, or a session uuid")
@@ -4900,7 +5000,10 @@ LAUNCH_WRITE_S = 45.0    # a large session takes tens of seconds to load and wri
 
 def launch_present(socket, pane, agent_id):
     fresh = RESOLVER.ps_table(refresh=True)
-    if agent_id and RESOLVER.wearers(agent_id, fresh):
+    # The strangers half only: whoever we already were was there before this
+    # launch, so counting it would call every launch a success.
+    appeared, _worn_by_us = RESOLVER.wearers(agent_id, fresh) if agent_id else ([], [])
+    if appeared:
         return True
     if pane:
         _, occupants = RESOLVER.pane_occupants(socket, pane, fresh)
@@ -5768,7 +5871,11 @@ def auto_redirect(ctx, args, table, prefix=""):
     # `claude` and is visible only to the registry.
     owner = RESOLVER.lead_pid_for(ctx["session_uuid"])
     strangers, _ours = RESOLVER.transcript_holders(ctx["session_uuid"], table)
-    holders = strangers + RESOLVER.live_agent_procs(agent_id, table)
+    # The strangers half of both questions, for one reason: this decides whether
+    # to move, the move restarts the member, and a run cannot restart the process
+    # it is running inside. run_one refuses that case by name.
+    worn, _worn_by_us = RESOLVER.wearers(agent_id, table)
+    holders = strangers + worn
     if holders or (owner and owner[2]):
         # Alive: leave it to the liveness guards. Say what the move would cost
         # rather than making it, since restarting throws away its current turn.
@@ -5989,7 +6096,10 @@ def crew_left_behind(source, dest, prefix=""):
     for name, (state, _why) in sorted(population.items()):
         if name == "team-lead":
             continue
-        live = RESOLVER.wearers(f"{name}@{source}")
+        # Both halves: these are report lines about who stays behind, and a
+        # member we are running inside stays behind like any other.
+        others, ours = RESOLVER.wearers(f"{name}@{source}")
+        live = others + ours
         said.append(f"{name} ({state}"
                     + (f", running as pid {live[0][0]}" if live else "") + ")")
     if said:
@@ -6242,7 +6352,11 @@ def run_one(args, passthrough, table, prefix="", pending=()):
 
     # Same agent already in that pane -> nothing to do. Anything else in it -> new pane.
     _, occupants = RESOLVER.pane_occupants(socket, want_pane, table) if want_pane else (False, [])
-    worn = {pid for pid, _ in RESOLVER.wearers(agent_id, table)} if agent_id else set()
+    # The strangers half only: this sorts the pane's occupants into "this agent"
+    # and "somebody else" to decide whether to reuse the pane or take a new one,
+    # and our own lineage is neither of those to a launch.
+    worn_by_others, _worn_by_us = RESOLVER.wearers(agent_id, table) if agent_id else ([], [])
+    worn = {pid for pid, _held in worn_by_others}
     here = [pid for pid, _cmd in occupants if pid in worn]
     others = [pid for pid, _ in occupants if pid not in here]
 
@@ -6726,9 +6840,14 @@ def run_standing(args):
     # member can be live and in no pane at all. Its own question, asked by the
     # verb that prints it, so a caller reading the verdict never buys a seat.
     seat, seat_socket = RESOLVER.seat_of(agent_id)
+    # Both halves, for the word at the end of the line. The usual way to ask
+    # this is from inside the session being asked about, and "it is live" reads
+    # as some other process unless the line says which one.
+    _others, ours = RESOLVER.wearers(agent_id)
+    inside = f"  (pid {ours[0][0]}, which this command is running inside)" if ours else ""
     print(fill("seat     " + {"seated": f"in a pane on {seat_socket}",
                               "unseated": "none; it is live and in no tmux pane",
-                              "not running": "none; it is not running"}[seat]))
+                              "not running": "none; it is not running"}[seat] + inside))
     if pid:
         said_how = re.sub(rf"^pid {pid}, ", "", how) if how else None
         print(fill(f"lead     pid {pid}{'' if alive else ', not running'}"
@@ -6828,8 +6947,15 @@ def diagnose_team(team, table=None, deep=False):
     mail = RESOLVER.inbox_state(team)
     waiting = {n: v for n, v in mail.items() if v[0]}
     torn = {n: v[1] for n, v in mail.items() if v[0] is None}
-    live = {n: RESOLVER.wearers(f"{n}@{team}") for n in population}
-    live = {n: w for n, w in live.items() if w}
+    # Both halves. The doctor counts and warns, and a member whose process is
+    # this command's own ancestor is live: dropping it undercounted the team and
+    # took the whole unseated-member warning with it, for the one team the asker
+    # is most likely to be asking about.
+    live = {}
+    for n in population:
+        others, ours = RESOLVER.wearers(f"{n}@{team}")
+        if others or ours:
+            live[n] = others + ours
     doubled = sorted(n for n, w in live.items() if len({p for p, _t in w}) > 1)
 
     if pid:
@@ -8055,7 +8181,14 @@ def run_team(args, passthrough, table):
     # a value this run just forged, and on a dry run it was never written, so
     # asking the disk calls every member of it a former and the union doubles.
     population = RESOLVER.team_population(args.team)
-    live = {name for name in population if RESOLVER.wearers(f"{name}@{args.team}")}
+    # The strangers half only: this set decides who gets launched, and a member
+    # this run is running inside cannot be relaunched by it. run_one refuses that
+    # one by name if the roster puts it in the job list anyway.
+    live = set()
+    for name in population:
+        others, _worn_by_us = RESOLVER.wearers(f"{name}@{args.team}")
+        if others:
+            live.add(name)
     members, former = select_jobs(members, population, live, lead_id,
                                   getattr(args, "all_members", False), args.team)
     ordered = sorted(members, key=lambda m: 1 if m.get("agentId") == lead_id else 0)
@@ -9587,7 +9720,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
                                           "beta": ("unrecorded", None),
                                           "gamma": ("listed", None)},
             inbox_state=lambda team: {},
-            wearers=lambda agent_id, table=None: [],
+            wearers=lambda agent_id, table=None: ([], []),
             roster_entries=lambda **kw: [],
             nameless_receipts=lambda: [],
             known_teams=lambda: (census_asked.append(1), {})[1])
@@ -11611,6 +11744,110 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("holder-one-question", "who holds a transcript is one question", not half_askers,
           ", ".join(half_askers))
 
+    # Who wears an agent id is ONE question too, and for the same reason it took
+    # longer to notice: the exclusion is correct for a launch, so nothing looked
+    # wrong until a report said "not running" about the process it was running
+    # inside. live_agent_procs is the strangers half, self_wears the remainder.
+    wearer_half_askers = sorted(
+        (callers_of("live_agent_procs") | callers_of("self_wears")) - {"wearers"})
+    check("wearer-one-question", "who wears an agent id is one question",
+          not wearer_half_askers, ", ".join(wearer_half_askers))
+
+    # The composition alone only pins that both halves exist. What makes the
+    # answer right is which sites read the second one, and both behaviours are
+    # legitimate: a launch must not count the process it runs inside, a report
+    # must. Nothing else here would notice a site changing column, which is how
+    # the exclusion reached the reporting sites to begin with. So the split is
+    # written down and checked against what the code actually does.
+    #
+    # acting   -> consumes the strangers half and drops the other, by name
+    # reporting-> reads both, and states an own-lineage wearer rather than
+    #             converting it to absence
+    WEARER_SITES = {
+        # acting: these decide whether, where, or what to launch, kill or move
+        "wearer_transcripts": "acting",    # the listing --stop kills from
+        "socket_hosting": "acting",        # the launch ladder's first rung
+        "already_running": "acting",       # the noop decision
+        "launch_present": "acting",        # did this launch come up
+        "auto_redirect": "acting",         # whether to move a member's team
+        "run_one": "acting",               # reuse this pane or take a new one
+        "run_team": "acting",              # which members get a job
+        # reporting: these state what is true and nothing acts on the answer
+        "any_child_running": "reporting",  # corroborating a team's lead
+        "resolve_transcript": "reporting", # which conversation an identity is on
+        "team_population": "reporting",    # unrecorded, or former
+        "seat_of": "reporting",            # where the process is
+        "apply_selector": "reporting",     # running or not, per ambiguous candidate
+        "crew_left_behind": "reporting",   # who stays on the old team
+        "diagnose_team": "reporting",      # the live map and the doubled set
+        "run_standing": "reporting",       # the dossier's seat row
+    }
+
+    def own_nodes(node):
+        """Every node in this function's own body, stopping at a function
+        nested inside it. callers_of names every enclosing function, so a
+        nested helper names its parent too; a column belongs to the code that
+        reads the answer, not to whatever that code happens to sit inside.
+        """
+        out, stack = [], list(ast.iter_child_nodes(node))
+        while stack:
+            sub = stack.pop()
+            if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            out.append(sub)
+            stack.extend(ast.iter_child_nodes(sub))
+        return out
+
+    def asks_wearers(node):
+        return (isinstance(node, ast.Call)
+                and (getattr(node.func, "id", None) == "wearers"
+                     or (isinstance(node.func, ast.Attribute) and node.func.attr == "wearers")))
+
+    def consumption_of(node):
+        """How this function consumes wearers(): "acting", "reporting", or why not.
+
+        Read off the unpack, not off the variable's name: a site is reporting
+        when it reads the binding it gave the second half, and acting when it
+        takes the pair and never looks at that binding again. A call that does
+        not unpack a pair at all is neither, and says so, because the pair is
+        truthy whichever half is empty and testing it directly is the bug this
+        whole split is against.
+        """
+        body = own_nodes(node)
+        ours_names = set()
+        for sub in body:
+            if not isinstance(sub, ast.Assign) or not any(
+                    asks_wearers(inner) for inner in ast.walk(sub.value)):
+                continue
+            for target in sub.targets:
+                if isinstance(target, ast.Tuple) and len(target.elts) == 2 \
+                        and isinstance(target.elts[1], ast.Name):
+                    ours_names.add(target.elts[1].id)
+        if not ours_names:
+            return "does not unpack both halves"
+        read = {sub.id for sub in body
+                if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load)}
+        return "reporting" if ours_names & read else "acting"
+
+    # run_selftest drives the question to test it, and holds this table's own
+    # text; every other caller is a site and has to be in it.
+    wearer_sites = sorted(
+        {name for name, node in funcs.items() if any(map(asks_wearers, own_nodes(node)))}
+        - {"run_selftest"})
+    miscounted = []
+    for site in wearer_sites:
+        actual = consumption_of(funcs[site])
+        declared = WEARER_SITES.get(site)
+        if declared is None:
+            miscounted.append(f"{site} consults wearers and is in no column ({actual})")
+        elif actual != declared:
+            miscounted.append(f"{site} is declared {declared} and {actual}")
+    for site in sorted(set(WEARER_SITES) - set(wearer_sites)):
+        miscounted.append(f"{site} is declared {WEARER_SITES[site]} and consults nothing")
+    check("wearer-sites-keep-their-column",
+          "every site that asks who wears an id keeps the column it is declared in",
+          not miscounted, "; ".join(miscounted))
+
     # --- the mail ledger joins sends against deliveries, four honest states
     with tempfile.TemporaryDirectory() as td:
         proj = Path(td) / "proj"
@@ -12437,7 +12674,12 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         spawned = {pay.get("name")
                    for path in paths
                    for pay in eng.members_spawned_into(path.stem, team)}
-        live_kids[team] = any(eng.wearers(f"{n}@{team}") for n in spawned if n)
+        worn = []
+        for n in spawned:
+            if n:
+                others, ours = eng.wearers(f"{n}@{team}")
+                worn.append(bool(others or ours))
+        live_kids[team] = any(worn)
     wrong = sorted(t for t, ok in live_kids.items() if not ok)
     # And the upgrade must reach the write: an evidence string without the word
     # uncorroborated is what lets the forge record a real leadSessionId.
@@ -12624,9 +12866,14 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             # Computed here rather than read from the verdict: a lead runs in a
             # terminal, so it occupies no pane and cannot be a seat. Counting it calls
             # every team with a live masqueraded lead split.
-            seats = {eng.socket_hosting([f"{n}@{team}"], table)[0]
-                     for n, (state, _w) in pop.items()
-                     if n != "team-lead" and eng.wearers(f"{n}@{team}")}
+            crew = []
+            for n, (_state, _w) in pop.items():
+                if n == "team-lead":
+                    continue
+                others, ours = eng.wearers(f"{n}@{team}")
+                if others or ours:
+                    crew.append(n)
+            seats = {eng.socket_hosting([f"{n}@{team}"], table)[0] for n in crew}
             seats.discard(None)
             if said_split != (len(seats) > 1):
                 verdicts[team] = f"split said {said_split}, crew sits on {len(seats)} server(s)"
@@ -12764,6 +13011,59 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("standing-says-the-seat",
           "the dossier says where the member's own process sits",
           "live and in no tmux pane" in seat_row, f"said {seat_row!r}")
+
+    # The wearer nobody could see: the process running the command. Every
+    # agent-id search drops our own lineage, so a report asked from inside the
+    # session it is about got an empty list and said the agent was not running,
+    # while the same shell's rebind refusal named its pid correctly because that
+    # one goes through the composed transcript question.
+    #
+    # The fixture is the scenario itself rather than a stand-in for it: the
+    # wearer's pid IS this test process, so _own_lineage puts it in our lineage
+    # for real and no lineage answer is stubbed. Its parent in the fake table is
+    # pid 0, which is no process at all, so the seat question finds no tmux
+    # server over it on any machine and the arm stays unseated everywhere.
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = eng = corpus_engine()
+    eng.session_registry = lambda: []
+    eng.team_minted_by = lambda pid: (crew, True)
+    mine_row = [(os.getpid(), 0, f"{FAKE_AGENT_BIN} --resume "
+                                 f"22222222-2222-4222-8222-222222222222 --agent-id petrel@{crew}")]
+    eng.ps_table = lambda refresh=False: mine_row
+    dossier = io.StringIO()
+    try:
+        seat = eng.seat_of(f"petrel@{crew}", mine_row)
+        halves = eng.wearers(f"petrel@{crew}", mine_row)
+        with contextlib.redirect_stderr(io.StringIO()):
+            verdict_mine, mine_lines, _rem = diagnose_team(crew, mine_row)
+        with contextlib.redirect_stderr(io.StringIO()), \
+                contextlib.redirect_stdout(dossier):
+            run_standing(_Args(agent_id=f"petrel@{crew}"))
+    except BaseException as exc:  # a report that crashes is a failed one
+        seat, halves, mine_lines = (f"raised {type(exc).__name__}", ([], []), [])
+    finally:
+        globals()["RESOLVER"] = real_resolver
+    members_line = next((ln for ln in mine_lines if ln.startswith("members ")), "")
+    unseated_line = next((ln for ln in mine_lines
+                          if ln.startswith("warning  ") and "in no tmux pane" in ln), "")
+    mine_seat_row = next((ln for ln in dossier.getvalue().splitlines()
+                          if ln.startswith("seat ")), "")
+    blind = {
+        # The half that would answer it, so a fixture that stopped being our own
+        # lineage fails here rather than passing the rest by accident.
+        "the fixture wearer is in our own lineage": halves[1] == [
+            (os.getpid(), "22222222-2222-4222-8222-222222222222")],
+        "no agent-id search returns it": halves[0] == [],
+        "its seat is unseated, not absent": seat == ("unseated", None),
+        "the doctor counts it live": "1 live" in members_line,
+        "the unseated warning names it": "petrel" in unseated_line,
+        "the dossier does not call it stopped": bool(mine_seat_row)
+        and "not running" not in mine_seat_row,
+    }
+    wrong = sorted(k for k, ok in blind.items() if not ok)
+    check("own-lineage-wearer-is-live",
+          "a wearer in the asking process's own lineage is reported as running",
+          not wrong, ", ".join(wrong) or f"seat {seat}, members {members_line!r}")
 
     # Mail in a mailbox does not demote a team whose lead is live and reading
     # it: that mail arrives at the lead's next turn boundary and needs nobody.
