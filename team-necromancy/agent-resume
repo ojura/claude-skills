@@ -7194,9 +7194,17 @@ def run_doctor(args, selector=None):
             print(fill(f"  remedy   {what}  ({tag[(shape, cost)]})"
                        if (shape, cost) in shared
                        else f"  remedy   {what}  ({cost})"))
+    if not target:
+        # The population, said once. --census counts teams on the same machine
+        # and prints a bigger number, because it counts every team any evidence
+        # names while a bare sweep looks only at the ones worth looking at. The
+        # two are read side by side, so each says which set it is counting.
+        print(fill(f"\n{len(teams)} of {len(everything)} team(s) examined, a team "
+                   f"being anything some evidence proves is one; --census counts "
+                   f"that same set, split by which evidence proves each"))
     if skipped:
-        print(fill(f"\n{skipped} team(s) with nothing live and no waiting mail "
-                   f"were not examined; --all covers them"))
+        print(fill(f"the {skipped} not examined have nothing live and no waiting "
+                   f"mail; --all covers them"))
     if not target and teams:
         print(fill("\nmail beyond the inbox files is joined for a named team only; "
                    "--mail-ledger <team> shows it for any team"))
@@ -7767,6 +7775,13 @@ def run_census():
     print("\nteams")
     for evidence, count in by_evidence.most_common():
         print(f"  {evidence:38} {count}")
+    # The rows above are one set cut three ways, and the doctor sweeps that
+    # whole set. Both reports print a team count and they are different
+    # numbers, so each says which set its number is over; adjacent counts of
+    # two different things otherwise read as one of them being wrong.
+    print(fill(f"  ...{len(known)} teams in all, each on one row above, under the "
+               f"strongest evidence for it; --doctor --all examines this same "
+               f"set, a block per team"))
     # Two columns, each labelled, because "contested" means two different things
     # and an unlabelled count of either invites a disagreement between people who
     # are both measuring correctly.
@@ -13017,6 +13032,56 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("sweep-remedy-tied-to-its-explanation",
           "each swept block's remedy says which shared explanation it means",
           not wrong, ", ".join(wrong) + f"; defined {sorted(defined)}, used {sorted(used)}")
+
+    # The census and the sweep both print a team count for one machine, and on
+    # this one they printed 20 and 67 in reports read side by side, with
+    # nothing saying they were counting different things. Each now says what
+    # its number is over; this drives both over the corpus and joins the
+    # census's total to the sweep's population, so the sentences cannot claim
+    # a common set the code does not have.
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = counting = corpus_engine()
+    counting.session_registry = lambda: []
+    counting.ps_table = lambda refresh=False: []
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as census_out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            run_census()
+        # Both sweeps: under --all the two numbers coincide, so only the bare
+        # one says whether the second is the whole population or a repeat of
+        # the first.
+        with contextlib.redirect_stdout(io.StringIO()) as pop_out:
+            run_doctor(_Args(team=None, agent_id=None, all_members=True))
+        with contextlib.redirect_stdout(io.StringIO()) as some_out:
+            run_doctor(_Args(team=None, agent_id=None, all_members=False))
+    finally:
+        globals()["RESOLVER"] = real_resolver
+    said = lambda text: re.search(r"(\d+) of (\d+) team\(s\) examined", flat(text))
+    total = re.search(r"(\d+) teams in all", flat(census_out.getvalue()))
+    swept_pop, some_pop = said(pop_out.getvalue()), said(some_out.getvalue())
+    printed_blocks = len([ln for ln in pop_out.getvalue().splitlines()
+                          if ln[:1].isalpha() and ln.split()[:1]
+                          and ln.split()[0].isupper()])
+    counts = {
+        "the census says how many teams in all": bool(total),
+        "the sweep says how many of how many it examined": bool(swept_pop),
+        "the two reports count one set": bool(total and swept_pop)
+            and total.group(1) == swept_pop.group(2),
+        "and it is the set the engine knows":
+            bool(total) and int(total.group(1)) == len(counting.known_teams()),
+        "the sweep examined as many teams as it printed":
+            bool(swept_pop) and int(swept_pop.group(1)) == printed_blocks,
+        "a bare sweep counts against that same population":
+            bool(some_pop) and some_pop.group(2) == swept_pop.group(2),
+        "and against it, not against what it examined":
+            bool(some_pop) and int(some_pop.group(1)) < int(some_pop.group(2)),
+    }
+    wrong = sorted(k for k, ok in counts.items() if not ok)
+    check("census-and-doctor-count-the-same-teams",
+          "the census total and the sweep's population are the same set",
+          not wrong, ", ".join(wrong + [
+              f"census {total and total.group(1)}, "
+              f"sweep {swept_pop and swept_pop.group(0)}"]))
 
     # A verdict names what an operator must act on. Pruned members are the trace
     # of finished work and an unrecorded one is fixed by running it, so neither
