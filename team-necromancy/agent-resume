@@ -1807,10 +1807,13 @@ class Resolver:
         the sender's transcript as a SendMessage tool use, and every delivery
         lands in the recipient's as a teammate-message wrapper carrying the
         body unchanged. The join is pure evidence-reading, and an unmatched
-        send has three honest states rather than one: still in the inbox
+        send has four honest states rather than one: still in the inbox
         file (queued), the recipient has not written since (pending a turn
-        boundary), or the recipient has written and no delivery matches
-        (unexplained - the drain-then-die window's visible shape).
+        boundary), taken into a live recipient's memory (in memory - the
+        drain-then-die window while it stands open), or the recipient has
+        written and no delivery matches (unexplained - what that window
+        leaves behind when it closes on a loss). Seven states in all, with
+        delivered, protocol and unknown recipient.
 
         Harness-emitted traffic (idle notifications) has no send side, so it
         never appears here; protocol-object sends are counted, not joined.
