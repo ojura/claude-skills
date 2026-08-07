@@ -6875,17 +6875,41 @@ def run_doctor(args, selector=None):
         teams = sorted(interesting) if not args.all_members else sorted(everything)
         skipped = 0 if args.all_members else len(everything) - len(teams)
     worst, seen = 0, set()
+    blocks = []
     for team in teams:
         verdict, lines, remedies = diagnose_team(team, deep=bool(target))
         seen.add(verdict)
+        # A remedy is a command plus an explanation of what it does. The
+        # command carries the team name and so differs per block; the
+        # explanation does not. Blanking the name gives the shape two blocks
+        # needing the same act share. Whole token only: a team name that is a
+        # prefix of a longer one must not blank half of the longer one.
+        shaped = [(what, cost, re.sub(rf"(?<![\w-]){re.escape(team)}(?![\w-])",
+                                      "<team>", what))
+                  for what, cost in remedies]
+        blocks.append((team, verdict, lines, shaped))
+        if verdict == "SEVERED":
+            worst = 1
+    # Nine teams needing the same act printed that act's explanation nine
+    # times, differing only by a name the block heading already carried. The
+    # command stays in the block, because it is what a reader copies and it
+    # differs; the explanation is stated once below, with the legend. Only
+    # what actually repeats moves: an act one block asks for keeps its
+    # parenthetical where it stands. A named team is a single block, so
+    # nothing in it can repeat and it still explains itself in full.
+    by_shape = collections.defaultdict(set)
+    for team, _verdict, _lines, shaped in blocks:
+        for _what, cost, shape in shaped:
+            by_shape[(shape, cost)].add(team)
+    shared = {pair for pair, wanting in by_shape.items() if len(wanting) > 1}
+    for team, verdict, lines, shaped in blocks:
         print("\n" + f"{verdict:<11} {team}".replace(
             verdict, tint(verdict, VERDICT_SGR.get(verdict)), 1))
         for line in lines:
             print(fill(f"  {line}"))
-        for what, cost in remedies:
-            print(fill(f"  remedy   {what}  ({cost})"))
-        if verdict == "SEVERED":
-            worst = 1
+        for what, cost, shape in shaped:
+            print(fill(f"  remedy   {what}" if (shape, cost) in shared
+                       else f"  remedy   {what}  ({cost})"))
     if skipped:
         print(fill(f"\n{skipped} team(s) with nothing live and no waiting mail "
                    f"were not examined; --all covers them"))
@@ -6903,6 +6927,13 @@ def run_doctor(args, selector=None):
             if name in seen:
                 print(fill(f"  {name:<11} {meaning}").replace(
                     name, tint(name, VERDICT_SGR.get(name)), 1))
+    if shared:
+        # The half the blocks above left out, beside the other legend, with
+        # <team> where each block prints its own name.
+        column = max(len(shape) for shape, _cost in shared)
+        print("\nremedies")
+        for shape, cost in sorted(shared):
+            print(fill(f"  {shape:<{column}}  {cost}"))
     return worst
 
 
@@ -12023,6 +12054,47 @@ def run_selftest(live=False, failed_only=False, list_only=False):
                 if ln[:1].isalpha() and ln.split()[:1] and ln.split()[0].isupper()]
     check("doctor-target-honoured", "a named team is the only one examined", len(verdicts) == 1,
           f"{len(verdicts)} verdict(s) for session-corpus-alpha")
+
+    # A remedy's explanation is the same sentence for every team needing the
+    # same act, and the sweep printed one copy per team. Driven both ways over
+    # the corpus, because the rule is about repetition and a single-team report
+    # has none to remove, so only the pair of runs says anything. The wanted
+    # pairs come from diagnose_team over the same teams the sweep covers, so
+    # the assertion is against what the engine actually offered rather than
+    # against a sentence written down here.
+    flat = lambda text: " ".join(text.split())
+    doctor_team = "session-corpus-alpha"
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = eng = corpus_engine()
+    eng.session_registry = lambda: []
+    eng.ps_table = lambda refresh=False: []
+    try:
+        wanted = collections.defaultdict(set)
+        for team in sorted(eng.known_teams()):
+            for _what, cost in diagnose_team(team)[2]:
+                wanted[cost].add(team)
+        with contextlib.redirect_stdout(io.StringIO()) as swept_doc:
+            run_doctor(_Args(team=None, agent_id=None, all_members=True))
+        with contextlib.redirect_stdout(io.StringIO()) as named_doc:
+            run_doctor(_Args(team=None, agent_id=None, all_members=False),
+                       selector=doctor_team)
+    finally:
+        globals()["RESOLVER"] = real_resolver
+    swept_flat, named_flat = flat(swept_doc.getvalue()), flat(named_doc.getvalue())
+    twice = sorted(c for c in wanted if swept_flat.count(flat(c)) != 1)
+    shared_remedy = {
+        # Without this the rule passes over a fixture where nothing repeats,
+        # which is the one case it is not about.
+        "the fixture repeats the named team's act": any(
+            len(who) > 1 and doctor_team in who for who in wanted.values()),
+        "the sweep says each explanation once": not twice,
+        "a named team still explains itself in full": any(
+            f"({flat(cost)})" in named_flat
+            for cost, who in wanted.items() if doctor_team in who),
+    }
+    wrong = sorted(k for k, ok in shared_remedy.items() if not ok)
+    check("sweep-shared-remedy-once", "the sweep states a shared remedy explanation once",
+          not wrong, ", ".join(wrong) + (f"; repeated: {twice}" if twice else ""))
 
     # A verdict names what an operator must act on. Pruned members are the trace
     # of finished work and an unrecorded one is fixed by running it, so neither
