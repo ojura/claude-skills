@@ -2798,6 +2798,23 @@ class Resolver:
                 entries.append(data)
         return entries
 
+    def configured_teammate_mode(self):
+        """Which teammate backend ~/.claude/settings.json asks for, or None.
+
+        The whole of the settings realm this tool reads. None covers both a
+        file that says nothing and a file that cannot be read: neither is a
+        substrate anybody has to be warned about, and a caller that had to
+        tell them apart would be deciding from the settings file rather than
+        from an answer about it.
+
+        Writing the file is a different matter and stays outside: install_hook
+        reads it, adds a hook and writes it back under its own rules.
+        """
+        try:
+            return json.loads((CLAUDE_DIR / "settings.json").read_text()).get("teammateMode")
+        except (OSError, ValueError):
+            return None
+
     def _socket_from_pane_pid(self, pid, table):
         """A pane process's parent is the tmux server; its cmdline carries -L <socket>."""
         parents = {p: pp for p, pp, _ in table}
@@ -5255,10 +5272,7 @@ def explain(ctx):
 def check_substrate():
     """SKILL.md says substrate choice is not ours to make, and this tool only
     implements the tmux one. Say so rather than silently imposing panes."""
-    try:
-        mode = json.loads((CLAUDE_DIR / "settings.json").read_text()).get("teammateMode")
-    except (OSError, ValueError):
-        return
+    mode = RESOLVER.configured_teammate_mode()
     if mode and mode not in ("tmux", "auto"):
         warn(f"teammateMode is {mode!r}, but this tool only revives into tmux panes")
 
@@ -8149,6 +8163,24 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         for hit in team_dir_reads(node))
     check("team-dir-read-engine-only", "a team directory is read only inside the engine",
           not team_peekers, "; ".join(team_peekers))
+
+    # ~/.claude/settings.json says which teammate substrate the harness is
+    # configured for, and this tool serves only one of them. The engine reads
+    # it; a second reader would be a second opinion about what the operator
+    # asked for. Barred by the file's name and by the key's, so a rogue reader
+    # has to avoid saying either. install_hook is the installer's
+    # read-modify-write, which adds a hook and puts the file back rather than
+    # concluding anything from it, and hands the path it opened to
+    # write_settings.
+    settings_names = {"settings.json", "teammateMode"}
+    settings_readers = sorted(
+        f"{node.name} names {sub.value!r} at line {sub.lineno}"
+        for node in tree.body if isinstance(node, ast.FunctionDef)
+        and node.name not in {"install_hook", "run_selftest"}
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Constant) and sub.value in settings_names)
+    check("settings-read-engine-only", "the settings file is read only inside the engine",
+          not settings_readers, "; ".join(settings_readers))
 
     # Wrapping serves the reader; the reader is not owed less. Every physical
     # line fits the width, and the reflowed text says word for word what the
