@@ -1883,40 +1883,90 @@ class Resolver:
             ledger.append(entry)
         return ledger
 
+    @staticmethod
+    def _objector_said(row):
+        """One objector's whole case as one sentence.
+
+        "pid N wears it" is kept contiguous. A rebind's refusal is asserted on
+        that phrase, and it is also the phrase a reader greps for, so the merge
+        adds clauses after it rather than rearranging around it. Our own
+        process keeps its own opening while it only holds something; once it
+        also wears the team the pid leads and the note follows.
+        """
+        parts = []
+        if "wears" in row["kinds"]:
+            parts.append(f"wears it ({row['worn']})")
+        if "operates" in row["kinds"]:
+            parts.append("operates as it (restored)")
+        if row["holds"]:
+            names = sorted(set(row["holds"]))
+            parts.append(f"holds {names[0]}'s transcript" if len(names) == 1
+                         else f"holds the transcripts of {some_of(names)}")
+        running = row["kinds"] & {"wears", "operates"}
+        who = f"this process (pid {row['pid']})" if row["ours"] and not running \
+            else f"pid {row['pid']}"
+        tail = "; that pid is this process" if row["ours"] and running else ""
+        return f"{who} {' and '.join(parts)}{tail}"
+
     def reap_objections(self, team, table, archive_mail=False):
-        """Why this team must not be reaped for a rebind, or [].
+        """Why this team must not be reaped for a rebind, as one row per objector.
 
         The cleanup bar, asked before a rebind may retire the stamped team:
         nobody live runs as it (worn argv, a holder of any transcript stamped
         with it, or a restored life operating as it), and no mail waits
         unless the caller archives it. Moving a member out of a live team by
         deleting the team is a beheading with extra steps.
+
+        A row is {"pid", "kinds", "said"}: which process it is about (None for
+        mail), which of wears/operates/holds/mail it raises, and the sentence
+        for it. One process is one row however many ways it objects, because
+        the argv walk and the transcript walk each used to emit their own
+        line, and a reader counting the processes to stop counted one twice.
+        Typed rows rather than sentences because the caller groups by remedy,
+        and grouping by which words a sentence happens to contain is how a
+        merged sentence lands in the wrong group.
         """
-        out = []
+        procs = {}
+
+        def process_row(pid):
+            return procs.setdefault(pid, {"pid": pid, "kinds": set(), "worn": None,
+                                          "holds": [], "ours": False})
+
         for entry in self.live_sessions():
             if not entry.get("alive"):
                 continue
             if entry.get("team") == team:
-                out.append(f"pid {entry['pid']} wears it "
-                           f"({entry.get('agent') or 'in argv'})")
+                row = process_row(entry["pid"])
+                row["kinds"].add("wears")
+                row["worn"] = entry.get("agent") or "in argv"
             elif entry.get("session"):
                 lived = self.transcript_path(entry["session"])
                 if lived and self.restored_identity(lived) == (team, "restored"):
-                    out.append(f"pid {entry['pid']} operates as it (restored)")
+                    process_row(entry["pid"])["kinds"].add("operates")
         for path, (name, stamped) in self.stamp_index().items():
             if stamped != team:
                 continue
             strangers, ours = self.transcript_holders(path.stem, table)
             for pid, _t in strangers:
-                out.append(f"pid {pid} holds {name}'s transcript")
+                row = process_row(pid)
+                row["kinds"].add("holds")
+                row["holds"].append(name)
             for pid in ours:
-                out.append(f"this process (pid {pid}) holds {name}'s transcript")
+                row = process_row(pid)
+                row["kinds"].add("holds")
+                row["holds"].append(name)
+                row["ours"] = True
+        out = [{"pid": row["pid"], "kinds": frozenset(row["kinds"]),
+                "said": self._objector_said(row)} for row in procs.values()]
         if not archive_mail:
             for name, (count, oldest) in self.inbox_state(team).items():
                 if count is None:
-                    out.append(f"{name}'s inbox is {oldest}")
+                    out.append({"pid": None, "kinds": frozenset({"mail"}),
+                                "said": f"{name}'s inbox is {oldest}"})
                 elif count:
-                    out.append(f"{count} unread for {name}, oldest {said_when(oldest)}")
+                    out.append({"pid": None, "kinds": frozenset({"mail"}),
+                                "said": f"{count} unread for {name}, "
+                                        f"oldest {said_when(oldest)}"})
         return out
 
     def nameless_receipts(self):
@@ -6930,37 +6980,45 @@ def apply_restamp(plan):
 
 
 def reap_blockers(stamped, args, table=None):
-    """Why this team cannot be retired: one line per objection, each class
-    closed by its way out. Read-only, so a caller can know it is blocked
-    before it asks anyone anything - the reason a redirect presents one
-    decision and not three.
+    """Why this team cannot be retired: one line per objection, under a heading
+    that says what the group is and how to get past it. Read-only, so a caller
+    can know it is blocked before it asks anyone anything - the reason a
+    redirect presents one decision and not three.
 
-    The lines are shaped for warn/die: bullets under the caller's opening
-    sentence, so ten objections read as a list rather than a wall, and a
-    bounded list says how much it left out.
+    The lines are shaped for warn/die: a heading, then its bullets, so ten
+    objections read as a list rather than a wall, and a bounded list says how
+    much it left out. The way out used to sit under the last bullet of its
+    group, where it read as a note about that one bullet instead of about the
+    whole group.
+
+    A process that both wears the team and holds a transcript stamped with it
+    arrives as one row and is listed once, in the group whose remedy it needs:
+    holding is the strict one, since --force cannot rewrite a file under a
+    live writer.
     """
     table = RESOLVER.ps_table() if table is None else table
-    objections = RESOLVER.reap_objections(stamped, table,
-                                          archive_mail=args.with_mail)
-    held = [o for o in objections if "holds" in o]
-    alive = [o for o in objections if o not in held
-             and ("wears" in o or "operates" in o)]
-    mail = [o for o in objections if o not in held and o not in alive]
+    rows = RESOLVER.reap_objections(stamped, table, archive_mail=args.with_mail)
+    held = [r for r in rows if "holds" in r["kinds"]]
+    alive = [r for r in rows if "holds" not in r["kinds"]
+             and r["kinds"] & {"wears", "operates"}]
+    mail = [r for r in rows if "mail" in r["kinds"]]
     lines = []
 
-    def blocker(items, escape):
-        lines.extend(f"- {item}" for item in items[:4])
-        if len(items) > 4:
-            lines.append(f"- and {len(items) - 4} more like these")
-        lines.append(f"  ({escape})")
+    def blocker(group, heading):
+        lines.append(heading)
+        lines.extend(f"- {r['said']}" for r in group[:4])
+        if len(group) > 4:
+            lines.append(f"- and {len(group) - 4} more like these")
 
     if mail:
-        blocker(mail, "--with-mail archives it into the receipt")
+        blocker(mail, "mail is waiting, and --with-mail archives it into the receipt:")
     if alive and not args.force:
-        blocker(alive, "--force instead rewrites the team this conversation "
-                       "comes back as: two fields, receipted, reversible")
+        blocker(alive, "a live process runs as it, and --force instead rewrites the "
+                       "team this conversation comes back as: two fields, receipted, "
+                       "reversible:")
     if held:
-        blocker(held, "stop it first; nothing forces this one")
+        blocker(held, "a live process holds a transcript stamped with it; "
+                      "stop it first, nothing forces this one:")
     return lines
 
 
@@ -8824,34 +8882,105 @@ def run_selftest(live=False, failed_only=False, list_only=False):
           and all(l.endswith(" \\") for l in lines[:-1]),
           f"paste ok {shlex.split(rejoined) == argv_case}, record ok {rec_joined == record_case}")
 
-    # A refusal that blocks on several things says each on its own line under
-    # the caller's sentence, each class closed by its way out, and a bounded
-    # listing says how much it left out instead of dropping it silently.
+    # A refusal that blocks on several things says each on its own line, under
+    # a heading that says what the group is and how to get past it, and a
+    # bounded listing says how much it left out instead of dropping it
+    # silently. The way out sat under the group's last bullet before this,
+    # where it read as a parenthetical about that one bullet.
     class _Blocked:
         with_mail, force = False, False
+
+    def _row(said, *kinds, pid=None):
+        return {"pid": pid, "kinds": frozenset(kinds), "said": said}
+
     real_reap_obj = RESOLVER.reap_objections
     RESOLVER.reap_objections = lambda team, table, archive_mail=False: (
-        [f"{n} unread for member{n}, oldest 2026-08-06 15:33:30" for n in range(1, 7)]
-        + ["pid 4242 wears it (someone@somewhere)",
-           "pid 4243 holds team-lead's transcript"])
+        [_row(f"{n} unread for member{n}, oldest 2026-08-06 15:33:30", "mail")
+         for n in range(1, 7)]
+        + [_row("pid 4242 wears it (someone@somewhere)", "wears", pid=4242),
+           _row("pid 4243 holds team-lead's transcript", "holds", pid=4243),
+           # Both at once, so which group takes it is exercised here rather
+           # than left to whichever word its sentence happens to contain.
+           _row("pid 4244 wears it (both@somewhere) and holds both's transcript",
+                "wears", "holds", pid=4244)])
     try:
         blocked = reap_blockers("session-blocked", _Blocked(), table={})
     finally:
         RESOLVER.reap_objections = real_reap_obj
     bullets = [l for l in blocked if l.startswith("- ")]
-    ways_out = [l for l in blocked if l.startswith("  (")]
+    headings = [l for l in blocked if not l.startswith("- ")]
+    # The heading each bullet arrived under: the nearest line above it that is
+    # not itself a bullet, and None when nothing opened the group at all.
+    opened, opener = [], None
+    for line in blocked:
+        if line.startswith("- "):
+            opened.append(opener)
+        else:
+            opener = line
     itemized = {
         "one objection per bullet": bullets and not any("; " in l for l in bullets),
-        "every class keeps its way out": len(ways_out) == 3
-            and any("--with-mail" in l for l in ways_out)
-            and any("--force" in l for l in ways_out)
-            and any("stop it first" in l for l in ways_out),
+        "every class keeps its way out": len(headings) == 3
+            and any("--with-mail" in l for l in headings)
+            and any("--force" in l for l in headings)
+            and any("stop it first" in l for l in headings),
+        "the way out is above its group": all(opened)
+            and all("--with-mail" in (h or "") for h in opened[:5])
+            and "--force" in (opened[5] or ""),
+        # Holding is the strict remedy: --force rewrites a file in place, and
+        # it cannot do that under a live writer. A process doing both belongs
+        # where stopping it is what is asked for.
+        "a process doing both is asked for the strict remedy": any(
+            "4244" in bullet and "stop it first" in (heading or "")
+            for bullet, heading in zip(bullets, opened)),
         "a bounded list says what it dropped": any("and 2 more" in l for l in bullets),
-        "nothing else rode along": len(blocked) == len(bullets) + len(ways_out),
+        "nothing else rode along": len(blocked) == len(bullets) + len(headings),
     }
     wrong = sorted(k for k, ok in itemized.items() if not ok)
-    check("blockers-listed-with-remedy", "blockers arrive one per line, each class with its way out", not wrong,
-          ", ".join(wrong))
+    check("blockers-listed-with-remedy", "blockers arrive one per line, each group under its way out",
+          not wrong, ", ".join(wrong))
+
+    # A process objecting two ways is one process. The argv walk and the
+    # transcript walk each used to emit a line for it, so a refusal listed one
+    # pid twice and a reader counting what to stop counted it twice too.
+    real_live2, real_stamps2 = RESOLVER.live_sessions, RESOLVER.stamp_index
+    real_holders2, real_inboxes2 = RESOLVER.transcript_holders, RESOLVER.inbox_state
+    real_restored = RESOLVER.restored_identity
+    RESOLVER.live_sessions = lambda: [
+        {"pid": 4242, "alive": True, "team": "session-doubled",
+         "agent": "audit@session-doubled", "session": "SEEN"},
+        {"pid": 4250, "alive": True, "team": "session-doubled",
+         "agent": "other@session-doubled", "session": "ELSE"}]
+    RESOLVER.stamp_index = lambda: {Path("/nowhere/SEEN.jsonl"): ("audit", "session-doubled"),
+                                    Path("/nowhere/OTHER.jsonl"): ("scribe", "session-doubled")}
+    RESOLVER.transcript_holders = lambda stem, table: (
+        ([(4242, "x")], []) if stem == "SEEN" else ([], [4243]))
+    RESOLVER.inbox_state = lambda team: {}
+    RESOLVER.restored_identity = lambda path: (None, None)
+    try:
+        doubled = RESOLVER.reap_objections("session-doubled", [])
+        with_dupes = reap_blockers("session-doubled", _Blocked(), table=[])
+    finally:
+        RESOLVER.live_sessions, RESOLVER.stamp_index = real_live2, real_stamps2
+        RESOLVER.transcript_holders, RESOLVER.inbox_state = real_holders2, real_inboxes2
+        RESOLVER.restored_identity = real_restored
+    printed = [l for l in with_dupes if l.startswith("- ")]
+    once = {
+        "one row per process": sorted(r["pid"] for r in doubled) == [4242, 4243, 4250],
+        "the double objector says both facts": any(
+            "wears it" in r["said"] and "holds" in r["said"] for r in doubled),
+        "a pid is bulleted once": all(
+            sum(f"pid {pid}" in l for l in printed) == 1 for pid in (4242, 4243, 4250)),
+        "no bullet is left over": len(printed) == 3,
+        # The phrase a rebind's refusal is asserted on, and the one a reader
+        # greps for, so the merge extends it rather than rearranging it.
+        "the worn phrase survives the merge": any(
+            "pid 4242 wears it" in r["said"] for r in doubled),
+        "our own process keeps its own opening": any(
+            r["said"].startswith("this process (pid 4243)") for r in doubled),
+    }
+    wrong = sorted(k for k, ok in once.items() if not ok)
+    check("refusal-names-a-pid-once", "a refusal names each process once, with all it objects",
+          not wrong, ", ".join(wrong))
 
     # The inbox files store ISO instants; every report and refusal prints the
     # ledger's local wall time, so a reader never converts timezones by eye.
@@ -8861,7 +8990,8 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     RESOLVER.live_sessions = lambda: []
     RESOLVER.stamp_index = lambda: {}
     try:
-        told = RESOLVER.reap_objections("session-clock", [], archive_mail=False)
+        told = [r["said"] for r in
+                RESOLVER.reap_objections("session-clock", [], archive_mail=False)]
     finally:
         RESOLVER.inbox_state = real_inboxes
         RESOLVER.live_sessions, RESOLVER.stamp_index = real_live, real_stamps
@@ -11117,7 +11247,9 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             if not (took and "reap" in out.getvalue()):
                 stray.append("an unobjected team was not reaped for the redirect")
             RESOLVER.reap_objections = lambda *a, **k: [
-                "3 unread for m, oldest x", "pid 9 wears it"]
+                {"pid": None, "kinds": frozenset({"mail"}),
+                 "said": "3 unread for m, oldest x"},
+                {"pid": 9, "kinds": frozenset({"wears"}), "said": "pid 9 wears it"}]
             told = io.StringIO()
             with contextlib.redirect_stderr(told), contextlib.redirect_stdout(io.StringIO()):
                 took = rebind_reap("OLD", "NEW", _Quiet, path=target, fatal=False)
@@ -11150,10 +11282,10 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         me = os.getpid()
         alive_table = [(me, 0, "claude --resume MATE-A --agent-id mate@TEAMA")]
         gates = []
-        said = eng6.reap_objections("TEAMA", alive_table)
+        said = [r["said"] for r in eng6.reap_objections("TEAMA", alive_table)]
         if not any("holds mate's transcript" in o for o in said):
             gates.append("a live holder of a stamped transcript did not object")
-        said = eng6.reap_objections("TEAMA", [])
+        said = [r["said"] for r in eng6.reap_objections("TEAMA", [])]
         if not any("unread for mate" in o for o in said):
             gates.append("unread mail did not object")
         if eng6.reap_objections("TEAMA", [], archive_mail=True):
