@@ -11875,22 +11875,120 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         check("writers-move-receipt-back", "the writers move, and the receipt is the way back", not moved,
               ", ".join(moved))
 
-    # --- a demote cannot embed the conversation it runs inside. The holder
-    # gate excludes our own lineage by design, so the invoking agent is the
-    # one holder it cannot see; self-hold is asked first for exactly that.
-    me = os.getpid()
-    fake_table = [(me, 0, "claude --resume FAKE-LINEAGE-UUID --agent-id x@t")]
-    blind = []
-    strangers, ours = RESOLVER.transcript_holders("FAKE-LINEAGE-UUID", fake_table)
-    if ours != [me]:
-        blind.append("the composed question does not see the invoking lineage")
-    if strangers:
-        blind.append("the composed question counts our own lineage as a stranger")
-    demote_src = ast.get_source_segment(source, funcs["run_demote"]) or ""
-    if "RESOLVER.transcript_holders(" not in demote_src:
-        blind.append("the demote gate does not ask the composed question")
-    check("demote-cannot-embed-self", "a demote cannot embed the conversation it runs inside", not blind,
-          ", ".join(blind))
+    # --- a demote cannot embed the conversation it runs inside, and will not
+    # embed one another live process is writing. The holder gate excludes our
+    # own lineage by design, so the invoking agent is the one holder it cannot
+    # see; self-hold is asked first for exactly that, and takes no --force.
+    #
+    # Both refusals are driven through run_demote against a fake process
+    # table. Reading the source for the holder question was the older test,
+    # and it only proved the verb asks: deleting either refusal left the
+    # question in place, so the suite stayed green while a demote embedded a
+    # file two writers had open.
+    with tempfile.TemporaryDirectory() as td:
+        proj = Path(td) / "proj"
+        proj.mkdir(parents=True)
+        compact = lambda d: json.dumps(d, separators=(",", ":"))
+        # A teammate that really does demote, so the arms where nothing stops
+        # it show the demote going through rather than meeting some later
+        # refusal that would make a broken gate look the same as a working one.
+        (proj / "MATEHELD.jsonl").write_text(
+            compact({"parentUuid": None, "sessionId": "MATEHELD", "agentName": "heldy",
+                     "teamName": "TEAMH", "type": "user", "uuid": "mh-root"}) + "\n" +
+            compact({"type": "last-prompt", "lastPrompt": "hi", "leafUuid": "mh-root",
+                     "sessionId": "MATEHELD"}) + "\n" +
+            compact({"parentUuid": "mh-root", "sessionId": "MATEHELD", "agentName": "heldy",
+                     "teamName": "TEAMH", "type": "assistant", "uuid": "mh-2"}) + "\n" +
+            compact({"type": "last-prompt", "lastPrompt": "again", "leafUuid": "mh-2",
+                     "sessionId": "MATEHELD"}) + "\n")
+
+        class _HeldArgs:
+            demote, force, with_mail = "MATEHELD", False, False
+            into, dry_run = "PARENT", True
+
+        class _ForcedArgs(_HeldArgs):
+            force = True
+
+        me = os.getpid()
+        holder = "claude --resume MATEHELD --agent-id heldy@TEAMH"
+        # One pid up from ours is a stranger by construction: the lineage walk
+        # starts at our own pid and follows this table's parents, and this
+        # table has no way to reach ours.
+        ours, stranger = [(me, 0, holder)], [(me + 1, 1, holder)]
+
+        def demoted(args, table):
+            """Everything this demote said, refusal or plan, on one line.
+
+            Both streams, because the two outcomes under test are told on
+            different ones: a refusal is die() to stderr, and a demote that
+            nothing stops names its destination on stdout. A demote that
+            stopped refusing returns rather than exiting, so the arms read
+            what it said instead of the suite ending on it. dry_run
+            throughout: the arms that get past both gates plan and print,
+            and nothing here writes.
+            """
+            real_ps = RESOLVER.ps_table
+            RESOLVER.ps_table = lambda: table
+            said, printed = io.StringIO(), io.StringIO()
+            try:
+                with contextlib.redirect_stderr(said), \
+                        contextlib.redirect_stdout(printed):
+                    try:
+                        run_demote(args)
+                    except SystemExit:
+                        pass
+            finally:
+                RESOLVER.ps_table = real_ps
+            return " ".join((said.getvalue() + " " + printed.getvalue()).split())
+
+        real_projects, real_teams = RESOLVER.projects_dir, RESOLVER.teams_dir
+        real_receipts = RECEIPTS_DIR
+        RESOLVER.projects_dir, RESOLVER.teams_dir = Path(td), Path(td) / "teams"
+        globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
+        try:
+            inside = demoted(_HeldArgs, ours)
+            inside_forced = demoted(_ForcedArgs, ours)
+            outside = demoted(_HeldArgs, stranger)
+            outside_forced = demoted(_ForcedArgs, stranger)
+            unheld = demoted(_HeldArgs, [])
+        finally:
+            RESOLVER.projects_dir, RESOLVER.teams_dir = real_projects, real_teams
+            globals()["RECEIPTS_DIR"] = real_receipts
+
+        # What the same demote says when nothing holds the file: the control
+        # both refusals need, since a refusal that fires whatever the process
+        # table says is not answering the holder question.
+        went_through = "demote MATEHELD ->"
+
+        blind = []
+        mine = f"you are demoting the transcript you are running (pid {me})"
+        if mine not in inside:
+            blind.append(f"a demote of our own conversation said: {inside or 'nothing'}")
+        if mine not in inside_forced:
+            blind.append(f"--force got past it: {inside_forced or 'nothing'}")
+        if went_through not in unheld:
+            blind.append(f"the same demote unheld did not go through: {unheld or 'nothing'}")
+        # The half the drive cannot see: self-hold is answered first, so a
+        # lineage that also counted as a stranger would still refuse here.
+        # The reap reads that half, and nothing else asserts the exclusion.
+        strangers, _ = RESOLVER.transcript_holders("MATEHELD", ours)
+        if strangers:
+            blind.append("the composed question counts our own lineage as a stranger")
+        check("demote-cannot-embed-self", "a demote cannot embed the conversation it runs inside", not blind,
+              ", ".join(blind))
+
+        holding = []
+        theirs = f"pid {me + 1} holds this transcript"
+        if theirs not in outside:
+            holding.append(f"a demote under a live holder said: {outside or 'nothing'}")
+        if went_through not in outside_forced:
+            holding.append(f"--force did not override the holder refusal: "
+                           f"{outside_forced or 'nothing'}")
+        if went_through not in unheld:
+            holding.append(f"the same demote unheld did not go through: {unheld or 'nothing'}")
+        check("demote-refuses-a-live-holder",
+              "a demote refuses a transcript a live stranger holds, unless forced",
+              not holding, ", ".join(holding))
 
     # Who holds a transcript is ONE question. Two consumers in one day
     # consulted half of it, the second within hours of the first fix, so the
