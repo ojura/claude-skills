@@ -175,7 +175,6 @@ _agent-resume() {
     '--into[the parent session a demoted transcript embeds under]:session:{_agent_resume_topic sessions session}' \
     '--no-launch[promote writes files and prints the launch line instead of launching]' \
     '--with-mail[archive unread inbox mail into the receipt instead of refusing]' \
-    '--cut[promote an unclassifiable side transcript as the chain from this record]:uuid:' \
     '--stop[stop the agent, session or team instead of resuming it]' \
     '--yes[do not ask before stopping]' \
     '--all[with a team, also resume members the roster no longer lists]' \
