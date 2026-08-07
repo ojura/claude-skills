@@ -204,6 +204,33 @@ their saved transcripts. `CLAUDE_DISABLE_ADOPT=1` turns all of it off.
 Teammates are not in adopt's inventory, which is the missing piece that would
 make team resume a real feature instead of this skill.
 
+## The engine owns the environment
+
+The environment this tool reasons about is five realms:
+
+- transcripts, both main sessions and the side transcripts under `subagents/`
+- team configs
+- claude sessions
+- running processes
+- tmux servers, sessions and panes
+
+Only the engine may examine a realm and draw a conclusion from what it finds.
+Everything else asks the engine a question and consumes the answer.
+
+The rule is about reading and concluding, not about acting. A launch runs
+`tmux split-window`, a reap removes a directory, a stop signals a pid: none of
+those is an examination. What may not happen outside the engine is looking at a
+realm and deciding from it what is true, because then two places answer the same
+question and they drift apart. That drift is most of this file's bug list: a
+report that judged mail from the inbox file while the ledger judged it from the
+transcripts, a liveness gate that could not see its own caller, a redirect aimed
+by a timing coincidence while the stamps said otherwise.
+
+Enforcement is per realm and incomplete. Transcripts and sessions are law, held
+by `transcript-pick-engine-only`, `tree-reached-via-engine` and their siblings.
+Team configs, processes and tmux are not yet, and the largest single offender is
+`cruft_reason`, which reads a team directory and decides what it is.
+
 ## Method
 
 Carried out of this file's construction rather than designed up front.
