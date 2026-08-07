@@ -5161,6 +5161,10 @@ def report_launch(ctx, command, prefix="", role="agent", agent_id=None, extra=()
             said += f"; the harness still brings it back as {stamped}, from its own stamps"
         print(fill(f"{prefix}identity {said}"))
     print(wrap_command(command, f"{prefix}command  ", f"{prefix}{'':11}", paste=True))
+    # The facts end here and the doing starts. Without the gap the two run
+    # together as one wall, and the report is long enough that a reader needs
+    # to be told where to stop reading facts.
+    print()
 
 
 def run_one(args, passthrough, table, prefix="", pending=()):
@@ -5443,7 +5447,11 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         # that did launch.
         warn(f"{prefix}{build_command_agent_id(ctx)} did not launch: {exc}")
         return Outcome("failed", socket, False, None)
-    print(f"{prefix}{'would run' if args.dry_run else 'running'} in pane {pane or '<new>'} ({action})")
+    # At the steps' indent, not flush left: this is one of the things the launch
+    # did, and a launch that alternates between two margins reads as two
+    # interleaved reports rather than one sequence.
+    print(fill(f"{prefix}  {'would run' if args.dry_run else 'running'} in pane "
+               f"{pane or '<new>'} ({action})"))
     if not args.no_tint:
         tint_pane(socket, pane, RESOLVER.field(ctx, "color"), RESOLVER.field(ctx, "agentName"), args.dry_run)
 
@@ -7790,6 +7798,10 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         "every line fits the terminal": all(len(l) <= 80 for l in report_lines),
         "the command strips back to its argv":
             cmd_at is not None and shlex.split(cmd_back) == report_argv,
+        # Facts above, doing below. Without the gap the two blocks read as one
+        # wall of text, which is the whole complaint the shape answers.
+        "the block closes with a blank line before the doing":
+            len(report_lines) > 1 and report_lines[-1] == "",
     }
     wrong = sorted(k for k, ok in reported.items() if not ok)
     check("launch-report-fits-exact", "the launch report fits the terminal and keeps its command exact",
