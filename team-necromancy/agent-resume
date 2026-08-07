@@ -3948,6 +3948,36 @@ class Resolver:
                 return key
         return None
 
+    def _demote_parent_objection(self, source, carried, had_stored):
+        """Why this demote could not default its parent, and what could serve.
+
+        "demote needs the parent session (--into)" was the whole refusal, which
+        left the reader to guess whether the tool had looked anywhere. Two
+        halves are said instead: which record was missing or silent, and
+        whether anything on disk offers a candidate. The spawn corpus is
+        walked only here, on the way out, and only when the transcript carries
+        stamps to look an agent up by.
+        """
+        if carried is not None:
+            why = "the promote record it carries names no parent session"
+        elif had_stored:
+            why = "the receipt stored for it names no parent session"
+        else:
+            why = ("it carries no promote record and no receipt was stored for "
+                   "it, so nothing on disk says where it came from")
+        name, team = self.stamp_index().get(Path(source)) or (None, None)
+        if not (name and team):
+            return (f"demote needs the parent session (--into): {why}, and it "
+                    "carries no agent stamps to look a spawn payload up by")
+        agent_id = f"{name}@{team}"
+        parent, _how = self.spawn_parent_of(agent_id)
+        if parent:
+            return (f"demote needs the parent session (--into): {why}. The spawn "
+                    f"payload naming {agent_id} is in {parent}, so that is the "
+                    "likely --into")
+        return (f"demote needs the parent session (--into): {why}, and no spawn "
+                f"payload names {agent_id}")
+
     def conversion_plan(self, source, direction, into=None, dest=None, stored=None,
                         identity=None):
         """The full plan for one conversion, proved before anyone acts on it.
@@ -3994,6 +4024,10 @@ class Resolver:
             # before transcripts carried their own.
             carried = self.carried_receipt(raws)
             stored = dict(stored or {})
+            # Whether a receipt was stored at all, kept before the merge below
+            # empties it of receipt keys: it is half of why a parent could not
+            # be defaulted, and the refusal has to say which half.
+            had_stored = bool(stored)
             if carried is not None:
                 # The file's own record is the whole truth about these fields,
                 # not a set of defaults to fill gaps in. A stored receipt can
@@ -4032,8 +4066,8 @@ class Resolver:
                         f"{from_session}, which no longer carries {anchor}; moving "
                         f"it would leave that prefix unresolvable"], "proved": False}
             if not into:
-                return {"objections": ["demote needs the parent session (--into)"],
-                        "proved": False}
+                return {"objections": [self._demote_parent_objection(
+                    source, carried, had_stored)], "proved": False}
             receipt = {"grammar": stored.get("grammar", "rooted"), "parent": into,
                        "dest_stem": source.stem,
                        "task_id": dest or stored.get("task_id") or source.stem,
@@ -9073,6 +9107,70 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     }
     wrong = sorted(k for k, ok in tagged.items() if not ok)
     check("explain-tags-its-sources", "--explain names each source once and tags its rows",
+          not wrong, ", ".join(wrong))
+
+    # "demote needs the parent session (--into)" was the whole refusal, so a
+    # reader could not tell whether the tool had looked for one. It now says
+    # which record was missing or silent, and either names the candidate the
+    # spawn corpus offers or says there is none.
+    with tempfile.TemporaryDirectory() as td:
+        eng_demote = Resolver(needs=Needs(maybe=set(NEED)))
+        eng_demote.projects_dir = Path(td) / "projects"
+        eng_demote.teams_dir = Path(td) / "teams"
+        proj = eng_demote.projects_dir / "proj"
+        proj.mkdir(parents=True)
+        line = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def demote_fixture(stem, name, extra=()):
+            """A transcript stamped for `name`, plus whatever else it must carry."""
+            stamps = {"agentName": name, "teamName": "TEAMX"} if name else {}
+            (proj / f"{stem}.jsonl").write_text("\n".join(
+                [line({"parentUuid": None, "type": "user", "uuid": f"{stem}-root",
+                       "timestamp": "2026-01-01T00:00:01Z", **stamps}), *extra]) + "\n")
+            return proj / f"{stem}.jsonl"
+
+        spawned = demote_fixture("MATE", "mate")
+        lonely = demote_fixture("LONE", "lone")
+        unstamped = demote_fixture("PLAIN", None)
+        # A promoted file's own trailing record, carrying everything but a parent.
+        receipted = demote_fixture("CARRIED", "borne", extra=[line(
+            {"type": RECEIPT_RECORD, "receipt": {"grammar": "rooted", "root": "x"}})])
+        # The lead whose spawn payload names one of them.
+        (proj / "LEADER.jsonl").write_text(line(
+            {"parentUuid": None, "type": "assistant", "uuid": "lead-root",
+             "timestamp": "2026-01-01T00:00:00Z",
+             "message": {"content": [{"type": "tool_result", "content": [
+                 {"status": "teammate_spawned", "name": "mate",
+                  "team_name": "TEAMX", "agent_id": "mate@TEAMX"}]}]}}) + "\n")
+
+        def refused(path, stored=None):
+            return " ".join(eng_demote.conversion_plan(
+                path, "demote", into=None, stored=stored)["objections"][0].split())
+
+        with_payload = refused(spawned)
+        without = refused(lonely)
+        nameless = refused(unstamped)
+        borne = refused(receipted)
+        from_receipt = refused(lonely, stored={"grammar": "rooted", "root": "y"})
+        told_why = {
+            "every refusal still names the flag": all(
+                "--into" in said for said in (with_payload, without, nameless,
+                                              borne, from_receipt)),
+            "a candidate is named when one exists":
+                "LEADER" in with_payload and "mate@TEAMX" in with_payload,
+            "no candidate is said plainly":
+                "no spawn payload names lone@TEAMX" in without,
+            "an unstamped file says it cannot look":
+                "no agent stamps" in nameless,
+            "a carried record without a parent says so":
+                "the promote record it carries names no parent" in borne,
+            "a stored receipt without a parent says so":
+                "the receipt stored for it names no parent" in from_receipt,
+            "the five refusals read differently":
+                len({with_payload, without, nameless, borne, from_receipt}) == 5,
+        }
+    wrong = sorted(k for k, ok in told_why.items() if not ok)
+    check("demote-parent-refusal-says-why", "a demote with no parent says why it could not find one",
           not wrong, ", ".join(wrong))
 
     # The inbox files store ISO instants; every report and refusal prints the
