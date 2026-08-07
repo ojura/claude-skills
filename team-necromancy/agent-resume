@@ -7423,6 +7423,19 @@ def run_sides(selector=None):
     return 0
 
 
+def conformance(part, whole):
+    """A census row's `part` of `whole`: the ratio, or a quieter form when
+    everything counted conforms.
+
+    Most of these rows read n/n, and printing the ratio anyway makes the eye
+    compare two numbers on every line to find the one line worth stopping at.
+    "all n" leaves the slash to the rows that have something to say. Nothing
+    counted keeps the ratio, because "all 0" claims a conformance no member
+    demonstrated.
+    """
+    return f"all {whole}" if whole and part == whole else f"{part}/{whole}"
+
+
 def run_census():
     """Count what this machine's ~/.claude actually contains. Read-only.
 
@@ -7456,22 +7469,23 @@ def run_census():
     lead_agrees = sum(1 for _, data, _ in rosters_leads(rosters)
                       if data.get("leadAgentId") == f"team-lead@{data.get('name')}")
     print("identity")
-    print(f"  roster members whose id is name@team   {id_agrees}/{id_total}")
-    print(f"  rosters whose lead is team-lead@team   {lead_agrees}/{len(rosters)}")
+    print(f"  roster members whose id is name@team   {conformance(id_agrees, id_total)}")
+    print(f"  rosters whose lead is team-lead@team   {conformance(lead_agrees, len(rosters))}")
 
     payload_pairs = [(p.get("agent_id"), p.get("name"), p.get("team_name"))
                      for p in RESOLVER.spawn_payloads()]
     payload_ok = sum(1 for aid, name, team in payload_pairs
                      if aid and name and team and aid == f"{name}@{team}")
     payload_total = sum(1 for aid, name, team in payload_pairs if aid and name and team)
-    print(f"  spawn payloads whose id is name@team   {payload_ok}/{payload_total}")
+    print(f"  spawn payloads whose id is name@team   "
+          f"{conformance(payload_ok, payload_total)}")
 
     resolves = sum(1 for _, data, _ in rosters
                    if data.get("leadSessionId") and RESOLVER.transcript_path(data["leadSessionId"]))
     named = sum(1 for _, data, _ in rosters if data.get("leadSessionId"))
     print("\nleads")
-    print(f"  rosters naming a lead session          {named}/{len(rosters)}")
-    print(f"  ...whose session is a real transcript  {resolves}/{named}")
+    print(f"  rosters naming a lead session          {conformance(named, len(rosters))}")
+    print(f"  ...whose session is a real transcript  {conformance(resolves, named)}")
     print("  ...which is the shape resolved from the roster alone; the rest are")
     print("     found through the records of who spawned whom")
 
@@ -7498,7 +7512,10 @@ def run_census():
     print("\ntranscripts")
     print(f"  stamped with a name and a team         {both}")
     print(f"  stamped with a name and no team        {name_only}")
-    print("  ...either ran team-less or were launched with mismatched team flags")
+    if name_only:
+        # Only when there is something to explain. Under a zero this described
+        # a category the machine does not have.
+        print("  ...either ran team-less or were launched with mismatched team flags")
     return 0
 
 
@@ -11488,6 +11505,56 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         check("ledger-rows-read-as-a-table",
               "the ledger's rows are headed and cut at a word", not wrong,
               ", ".join(wrong))
+
+    # --- the census annotates only what a reader has to stop at
+    # A note saying what a category would mean, printed under a count of zero,
+    # explains something this machine does not have. Driven both ways over one
+    # engine with the stamps stubbed, because the rule is a conditional and one
+    # arm of it proves nothing about the other.
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = eng7 = corpus_engine()
+    stamped = {Path("teamed.jsonl"): ("alice", "session-corpus-alpha")}
+    census_told = {}
+    try:
+        for arm, stamps in (("zero", stamped),
+                            ("nonzero", {**stamped, Path("loose.jsonl"): ("bob", None)})):
+            eng7.stamp_index = lambda stamps=stamps: stamps
+            with contextlib.redirect_stdout(io.StringIO()) as census_out:
+                run_census()
+            census_told[arm] = census_out.getvalue()
+    finally:
+        globals()["RESOLVER"] = real_resolver
+    explains = "either ran team-less"
+    zero_note = {
+        "the zero count is still printed":
+            "stamped with a name and no team        0" in census_told["zero"],
+        "its explanation is not": explains not in census_told["zero"],
+        "a nonzero count is printed":
+            "stamped with a name and no team        1" in census_told["nonzero"],
+        "and keeps its explanation": explains in census_told["nonzero"],
+    }
+    wrong = sorted(k for k, ok in zero_note.items() if not ok)
+    check("census-zero-note-only-when-nonzero",
+          "the census explains a category only where it counted one", not wrong,
+          ", ".join(wrong))
+
+    # Almost every conformance row reads n/n, so printing the ratio anyway made
+    # the eye compare two numbers on every line to find the one line that had
+    # something to say. The helper is asserted directly and the rendered census
+    # is asserted to have used it.
+    ratios = {
+        "a conforming row loses the ratio": conformance(7, 7) == "all 7",
+        "a row that differs keeps it": conformance(6, 7) == "6/7",
+        # "all 0" claims a conformance no member demonstrated.
+        "nothing counted keeps the ratio": conformance(0, 0) == "0/0",
+        "no printed row states a number over itself": not any(
+            re.search(r"\b(\d+)/\1\b", line)
+            for line in census_told["nonzero"].splitlines()),
+    }
+    wrong = sorted(k for k, ok in ratios.items() if not ok)
+    check("census-marks-only-what-differs",
+          "the census annotates the rows whose two numbers differ", not wrong,
+          ", ".join(wrong))
 
     # --- the reports carry what the mailbox file cannot show
     sample = [
