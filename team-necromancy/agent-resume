@@ -4210,7 +4210,7 @@ def enforce_ctx(ctx, args):
     # than a contradiction to refuse. It is set only by the lead path, and only
     # once that path has been through the rebind step.
     enforce_identity(ctx["resolution"], ctx["objections"],
-                     allow_team_change=bool(args.to_team) or bool(ctx.get("lead_move")),
+                     allow_team_change=bool(args.to_team) or bool(ctx.get("lead_moving")),
                      force=args.force)
     enforce_restore(ctx, args)
 
@@ -4236,7 +4236,7 @@ def enforce_restore(ctx, args):
     # team the stamps name or rewrote them. Asking again here would re-refuse a
     # move this run has just made, and in a dry run, where neither has happened
     # yet, would refuse the preview of it. Nothing on the member path sets this.
-    if ctx.get("lead_move"):
+    if ctx.get("lead_moving"):
         return
     stamped, state = RESOLVER.restored_identity(path)
     if state != "restored":
@@ -5623,22 +5623,33 @@ def report_launch(ctx, command, prefix="", role="agent", agent_id=None, extra=()
     print()
 
 
-def lead_source_team(ctx, dest):
-    """The team a lead is moving off, or None when this launch is not a move.
+def lead_move(ctx, args, dest):
+    """(the team this lead is leaving, whether the launch takes the conversation
+    over) for a lead about to come up as dest.
 
-    Two shapes of lead, one question. A lead that was itself launched
-    flag-bound carries team stamps on its window-start, and restored_identity
-    reads them; a plain lead stamps nothing at all, and the only identity it
-    leaves on disk is the spawn payloads teams_led_by reads. Either way the
-    answer is a team this conversation was running as and dest is not, which
-    is what makes the crew it is leaving behind nameable.
+    Two shapes of lead, one question for the first half. A lead that was itself
+    launched flag-bound carries team stamps on its window-start, and
+    restored_identity reads them; a plain lead stamps nothing at all, and the
+    only identity it leaves on disk is the spawn payloads teams_led_by reads.
+    Either way the answer is a team this conversation was running as and dest is
+    not, which is what makes the crew it leaves behind nameable.
+
+    Taking over is the narrower half, and it is where the guards change. Asked
+    for by flag, or stamps that would otherwise win: those are the two launches
+    that are not the launch that would have happened anyway, so those are the
+    two that end whoever holds the conversation and retire what the stamps name.
+    An unstamped lead pointed at another team is the ordinary masquerade, whose
+    guards stay exactly as they were; the flags already win by themselves and
+    the report is all this adds.
     """
     path = getattr(ctx["resolution"], "path", None)
     if not path or not dest:
-        return None
+        return None, False
     stamped, state = RESOLVER.restored_identity(path)
     source = stamped if state else next(iter(RESOLVER.teams_led_by(path.stem)), None)
-    return source if source and source != dest else None
+    if not source or source == dest:
+        return None, False
+    return source, bool(args.to_team) or state == "restored"
 
 
 def lead_holders(ctx, table):
@@ -5704,8 +5715,11 @@ def crew_left_behind(source, dest, prefix=""):
         live = RESOLVER.wearers(f"{name}@{source}")
         said.append(f"{name} ({state}"
                     + (f", running as pid {live[0][0]}" if live else "") + ")")
-    lines = [f"crew     {len(said)} stay on {source}"
-             + (": " + ", ".join(said) if said else "")]
+    if said:
+        lines = [f"crew     {len(said)} {'stays' if len(said) == 1 else 'stay'} "
+                 f"on {source}: " + ", ".join(said)]
+    else:
+        lines = [f"crew     nobody else is on {source}"]
     for name, (count, oldest) in sorted(RESOLVER.inbox_state(source).items()):
         if count is None:
             lines.append(f"mail     {name}'s inbox is {oldest}; it stays where it is")
@@ -5732,7 +5746,7 @@ def lead_rebind(ctx, args, source, dest, prefix=""):
     no stamps needs neither - the flags already win - and only the crew report
     is left to do.
     """
-    ctx["lead_move"] = dest
+    ctx["lead_moving"] = dest
     path = getattr(ctx["resolution"], "path", None)
     stamped, state = RESOLVER.restored_identity(path) if path else (None, None)
     # Gathered before the reap, because the reap takes the roster and the
@@ -5787,7 +5801,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             # the lead session of the team it is leaving.
             ctx["to_lead"] = ctx["session_uuid"]
         dest = ctx.get("to_team") or RESOLVER.field(ctx, "teamName")
-        source = lead_source_team(ctx, dest)
+        source, taking_over = lead_move(ctx, args, dest)
         command = build_command(ctx, args, passthrough)
         # A lead is the socket's namesake - a swarm server is named after the
         # lead's pid, and members resolve theirs by asking who their lead is -
@@ -5816,7 +5830,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         # ended, which is the same exemption the member path takes on an
         # explicit --to-team and for the same reason; a kill that did not work
         # leaves it un-exempt and the guard stops the run.
-        cleared = bool(source) and lead_kill_gate(ctx, args, table, prefix)
+        cleared = taking_over and lead_kill_gate(ctx, args, table, prefix)
         # A lead is not exec'd onto a conversation someone is already running,
         # for the same reason a member is not spawned onto one.
         running = None if cleared else already_running(ctx, args, is_lead=True)
