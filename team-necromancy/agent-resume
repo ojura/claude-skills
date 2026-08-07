@@ -5642,7 +5642,13 @@ def report_launch(ctx, command, prefix="", role="agent", agent_id=None, extra=()
         # it; a team run's [name] headers already do this.
         print()
     print(f"{prefix}{role:<8} {agent_id or '(unknown)'}")
-    print(fill(f"{prefix}session  {ctx['session_uuid']}  ({ctx['transcript'][0]})"))
+    # The uuid alone, not the file it lives in. A transcript path is one token
+    # fill() cannot break, so it stayed whole and ran far past every other row
+    # here, and it only repeated the report: the file is named for the uuid on
+    # this row, in a projects directory named for the cwd a few rows below. A
+    # reader who wants the file by name has it from --explain, which says which
+    # transcript every resolved field was read out of.
+    print(f"{prefix}session  {ctx['session_uuid']}")
     print(f"{prefix}via      {ctx['via']}")
     if ctx.get("placed"):
         print(fill(f"{prefix}team     {ctx['placed'][0]}  ({ctx['placed'][1]})"))
@@ -8314,7 +8320,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             shutil.rmtree(base, ignore_errors=True)
 
     seen_at_spawn = []
-    started, started_entry, started_srv, _said = resume_run(
+    started, started_entry, started_srv, started_said = resume_run(
         "willow@session-corpus-alpha", listed=False, watch=seen_at_spawn.append)
     at_spawn = seen_at_spawn[0] if seen_at_spawn else None
 
@@ -8350,6 +8356,43 @@ def run_selftest(live=False, failed_only=False, list_only=False):
           "a bare resume starts the agent and joins no team",
           bare_status == "launched" and bare_entry is None,
           f"{bare_status}, entry {bare_entry}")
+
+    # The session row of the report the launch above printed. It says which
+    # conversation is coming back, and it used to print that conversation's
+    # file beside it: one token fill() cannot break, so it ran past every other
+    # row in the block at any width, saying only what the uuid on the row and
+    # the cwd row below it already say. The rows hanging under it are read too,
+    # because a path pushed off the row and wrapped underneath is the same long
+    # line. The transcript this run resolves lives under a mkdtemp directory,
+    # so it always has a path to print; the row not showing one is the report's
+    # doing, not the fixture's.
+    report = started_said.splitlines()
+    block_at = next((i for i, l in enumerate(report) if l.startswith("agent ")), None)
+    block = []
+    for line in report[block_at:] if block_at is not None else []:
+        if not line.strip():
+            break
+        block.append(line)
+    row_at = next((i for i, l in enumerate(block) if l.startswith("session ")), None)
+    row = []
+    for line in block[row_at:] if row_at is not None else []:
+        if row and not line.startswith(" "):
+            break
+        row.append(line)
+    resumed = re.search(r"--resume (\S+)", "\n".join(block))
+    stated = []
+    if row_at is None:
+        stated.append("the launch report printed no session row")
+    elif not resumed:
+        stated.append("the launch report printed no command resuming anything")
+    elif resumed.group(1) not in row[0]:
+        stated.append(f"the row does not name what the command resumes: {row[0].strip()!r}")
+    pathed = [l for l in row if "/" in l]
+    if pathed:
+        stated.append(f"a path is printed with it: {pathed[0].strip()[:70]!r}")
+    check("session-row-is-a-uuid-not-a-path",
+          "the session row names the conversation and prints no transcript path",
+          not stated, "; ".join(stated))
 
     # --- the lead move, driven end to end through run_one
     # Nothing below may end a real process: the arms that reach the kill either
