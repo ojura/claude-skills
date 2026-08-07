@@ -2815,6 +2815,91 @@ class Resolver:
         except (OSError, ValueError):
             return None
 
+    def socket_dir(self):
+        """Where tmux keeps its socket files. A path question, like roster_path."""
+        return Path(os.environ.get("TMUX_TMPDIR") or f"/tmp/tmux-{os.getuid()}")
+
+    def socket_alive(self, socket):
+        """Is a tmux server listening on this socket?
+
+        One test, everywhere. A connect() answers it in microseconds; asking
+        tmux costs a process spawn each time, and having two tests meant a
+        socket could be 'dead' to the reaper and 'live' to the launcher.
+        """
+        path = socket if isinstance(socket, Path) else self.socket_dir() / socket
+        probe = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+        probe.settimeout(0.2)
+        try:
+            probe.connect(str(path))
+            return True
+        except (ConnectionRefusedError, FileNotFoundError):
+            return False
+        except OSError:
+            return True  # ambiguous: assume live rather than reap or clobber
+        finally:
+            probe.close()
+
+    def swarm_sockets(self):
+        """Swarm socket files, newest first. The one place that directory is listed."""
+        return sorted(self.socket_dir().glob(f"{SOCKET_PREFIX}*"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+
+    def newest_live_socket(self):
+        """The most recently touched swarm socket with a server behind it."""
+        for path in self.swarm_sockets():
+            if self.socket_alive(path):
+                return path.name
+        return None
+
+    def dead_sockets(self):
+        """Swarm socket files with no server behind them, and old enough to say so.
+
+        A socket younger than the grace is not evidence of anything: a server
+        mid-bind has a file and no listener yet, and reaping it takes the
+        server's name out from under it. Age is the whole of the difference,
+        so it is judged here rather than by whoever does the unlinking.
+        """
+        stale = []
+        now = time.time()
+        for path in self.swarm_sockets():
+            try:
+                if now - path.stat().st_mtime < SOCKET_GRACE_S:
+                    continue
+            except OSError:
+                continue
+            if not self.socket_alive(path):
+                stale.append(path)
+        return stale
+
+    def swarm_session_live(self, socket):
+        """Is the swarm session actually up on this socket? Server plus session:
+        a live server with no claude-swarm session still needs one created."""
+        return bool(socket) and self.socket_alive(socket) and tmux(
+            socket, "has-session", "-t", TMUX_SESSION).returncode == 0
+
+    def attached_clients(self, socket):
+        """How many tmux clients are watching the swarm session on this socket."""
+        result = tmux(socket, "list-clients", "-t", TMUX_SESSION)
+        return len([line for line in result.stdout.splitlines() if line]) if result.returncode == 0 else 0
+
+    def socket_state(self, socket):
+        """What is actually true of this socket right now.
+
+        The `how` label a caller carries only says where the name came from.
+        Printed alone, a derived name reads as a running server that may
+        already be gone.
+        """
+        if not socket:
+            return "unresolved"
+        # The state, not a promise: whether anything gets created is the
+        # launch's to say, and a run that noops creates nothing.
+        if not self.socket_alive(socket):
+            return "no server"
+        if not self.swarm_session_live(socket):
+            return f"server up, no {TMUX_SESSION} session"
+        clients = self.attached_clients(socket)
+        return f"live, {clients} client{'' if clients == 1 else 's'} attached"
+
     def _socket_from_pane_pid(self, pid, table):
         """A pane process's parent is the tmux server; its cmdline carries -L <socket>."""
         parents = {p: pp for p, pp, _ in table}
@@ -2872,7 +2957,7 @@ class Resolver:
                 continue
             for pid, _ in self.live_agent_procs(agent_id, table):
                 sock = self._socket_from_pane_pid(pid, table)
-                if sock and socket_alive(sock):
+                if sock and self.socket_alive(sock):
                     return sock, f"live pane of pid {pid}"
                 if sock:
                     warn(f"pid {pid} looked like a pane on {sock}, but that server is gone")
@@ -4305,36 +4390,6 @@ def tmux(socket, *args):
     return subprocess.run(["tmux", "-L", socket, *args], capture_output=True, text=True)
 
 
-def socket_dir():
-    return Path(os.environ.get("TMUX_TMPDIR") or f"/tmp/tmux-{os.getuid()}")
-
-
-def socket_alive(socket):
-    """Is a tmux server listening on this socket?
-
-    One test, everywhere. A connect() answers it in microseconds; asking tmux
-    costs a process spawn each time, and having two tests meant a socket could
-    be 'dead' to the reaper and 'live' to the launcher.
-    """
-    path = socket if isinstance(socket, Path) else socket_dir() / socket
-    probe = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
-    probe.settimeout(0.2)
-    try:
-        probe.connect(str(path))
-        return True
-    except (ConnectionRefusedError, FileNotFoundError):
-        return False
-    except OSError:
-        return True  # ambiguous: assume live rather than reap or clobber
-    finally:
-        probe.close()
-
-
-def swarm_sockets():
-    """Swarm socket files, newest first. The one place that directory is listed."""
-    return sorted(socket_dir().glob(f"{SOCKET_PREFIX}*"), key=lambda p: p.stat().st_mtime, reverse=True)
-
-
 def list_panes(socket):
     res = tmux(socket, "list-panes", "-a", "-F", "#{session_name}\t#{window_id}\t#{pane_id}\t#{pane_pid}")
     if res.returncode != 0:
@@ -4480,35 +4535,6 @@ def current_tmux():
     return Path(inside.split(",")[0]).name, os.environ.get("TMUX_PANE")
 
 
-def swarm_session_live(socket):
-    """Is the swarm session actually up on this socket? Server plus session:
-    a live server with no claude-swarm session still needs one created."""
-    return bool(socket) and socket_alive(socket) and tmux(socket, "has-session", "-t", TMUX_SESSION).returncode == 0
-
-
-def socket_state(socket):
-    """What is actually true of this socket right now.
-
-    The `how` label only says where the name came from. Printed alone, a
-    derived name reads as a running server that may already be gone.
-    """
-    if not socket:
-        return "unresolved"
-    # The state, not a promise: whether anything gets created is the launch's
-    # to say, and a run that noops creates nothing.
-    if not socket_alive(socket):
-        return "no server"
-    if not swarm_session_live(socket):
-        return f"server up, no {TMUX_SESSION} session"
-    clients = attached_clients(socket)
-    return f"live, {clients} client{'' if clients == 1 else 's'} attached"
-
-
-def attached_clients(socket):
-    result = tmux(socket, "list-clients", "-t", TMUX_SESSION)
-    return len([line for line in result.stdout.splitlines() if line]) if result.returncode == 0 else 0
-
-
 def maybe_attach(args, socket):
     """Attach to the swarm unless something says not to, then say why not.
 
@@ -4520,7 +4546,7 @@ def maybe_attach(args, socket):
     """
     if not socket or args.no_attach:
         return
-    if not socket_alive(socket):
+    if not RESOLVER.socket_alive(socket):
         # Every veto below is about whether attaching is wanted. This one is
         # about whether there is anything to attach to, so it comes first and
         # suggests no command: a run where nothing launched leaves an empty
@@ -4535,7 +4561,7 @@ def maybe_attach(args, socket):
         reason = "not a terminal"
     elif os.environ.get("TMUX"):
         reason = "already inside tmux"
-    elif not args.attach and attached_clients(socket):
+    elif not args.attach and RESOLVER.attached_clients(socket):
         reason = "someone is already watching it"
 
     if reason and not args.attach:
@@ -4661,7 +4687,7 @@ def launch(socket, want_pane, cwd, command, dry, replace_pane=None):
     Never reuses an occupied pane: the caller has already decided that whatever
     lives in the recorded pane is not this agent, so we always get our own pane.
     """
-    session_live = swarm_session_live(socket)
+    session_live = RESOLVER.swarm_session_live(socket)
     # A poison left on the server by an interrupted Recipe 1 run must not be
     # inherited by a real resume. Anything else set there is the operator's and
     # is passed through: the swarm's own agents are running with it.
@@ -4672,7 +4698,7 @@ def launch(socket, want_pane, cwd, command, dry, replace_pane=None):
     # either direction: ask only the server and a poison arrives by descent
     # moments later, ask both and a launch from inside a poisoned pane strips the
     # legitimate url a live server was about to give the agent.
-    if socket_alive(socket):
+    if RESOLVER.socket_alive(socket):
         server_url = tmux(socket, "show-environment", "-g", "ANTHROPIC_BASE_URL")
         value = server_url.stdout.strip().partition("=")[2] if server_url.returncode == 0 else ""
         carrier = socket
@@ -4708,7 +4734,7 @@ def launch(socket, want_pane, cwd, command, dry, replace_pane=None):
         argv = ["respawn-pane", "-k", "-t", replace_pane]
         action = "respawn"
     elif not session_live:
-        if not socket_alive(socket):
+        if not RESOLVER.socket_alive(socket):
             warn(f"socket {socket} is down, reestablishing")
         else:
             warn(f"session {TMUX_SESSION} missing on {socket}, recreating")
@@ -5560,10 +5586,10 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             # a half-answer; the rest are named too, with what is on them.
             elsewhere = {s: who for s, who in seats.items() if s != crew_socket}
             seat.insert(0, ("socket", f"{crew_socket}  [{crew_why}] "
-                                      f"({socket_state(crew_socket)})"))
+                                      f"({RESOLVER.socket_state(crew_socket)})"))
             for other, who in sorted(elsewhere.items()):
                 seat.insert(1, ("also", f"{other} hosts {', '.join(who)} "
-                                        f"({socket_state(other)})"))
+                                        f"({RESOLVER.socket_state(other)})"))
         report_launch(ctx, command, prefix, role="lead", agent_id=agent_id,
                       extra=seat)
         # A lead is not exec'd onto a conversation someone is already running,
@@ -5676,7 +5702,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     command = build_command(ctx, args, passthrough)
     adopted = inherit_credentials(ctx)
 
-    seat = [("socket", f"{socket}  [{how}] ({socket_state(socket)})"),
+    seat = [("socket", f"{socket}  [{how}] ({RESOLVER.socket_state(socket)})"),
             ("pane", pane_said),
             ("cwd", cwd or "(inherit)")]
     if adopted:
@@ -5856,8 +5882,8 @@ def _complete(topic):
         return 0
 
     if topic == "sockets":
-        for path in swarm_sockets():
-            state = "live" if socket_alive(path) else "dead"
+        for path in RESOLVER.swarm_sockets():
+            state = "live" if RESOLVER.socket_alive(path) else "dead"
             print(f"{path.name}:{state}, {ms_str(int(path.stat().st_mtime * 1000))}")
         return 0
 
@@ -6012,21 +6038,15 @@ SOCKET_GRACE_S = 60  # never reap a socket younger than this; a server may be mi
 
 
 def cleanup_sockets(dry=False):
-    """Remove swarm socket files whose tmux server is gone.
+    """Remove the socket files the engine says have no server behind them.
 
-    Probes with a connect() rather than spawning tmux per socket: this runs
-    from a SessionStart hook, so it has to be measured in milliseconds.
+    Which those are is the engine's answer (dead_sockets, a connect() per
+    socket rather than a tmux spawn, because this runs from a SessionStart
+    hook and has to be measured in milliseconds). What is left here is the
+    unlinking and the line it prints.
     """
     removed = []
-    now = time.time()
-    for path in swarm_sockets():
-        try:
-            if now - path.stat().st_mtime < SOCKET_GRACE_S:
-                continue
-        except OSError:
-            continue
-        if socket_alive(path):
-            continue
+    for path in RESOLVER.dead_sockets():
         if dry:
             removed.append(path.name)
             continue
@@ -7107,13 +7127,6 @@ def run_install():
     return 1 if failed else 0
 
 
-def newest_live_socket():
-    for path in swarm_sockets():
-        if socket_alive(path):
-            return path.name
-    return None
-
-
 def run_poison(args):
     """Recipe 1 steps 0 and 2: (un)set ANTHROPIC_BASE_URL on the swarm server.
 
@@ -7121,10 +7134,10 @@ def run_poison(args):
     5-hour window anchored. Processes already running keep the env they were
     born with, in both directions; env is fixed at exec.
     """
-    sock = args.socket or newest_live_socket()
+    sock = args.socket or RESOLVER.newest_live_socket()
     if not sock:
         die("no live swarm socket; pass --socket claude-swarm-<pid>")
-    if not socket_alive(sock):
+    if not RESOLVER.socket_alive(sock):
         die(f"socket {sock} has no live tmux server; poison lives in server env, nothing to set")
 
     if args.poison:
@@ -7277,7 +7290,7 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
     # Offered only where a server exists to attach to: after a launch one
     # does, and a noop on a dead socket must not promise a keypress whose
     # only outcome is "nothing to attach to".
-    if (not args.dry_run and socket and socket_alive(socket)
+    if (not args.dry_run and socket and RESOLVER.socket_alive(socket)
             and any(s in ("launched", "noop") for _, s in results)):
         print()
         targets = [a.agent_id for _, a in jobs if a is not None and getattr(a, "agent_id", None)]
@@ -7383,7 +7396,7 @@ def run_team(args, passthrough, table):
     members, former = select_jobs(members, population, live, lead_id,
                                   getattr(args, "all_members", False), args.team)
     ordered = sorted(members, key=lambda m: 1 if m.get("agentId") == lead_id else 0)
-    where = (f"socket {socket} ({socket_why}, {socket_state(socket)})" if socket
+    where = (f"socket {socket} ({socket_why}, {RESOLVER.socket_state(socket)})" if socket
              else "socket resolved per member")
     print(fill(f"team     {args.team}  ({len(ordered)} members, {where})"))
     note = former_members_note(former)
@@ -8182,6 +8195,29 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("settings-read-engine-only", "the settings file is read only inside the engine",
           not settings_readers, "; ".join(settings_readers))
 
+    # Whether a tmux server is there has one implementation, the engine's
+    # connect() probe, and two spellings that could ask it again: a second
+    # AF_UNIX probe, and a tmux subcommand whose whole answer is whether a
+    # server, a session or a client exists. Both are barred outside the
+    # engine, by the module the probe needs and by the subcommands
+    # themselves, so a raw subprocess is caught as surely as a call through
+    # tmux(). Acting on tmux is untouched: a launch splits a window, a tint
+    # sets options, a poison sets a variable, and none of those reads a
+    # verdict. live_checks is not exempted and does not need to be: it drives
+    # tmux hard, and never to ask whether a server is up.
+    server_questions = {"has-session", "list-clients", "list-sessions"}
+    asked_outside = set()
+    for node in ast.walk(tree):
+        line = getattr(node, "lineno", None)
+        if line is None or line in engine_lines or line in selftest_lines:
+            continue
+        if isinstance(node, ast.Name) and node.id == "socketlib" and isinstance(node.ctx, ast.Load):
+            asked_outside.add(f"an AF_UNIX probe at line {line}")
+        elif isinstance(node, ast.Constant) and node.value in server_questions:
+            asked_outside.add(f"tmux {node.value} at line {line}")
+    check("server-liveness-engine-only", "whether a tmux server is up is asked only inside the engine",
+          not asked_outside, "; ".join(sorted(asked_outside)))
+
     # Wrapping serves the reader; the reader is not owed less. Every physical
     # line fits the width, and the reflowed text says word for word what the
     # wall said: a lost fact must never be the fix for an unreadable one.
@@ -8665,12 +8701,12 @@ def run_selftest(live=False, failed_only=False, list_only=False):
 
     # The attach offer is made only where a server exists: a keypress whose
     # only outcome is "nothing to attach to" is not an offer.
-    real_alive_fn = globals()["socket_alive"]
+    real_alive_fn = RESOLVER.socket_alive
     real_confirm_fn = globals()["confirm_attach"]
     real_one_fn = globals()["run_one"]
     offered_at = []
     try:
-        globals()["socket_alive"] = lambda s: s == "sock-live"
+        RESOLVER.socket_alive = lambda s: s == "sock-live"
         globals()["confirm_attach"] = (
             lambda targets, table, sock: (offered_at.append(sock), False)[1])
         globals()["run_one"] = (
@@ -8684,7 +8720,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
                 job.socket = sock
                 run_agents(job, [], {}, [(None, job)], socket=sock)
     finally:
-        globals()["socket_alive"] = real_alive_fn
+        RESOLVER.socket_alive = real_alive_fn
         globals()["confirm_attach"] = real_confirm_fn
         globals()["run_one"] = real_one_fn
     check("attach-only-if-server", "an attach is offered only where a server exists",
@@ -9288,10 +9324,10 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # The fixture's server counts as existing: whether a dead one gates the
     # offer is its own check, and this one asks only who took the terminal.
     real_one, real_confirm = globals()["run_one"], globals()["confirm_attach"]
-    real_alive_gate = globals()["socket_alive"]
+    real_alive_gate = RESOLVER.socket_alive
     asked = []
     try:
-        globals()["socket_alive"] = lambda s: s == "sock" or real_alive_gate(s)
+        RESOLVER.socket_alive = lambda s: s == "sock" or real_alive_gate(s)
         globals()["confirm_attach"] = lambda targets, table, sock: asked.append(sock) and False
         offers = {}
         for label, status in (("a lead already up", "noop"), ("a lead handed over", "manual")):
@@ -9310,7 +9346,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             offers[label] = bool(asked) == (status == "noop")
     finally:
         globals()["run_one"], globals()["confirm_attach"] = real_one, real_confirm
-        globals()["socket_alive"] = real_alive_gate
+        RESOLVER.socket_alive = real_alive_gate
     wrong = sorted(k for k, good in offers.items() if not good)
     check("swarm-offer-fallback", "the swarm is offered when nothing else took over", not wrong, ", ".join(wrong))
 
