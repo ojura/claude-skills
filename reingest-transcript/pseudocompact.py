@@ -11,6 +11,14 @@ What it appends (validated empirically 2026-08-03):
      from the file's final last-prompt line, not from the last chain entry.
      Without it the new entry is silently ignored.
 
+The default leaf is the file's LAST conversation entry, not the trailing
+last-prompt's leafUuid. A last-prompt is written only when the operator
+submits a prompt, so turns driven by teammate messages append entries
+without one and that pointer falls behind. Grafting onto the stale pointer
+orphans every turn after it, since they stop being ancestors of the new
+boundary and no logicalParentUuid walk can reach them again. When the two
+disagree the tool says so and grafts at the real tip.
+
 Optionally trims a dead tail first (--leaf): keeps everything up to and
 including the target entry, plus an immediately-following last-prompt line
 if it already points at the target.
@@ -21,7 +29,7 @@ Caveats the tool cannot fix for you:
     appends entries parented on uuids that may no longer exist.
   - A cancelled /resume in the fresh process appends a cruft turn and a
     last-prompt pointing at it; re-run with --leaf <pseudocompaction-uuid>
-    is NOT the fix — just delete the cruft lines and re-append the
+    is NOT the fix: just delete the cruft lines and re-append the
     last-prompt (or restore the .bak and re-run this tool).
 
 Usage:
@@ -130,7 +138,7 @@ def main():
             die(f"uuid {args.leaf} not found in {path}")
         cut = matches[-1]
         leaf_uuid = args.leaf
-        # keep an adjacent last-prompt that already points at the kept leaf —
+        # keep an adjacent last-prompt that already points at the kept leaf,
         # its lastPrompt text stays accurate for the session picker
         if (cut + 1 < len(entries)
                 and entries[cut + 1][1].get("type") == "last-prompt"
@@ -141,23 +149,33 @@ def main():
     else:
         kept = entries
         trimmed = []
-        uuids = {d["uuid"] for _, d, _ in kept if d.get("uuid")}
-        last_prompts = [d for _, d, _ in kept if d.get("type") == "last-prompt"]
-        leaf_uuid = None
-        if last_prompts and last_prompts[-1].get("leafUuid"):
+        # The graft leaf is the file's last conversation entry, NOT the trailing
+        # last-prompt's leafUuid. A last-prompt is written only when the operator
+        # submits a prompt, so on a session whose final turns were driven by
+        # teammate messages (which append entries but no last-prompt) that pointer
+        # lags behind the real tip. Grafting onto it orphans every turn after it:
+        # they stop being ancestors of the new boundary, so no walk that follows
+        # logicalParentUuid can reach them again, and they are silently gone.
+        chain = [d for _, d, _ in kept
+                 if d.get("uuid") and d.get("type") in ("user", "assistant")
+                 and not d.get("isSidechain")]
+        if not chain:
+            die("no conversation entry with a uuid found; nothing to hang the leaf on")
+        leaf_uuid = chain[-1]["uuid"]
+        last_prompts = [d for _, d, _ in kept
+                        if d.get("type") == "last-prompt" and d.get("leafUuid")]
+        if last_prompts and last_prompts[-1]["leafUuid"] != leaf_uuid:
             cand = last_prompts[-1]["leafUuid"]
-            if cand in uuids:
-                leaf_uuid = cand
+            idx = next((i for i, d in enumerate(chain) if d.get("uuid") == cand), None)
+            if idx is None:
+                print(f"note: the trailing last-prompt names {cand}, which is not a "
+                      "conversation entry in this file; grafting at the last entry instead")
             else:
-                # a killed/crashed process can leave a trailing last-prompt
-                # pointing at an entry it never wrote (or that was restored away)
-                print(f"note: trailing last-prompt leafUuid {cand} does not "
-                      "exist in this file; falling back to the last chain entry")
-        if leaf_uuid is None:
-            chain = [d for _, d, _ in kept if d.get("uuid")]
-            if not chain:
-                die("no entry with a uuid found; nothing to hang the leaf on")
-            leaf_uuid = chain[-1]["uuid"]
+                n = len(chain) - 1 - idx
+                print(f"note: the trailing last-prompt names {cand}, which is {n} "
+                      f"conversation entr{'y' if n == 1 else 'ies'} short of the end "
+                      f"of the file; grafting at the last entry instead so those {n} "
+                      "are not orphaned")
 
     leaf_entries = [d for _, d, _ in kept if d.get("uuid") == leaf_uuid]
     if not leaf_entries:
@@ -212,14 +230,14 @@ def main():
 
     procs = live_processes(donor.get("sessionId"))
     if procs:
-        print("\nWARNING: live process(es) reference this session — the edit "
+        print("\nWARNING: live process(es) reference this session; the edit "
               "only takes effect on a fresh resume; prompting a stale process "
               "appends dangling-parented entries:")
         for p in procs:
             print(f"  {p}")
 
     if args.dry_run:
-        print("\ndry run — nothing written")
+        print("\ndry run, nothing written")
         return
 
     # --- write ---------------------------------------------------------------
