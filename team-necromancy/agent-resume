@@ -525,8 +525,27 @@ def confirm_attach(targets, table, socket):
 def check_passthrough(passthrough, parser):
     """Reject a flag that is neither ours nor claude's, and say what was meant.
 
-    A near miss is almost always a typo of one of our own flags rather than an
-    unknown claude flag, so the suggestion is drawn from both sets.
+    A prefix is asked about first, and only then how words look. A flag that is
+    a strict prefix of one of ours is a try at that one, and it has to be
+    caught here because it is the case similarity is worst at: when a flag is
+    renamed, its old spelling is a prefix of its new one, and every character
+    the replacement added counts as difference, so the longer the new name the
+    lower it scores. --as, after --as-agent replaced it, scored --as-agent at
+    0.57, under the 0.7 cutoff, while the unrelated claude flag --betas scored
+    0.73. Similarity had no way to reach the right answer there; a prefix does.
+
+    Several of ours can share a prefix, and then all of them are named rather
+    than one being picked. --into prefixes both --into-session and --into-team,
+    which do different things; ranking those two by similarity would put
+    --into-team first only because -team is shorter than -session, and would
+    drop --into-session under the cutoff at 0.60 and out of the message
+    entirely.
+
+    Nothing else is ranked by which set it is in. Once no prefix matches, one
+    search covers our flags and the allowlist together, because a near miss can
+    be a typo of either and the closest word is the honest answer: --team-nam
+    is a try at claude's --team-name at 0.95, not at our --team at 0.75, and
+    searching ours first would answer --team.
     """
     known = set(PASSTHROUGH_FLAGS)  # the table's keys are the allowlist
     ours = {opt for action in parser._actions for opt in action.option_strings}
@@ -537,8 +556,11 @@ def check_passthrough(passthrough, parser):
         flag = token.split("=", 1)[0]
         if flag in known:
             continue
-        near = difflib.get_close_matches(flag, sorted(known | ours), n=1, cutoff=0.7)
-        hint = f"; did you mean {near[0]}?" if near else ""
+        starts = sorted(opt for opt in ours if opt.startswith(flag) and opt != flag)
+        near = starts or difflib.get_close_matches(
+            flag, sorted(known | ours), n=1, cutoff=0.7)
+        hint = (f"; did you mean {near[0]}?" if len(near) == 1 else
+                f"; did you mean one of {some_of(near)}?" if near else "")
         die(f"unknown flag {flag}{hint}\n"
             f"  flags for the resumed session must be one of: {', '.join(sorted(known))}")
 
@@ -10803,6 +10825,53 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     }
     wrong = sorted(k for k, good in flags.items() if not good)
     check("forward-only-known-flags", "only flags the table knows are forwarded", not wrong, ", ".join(wrong))
+
+    # --- and where a suggestion comes from: a prefix of one of ours first,
+    # then the closest word in either set. The stub carries the shapes that
+    # made this bite. A flag whose old name is a prefix of its new one, which
+    # similarity cannot reach. Two of ours sharing a prefix, where ranking them
+    # would drop one. And one of ours that a claude flag beats on the same
+    # typo, which pins the pooled search: --team-nam is a try at --team-name
+    # and must not be taken by our --team.
+    class _Renamed:
+        _actions = [type("a", (), {"option_strings": [
+            "--as-agent", "--into-session", "--into-team", "--tmux-session",
+            "--team"]})()]
+
+    def _suggested(flag):
+        """What a refusal of this flag offered, with the allowlist line dropped.
+
+        Every refusal prints the whole claude allowlist, so a search of the
+        message for a flag name would match that listing rather than the
+        suggestion. Cut at the sentence that opens it rather than at a newline,
+        because the line above it wraps to the terminal.
+        """
+        died, msg = _dies(check_passthrough, [flag, "x"], _Renamed())
+        return msg.split("flags for the resumed session")[0] if died else "was not refused"
+
+    prefixed, shared = _suggested("--as"), _suggested("--into")
+    ours_typo, both_near = _suggested("--tmux-sessionn"), _suggested("--team-nam")
+    claude_typo, resembles_nothing = _suggested("--modle"), _suggested("--frobnicate")
+    sourced = {
+        "the old name of a renamed flag is answered with the new one":
+            "--as-agent?" in prefixed,
+        "and not with the claude flag that scores higher on it":
+            "--betas" not in prefixed,
+        "a prefix two of ours share names both": (
+            "--into-session" in shared and "--into-team" in shared),
+        "a near miss of one of ours is answered with ours":
+            "--tmux-session?" in ours_typo,
+        "a near miss of a claude flag is answered from the allowlist":
+            "--model?" in claude_typo,
+        "and still from the allowlist when one of ours is near the same word":
+            "--team-name?" in both_near,
+        "a flag resembling neither is answered with no guess":
+            "did you mean" not in resembles_nothing,
+    }
+    wrong = sorted(k for k, good in sourced.items() if not good)
+    check("suggest-a-prefix-before-a-near-miss",
+          "an unknown flag is suggested the one of ours it prefixes, or else the closest of either set",
+          not wrong, "; ".join(wrong))
 
     scope = {
         "one-agent flag refused for many": _dies(check_flag_scope, ["--agent-color", "red"], 4)[0],
