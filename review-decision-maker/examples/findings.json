@@ -1,0 +1,62 @@
+{
+  "title": "Example branch review findings",
+  "source": "review-findings.json",
+  "generated_from": [
+    "correctness-review",
+    "test-review"
+  ],
+  "findings": [
+    {
+      "id": "F001",
+      "severity": "critical",
+      "category": "correctness",
+      "title": "Length validation happens after the buffer read",
+      "locations": [
+        {
+          "file": "src/frame_reader.cpp",
+          "line": "42-57"
+        }
+      ],
+      "agents": [
+        "correctness-review"
+      ],
+      "description": "readFrame copies the declared payload before checking whether the input contains that many bytes.",
+      "evidence": "A frame with declared length 4096 and a 12 byte body reaches memcpy first, so the read crosses the supplied buffer.",
+      "proposed_resolution": "Validate the declared length against the remaining input before copying, then add a truncated-frame regression test."
+    },
+    {
+      "id": "F002",
+      "severity": "medium",
+      "category": "api-naming",
+      "title": "The parser name describes one caller instead of the file format",
+      "locations": [
+        "include/import_job.h:18",
+        "src/import_job.cpp:71-96"
+      ],
+      "reviewers": [
+        "correctness-review"
+      ],
+      "description": "ImportJob parses every .trace file, but its public name ties it to the upload screen.",
+      "failure_scenario": "A second caller must either depend on upload vocabulary or add a duplicate parser wrapper.",
+      "suggested_fix": "Rename it to TraceFileImporter and update the two call sites.",
+      "decision": "discuss",
+      "note": "Confirm whether this API is public before choosing the rename scope."
+    },
+    {
+      "id": "F003",
+      "severity": "low",
+      "category": "test-coverage",
+      "title": "The boundary test name promises both limits but checks only the upper limit",
+      "locations": [
+        {
+          "path": "tests/frame_reader_test.cpp",
+          "lines": 133
+        }
+      ],
+      "reported_by": "test-review",
+      "description": "rejectsOutOfRangeLengths covers a length above the maximum but not a negative decoded length.",
+      "evidence": "The test body constructs only the oversized case.",
+      "proposed_resolution": "Rename the test to rejectsOversizedLength or add the missing lower-bound case."
+    }
+  ]
+}

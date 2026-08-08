@@ -1,0 +1,1971 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Review consolidated branch findings, record a decision and note for each, and export the result.">
+  <title>@@BOARD_TITLE@@</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --page: #f9f9f7;
+      --surface: #fcfcfb;
+      --surface-raised: #ffffff;
+      --surface-muted: #f0efec;
+      --text: #0b0b0b;
+      --text-secondary: #52514e;
+      --muted: #6f6d68;
+      --border: #d8d7d1;
+      --border-strong: #b9b8b2;
+      --control-border: #76746f;
+      --accent: #2a78d6;
+      --accent-soft: #cde2fb;
+      --accent-strong: #184f95;
+      --button-primary: #184f95;
+      --good: #0ca30c;
+      --resolved: #7c3aed;
+      --warning: #fab219;
+      --serious: #ec835a;
+      --critical: #d03b3b;
+      --neutral: #6b7280;
+      --shadow: 0 12px 32px rgba(11, 11, 11, 0.08);
+      --focus-color: #184f95;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root:where(:not([data-theme="light"])) {
+        color-scheme: dark;
+        --page: #0d0d0d;
+        --surface: #1a1a19;
+        --surface-raised: #20201f;
+        --surface-muted: #2c2c2a;
+        --text: #ffffff;
+        --text-secondary: #c3c2b7;
+        --muted: #a6a49d;
+        --border: #383835;
+        --border-strong: #565651;
+        --control-border: #898781;
+        --accent: #3987e5;
+        --accent-soft: #183f6c;
+        --accent-strong: #9ec5f4;
+        --button-primary: #256abf;
+        --resolved: #a78bfa;
+        --shadow: 0 14px 36px rgba(0, 0, 0, 0.32);
+        --focus-color: #9ec5f4;
+      }
+    }
+
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface: #1a1a19;
+      --surface-raised: #20201f;
+      --surface-muted: #2c2c2a;
+      --text: #ffffff;
+      --text-secondary: #c3c2b7;
+      --muted: #a6a49d;
+      --border: #383835;
+      --border-strong: #565651;
+      --control-border: #898781;
+      --accent: #3987e5;
+      --accent-soft: #183f6c;
+      --accent-strong: #9ec5f4;
+      --button-primary: #256abf;
+      --resolved: #a78bfa;
+      --shadow: 0 14px 36px rgba(0, 0, 0, 0.32);
+      --focus-color: #9ec5f4;
+    }
+
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      padding-bottom: var(--bottom-controls-offset, 0px);
+      background: var(--page);
+      color: var(--text);
+      line-height: 1.5;
+    }
+
+    button, input, select, textarea { font: inherit; }
+
+    button, select, input[type="search"] {
+      min-height: 2.5rem;
+    }
+
+    button, select, input, textarea {
+      color: var(--text);
+    }
+
+    button:focus-visible, select:focus-visible, input:focus-visible,
+    textarea:focus-visible, summary:focus-visible, a:focus-visible {
+      outline: 3px solid var(--focus-color);
+      outline-offset: 2px;
+      box-shadow: none;
+    }
+
+    .visually-hidden {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    .page-header, main, .page-footer {
+      width: min(1840px, calc(100% - 2rem));
+      margin-inline: auto;
+    }
+
+    .page-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 2rem;
+      align-items: flex-start;
+      padding: 2rem 0 1.1rem;
+    }
+
+    .eyebrow {
+      margin: 0 0 0.35rem;
+      color: var(--accent-strong);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(1.75rem, 3vw, 2.8rem);
+      line-height: 1.08;
+      letter-spacing: -0.035em;
+    }
+
+    .lede {
+      max-width: 72ch;
+      margin: 0.65rem 0 0;
+      color: var(--text-secondary);
+      font-size: 1rem;
+    }
+
+    .header-tools {
+      display: grid;
+      grid-template-columns: max-content max-content;
+      align-items: center;
+      justify-content: end;
+      justify-items: end;
+      gap: 0.4rem 0.55rem;
+    }
+
+    #theme-toggle { inline-size: 8.5rem; }
+    #density-toggle { inline-size: 12rem; }
+
+    .save-state {
+      grid-column: 1 / -1;
+      width: 100%;
+      min-height: 1.25rem;
+      overflow: hidden;
+      color: var(--text-secondary);
+      font-size: 0.82rem;
+      text-align: right;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: 0.9rem;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .progress-panel {
+      position: sticky;
+      top: 0;
+      z-index: 40;
+      padding: 1rem 1.1rem;
+      margin-bottom: 0.85rem;
+    }
+
+    .progress-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 1rem;
+      margin-bottom: 0.55rem;
+    }
+
+    .progress-heading strong { font-size: 1rem; }
+
+    .progress-percent {
+      color: var(--text-secondary);
+      font-variant-numeric: tabular-nums;
+      font-weight: 700;
+    }
+
+    .progress-track {
+      height: 0.65rem;
+      overflow: hidden;
+      border-radius: 999px;
+      background: var(--surface-muted);
+      border: 1px solid var(--border);
+    }
+
+    .progress-fill {
+      width: 0;
+      height: 100%;
+      border-radius: inherit;
+      background: var(--accent);
+      transition: width 180ms ease;
+    }
+
+    .summary-stats {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(8rem, 1fr));
+      gap: 0.6rem;
+      margin-top: 0.85rem;
+    }
+
+    .stat-button {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      grid-template-areas: "mark value" "mark label";
+      column-gap: 0.55rem;
+      align-items: center;
+      padding: 0.65rem 0.75rem;
+      border: 1px solid var(--control-border);
+      border-radius: 0.65rem;
+      background: var(--surface-raised);
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .stat-button:hover { border-color: var(--border-strong); }
+    .stat-button[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+
+    .stat-mark {
+      grid-area: mark;
+      width: 0.68rem;
+      height: 2rem;
+      border-radius: 999px;
+      background: var(--neutral);
+    }
+
+    .stat-undecided .stat-mark { background: var(--neutral); }
+    .stat-resolved .stat-mark { background: var(--resolved); }
+    .stat-fix .stat-mark { background: var(--good); }
+    .stat-discuss .stat-mark { background: var(--accent); }
+    .stat-defer .stat-mark { background: var(--warning); }
+    .stat-reject .stat-mark { background: var(--critical); }
+
+    .stat-value {
+      grid-area: value;
+      font-size: 1.3rem;
+      font-weight: 800;
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .stat-label {
+      grid-area: label;
+      color: var(--text-secondary);
+      font-size: 0.78rem;
+    }
+
+    .filter-panel {
+      position: relative;
+      z-index: 20;
+      padding: 0.8rem;
+      margin-bottom: 0.85rem;
+      scroll-margin-top: calc(var(--sticky-controls-offset, 0px) + 0.6rem);
+    }
+
+    .filter-panel.controls-collapsed .filter-row,
+    .filter-panel.controls-collapsed .active-filter-chips { display: none; }
+
+    .bottom-control-panel {
+      position: fixed;
+      left: 50%;
+      bottom: 0;
+      z-index: 50;
+      width: min(1840px, calc(100% - 2rem));
+      padding: 0.65rem 0.8rem;
+      border-bottom-left-radius: 0;
+      border-bottom-right-radius: 0;
+      transform: translateX(-50%);
+    }
+
+    .control-sticky-sentinel {
+      height: 1px;
+      margin-bottom: -1px;
+      pointer-events: none;
+    }
+
+    body[data-controls-stuck="true"] .progress-panel {
+      border-top-left-radius: 0;
+      border-top-right-radius: 0;
+      box-shadow: 0 12px 28px rgba(11, 11, 11, 0.14);
+    }
+
+    .filter-row, .action-row {
+      display: flex;
+      align-items: end;
+      gap: 0.6rem;
+      flex-wrap: wrap;
+    }
+
+    .bottom-control-panel .action-row {
+      align-items: center;
+      margin: 0;
+      padding: 0;
+      border: 0;
+    }
+
+    .active-filter-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin-top: 0.65rem;
+      padding-top: 0.65rem;
+      border-top: 1px solid var(--border);
+    }
+
+    .active-filter-chip {
+      min-height: 2rem;
+      padding: 0.3rem 0.5rem;
+      border: 1px solid var(--control-border);
+      border-radius: 999px;
+      background: var(--surface-raised);
+      color: var(--text);
+      font-size: 0.74rem;
+      cursor: pointer;
+    }
+
+    .field {
+      display: grid;
+      gap: 0.25rem;
+      min-width: 9.5rem;
+    }
+
+    .field-search { flex: 2 1 21rem; }
+
+    .field label {
+      color: var(--text-secondary);
+      font-size: 0.72rem;
+      font-weight: 750;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+
+    input[type="search"], select, textarea {
+      width: 100%;
+      border: 1px solid var(--control-border);
+      border-radius: 0.55rem;
+      background: var(--surface-raised);
+    }
+
+    input[type="search"], select { padding: 0.48rem 0.65rem; }
+    ::placeholder { color: var(--muted); opacity: 1; }
+
+    .checkbox-control {
+      display: inline-flex;
+      align-items: center;
+      min-height: 2.5rem;
+      gap: 0.45rem;
+      padding: 0 0.65rem;
+      border: 1px solid var(--control-border);
+      border-radius: 0.55rem;
+      background: var(--surface-raised);
+      cursor: pointer;
+    }
+
+    input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.4rem;
+      padding: 0.48rem 0.7rem;
+      border: 1px solid var(--control-border);
+      border-radius: 0.55rem;
+      background: var(--surface-raised);
+      color: var(--text);
+      font-weight: 680;
+      cursor: pointer;
+    }
+
+    .button-icon {
+      width: 1rem;
+      height: 1rem;
+      flex: 0 0 auto;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .button:hover { border-color: var(--accent); }
+    .button-primary { border-color: var(--button-primary); background: var(--button-primary); color: #ffffff; }
+    .button-danger { border-color: var(--critical); color: var(--text); box-shadow: inset 3px 0 0 var(--critical); }
+
+    .segmented-export {
+      display: inline-flex;
+      align-items: stretch;
+    }
+
+    .segmented-export .button {
+      position: relative;
+      margin-left: -1px;
+      padding-inline: 0.55rem;
+      border-radius: 0;
+    }
+
+    .segmented-export .button:first-child {
+      margin-left: 0;
+      border-top-left-radius: 0.55rem;
+      border-bottom-left-radius: 0.55rem;
+    }
+
+    .segmented-export .button:last-child {
+      border-top-right-radius: 0.55rem;
+      border-bottom-right-radius: 0.55rem;
+    }
+
+    .segmented-export .button:hover,
+    .segmented-export .button:focus-visible { z-index: 1; }
+
+    .segment-label { font-size: 0.78rem; }
+
+    .shown-count {
+      margin-left: auto;
+      color: var(--text-secondary);
+      font-size: 0.84rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .shortcut-hint {
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+
+    kbd {
+      padding: 0.08rem 0.35rem;
+      border: 1px solid var(--border-strong);
+      border-bottom-width: 2px;
+      border-radius: 0.3rem;
+      background: var(--surface-muted);
+      font-family: inherit;
+      font-size: 0.72rem;
+    }
+
+    .table-panel { overflow: visible; }
+
+    .table-scroll {
+      max-height: none;
+      min-height: 0;
+      overflow: visible;
+    }
+
+    table {
+      width: 100%;
+      min-width: 1160px;
+      border-collapse: separate;
+      border-spacing: 0;
+      table-layout: fixed;
+    }
+
+    col.reference { width: 10rem; }
+    col.finding { width: 42%; }
+    col.agents { width: 11rem; }
+    col.decision { width: 17rem; }
+    col.note { width: 21rem; }
+
+    thead th {
+      position: sticky;
+      top: var(--sticky-controls-offset, 0px);
+      z-index: 12;
+      padding: 0.72rem;
+      border-bottom: 1px solid var(--border-strong);
+      background: var(--surface-muted);
+      color: var(--text-secondary);
+      font-size: 0.75rem;
+      letter-spacing: 0.045em;
+      text-align: left;
+      text-transform: uppercase;
+    }
+
+    thead th:first-child { left: 0; z-index: 14; border-top-left-radius: 0.9rem; }
+    thead th:last-child { border-top-right-radius: 0.9rem; }
+
+    tbody th, tbody td {
+      padding: 0.85rem 0.75rem;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+      background: var(--surface);
+    }
+
+    tbody tr:nth-child(even) th,
+    tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--surface-muted) 42%, var(--surface)); }
+
+    tbody tr:hover th, tbody tr:hover td,
+    tbody tr:focus-within th, tbody tr:focus-within td {
+      background: color-mix(in srgb, var(--accent-soft) 24%, var(--surface));
+    }
+
+    .finding-row {
+      scroll-margin-top: calc(var(--sticky-controls-offset, 0px) + 0.75rem);
+      scroll-margin-bottom: calc(var(--bottom-controls-offset, 0px) + 0.75rem);
+    }
+
+    .finding-row.pinned-review th,
+    .finding-row.pinned-review td {
+      background: color-mix(in srgb, var(--accent-soft) 32%, var(--surface));
+    }
+
+    tbody tr[data-decision="resolved"] { --row-status: var(--resolved); }
+    tbody tr[data-decision="fix"] { --row-status: var(--good); }
+    tbody tr[data-decision="discuss"] { --row-status: var(--accent); }
+    tbody tr[data-decision="defer"] { --row-status: var(--warning); }
+    tbody tr[data-decision="reject"] { --row-status: var(--critical); }
+    tbody tr[data-decision="undecided"] { --row-status: var(--neutral); }
+
+    tbody tr > :first-child { border-left: 4px solid var(--row-status); }
+
+    .reference-cell {
+      position: sticky;
+      left: 0;
+      z-index: 8;
+      text-align: left;
+    }
+
+    .finding-id {
+      display: block;
+      width: fit-content;
+      margin-bottom: 0.5rem;
+      color: var(--accent-strong);
+      font-size: 1rem;
+      font-weight: 850;
+      font-variant-numeric: tabular-nums;
+      text-decoration: none;
+    }
+
+    .finding-id:hover { text-decoration: underline; }
+
+    .severity-badge, .category-label, .agent-badge {
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      border-radius: 999px;
+      font-weight: 750;
+    }
+
+    .severity-badge {
+      gap: 0.32rem;
+      margin-bottom: 0.45rem;
+      padding: 0.22rem 0.5rem;
+      border: 1px solid var(--severity-color, var(--border-strong));
+      color: var(--text);
+      font-size: 0.72rem;
+    }
+
+    .severity-badge::before {
+      width: 0.48rem;
+      height: 0.48rem;
+      border-radius: 50%;
+      background: var(--severity-color, var(--neutral));
+      content: "";
+      flex: 0 0 auto;
+    }
+
+    .severity-critical { --severity-color: var(--critical); }
+    .severity-high { --severity-color: var(--serious); }
+    .severity-medium-high { --severity-color: var(--warning); }
+    .severity-medium { --severity-color: var(--warning); }
+    .severity-low-medium { --severity-color: var(--accent); }
+    .severity-low { --severity-color: var(--neutral); }
+
+    .category-label {
+      display: block;
+      color: var(--text-secondary);
+      font-size: 0.7rem;
+      line-height: 1.25;
+    }
+
+    .finding-cell h2 {
+      margin: 0;
+      font-size: 1rem;
+      line-height: 1.35;
+      letter-spacing: -0.01em;
+    }
+
+    .locations {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.3rem;
+      margin: 0.48rem 0 0.55rem;
+    }
+
+    .location {
+      max-width: 100%;
+      overflow-wrap: anywhere;
+      padding: 0.12rem 0.35rem;
+      border-radius: 0.32rem;
+      background: var(--surface-muted);
+      color: var(--text-secondary);
+      font-size: 0.7rem;
+    }
+
+    details { border-radius: 0.45rem; }
+
+    summary {
+      display: flex;
+      align-items: center;
+      width: 100%;
+      min-height: 2rem;
+      padding: 0.3rem 0.25rem;
+      color: var(--accent-strong);
+      cursor: pointer;
+      font-size: 0.8rem;
+      font-weight: 720;
+    }
+
+    .detail-grid {
+      display: grid;
+      gap: 0.65rem;
+      margin-top: 0.65rem;
+    }
+
+    .detail-grid section {
+      padding: 0.65rem 0.75rem;
+      border-left: 3px solid var(--border-strong);
+      border-radius: 0.35rem;
+      background: var(--surface-raised);
+    }
+
+    .detail-grid .resolution-panel { border-left-color: var(--accent); }
+
+    .detail-grid h3 {
+      margin: 0 0 0.28rem;
+      color: var(--text-secondary);
+      font-size: 0.72rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .detail-grid p { margin: 0; font-size: 0.86rem; }
+
+    .agent-list { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+
+    .agent-badge {
+      padding: 0.22rem 0.48rem;
+      border: 1px solid var(--border);
+      background: var(--surface-raised);
+      color: var(--text-secondary);
+      font-size: 0.68rem;
+      line-height: 1.25;
+    }
+
+    fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+
+    .decision-options {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.34rem;
+    }
+
+    .decision-option {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      min-height: 2.75rem;
+      padding: 0.45rem 0.5rem;
+      border: 1px solid var(--control-border);
+      border-radius: 0.45rem;
+      background: var(--surface-raised);
+      cursor: pointer;
+      font-size: 0.78rem;
+      font-weight: 680;
+    }
+
+    .decision-option:hover { border-color: var(--accent); }
+    .decision-option:has(input:focus-visible) { outline: 3px solid var(--focus-color); outline-offset: 2px; }
+    .decision-option input:focus-visible { outline: none; box-shadow: none; }
+    .decision-option:has(input:checked) { border-color: var(--row-choice, var(--neutral)); box-shadow: inset 3px 0 0 var(--row-choice, var(--neutral)); }
+    .decision-undecided { --row-choice: var(--neutral); }
+    .decision-resolved { --row-choice: var(--resolved); }
+    .decision-fix { --row-choice: var(--good); }
+    .decision-discuss { --row-choice: var(--accent); }
+    .decision-defer { --row-choice: var(--warning); }
+    .decision-reject { --row-choice: var(--critical); }
+
+    .note-cell textarea {
+      min-height: 4.25rem;
+      max-height: 14rem;
+      padding: 0.55rem 0.6rem;
+      resize: vertical;
+      line-height: 1.4;
+    }
+
+    .note-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.55rem;
+      margin-top: 0.35rem;
+    }
+
+    .note-hint {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      color: var(--text-secondary);
+      font-size: 0.72rem;
+      font-weight: 650;
+    }
+
+    .note-hint::before {
+      width: 0.5rem;
+      height: 0.5rem;
+      border-radius: 50%;
+      background: var(--neutral);
+      content: "";
+      flex: 0 0 auto;
+    }
+
+    .note-hint[data-state="saving"]::before { background: var(--warning); }
+    .note-hint[data-state="saved"]::before { background: var(--good); }
+    .note-hint[data-state="failed"]::before { background: var(--critical); }
+
+    .row-advance {
+      min-height: 2.25rem;
+      padding: 0.35rem 0.55rem;
+      border: 1px solid var(--control-border);
+      border-radius: 0.45rem;
+      background: var(--surface-raised);
+      color: var(--text);
+      font-size: 0.75rem;
+      font-weight: 720;
+      cursor: pointer;
+    }
+
+    .finding-row[data-decision="undecided"] .row-advance { visibility: hidden; }
+
+    .storage-warning {
+      padding: 0.35rem 0.55rem;
+      border: 1px solid var(--critical);
+      border-radius: 0.45rem;
+      background: var(--surface-raised);
+      color: var(--text);
+      font-size: 0.78rem;
+      font-weight: 750;
+    }
+
+    body[data-storage-failed="true"] :is(#export-json, #copy-json) { outline: 3px solid var(--critical); outline-offset: 2px; }
+
+    .empty-state {
+      padding: 3rem 1rem;
+      color: var(--text-secondary);
+      text-align: center;
+    }
+
+    .empty-state[hidden], tr[hidden] { display: none; }
+
+    .finding-row.pulse th, .finding-row.pulse td {
+      animation: row-pulse 1.2s ease-out;
+    }
+
+    @keyframes row-pulse {
+      0% { background: color-mix(in srgb, var(--accent-soft) 70%, var(--surface)); }
+      100% { background: var(--surface); }
+    }
+
+    body[data-density="compact"] tbody th,
+    body[data-density="compact"] tbody td { padding-block: 0.52rem; }
+    body[data-density="compact"] .detail-grid p { font-size: 0.8rem; }
+    body[data-density="compact"] .note-cell textarea { min-height: 3rem; }
+
+    .page-footer {
+      padding: 1rem 0 2.5rem;
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+
+    .import-dialog {
+      width: min(42rem, calc(100% - 2rem));
+      padding: 0;
+      border: 1px solid var(--control-border, var(--border-strong));
+      border-radius: 0.9rem;
+      background: var(--surface);
+      color: var(--text);
+      box-shadow: var(--shadow);
+    }
+
+    .import-dialog::backdrop { background: rgba(0, 0, 0, 0.58); }
+    .import-dialog form { padding: 1.2rem; }
+    .import-dialog h2 { margin: 0 0 0.35rem; }
+    .import-dialog p { color: var(--text-secondary); }
+
+    .import-counts {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.55rem;
+      margin: 1rem 0;
+    }
+
+    .import-counts div {
+      padding: 0.65rem;
+      border: 1px solid var(--border);
+      border-radius: 0.55rem;
+      background: var(--surface-raised);
+    }
+
+    .import-counts dt { color: var(--text-secondary); font-size: 0.78rem; }
+    .import-counts dd { margin: 0.1rem 0 0; font-size: 1.25rem; font-weight: 800; }
+    .import-guidance { padding: 0.7rem; border-left: 3px solid var(--warning); background: var(--surface-muted); }
+    .dialog-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.55rem; margin-top: 1rem; }
+
+    @media (max-width: 1700px) {
+      .bottom-control-panel .shortcut-hint { display: none; }
+    }
+
+    @media (max-width: 1200px) {
+      .summary-stats { grid-template-columns: repeat(3, minmax(8rem, 1fr)); }
+
+      .bottom-control-panel .action-row {
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        padding-bottom: 0.15rem;
+        scrollbar-width: thin;
+      }
+
+      .bottom-control-panel .action-row > * { flex: 0 0 auto; }
+      .bottom-control-panel .shown-count { width: auto; margin-left: 0; white-space: nowrap; }
+      .bottom-control-panel .shortcut-hint { display: none; }
+      .page-header { display: block; }
+      .page-header { display: block; }
+      .header-tools { justify-content: start; justify-items: start; margin-top: 1rem; }
+      .save-state { text-align: left; }
+      .shown-count { width: 100%; margin-left: 0; }
+      .table-panel { border: 0; background: transparent; box-shadow: none; overflow: visible; }
+      .table-scroll { overflow: visible; }
+      table { display: block; min-width: 0; }
+      colgroup { display: none; }
+
+      thead {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
+      tbody {
+        display: grid;
+        gap: 0.85rem;
+      }
+
+      .finding-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        scroll-margin-top: calc(var(--sticky-controls-offset, 0px) + 0.75rem);
+        overflow: hidden;
+        border: 1px solid var(--border);
+        border-left: 5px solid var(--row-status);
+        border-radius: 0.8rem;
+        background: var(--surface);
+        box-shadow: 0 5px 18px rgba(11, 11, 11, 0.06);
+      }
+
+      .finding-row.pinned-review { border-color: var(--accent); box-shadow: var(--focus-color) 0 0 0 2px; }
+
+      tbody th, tbody td,
+      tbody tr:nth-child(even) th, tbody tr:nth-child(even) td,
+      tbody tr:hover th, tbody tr:hover td,
+      tbody tr:focus-within th, tbody tr:focus-within td {
+        position: static;
+        display: block;
+        width: auto;
+        padding: 0.75rem;
+        border: 0;
+        background: transparent;
+      }
+
+      tbody tr > :first-child { border-left: 0; }
+
+      .reference-cell {
+        display: grid;
+        grid-template-columns: auto auto 1fr;
+        align-items: center;
+        gap: 0.55rem;
+        border-bottom: 1px solid var(--border);
+        text-align: left;
+      }
+
+      .finding-id, .severity-badge { margin: 0; }
+      .category-label { display: inline-flex; justify-self: end; text-align: right; }
+      .finding-cell { padding-top: 0.85rem; }
+      .finding-cell h2 { font-size: 1.08rem; }
+      .agents-cell { padding-top: 0.25rem; }
+      .decision-cell { border-top: 1px solid var(--border); }
+      .decision-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .note-cell { padding-top: 0.35rem; }
+      .note-cell textarea { min-height: 6rem; }
+    }
+
+    @media (max-width: 600px) {
+      .summary-stats { grid-template-columns: repeat(2, minmax(8rem, 1fr)); }
+      .bottom-control-panel { width: 100%; padding: 0.5rem; border-radius: 0; }
+      .segmented-export .button { padding-inline: 0.55rem; }
+      .segment-label { display: none; }
+      .reference-cell { grid-template-columns: auto auto; }
+      .category-label { grid-column: 1 / -1; justify-self: start; text-align: left; }
+      .import-counts { grid-template-columns: 1fr; }
+      .dialog-actions { display: grid; }
+    }
+
+    @media (max-height: 520px) {
+      .progress-panel { position: relative; top: auto; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+    }
+
+    @media (forced-colors: active) {
+      .severity-badge, .agent-badge, .decision-option, .stat-button { forced-color-adjust: auto; }
+      tbody tr > :first-child { border-left-style: double; }
+    }
+
+    @media print {
+      body { padding-bottom: 0; }
+      .header-tools, .control-sticky-sentinel, .filter-panel, .bottom-control-panel, .summary-stats, .note-actions, .page-footer { display: none !important; }
+      .page-header, main { width: 100%; }
+      .progress-panel, .table-panel { position: static; box-shadow: none; }
+      .table-scroll { max-height: none; overflow: visible; }
+      table { min-width: 0; table-layout: auto; font-size: 9pt; }
+      thead th, .reference-cell { position: static; }
+      details > *:not(summary) { display: block !important; }
+      summary { display: none; }
+      textarea { border: 0; min-height: 2rem; }
+    }
+  </style>
+</head>
+<body data-density="comfortable">
+  <header class="page-header">
+    <div>
+      <p class="eyebrow">Branch review decision board</p>
+      <h1>@@BOARD_TITLE@@</h1>
+      <p class="lede">@@FINDING_COUNT@@ consolidated findings from @@REVIEWER_SUMMARY@@. Work one row at a time, keep long evidence collapsed until needed, and record the reason for each decision.</p>
+    </div>
+    <div class="header-tools">
+      <button class="button" id="theme-toggle" type="button">Theme: Auto</button>
+      <button class="button" id="density-toggle" type="button">Density: Comfortable</button>
+      <span class="save-state" id="save-state" role="status" aria-live="polite">Loading local decisions...</span>
+    </div>
+  </header>
+
+  <main>
+    <div class="control-sticky-sentinel" aria-hidden="true"></div>
+    <section class="panel progress-panel" aria-labelledby="progress-title">
+      <div class="progress-heading">
+        <strong id="progress-title"><span id="decided-count">0</span> of @@FINDING_COUNT@@ decided</strong>
+        <span class="progress-percent" id="progress-percent">0%</span>
+      </div>
+      <div class="progress-track" id="progress-track" role="progressbar" aria-labelledby="progress-title" aria-valuemin="0" aria-valuemax="@@FINDING_COUNT@@" aria-valuenow="0">
+        <div class="progress-fill" id="progress-fill"></div>
+      </div>
+      <div class="summary-stats" aria-label="Decision counts">
+        <button class="stat-button stat-undecided" type="button" data-stat-decision="undecided" aria-pressed="false">
+          <span class="stat-mark" aria-hidden="true"></span><span class="stat-value" id="count-undecided">@@FINDING_COUNT@@</span><span class="stat-label">Undecided</span>
+        </button>
+        <button class="stat-button stat-resolved" type="button" data-stat-decision="resolved" aria-pressed="false">
+          <span class="stat-mark" aria-hidden="true"></span><span class="stat-value" id="count-resolved">0</span><span class="stat-label">Resolved</span>
+        </button>
+        <button class="stat-button stat-fix" type="button" data-stat-decision="fix" aria-pressed="false">
+          <span class="stat-mark" aria-hidden="true"></span><span class="stat-value" id="count-fix">0</span><span class="stat-label">Fix</span>
+        </button>
+        <button class="stat-button stat-discuss" type="button" data-stat-decision="discuss" aria-pressed="false">
+          <span class="stat-mark" aria-hidden="true"></span><span class="stat-value" id="count-discuss">0</span><span class="stat-label">Discuss</span>
+        </button>
+        <button class="stat-button stat-defer" type="button" data-stat-decision="defer" aria-pressed="false">
+          <span class="stat-mark" aria-hidden="true"></span><span class="stat-value" id="count-defer">0</span><span class="stat-label">Defer</span>
+        </button>
+        <button class="stat-button stat-reject" type="button" data-stat-decision="reject" aria-pressed="false">
+          <span class="stat-mark" aria-hidden="true"></span><span class="stat-value" id="count-reject">0</span><span class="stat-label">Reject</span>
+        </button>
+      </div>
+    </section>
+
+    <section class="panel filter-panel" aria-label="Finding filters">
+      <div class="filter-row">
+        <div class="field field-search">
+          <label for="search">Search everything</label>
+          <input id="search" type="search" placeholder="Title, evidence, file, reviewer, or note" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="severity-filter">Severity</label>
+          <select id="severity-filter">
+            <option value="all">All severities</option>
+            <option value="priority">Critical + high + medium-high</option>
+            <option value="critical">Critical</option>
+            <option value="high">High</option>
+            <option value="medium-high">Medium-high</option>
+            <option value="medium">Medium</option>
+            <option value="low-medium">Low-medium</option>
+            <option value="low">Low</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="category-filter">Category</label>
+          <select id="category-filter"><option value="all">All categories</option>@@CATEGORY_OPTIONS@@</select>
+        </div>
+        <div class="field">
+          <label for="agent-filter">Reviewer</label>
+          <select id="agent-filter"><option value="all">All reviewers</option>@@AGENT_OPTIONS@@</select>
+        </div>
+        <div class="field">
+          <label for="decision-filter">Decision</label>
+          <select id="decision-filter">
+            <option value="all">All decisions</option>
+            <option value="undecided">Undecided</option>
+            <option value="resolved">Resolved</option>
+            <option value="fix">Fix</option>
+            <option value="discuss">Discuss</option>
+            <option value="defer">Defer</option>
+            <option value="reject">Reject</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="sort-order">Sort</label>
+          <select id="sort-order">
+            <option value="rank">Review priority</option>
+            <option value="severity">Severity</option>
+            <option value="file">Primary file</option>
+            <option value="id">Finding ID</option>
+            <option value="decision">Decision</option>
+          </select>
+        </div>
+        <button class="button button-danger" id="reset-decisions" type="button">Reset local review work</button>
+      </div>
+      <div class="active-filter-chips" id="active-filter-chips" role="group" aria-label="Active filters" hidden></div>
+    </section>
+
+    <section class="panel bottom-control-panel" aria-label="Review actions">
+      <div class="action-row">
+        <button class="button button-primary" id="next-undecided" type="button">Next undecided</button>
+        <button class="button" id="toggle-controls" type="button" aria-pressed="false">Collapse controls</button>
+        <button class="button" id="clear-filters" type="button">Clear filters</button>
+        <button class="button" id="expand-visible" type="button">Expand visible</button>
+        <button class="button" id="collapse-all" type="button">Collapse all</button>
+        <div class="segmented-export" role="group" aria-label="Export and copy options">
+          <button class="button" id="export-html" type="button" aria-label="Export HTML snapshot" title="Export HTML snapshot">
+            <svg class="button-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><path d="M14 2v6h6M12 12v6M9 15l3 3 3-3"></path>
+            </svg><span class="segment-label">HTML</span>
+          </button>
+          <button class="button" id="export-json" type="button" aria-label="Export JSON" title="Export JSON">
+            <svg class="button-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24">
+              <path d="M12 3v12"></path><path d="m7 10 5 5 5-5"></path><path d="M5 21h14"></path>
+            </svg><span class="segment-label">JSON</span>
+          </button>
+          <button class="button" id="copy-json" type="button" aria-label="Copy JSON" title="Copy JSON">
+            <svg class="button-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24">
+              <rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+            </svg><span class="segment-label">Copy</span>
+          </button>
+          <button class="button" id="export-csv" type="button" aria-label="Export CSV" title="Export CSV">
+            <svg class="button-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24">
+              <rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M3 10h18M9 4v16M15 4v16"></path>
+            </svg><span class="segment-label">CSV</span>
+          </button>
+        </div>
+        <button class="button" id="import-button" type="button">
+          <svg class="button-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24">
+            <path d="M12 21V9"></path><path d="m7 14 5-5 5 5"></path><path d="M5 3h14"></path>
+          </svg>
+          Import decisions
+        </button>
+        <button class="button" id="undo-import" type="button" hidden>Undo import</button>
+        <label class="visually-hidden" for="import-file">Import decisions JSON file</label>
+        <input class="visually-hidden" id="import-file" type="file" accept="application/json,.json">
+        <label class="checkbox-control"><input id="hide-decided" type="checkbox"> Hide decided</label>
+        <span class="storage-warning" id="storage-warning" role="alert" hidden>Local save failed. Export or copy JSON now.</span>
+        <span class="shortcut-hint"><kbd>/</kbd> search, <kbd>N</kbd> next undecided</span>
+        <span class="shown-count" id="shown-count" aria-live="polite">Showing @@FINDING_COUNT@@ of @@FINDING_COUNT@@</span>
+      </div>
+    </section>
+
+    <noscript><p class="panel empty-state">JavaScript is required for filtering, persistence, and export. The complete table remains readable below.</p></noscript>
+
+    <section class="panel table-panel" aria-label="Findings decision table">
+      <div class="table-scroll" id="table-scroll">
+        <table>
+          <caption class="visually-hidden">Union of verifier findings with descriptions, evidence, proposed resolutions, decisions, and notes</caption>
+          <colgroup>
+            <col class="reference"><col class="finding"><col class="agents"><col class="decision"><col class="note">
+          </colgroup>
+          <thead>
+            <tr><th scope="col">Ref</th><th scope="col">Finding</th><th scope="col">Reported by</th><th scope="col">Decision</th><th scope="col">Note</th></tr>
+          </thead>
+          <tbody id="findings-body">
+@@FINDING_ROWS@@
+      </tbody>
+        </table>
+        <div class="empty-state" id="empty-state" hidden>No findings match these filters. Clear a filter or broaden the search.</div>
+      </div>
+    </section>
+  </main>
+
+  <dialog class="import-dialog" id="import-dialog" aria-labelledby="import-title">
+    <form method="dialog">
+      <h2 id="import-title">Import preview</h2>
+      <p id="import-summary">Review the import before changing local decisions and notes.</p>
+      <dl class="import-counts">
+        <div><dt>Valid matches</dt><dd id="import-matched-count">0</dd></div>
+        <div><dt>Unknown findings</dt><dd id="import-unmatched-count">0</dd></div>
+        <div><dt>Invalid entries</dt><dd id="import-invalid-count">0</dd></div>
+        <div><dt>Findings absent from file</dt><dd id="import-missing-count">0</dd></div>
+      </dl>
+      <p class="import-guidance"><strong>Merge matching</strong> preserves existing work for findings absent from the file. <strong>Replace all</strong> clears every decision and note before applying the valid matches.</p>
+      <div class="dialog-actions">
+        <button class="button" type="submit" value="cancel">Cancel</button>
+        <button class="button button-primary" type="submit" value="merge">Merge matching</button>
+        <button class="button button-danger" type="submit" value="replace">Replace all decisions and notes</button>
+      </div>
+    </form>
+  </dialog>
+
+  <footer class="page-footer">
+    Source: <code>@@SOURCE_NAME@@</code>. Decisions and notes stay in this browser until exported or reset.
+  </footer>
+
+  <script id="findings-data" type="application/json">@@FINDINGS_DATA@@</script>
+  <script>
+    'use strict';
+
+    const DATA = JSON.parse(document.getElementById('findings-data').textContent);
+    const FINDINGS = DATA.findings;
+    const FINDING_BY_ID = new Map(FINDINGS.map((finding) => [finding.id, finding]));
+    const DATASET_SIGNATURE = DATA.dataset_signature;
+    const STORAGE_KEY = DATA.embedded_snapshot_id
+      ? `branch-review-findings-snapshot-v1:${DATASET_SIGNATURE}:${DATA.embedded_snapshot_id}`
+      : `branch-review-findings-v1:${DATASET_SIGNATURE}`;
+    const DECISION_VALUES = ['undecided', 'resolved', 'fix', 'discuss', 'defer', 'reject'];
+    const SEVERITY_RANK = {critical: 0, high: 1, 'medium-high': 2, medium: 3, 'low-medium': 4, low: 5};
+    const DECISION_RANK = {undecided: 0, discuss: 1, fix: 2, defer: 3, reject: 4, resolved: 5};
+
+    const rows = Array.from(document.querySelectorAll('.finding-row'));
+    const rowById = new Map(rows.map((row) => [row.dataset.findingId, row]));
+    const controls = {
+      search: document.getElementById('search'),
+      severity: document.getElementById('severity-filter'),
+      category: document.getElementById('category-filter'),
+      agent: document.getElementById('agent-filter'),
+      decision: document.getElementById('decision-filter'),
+      sort: document.getElementById('sort-order'),
+      hideDecided: document.getElementById('hide-decided')
+    };
+    const progressPanel = document.querySelector('.progress-panel');
+    const filterPanel = document.querySelector('.filter-panel');
+    const bottomControlPanel = document.querySelector('.bottom-control-panel');
+    const controlStickySentinel = document.querySelector('.control-sticky-sentinel');
+
+    const defaultState = () => ({
+      version: 1,
+      datasetSignature: DATASET_SIGNATURE,
+      decisions: {...(DATA.initial_decisions || {})},
+      notes: {...(DATA.initial_notes || {})},
+      importRollback: null,
+      theme: DATA.initial_theme || 'auto',
+      density: DATA.initial_density || 'comfortable'
+    });
+
+    let state = defaultState();
+    let saveTimer = null;
+    let pinnedFindingId = null;
+    const pendingSaveIds = new Set();
+
+    function setSaveMessage(message) {
+      const saveState = document.getElementById('save-state');
+      saveState.textContent = message;
+      saveState.title = message;
+    }
+
+    function setRowSaveState(id, status, message) {
+      const row = rowById.get(id);
+      if (!row) return;
+      const hint = row.querySelector('.note-hint');
+      hint.dataset.state = status;
+      hint.textContent = message;
+    }
+
+    function setStorageFailure(failed) {
+      document.body.toggleAttribute('data-storage-failed', failed);
+      document.getElementById('storage-warning').hidden = !failed;
+    }
+
+    function setControlsStuck(stuck) {
+      if (stuck) document.body.dataset.controlsStuck = 'true';
+      else delete document.body.dataset.controlsStuck;
+    }
+
+    function updateStickyControlsOffset() {
+      const controlsAreSticky = getComputedStyle(progressPanel).position === 'sticky';
+      const offset = controlsAreSticky ? progressPanel.getBoundingClientRect().height : 0;
+      document.documentElement.style.setProperty('--sticky-controls-offset', `${offset}px`);
+      if (!controlsAreSticky) setControlsStuck(false);
+    }
+
+    function updateBottomControlsOffset() {
+      const controlsAreFixed = getComputedStyle(bottomControlPanel).position === 'fixed';
+      const offset = controlsAreFixed ? bottomControlPanel.getBoundingClientRect().height : 0;
+      document.documentElement.style.setProperty('--bottom-controls-offset', `${offset}px`);
+    }
+
+    const progressPanelResizeObserver = typeof ResizeObserver === 'function'
+      ? new ResizeObserver(updateStickyControlsOffset)
+      : null;
+    const bottomControlResizeObserver = typeof ResizeObserver === 'function'
+      ? new ResizeObserver(updateBottomControlsOffset)
+      : null;
+
+    function updateControlsStuckState() {
+      const controlsAreSticky = getComputedStyle(progressPanel).position === 'sticky';
+      const passedSentinel = controlStickySentinel.getBoundingClientRect().bottom <= 0;
+      setControlsStuck(controlsAreSticky && passedSentinel);
+    }
+
+    function loadState() {
+      try {
+        const stored = localStorage.getItem(STORAGE_KEY);
+        if (!stored) {
+          setSaveMessage(DATA.embedded_snapshot_id ? 'Loaded embedded decisions' : 'No local decisions yet');
+          return;
+        }
+        const parsed = JSON.parse(stored);
+        if (parsed.datasetSignature !== DATASET_SIGNATURE) {
+          setSaveMessage('Local save belongs to another dataset');
+          return;
+        }
+        state = {
+          ...defaultState(),
+          ...parsed,
+          decisions: parsed.decisions || {},
+          notes: parsed.notes || {}
+        };
+        setSaveMessage('Loaded local decisions');
+      } catch (error) {
+        console.warn('Cannot load local decisions', error);
+        setSaveMessage('Local save could not be loaded');
+      }
+    }
+
+    function persistNow() {
+      if (saveTimer !== null) {
+        window.clearTimeout(saveTimer);
+        saveTimer = null;
+      }
+      try {
+        state.updatedAt = new Date().toISOString();
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+        for (const id of pendingSaveIds) setRowSaveState(id, 'saved', 'Saved');
+        pendingSaveIds.clear();
+        setStorageFailure(false);
+        setSaveMessage('Saved locally');
+      } catch (error) {
+        console.warn('Cannot save local decisions', error);
+        for (const id of pendingSaveIds) setRowSaveState(id, 'failed', 'Save failed');
+        pendingSaveIds.clear();
+        setStorageFailure(true);
+        setSaveMessage('Local save failed. Export or copy JSON now.');
+      }
+    }
+
+    function scheduleSave(id) {
+      if (id) {
+        pendingSaveIds.add(id);
+        setRowSaveState(id, 'saving', 'Saving...');
+      }
+      if (saveTimer !== null) window.clearTimeout(saveTimer);
+      saveTimer = window.setTimeout(persistNow, 180);
+    }
+
+    function currentDecision(id) {
+      const value = state.decisions[id];
+      return DECISION_VALUES.includes(value) ? value : 'undecided';
+    }
+
+    function resizeNote(textarea) {
+      textarea.style.height = 'auto';
+      const nextHeight = Math.min(Math.max(textarea.scrollHeight, 68), 224);
+      textarea.style.height = `${nextHeight}px`;
+    }
+
+    function applyTheme() {
+      if (state.theme === 'auto') document.documentElement.removeAttribute('data-theme');
+      else document.documentElement.dataset.theme = state.theme;
+      document.getElementById('theme-toggle').textContent = `Theme: ${state.theme[0].toUpperCase()}${state.theme.slice(1)}`;
+    }
+
+    function applyDensity() {
+      document.body.dataset.density = state.density;
+      document.getElementById('density-toggle').textContent = `Density: ${state.density[0].toUpperCase()}${state.density.slice(1)}`;
+    }
+
+    function hydrateRows() {
+      for (const finding of FINDINGS) {
+        const row = rowById.get(finding.id);
+        const decision = currentDecision(finding.id);
+        row.dataset.decision = decision;
+        const selected = row.querySelector(`input[type="radio"][value="${decision}"]`);
+        if (selected) selected.checked = true;
+        const note = row.querySelector('textarea[data-note-id]');
+        note.value = state.notes[finding.id] || '';
+        resizeNote(note);
+        const hasStoredWork = Object.hasOwn(state.decisions, finding.id) || Object.hasOwn(state.notes, finding.id);
+        setRowSaveState(finding.id, hasStoredWork ? 'saved' : 'idle', hasStoredWork ? 'Loaded' : 'Not saved yet');
+      }
+      applyTheme();
+      applyDensity();
+    }
+
+    function normalizeSearch(value) {
+      return value.trim().toLocaleLowerCase();
+    }
+
+    function rowSearchText(finding) {
+      const locations = finding.locations.map((location) => `${location.file}:${location.line}`).join(' ');
+      const note = state.notes[finding.id] || '';
+      return normalizeSearch([
+        finding.id, finding.severity, finding.category, finding.title, locations,
+        finding.agents.join(' '), finding.description, finding.evidence,
+        finding.proposed_resolution, note
+      ].join(' '));
+    }
+
+    function matchesSeverity(finding, filter) {
+      if (filter === 'all') return true;
+      if (filter === 'priority')
+        return finding.severity === 'critical' || finding.severity === 'high' || finding.severity === 'medium-high';
+      return finding.severity === filter;
+    }
+
+    function compareRows(left, right) {
+      const leftFinding = FINDING_BY_ID.get(left.dataset.findingId);
+      const rightFinding = FINDING_BY_ID.get(right.dataset.findingId);
+      switch (controls.sort.value) {
+        case 'severity':
+          return SEVERITY_RANK[leftFinding.severity] - SEVERITY_RANK[rightFinding.severity]
+            || leftFinding.id.localeCompare(rightFinding.id);
+        case 'file':
+          return leftFinding.locations[0].file.localeCompare(rightFinding.locations[0].file)
+            || leftFinding.id.localeCompare(rightFinding.id);
+        case 'id':
+          return leftFinding.id.localeCompare(rightFinding.id);
+        case 'decision':
+          return DECISION_RANK[currentDecision(leftFinding.id)] - DECISION_RANK[currentDecision(rightFinding.id)]
+            || leftFinding.id.localeCompare(rightFinding.id);
+        default:
+          return Number(left.dataset.order) - Number(right.dataset.order);
+      }
+    }
+
+    function sortRows() {
+      const body = document.getElementById('findings-body');
+      rows.sort(compareRows);
+      for (const row of rows) body.appendChild(row);
+    }
+
+    function updateStatButtons() {
+      for (const button of document.querySelectorAll('[data-stat-decision]')) {
+        button.setAttribute('aria-pressed', String(controls.decision.value === button.dataset.statDecision));
+      }
+    }
+
+    function updateActiveFilters() {
+      const active = [];
+      if (controls.search.value.trim())
+        active.push({label: `Search: ${controls.search.value.trim()}`, clear: () => { controls.search.value = ''; }});
+      if (controls.severity.value !== 'all')
+        active.push({label: `Severity: ${controls.severity.selectedOptions[0].textContent}`, clear: () => { controls.severity.value = 'all'; }});
+      if (controls.category.value !== 'all')
+        active.push({label: `Category: ${controls.category.selectedOptions[0].textContent}`, clear: () => { controls.category.value = 'all'; }});
+      if (controls.agent.value !== 'all')
+        active.push({label: `Agent: ${controls.agent.selectedOptions[0].textContent}`, clear: () => { controls.agent.value = 'all'; }});
+      if (controls.decision.value !== 'all')
+        active.push({label: `Decision: ${controls.decision.selectedOptions[0].textContent}`, clear: () => { controls.decision.value = 'all'; }});
+      if (controls.hideDecided.checked)
+        active.push({label: 'Hide decided', clear: () => { controls.hideDecided.checked = false; }});
+
+      const container = document.getElementById('active-filter-chips');
+      container.replaceChildren();
+      for (const filter of active) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'active-filter-chip';
+        button.textContent = `${filter.label} ×`;
+        button.addEventListener('click', () => {
+          filter.clear();
+          pinnedFindingId = null;
+          applyFilters();
+        });
+        container.appendChild(button);
+      }
+      container.hidden = active.length === 0;
+    }
+
+    function applyFilters() {
+      sortRows();
+      const queryTokens = normalizeSearch(controls.search.value).split(/\s+/).filter(Boolean);
+      let shown = 0;
+      for (const finding of FINDINGS) {
+        const row = rowById.get(finding.id);
+        const decision = currentDecision(finding.id);
+        const haystack = rowSearchText(finding);
+        const matchesQuery = queryTokens.every((token) => haystack.includes(token));
+        const matchesFilters = matchesQuery
+          && matchesSeverity(finding, controls.severity.value)
+          && (controls.category.value === 'all' || finding.category === controls.category.value)
+          && (controls.agent.value === 'all' || finding.agents.includes(controls.agent.value))
+          && (controls.decision.value === 'all' || decision === controls.decision.value)
+          && (!controls.hideDecided.checked || decision === 'undecided');
+        const visible = matchesFilters || finding.id === pinnedFindingId;
+        row.hidden = !visible;
+        row.classList.toggle('pinned-review', finding.id === pinnedFindingId);
+        if (visible) shown += 1;
+      }
+      document.getElementById('shown-count').textContent = `Showing ${shown} of ${FINDINGS.length}`;
+      document.getElementById('empty-state').hidden = shown !== 0;
+      updateStatButtons();
+      updateActiveFilters();
+    }
+
+    function updateSummary() {
+      const counts = Object.fromEntries(DECISION_VALUES.map((decision) => [decision, 0]));
+      for (const finding of FINDINGS) counts[currentDecision(finding.id)] += 1;
+      for (const decision of DECISION_VALUES) {
+        document.getElementById(`count-${decision}`).textContent = String(counts[decision]);
+      }
+      const decided = FINDINGS.length - counts.undecided;
+      const percent = FINDINGS.length === 0 ? 0 : Math.round((decided / FINDINGS.length) * 100);
+      document.getElementById('decided-count').textContent = String(decided);
+      document.getElementById('progress-percent').textContent = `${percent}%`;
+      document.getElementById('progress-fill').style.width = `${percent}%`;
+      const track = document.getElementById('progress-track');
+      track.setAttribute('aria-valuenow', String(decided));
+      track.setAttribute('aria-valuetext', `${decided} of ${FINDINGS.length} findings decided`);
+    }
+
+    function refreshAll() {
+      hydrateRows();
+      updateSummary();
+      applyFilters();
+      updateUndoImportButton();
+    }
+
+    function clearFilters() {
+      controls.search.value = '';
+      controls.severity.value = 'all';
+      controls.category.value = 'all';
+      controls.agent.value = 'all';
+      controls.decision.value = 'all';
+      controls.hideDecided.checked = false;
+      pinnedFindingId = null;
+      applyFilters();
+    }
+
+    function focusFinding(row) {
+      row.hidden = false;
+      row.scrollIntoView({behavior: 'smooth', block: 'center', inline: 'nearest'});
+      row.classList.remove('pulse');
+      void row.offsetWidth;
+      row.classList.add('pulse');
+      const firstAction = row.querySelector('input[type="radio"][value="resolved"]');
+      window.setTimeout(() => {
+        firstAction.focus();
+        firstAction.scrollIntoView({behavior: 'smooth', block: 'center', inline: 'nearest'});
+      }, 220);
+    }
+
+    function findNextVisibleUndecidedAfter(currentRow) {
+      const start = Math.max(rows.indexOf(currentRow), -1);
+      for (let offset = 1; offset <= rows.length; offset += 1) {
+        const candidate = rows[(start + offset) % rows.length];
+        if (!candidate.hidden && currentDecision(candidate.dataset.findingId) === 'undecided') return candidate;
+      }
+      return null;
+    }
+
+    function saveAndAdvance(row) {
+      persistNow();
+      pinnedFindingId = null;
+      applyFilters();
+      let target = findNextVisibleUndecidedAfter(row);
+      if (!target) {
+        const hasUndecided = rows.some((candidate) => currentDecision(candidate.dataset.findingId) === 'undecided');
+        if (hasUndecided) {
+          clearFilters();
+          target = findNextVisibleUndecidedAfter(row);
+        }
+      }
+      if (target) focusFinding(target);
+      else setSaveMessage('Every finding has a decision');
+    }
+
+    function goToNextUndecided() {
+      let target = rows.find((row) => !row.hidden && currentDecision(row.dataset.findingId) === 'undecided');
+      if (!target) {
+        target = rows.find((row) => currentDecision(row.dataset.findingId) === 'undecided');
+        if (target) {
+          clearFilters();
+          applyFilters();
+        }
+      }
+      if (target) focusFinding(target);
+      else setSaveMessage('Every finding has a decision');
+    }
+
+    function download(name, content, type) {
+      const blob = new Blob([content], {type});
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = name;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    function exportPayload() {
+      return {
+        schema_version: 1,
+        decision_schema_version: DATA.decision_schema_version,
+        dataset_signature: DATASET_SIGNATURE,
+        source: DATA.source,
+        generated_from: DATA.generated_from,
+        exported_at: new Date().toISOString(),
+        findings: FINDINGS.map((finding) => ({
+          id: finding.id,
+          severity: finding.severity,
+          category: finding.category,
+          title: finding.title,
+          locations: finding.locations,
+          agents: finding.agents,
+          decision: currentDecision(finding.id),
+          note: state.notes[finding.id] || ''
+        }))
+      };
+    }
+
+    // Returns the current export as formatted JSON for both download and clipboard actions.
+    function exportJsonText() {
+      return `${JSON.stringify(exportPayload(), null, 2)}\n`;
+    }
+
+    function embeddedSnapshotData() {
+      const embeddedAt = new Date().toISOString();
+      return {
+        ...DATA,
+        initial_decisions: Object.fromEntries(
+          FINDINGS.map((finding) => [finding.id, currentDecision(finding.id)])
+        ),
+        initial_notes: Object.fromEntries(
+          FINDINGS.map((finding) => [finding.id, state.notes[finding.id] || ''])
+        ),
+        initial_theme: state.theme,
+        initial_density: state.density,
+        embedded_snapshot_id: embeddedAt,
+        embedded_snapshot_at: embeddedAt
+      };
+    }
+
+    function jsonForEmbeddedScript(value) {
+      return JSON.stringify(value)
+        .replaceAll('<', '\\u003c')
+        .replaceAll('>', '\\u003e')
+        .replaceAll('&', '\\u0026')
+        .replaceAll(String.fromCharCode(0x2028), '\\u2028')
+        .replaceAll(String.fromCharCode(0x2029), '\\u2029');
+    }
+
+    function exportHtmlText() {
+      const root = document.documentElement.cloneNode(true);
+      const dataScript = root.querySelector('#findings-data');
+      if (!dataScript) throw new Error('findings data script is missing');
+      dataScript.textContent = jsonForEmbeddedScript(embeddedSnapshotData());
+      return `<!doctype html>\n${root.outerHTML}\n`;
+    }
+
+    function exportHtmlSnapshot() {
+      try {
+        download(
+          `${DATA.export_basename}-decisions.html`,
+          exportHtmlText(),
+          'text/html;charset=utf-8'
+        );
+        setSaveMessage('HTML snapshot exported with decisions embedded');
+      } catch (error) {
+        console.warn('Cannot export HTML snapshot', error);
+        setSaveMessage('HTML snapshot export failed. Use Export JSON instead.');
+      }
+    }
+
+    // Copies content through the selection API, restores focus, and returns whether
+    // the browser accepted the command. This keeps file:// exports usable.
+    function copyTextWithSelectionFallback(content) {
+      const previousFocus = document.activeElement;
+      const copySource = document.createElement('textarea');
+      copySource.className = 'visually-hidden';
+      copySource.value = content;
+      copySource.readOnly = true;
+      copySource.setAttribute('aria-hidden', 'true');
+      document.body.appendChild(copySource);
+
+      let copied = false;
+      try {
+        copySource.select();
+        copied = document.execCommand('copy');
+      } finally {
+        copySource.remove();
+        if (previousFocus instanceof HTMLElement) previousFocus.focus();
+      }
+      return copied;
+    }
+
+    // Copies the JSON export and resolves after the live status reports the outcome.
+    async function copyExportJson() {
+      const content = exportJsonText();
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          try {
+            await navigator.clipboard.writeText(content);
+            setSaveMessage('Export JSON copied');
+            return;
+          } catch {
+            // Standalone files may lack Clipboard API permission, so use the selection fallback.
+          }
+        }
+
+        if (!copyTextWithSelectionFallback(content))
+          throw new Error('browser rejects clipboard copy');
+        setSaveMessage('Export JSON copied');
+      } catch (error) {
+        console.warn('Cannot copy export JSON', error);
+        setSaveMessage('Copy failed. Use Export JSON instead.');
+      }
+    }
+
+    function csvCell(value) {
+      const text = String(value ?? '');
+      // Spreadsheet applications can execute leading formula markers in imported CSV cells.
+      const safeText = /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
+      return `"${safeText.replaceAll('"', '""')}"`;
+    }
+
+    function exportCsv() {
+      const header = ['id', 'severity', 'category', 'title', 'locations', 'agents', 'decision', 'note'];
+      const lines = [header.map(csvCell).join(',')];
+      for (const finding of FINDINGS) {
+        const locations = finding.locations.map((location) => `${location.file}:${location.line}`).join(' | ');
+        lines.push([
+          finding.id, finding.severity, finding.category, finding.title, locations,
+          finding.agents.join(' | '), currentDecision(finding.id), state.notes[finding.id] || ''
+        ].map(csvCell).join(','));
+      }
+      download(`${DATA.export_basename}-decisions.csv`, `${lines.join('\n')}\n`, 'text/csv;charset=utf-8');
+    }
+
+    function inspectImportPayload(parsed) {
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+        throw new Error('import file must contain a JSON object');
+      if (parsed.schema_version !== 1)
+        throw new Error('import file schema_version must be 1');
+      if (parsed.dataset_signature !== DATASET_SIGNATURE)
+        throw new Error('import file belongs to a different findings dataset');
+      if (!Array.isArray(parsed.findings))
+        throw new Error('import file must contain a findings array');
+
+      const entries = [];
+      const unmatched = [];
+      const invalid = [];
+      const seenIds = new Set();
+      const presentFindingIds = new Set();
+      for (const candidate of parsed.findings) {
+        if (!candidate || typeof candidate !== 'object' || typeof candidate.id !== 'string') {
+          invalid.push(candidate);
+          continue;
+        }
+        if (FINDING_BY_ID.has(candidate.id)) presentFindingIds.add(candidate.id);
+        if (seenIds.has(candidate.id)) {
+          invalid.push(candidate);
+          continue;
+        }
+        seenIds.add(candidate.id);
+        if (!FINDING_BY_ID.has(candidate.id)) {
+          unmatched.push(candidate);
+          continue;
+        }
+        if (!DECISION_VALUES.includes(candidate.decision) || typeof candidate.note !== 'string') {
+          invalid.push(candidate);
+          continue;
+        }
+        entries.push({id: candidate.id, decision: candidate.decision, note: candidate.note});
+      }
+
+      if (entries.length === 0)
+        throw new Error(`import contains no valid matching findings (${unmatched.length} unknown, ${invalid.length} invalid)`);
+
+      return {
+        entries,
+        unmatched,
+        invalid,
+        missingCount: FINDINGS.filter((finding) => !presentFindingIds.has(finding.id)).length
+      };
+    }
+
+    function chooseImportMode(preview) {
+      const dialog = document.getElementById('import-dialog');
+      document.getElementById('import-matched-count').textContent = String(preview.entries.length);
+      document.getElementById('import-unmatched-count').textContent = String(preview.unmatched.length);
+      document.getElementById('import-invalid-count').textContent = String(preview.invalid.length);
+      document.getElementById('import-missing-count').textContent = String(preview.missingCount);
+      document.getElementById('import-summary').textContent = `${preview.entries.length} valid finding${preview.entries.length === 1 ? '' : 's'} can be imported from this file.`;
+      dialog.returnValue = 'cancel';
+      return new Promise((resolve) => {
+        dialog.addEventListener('close', () => {
+          resolve(dialog.returnValue === 'merge' || dialog.returnValue === 'replace' ? dialog.returnValue : null);
+        }, {once: true});
+        dialog.showModal();
+      });
+    }
+
+    function updateUndoImportButton() {
+      document.getElementById('undo-import').hidden = !state.importRollback;
+    }
+
+    function invalidateImportRollback() {
+      if (!state.importRollback) return;
+      state.importRollback = null;
+      updateUndoImportButton();
+    }
+
+    function applyImport(preview, mode) {
+      state.importRollback = {
+        decisions: {...state.decisions},
+        notes: {...state.notes},
+        createdAt: new Date().toISOString()
+      };
+      const nextDecisions = mode === 'replace' ? {} : {...state.decisions};
+      const nextNotes = mode === 'replace' ? {} : {...state.notes};
+      for (const entry of preview.entries) {
+        nextDecisions[entry.id] = entry.decision;
+        nextNotes[entry.id] = entry.note;
+      }
+      state.decisions = nextDecisions;
+      state.notes = nextNotes;
+      for (const entry of preview.entries) pendingSaveIds.add(entry.id);
+      refreshAll();
+      for (const entry of preview.entries) setRowSaveState(entry.id, 'saving', 'Saving...');
+      persistNow();
+      updateUndoImportButton();
+      const verb = mode === 'replace' ? 'Replaced review work with' : 'Merged';
+      setSaveMessage(`${verb} ${preview.entries.length} imported findings`);
+    }
+
+    async function importFile(file) {
+      const parsed = JSON.parse(await file.text());
+      const preview = inspectImportPayload(parsed);
+      const mode = await chooseImportMode(preview);
+      if (!mode) return;
+      applyImport(preview, mode);
+    }
+
+    function undoLastImport() {
+      if (!state.importRollback) return;
+      const rollback = state.importRollback;
+      const affectedIds = new Set([
+        ...Object.keys(state.decisions), ...Object.keys(state.notes),
+        ...Object.keys(rollback.decisions), ...Object.keys(rollback.notes)
+      ]);
+      state.decisions = {...rollback.decisions};
+      state.notes = {...rollback.notes};
+      state.importRollback = null;
+      for (const id of affectedIds) pendingSaveIds.add(id);
+      refreshAll();
+      for (const id of affectedIds) setRowSaveState(id, 'saving', 'Saving...');
+      persistNow();
+      updateUndoImportButton();
+      setSaveMessage('Import undone');
+    }
+
+    loadState();
+    refreshAll();
+    updateStickyControlsOffset();
+    updateBottomControlsOffset();
+    updateControlsStuckState();
+    if (progressPanelResizeObserver) progressPanelResizeObserver.observe(progressPanel);
+    if (bottomControlResizeObserver) bottomControlResizeObserver.observe(bottomControlPanel);
+    window.addEventListener('scroll', updateControlsStuckState, {passive: true});
+    window.addEventListener('resize', () => {
+      updateStickyControlsOffset();
+      updateBottomControlsOffset();
+      updateControlsStuckState();
+    });
+
+    for (const input of Object.values(controls)) {
+      const eventName = input === controls.search ? 'input' : 'change';
+      input.addEventListener(eventName, () => {
+        pinnedFindingId = null;
+        if (input === controls.decision && controls.decision.value !== 'all' && controls.decision.value !== 'undecided')
+          controls.hideDecided.checked = false;
+        if (input === controls.hideDecided && controls.hideDecided.checked
+            && controls.decision.value !== 'all' && controls.decision.value !== 'undecided')
+          controls.decision.value = 'all';
+        applyFilters();
+      });
+    }
+
+    document.addEventListener('change', (event) => {
+      const radio = event.target.closest('input[type="radio"][data-finding-id]');
+      if (!radio) return;
+      const id = radio.dataset.findingId;
+      invalidateImportRollback();
+      state.decisions[id] = radio.value;
+      rowById.get(id).dataset.decision = radio.value;
+      const decisionFilterWouldHide = controls.decision.value !== 'all' && controls.decision.value !== radio.value;
+      const hideDecidedWouldHide = controls.hideDecided.checked && radio.value !== 'undecided';
+      if (radio.value !== 'undecided' && (decisionFilterWouldHide || hideDecidedWouldHide)) pinnedFindingId = id;
+      else if (pinnedFindingId === id) pinnedFindingId = null;
+      scheduleSave(id);
+      updateSummary();
+      applyFilters();
+    });
+
+    document.addEventListener('input', (event) => {
+      const note = event.target.closest('textarea[data-note-id]');
+      if (!note) return;
+      invalidateImportRollback();
+      state.notes[note.dataset.noteId] = note.value;
+      resizeNote(note);
+      scheduleSave(note.dataset.noteId);
+      if (controls.search.value) applyFilters();
+    });
+
+    document.addEventListener('click', (event) => {
+      const advance = event.target.closest('.row-advance');
+      if (!advance) return;
+      saveAndAdvance(advance.closest('.finding-row'));
+    });
+
+    for (const button of document.querySelectorAll('[data-stat-decision]')) {
+      button.addEventListener('click', () => {
+        const value = button.dataset.statDecision;
+        controls.decision.value = controls.decision.value === value ? 'all' : value;
+        controls.hideDecided.checked = false;
+        pinnedFindingId = null;
+        applyFilters();
+      });
+    }
+
+    document.getElementById('next-undecided').addEventListener('click', goToNextUndecided);
+    document.getElementById('toggle-controls').addEventListener('click', (event) => {
+      const collapsed = filterPanel.classList.toggle('controls-collapsed');
+      event.currentTarget.setAttribute('aria-pressed', String(collapsed));
+      event.currentTarget.textContent = collapsed ? 'Expand controls' : 'Collapse controls';
+    });
+    document.getElementById('clear-filters').addEventListener('click', clearFilters);
+    document.getElementById('expand-visible').addEventListener('click', () => {
+      for (const row of rows) if (!row.hidden) row.querySelector('details').open = true;
+    });
+    document.getElementById('collapse-all').addEventListener('click', () => {
+      for (const row of rows) row.querySelector('details').open = false;
+    });
+
+    document.getElementById('theme-toggle').addEventListener('click', () => {
+      const themes = ['auto', 'light', 'dark'];
+      state.theme = themes[(themes.indexOf(state.theme) + 1) % themes.length];
+      applyTheme();
+      scheduleSave();
+    });
+
+    document.getElementById('density-toggle').addEventListener('click', () => {
+      state.density = state.density === 'comfortable' ? 'compact' : 'comfortable';
+      applyDensity();
+      scheduleSave();
+    });
+
+    document.getElementById('export-json').addEventListener('click', () => {
+      download(`${DATA.export_basename}-decisions.json`, exportJsonText(), 'application/json;charset=utf-8');
+    });
+    document.getElementById('export-html').addEventListener('click', exportHtmlSnapshot);
+    document.getElementById('copy-json').addEventListener('click', copyExportJson);
+    document.getElementById('export-csv').addEventListener('click', exportCsv);
+
+    const importInput = document.getElementById('import-file');
+    document.getElementById('import-button').addEventListener('click', () => importInput.click());
+    document.getElementById('undo-import').addEventListener('click', undoLastImport);
+    importInput.addEventListener('change', async () => {
+      const file = importInput.files && importInput.files[0];
+      if (!file) return;
+      try {
+        await importFile(file);
+      } catch (error) {
+        console.error('Cannot import decisions', error);
+        window.alert(`Cannot import decisions: ${error.message}`);
+      } finally {
+        importInput.value = '';
+      }
+    });
+
+    document.getElementById('reset-decisions').addEventListener('click', () => {
+      if (!window.confirm('Reset local review work to this board\'s supplied starting state? Export or copy first if you may need it later.')) return;
+      state = {...defaultState(), theme: state.theme, density: state.density};
+      refreshAll();
+      persistNow();
+      setSaveMessage('Local review work reset');
+    });
+
+    controls.search.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      controls.search.value = '';
+      applyFilters();
+      controls.search.blur();
+    });
+
+    document.addEventListener('keydown', (event) => {
+      const target = event.target;
+      const isEditing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement;
+      if (event.key === '/' && !isEditing) {
+        event.preventDefault();
+        controls.search.focus();
+      } else if (event.key.toLocaleLowerCase() === 'n' && !isEditing) {
+        event.preventDefault();
+        goToNextUndecided();
+      }
+    });
+
+    window.addEventListener('beforeunload', () => {
+      if (saveTimer !== null) persistNow();
+    });
+
+    if (window.location.hash.startsWith('#finding-')) {
+      const target = document.getElementById(window.location.hash.slice(1));
+      if (target) window.setTimeout(() => focusFinding(target), 80);
+    }
+  </script>
+</body>
+</html>
