@@ -806,6 +806,20 @@ class Needs:
                 f"maybe={sorted(n.name for n in self._maybe)})")
 
 
+# What a team directory holds that this tool or the harness wrote. One list,
+# because two questions are asked of it and they must not drift: the sweep asks
+# whether a directory holds anything else before removing it, and the reap asks
+# which entries it may delete. A reap that recognised a name the sweep does not
+# would delete a file the sweep was written to spare.
+SCAFFOLDING = frozenset({
+    "config.json",
+    "inboxes",              # holding .json mailboxes and nothing else
+    f"config.json.bak-{TOOL}",
+    f"config.json.tmp-{TOOL}",
+    "config.json.lock",
+})
+
+
 class Resolver:
     """Everything a resolution reads, loaded once per run and held together.
 
@@ -1641,17 +1655,11 @@ class Resolver:
         reaper needs one verdict: the roster arm (is there a config.json, and
         does it read as a roster) and the mailbox arm (is every inbox a real
         mailbox, and is every mailbox empty). Every entry must be something
-        this tool or the harness is known to create, and known to be
-        contentless. Anything unrecognised, anything nested, any symlink, and
-        any inbox holding mail means the directory is spared.
+        this tool or the harness is known to create, from SCAFFOLDING, and
+        known to be contentless. Anything unrecognised, anything nested, any
+        symlink, and any inbox holding mail means the directory is spared.
         """
-        known = {
-            "config.json",
-            "inboxes",
-            f"config.json.bak-{TOOL}",
-            f"config.json.tmp-{TOOL}",
-            "config.json.lock",
-        }
+        known = SCAFFOLDING
         try:
             entries = list(team_dir.iterdir())
         except OSError as exc:
@@ -1698,6 +1706,49 @@ class Resolver:
         if not isinstance(data, dict) or not isinstance(data.get("members", []), list):
             return "config.json is not a roster"
         return None
+
+    def scaffolding_and_strays(self, team_dir):
+        """What this tool made in this directory, and what it did not.
+
+        Returns (paths it made, names it did not), the names relative to
+        team_dir so a report can say "inboxes/scratch" rather than a whole
+        path. Recognised is SCAFFOLDING, the same list the sweep's
+        scaffolding_objection works from, plus the rule inside inboxes: a
+        mailbox is a .json file and nothing else there is ours.
+
+        Never a symlink, whatever it is called, and never a directory where a
+        file belongs. The sweep spares a directory holding either of those, and
+        a delete step that recognised more than the sweep does would remove
+        what the sweep was written to keep.
+
+        Nothing here acts. A caller that deletes asks first and then deletes
+        from the answer, so what may go is settled before any of it goes and
+        the walk is not reading a directory it is changing.
+        """
+        mine, strays = [], []
+        try:
+            entries = sorted(team_dir.iterdir())
+        except OSError as exc:
+            return [], [f"unreadable ({exc})"]
+        for item in entries:
+            if item.name not in SCAFFOLDING or item.is_symlink():
+                strays.append(item.name)
+            elif item.name == "inboxes":
+                try:
+                    boxes = sorted(item.iterdir())
+                except OSError as exc:
+                    strays.append(f"inboxes ({exc})")
+                    continue
+                for box in boxes:
+                    if box.is_symlink() or not box.is_file() or box.suffix != ".json":
+                        strays.append(f"inboxes/{box.name}")
+                    else:
+                        mine.append(box)
+            elif not item.is_file():
+                strays.append(item.name)
+            else:
+                mine.append(item)
+        return mine, strays
 
     def receipt_contents(self, team_dir, only=None):
         """What a receipt taken from this team directory would hold, verbatim.
@@ -7494,6 +7545,15 @@ def reap_team(team, dry=False, prefix=""):
     name, the receipt is not written, nothing is deleted, and the refusal names
     the file that moved. Retrying would only ask the same broken question again.
 
+    Then the delete, and only of files this tool made: the SCAFFOLDING names
+    the sweep works from, and .json mailboxes inside inboxes. A team directory
+    can hold a stray somebody put there, notes.txt or a scratch file, and it is
+    not ours to remove because it was standing next to our config.json. What
+    may go is decided before any of it goes, and anything else keeps the
+    directory: it goes back under the team's own name holding what was kept,
+    and the report names it. The retirement holds either way, since the roster
+    is in the receipt and off the disk, which is all a retirement is.
+
     A dry run cannot claim anything, because it makes no cut. It reads the live
     directory once and says what a receipt taken at that moment would hold;
     anything written after that read is in no preview.
@@ -7552,19 +7612,50 @@ def reap_team(team, dry=False, prefix=""):
 
     RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
     replace_json(receipt_at, receipt)
-    try:
-        # The whole directory in one act, receipt first. It is already out of
-        # reach under a staged name, so an interrupted delete leaves the staged
-        # team the sweep understands rather than a headless live one.
-        shutil.rmtree(staged)
-    except OSError as exc:
-        warn(f"{team}'s bytes are in {receipt_at}, but the staged copy at "
-             f"{staged} could not be removed: {exc}")
+
+    # Receipt first, then the delete, and only of what this tool made. A team
+    # directory can hold a file somebody put there by hand, and standing next
+    # to our scaffolding is not what makes something ours to remove. What may
+    # go is decided in one read before any of it goes.
+    mine, strays = RESOLVER.scaffolding_and_strays(staged)
+    for path in sorted(mine, key=lambda p: p.name == "config.json"):
+        # config.json last: an interrupted delete leaves something the sweep
+        # still reads as a team rather than a directory with no roster.
+        try:
+            path.unlink()
+        except OSError as exc:
+            strays.append(f"{path.relative_to(staged)} ({exc})")
+    for empty in (staged / "inboxes", staged):
+        try:
+            empty.rmdir()
+        except OSError:
+            pass    # something is still in it, and what that is is said below
     step(False, "", f"archived {said_reads(caught)}" + (
         f", including {', '.join(late)}, written after the first read" if late else ""),
         indent=prefix)
 
-    if team in {d.name for d in RESOLVER.team_dirs()}:
+    if staged.is_dir():
+        # Kept, not deleted, and put back where its owner left it. The team is
+        # retired all the same: the roster is in the receipt and off the disk,
+        # and that is the whole of what a retirement is.
+        held = (f"holds {some_of(strays)}, which this tool did not put there"
+                if strays else "would not go although this tool's own files "
+                "are gone from it")
+        where, aside = team_dir, ""
+        if team in {d.name for d in RESOLVER.team_dirs()}:
+            where, aside = staged, (
+                f"; the name {team_dir} is taken again, by something that "
+                "remade it after the cut, so this is left where it is rather "
+                "than written over that")
+        else:
+            try:
+                os.rename(staged, team_dir)
+            except OSError as exc:
+                where, aside = staged, f"; putting it back under its own name failed: {exc}"
+        warn(f"{team}'s directory {held}, so nothing there was deleted and it "
+             f"is at {where}{aside}. Its roster is archived in {receipt_at} and "
+             "gone from disk either way, so the team is retired")
+    elif team in {d.name for d in RESOLVER.team_dirs()}:
         waiting = [f"{RESOLVER.inbox_path(team, name)} ({count})"
                    for name, (count, _oldest) in sorted(RESOLVER.inbox_state(team).items())
                    if count]
@@ -13314,6 +13405,89 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         check("reap-aborts-on-a-write-past-the-cut",
               "a write after the cut puts the directory back and deletes nothing",
               not kept, ", ".join(kept))
+
+    # --- and what the delete step is allowed to take. A team directory can
+    # hold a file this tool never wrote, and being next to our config.json is
+    # not what makes it ours. The reap archives and removes its own
+    # scaffolding, leaves the stray where its owner left it, and puts the
+    # directory back under the team's own name holding only that. The team is
+    # retired all the same, which is why the roster is checked here too: the
+    # receipt has it and the disk does not.
+    with tempfile.TemporaryDirectory() as td:
+        teams = Path(td) / "teams"
+        tdir = teams / "TEAMSTRAY"
+        roster = '{"name": "TEAMSTRAY", "members": []}'
+        (tdir / "inboxes").mkdir(parents=True)
+        (tdir / "config.json").write_text(roster)
+        (tdir / "config.json.lock").write_text("")
+        (tdir / "inboxes" / "mate.json").write_text("[]")
+        (tdir / "notes.txt").write_text("somebody's scratch file")
+        real_teams, real_receipts = RESOLVER.teams_dir, RECEIPTS_DIR
+        RESOLVER.teams_dir = teams
+        globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
+        said = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(said), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                reap_team("TEAMSTRAY")
+            archived = load_receipt("TEAMSTRAY")
+        finally:
+            RESOLVER.teams_dir = real_teams
+            globals()["RECEIPTS_DIR"] = real_receipts
+        told = " ".join(said.getvalue().split())
+        swept = []
+        if not (tdir / "notes.txt").is_file():
+            swept.append("the stray file went with the scaffolding")
+        elif (tdir / "notes.txt").read_text() != "somebody's scratch file":
+            swept.append("the stray file is not the bytes its owner left")
+        if (tdir / "config.json").exists():
+            swept.append("the roster outlived the reap, so nothing was retired")
+        if not archived or archived.get("config") != roster:
+            swept.append("the roster did not ride the receipt")
+        if (tdir / "inboxes").exists() or (tdir / "config.json.lock").exists():
+            swept.append("scaffolding this tool wrote was left behind")
+        if list(teams.glob("TEAMSTRAY" + STAGING + "*")):
+            swept.append("the remains were left under the staged name")
+        if "notes.txt" not in told:
+            swept.append(f"the reap did not name what it kept: {told or 'it said nothing'}")
+        if "retired" not in told:
+            swept.append(f"the reap did not say the retirement held: "
+                         f"{told or 'it said nothing'}")
+        check("reap-keeps-what-it-did-not-make",
+              "a reap removes its own scaffolding and keeps a file it did not write",
+              not swept, ", ".join(swept))
+
+    # --- and both of those work from one list of what this tool's own files
+    # are called. The sweep asks whether a team directory holds anything else
+    # before removing it; the reap asks which entries it may delete. Two lists
+    # could answer differently, and the way that would show is a reap deleting
+    # a file the sweep was written to spare.
+    listed = [node.lineno for node in ast.walk(tree)
+              if isinstance(node, (ast.Set, ast.List, ast.Tuple))
+              and any(isinstance(part, ast.Constant) and part.value == "config.json.lock"
+                      for part in node.elts)]
+    defined = [node for node in tree.body if isinstance(node, ast.Assign)
+               and any(isinstance(target, ast.Name) and target.id == "SCAFFOLDING"
+                       for target in node.targets)]
+    forked = []
+    if len(defined) != 1:
+        forked.append(f"SCAFFOLDING is assigned {len(defined)} time(s), not once")
+    else:
+        span = range(defined[0].lineno, (defined[0].end_lineno or defined[0].lineno) + 1)
+        elsewhere = [line for line in listed if line not in span]
+        if elsewhere:
+            forked.append("the names are listed again at line "
+                          + ", ".join(str(line) for line in elsewhere))
+    for named in ("scaffolding_objection", "scaffolding_and_strays"):
+        node = funcs.get(named)
+        if not node:
+            forked.append(f"{named} is gone, so the pair this holds together is not there")
+        elif "SCAFFOLDING" not in {sub.id for sub in ast.walk(node)
+                                   if isinstance(sub, ast.Name)}:
+            forked.append(f"{named} does not read SCAFFOLDING")
+    check("scaffolding-named-once",
+          "the sweep and the reap work from one list of this tool's own files",
+          not forked, "; ".join(forked))
 
     # --- the same catch one file down, through the demote that archives a
     # single inbox. The window there is between reading the mailbox and putting
