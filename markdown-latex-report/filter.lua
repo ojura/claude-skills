@@ -738,3 +738,49 @@ function RawInline(elem)
   elem.text = add_breaks_to_latex(elem.text)
   return elem
 end
+
+-- ---------------------------------------------------------------------------
+-- Vector-figure promotion. Chart scripts write each plot twice with the same
+-- basename: a raster .png (what the Markdown references, so plain-Markdown
+-- preview keeps working) and a vector .pdf sibling. For the LaTeX build only,
+-- an image whose .png source has a .pdf sibling on disk is promoted to the
+-- vector file. Images without a sibling (photos, renders, screenshots) pass
+-- through untouched, so the rule applies itself only to plots that opted in.
+local function file_exists(path)
+  local f = io.open(path, "r")
+  if f then f:close(); return true end
+  return false
+end
+
+local function resolve_on_resource_path(src)
+  if src:match("^/") then
+    return file_exists(src) and src or nil
+  end
+  local dirs = { "." }
+  local ok, rp = pcall(function() return PANDOC_STATE.resource_path end)
+  if ok and type(rp) == "table" then dirs = rp end
+  for _, dir in ipairs(dirs) do
+    local cand = tostring(dir) .. "/" .. src
+    if file_exists(cand) then return cand end
+  end
+  -- last resort: next to the first input file
+  local ok2, files = pcall(function() return PANDOC_STATE.input_files end)
+  if ok2 and files and files[1] then
+    local base = tostring(files[1]):match("(.*/)") or "./"
+    local cand = base .. src
+    if file_exists(cand) then return cand end
+  end
+  return nil
+end
+
+function Image(img)
+  if not FORMAT:match("latex") then return nil end
+  if not img.src:match("%.png$") then return nil end
+  local sibling = img.src:gsub("%.png$", ".pdf")
+  local found = resolve_on_resource_path(sibling)
+  if found then
+    img.src = found
+    return img
+  end
+  return nil
+end

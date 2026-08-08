@@ -51,6 +51,40 @@ gated on a `.stamp` sentinel so editing the Markdown alone does not redraw them.
 Point `PLOT` and `CHARTS_DIR` at your own script and output directory, or drop
 charts in and reference them with `![caption](charts/NAME.png){width=90%}`.
 
+## Figures: vector for the PDF, raster for the Markdown
+
+Plot scripts write every chart **twice with the same basename in the same
+directory**: a raster `.png` and a vector `.pdf`
+(`fig.savefig("charts/foo.png", dpi=150)` then `fig.savefig("charts/foo.pdf")`).
+The Markdown references only the `.png`, so plain-Markdown preview (GitHub,
+editors) keeps working. At LaTeX time `filter.lua`'s `Image` handler promotes
+any `.png` image whose `.pdf` sibling exists on the resource path to the
+vector file, so the shipped PDF gets sharp, zoomable, searchable plots
+instead of re-rasterized bitmaps. Photographs, renders and screenshots stay
+raster by simply not shipping a sibling; the rule only touches plots that
+opted in. Why: raster plots blur at print zoom and bloat at high dpi; vector
+axis text stays crisp at any size and usually weighs less. (Raster payloads
+inside a vector figure, e.g. an imshow heatmap, correctly remain raster while
+their axes and labels go vector.)
+
+### Two hazards learned in production
+
+**Broken PDF image encoding in old matplotlib.** Ubuntu 24.04's system
+matplotlib (3.6.3) writes corrupt image XObjects for `imshow` content in PDF
+output on some systems: rows decode with a shifted stride and the image
+shears into diagonal wrap-around bands, while the PNG (Agg) output of the
+same figure stays correct, and all PDF renderers (poppler, mupdf, gs) agree
+on the corruption because the file itself is bad. Generate figures with
+matplotlib >= 3.8 (a venv is fine) and always render one PDF page
+(`pdftoppm`) and compare it against the PNG before shipping. Text-and-line
+vector figures are unaffected; only embedded raster payloads shear.
+
+**Stale embeds.** Images are embedded at pandoc time, and the `all` target
+echoes "built" even when the PDF was up to date, so regenerating only a
+figure and re-running `make` used to keep the old embed silently. The
+Makefile now lists `img/*` next to the report as dependencies; if your
+figures live elsewhere, `make rebuild` after regenerating them.
+
 ## Markdown conventions the pipeline expects
 
 - Title block: pandoc's `% Title` / `% Author` / `% Date` three-line form at the

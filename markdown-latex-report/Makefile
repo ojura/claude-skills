@@ -34,7 +34,11 @@ $(CHARTS_STAMP): $(PLOT)
 	@touch $@
 
 # ---- PDF ----
-$(OUT): $(REPORT) header.tex filter.lua $(LOCAL_STYS) $(CHARTS_STAMP)
+# figures live next to the report (img/) and are promoted to .pdf siblings
+# by filter.lua; regenerating a figure must trigger a re-embed
+FIGS := $(wildcard $(dir $(REPORT))img/*)
+
+$(OUT): $(REPORT) header.tex filter.lua $(LOCAL_STYS) $(CHARTS_STAMP) $(FIGS)
 	TEXINPUTS=.:$$TEXINPUTS pandoc $(REPORT) \
 		--from markdown+raw_tex+raw_attribute-smart \
 		--pdf-engine=lualatex \
