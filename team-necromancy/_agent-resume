@@ -8,6 +8,16 @@
 # Display strings are built here (compadd -d): names are padded so the @session
 # columns align (globally, across groups sharing one listing), and list-colors
 # patterns are generated from those exact displays so per-agent colors match.
+#
+# The flag list below is a second copy of what argparse already declares. For
+# now the completion-flag-parity check holds the two together: it fails on a
+# flag the parser takes that is not offered here, and on one offered here the
+# parser would refuse. Two flags that check does not cover: the per-flag prose,
+# and which completion action fills a flag's value. Both are written only here,
+# which is why the copy exists at all rather than being generated. Generating
+# the spec from the parser is the direction, and the objection that used to
+# stand against it, an interpreter start on the TAB path, is answered by the
+# cache below.
 
 # A bare TAB used to offer everything on the machine, which here is 315 rows.
 # zsh lists at most LISTMAX rows (100 by default) before it stops and asks "do
