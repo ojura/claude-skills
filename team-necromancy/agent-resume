@@ -9248,8 +9248,33 @@ def live_checks():
     # tier is run as a child rather than captured in this process, because
     # capturing our own stderr would swallow a traceback and let a crash read as
     # a clean run. The child is passed no --live, so this does not nest.
-    quiet = sp.run([sys.executable, str(Path(__file__).resolve()), "--selftest", "--failed"],
+    # The child is where the read-only tier runs for a live invocation. Its
+    # stderr is what the check below is about, and its verdicts are the tier's
+    # own, so they are taken here rather than computed a second time in the
+    # parent: one invocation used to run all of them twice.
+    quiet = sp.run([sys.executable, str(Path(__file__).resolve()), "--selftest"],
                    capture_output=True, text=True, timeout=900)
+    inherited, summary = [], None
+    for line in quiet.stdout.splitlines():
+        verdict = line.strip()
+        if verdict.startswith(("PASS  ", "FAIL  ")):
+            rest = verdict[6:]
+            cid, _, name = rest.partition("  ")
+            name, _, detail = name.strip().partition("  (")
+            inherited.append((cid.strip(), name.strip(),
+                              verdict.startswith("PASS"), detail.rstrip(")")))
+        elif "checks passed" in verdict:
+            summary = verdict
+    # A child that died mid-run leaves a short list and no summary, and taking
+    # its verdicts on trust would report the checks it never reached as absent
+    # rather than as unanswered. The count it states is the one thing that can
+    # contradict the rows it printed, so it is compared rather than believed.
+    counted = summary and summary.split("/")[1].split()[0]
+    check("read-only-verdicts-survive-the-child",
+          "a live run reports every read-only verdict the child reached",
+          bool(inherited) and counted is not None and int(counted) == len(inherited),
+          f"{len(inherited)} row(s) parsed, child said {summary!r}")
+    out.extend(inherited)
     stray = [line for line in quiet.stderr.splitlines() if line.strip()]
     check("suite-prints-no-stray-warnings",
           "the suite says nothing to an operator who is not there", not stray,
@@ -10017,7 +10042,24 @@ def check_report(results, failed_only=False):
     return lines + ["", f"{len(results) - failed}/{len(results)} checks passed"]
 
 
+def _selftest_report(results, failed_only, list_only):
+    """Print one tier's verdicts, however the run assembled them."""
+    if list_only:
+        for cid, name, _ok, _detail in results:
+            print(f"{cid}  {name}")
+        return 0
+    for line in check_report(results, failed_only):
+        print(line)
+    return 1 if any(not ok for _, _, ok, _ in results) else 0
+
+
 def run_selftest(live=False, failed_only=False, list_only=False):
+    if live:
+        # live_checks runs the read-only tier as a child, to read its stderr and
+        # to take its verdicts. Running it here as well would answer every
+        # read-only question twice in one invocation, which is what it did.
+        return _selftest_report(live_checks(), failed_only, list_only)
+
     """Assert the invariants this tool keeps rediscovering. Read-only.
 
     Two kinds: structural ones read from this file's own syntax tree, because
@@ -16548,17 +16590,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("asking-is-not-resuming", "describing a team warns about nothing; rebuilding it does",
           not quiet, "; ".join(quiet))
 
-    if live:
-        results.extend(live_checks())
-
-    if list_only:
-        for cid, name, _ok, _detail in results:
-            print(f"{cid}  {name}")
-        return 0
-
-    for line in check_report(results, failed_only):
-        print(line)
-    return 1 if any(not ok for _, _, ok, _ in results) else 0
+    return _selftest_report(results, failed_only, list_only)
 
 
 def verb_needs(args, selector):
