@@ -11713,9 +11713,11 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # find them but could not say which group each went to. One walk answers
     # both questions, so the grouping check below is not a second scrape that
     # can drift away from this one.
+    # main is where the ladder lives and where the engine is constructed, which
+    # a check further down reads; the flags moved out to build_parser.
     main_src = ast.get_source_segment(source, funcs["main"]) or ""
     declared = []          # (option strings of one call, the object it was called on)
-    for node in ast.walk(funcs["main"]):
+    for node in ast.walk(funcs["build_parser"]):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "add_argument"):
             continue
@@ -11748,7 +11750,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # --live and --list, which do nothing without --selftest, between --bare
     # and --all. Every one now sits on a group, and on one, so a flag added
     # later cannot land back in an ungrouped pile without failing here.
-    group_names = {node.targets[0].id for node in ast.walk(funcs["main"])
+    group_names = {node.targets[0].id for node in ast.walk(funcs["build_parser"])
                    if isinstance(node, ast.Assign) and len(node.targets) == 1
                    and isinstance(node.targets[0], ast.Name)
                    and isinstance(node.value, ast.Call)
@@ -16504,7 +16506,15 @@ def audited(entry):
     return code
 
 
-def main():
+def build_parser():
+    """Every flag this tool takes, declared once, in the groups it prints them in.
+
+    Lifted out of main so the completion emitter can run the real parser instead
+    of scraping this file for add_argument calls. A scraper reads what the
+    source says; the parser knows what a flag actually does, which of nargs,
+    metavar, SUPPRESS and the annotations below it would otherwise have to
+    guess at from text.
+    """
     parser = argparse.ArgumentParser(
         prog=TOOL, allow_abbrev=False, add_help=False,
         formatter_class=HelpLayout,
@@ -16647,6 +16657,11 @@ def main():
     suite.add_argument("--list", action="store_true",
                        help="with --selftest, print every check's id and prose, one per "
                             "line, instead of running verdicts")
+    return parser
+
+
+def main():
+    parser = build_parser()
     # Only a *leading* bare word is the selector; later bare words belong to
     # forwarded flags (argparse can't know that --model takes a value).
     argv = sys.argv[1:]
