@@ -2781,17 +2781,27 @@ class Resolver:
         field at the timestamps _scan_transcript gives them, with agentId
         derived from the two stamps if nothing else supplied one; the identity a
         live process is wearing, when a live pid is what found this transcript;
-        the lead transcript's record of spawning this agent; and last,
-        parentSessionId from the engine's lead-session lookup when nothing above
-        named one. Underscore keys stay out, so the harness's display label
-        never reaches the merge as a name.
+        the promote receipt the transcript carries, which names the agent the
+        operator asked this conversation to become; the lead transcript's record
+        of spawning this agent; and last, parentSessionId from the engine's
+        lead-session lookup when nothing above named one. Underscore keys stay
+        out, so the harness's display label never reaches the merge as a name.
 
-        Recency is not the whole rule in three places. The spawn record is added
+        Recency is not the whole rule in four places. The spawn record is added
         at timestamp 0 and added last, so it loses to every dated source and
         loses ties as well; it is read on every run rather than only where a
         field is missing, because present is not good, and a roster holding
         claude-opus-5 beside a spawn record holding claude-opus-5[1m] would
-        otherwise keep the lossier one forever. A worn identity is pinned a
+        otherwise keep the lossier one forever. The promote receipt is added at
+        timestamp 0 too, and for the same reason in reverse: it is this tool's
+        own record of what it did when it made the file, so a roster entry
+        written since, a stamp the agent has written since, and a live process's
+        argv are all the world speaking later and all outrank it. It is added
+        just before the spawn record, so it wins that one tie, which is the only
+        tie a timestamp of 0 leaves: the spawn record is looked up by the agent
+        id, and for a promoted member this receipt is the only source of one, so
+        letting the record found that way rename the agent would be circular.
+        A worn identity is pinned a
         millisecond past the transcript's last activity, which outranks anything
         the transcript itself can say: argv is frozen at exec, stamps are older
         lines on the same file, and a rebind is what puts the two out of step.
@@ -2866,6 +2876,14 @@ class Resolver:
         others = [(p, f, t) for p, f, t in res.others]
         session_uuid = res.path.stem
 
+        # What a promote wrote into this file when it made it. Read here, where
+        # the file is known, so both the refusal below and the merge further
+        # down work off one answer. Only the pair counts: half an identity places
+        # nobody, and the receipt writes both halves or neither.
+        receipt = self.receipt_carried_by(res.path) or {}
+        promoted_as = ((receipt.get("name"), receipt.get("team"))
+                       if receipt.get("name") and receipt.get("team") else None)
+
         # Located; now placed. Clearing the entry when the team changes is what
         # keeps a stale roster from contributing the team it described a life ago:
         # its appearance still travels, through the payload record below.
@@ -2933,7 +2951,12 @@ class Resolver:
                     # teammate's transcript nor a lead's. Say that, rather than
                     # continuing down the member path to fail on a missing socket,
                     # which describes a pane this transcript was never going to get.
-                    if not agent_id:
+                    # A promoted file is the one shape that reaches here with an
+                    # identity anyway: it carries no stamps by design and joins no
+                    # roster until its first launch, and the receipt in it is what
+                    # says who it is. The refusal stands for everything else, and
+                    # is the truth for a transcript with none of the three.
+                    if not agent_id and not promoted_as:
                         die(
                             f"{res.path.name} carries no agent stamps, so it is not a teammate's, "
                             "and records spawning no teammates, so it never led a team either. "
@@ -2994,9 +3017,23 @@ class Resolver:
             merged.add("agentName", worn_name, pinned, "live argv")
             merged.add("teamName", worn_team, pinned, "live argv")
 
+        # ---- the promote that made this file, and the identity it was given
+        # Timestamp 0, so every dated source outranks it. That is the whole
+        # ranking argument: a receipt records what this tool did, and a roster
+        # entry, a stamp or a live process's argv each record something the world
+        # did afterwards. Added before the spawn lookup below because that lookup
+        # is keyed on the agent id, and for a member whose membership is still
+        # only a receipt this is the only source of one.
+        if promoted_as:
+            merged.add("agentName", promoted_as[0], 0, "promote receipt")
+            merged.add("teamName", promoted_as[1], 0, "promote receipt")
+            merged.add("agentId", f"{promoted_as[0]}@{promoted_as[1]}", 0, "promote receipt")
+
         # ---- last resort: the lead's record of spawning this member
-        # Timestamp 0 so it loses every tie: it is a snapshot from spawn time, and
-        # the roster or the transcript is newer whenever either has the field. Read
+        # Timestamp 0 so every dated source beats it: it is a snapshot from spawn
+        # time, and the roster or the transcript is newer whenever either has the
+        # field. Added last, so it also loses the one tie there is, to the receipt
+        # above. Read
         # lazily, since the lead transcript can be megabytes.
         # Consulted unconditionally, not only when a field is missing: "present" is
         # not "good". A roster can hold claude-opus-5 where the spawn record holds
@@ -3802,6 +3839,28 @@ class Resolver:
         parameters. Built by the same pass and the same read as the stamps."""
         self.stamp_index()
         return self._carried
+
+    def receipt_carried_by(self, path):
+        """The conversion receipt this one transcript carries, or None.
+
+        The same question carried_receipts() answers for the whole tree, asked
+        about one file. A run that resolved by uuid never sweeps the tree for
+        stamps, and making it do so to read the last line of the file already
+        in its hand would be paying corpus cost for a single answer. When the
+        sweep has already run its map answers, so both routes give one value.
+        """
+        path = Path(path)
+        if self._carried is not None:
+            return self._carried.get(path)
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as handle:
+                if size > INDEX_CHUNK:
+                    handle.seek(size - INDEX_CHUNK)
+                tail = handle.read(INDEX_CHUNK)
+        except OSError:
+            return None
+        return self.carried_receipt(tail.decode("utf-8", "replace").splitlines())
 
     def team_lead_session(self, team):
         """The session id a team names as its lead's, via the roster reader."""
@@ -9332,6 +9391,136 @@ def run_selftest(live=False, failed_only=False, list_only=False):
           "a bare resume starts the agent and joins no team",
           bare_status == "launched" and bare_entry is None,
           f"{bare_status}, entry {bare_entry}")
+
+    # --- a promoted member that has never launched
+    # Its identity is written in one place only, the record the file carries:
+    # a promote fabricates no stamps and writes no roster entry. The fixture is
+    # made by the real conversion writers rather than hand-written bytes, so
+    # what these check against is a promote and not an imitation of one.
+    PROMOTED = ("dropped", "session-corpus-alpha")
+
+    class _Promote:
+        """The flags run_promote reads, set the way the owner's specimen was
+        made: --as-agent name@team and --no-launch. --force because the corpus
+        file's mtime is whenever this tree was checked out, and a fresh checkout
+        would otherwise be refused as still running."""
+
+        def __init__(self, **kw):
+            self.__dict__.update({"promote": "fork1", "as_": None, "dry_run": False,
+                                  "force": True, "no_launch": True})
+            self.__dict__.update(kw)
+
+    def promote_the_fork(root, into=PROMOTED):
+        """Run the promote verb against this tree. Returns the stem it made.
+
+        The verb rather than the plan and the writer under it, so what these
+        checks resume is what the command produces, receipt line included.
+        """
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
+        eng.projects_dir, eng.teams_dir = root / "projects", root / "teams"
+        real_resolver, real_receipts = globals()["RESOLVER"], globals()["RECEIPTS_DIR"]
+        globals().update(RESOLVER=eng, RECEIPTS_DIR=root / "receipts")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                run_promote(_Promote(as_=f"{into[0]}@{into[1]}"))
+        finally:
+            globals().update(RESOLVER=real_resolver, RECEIPTS_DIR=real_receipts)
+        # Off the receipt it just wrote, not off its output: the file it made is
+        # the thing being asked about, and the receipt names it.
+        made = json.loads(sorted((root / "receipts").glob("*.json"))[0].read_text())
+        return made["dest_stem"]
+
+    # Resolution and the socket, off a tree of their own so the assertions can
+    # read what the run decided rather than what the fixture forced on it.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "corpus"
+        shutil.copytree(Path(__file__).resolve().parent / "test" / "corpus", root)
+        stem = promote_the_fork(root)
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
+        eng.projects_dir, eng.teams_dir = root / "projects", root / "teams"
+        eng.ps_table = lambda refresh=False: []
+        eng.session_registry = lambda: []
+        agent_id = f"{PROMOTED[0]}@{PROMOTED[1]}"
+        with contextlib.redirect_stderr(io.StringIO()):
+            by_id = eng.identity(agent_id=agent_id)
+            by_uuid = eng.identity(session_uuid=stem)
+        real_resolver = globals()["RESOLVER"]
+        globals()["RESOLVER"] = eng
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                sock, _why = resolve_socket(by_id, _Run(), [])
+        finally:
+            globals()["RESOLVER"] = real_resolver
+        found = {
+            "the address resolves to the promoted file":
+                by_id["transcript"][0].stem == stem,
+            "and to the agent the promote named":
+                eng.field(by_id, "agentId") == agent_id,
+            "the uuid alone resolves the same agent":
+                eng.field(by_uuid, "agentId") == agent_id
+                and eng.field(by_uuid, "teamName") == PROMOTED[1],
+            "the receipt is named as the source":
+                eng.provenance(by_uuid, "teamName")[2] == "promote receipt",
+            "the receipt loses to every dated source":
+                eng.provenance(by_uuid, "teamName")[1] == 0,
+            "the socket is the team's":
+                sock == f"{SOCKET_PREFIX}{PROMOTED[1]}",
+        }
+        wrong = sorted(k for k, ok in found.items() if not ok)
+        check("promoted-member-resolves-by-its-receipt",
+              "a promoted member that never launched is found by its own receipt",
+              not wrong, ", ".join(wrong))
+
+        # And the refusal it must not swallow. Same tree, a transcript with no
+        # stamps, no receipt and no spawn payloads: nothing on disk says who it
+        # is, and saying so is the right answer.
+        blank = "0b1a0b1a-0b1a-4b1a-8b1a-0b1a0b1a0b1a"
+        (root / "projects" / "corpus" / f"{blank}.jsonl").write_text(json.dumps(
+            {"type": "user", "uuid": "bl-root", "parentUuid": None,
+             "sessionId": blank, "timestamp": "2026-05-01T00:00:00Z",
+             "message": {"role": "user", "content": "nobody"}},
+            separators=(",", ":")) + "\n")
+        blank_eng = Resolver(needs=Needs(maybe=set(NEED)))
+        blank_eng.projects_dir, blank_eng.teams_dir = root / "projects", root / "teams"
+        blank_eng.ps_table = lambda refresh=False: []
+        blank_eng.session_registry = lambda: []
+        with contextlib.redirect_stderr(io.StringIO()) as refusal:
+            try:
+                blank_eng.identity(session_uuid=blank)
+                refused = False
+            except SystemExit:
+                refused = True
+        said = " ".join(refusal.getvalue().split())
+        honest = {
+            "a transcript with nothing on it is refused": refused,
+            "and the refusal says why it is neither":
+                "carries no agent stamps" in said and "spawning no teammates" in said,
+            "and offers a way to resume it anyway": "--agent-id" in said,
+            # The arm that proves the refusal is still reachable: the same
+            # engine, asked about the promoted file, does not refuse.
+            "a promoted file is not refused by it":
+                bool(eng.field(by_uuid, "agentId")),
+        }
+        wrong = sorted(k for k, ok in honest.items() if not ok)
+        check("transcript-with-no-identity-refused",
+              "a transcript nothing on disk names still gets the honest refusal",
+              not wrong, ", ".join(wrong))
+
+    # The first launch is what registers it, driven end to end: the roster gains
+    # the entry the design defers to launch time, with the seat it actually got.
+    prom_status, prom_entry, _srv, prom_said = resume_run(
+        f"{PROMOTED[0]}@{PROMOTED[1]}", listed=False, prepare=promote_the_fork)
+    registered = {
+        "the launch reaches tmux": prom_status == "launched",
+        "the roster gains the member": bool(prom_entry),
+        "with the seat it got": (prom_entry or {}).get("tmuxPaneId") == "%0",
+        "and the command wears the promoted identity":
+            f"--agent-id {PROMOTED[0]}@{PROMOTED[1]}" in prom_said,
+    }
+    wrong = sorted(k for k, ok in registered.items() if not ok)
+    check("promoted-member-registers-on-first-launch",
+          "a promoted member's first launch is what puts it in the roster",
+          not wrong, ", ".join(wrong) or f"{prom_status}, entry {prom_entry}")
 
     # The session row of the report the launch above printed. It says which
     # conversation is coming back, and it used to print that conversation's
