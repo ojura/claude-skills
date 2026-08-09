@@ -9242,6 +9242,12 @@ UNITS = []
 RUNNER_CHECKS = (("live-checks-say-nothing-mid-run",
                   "a live check prints nothing between the verdicts"),)
 
+# The runner's own check when it splits the tier, listed only then, because a
+# run that took no shares has nothing to say about them and a row reporting on
+# shares that do not exist would pass without asking anything.
+SHARED_CHECKS = (("live-shares-report-in-full",
+                  "every share of a split live run reported every verdict it ran"),)
+
 
 def unit(*ids, live=False):
     """Register one unit of the suite under the ids it produces."""
@@ -9251,12 +9257,15 @@ def unit(*ids, live=False):
     return take
 
 
-def _live_context():
+def _live_context(child=None):
     """Everything the units share, computed once.
 
     A dependency between units is written down here rather than
     inherited from scope, so a unit run on its own says what it wants
     instead of reading whatever a neighbour left behind.
+
+    child is the read-only run a parent has already done, for a worker given
+    one share of the tier. Without it the context runs its own.
     """
     s = types.SimpleNamespace()
     # The suite's own functions, taken from the registry rather than listed: a
@@ -9295,39 +9304,22 @@ def _live_context():
     # stderr is what the check below is about, and its verdicts are the tier's
     # own, so they are taken here rather than computed a second time in the
     # parent, so one invocation answers each check once.
-    quiet = sp.run([sys.executable, str(Path(__file__).resolve()), "--selftest"],
-                   capture_output=True, text=True, timeout=900)
-    inherited, summary = [], None
-    for line in quiet.stdout.splitlines():
-        verdict = line.strip()
-        if verdict.startswith(("PASS  ", "FAIL  ")):
-            rest = verdict[6:]
-            cid, _, name = rest.partition("  ")
-            name, _, detail = name.strip().partition("  (")
-            inherited.append((cid.strip(), name.strip(),
-                              verdict.startswith("PASS"), detail.rstrip(")")))
-        elif "checks passed" in verdict:
-            summary = verdict
-    # A child that died mid-run leaves a short list and no summary, and taking
-    # its verdicts on trust would report the checks it never reached as absent
-    # rather than as unanswered. The count it states is the one thing that can
-    # contradict the rows it printed, so it is compared rather than believed.
+    # Running the read-only tier belongs to the invocation once, not to each
+    # worker of one. A run given a share is handed what the parent already ran,
+    # so a sharded run inherits the same verdicts from the same child instead of
+    # answering the read-only tier once per share.
+    quiet = child or sp.run([sys.executable, str(Path(__file__).resolve()), "--selftest"],
+                           capture_output=True, text=True, timeout=900)
+    inherited, summary = verdicts_from(quiet.stdout)
     counted = summary and summary.split("/")[1].split()[0]
 
-    s._ = _
-    s.cid = cid
     s.counted = counted
-    s.detail = detail
     s.inherited = inherited
-    s.line = line
-    s.name = name
     s.out = out
     s.pty = pty
     s.quiet = quiet
-    s.rest = rest
     s.sp = sp
     s.summary = summary
-    s.verdict = verdict
     return s
 
 
@@ -9478,7 +9470,7 @@ def _check_launch_baseurl_carriers(s):
         drops_inherited = scrubs(own(f"{TOOL}-selftest-absent"), POISON_URL)
         keeps_inherited_real = not scrubs(own(f"{TOOL}-selftest-absent"), "https://gateway.example")
     finally:
-        tmux(probe_sock, "kill-server")
+        ended(probe_sock)
     carriers = {
         "a real url on the server is kept": keeps_real,
         "a live server's real url survives a poisoned shell": keeps_real_from_poisoned_shell,
@@ -9522,7 +9514,7 @@ def _check_team_fits_window(s):
               refused is None and len(placed) == wanted and set(placed) <= alive,
               refused or f"placed {len(placed)}/{wanted}, {len(alive)} alive")
     finally:
-        tmux(geom_sock, "kill-server")
+        ended(geom_sock)
     return checked
 
 
@@ -9940,7 +9932,7 @@ def _check_poison_preview_changes_nothing(s):
         clear_said, clear_code = poison_run("--unpoison", "--dry-run")
         after_clear_preview = server_env()
     finally:
-        tmux(poison_sock, "kill-server")
+        ended(poison_sock)
         shutil.rmtree(poison_home, ignore_errors=True)
     poisoning = {
         "a fresh server holds no base url": was == "(unset)",
@@ -9987,6 +9979,27 @@ def own(name):
     return f"{name}-{os.getpid()}"
 
 
+def ended(socket):
+    """End a fixture's tmux server, and remove the file it leaves behind.
+
+    kill-server stops the server and leaves its socket file in the socket
+    directory. A fixture's name belongs to one run, so no later run reuses that
+    name or writes over the file, and every run that stood a server up added
+    one more that nobody would remove. --cleanup does not reach them: it reaps
+    swarm sockets by their own prefix, and teaching it the suite's names would
+    put the suite's litter in the tool's hands. A test clears up after itself.
+
+    In a finally, so a kill-server that fails still takes the file with it.
+    """
+    try:
+        tmux(socket, "kill-server")
+    finally:
+        # Where tmux keeps its sockets is the engine's answer; unlinking one is
+        # not a question, so it happens here rather than there.
+        with contextlib.suppress(OSError):
+            (RESOLVER.socket_dir() / socket).unlink(missing_ok=True)
+
+
 
 @unit(("live-fixtures-are-this-run's", "a live fixture name belongs to the run that made it"))
 def _check_live_fixtures_are_own(s):
@@ -10030,6 +10043,58 @@ def _check_live_fixtures_are_own(s):
           not shared, ", ".join(sorted(set(shared))))
     return checked
 
+
+
+@unit(('shares-cover-the-tier-once',
+       'splitting the live tier any number of ways runs each check exactly once'))
+def _check_shares_cover_the_tier_once(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    live_units = [name for name, _ids, _run, is_live in UNITS if is_live]
+    # in_share is what the runner splits by, so it is asked here rather than
+    # the split being worked out again: a check doing its own arithmetic would
+    # agree with itself while the runner disagreed with both of them. A share
+    # that dropped a unit would otherwise read as a smaller tier passing, and a
+    # share that took one twice as a duplicate id nobody looked for.
+    over = len(live_units) + 3      # more shares than units: the empty ones count too
+    wrong = sorted(jobs for jobs in (1, 2, 3, 4, 7, 16, over)
+                   if sorted(at for which in range(jobs)
+                             for at in in_share(len(live_units), (which, jobs)))
+                   != list(range(len(live_units))))
+    check("shares-cover-the-tier-once",
+          "splitting the live tier any number of ways runs each check exactly once",
+          not wrong and in_share(len(live_units), None) == list(range(len(live_units))),
+          f"wrong at {wrong} share(s)" if wrong
+          else f"{len(live_units)} unit(s), split every way up to {over}")
+    return checked
+
+
+@unit(('fixture-leaves-no-socket-file',
+       'a fixture that ends its server takes the socket file with it'), live=True)
+def _check_fixture_leaves_no_socket_file(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    # Asked of a server this check stands up and ends itself, rather than of
+    # what the tier happens to have left by now, so the answer does not depend
+    # on which units ran before this one.
+    litter = own(f"{TOOL}-selftest-litter")
+    where = RESOLVER.socket_dir() / litter
+    try:
+        tmux(litter, "new-session", "-d", "-s", TMUX_SESSION, "sleep", "30")
+        stood = where.exists()
+    finally:
+        ended(litter)
+    check("fixture-leaves-no-socket-file",
+          "a fixture that ends its server takes the socket file with it",
+          stood and not where.exists(),
+          f"file while the server ran: {stood}, once it ended: {where.exists()}")
+    return checked
 
 
 @unit(("smoke-counts-only-what-it-started",
@@ -10099,6 +10164,28 @@ def _check_smoke_counts_only_what_it_started(s):
     return checked
 
 
+def verdicts_from(said):
+    """(rows, the summary line) for what another process reported.
+
+    A run that died mid-way leaves a short list and no summary, and taking its
+    rows on trust would report the checks it never reached as absent rather
+    than as unanswered. The stated count is the one thing that can contradict
+    the rows, so callers compare rather than believe.
+    """
+    rows, summary = [], None
+    for line in said.splitlines():
+        verdict = line.strip()
+        if verdict.startswith(("PASS  ", "FAIL  ")):
+            rest = verdict[6:]
+            cid, _, name = rest.partition("  ")
+            name, _, detail = name.strip().partition("  (")
+            rows.append((cid.strip(), name.strip(),
+                         verdict.startswith("PASS"), detail.rstrip(")")))
+        elif "checks passed" in verdict:
+            summary = verdict
+    return rows, summary
+
+
 def started_here():
     """Anything a launch from this run would have added to the machine.
 
@@ -10119,17 +10206,121 @@ def started_here():
                if sock.name.endswith(f"-{os.getpid()}")})
 
 
-def live_checks():
-    """Run every unit registered as live, against the live tier's context.
+def hand_down(quiet, where):
+    """Write a read-only child's output where a worker can read it back."""
+    where.write_text(json.dumps({"args": quiet.args, "returncode": quiet.returncode,
+                                 "stdout": quiet.stdout, "stderr": quiet.stderr}))
+    return where
+
+
+def handed_down(where):
+    """The child a parent already ran, as the run of it this process skipped.
+
+    A file rather than the worker's stdin: the read-only tier prints a line per
+    check, and a pipe nobody is reading stops accepting them partway, which
+    would hang the run rather than fail it.
+    """
+    got = json.loads(Path(where).read_text())
+    return subprocess.CompletedProcess(got["args"], got["returncode"],
+                                       got["stdout"], got["stderr"])
+
+
+def in_share(count, share):
+    """Which places in a list of that many units this share answers for.
+
+    Taken by position rather than by name, so a unit added later moves at most
+    one unit between shares. For any number of shares each place falls in
+    exactly one of them, which is what lets the shares be merged into one
+    tier's worth of verdicts. share=None is the whole tier.
+    """
+    return [at for at in range(count)
+            if share is None or at % share[1] == share[0]]
+
+
+def _live_in_parallel(jobs):
+    """The live units run in jobs processes at once, their verdicts merged.
+
+    Each worker owns its fixtures, because a fixture is named for the run that
+    made it and a run asks only about what it started, so two workers cannot
+    see each other. The read-only tier is inherited once here rather than
+    once per worker.
+
+    A worker that dies leaves rows without the summary that counts them, and
+    the gap is reported as a failure rather than passing as fewer checks.
+    """
+    s = _live_context()
+    out = list(s.inherited)
+    workers, short = [], []
+    with tempfile.TemporaryDirectory(prefix=f"{TOOL}-shares-") as room:
+        inherit = hand_down(s.quiet, Path(room) / "read-only.json")
+        try:
+            workers = [subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()),
+                 "--selftest", "--live", "--share", f"{at}/{jobs}",
+                 "--inherit", str(inherit)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                for at in range(jobs)]
+            for at, worker in enumerate(workers):
+                # A worker that hangs would hold this run open with no way out,
+                # so it is given a bound and killed by the code that started it.
+                try:
+                    said, _err = worker.communicate(timeout=900)
+                except subprocess.TimeoutExpired:
+                    worker.kill()
+                    said, _err = worker.communicate()
+                rows, summary = verdicts_from(said)
+                counted = summary and summary.split("/")[1].split()[0]
+                if counted is None or int(counted) != len(rows):
+                    short.append(f"share {at}/{jobs}: {len(rows)} row(s), "
+                                 f"it said {summary!r}")
+                out.extend(rows)
+        finally:
+            # Whatever ended this run, no worker of it outlives it, and the
+            # file they read is removed with the directory holding it.
+            for worker in workers:
+                if worker.poll() is None:
+                    worker.kill()
+                    worker.wait()
+                # A killed worker never reached its own teardown, so its
+                # fixtures are removed by the run that killed it. They are
+                # named for the process that made them, which is what makes
+                # them findable from here and nobody else's to remove.
+                for left in RESOLVER.socket_dir().glob(f"{TOOL}-selftest-*-{worker.pid}"):
+                    with contextlib.suppress(OSError):
+                        left.unlink()
+
+    # The units ran in the workers, so the workers are what watched them print.
+    # Folding their rows into one keeps the id unique across the merge, and
+    # counting them keeps a worker that never reached the check from reading as
+    # a quiet one.
+    # One verdict for the shares between them, reported whether or not any fell
+    # short, so the run says the merge was whole rather than saying nothing.
+    out.append((SHARED_CHECKS[0][0], SHARED_CHECKS[0][1], not short, "; ".join(short)))
+    watched = [row for row in out if row[0] == RUNNER_CHECKS[0][0]]
+    out = [row for row in out if row[0] != RUNNER_CHECKS[0][0]]
+    noisy = "; ".join(detail for _c, _n, ok, detail in watched if not ok)
+    out.append((RUNNER_CHECKS[0][0], RUNNER_CHECKS[0][1],
+                len(watched) == jobs and not noisy,
+                noisy or (f"{len(watched)} of {jobs} share(s) said"
+                          if len(watched) != jobs else "")))
+    return out
+
+
+def live_checks(share=None, child=None):
+    """Run the live units, or one share of them, against the live context.
+
+    A share is (which, out_of): the units whose place in the registry falls in
+    it, and none of the read-only verdicts, which the run that asked for
+    shares inherits once for all of them.
 
     The read-only tier's verdicts come from the child the context ran, so a
     live invocation answers those questions once.
     """
-    s = _live_context()
-    out = list(s.inherited)
-    for _name, _ids, run, is_live in UNITS:
-        if is_live:
-            out.extend(run(s))
+    s = _live_context(child)
+    out = [] if share else list(s.inherited)
+    live_units = [run for _n, _i, run, is_live in UNITS if is_live]
+    for at in in_share(len(live_units), share):
+        out.extend(live_units[at](s))
     return out
 
 
@@ -10172,42 +10363,45 @@ await() {  # marker seconds
   done
   return 1
 }
-settle() {  # quiet-seconds cap-seconds: read until the shell stops talking
-  local -F quiet=$1 cap=$2 last=0 t0=$EPOCHREALTIME
-  buf=''
-  while (( EPOCHREALTIME - t0 < cap )); do
-    if zpty -r -t z chunk 0.05 2>/dev/null; then
-      buf+=$chunk; last=$EPOCHREALTIME
-    elif (( last > 0 && EPOCHREALTIME - last > quiet )); then
-      return 0
-    fi
-  done
+tabbed() {  # seconds: one completion, waited for rather than timed
+  # The completion says when it is done, from inside zle, because nothing
+  # outside can. Keys sent ahead of it do not work: zsh treats input waiting to
+  # be read as a reason not to list at all, so queuing a marker behind the TAB
+  # cancelled the listing the check is about. Waiting for a quiet stretch
+  # instead measured the end of the listing by guess, and a machine that paused
+  # mid-listing for longer than the guess took a part of it for the whole.
+  zpty -w -n z $'\024'      # ^T, bound at setup to complete and then say so
+  await TAB-DONE $1 || return 1
+  zpty -w -n z $'\025'      # discard the completed line
+  drain
 }
 zpty -b z "HOME=$fakehome CLAUDE_CONFIG_DIR= PATH=$bindir:\$PATH zsh -f -i" \
   || { print DRIVE_FAIL no-pty; return 1 }
-await READY 10 || { zpty -w z 'print READY'; await READY 10 }
+# The shell is asked to say it is up rather than waited at in the hope it
+# says so on its own: -f skipped every rc file, so nothing here prints a
+# greeting, and waiting for one cost the full timeout on every run.
+# A pty echoes what is typed, so a marker typed whole would be matched from
+# the echo before the shell had read it; split, only the shell's own output
+# spells it.
+zpty -w z 'print REA${:-}DY'
+await READY 10 || { print DRIVE_FAIL no-shell; zpty -d z; return 1 }
 drain
 # -f skipped every rc file, so the setup is sent instead: a terminal tall and
 # wide enough that no row of the listing scrolls or wraps, the three matcher
 # specs oh-my-zsh sets, and LISTMAX left at its own default, so "would zsh stop
 # and ask" is asked of the default rather than of whatever this machine uses.
-zpty -w z "stty rows 400 cols 200; fpath=($fpdir \$fpath); autoload -Uz compinit; compinit -u -D; zstyle ':completion:*' matcher-list 'm:{a-z}={A-Z}' 'r:|=*' 'l:|=* r:|=*'; LISTMAX=100; print SETUP-DONE"
+zpty -w z "stty rows 400 cols 200; fpath=($fpdir \$fpath); autoload -Uz compinit; compinit -u -D; zstyle ':completion:*' matcher-list 'm:{a-z}={A-Z}' 'r:|=*' 'l:|=* r:|=*'; LISTMAX=100; tabmark() { zle expand-or-complete; zle -R; print -r -- TAB-DONE >/dev/tty; }; zle -N tabmark; bindkey '^T' tabmark; print SETUP\${:-}-DONE"
 await SETUP-DONE 30 || { print DRIVE_FAIL no-setup; zpty -d z; return 1 }
 drain
-zpty -w -n z "$tool zzqqxxnothing"$'\t'
-settle 2.0 40
+zpty -w -n z "$tool zzqqxxnothing"
+tabbed 40 || { print DRIVE_FAIL no-tab-one; zpty -d z; return 1 }
 cp -- $calls $calls.after-one-tab
-zpty -w -n z $'\025'
-drain
-zpty -w -n z "$tool "$'\t'
-settle 2.0 40
+zpty -w -n z "$tool "
+tabbed 40 || { print DRIVE_FAIL no-tab-bare; zpty -d z; return 1 }
 print -r -- "$buf" > $calls.bare
-zpty -w -n z $'\025'
-drain
-zpty -w -n z "$tool --"$'\t'
-settle 2.0 40
+zpty -w -n z "$tool --"
+tabbed 40 || { print DRIVE_FAIL no-tab-flags; zpty -d z; return 1 }
 print -r -- "$buf" > $calls.flags
-zpty -w -n z $'\025'
 zpty -d z
 print DRIVE_OK
 """
@@ -12621,6 +12815,7 @@ def _check_every_flag_declares_a_menu_row(s):
     # a check further down reads; the flags moved out to build_parser.
     main_src = src_of(funcs["main"]) or ""
     declared = []          # (option strings of one call, the object it was called on)
+    hidden = set()         # the first long spelling of each help=SUPPRESS flag
     for node in ast.walk(funcs["build_parser"]):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "add_argument"):
@@ -12629,6 +12824,15 @@ def _check_every_flag_declares_a_menu_row(s):
                 if isinstance(a, ast.Constant) and str(a.value).startswith("-")]
         if opts:
             declared.append((opts, getattr(node.func.value, "id", "?")))
+            # A suppressed flag is one the parser takes and the menu does not
+            # offer, so the parity check below has to know which ones those are
+            # or every one of them reads as a flag the emitter forgot. Read
+            # here, off the same call the option strings come from, rather than
+            # kept as a list of names that a later flag would have to be added
+            # to by hand.
+            if any(kw.arg == "help" and isinstance(kw.value, ast.Attribute)
+                   and kw.value.attr == "SUPPRESS" for kw in node.keywords):
+                hidden.add(next((o for o in opts if o.startswith("--")), opts[0]))
 
     # Every flag says which line the menu gives it, even when that is the help
     # page's own sentence, which AS_HELP is how an author says. Defaulting to
@@ -12646,6 +12850,7 @@ def _check_every_flag_declares_a_menu_row(s):
     s.comp_path = comp_path
     s.comp_text = comp_text
     s.declared = declared
+    s.hidden = hidden
     s.main_src = main_src
     return checked
 
@@ -12658,6 +12863,7 @@ def _check_completion_flags_are_parseable(s):
         checked.append((cid, name, ok, detail))
 
     declared = s.declared
+    hidden = s.hidden
 
     emitted = io.StringIO()
     with contextlib.redirect_stdout(emitted):
@@ -12671,7 +12877,7 @@ def _check_completion_flags_are_parseable(s):
     # the emitter is supposed to: first long spelling, nothing suppressed.
     takes = {opt for opts, _on in declared
              for opt in [next((o for o in opts if o.startswith("--")), None)]
-             if opt} - {"--complete"}
+             if opt} - hidden
     wrong = sorted(offered ^ takes)
     check("completion-flags-are-parseable",
           "the flags topic emits four fields a shell can split, one per flag the parser takes",
@@ -18583,7 +18789,8 @@ def _check_check_line_one_owner(s):
     return checked
 
 
-def run_selftest(live=False, failed_only=False, list_only=False):
+def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=None,
+                 child=None):
     if list_only:
         # Both tiers are registered, so asking what exists reads the registry
         # and runs nothing.
@@ -18594,6 +18801,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         # what the live tier printed while running, which only the caller of
         # the tier can see. It is listed here so the listing stays complete.
         rows += list(RUNNER_CHECKS) if live else []
+        rows += list(SHARED_CHECKS) if live and jobs > 1 else []
         column = max((len(cid) for cid, _said in rows), default=0)
         for cid, said in rows:
             print(check_line(cid, said, idwidth=column))
@@ -18609,7 +18817,9 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         # noisy instead of the noise merely vanishing.
         said = io.StringIO()
         with contextlib.redirect_stdout(said):
-            results = live_checks()
+            results = _live_in_parallel(jobs) if jobs > 1 else live_checks(share, child)
+        if jobs > 1:
+            return _selftest_report(results, failed_only)
         loud = [line for line in said.getvalue().splitlines() if line.strip()]
         results.append((
             "live-checks-say-nothing-mid-run",
@@ -18943,6 +19153,17 @@ def build_parser():
                               help="with --selftest, print every check's id and prose, one per "
                                    "line, instead of running verdicts"),
            row='with --selftest, print every check id and its prose, one per line')
+    offers(suite.add_argument("--jobs", metavar="COUNT", type=int, default=1,
+                              help="with --selftest --live, run the live checks in this many "
+                                   "processes at once; each owns the fixtures it makes"),
+           row='with --selftest --live, run the live checks in this many processes')
+    # One worker's portion of the live tier. Written by --jobs and read by
+    # nobody else, so it is not offered: a person typing it by hand would get
+    # part of a tier and a summary counting only that part.
+    suite.add_argument("--share", metavar="I/N", help=argparse.SUPPRESS)
+    # Where the parent left the read-only child it already ran, so a worker
+    # inherits those verdicts rather than answering that tier a second time.
+    suite.add_argument("--inherit", metavar="PATH", help=argparse.SUPPRESS)
     return parser
 
 
@@ -18973,7 +19194,13 @@ def main():
             f"{'--agent-id' if args.agent_id else '--resume'} names one agent; pick one")
 
     if args.selftest:
-        return run_selftest(live=args.live, failed_only=args.failed, list_only=args.list)
+        share = None
+        if args.share:
+            which, _, out_of = args.share.partition("/")
+            share = (int(which), int(out_of))
+        return run_selftest(live=args.live, failed_only=args.failed, list_only=args.list,
+                            jobs=args.jobs, share=share,
+                            child=handed_down(args.inherit) if args.inherit else None)
     if args.live:
         die("--live extends --selftest; it does nothing on its own")
 
