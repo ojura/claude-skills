@@ -7564,13 +7564,74 @@ def diagnose_team(team, table=None, deep=False):
     return verdict, lines, remedies
 
 
+def doctor_target(args, selector):
+    """The team this run was pointed at, or None when it was pointed at nothing.
+
+    The classifier answers six kinds and this used to read two of them, so a
+    token that named no team fell through to the sweep: a typo answered about
+    every team on the machine and took its exit code from the worst of them,
+    and a name in two rosters came back as a list and died on it. Naming
+    something the doctor cannot ask about is now a refusal, because widening a
+    question nobody asked is the one thing this verb says it must not do.
+
+    Only an empty hand sweeps. Where the token names a conversation rather than
+    a team, the team it is stamped with is named, since that is the question
+    the reader was reaching for.
+    """
+    if args.team:
+        return args.team
+    if args.agent_id:
+        team = args.agent_id.partition("@")[2]
+        if not team:
+            die(f"--agent-id {args.agent_id} names no team, and this asks about a team; "
+                f"pass it as name@team, or name the team on its own")
+        return team
+    if not selector:
+        return None
+
+    kind, value, why = RESOLVER.classify(selector)
+    if kind == "team":
+        return value
+    if kind == "agent_id":
+        team = (value or "").partition("@")[2]
+        if team:
+            return team
+        die(f"{selector} names no team, and this asks about a team; pass it as "
+            f"name@team, or name the team on its own")
+    if kind == "ambiguous":
+        teams = sorted({entry["team"] for entry in value})
+        die(f"{selector} is in {len(teams)} rosters, so it names no one team: "
+            f"{some_of(teams)}. Name the team you mean")
+    instead = (f"Name a team, or run {TOOL} --doctor with nothing to sweep every "
+               f"team that has something live or waiting")
+    if kind in ("uuid", "name"):
+        # Both name a conversation. The team it is stamped with is the question
+        # a reader asking this way was reaching for, so it is named rather than
+        # answered on their behalf.
+        # Read out of the stamp answer by name rather than by picking a
+        # transcript for ourselves: which file a session id names is the
+        # engine's question, and this needs only the team stamped on it.
+        stamps = RESOLVER.stamp_index()
+        path = getattr(value, "path", None) if kind == "name" else next(
+            (p for p in stamps if p.stem == selector), None)
+        stamped = (stamps.get(path) or (None, None))[1] if path else None
+        if not path and kind == "uuid":
+            path = next((p for p in RESOLVER.transcripts_starting(selector[:8])
+                         if p.stem == selector), None)
+        if stamped:
+            die(f"{selector} names a conversation, not a team. It is stamped with "
+                f"{stamped}, so ask about that: {TOOL} --doctor {stamped}")
+        if not path:
+            die(f"no conversation has the id {selector}, so there is no team to "
+                f"ask about. {instead}")
+        die(f"{selector} names a conversation that carries no team stamp, so "
+            f"there is no team to ask about. {instead}")
+    die(f"{selector} {why}, so there is no team to ask about. {instead}")
+
+
 def run_doctor(args, selector=None):
     """Say whether each team's lead is connected to it. Diagnoses, never treats."""
-    named = args.team or (args.agent_id or "").partition("@")[2] or None
-    if not named and selector:
-        kind, value, _why = RESOLVER.classify(selector)
-        named = value if kind == "team" else (value or "").partition("@")[2] or None
-    target = named or None
+    target = doctor_target(args, selector)
     if target:
         # The named team is the declared need; a census of every team on the
         # machine answers a question this run never asks.
@@ -15314,6 +15375,66 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         globals()["RESOLVER"] = real_resolver
     check("verdict-names-actionable", "a verdict names something to act on", not verdicts,
           "; ".join(f"{t}: {why}" for t, why in verdicts.items()))
+
+    # Pointed at something that is not a team, the doctor used to drop the name
+    # and sweep every team on the machine: a typo answered a question nobody
+    # asked and took its exit code from the worst team on the box, and a name
+    # carried by several rosters came back as a list and died on it. Driven as
+    # command lines rather than by calling run_doctor, because the token has to
+    # cross argument parsing and dispatch to reach the classifier at all.
+    #
+    # The sweep arm is what stops this passing with the doctor refusing
+    # everything, and the named arm is what stops it passing with the doctor
+    # refusing nothing; each is one half of the property.
+    doc_home = Path(tempfile.mkdtemp())
+    shutil.copytree(Path(__file__).resolve().parent / "test" / "corpus", doc_home,
+                    dirs_exist_ok=True)
+    aimed = {}
+    try:
+        def doctor_says(*argv):
+            """(what a --doctor printed, its exit code)."""
+            done = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--doctor", *argv],
+                capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL,
+                env={**os.environ, "CLAUDE_CONFIG_DIR": str(doc_home), "COLUMNS": "100"})
+            return " ".join((done.stdout + done.stderr).split()), done.returncode
+
+        swept, swept_code = doctor_says()
+        named, named_code = doctor_says("session-corpus-alpha")
+        typo, typo_code = doctor_says("nosuchteam")
+        several, several_code = doctor_says("team-lead")
+        stranger, stranger_code = doctor_says("00000000-0000-4000-8000-000000000000")
+        for label, (said, code) in {
+                "a typo": (typo, typo_code),
+                "a name several rosters carry": (several, several_code),
+                "a uuid nothing holds": (stranger, stranger_code)}.items():
+            if "Traceback" in said:
+                aimed[label] = f"crashed: {said[-90:]}"
+            elif code == 0:
+                aimed[label] = f"was answered rather than refused: {said[:90]}"
+            elif "DEGRADED" in said or "SEVERED" in said or "CONNECTED" in said:
+                aimed[label] = f"widened into a sweep: {said[:90]}"
+        # The refusal has to name what was typed, or a reader cannot tell which
+        # of several tokens on the line the doctor could not place.
+        if "nosuchteam" not in typo:
+            aimed["a typo"] = f"does not name what was typed: {typo[:90]}"
+        if "session-corpus-alpha" not in several:
+            aimed["a name several rosters carry"] = f"names no candidate: {several[:90]}"
+        if named_code != 0 or "session-corpus-alpha" not in named:
+            aimed["a real team"] = f"did not answer: {named[:90]}"
+        # Only that it still sweeps, and that is asserted on the blocks rather
+        # than on the exit code, which reports the worst verdict found and so
+        # says nothing about whether anything was examined. Which teams the
+        # sweep finds interesting is its own question; naming one here would
+        # fail for a reason that has nothing to do with this check.
+        if not any(v in swept for v in
+                   ("CONNECTED", "DEGRADED", "SEVERED", "UNKNOWABLE")):
+            aimed["an empty hand"] = f"examined nothing: {swept[:90]}"
+    finally:
+        shutil.rmtree(doc_home, ignore_errors=True)
+    check("doctor-refuses-what-names-no-team",
+          "the doctor answers about the team it was given, or refuses; it never widens",
+          not aimed, "; ".join(f"{k}: {v}" for k, v in sorted(aimed.items())))
 
     # DEGRADED is the verdict that means a person must act, and three different
     # states reach it. Each is driven here as its own fixture over one corpus
