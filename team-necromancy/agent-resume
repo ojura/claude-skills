@@ -9026,6 +9026,132 @@ def live_checks():
         spared.kill()
         spared.wait()
 
+    # -- the program driven the way a person types it
+    #
+    # Every other check in this suite calls a function against fixtures that
+    # resolve. This one types commands at the front door, and that difference
+    # is what hid a crash on the plainest shapes there are: a name that is not
+    # there, a name@team that is not there, a uuid nothing holds. Each printed
+    # its refusal and then died in a traceback out of the end-of-run audit,
+    # against a suite that was green, because no check drives argument
+    # parsing, dispatch and the audit together.
+    #
+    # Refusing is most of what these shapes should do, so a non-zero exit with
+    # a message is a pass and only a traceback is a failure; the detail names
+    # the command and the exception it died of. Both are covered on purpose: a
+    # list that refused everything would pass with resolution deleted, so a
+    # run that goes through is required too. Every shape that could launch
+    # carries --dry-run, and the tier checks afterwards that it started
+    # nothing, since one forgotten --dry-run would leave a claude process and
+    # a tmux server behind on every suite run.
+    here_uuid = "22222222-2222-4222-8222-222222222222"
+    gone_uuid = "00000000-0000-4000-8000-000000000000"
+    shapes = [
+        # a name, spelled the ways people spell one
+        ("runs", ["willow", "--dry-run"]),
+        ("refuses", ["nosuchname", "--dry-run"]),
+        ("runs", ["willow@session-corpus-alpha", "--dry-run"]),
+        ("refuses", ["nosuchagent@session-corpus-alpha", "--dry-run"]),
+        ("refuses", ["nosuch@nosuchteam", "--dry-run"]),
+        ("refuses", ["@session-corpus-alpha", "--dry-run"]),       # nothing before the @
+        ("refuses", ["WILLOW@session-corpus-alpha", "--dry-run"]), # a case the roster does not carry
+        ("runs", ["willow@", "--dry-run"]),                        # a trailing @ is a bare name
+        ("runs", ["willow@team@extra", "--dry-run"]),              # two @, warned about
+        # a session uuid, held and not held
+        ("runs", [here_uuid, "--dry-run"]),
+        ("refuses", [gone_uuid, "--dry-run"]),
+        # a team, bare and behind the flag. Either way round: whether a team
+        # comes up depends on its lead being live, which is this machine's
+        # business rather than the fixture's.
+        ("either", ["session-corpus-alpha", "--dry-run"]),
+        ("refuses", ["nosuchteam", "--dry-run"]),
+        ("either", ["--team", "session-corpus-alpha", "--dry-run"]),
+        ("refuses", ["--team", "nosuchteam", "--dry-run"]),
+        # --standing on each of those shapes
+        ("runs", ["willow", "--standing"]),
+        ("refuses", ["nosuchname", "--standing"]),
+        ("runs", ["willow@session-corpus-alpha", "--standing"]),
+        ("runs", ["nosuchagent@session-corpus-alpha", "--standing"]),
+        ("refuses", [here_uuid, "--standing"]),
+        ("refuses", [gone_uuid, "--standing"]),
+        ("refuses", ["session-corpus-alpha", "--standing"]),
+        ("refuses", ["nosuchteam", "--standing"]),
+        # the other verbs, pointed at what they cannot find. --doctor is
+        # either way round for a reason worth writing down: classify() does
+        # not know the name, so run_doctor drops it and sweeps the machine,
+        # and the exit code is then whatever the worst team on this machine
+        # is. Pinning it would be pinning that, and both the dispatch comment
+        # in main and run_doctor's own say a named team is not meant to widen
+        # into a sweep. It is a separate defect from the one this tier was
+        # written for, so this only holds it to not crashing.
+        ("either", ["--doctor", "nosuchteam"]),
+        ("refuses", ["--demote", gone_uuid]),
+        ("refuses", ["--promote", "nosuchside"]),
+        # nothing wears this id, so the stop finds nothing and asks nobody
+        ("refuses", ["--agent-id", "ghost@session-corpus-alpha", "--stop"]),
+        ("refuses", ["--frobnicate", "willow"]),
+    ]
+
+    def swarm_now():
+        """Anything a launch from this tier would have added to the machine.
+
+        The processes are narrowed to agents wearing a fixture identity,
+        because this machine runs real agents of its own and one somebody else
+        spawns while the tier is running is not the tier's doing. The servers
+        are not narrowed: only this tool makes a claude-swarm socket, and one
+        appearing here is worth a look whichever shape made it.
+        """
+        return ({str(pid) for pid, _ppid, cmd in RESOLVER.ps_table(refresh=True)
+                 if "--agent-id" in cmd and "session-corpus-" in cmd}
+                | {sock.name for sock in RESOLVER.swarm_sockets()})
+
+    # A copy of the fixture rather than the fixture: a shape that turned out to
+    # write would otherwise edit the corpus every other check reads.
+    smoke_home = Path(tempfile.mkdtemp(prefix=f"{TOOL}-smoke-"))
+    smoke_cfg = smoke_home / "claude"
+    shutil.copytree(Path(__file__).resolve().parent / "test" / "corpus", smoke_cfg)
+    smoke_env = dict(os.environ, CLAUDE_CONFIG_DIR=str(smoke_cfg), NO_COLOR="1")
+    crashed, misbehaved, codes = [], [], set()
+    was_up = swarm_now()
+    try:
+        for expect, argv in shapes:
+            typed = f"{TOOL} {' '.join(argv)}"
+            try:
+                # stdin closed: a prompt nobody can answer must not hang the
+                # suite, and no shape here is meant to reach one.
+                run = sp.run([sys.executable, str(Path(__file__).resolve()), *argv],
+                             capture_output=True, text=True, env=smoke_env,
+                             stdin=sp.DEVNULL, timeout=60)
+            except sp.TimeoutExpired:
+                crashed.append(f"{typed}: still running after 60s")
+                continue
+            codes.add(run.returncode)
+            if "Traceback (most recent call last)" in run.stderr:
+                died_of = next((line for line in reversed(run.stderr.splitlines())
+                                if re.match(r"[A-Za-z_.]+(Error|Exception):", line)),
+                               "no exception line")
+                crashed.append(f"{typed}: {died_of.strip()[:110]}")
+            elif expect == "runs" and run.returncode != 0:
+                misbehaved.append(f"{typed}: exit {run.returncode}, expected it to go through")
+            elif expect == "refuses" and run.returncode == 0:
+                misbehaved.append(f"{typed}: exit 0, expected a refusal")
+            elif expect == "refuses" and not run.stderr.strip():
+                misbehaved.append(f"{typed}: exit {run.returncode} and said nothing")
+    finally:
+        shutil.rmtree(smoke_home, ignore_errors=True)
+    left_behind = sorted(swarm_now() - was_up)
+    if left_behind:
+        misbehaved.append(f"started something and left it: {', '.join(left_behind)}")
+    if 0 not in codes or not codes - {0}:
+        misbehaved.append(f"a run and a refusal must both be covered, "
+                          f"and the exit codes seen were {sorted(codes)}")
+    told = crashed + misbehaved
+    # Three whole entries and then a count, rather than a run of them cut off
+    # mid-command: the detail is one line, and half a command name is no lead.
+    shown = told[:3] + ([f"and {len(told) - 3} more"] if len(told) > 3 else [])
+    check("smoke-typed-commands", "the commands a person types end in a message, not a traceback",
+          not told, "; ".join(shown))
+
     return out
 
 
