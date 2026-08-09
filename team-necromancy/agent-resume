@@ -299,6 +299,10 @@ def check_identity_flags(args, passthrough):
     who supplies both and contradicts them is describing an agent that cannot
     exist, and the name is what routes mail: the mailbox is inboxes/<name>.json,
     so the wrong name reads an address nobody writes to.
+
+    A team-less --agent-id is caught too, since name_and_team reads it as the
+    name it is: "--agent-id mate --agent-name other" names two agents whichever
+    way the id is spelled.
     """
     named = None
     tokens = list(passthrough)
@@ -307,11 +311,10 @@ def check_identity_flags(args, passthrough):
             named = tokens[index + 1]
         elif token.startswith("--agent-name="):
             named = token.split("=", 1)[1]
-    if named and args.agent_id and "@" in args.agent_id:
-        wearing = args.agent_id.split("@", 1)[0]
-        if wearing != named:
-            die(f"--agent-id says {wearing!r} and --agent-name says {named!r}; they are one "
-                f"fact, and the name is what addresses the mailbox. Pass one, or matching ones")
+    wearing = name_and_team(args.agent_id)[0]
+    if named and wearing and wearing != named:
+        die(f"--agent-id says {wearing!r} and --agent-name says {named!r}; they are one "
+            f"fact, and the name is what addresses the mailbox. Pass one, or matching ones")
 
 
 # Every flag that is a whole run by itself, keyed by the attribute argparse
@@ -413,6 +416,41 @@ def check_flags_took_effect(passthrough, results, args):
     die(f"{', '.join(named)} only {verb} effect on a process that is started, and nothing "
         f"was started: every agent named was already running. Stop it first (--stop), "
         f"or pass --force to start a second copy.")
+
+
+def name_and_team(agent_id):
+    """The (name, team) an agent id names. The inverse of agent_id_of.
+
+    An id with no "@" is a name and no team, so "mate" answers ("mate", None)
+    rather than raising or handing back an empty team. That is what the halves
+    mean: --agent-name is the mailbox address and --team-name is the roster it
+    is in, and a token carrying only the first still names an agent. Callers
+    that need both halves test the team and say so themselves, because what a
+    missing team costs differs per caller: --doctor refuses, a promote fills it
+    in from the side transcript, a report prints what it holds.
+
+    Nothing is refused. A malformed id arrives out of a roster somebody else
+    wrote, and the callers here report on such a roster rather than dying on
+    it.
+
+    Empty halves answer None, not "": an id of "@team" names no agent and
+    "mate@" names no team, and None is how the rest of this file spells a
+    question that was not answered.
+    """
+    name, _, team = (agent_id or "").partition("@")
+    return name or None, team or None
+
+
+def agent_id_of(name, team):
+    """The id an agent of this name on this team wears. The inverse of
+    name_and_team.
+
+    The one place the "@" is written, so a launch's argv, a roster entry and a
+    report cannot spell one agent three ways. Halves are spelled as they come:
+    a caller holding half an identity decides what to do about it before it
+    asks for an id.
+    """
+    return f"{name}@{team}"
 
 
 def agent_colour(agent_id, member=None):
@@ -1201,7 +1239,7 @@ class Resolver:
             # is for unbound launches), so every rung above it is blind to one.
             # It does advertise its identity in argv, which is exact evidence.
             masquerade = next((e for e in self.live_sessions()
-                               if e["alive"] and e["agent"] == f"team-lead@{team}"), None)
+                               if e["alive"] and e["agent"] == agent_id_of("team-lead", team)), None)
             if masquerade:
                 return masquerade["pid"], True, f"pid {masquerade['pid']}, masquerading as {masquerade['agent']}", True
 
@@ -1271,7 +1309,7 @@ class Resolver:
             claimant uncorroborated exactly when the asker is its own child.
             """
             for name in names:
-                others, ours = self.wearers(f"{name}@{team}")
+                others, ours = self.wearers(agent_id_of(name, team))
                 if others or ours:
                     return True
             return False
@@ -1479,7 +1517,7 @@ class Resolver:
             entry["session"] = entry["session"] or held
             if agent:
                 entry["agent"] = agent
-                entry["team"] = agent.split("@", 1)[1] if "@" in agent else None
+                entry["team"] = name_and_team(agent)[1]
         return list(found.values())
 
     def _log(self, stem):
@@ -1515,7 +1553,7 @@ class Resolver:
         return {
             "name": name,
             "team": team,
-            "agentId": (f"{name}@{team}" if name and team else self.field(ctx, "agentId") or ""),
+            "agentId": (agent_id_of(name, team) if name and team else self.field(ctx, "agentId") or ""),
             "parentSession": self.field(ctx, "parentSessionId") or "",
             "agentType": self.field(ctx, "agentType"),
             "planModeRequired": self.field(ctx, "permissionMode") == "plan",
@@ -1567,7 +1605,7 @@ class Resolver:
             if team and entry["team"].lower() != team.lower():
                 continue
             if theirs.lower() == name.lower():
-                near.add(f"{theirs}@{entry['team']}")
+                near.add(agent_id_of(theirs, entry["team"]))
         return sorted(near)
 
     def _pid_running_team(self, team):
@@ -2073,23 +2111,23 @@ class Resolver:
         if name and team:
             # Both halves: argv is the strongest evidence this tool has, and our
             # own lineage carries the same argv as anyone else's process.
-            others, ours = self.wearers(f"{name}@{team}")
+            others, ours = self.wearers(agent_id_of(name, team))
             seen = others + ours
             held = {transcript for _, transcript in seen if transcript}
             if len(held) > 1:
                 return Resolution(reason=(
-                    f"{len(seen)} live processes wear {name}@{team} on different conversations "
+                    f"{len(seen)} live processes wear {agent_id_of(name, team)} on different conversations "
                     f"({', '.join(f'pid {pid} on {t[:8]}' for pid, t in seen if t)}); "
                     "name the one you mean with --resume"))
             if held:
                 path = self.transcript_path(held.pop())
                 if path:
                     if len(seen) > 1:
-                        warn(f"{len(seen)} live processes wear {name}@{team} on this one "
+                        warn(f"{len(seen)} live processes wear {agent_id_of(name, team)} on this one "
                              f"conversation (pids {', '.join(str(pid) for pid, _ in seen)})")
                     fields, last = ({}, 0) if quick else self._scan_transcript(path)
                     return Resolution(path, fields, last, strength=EXACT,
-                                      via=f"live pid {seen[0][0]} wearing {name}@{team}")
+                                      via=f"live pid {seen[0][0]} wearing {agent_id_of(name, team)}")
 
         if lead_session or is_lead:
             path = self.transcript_path(lead_session) if lead_session else None
@@ -2132,7 +2170,7 @@ class Resolver:
                 return Resolution(
                     *hits[0], via="agentName only (unique across rosters)", strength=NAME_ONLY, others=hits[1:]
                 )
-        label = f"{name or '?'}@{team or '?'}"
+        label = agent_id_of(name or "?", team or "?")
         # Every rung is spent. If a roster carries this word under different
         # capitals, saying so is the whole difference between a dead end and a
         # typo, and it costs one pass over rosters already read.
@@ -2202,7 +2240,7 @@ class Resolver:
                 # path drew that line already; this is the same word, one reader.
                 # Both halves, because this states what an agent is: filing the
                 # asker's own process under former is the same false report.
-                others, ours = self.wearers(f"{name}@{team}")
+                others, ours = self.wearers(agent_id_of(name, team))
                 people[name] = (("unrecorded", "running, and in no roster")
                                 if others or ours
                                 else ("former", "a transcript stamped with this team"))
@@ -3048,10 +3086,10 @@ class Resolver:
         team = name = None
         if team_entry:
             team, name = team_entry["team"], team_entry["member"].get("name")
-        elif agent_id and "@" in agent_id:
-            name, team = agent_id.split("@", 1)
+        elif agent_id:
+            name, team = name_and_team(agent_id)
 
-        worn_id = f"{name}@{team}" if name and team else None
+        worn_id = agent_id_of(name, team) if name and team else None
         # The harness reserves the name, so a lead is a lead whether or not a roster
         # survives to say so; without this a reaped team's lead is refused as a name
         # that lives in several rosters.
@@ -3142,7 +3180,7 @@ class Resolver:
                     leads_team = led
                     merged.add("teamName", led, res.last_ts, "spawn payloads in this transcript")
                     merged.add("agentName", "team-lead", res.last_ts, "spawn payloads in this transcript")
-                    merged.add("agentId", f"team-lead@{led}", res.last_ts, "spawn payloads in this transcript")
+                    merged.add("agentId", agent_id_of("team-lead", led), res.last_ts, "spawn payloads in this transcript")
                     break
                 else:
                     # Nothing stamped it and it spawned nobody, so it is neither a
@@ -3195,7 +3233,7 @@ class Resolver:
             name = fields.get("agentName", (None,))[0]
             team = fields.get("teamName", (None,))[0]
             if name and team:
-                merged.add("agentId", f"{name}@{team}", last_ts, src + " (derived)")
+                merged.add("agentId", agent_id_of(name, team), last_ts, src + " (derived)")
 
         # ---- a worn identity pins the identity triple
         # When a live process is what identified this transcript, that process is
@@ -3205,8 +3243,8 @@ class Resolver:
         # so per-field most-recent-wins can otherwise take the id from one source and
         # the team from another, and emit a command wearing two different teams.
         # Non-identity fields keep normal merge semantics.
-        if res.via.startswith("live pid ") and worn_id and "@" in worn_id:
-            worn_name, _, worn_team = worn_id.partition("@")
+        if res.via.startswith("live pid ") and worn_id:
+            worn_name, worn_team = name_and_team(worn_id)
             pinned = last_ts + 1  # outranks anything the transcript itself can say
             merged.add("agentId", worn_id, pinned, "live argv")
             merged.add("agentName", worn_name, pinned, "live argv")
@@ -3222,7 +3260,7 @@ class Resolver:
         if promoted_as:
             merged.add("agentName", promoted_as[0], 0, "promote receipt")
             merged.add("teamName", promoted_as[1], 0, "promote receipt")
-            merged.add("agentId", f"{promoted_as[0]}@{promoted_as[1]}", 0, "promote receipt")
+            merged.add("agentId", agent_id_of(*promoted_as), 0, "promote receipt")
 
         # ---- last resort: the lead's record of spawning this member
         # Timestamp 0 so every dated source beats it: it is a snapshot from spawn
@@ -3258,7 +3296,7 @@ class Resolver:
             "other_transcripts": others,
             # A lead reached by rung 4 has no roster entry yet, so its own merged id
             # is the answer: the payloads that named its team also make it the lead.
-            "lead_agent_id": (f"team-lead@{leads_team}" if leads_team
+            "lead_agent_id": (agent_id_of("team-lead", leads_team) if leads_team
                               else team_entry["leadAgentId"] if team_entry
                               else (aid if (aid := merged.pick("agentId")[0])
                                     and merged.pick("agentName")[0] == "team-lead" else None)),
@@ -3989,7 +4027,7 @@ class Resolver:
             for _, payload in self._log(path.stem):
                 name, team = payload.get("name"), payload.get("team_name")
                 if name and team:
-                    self._by_agent[f"{name}@{team}"] = payload
+                    self._by_agent[agent_id_of(name, team)] = payload
         return self._by_agent
 
     def spawn_payload(self, agent_id, lead_session=None):
@@ -4006,7 +4044,7 @@ class Resolver:
         # Keyed on name and team together: a lead that respawns a name into a later
         # team holds a payload for each, and the name alone returns whichever came
         # last, which is the wrong life's colour and model.
-        name, _, team = agent_id.partition("@")
+        name, team = name_and_team(agent_id)
         if lead_session and team:
             found = next((payload for payload in self.members_spawned_into(lead_session, team)
                           if payload.get("name") == name), None)
@@ -4188,7 +4226,7 @@ class Resolver:
         its own engine question (spawn_parent_of) that only --standing asks,
         and a caller consulting the verdict never buys the spawn corpus.
         """
-        name, _, team = agent_id.partition("@")
+        name, team = name_and_team(agent_id)
         pid, alive, how, exact_lead = self.lead_pid(parent_session, team)
         lead_team, exact_team = self.team_minted_by(pid) if pid and alive else (None, False)
         roster = self.roster_of(lead_team) if lead_team else None
@@ -4242,7 +4280,7 @@ class Resolver:
                 why += "; that roster lists no members at all, so nothing is polled yet"
                 remedies += [("have the lead start any teammate",
                               "it starts reading mail immediately; costs nothing"),
-                             (f"resume the lead as team-lead@{lead_team}",
+                             (f"resume the lead as {agent_id_of('team-lead', lead_team)}",
                               "restarts it with team flags; it reads the roster on "
                               "the way up and loses its current turn")]
         elif polls[0] is None:
@@ -4250,7 +4288,7 @@ class Resolver:
                                     f"reading cannot be told from outside its process")
             remedies = [("have the lead start any teammate",
                          "it starts reading mail immediately; costs nothing"),
-                        (f"resume the lead as team-lead@{lead_team}",
+                        (f"resume the lead as {agent_id_of('team-lead', lead_team)}",
                          "restarts it with team flags; it reads this roster on "
                          "the way up and loses its current turn")]
         else:
@@ -4710,7 +4748,7 @@ class Resolver:
         if not (name and team):
             return (f"demote needs the parent session (--into-session): {why}, and it "
                     "carries no agent stamps to look a spawn payload up by")
-        agent_id = f"{name}@{team}"
+        agent_id = agent_id_of(name, team)
         parent, _how = self.spawn_parent_of(agent_id)
         if parent:
             return (f"demote needs the parent session (--into-session): {why}. The spawn "
@@ -5862,7 +5900,7 @@ def forge_team(ctx, dry, evidence=None, team=None):
         # The payloads carry the colour, type and model the roster held, which is
         # the same evidence RESOLVER.led_teams() uses to identify this lead at all.
         members = [{
-            "agentId": f"team-lead@{team}",
+            "agentId": agent_id_of("team-lead", team),
             "name": "team-lead",
             "agentType": "team-lead",
             "joinedAt": now,
@@ -5873,7 +5911,7 @@ def forge_team(ctx, dry, evidence=None, team=None):
         }]
         for payload in RESOLVER.members_spawned_into(ctx["session_uuid"], team):
             entry = {
-                "agentId": payload.get("agent_id") or f"{payload['name']}@{team}",
+                "agentId": payload.get("agent_id") or agent_id_of(payload["name"], team),
                 "name": payload["name"],
                 "joinedAt": now,
                 "tmuxPaneId": payload.get("tmux_pane_id") or "",
@@ -5890,7 +5928,7 @@ def forge_team(ctx, dry, evidence=None, team=None):
         config = {
             "name": team,
             "createdAt": now,
-            "leadAgentId": f"team-lead@{team}",
+            "leadAgentId": agent_id_of("team-lead", team),
             # Written only at the strength the engine will later read it at. Rung 1
             # treats leadSessionId as EXACT and asks nothing further, so recording an
             # uncorroborated guess there would convert a one-off warning into a
@@ -5909,7 +5947,7 @@ def forge_team(ctx, dry, evidence=None, team=None):
             "members": members,
         }
         rebuilt = ", ".join(m["name"] for m in members[1:]) or "no members recovered"
-        ctx["lead_agent_id"] = f"team-lead@{team}"
+        ctx["lead_agent_id"] = agent_id_of("team-lead", team)
         if dry:
             step(True, f"would forge {cfg} (lead + {rebuilt}) and seed every inbox", "")
             # Returned in both modes so a dry run previews the same roster a real
@@ -5938,11 +5976,11 @@ def forge_team(ctx, dry, evidence=None, team=None):
     config = {
         "name": team,
         "createdAt": now,
-        "leadAgentId": f"team-lead@{team}",
+        "leadAgentId": agent_id_of("team-lead", team),
         "leadSessionId": lead_sid,
         "members": [
             {
-                "agentId": f"team-lead@{team}",
+                "agentId": agent_id_of("team-lead", team),
                 "name": "team-lead",
                 "agentType": "team-lead",
                 "joinedAt": now,
@@ -6266,7 +6304,7 @@ def build_command(ctx, args, passthrough):
             if field == "teamName":
                 value = dest
             elif field == "agentId":
-                value = f"{RESOLVER.field(ctx, 'agentName')}@{dest}"
+                value = agent_id_of(RESOLVER.field(ctx, "agentName"), dest)
             elif field == "parentSessionId":
                 value = ctx.get("to_lead") or value
         # The name and the team are the two halves of the id, not second opinions
@@ -6281,8 +6319,11 @@ def build_command(ctx, args, passthrough):
         if flag in ("--agent-name", "--team-name"):
             emitted_id = next((cmd[i + 1] for i, token in enumerate(cmd)
                                if token == "--agent-id"), None)
-            if emitted_id and "@" in emitted_id:
-                name_half, _, team_half = emitted_id.partition("@")
+            name_half, team_half = name_and_team(emitted_id)
+            if name_half:
+                # An --agent-id of "mate" emits --agent-name mate and no
+                # --team-name at all: the id is what this launch wears, so
+                # both flags come off it and neither off the merge.
                 value = name_half if flag == "--agent-name" else team_half
         if not value:
             continue
@@ -6359,7 +6400,7 @@ def check_substrate():
 def build_command_agent_id(ctx):
     """The agent id the launch wears, which a rebind changes."""
     dest = ctx.get("to_team")
-    return f"{RESOLVER.field(ctx, 'agentName')}@{dest}" if dest else RESOLVER.field(ctx, "agentId")
+    return agent_id_of(RESOLVER.field(ctx, "agentName"), dest) if dest else RESOLVER.field(ctx, "agentId")
 
 
 def confirm_redirect(agent_id, pid, dest, source, prefix=""):
@@ -6727,7 +6768,7 @@ def crew_left_behind(source, dest, prefix=""):
             continue
         # Both halves: these are report lines about who stays behind, and a
         # member we are running inside stays behind like any other.
-        others, ours = RESOLVER.wearers(f"{name}@{source}")
+        others, ours = RESOLVER.wearers(agent_id_of(name, source))
         live = others + ours
         said.append(f"{name} ({state}"
                     + (f", running as pid {live[0][0]}" if live else "") + ")")
@@ -7249,14 +7290,14 @@ def _complete(topic):
             joined = f"joined {ms_str(entry['ts'])}"
             print(f"{agent_id}\t{title + ', ' + joined if title else joined}\t")
         for team, evidence in sorted(RESOLVER.known_teams().items()):
-            if f"team-lead@{team}" in seen or RESOLVER.has_roster(team):
+            if agent_id_of("team-lead", team) in seen or RESOLVER.has_roster(team):
                 continue
             path, why = RESOLVER.lead_transcript_for(team)
             if not path:
                 continue
             title = session_title(path, limit=COMPLETION_TITLE)
             label = f"{title}, no roster" if title else f"no roster, found by {evidence}"
-            print(f"team-lead@{team}\t{label}\t")
+            print(f"{agent_id_of('team-lead', team)}\t{label}\t")
         return 0
 
     if topic == "names":
@@ -7269,7 +7310,7 @@ def _complete(topic):
         for path, (name, team) in RESOLVER.stamp_index().items():
             if not name or not team or name == "team-lead":
                 continue
-            agent_id = f"{name}@{team}"
+            agent_id = agent_id_of(name, team)
             try:
                 when = int(path.stat().st_mtime * 1000)
             except OSError:
@@ -7295,7 +7336,7 @@ def _complete(topic):
         live_agents = {e["agent"] for e in RESOLVER.live_sessions() if e["alive"] and e["agent"]}
         best = {}
         for agent_id, (when, path, member) in candidates.items():
-            name = agent_id.split("@", 1)[0]
+            name = name_and_team(agent_id)[0]
             rank = (agent_id in live_agents, path is not None, when)
             if name not in best or rank > best[name][0]:
                 best[name] = (rank, agent_id)
@@ -7307,7 +7348,7 @@ def _complete(topic):
         # than scattered through one long list.
         by_team = collections.defaultdict(list)
         for agent_id, (when, path, member) in candidates.items():
-            by_team[agent_id.split("@", 1)[-1]].append((when, agent_id, path, member))
+            by_team[name_and_team(agent_id)[1]].append((when, agent_id, path, member))
         rosters = {e["team"] for e in RESOLVER.scan_teams()}
         for team in sorted(by_team, key=lambda t: max(w for w, *_ in by_team[t]), reverse=True):
             members = sorted(by_team[team], reverse=True)
@@ -7525,7 +7566,7 @@ def run_standing(args):
                False: "does not reach its lead",
                None: "may not reach its lead"}[reachable]
     print(fill(f"mail     {verdict}: {why}"))
-    name, _, team = s["agent_id"].partition("@")
+    name, team = name_and_team(s["agent_id"])
     res = RESOLVER.resolve_transcript(name=name, team=team, quick=True)
     held = res.path.stem if res and getattr(res, "path", None) else None
     fragile = RESOLVER.rebind_fragility(held, team)
@@ -7609,7 +7650,7 @@ def diagnose_team(team, table=None, deep=False):
     # is most likely to be asking about.
     live = {}
     for n in population:
-        others, ours = RESOLVER.wearers(f"{n}@{team}")
+        others, ours = RESOLVER.wearers(agent_id_of(n, team))
         if others or ours:
             live[n] = others + ours
     doubled = sorted(n for n, w in live.items() if len({p for p, _t in w}) > 1)
@@ -7641,7 +7682,7 @@ def diagnose_team(team, table=None, deep=False):
     # One seat answer per live member, read twice: the split wants the sockets,
     # the warning below wants the names that have none. Asking the seat question
     # again for the second of those would double what this sweep pays per member.
-    seating = {n: RESOLVER.seat_of(f"{n}@{team}", table)
+    seating = {n: RESOLVER.seat_of(agent_id_of(n, team), table)
                for n in live if n != "team-lead"}
     seats = {sock for _state, sock in seating.values() if sock}
     split = len(seats) > 1
@@ -7659,7 +7700,7 @@ def diagnose_team(team, table=None, deep=False):
     if unseated:
         one = len(unseated) == 1
         it = "it" if one else "them"
-        stop = f"{unseated[0]}@{team}" if one else "each of them"
+        stop = agent_id_of(unseated[0], team) if one else "each of them"
         lines.append(f"warning  {', '.join(unseated)} {'is' if one else 'are'} live "
                      f"and in no tmux pane; a run of this team leaves {it} there, "
                      f"because a live member makes that run a noop rather than a "
@@ -7731,7 +7772,7 @@ def diagnose_team(team, table=None, deep=False):
         # a roster written from outside.
         remedies.append(("start any teammate from inside the lead",
                          "it starts reading mail immediately; costs nothing"))
-        remedies.append((f"{TOOL} team-lead@{team}",
+        remedies.append((f"{TOOL} {agent_id_of('team-lead', team)}",
                          "restarts the lead with team flags; it reads this roster "
                          "on the way up and loses its current turn"))
     elif doubled or split:
@@ -7747,9 +7788,9 @@ def diagnose_team(team, table=None, deep=False):
             # wearing it and ends each one; the id names both wearers, so the
             # stop cannot be aimed at one of them and the resume is what leaves
             # exactly one behind.
-            remedies.append((f"{TOOL} --stop {name}@{team}",
+            remedies.append((f"{TOOL} --stop {agent_id_of(name, team)}",
                              f"ends all {len(live[name])} processes wearing that id"))
-            remedies.append((f"{TOOL} {name}@{team}", "starts one of them again"))
+            remedies.append((f"{TOOL} {agent_id_of(name, team)}", "starts one of them again"))
     else:
         verdict = "CONNECTED"
     return verdict, lines, remedies
@@ -7770,7 +7811,7 @@ def doctor_target(args, selector):
     if args.team:
         return args.team
     if args.agent_id:
-        team = args.agent_id.partition("@")[2]
+        team = name_and_team(args.agent_id)[1]
         if not team:
             die(f"--agent-id {args.agent_id} names no team, and this asks about a team; "
                 f"pass it as name@team, or name the team on its own")
@@ -7782,7 +7823,7 @@ def doctor_target(args, selector):
     if kind == "team":
         return value
     if kind == "agent_id":
-        team = (value or "").partition("@")[2]
+        team = name_and_team(value)[1]
         if team:
             return team
         die(f"{selector} names no team, and this asks about a team; pass it as "
@@ -8357,8 +8398,7 @@ def run_promote(args):
         die(why)
     name, team = None, None
     if args.as_:
-        name, _, team = args.as_.partition("@")
-        name, team = name or None, team or None
+        name, team = name_and_team(args.as_)
     defaulted = not name
     name = name or entry["name"] or entry["task_id"]
     if not team:
@@ -8370,7 +8410,7 @@ def run_promote(args):
                 else f"no --as-agent was passed, so no team was named; {name} "
                      "is the name this would take from the side transcript")
         die(f"{half}. A promote has to be told which team it joins: "
-            f"type --as-agent {name}@<team>")
+            f"type --as-agent {agent_id_of(name, '<team>')}")
     # The spoken identity goes in before the plan is built, because until the
     # first launch registers this member the promoted transcript is the only
     # thing that says who it is, and it says so in the line it carries.
@@ -8389,12 +8429,12 @@ def run_promote(args):
           f"({entry['grammar']}, {len(plan['lines'])} lines)")
     if defaulted:
         print(f"name     {name}  (from the side transcript's meta)")
-    print(f"as       {name}@{team}")
+    print(f"as       {agent_id_of(name, team)}")
     print(f"into     {dest}")
     print(f"receipt  {RECEIPTS_DIR / (plan['receipt']['root'] or dest.stem)}.json")
     # One spelling of the launch line; the dry and real paths differ only in
     # their annotation, so the preview cannot drift from what a run prints.
-    launch = [sys.argv[0], f"{name}@{team}", "--resume", dest.stem]
+    launch = [sys.argv[0], agent_id_of(name, team), "--resume", dest.stem]
     launch_line = f"launch   {shlex.join(launch)}"
     if args.dry_run:
         print(f"{launch_line}  (dry run; nothing written)")
@@ -8623,10 +8663,10 @@ def run_census():
                for member in data.get("members", [])]
     id_agrees = sum(1 for _, _, m in members
                     if m.get("agentId") and m.get("name")
-                    and m["agentId"].split("@", 1)[0] == m["name"])
+                    and name_and_team(m["agentId"])[0] == m["name"])
     id_total = sum(1 for _, _, m in members if m.get("agentId") and m.get("name"))
     lead_agrees = sum(1 for _, data, _ in rosters_leads(rosters)
-                      if data.get("leadAgentId") == f"team-lead@{data.get('name')}")
+                      if data.get("leadAgentId") == agent_id_of("team-lead", data.get("name")))
     print("identity")
     print(f"  roster members whose id is name@team   {conformance(id_agrees, id_total)}")
     print(f"  rosters whose lead is team-lead@team   {conformance(lead_agrees, len(rosters))}")
@@ -8634,7 +8674,7 @@ def run_census():
     payload_pairs = [(p.get("agent_id"), p.get("name"), p.get("team_name"))
                      for p in RESOLVER.spawn_payloads()]
     payload_ok = sum(1 for aid, name, team in payload_pairs
-                     if aid and name and team and aid == f"{name}@{team}")
+                     if aid and name and team and aid == agent_id_of(name, team))
     payload_total = sum(1 for aid, name, team in payload_pairs if aid and name and team)
     print(f"  spawn payloads whose id is name@team   "
           f"{conformance(payload_ok, payload_total)}")
@@ -9139,7 +9179,7 @@ def select_jobs(members, population, live, lead_id, all_members, team):
         # now and merely unrecorded, and a section header calling it an ex-member
         # describes the record's gap as the agent's state.
         kind = "unrecorded" if name in live else "former"
-        return {"agentId": f"{name}@{team}", "name": name, kind: True}
+        return {"agentId": agent_id_of(name, team), "name": name, kind: True}
 
     listed = {m.get("name") for m in members if m.get("name")}
     if all_members:
@@ -9194,7 +9234,7 @@ def run_team(args, passthrough, table):
     # one by name if the roster puts it in the job list anyway.
     live = set()
     for name in population:
-        others, _worn_by_us = RESOLVER.wearers(f"{name}@{args.team}")
+        others, _worn_by_us = RESOLVER.wearers(agent_id_of(name, args.team))
         if others:
             live.add(name)
     members, former = select_jobs(members, population, live, lead_id,
@@ -18759,6 +18799,64 @@ def _check_asking_is_not_resuming(s):
           not quiet, "; ".join(quiet))
     return checked
 
+
+
+@unit(("agent-id-spelled-one-way", "an agent id comes apart and goes together in one place"))
+def _check_agent_id_spelled_one_way(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    ast = s.ast
+    funcs = s.funcs
+    tree = s.tree
+
+    owners = ("name_and_team", "agent_id_of")
+    forked = [f"{named} is gone, so nothing owns how an id is spelled"
+              for named in owners if named not in funcs]
+    if not forked:
+        # agent_id_of builds the id, name_and_team takes it apart again, and
+        # the four rows compare what those two say against what they were
+        # given. No spelling of "mate@session-1234abcd" is written out here.
+        built = agent_id_of("mate", "session-1234abcd")
+        for asked, got, want in (
+                (f"{built} taken apart", name_and_team(built), ("mate", "session-1234abcd")),
+                ("an id with no team", name_and_team("mate"), ("mate", None)),
+                ("an id with no name", name_and_team("@crew"), (None, "crew")),
+                ("no id at all", name_and_team(None), (None, None))):
+            if got != want:
+                forked.append(f"{asked} answers {got}, not {want}")
+
+    # A second spelling anywhere else, in either direction: .split("@"),
+    # .partition("@") and their r-forms, and any f-string whose text runs up to
+    # an "@" and then substitutes, which is both f"{name}@{team}" and
+    # f"team-lead@{team}". The suite is left out: its fixtures write the ids a
+    # roster really holds and its assertions read the ids a launch really
+    # emitted, so both spell them out.
+    spread = []
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            continue
+        if node.name in s.suite_fns or node.name in owners:
+            continue
+        for sub in ast.walk(node):
+            if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr in ("split", "rsplit", "partition", "rpartition")
+                    and sub.args and isinstance(sub.args[0], ast.Constant)
+                    and sub.args[0].value == "@"):
+                spread.append(f"{node.name} cuts an id apart at line {sub.lineno}")
+            if not isinstance(sub, ast.JoinedStr):
+                continue
+            for at, piece in enumerate(sub.values[:-1]):
+                if (isinstance(piece, ast.Constant) and isinstance(piece.value, str)
+                        and piece.value.endswith("@")
+                        and isinstance(sub.values[at + 1], ast.FormattedValue)):
+                    spread.append(f"{node.name} builds an id at line {sub.lineno}")
+    forked += sorted(set(spread))
+    check("agent-id-spelled-one-way", "an agent id comes apart and goes together in one place",
+          not forked, "; ".join(forked[:3]))
+    return checked
 
 
 @unit(("check-line-one-owner", "a check reads the same way wherever it is printed"))
