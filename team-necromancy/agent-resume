@@ -453,6 +453,28 @@ def agent_id_of(name, team):
     return f"{name}@{team}"
 
 
+def implicit_team_block(team):
+    """The session id block a team name was minted from, or None.
+
+    A leader given no team name mints one lazily and calls it session- plus the
+    first eight hex of its own live session id. So a name of that shape carries
+    a fact about which session made it, and a name of any other shape carries
+    none: that team was named by a flag.
+
+    "session-a52cb2af" answers "a52cb2af". "crew", "session-a52cb2af-two" and
+    None all answer None. The eight characters come back as text and not as a
+    match object, so lead_pid and lead_session_for can hand them straight to
+    startswith and to transcripts_starting, and classify can test the answer
+    for nothing more than the shape.
+
+    Eight hex is what the harness takes and it is not a session id: several
+    sessions can open with the same eight, so a block narrows a search and
+    never settles it.
+    """
+    minted = re.fullmatch(r"session-([0-9a-f]{8})", team or "")
+    return minted.group(1) if minted else None
+
+
 def agent_colour(agent_id, member=None):
     """The roster colour for an agent, falling back to the spawn record.
 
@@ -1199,6 +1221,52 @@ class Resolver:
                 self._spawns[stem][payload["name"]] = payload  # last spawn of a name wins
                 self._spawn_log[stem].append((stamp, payload))
 
+    def session_names_team(self, session_id, team):
+        """Does this session id name this team?
+
+        True when the team's name was minted and this id opens with the eight
+        hex it was minted from. A team named by a --team-name flag was minted
+        by nobody, so it answers False for every id.
+
+        The one place a session is matched to a team name. A caller holding a
+        registry entry, a transcript stem or a candidate path asks here instead
+        of taking the name apart and comparing prefixes for itself, because
+        eight hex is not a session id: a match narrows the field and settles
+        nothing, and that is one judgement, not four.
+        """
+        block = implicit_team_block(team)
+        return bool(block and str(session_id or "").startswith(block))
+
+    def sessions_naming(self, team):
+        """Every transcript whose session id names this team, newest first.
+
+        More than one is an ordinary answer, since eight hex is not a session
+        id, and all of them come back: which of several conversations to
+        believe is the caller's judgement and it needs to see that there were
+        several.
+
+        transcripts_starting narrows the tree to the block and
+        session_names_team decides, so the match is made in one place.
+        """
+        block = implicit_team_block(team)
+        if not block:
+            return []
+        return sorted((path for path in self.transcripts_starting(block)
+                       if self.session_names_team(path.stem, team)),
+                      key=lambda path: path.stat().st_mtime, reverse=True)
+
+    def registry_entries_naming(self, team):
+        """Every session registry entry whose session id names this team.
+
+        The registry is read only for a name a session could have minted: a
+        flag-named team is nobody's session id, so there is nothing in there to
+        find and the whole of ~/.claude/sessions is left unparsed.
+        """
+        if not implicit_team_block(team):
+            return []
+        return [data for data in self.session_registry()
+                if self.session_names_team(data.get("sessionId"), team)]
+
     def lead_pid(self, parent_session=None, team=None):
         """(pid, alive, how, exact) for the live process this agent's lead runs as.
 
@@ -1220,21 +1288,18 @@ class Resolver:
             # A fresh lead's internal id IS its transcript id, so its implicit team
             # is named after a session the registry knows: an exact join, preferred
             # over the time window below. (16 of 37 team dirs here are that shape.)
-            block = re.fullmatch(r"session-([0-9a-f]{8})", team)
-            if block:
-                for data in self.session_registry():
-                    if str(data.get("sessionId", "")).startswith(block.group(1)):
-                        if self.pid_alive(data["pid"], data.get("procStart")):
-                            # The registry records the id a life resumed from,
-                            # not the identity restore gave it: a transcript
-                            # whose window-start restores to another team makes
-                            # this pid that team's lead, not this one's.
-                            joined = self.transcript_path(str(data.get("sessionId", "")))
-                            if joined:
-                                rteam, state = self.restored_identity(joined)
-                                if state == "restored" and rteam != team:
-                                    continue
-                            return data["pid"], True, f"pid {data['pid']}, whose session id names team {team}", True
+            for data in self.registry_entries_naming(team):
+                if self.pid_alive(data["pid"], data.get("procStart")):
+                    # The registry records the id a life resumed from,
+                    # not the identity restore gave it: a transcript
+                    # whose window-start restores to another team makes
+                    # this pid that team's lead, not this one's.
+                    joined = self.transcript_path(str(data.get("sessionId", "")))
+                    if joined:
+                        rteam, state = self.restored_identity(joined)
+                        if state == "restored" and rteam != team:
+                            continue
+                    return data["pid"], True, f"pid {data['pid']}, whose session id names team {team}", True
             # A masqueraded lead writes no sessions/<pid>.json at all (the registry
             # is for unbound launches), so every rung above it is blind to one.
             # It does advertise its identity in argv, which is exact evidence.
@@ -1299,7 +1364,6 @@ class Resolver:
         roster_members = {e["member"].get("name") for e in rosters}
         roster_leads = {e.get("leadSessionId") for e in rosters}
         live_here = {e.get("session") for e in self.live_sessions() if e.get("team") == team}
-        block = re.fullmatch(r"session-([0-9a-f]{8})", team)
 
         def any_child_running(names):
             """Is any of these members of this team running right now?
@@ -1330,7 +1394,7 @@ class Resolver:
             # payloads and never breaks a tie between copies of one history.
             if spawned and any_child_running(name for name in spawned if name):
                 return "live members it spawned"
-            if block and path.stem.startswith(block.group(1)):
+            if self.session_names_team(path.stem, team):
                 return "team-name block"
             return None
 
@@ -1810,13 +1874,9 @@ class Resolver:
         path, _why = self.lead_transcript_for(team)
         if path:
             return path.stem
-        block = re.fullmatch(r"session-([0-9a-f]{8})", team or "")
-        if not block:
-            return None
-        hits = sorted(self.transcripts_starting(block.group(1)),
-                      key=lambda p: p.stat().st_mtime, reverse=True)
+        hits = self.sessions_naming(team)
         if len(hits) > 1:
-            warn(f"{len(hits)} transcripts start with {block.group(1)}; assuming {hits[0].stem}")
+            warn(f"{len(hits)} transcripts name team {team}; assuming {hits[0].stem}")
         return hits[0].stem if hits else None
 
     def roster_path(self, team):
@@ -3477,7 +3537,7 @@ class Resolver:
         team_why = self.team_evidence(token)
         if team_why:
             return "team", token, team_why
-        if re.fullmatch(r"session-[0-9a-f]{8}", token):
+        if implicit_team_block(token):
             return ("unknown", None,
                     "is shaped like a team but is not one: no roster on disk, no spawn "
                     "payloads name it, and no transcript is stamped with it")
@@ -15119,8 +15179,12 @@ def _check_pick_evidence_names_no_team(s):
         picked = {
             "the timing pairing is what answered": got_pid == me and got_alive,
             "and it is graded inexact": got_exact is False,
+            # got_how is cut into words and every word handed to
+            # implicit_team_block, which is what decides whether a name is a
+            # team the harness minted.
             "the evidence names no team of this shape":
-                bool(got_how) and not re.search(r"session-[0-9a-f]{8}", got_how),
+                bool(got_how) and not any(implicit_team_block(word)
+                                          for word in re.findall(r"[\w-]+", got_how)),
             "nor this team by name": bool(got_how) and paired not in got_how,
             "and it still leads with the pid its readers strip":
                 bool(got_how) and got_how.startswith(f"pid {me}, "),
@@ -18799,6 +18863,81 @@ def _check_asking_is_not_resuming(s):
           not quiet, "; ".join(quiet))
     return checked
 
+
+
+@unit(("implicit-team-shape-one-owner", "one place says what a lazily minted team is named after"))
+def _check_implicit_team_shape_one_owner(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    ast = s.ast
+    funcs = s.funcs
+    tree = s.tree
+
+    forked = []
+    owner = funcs.get("implicit_team_block")
+    pattern = next((arg.value for node in (ast.walk(owner) if owner else ())
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and getattr(node.func.value, "id", None) == "re"
+                    for arg in node.args[:1]
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str)), None)
+    if not owner:
+        forked.append("implicit_team_block is gone, so nothing owns the shape")
+    elif not pattern:
+        forked.append("implicit_team_block matches nothing, so there is no shape to hold")
+    else:
+        # implicit_team_block is called on four team names and every answer
+        # compared: one the harness minted, one that merely starts like a
+        # minted one, one a --team-name flag gave, and no team at all.
+        for asked, got, want in (
+                ("a minted name", implicit_team_block("session-a52cb2af"), "a52cb2af"),
+                ("a minted name with more after it",
+                 implicit_team_block("session-a52cb2af-two"), None),
+                ("a name a flag gave", implicit_team_block("crew"), None),
+                ("no team at all", implicit_team_block(None), None)):
+            if got != want:
+                forked.append(f"{asked} answers {got!r}, not {want!r}")
+
+        # pattern holds implicit_team_block's own regex, taken a few lines up
+        # out of the re.fullmatch call in its body. Any other string literal in
+        # this file containing that regex is a second copy of the rule.
+        # Parentheses are dropped from both sides, so r"session-([0-9a-f]{8})"
+        # and r"session-[0-9a-f]{8}" count as the same text.
+        def bare(text):
+            return "".join(ch for ch in text if ch not in "()")
+
+        spans = [(fn.lineno, fn.end_lineno or fn.lineno, fn.name)
+                 for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)]
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                continue
+            if bare(pattern) not in bare(node.value):
+                continue
+            inside = sorted(span for span in spans if span[0] <= node.lineno <= span[1])
+            where = inside[-1][2] if inside else "<module>"
+            if where != owner.name:
+                forked.append(f"{where} writes the shape again at line {node.lineno}")
+
+        # Eight hex characters are not a session id, and what a match on them
+        # is worth is one judgement. session_names_team makes it;
+        # sessions_naming and registry_entries_naming carry it to the two
+        # corpora a team name is looked for in, and classify wants the shape
+        # and nothing else. Anybody else holding the raw block is matching
+        # names to sessions on its own account.
+        asks = s.callers_of("implicit_team_block") - s.suite_fns
+        extra = asks - {"session_names_team", "sessions_naming",
+                        "registry_entries_naming", "classify"}
+        if extra:
+            forked.append("the block is handed out to " + ", ".join(sorted(extra)))
+        for named in ("session_names_team", "sessions_naming", "registry_entries_naming"):
+            if named not in funcs:
+                forked.append(f"{named} is gone, so a caller has to match names itself")
+    check("implicit-team-shape-one-owner",
+          "one place says what a lazily minted team is named after",
+          not forked, "; ".join(sorted(set(forked))[:3]))
+    return checked
 
 
 @unit(("agent-id-spelled-one-way", "an agent id comes apart and goes together in one place"))
