@@ -9391,8 +9391,12 @@ def live_checks():
     try:
         for i in range(wanted):
             try:
-                pane, _action = launch(geom_sock, placed[0] if placed else None,
-                                       "/tmp", ["sleep", "30"], False)
+                # A launch says what it ran, which is for an operator watching
+                # one. Here it is seven fixtures, and the lines landed between
+                # the verdicts.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    pane, _action = launch(geom_sock, placed[0] if placed else None,
+                                           "/tmp", ["sleep", "30"], False)
                 placed.append(pane)
             except LaunchFailed as exc:
                 refused = f"member {i + 1}: {exc}"
@@ -10058,7 +10062,21 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         # live_checks runs the read-only tier as a child, to read its stderr and
         # to take its verdicts. Running it here as well would answer every
         # read-only question twice in one invocation, which is what it did.
-        return _selftest_report(live_checks(), failed_only, list_only)
+        # Its stdout is captured for the same reason its stderr is watched: a
+        # fixture launch prints what it ran, and those lines landed between the
+        # verdicts, and inside --list where every line is read as an id.
+        # Captured rather than silenced, so the check below can say the tier was
+        # noisy instead of the noise merely vanishing.
+        said = io.StringIO()
+        with contextlib.redirect_stdout(said):
+            results = live_checks()
+        loud = [line for line in said.getvalue().splitlines() if line.strip()]
+        results.append((
+            "live-checks-say-nothing-mid-run",
+            "a live check prints nothing between the verdicts",
+            not loud,
+            f"{len(loud)} line(s), first: {loud[0].strip()[:60]!r}" if loud else ""))
+        return _selftest_report(results, failed_only, list_only)
 
     """Assert the invariants this tool keeps rediscovering. Read-only.
 
