@@ -913,6 +913,40 @@ SCAFFOLDING = frozenset({
 })
 
 
+class Cache:
+    """One of the engine's held answers, and its own entry in the list of them.
+
+    The fence that keeps callers out of the engine's storage needs to know what
+    that storage is called. Written down by hand, that list went stale in both
+    directions at once: it carried `_ps`, which was never the name of anything,
+    and it was missing `_procs` and `_carried`, which are two of the seven real
+    ones. Declaring a cache is what registers it here, so the list cannot say
+    something the class does not.
+
+    `empty` is what the cache holds before anything fills it, called per engine
+    when it is a factory, so two engines never share one dict.
+    """
+
+    names = set()
+
+    def __init__(self, empty=None):
+        self.empty = empty
+
+    def __set_name__(self, owner, name):
+        self.name, self.slot = name, f"__cache_{name}"
+        Cache.names.add(name)
+
+    def __get__(self, engine, owner=None):
+        if engine is None:
+            return self
+        if self.slot not in engine.__dict__:
+            engine.__dict__[self.slot] = self.empty() if callable(self.empty) else self.empty
+        return engine.__dict__[self.slot]
+
+    def __set__(self, engine, value):
+        engine.__dict__[self.slot] = value
+
+
 class Resolver:
     """Everything a resolution reads, loaded once per run and held together.
 
@@ -941,16 +975,19 @@ class Resolver:
     ask its loader or the whole run may not.
     """
 
+    # Declared here rather than assigned in __init__, because declaring one is
+    # what puts it in Cache.names, and that is what the fence reads.
+    _procs = Cache()             # [(pid, ppid, args)], read from /proc
+    _stamps = Cache()            # transcript stem -> (agentName, teamName)
+    _carried = Cache()           # transcript path -> the receipt it carries
+    _spawns = Cache(dict)        # transcript stem -> {name: last payload of that name}
+    _spawn_log = Cache(dict)     # transcript stem -> [(stamp, payload)] in file order
+    _by_agent = Cache()          # "name@team" -> payload, across every transcript
+    _by_team = Cache()           # team -> [(stamp, path)] of transcripts that led it
+
     def __init__(self, needs=None):
         self.needs = needs if needs is not None else Needs()
         self.exercised = set()
-        self._procs = None       # [(pid, ppid, args)], read from /proc
-        self._stamps = None      # transcript stem -> (agentName, teamName)
-        self._carried = None     # transcript path -> the receipt it carries
-        self._spawns = {}        # transcript stem -> {name: last payload of that name}
-        self._spawn_log = {}     # transcript stem -> [(stamp, payload)] in file order
-        self._by_agent = None    # "name@team" -> payload, across every transcript
-        self._by_team = None     # team -> [(stamp, path)] of transcripts that led it
         self.teams_dir = TEAMS_DIR   # overridable so a test engine can read a synthetic tree
         self.projects_dir = PROJECTS_DIR  # same, for the transcript tree
 
@@ -9952,8 +9989,12 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # picker need only avoid the named entry point and glob directly.
     # Membership of the class is checkable and cannot be sidestepped by
     # choosing a different spelling.
-    ambient = {"PROJECTS_DIR", "SESSIONS_DIR", "TEAMS_DIR",
-               "_ps", "_stamps", "_spawns", "_spawn_log", "_by_agent", "_by_team"}
+    # The tree's own names, matched where a name is what appears. The engine's
+    # caches are matched separately, as attributes, because attributes are how
+    # they are reached: self._procs and RESOLVER._procs both parse as
+    # ast.Attribute, which a test against ast.Name can never see. Holding both
+    # kinds in one set is what made six of its nine entries inert.
+    ambient = {"PROJECTS_DIR", "SESSIONS_DIR", "TEAMS_DIR"}
     engine_lines = set(range(engine_node.lineno, engine_node.end_lineno + 1))
     # Found from the tree, never written down: a recorded line range drifts as the
     # file grows, and a drifted exemption silently excuses whatever moved into it.
@@ -10849,14 +10890,37 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("no-module-reaches-engine", "no module code reaches inside the engine", not private_reach,
           "; ".join(private_reach))
 
+    def outside(node):
+        """A read of this node, from neither the engine nor the suite."""
+        return (isinstance(node.ctx, ast.Load)  # a Store is the declaration; only a use is a reach
+                and node.lineno not in engine_lines
+                and node.lineno not in selftest_lines)
+
     trespass = sorted({
         f"{node.id} at line {node.lineno}"
         for node in ast.walk(tree)
-        if isinstance(node, ast.Name) and node.id in ambient
-        and isinstance(node.ctx, ast.Load)   # the declaration is a Store; only a use is a reach
-        and node.lineno not in engine_lines
-        and node.lineno not in selftest_lines})
+        if isinstance(node, ast.Name) and node.id in ambient and outside(node)
+    } | {
+        # Whatever Cache registered, however the caller spells the object it
+        # hangs off: RESOLVER._procs, an engine bound to another name, one
+        # returned by a call. no-module-reaches-engine reads the source text for
+        # the literal RESOLVER._x, so an alias walks past it; this does not.
+        f"{node.attr} at line {node.lineno}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr in Cache.names and outside(node)})
     check("tree-reached-via-engine", "the tree is reached only through the engine", not trespass, "; ".join(trespass))
+
+    # And the other half of that promise: a cache the class holds without
+    # declaring would be absent from Cache.names, so the check above would not
+    # know to bar it and would say so to nobody.
+    unmarked = sorted({
+        f"{target.attr} at line {target.lineno}"
+        for node in ast.walk(engine_node) if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Attribute) and target.attr.startswith("_")
+        and target.attr not in Cache.names})
+    check("engine-caches-declare-themselves", "every cache the engine holds is one it registered",
+          not unmarked, "; ".join(unmarked))
 
     # The same mechanism for a different realm, which is why it is a separate
     # check rather than another name in `ambient`: CLAUDE_PROC is not the
