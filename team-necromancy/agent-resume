@@ -3073,6 +3073,10 @@ class Resolver:
             "placed": (placed, placed_why) if redirected else None,
             "resolution": res,
             "to_team": to_team,
+            # Carried out rather than looked up again: agent_cwd needs the
+            # session this file was promoted out of, and a second read could
+            # answer differently from the one the identity was built on.
+            "receipt": receipt,
         }
 
     def agent_cwd(self, ctx):
@@ -3085,6 +3089,21 @@ class Resolver:
         and at least one matches its last). So prefer whichever recorded cwd
         actually flattens to this transcript's own project dir, newest first, and
         fall back to the newest with a warning.
+
+        A promoted conversation is the one shape whose own directories cannot
+        answer, and it is not rare, it is every promote. The file was moved into
+        the project dir of the session it was forked out of, while the
+        conversation itself ran wherever the fork ran, so its recorded
+        directories flatten somewhere else and a resume started in one of them
+        looks in the wrong place. Measured on this machine: of 771 transcripts
+        that record a cwd, 767 record one that flattens to their own project
+        dir, and the owner's promoted specimen is one of the four that do not.
+        The session it came from is named in the promote receipt and its
+        transcript sits in that same project dir, so its directories are ones the
+        harness did file there; take the newest of those. Where the file sits is
+        not this method's to change: a demote rebuilds the side transcript under
+        the project dir the promoted file is in, so moving it at promote time
+        would send the undo somewhere the parent's subagents do not live.
 
         The dir name itself is not a source: flattening maps every non-alphanumeric
         to '-', so '_', '.', ' ', '-' and '/' all collapse together (verified across
@@ -3099,17 +3118,42 @@ class Resolver:
         consistent = [c for c in candidates if flatten_cwd(c) == project]
         if consistent:
             return consistent[-1]
+        inherited = self.promoted_from_cwds(ctx)
+        if inherited:
+            return inherited[-1]
         if candidates:
-            if len(set(candidates)) > 1:
-                warn(f"cwd moved during this session ({' -> '.join(dict.fromkeys(candidates))}); "
-                     f"none flattens to project dir {project}, using the newest")
+            # Said once, at the moment it is decided, and only when it can go
+            # wrong: what the reader wants to know is where the agent starts and
+            # whether its conversation is findable from there.
+            warn(f"starting in {candidates[-1]}, the last directory this conversation "
+                 f"ran in. Claude looks for a conversation only among the ones kept "
+                 f"for the directory it starts in, and this conversation is kept "
+                 f"under a different one, so the resume may not find it")
             return candidates[-1]
         fallback = merged.pick("cwd")[0]
         if not fallback:
-            warn("no cwd recorded in roster or transcript; the agent starts in whatever "
-                 "directory it inherits, and --resume looks a transcript up under the project "
-                 "dir of that directory, so it may not find its own conversation")
+            warn("nothing records which directory this conversation ran in, so the agent "
+                 "starts in whichever directory this command was run from. Claude looks "
+                 "for a conversation only among the ones kept for the directory it starts "
+                 "in, so the resume may not find it")
         return fallback or None
+
+    def promoted_from_cwds(self, ctx):
+        """Directories the session this file was promoted out of ran in, kept to
+        those that flatten to the project dir the promoted file sits in.
+
+        Empty for anything that was not promoted, and empty when that session's
+        own transcript is gone or never ran anywhere that flattens there, so the
+        filter is also the check that the receipt named the right file. One whole
+        read of one transcript, on a branch only a promoted file reaches.
+        """
+        parent = (ctx.get("receipt") or {}).get("parent")
+        source = self.transcript_path(parent) if parent else None
+        if not source:
+            return []
+        project = ctx["transcript"][0].parent.name
+        fields, _last = self._scan_transcript(source)
+        return [c for c in fields.get("_cwds", ([],))[0] if flatten_cwd(c) == project]
 
     def field(self, ctx, name):
         """One assembled field's value, or None.
@@ -9521,6 +9565,76 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("promoted-member-registers-on-first-launch",
           "a promoted member's first launch is what puts it in the roster",
           not wrong, ", ".join(wrong) or f"{prom_status}, entry {prom_entry}")
+
+    # --- where a promoted agent starts
+    # The file was moved into the project dir of the session it was forked out
+    # of, so the conversation's own directories send `claude --resume` looking in
+    # the wrong place. Real directory names here, because the rule turns on a
+    # real flattening and a made-up project dir name would prove nothing.
+    with tempfile.TemporaryDirectory() as td:
+        home, parent = Path(td) / "work", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        moved = "5ee5ee5e-e5ee-45ee-85ee-e5ee5ee5ee5e"
+        proj = Path(td) / "projects" / flatten_cwd(str(home))
+        proj.mkdir(parents=True)
+        # The session it came from: it ran in the directory this project dir is
+        # named after, and later somewhere else, so "newest that fits" is what
+        # the answer has to be and not "the newest" or "the first".
+        (proj / f"{parent}.jsonl").write_text("\n".join(json.dumps(rec, separators=(",", ":")) for rec in (
+            {"type": "user", "uuid": "pa-1", "parentUuid": None, "sessionId": parent,
+             "cwd": str(home / "deep"), "timestamp": "2026-05-01T00:00:00Z",
+             "message": {"role": "user", "content": "a"}},
+            {"type": "user", "uuid": "pa-2", "parentUuid": "pa-1", "sessionId": parent,
+             "cwd": str(home), "timestamp": "2026-05-01T00:01:00Z",
+             "message": {"role": "user", "content": "b"}},
+            {"type": "user", "uuid": "pa-3", "parentUuid": "pa-2", "sessionId": parent,
+             "cwd": str(home / "other"), "timestamp": "2026-05-01T00:02:00Z",
+             "message": {"role": "user", "content": "c"}})) + "\n")
+        # The promoted conversation: it only ever ran under a directory of its
+        # own, which is the whole problem.
+        own = str(Path(td) / "elsewhere")
+        (proj / f"{moved}.jsonl").write_text("\n".join([json.dumps(
+            {"type": "user", "uuid": "mv-1", "parentUuid": None, "sessionId": moved,
+             "cwd": own, "timestamp": "2026-05-01T01:00:00Z",
+             "message": {"role": "user", "content": "d"}}, separators=(",", ":")),
+            json.dumps({"type": RECEIPT_RECORD, "receipt": {
+                "dest_stem": moved, "grammar": "pointer", "name": "wanderer",
+                "parent": parent, "root": moved, "task_id": "awanderer",
+                "team": "session-corpus-alpha"}},
+                separators=(",", ":"), sort_keys=True)]) + "\n")
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
+        eng.projects_dir = Path(td) / "projects"
+        eng.teams_dir = Path(td) / "teams"
+        eng.ps_table = lambda refresh=False: []
+        eng.session_registry = lambda: []
+        with contextlib.redirect_stderr(io.StringIO()) as quiet:
+            where = eng.agent_cwd(eng.identity(session_uuid=moved))
+        silent = quiet.getvalue().strip() == ""
+        # With that session's file gone there is nothing left that fits, and the
+        # run says so instead of starting somewhere and hoping.
+        (proj / f"{parent}.jsonl").unlink()
+        stale = Resolver(needs=Needs(maybe=set(NEED)))
+        stale.projects_dir, stale.teams_dir = eng.projects_dir, eng.teams_dir
+        stale.ps_table = lambda refresh=False: []
+        stale.session_registry = lambda: []
+        with contextlib.redirect_stderr(io.StringIO()) as loud:
+            fell_back = stale.agent_cwd(stale.identity(session_uuid=moved))
+        told = " ".join(loud.getvalue().split())
+        starts = {
+            "it starts where its own file can be found": where == str(home),
+            "which is not the directory the conversation last ran in": where != own,
+            "and nothing is said, because nothing can go wrong": silent,
+            "with no such directory it starts where the conversation ran":
+                fell_back == own,
+            "and names that directory": own in told,
+            "and says the resume may not find the conversation":
+                "may not find it" in told,
+            "and says none of it in this tool's own vocabulary":
+                not any(word in told for word in ("flatten", "project dir")),
+        }
+        wrong = sorted(k for k, ok in starts.items() if not ok)
+        check("promoted-starts-where-its-file-is",
+              "a promoted agent starts in a directory its own conversation can be found from",
+              not wrong, ", ".join(wrong) or f"chose {where}")
 
     # The session row of the report the launch above printed. It says which
     # conversation is coming back, and it used to print that conversation's
