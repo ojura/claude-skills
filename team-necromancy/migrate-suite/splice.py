@@ -226,7 +226,6 @@ SUBS = [
 # An exclusion rewritten above can remove a unit's only use of a name it was
 # handed, so the handover is trimmed to what the final text reads.
 def drop_unused_handovers(text):
-    import re as _re
     tree = ast.parse(text)
     doomed = set()
     for fnode in ast.walk(tree):

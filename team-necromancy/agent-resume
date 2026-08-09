@@ -151,6 +151,8 @@ def base_url_is_poison(value):
 
 # Title lookup reads the tail first (titles are rewritten every few turns, so the
 # current one is almost always there) and only falls back to the head.
+
+
 TITLE_TAIL_BYTES = 64 * 1024
 TITLE_HEAD_BYTES = 256 * 1024
 
@@ -611,7 +613,8 @@ def read_one_key():
     """One keypress, raw, or None when there is no terminal to read from."""
     if not sys.stdin.isatty():
         return None
-    import termios, tty
+    import termios
+    import tty
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     try:
@@ -1085,6 +1088,7 @@ class Resolver:
 
     def refresh_procs(self):
         self._procs = None
+
     def _grep_files(self, needle, scope, recursive):
         """Files containing this literal."""
         result = self._search("files", needle, scope, recursive)
@@ -1158,7 +1162,6 @@ class Resolver:
                     continue
             stamped.sort(key=lambda item: item[2], reverse=True)
             return stamped
-
 
         def confirm(paths):
             out = []
@@ -1413,7 +1416,6 @@ class Resolver:
                           f"({listed}); name one with --resume")
         return None, (f"{len(hits)} transcripts claim {team} and nothing corroborates any of them "
                       f"({listed}); name one with --resume")
-
 
     def led_teams(self):
         """{team: [(last spawn ts, transcript path), ...]} for every team a lead ran as.
@@ -3587,7 +3589,6 @@ class Resolver:
         found.sort(key=lambda entry: entry["ts"], reverse=True)
         return found
 
-
     def rosters(self):
         """[(cfg path, parsed roster, mtime ms)] for every team config on disk.
 
@@ -4954,14 +4955,10 @@ class Resolver:
                 "proved": proved}
 
 
-
-
 _MISSING = object()
 
 
 RESOLVER = Resolver()
-
-
 
 
 def hook_event():
@@ -4995,8 +4992,6 @@ AUTH_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKE
 INHERIT_ENV = AUTH_ENV + ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",)
 
 
-
-
 def inherit_credentials(ctx):
     """Adopt the lead's credentials into our own env, so a tmux server we spawn
     passes them to its panes exactly as a harness-spawned server would.
@@ -5022,10 +5017,6 @@ def inherit_credentials(ctx):
 
 
 # ---------------------------------------------------------------- disk scanners
-
-
-
-
 
 TITLE_RE = re.compile(rb'"type":"(ai|custom)-title","(?:aiTitle|customTitle)":"((?:[^"\\]|\\.)*)"')
 TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9_-]*[^>]*>")
@@ -5140,8 +5131,6 @@ def session_title(path, limit=60):
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 
-
-
 # ------------------------------------------------------- transcript resolution
 #
 # One engine. Every caller that needs "which transcript is this agent" goes
@@ -5231,24 +5220,10 @@ def team_line(team, entries, limit=60):
     return f"{title}  [{facts}]" if title else facts
 
 
-
-
 def flatten_cwd(cwd):
     """A cwd's project dir name. Every non-alphanumeric becomes '-' (verified
     against 70 of this machine's project dirs). Lossy, so it has no inverse."""
     return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def enter_agent_cwd(ctx, prefix=""):
@@ -5272,12 +5247,6 @@ def enter_agent_cwd(ctx, prefix=""):
     except OSError as exc:
         die(f"cannot enter {where}: {exc}")
     return where
-
-
-
-
-
-
 
 
 def build(args):
@@ -5437,8 +5406,6 @@ def note_identity(ctx, prefix=""):
                  f"not {wanted!r}; it is live under that identity regardless")
 
 
-
-
 def enforce_identity(res, objections, allow_team_change, force):
     """Act on what identity_objections found. Disposition, not judgement.
 
@@ -5539,14 +5506,6 @@ def apply_selector(token, args, table):
         die(f"{token} {why}")
 
 
-
-
-
-
-
-
-
-
 def resolve_to_team(args, ctx):
     """--into-team live -> the team this agent's own lead is currently running as.
 
@@ -5569,36 +5528,8 @@ def resolve_to_team(args, ctx):
     print(f"rebind   {how}, now running as team {dest}")
     return dest
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ---------------------------------------------------------------- tmux
+
 
 def tmux(socket, *args):
     return subprocess.run(["tmux", "-L", socket, *args], capture_output=True, text=True)
@@ -5613,26 +5544,7 @@ CLAUDE_PROC = re.compile(r"(^|/)claude$|/versions/[\d.]+$")
 FAKE_AGENT_BIN = f"/nonexistent/{TOOL}-selftest/versions/0.0.0"
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ---------------------------------------------------------------- resolution
-
-
-
-
-
 
 
 def resolve_socket(ctx, args, table):
@@ -5929,26 +5841,6 @@ SPAWN_FIELDS = {
     "color": "color",
     "tmux_pane_id": "tmuxPaneId",
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def forge_team(ctx, dry, evidence=None, team=None):
@@ -8789,7 +8681,6 @@ def run_census():
     print(f"  ...still unresolved after corroboration {len(unresolved)}")
     print("  ...the rest are decided by the ladder; these are refused, not guessed")
 
-
     stamps = RESOLVER.stamp_index()
     both = sum(1 for name, team in stamps.values() if name and team)
     name_only = sum(1 for name, team in stamps.values() if name and not team)
@@ -9727,7 +9618,7 @@ def _check_smoke_typed_commands(s):
         ("refuses", ["nosuchagent@session-corpus-alpha", "--dry-run"]),
         ("refuses", ["nosuch@nosuchteam", "--dry-run"]),
         ("refuses", ["@session-corpus-alpha", "--dry-run"]),       # nothing before the @
-        ("refuses", ["WILLOW@session-corpus-alpha", "--dry-run"]), # a case the roster does not carry
+        ("refuses", ["WILLOW@session-corpus-alpha", "--dry-run"]),  # a case the roster does not carry
         ("runs", ["willow@", "--dry-run"]),                        # a trailing @ is a bare name
         ("runs", ["willow@team@extra", "--dry-run"]),              # two @, warned about
         # a session uuid, held and not held
@@ -10135,7 +10026,6 @@ def ended(socket):
             (RESOLVER.socket_dir() / socket).unlink(missing_ok=True)
 
 
-
 @unit(("live-fixtures-are-this-run's", "a live fixture name belongs to the run that made it"))
 def _check_live_fixtures_are_own(s):
     checked = []
@@ -10177,7 +10067,6 @@ def _check_live_fixtures_are_own(s):
     check("live-fixtures-are-this-run's", "a live fixture name belongs to the run that made it",
           not shared, ", ".join(sorted(set(shared))))
     return checked
-
 
 
 @unit(('shares-cover-the-tier-once',
@@ -10476,8 +10365,6 @@ def live_checks(share=None, child=None):
             register(*row)
     return out, register
 
-
-
 # What one TAB costs, pinned by shape rather than by a clock, because a timing
 # assertion on someone else's machine is a coin toss. Two things made a TAB
 # unusable, and each has a check below.
@@ -10496,6 +10383,8 @@ def live_checks(share=None, child=None):
 # that keeps the shape and loses the speed passes both. They are also read
 # through a terminal, so a zsh that lays a listing out differently would need
 # the row count taken differently.
+
+
 HOSTILE_ROW = "a [bracket] pair, a colon: an apostrophe's, a \"quote\""
 
 
@@ -10782,6 +10671,7 @@ def _suite_context():
                                   + [_source_lines[last][:node.end_col_offset]])
             _segments[key] = text
         return text
+
     def is_delegate(node):
         """A transitional forwarder: one return of RESOLVER.<same name>(*a, **k).
 
@@ -10916,6 +10806,7 @@ def _check_roster_read_one_place(s):
     # Narrowly: reading a roster file. Parsing a transcript line or a settings
     # file is a different question and stays where it is; the regression shape
     # is several functions each deciding for themselves what a roster is.
+
     def reads_a_roster(node):
         body = src_of(node) or ""
         return ("loads" in body
@@ -11471,6 +11362,7 @@ def _check_refusal_names_a_case_near_match(s):
     plain = eng_case.resolve_transcript(name="zzzznotreal", team="session-corpus-alpha", quick=True)
     # Driven through the caller too, because the flag is only worth setting if
     # the caller reads it: the message a person sees is the one built here.
+
     def cased_refusal(asked):
         """What identity() printed when it refused this name, as one line."""
         with contextlib.redirect_stderr(io.StringIO()) as told:
@@ -11659,13 +11551,13 @@ def _check_session_row_is_a_uuid_not_a_path(s):
     started_said = s.started_said
 
     report = started_said.splitlines()
-    block_at = next((i for i, l in enumerate(report) if l.startswith("agent ")), None)
+    block_at = next((i for i, each in enumerate(report) if each.startswith("agent ")), None)
     block = []
     for line in report[block_at:] if block_at is not None else []:
         if not line.strip():
             break
         block.append(line)
-    row_at = next((i for i, l in enumerate(block) if l.startswith("session ")), None)
+    row_at = next((i for i, each in enumerate(block) if each.startswith("session ")), None)
     row = []
     for line in block[row_at:] if row_at is not None else []:
         if row and not line.startswith(" "):
@@ -11679,7 +11571,7 @@ def _check_session_row_is_a_uuid_not_a_path(s):
         stated.append("the launch report printed no command resuming anything")
     elif resumed.group(1) not in row[0]:
         stated.append(f"the row does not name what the command resumes: {row[0].strip()!r}")
-    pathed = [l for l in row if "/" in l]
+    pathed = [each for each in row if "/" in each]
     if pathed:
         stated.append(f"a path is printed with it: {pathed[0].strip()[:70]!r}")
     check("session-row-is-a-uuid-not-a-path",
@@ -11733,7 +11625,7 @@ def _check_lead_rebind_crew_report(s):
         # is the one name that must not be listed as staying.
         expected = (set(corpus_engine().team_population("session-corpus-alpha"))
                     | {"drift"}) - {"team-lead"}
-        crew_line = next((l for l in moved_said.splitlines() if l.startswith("crew ")), "")
+        crew_line = next((each for each in moved_said.splitlines() if each.startswith("crew ")), "")
         missing = sorted(n for n in expected if n not in crew_line)
         told = " ".join(moved_said.split())
         if moved != "manual":
@@ -12342,7 +12234,7 @@ def _check_wrap_width_lossless(s):
     widowy = " ".join(["a" * 8] * 8 + ["tail"])
     dewidowed = fill(widowy, width=72)
     check("wrap-width-lossless", "a long message wraps inside the width and loses nothing",
-          all(len(l) <= 72 for l in filled.splitlines())
+          all(len(each) <= 72 for each in filled.splitlines())
           and " ".join(filled.split()) == " ".join(tale.split())
           and labelled == "cwd      /" + "x" * 90
           and len(dewidowed.splitlines()[-1].split()) == 2
@@ -12364,17 +12256,17 @@ def _check_wrap_command_rejoins(s):
     pasted = wrap_command(argv_case, "command  ", " " * 11, paste=True, width=64)
     lines = pasted.splitlines()
     rejoined = " ".join([lines[0][len("command  "):].rstrip("\\").rstrip()]
-                        + [l[11:].rstrip("\\").rstrip() for l in lines[1:]])
+                        + [each[11:].rstrip("\\").rstrip() for each in lines[1:]])
     record_case = "tmux -L s split-window 'exec env A=1  B=2 claude --long-flag'"
     recorded = wrap_command(record_case, "  ran: ", "    ", width=24)
     rec_lines = recorded.splitlines()
-    rec_joined = " ".join([rec_lines[0][len("  ran: "):]] + [l[4:] for l in rec_lines[1:]])
+    rec_joined = " ".join([rec_lines[0][len("  ran: "):]] + [each[4:] for each in rec_lines[1:]])
     check("wrap-command-rejoins", "a wrapped command rejoins to the exact command",
           shlex.split(rejoined) == argv_case and rec_joined == record_case
-          and len(lines) > 1 and all(len(l) <= 64 for l in lines)
+          and len(lines) > 1 and all(len(each) <= 64 for each in lines)
           # the paste form is only a paste form while every broken line
           # still announces its continuation
-          and all(l.endswith(" \\") for l in lines[:-1]),
+          and all(each.endswith(" \\") for each in lines[:-1]),
           f"paste ok {shlex.split(rejoined) == argv_case}, record ok {rec_joined == record_case}")
     return checked
 
@@ -12406,8 +12298,8 @@ def _check_blockers_listed_with_remedy(s):
         blocked = reap_blockers("session-blocked", _Blocked(), table={})
     finally:
         RESOLVER.reap_objections = real_reap_obj
-    bullets = [l for l in blocked if l.startswith("- ")]
-    headings = [l for l in blocked if not l.startswith("- ")]
+    bullets = [each for each in blocked if each.startswith("- ")]
+    headings = [each for each in blocked if not each.startswith("- ")]
     # The heading each bullet arrived under: the nearest line above it that is
     # not itself a bullet, and None when nothing opened the group at all.
     opened, opener = [], None
@@ -12417,11 +12309,11 @@ def _check_blockers_listed_with_remedy(s):
         else:
             opener = line
     itemized = {
-        "one objection per bullet": bullets and not any("; " in l for l in bullets),
+        "one objection per bullet": bullets and not any("; " in each for each in bullets),
         "every class keeps its way out": len(headings) == 3
-            and any("--with-mail" in l for l in headings)
-            and any("--force" in l for l in headings)
-            and any("stop it first" in l for l in headings),
+            and any("--with-mail" in each for each in headings)
+            and any("--force" in each for each in headings)
+            and any("stop it first" in each for each in headings),
         "the way out is above its group": all(opened)
             and all("--with-mail" in (h or "") for h in opened[:5])
             and "--force" in (opened[5] or ""),
@@ -12431,7 +12323,7 @@ def _check_blockers_listed_with_remedy(s):
         "a process doing both is asked for the strict remedy": any(
             "4244" in bullet and "stop it first" in (heading or "")
             for bullet, heading in zip(bullets, opened)),
-        "a bounded list says what it dropped": any("and 2 more" in l for l in bullets),
+        "a bounded list says what it dropped": any("and 2 more" in each for each in bullets),
         "nothing else rode along": len(blocked) == len(bullets) + len(headings),
     }
     wrong = sorted(k for k, ok in itemized.items() if not ok)
@@ -12472,13 +12364,13 @@ def _check_refusal_names_a_pid_once(s):
         RESOLVER.live_sessions, RESOLVER.stamp_index = real_live2, real_stamps2
         RESOLVER.transcript_holders, RESOLVER.inbox_state = real_holders2, real_inboxes2
         RESOLVER.restored_identity = real_restored
-    printed = [l for l in with_dupes if l.startswith("- ")]
+    printed = [each for each in with_dupes if each.startswith("- ")]
     once = {
         "one row per process": sorted(r["pid"] for r in doubled) == [4242, 4243, 4250],
         "the double objector says both facts": any(
             "wears it" in r["said"] and "holds" in r["said"] for r in doubled),
         "a pid is bulleted once": all(
-            sum(f"pid {pid}" in l for l in printed) == 1 for pid in (4242, 4243, 4250)),
+            sum(f"pid {pid}" in each for each in printed) == 1 for pid in (4242, 4243, 4250)),
         "no bullet is left over": len(printed) == 3,
         # The phrase a rebind's refusal is asserted on, and the one a reader
         # greps for, so the merge extends it rather than rearranging it.
@@ -12535,8 +12427,8 @@ def _check_explain_tags_its_sources(s):
         explain({"merged": merged_fake,
                  "other_transcripts": [(Path("/nowhere/older.jsonl"), None, 1_500_000_000_000)]})
     told = explained.getvalue()
-    field_rows = [l for l in told.splitlines()
-                  if l.startswith("  ") and l.split() and l.split()[0] in merged_fake.cands]
+    field_rows = [each for each in told.splitlines()
+                  if each.startswith("  ") and each.split() and each.split()[0] in merged_fake.cands]
 
     def tag_of(line):
         """This row's source tag, or None when the row carries no tag column."""
@@ -12553,14 +12445,14 @@ def _check_explain_tags_its_sources(s):
         "a source is spelled out once": told.count(roster_source) == 1
             and told.count(jsonl_source) == 1,
         "no row repeats a source": not any(
-            roster_source in l or jsonl_source in l for l in field_rows),
+            roster_source in each or jsonl_source in each for each in field_rows),
         "the legend says which tag is which": any(
-            l.strip().startswith("sources") and roster_source in l
-            for l in told.splitlines()),
-        "the tags line up": len({tag_column(l) for l in field_rows}) == 1
-            and None not in {tag_column(l) for l in field_rows},
-        "two sources get two tags": len({tag_of(l) for l in field_rows}) == 2
-            and None not in {tag_of(l) for l in field_rows},
+            each.strip().startswith("sources") and roster_source in each
+            for each in told.splitlines()),
+        "the tags line up": len({tag_column(each) for each in field_rows}) == 1
+            and None not in {tag_column(each) for each in field_rows},
+        "two sources get two tags": len({tag_of(each) for each in field_rows}) == 2
+            and None not in {tag_of(each) for each in field_rows},
         "the conflict is still marked": "<- conflict: claude-fable-5, fable" in told,
         "the ignored transcript is still named": "older transcript ignored" in told,
     }
@@ -12585,7 +12477,9 @@ def _check_demote_parent_refusal_says_why(s):
         eng_demote.teams_dir = Path(td) / "teams"
         proj = eng_demote.projects_dir / "proj"
         proj.mkdir(parents=True)
-        line = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def line(d):
+            return json.dumps(d, separators=(",", ":"))
 
         def demote_fixture(stem, name, extra=()):
             """A transcript stamped for `name`, plus whatever else it must carry."""
@@ -12771,10 +12665,10 @@ def _check_doctor_shared_fact_once(s):
 
     solo = {
         "a missing lead is one fact": lines_none[0] == "lead     (none)"
-            and not any("(None)" in l for l in lines_none),
+            and not any("(None)" in each for each in lines_none),
         "members in one state share one note":
-            sum(1 for l in lines_none if l.startswith("note")) == 1
-            and any("alpha, beta" in l for l in lines_none),
+            sum(1 for each in lines_none if each.startswith("note")) == 1
+            and any("alpha, beta" in each for each in lines_none),
         "a live pid is said once": lines_live[0].count("pid 7717") == 1,
     }
     wrong = sorted(k for k, ok in solo.items() if not ok)
@@ -12855,9 +12749,9 @@ def _check_mail_count_per_recipient(s):
         {"sender": "b", "to": "y", "summary": "", "sent": 2,
          "state": "in memory", "detail": ""}])
     check("mail-count-per-recipient", "held mail is counted per recipient, its physics said once",
-          sum(1 for l in grouped if "memory" in l) == 1
-          and sum(1 for l in grouped if "turn boundary" in l) == 1
-          and any("x's memory" in l and "y's memory" in l for l in grouped),
+          sum(1 for each in grouped if "memory" in each) == 1
+          and sum(1 for each in grouped if "turn boundary" in each) == 1
+          and any("x's memory" in each and "y's memory" in each for each in grouped),
           "; ".join(grouped))
     return checked
 
@@ -12917,13 +12811,13 @@ def _check_launch_report_fits_exact(s):
         else:
             os.environ["COLUMNS"] = real_columns
     report_lines = told_report.getvalue().splitlines()
-    cmd_at = next((i for i, l in enumerate(report_lines) if l.startswith("command")), None)
-    cmd_back = " ".join(l[9 if i == cmd_at else 11:].rstrip("\\").rstrip()
-                        for i, l in enumerate(report_lines[cmd_at:], cmd_at)) \
+    cmd_at = next((i for i, each in enumerate(report_lines) if each.startswith("command")), None)
+    cmd_back = " ".join(each[9 if i == cmd_at else 11:].rstrip("\\").rstrip()
+                        for i, each in enumerate(report_lines[cmd_at:], cmd_at)) \
         if cmd_at is not None else ""
     reported = {
         "the block opens with a blank line": report_lines and report_lines[0] == "",
-        "every line fits the terminal": all(len(l) <= 80 for l in report_lines),
+        "every line fits the terminal": all(len(each) <= 80 for each in report_lines),
         "the command strips back to its argv":
             cmd_at is not None and shlex.split(cmd_back) == report_argv,
         # Facts above, doing below. Without the gap the two blocks read as one
@@ -14245,7 +14139,9 @@ def _check_explain_value_is_what_the_launch_emits(s):
         fx = Path(td)
         # The stamps are read off the bytes, and the pattern the reader uses has
         # no space after the colon, which is how the harness writes them.
-        dense = lambda record: json.dumps(record, separators=(",", ":"))
+
+        def dense(record):
+            return json.dumps(record, separators=(",", ":"))
         fx_team, fx_lead = "session-lossy", "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
         fx_mates = {"tern": ("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "claude-opus-5[1m]"),
                     "gull": ("ffffffff-ffff-4fff-8fff-ffffffffffff", "claude-opus-5-20260101")}
@@ -14491,15 +14387,15 @@ def _check_cleanup_opens_with_outcome(s):
                 run_cleanup(dry=False)
             with contextlib.redirect_stdout(io.StringIO()) as again:
                 run_cleanup(dry=False)
-        preview = [l for l in previewed.getvalue().splitlines() if l.strip()]
-        acted = [l for l in swept.getvalue().splitlines() if l.strip()]
+        preview = [each for each in previewed.getvalue().splitlines() if each.strip()]
+        acted = [each for each in swept.getvalue().splitlines() if each.strip()]
         sweep = {
             "the preview opens with its outcome":
                 bool(preview) and preview[0].startswith("would remove ")
                 and "session-sweep-empty" in preview[0],
             "the reasons come after it":
-                any(l.lstrip().startswith("keeping ") for l in preview[1:])
-                and not any(l.lstrip().startswith("keeping ") for l in preview[:1]),
+                any(each.lstrip().startswith("keeping ") for each in preview[1:])
+                and not any(each.lstrip().startswith("keeping ") for each in preview[:1]),
             "a removal says so without --dry-run":
                 len(acted) == 1 and acted[0].startswith("removed "),
             "the hook stays silent with nothing to do": again.getvalue() == "",
@@ -15644,7 +15540,9 @@ def _check_side_selector_names_the_task_id(s):
         # The bare id, not the one inside 'agent-t9': a refusal that only echoes
         # what was typed has named nothing, and quoting the selector back would
         # satisfy a plain substring test.
-        bare = lambda why: bool(re.search(r"(?<![\w.-])t9(?![\w.-])", why))
+
+        def bare(why):
+            return bool(re.search(r"(?<![\w.-])t9(?![\w.-])", why))
         spelled = {
             "the file's stem is refused": stem_hit is None,
             "and the stem's refusal names the task id": bare(stem_why),
@@ -15663,7 +15561,8 @@ def _check_side_selector_names_the_task_id(s):
         # --as-agent settles the name before the team is looked at, so the team
         # is the only half that can be missing here. Printing "name@team" whole would read as
         # both halves missing, and a caller who typed a name would retype it.
-        flat = lambda text: " ".join(text.split())
+        def flat(text):
+            return " ".join(text.split())
         real_resolver = globals()["RESOLVER"]
         globals()["RESOLVER"] = eng
         try:
@@ -15718,7 +15617,9 @@ def _check_conversion_proves_inverse(s):
     with tempfile.TemporaryDirectory() as td:
         sub = Path(td) / "proj" / "PARENT" / "subagents"
         sub.mkdir(parents=True)
-        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def compact(d):
+            return json.dumps(d, separators=(",", ":"))
         rows = [
             {"parentUuid": None, "isSidechain": True, "sessionId": "PARENT",
              "agentId": "t1", "type": "user", "uuid": "cv-root",
@@ -15899,7 +15800,9 @@ def _check_writers_move_receipt_back(s):
     with tempfile.TemporaryDirectory() as td:
         sub = Path(td) / "proj" / "PARENT" / "subagents"
         sub.mkdir(parents=True)
-        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def compact(d):
+            return json.dumps(d, separators=(",", ":"))
         body = "\n".join(compact(r) for r in [
             {"type": "fork-context-ref", "agentId": "x1", "parentSessionId": "PARENT",
              "parentLastUuid": "pl-leaf", "contextLength": 9},
@@ -15979,7 +15882,9 @@ def _check_demote_cannot_embed_self(s):
     with tempfile.TemporaryDirectory() as td:
         proj = Path(td) / "proj"
         proj.mkdir(parents=True)
-        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def compact(d):
+            return json.dumps(d, separators=(",", ":"))
         # A teammate that really does demote, so the arms where nothing stops
         # it show the demote going through rather than meeting some later
         # refusal that would make a broken gate look the same as a working one.
@@ -16137,7 +16042,7 @@ def _check_wearer_sites_keep_their_column(s):
         "run_team": "acting",              # which members get a job
         # reporting: these state what is true and nothing acts on the answer
         "any_child_running": "reporting",  # corroborating a team's lead
-        "resolve_transcript": "reporting", # which conversation an identity is on
+        "resolve_transcript": "reporting",  # which conversation an identity is on
         "team_population": "reporting",    # unrecorded, or former
         "seat_of": "reporting",            # where the process is
         "apply_selector": "reporting",     # running or not, per ambiguous candidate
@@ -16228,7 +16133,9 @@ def _check_mail_ledger_joins_deliveries(s):
     with tempfile.TemporaryDirectory() as td:
         proj = Path(td) / "proj"
         proj.mkdir(parents=True)
-        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def compact(d):
+            return json.dumps(d, separators=(",", ":"))
 
         def send_rec(body, ts):
             return compact({"type": "assistant", "agentName": "alice",
@@ -16318,7 +16225,9 @@ def _check_ledger_detail_once_per_addressee(s):
     with tempfile.TemporaryDirectory() as td:
         proj = Path(td) / "proj"
         proj.mkdir(parents=True)
-        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def compact(d):
+            return json.dumps(d, separators=(",", ":"))
         fx_team = "session-ledgerfx"
         wordy = ("a summary long enough to run off the end of the column the "
                  "ledger leaves for it")
@@ -16356,7 +16265,7 @@ def _check_ledger_detail_once_per_addressee(s):
                 os.environ["COLUMNS"] = real_columns
         told = ledger_out.getvalue()
         said = " ".join(told.split())
-        sent_lines = [l for l in told.splitlines() if l.startswith("2026-")]
+        sent_lines = [each for each in told.splitlines() if each.startswith("2026-")]
         repeated = [r for r in fx_rows if r["to"] == "nowhere"]
         alone = next((r for r in fx_rows if r["to"] == "elsewhere"), None)
         # Defaulted rather than indexed, so a fixture that stops producing
@@ -16376,7 +16285,7 @@ def _check_ledger_detail_once_per_addressee(s):
             # every send keeps its own row saying one.
             "every send still shows its state":
                 len(sent_lines) == len(fx_rows)
-                and all("unknown recipient" in l for l in sent_lines),
+                and all("unknown recipient" in each for each in sent_lines),
         }
         wrong = sorted(k for k, ok in grouped.items() if not ok)
         check("ledger-detail-once-per-addressee",
@@ -16393,12 +16302,12 @@ def _check_ledger_detail_once_per_addressee(s):
                 and wordy[len(cut) - 3:len(cut) - 2] in (" ", ""),
             "a summary that fits is left alone": clip("a short one", 30) == "a short one",
             "the printed rows are cut the same way":
-                any(l.rstrip().endswith("...") for l in sent_lines),
+                any(each.rstrip().endswith("...") for each in sent_lines),
             # The summary's column is whatever the fixed columns leave, so a
             # miscounted layout shows up as rows past the width. Names are not
             # cut, so this holds for names that fit their column, as these do.
             "the rows fit the design width":
-                all(len(l) <= 100 for l in told.splitlines()),
+                all(len(each) <= 100 for each in told.splitlines()),
         }
         wrong = sorted(k for k, ok in table.items() if not ok)
         check("ledger-rows-read-as-a-table",
@@ -16532,7 +16441,9 @@ def _check_restamp_window_start(s):
     with tempfile.TemporaryDirectory() as td:
         proj = Path(td) / "proj"
         proj.mkdir()
-        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def compact(d):
+            return json.dumps(d, separators=(",", ":"))
         rows = [
             {"parentUuid": None, "agentName": "mate", "teamName": "OLD",
              "type": "user", "uuid": "rs-root",
@@ -16577,6 +16488,7 @@ def _check_restamp_window_start(s):
             noop = eng7.restamp_plan(target, "OLD")
             if noop["proved"] or not noop["objections"]:
                 stray.append("an already-agreeing restamp did not refuse")
+
             def provable(made, what):
                 """Whether this plan may be applied, recording why when not.
 
@@ -16621,8 +16533,8 @@ def _check_restamp_window_start(s):
                         apply_restamp(hop)
                     if hopped:
                         lines = target.read_text().splitlines()
-                        traces = [json.loads(l)["restamp"] for l in lines
-                                  if RESTAMP_RECORD in l]
+                        traces = [json.loads(each)["restamp"] for each in lines
+                                  if RESTAMP_RECORD in each]
                         if len(traces) != 1:
                             stray.append(f"three moves left {len(traces)} traces")
                         elif (traces[0]["old"]["teamName"], traces[0]["new"]["teamName"]) != ("OLD", "FAR"):
@@ -16693,7 +16605,9 @@ def _check_restamp_refuses_a_third_field(s):
     with tempfile.TemporaryDirectory() as td:
         proj = Path(td) / "proj"
         proj.mkdir()
-        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def compact(d):
+            return json.dumps(d, separators=(",", ":"))
 
         def one_window(stem, extra=None):
             """A transcript whose window-start carries both stamps, plus extra."""
@@ -16737,7 +16651,9 @@ def _check_restamp_refuses_an_unrestorable_line(s):
     with tempfile.TemporaryDirectory() as td:
         proj = Path(td) / "proj"
         proj.mkdir()
-        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def compact(d):
+            return json.dumps(d, separators=(",", ":"))
 
         def twinned(stem, first_uuid):
             """Two records under one window, the earlier one unstamped."""
@@ -16785,7 +16701,9 @@ def _check_restamp_refuses_a_non_record_line(s):
     with tempfile.TemporaryDirectory() as td:
         proj = Path(td) / "proj"
         proj.mkdir()
-        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def compact(d):
+            return json.dumps(d, separators=(",", ":"))
 
         def with_array(stem, lead):
             """A stamped window-start, optionally preceded by a bare array."""
@@ -16853,7 +16771,9 @@ def _check_rebind_retires_if_unnoticed(s):
         eng6.roster_path("TEAMA").write_text('{"name": "TEAMA", "members": []}')
         (adir / "inboxes" / "mate.json").write_text(
             json.dumps([{"text": "hi", "timestamp": "2026-01-01T00:00:00Z"}]))
-        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def compact(d):
+            return json.dumps(d, separators=(",", ":"))
         proj = Path(td) / "proj"
         proj.mkdir()
         (proj / "MATE-A.jsonl").write_text(compact(
@@ -17191,7 +17111,9 @@ def _check_demote_catches_a_late_send(s):
     with tempfile.TemporaryDirectory() as td:
         proj = Path(td) / "proj"
         proj.mkdir(parents=True)
-        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def compact(d):
+            return json.dumps(d, separators=(",", ":"))
         (proj / "MATELATE.jsonl").write_text(
             compact({"parentUuid": None, "sessionId": "MATELATE", "agentName": "posty",
                      "teamName": "TEAMP", "type": "user", "uuid": "ml-root"}) + "\n" +
@@ -17266,7 +17188,9 @@ def _check_unread_mail_refusal_no_crash(s):
     with tempfile.TemporaryDirectory() as td:
         proj = Path(td) / "proj"
         proj.mkdir(parents=True)
-        compact = lambda d: json.dumps(d, separators=(",", ":"))
+
+        def compact(d):
+            return json.dumps(d, separators=(",", ":"))
         (proj / "MATEDEMO.jsonl").write_text(
             compact({"parentUuid": None, "sessionId": "MATEDEMO", "agentName": "maily",
                      "teamName": "TEAMM", "type": "user", "uuid": "md-root"}) + "\n")
@@ -17355,6 +17279,7 @@ def _check_no_launch_onto_live_conversation(s):
 
     try:
         RESOLVER.lead_pid_for = lambda uuid: (4242, "x", True)
+
         def why_of(ctx_, args_, **kw):
             answer = already_running(ctx_, args_, **kw)
             return answer[0] if answer else ""
@@ -17547,6 +17472,7 @@ def _check_restore_reads_window_start(s):
         # The rebind guard fires against the DESTINATION, not against the
         # merge (which echoes the stamps and made the guard compare the
         # stamps to themselves - a dead branch behind a green suite).
+
         class _RebindRes:
             def __init__(self, path):
                 self.path = path
@@ -17927,7 +17853,8 @@ def _check_sweep_shared_remedy_once(s):
     _Args = s._Args
     corpus_engine = s.corpus_engine
 
-    flat = lambda text: " ".join(text.split())
+    def flat(text):
+        return " ".join(text.split())
     doctor_team = "session-corpus-alpha"
     real_resolver = globals()["RESOLVER"]
     globals()["RESOLVER"] = eng = corpus_engine()
@@ -18038,7 +17965,9 @@ def _check_census_and_doctor_count_the_same_teams(s):
             run_doctor(_Args(team=None, agent_id=None, all_members=False))
     finally:
         globals()["RESOLVER"] = real_resolver
-    said = lambda text: re.search(r"(\d+) of (\d+) team\(s\) examined", flat(text))
+
+    def said(text):
+        return re.search(r"(\d+) of (\d+) team\(s\) examined", flat(text))
     total = re.search(r"(\d+) teams in all", flat(census_out.getvalue()))
     swept_pop, some_pop = said(pop_out.getvalue()), said(some_out.getvalue())
     printed_blocks = len([ln for ln in pop_out.getvalue().splitlines()
@@ -18909,7 +18838,6 @@ def _check_asking_is_not_resuming(s):
     return checked
 
 
-
 @unit(("check-registration-one-owner", "registering a check means one thing in every tier"))
 def _check_check_registration_one_owner(s):
     checked = []
@@ -19290,7 +19218,6 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=N
                  "a unit produces the ids it registered", False,
                  "; ".join(misdeclared))
     return _selftest_report(results, failed_only)
-
 
 
 def verb_needs(args, selector):
