@@ -944,7 +944,7 @@ class Resolver:
     def __init__(self, needs=None):
         self.needs = needs if needs is not None else Needs()
         self.exercised = set()
-        self._procs = None       # pid -> row, from ps
+        self._procs = None       # [(pid, ppid, args)], read from /proc
         self._stamps = None      # transcript stem -> (agentName, teamName)
         self._carried = None     # transcript path -> the receipt it carries
         self._spawns = {}        # transcript stem -> {name: last payload of that name}
@@ -1548,22 +1548,32 @@ class Resolver:
         return self._claude_procs(f"--resume {session_uuid}", table)
 
     def _proc_stat(self, pid):
-        """(state, starttime) from /proc/pid/stat, fields 3 and 22.
+        """(state, ppid, starttime) from /proc/pid/stat, fields 3, 4 and 22.
 
         The rawest read of the process realm, so it stays private: what a
         state letter means is pid_alive's and state_note's to say, and a
         caller left to interpret one for itself would be the second opinion
         this whole fence is against.
+
+        Field 2 is the executable name in parentheses and can hold both
+        spaces and parentheses, so the fields after it are found from the
+        last close paren rather than by splitting the line. That is why the
+        table asks here for a parent pid instead of parsing stat itself: one
+        parser, and it is this one.
         """
         try:
             stat = Path(f"/proc/{pid}/stat").read_text()
-        except OSError:
-            return None, None
+        except (OSError, ValueError):
+            # ValueError catches a comm that is not valid utf-8. The table
+            # now reads this for every process on the machine, other users'
+            # included, so a name we cannot decode has to answer "unknown"
+            # rather than end the whole snapshot.
+            return None, None, None
         try:
             rest = stat[stat.rindex(")") + 2:].split()
-            return rest[0], rest[19]
+            return rest[0], int(rest[1]), rest[19]
         except (ValueError, IndexError):
-            return None, None
+            return None, None, None
 
     def pid_alive(self, pid, procstart=None):
         """Is this process still running, and still the one that was meant?
@@ -1573,7 +1583,7 @@ class Resolver:
         stepping on it. `procstart` is what stops a recycled pid number from
         answering yes for a stranger.
         """
-        state, st = self._proc_stat(pid)
+        state, _ppid, st = self._proc_stat(pid)
         if st is None or state in ("Z", "X"):
             return False
         return procstart in (None, "", st)
@@ -1607,8 +1617,8 @@ class Resolver:
         return found
 
     def _cmdline(self, pid):
-        """One process's argv as a string, for a pid the process table did not
-        carry. Private: the table is how everything else asks."""
+        """One process's argv as a string. Private: the table is how everything
+        else asks, and the table is built out of this one pid at a time."""
         try:
             return Path(f"/proc/{pid}/cmdline").read_bytes().replace(
                 b"\0", b" ").decode(errors="replace").strip()
@@ -1619,19 +1629,49 @@ class Resolver:
         """[(pid, ppid, args)] for every process we can see, snapshotted once.
 
         One run judges liveness against one consistent picture, and a single
-        resolve was spawning ps three times.
+        resolve was reading the process list three times.
+
+        Read out of /proc, not out of ps. ps is a program that reads these
+        same files and then formats them for a terminal, and the formatting
+        was the bug: it cuts every line to COLUMNS, which a subprocess takes
+        from whatever shell the tool was typed in. Measured on this machine at
+        COLUMNS=100, a 342-character claude command line lost its --agent-id
+        and --team-name, so a running agent read as not running, --stop said
+        there was nothing to stop, and a resume that should have nooped
+        offered to split a second process onto a transcript that already had
+        one. A wider terminal only moved the cut. Reading the files ourselves
+        has no width, and no COLUMNS, LANG, PATH or TERM can shape it.
+
+        A row is a process with a command line. Kernel threads have none, and
+        neither does a zombie, which pid_alive already answers no for and
+        which holds no transcript open. Dropping them cannot break the ppid
+        chains _descendants and _own_lineage walk, because a process's
+        children are reparented while it exits, so nothing alive has a zombie
+        for a parent. Counted here read-only: of 403 pids with no command
+        line, 402 were kernel threads and one was a zombie, and no process had
+        its parent among them.
+
+        Sorted by pid, so the order two runs report wearers in is the same and
+        does not follow whatever order /proc happened to list them in.
         """
         self._exercise(NEED.PROCS)
         if self._procs is not None and not refresh:
             return self._procs
-        out = subprocess.run(
-            ["ps", "-eo", "pid=,ppid=,args="], capture_output=True, text=True
-        ).stdout
         rows = []
-        for line in out.splitlines():
-            parts = line.strip().split(None, 2)
-            if len(parts) == 3 and parts[0].isdigit():
-                rows.append((int(parts[0]), int(parts[1]), parts[2]))
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            args = self._cmdline(pid)
+            if not args:
+                continue
+            _state, ppid, _started = self._proc_stat(pid)
+            if ppid is None:
+                # It exited between the listing and the read. A row with no
+                # parent would sit outside every chain anyway.
+                continue
+            rows.append((pid, ppid, args))
+        rows.sort()
         self._procs = rows
         return rows
 
@@ -9418,6 +9458,94 @@ def live_checks():
     check("stop-preview-ends-nothing", "a --stop preview ends nothing and says what it would end",
           not wrong, ", ".join(wrong))
 
+    # What the tool sees running must not depend on how wide the terminal it
+    # was typed in was. It did: the table came from ps, ps cuts every line to
+    # COLUMNS, and at 100 columns a 342-character claude command line lost the
+    # --agent-id and --team-name off its end. Measured on this machine at the
+    # time: a live agent read as not running, --stop said there was nothing to
+    # stop, and a resume that should have nooped offered to split a second
+    # process onto a transcript that already had one.
+    #
+    # The fixture pads its own command line well past the narrow width and puts
+    # --agent-id after the padding, so a cut at 100 columns takes the identity
+    # with it. COLUMNS is set here in this process because that is where a
+    # subprocess would have inherited it from; a table read out of files never
+    # looks at it, which is the point.
+    width_id = "widths@selftest-columns"
+    padded = sp.Popen([FAKE_AGENT_BIN, "-c", '__import__("time").sleep(60)',
+                       "--pad", "p" * 400, "--agent-id", width_id],
+                      executable=sys.executable)
+
+    def engine_at(columns):
+        """A fresh engine whose snapshot was taken at this terminal width.
+
+        The engine caches its table, so the width is restored before anything
+        is asked of it: what is under test is the snapshot the width produced,
+        not the width the question is asked at.
+        """
+        was = os.environ.get("COLUMNS")
+        os.environ["COLUMNS"] = columns
+        try:
+            eng = Resolver(needs=Needs(maybe=set(NEED)))
+            eng.ps_table(refresh=True)
+            return eng
+        finally:
+            if was is None:
+                os.environ.pop("COLUMNS", None)
+            else:
+                os.environ["COLUMNS"] = was
+
+    try:
+        time.sleep(0.3)          # let it reach the process table
+        narrow, wide = engine_at("100"), engine_at("1000")
+        narrow_rows = {pid: (ppid, args) for pid, ppid, args in narrow.ps_table()}
+        wide_rows = {pid: (ppid, args) for pid, ppid, args in wide.ps_table()}
+        # Only the pids both snapshots hold. This machine starts and ends
+        # processes while the suite runs, and a pid that came or went between
+        # two reads is churn, not width. A pid in both that says two different
+        # things is the fault.
+        moved = sorted(str(pid) for pid in set(narrow_rows) & set(wide_rows)
+                       if narrow_rows[pid] != wide_rows[pid])
+        full = f"--agent-id {width_id}"
+        widths = {
+            "the fixture is in both snapshots":
+                padded.pid in narrow_rows and padded.pid in wide_rows,
+            "with its whole command line in both":
+                full in narrow_rows.get(padded.pid, (0, ""))[1]
+                and full in wide_rows.get(padded.pid, (0, ""))[1],
+            "and no shared row says two different things": not moved,
+        }
+        wrong = sorted(k for k, ok in widths.items() if not ok)
+        check("process-table-width-independent",
+              "the process table is the same at a narrow and a wide terminal",
+              not wrong, "; ".join(wrong) + (f"; rows that moved: {', '.join(moved[:3])}" if moved else ""))
+
+        # The half that decides anything. A table nobody could tell apart is
+        # worth having only because the answers built on it come out the same,
+        # so this asks the engine's own liveness question rather than reading
+        # the table again, and it wants a yes at both widths: two snapshots
+        # that agree that nothing is running would satisfy a check that only
+        # compared them.
+        narrow_others, narrow_ours = narrow.wearers(width_id)
+        wide_others, wide_ours = wide.wearers(width_id)
+        narrow_seen = [pid for pid, _ in narrow_others]
+        wide_seen = [pid for pid, _ in wide_others]
+        check("liveness-width-independent",
+              "an agent that is running is seen as running at either terminal width",
+              narrow_seen == wide_seen == [padded.pid]
+              # A process we spawned is a child, never an ancestor, so it is a
+              # stranger to us and both widths must say so. A fixture that
+              # landed in our own lineage would be excluded from the strangers
+              # half for a reason that has nothing to do with width.
+              and not narrow_ours and not wide_ours,
+              f"pid {padded.pid} is running; at 100 columns the engine saw "
+              f"{narrow_seen or 'nothing'}, at 1000 it saw {wide_seen or 'nothing'}"
+              + (f"; and it read as our own lineage: {narrow_ours or wide_ours}"
+                 if narrow_ours or wide_ours else ""))
+    finally:
+        padded.kill()
+        padded.wait()
+
     # --install --dry-run against a fake home. A child with HOME and
     # CLAUDE_CONFIG_DIR moved, because the installer's targets are the real
     # home's and an in-process call would have to patch the way it finds them.
@@ -10886,11 +11014,11 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("pane-question-engine-only", "which panes exist and where we sit is asked only inside the engine",
           not pane_askers, "; ".join(pane_askers))
 
-    # The process realm has two sources and both are the engine's: the ps
-    # snapshot every run judges against, and /proc for the three questions ps
-    # does not answer (is this the same process, is it suspended, what
-    # environment is it running with). A second reader is how a pid comes back
-    # alive in one place and dead in another.
+    # The process realm has one source and it is the engine's: /proc, for the
+    # snapshot every run judges against and for the questions asked of a
+    # single pid (is this the same process, is it suspended, what environment
+    # is it running with). A second reader is how a pid comes back alive in
+    # one place and dead in another.
     #
     # Two spellings, because a rogue liveness test does not need /proc: signal
     # 0 is the other idiom, and it disagrees with pid_alive in exactly the
@@ -10914,6 +11042,31 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             proc_readers.add(f"a signal-0 liveness test at line {line}")
     check("proc-read-engine-only", "a process is read only inside the engine",
           not proc_readers, "; ".join(sorted(proc_readers)))
+
+    # And the snapshot is read, never run. It used to shell out to ps, which
+    # cuts its output to COLUMNS: at 100 columns a 342-character claude command
+    # line lost its --agent-id and --team-name, so a running agent read as not
+    # running and a resume offered to start a second process on a transcript
+    # that already had one. Reading the files directly has no width to inherit,
+    # so what has to stay gone is the subprocess. Barred by the callables that
+    # start a program, not by the word "ps", which a rewrite need only avoid
+    # spelling. The two width checks in --live prove the answer does not move;
+    # this one keeps the reason it cannot.
+    starters = {"run", "Popen", "call", "check_call", "check_output", "getoutput",
+                "system", "popen", "spawnv", "spawnvp", "execv", "execvp", "which"}
+    table_node = next((m for m in engine_node.body
+                       if isinstance(m, ast.FunctionDef) and m.name == "ps_table"), None)
+    if table_node is None:
+        started = ["the engine has no ps_table to check"]
+    else:
+        started = sorted({
+            f"{sub.func.attr if isinstance(sub.func, ast.Attribute) else sub.func.id}()"
+            f" at line {sub.lineno}"
+            for sub in ast.walk(table_node) if isinstance(sub, ast.Call)
+            and isinstance(sub.func, (ast.Attribute, ast.Name))
+            and (sub.func.attr if isinstance(sub.func, ast.Attribute) else sub.func.id) in starters})
+    check("process-table-runs-no-program", "the process table is read from /proc, not run",
+          not started, "; ".join(started))
 
     # Wrapping serves the reader; the reader is not owed less. Every physical
     # line fits the width, and the reflowed text says word for word what the
@@ -13886,10 +14039,13 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         return "reporting" if ours_names & read else "acting"
 
     # run_selftest drives the question to test it, and holds this table's own
-    # text; every other caller is a site and has to be in it.
+    # text; live_checks drives it for the same reason, against a process it
+    # spawned. Both columns describe what production code does with the answer,
+    # so a suite that only asks in order to compare answers belongs in neither.
+    # Every other caller is a site and has to be in the table.
     wearer_sites = sorted(
         {name for name, node in funcs.items() if any(map(asks_wearers, own_nodes(node)))}
-        - {"run_selftest"})
+        - {"run_selftest", "live_checks"})
     miscounted = []
     for site in wearer_sites:
         actual = consumption_of(funcs[site])
