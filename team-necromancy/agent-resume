@@ -9375,6 +9375,33 @@ def unit(*ids, live=False):
     return take
 
 
+def check_rows():
+    """One place says what registering a check means.
+
+    Returns (the rows registered so far, the function that registers one). A row
+    is a check's id, the name it prints under, its verdict and its detail, and
+    an id may be registered once. Two rows under one id would let --failed name
+    a check that also passed, so a second one stops the run rather than
+    reporting either of them.
+
+    Every producer of rows registers here: the read-only tier, a whole live
+    tier, one share of one, and the merge of several shares. That last one is
+    why a merge folds before it registers rather than after: each share reports
+    on its own printing under the one id, and the fold is what makes those into
+    the single row the run states.
+    """
+    rows = []
+    seen_ids = set()
+
+    def register(cid, name, ok, detail=""):
+        if cid in seen_ids:
+            raise RuntimeError(f"duplicate check id: {cid!r}")
+        seen_ids.add(cid)
+        rows.append((cid, name, ok, detail))
+
+    return rows, register
+
+
 def _live_context(child=None):
     """Everything the units share, computed once.
 
@@ -9404,15 +9431,6 @@ def _live_context(child=None):
     """
     import pty
     import subprocess as sp
-    out = []
-    seen_ids = set()
-
-    def check(cid, name, ok, detail=""):
-        if cid in seen_ids:
-            raise RuntimeError(f"duplicate check id: {cid!r}")
-        seen_ids.add(cid)
-        out.append((cid, name, ok, detail))
-
     # A warning printed while the suite runs is the tool talking to an operator
     # who is not there, and it lands in the middle of the results. The read-only
     # tier is run as a child rather than captured in this process, because
@@ -9433,7 +9451,6 @@ def _live_context(child=None):
 
     s.counted = counted
     s.inherited = inherited
-    s.out = out
     s.pty = pty
     s.quiet = quiet
     s.sp = sp
@@ -10365,10 +10382,15 @@ def _live_in_parallel(jobs):
 
     A worker that dies leaves rows without the summary that counts them, and
     the gap is reported as a failure rather than passing as fewer checks.
+
+    Returns the rows and the register that filled them, the same pair
+    live_checks hands back, so a caller adds a row of its own the one way.
     """
     s = _live_context()
-    out = list(s.inherited)
-    workers, short = [], []
+    out, register = check_rows()
+    for row in s.inherited:
+        register(*row)
+    workers, short, watched = [], [], []
     with tempfile.TemporaryDirectory(prefix=f"{TOOL}-shares-") as room:
         inherit = hand_down(s.quiet, Path(room) / "read-only.json")
         try:
@@ -10391,7 +10413,14 @@ def _live_in_parallel(jobs):
                 if counted is None or int(counted) != len(rows):
                     short.append(f"share {at}/{jobs}: {len(rows)} row(s), "
                                  f"it said {summary!r}")
-                out.extend(rows)
+                # Every share reports on its own printing under the one id, so
+                # those rows are held back for the fold below and never
+                # registered as they arrive. Everything else goes in as it is.
+                for row in rows:
+                    if row[0] == RUNNER_CHECKS[0][0]:
+                        watched.append(row)
+                    else:
+                        register(*row)
         finally:
             # Whatever ended this run, no worker of it outlives it, and the
             # file they read is removed with the directory holding it.
@@ -10407,21 +10436,18 @@ def _live_in_parallel(jobs):
                     with contextlib.suppress(OSError):
                         left.unlink()
 
-    # The units ran in the workers, so the workers are what watched them print.
-    # Folding their rows into one keeps the id unique across the merge, and
-    # counting them keeps a worker that never reached the check from reading as
-    # a quiet one.
     # One verdict for the shares between them, reported whether or not any fell
     # short, so the run says the merge was whole rather than saying nothing.
-    out.append((SHARED_CHECKS[0][0], SHARED_CHECKS[0][1], not short, "; ".join(short)))
-    watched = [row for row in out if row[0] == RUNNER_CHECKS[0][0]]
-    out = [row for row in out if row[0] != RUNNER_CHECKS[0][0]]
+    register(SHARED_CHECKS[0][0], SHARED_CHECKS[0][1], not short, "; ".join(short))
+    # The units ran in the workers, so the workers are what watched them print.
+    # The jobs rows held back above become this one, and counting them keeps a
+    # worker that never reached the check from reading as a quiet one.
     noisy = "; ".join(detail for _c, _n, ok, detail in watched if not ok)
-    out.append((RUNNER_CHECKS[0][0], RUNNER_CHECKS[0][1],
-                len(watched) == jobs and not noisy,
-                noisy or (f"{len(watched)} of {jobs} share(s) said"
-                          if len(watched) != jobs else "")))
-    return out
+    register(RUNNER_CHECKS[0][0], RUNNER_CHECKS[0][1],
+             len(watched) == jobs and not noisy,
+             noisy or (f"{len(watched)} of {jobs} share(s) said"
+                       if len(watched) != jobs else ""))
+    return out, register
 
 
 def live_checks(share=None, child=None):
@@ -10433,13 +10459,22 @@ def live_checks(share=None, child=None):
 
     The read-only tier's verdicts come from the child the context ran, so a
     live invocation answers those questions once.
+
+    Returns the rows and the register that filled them: run_selftest has one
+    row of its own to add about what this tier printed while it ran, and it
+    goes in through that same register. A share refuses a repeated id here, in
+    the worker, the way a whole tier refuses one.
     """
     s = _live_context(child)
-    out = [] if share else list(s.inherited)
+    out, register = check_rows()
+    if not share:
+        for row in s.inherited:
+            register(*row)
     live_units = [run for _n, _i, run, is_live in UNITS if is_live]
     for at in in_share(len(live_units), share):
-        out.extend(live_units[at](s))
-    return out
+        for row in live_units[at](s):
+            register(*row)
+    return out, register
 
 
 
@@ -10704,15 +10739,6 @@ def _suite_context():
     """
     import ast
     import tempfile
-
-    results = []
-    seen_ids = set()
-
-    def check(cid, name, ok, detail=""):
-        if cid in seen_ids:
-            raise RuntimeError(f"duplicate check id: {cid!r}")
-        seen_ids.add(cid)
-        results.append((cid, name, ok, detail))
 
     def corpus_engine():
         """A Resolver pointed at test/corpus/ instead of this machine.
@@ -18884,6 +18910,96 @@ def _check_asking_is_not_resuming(s):
 
 
 
+@unit(("check-registration-one-owner", "registering a check means one thing in every tier"))
+def _check_check_registration_one_owner(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    ast = s.ast
+    funcs = s.funcs
+    tree = s.tree
+
+    forked = []
+    owner = funcs.get("check_rows")
+    if not owner:
+        forked.append("check_rows is gone, so nothing says what registering means")
+    else:
+        # check_rows is called here and given two rows, then the first id a
+        # second time. What comes back in its list, and what it raises on the
+        # repeat, is the answer.
+        rows, register = check_rows()
+        register("one", "the first", True, "")
+        register("two", "the second", False, "why")
+        if rows != [("one", "the first", True, ""), ("two", "the second", False, "why")]:
+            forked.append(f"a registered row comes back as {rows}")
+        try:
+            register("one", "the first again", True, "")
+        except RuntimeError:
+            pass
+        else:
+            forked.append("one id registers twice and nothing is said")
+
+        # refusal holds the message check_rows raises on a repeat, taken out of
+        # the raise in its own body. Any string literal outside check_rows
+        # containing that message is a second refusal.
+        refusal = next((piece.value for node in ast.walk(owner)
+                        if isinstance(node, ast.Raise)
+                        for piece in ast.walk(node)
+                        if isinstance(piece, ast.Constant)
+                        and isinstance(piece.value, str) and piece.value.strip()), None)
+        if not refusal:
+            forked.append("check_rows refuses nothing, so there is no refusal to hold")
+        else:
+            spans = [(fn.lineno, fn.end_lineno or fn.lineno, fn.name)
+                     for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)]
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                    continue
+                if refusal not in node.value:
+                    continue
+                if owner.lineno <= node.lineno <= (owner.end_lineno or owner.lineno):
+                    continue
+                inside = sorted(span for span in spans if span[0] <= node.lineno <= span[1])
+                forked.append(f"{inside[-1][2] if inside else '<module>'} refuses a "
+                              f"duplicate itself at line {node.lineno}")
+
+    # run_selftest, live_checks and _live_in_parallel each have to call
+    # check_rows, and none of them may append to the list check_rows handed
+    # back: a row put in that way was never registered and no id rule ever saw
+    # it. run_selftest takes its rows from whichever of the other two ran, so a
+    # call anywhere in the expression it assigns from counts.
+    reaches = s.callers_of("check_rows")
+    handers = ("check_rows", "live_checks", "_live_in_parallel")
+    for named in ("run_selftest", "live_checks", "_live_in_parallel"):
+        node = funcs.get(named)
+        if not node:
+            forked.append(f"{named} is gone, so a tier this holds together is not here")
+            continue
+        if named not in reaches:
+            forked.append(f"{named} does not reach check_rows")
+        held = {target.elts[0].id for sub in ast.walk(node)
+                if isinstance(sub, ast.Assign)
+                and any(isinstance(part, ast.Call)
+                        and getattr(part.func, "id", None) in handers
+                        for part in ast.walk(sub.value))
+                for target in sub.targets
+                if isinstance(target, ast.Tuple) and target.elts
+                and isinstance(target.elts[0], ast.Name)}
+        if not held:
+            forked.append(f"{named} does not take a register back with its rows")
+        for sub in ast.walk(node):
+            if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr in ("append", "extend")
+                    and getattr(sub.func.value, "id", None) in held):
+                forked.append(f"{named} puts a row in without registering it, "
+                              f"at line {sub.lineno}")
+    check("check-registration-one-owner", "registering a check means one thing in every tier",
+          not forked, "; ".join(sorted(set(forked))[:3]))
+    return checked
+
+
 @unit(("team-layout-one-owner", "what a team directory holds is named in one place"))
 def _check_team_layout_one_owner(s):
     checked = []
@@ -19141,35 +19257,38 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=N
         # noisy instead of the noise merely vanishing.
         said = io.StringIO()
         with contextlib.redirect_stdout(said):
-            results = _live_in_parallel(jobs) if jobs > 1 else live_checks(share, child)
+            results, register = (_live_in_parallel(jobs) if jobs > 1
+                                 else live_checks(share, child))
         if jobs > 1:
+            # The workers watched their own units print, and _live_in_parallel
+            # has already folded what each of them saw into the one row.
             return _selftest_report(results, failed_only)
         loud = [line for line in said.getvalue().splitlines() if line.strip()]
-        results.append((
-            "live-checks-say-nothing-mid-run",
-            "a live check prints nothing between the verdicts",
-            not loud,
-            f"{len(loud)} line(s), first: {loud[0].strip()[:60]!r}" if loud else ""))
+        register(RUNNER_CHECKS[0][0], RUNNER_CHECKS[0][1], not loud,
+                 f"{len(loud)} line(s), first: {loud[0].strip()[:60]!r}" if loud else "")
         return _selftest_report(results, failed_only)
     s = _suite_context()
-    results, seen_ids = [], set()
+    results, register = check_rows()
+    misdeclared = []
     for _name, ids, run, is_live in UNITS:
         if is_live:
             continue
         produced = run(s)
-        for cid, name, ok, detail in produced:
-            if cid in seen_ids:
-                raise RuntimeError(f"duplicate check id: {cid!r}")
-            seen_ids.add(cid)
-            results.append((cid, name, ok, detail))
+        for row in produced:
+            register(*row)
         # The registry is a claim about what a unit does, and a claim this
-        # suite makes about itself is checked like any other.
+        # suite makes about itself is checked like any other. Every unit that
+        # gets it wrong goes into misdeclared and they come back as one
+        # registry-declares-what-it-runs row, since that is one id and an id
+        # registers once.
         said = sorted(cid for cid, _n, _o, _d in produced)
         if said != sorted(cid for cid, _s in ids):
-            results.append(("registry-declares-what-it-runs",
-                            "a unit produces the ids it registered", False,
-                            f"{_name} registered {sorted(c for c, _s in ids)}, "
-                            f"produced {said}"))
+            misdeclared.append(f"{_name} registered {sorted(c for c, _s in ids)}, "
+                               f"produced {said}")
+    if misdeclared:
+        register("registry-declares-what-it-runs",
+                 "a unit produces the ids it registered", False,
+                 "; ".join(misdeclared))
     return _selftest_report(results, failed_only)
 
 
