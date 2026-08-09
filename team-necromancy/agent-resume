@@ -1879,10 +1879,29 @@ class Resolver:
             warn(f"{len(hits)} transcripts name team {team}; assuming {hits[0].stem}")
         return hits[0].stem if hits else None
 
+    def team_dir(self, team):
+        """This team's directory. Everything the team owns is inside it, and
+        every path answer below is this one plus a name."""
+        return self.teams_dir / team
+
+    def roster_in(self, team_dir):
+        """The roster inside a team directory.
+
+        By directory rather than by team name, because a reap reads one team
+        twice, once where it lives and once at the staged path it was renamed
+        to, and that path is nobody's team name.
+        """
+        return team_dir / "config.json"
+
+    def inboxes_in(self, team_dir):
+        """The mailbox directory inside a team directory, for the same reason
+        roster_in takes a directory."""
+        return team_dir / "inboxes"
+
     def roster_path(self, team):
         """Where this team's roster lives. A path question, not a write: the class
         answers where things are so writers never have to know the layout."""
-        return self.teams_dir / team / "config.json"
+        return self.roster_in(self.team_dir(team))
 
     def has_roster(self, team):
         """Is there a roster on disk for this team?
@@ -1897,7 +1916,7 @@ class Resolver:
 
     def inbox_path(self, team, name):
         """Where this member's mailbox lives."""
-        return self.teams_dir / team / "inboxes" / f"{name}.json"
+        return self.inboxes_in(self.team_dir(team)) / f"{name}.json"
 
     def inbox_seeded(self, team, name):
         """Does this member already have a mailbox file with something in it?
@@ -1922,7 +1941,7 @@ class Resolver:
         """
         state = {}
         try:
-            boxes = sorted((self.teams_dir / team / "inboxes").iterdir())
+            boxes = sorted(self.inboxes_in(self.team_dir(team)).iterdir())
         except OSError:
             return state
         for box in boxes:
@@ -2007,7 +2026,7 @@ class Resolver:
             # A deletion gate re-proves the structure itself: a count is not proof
             # that what it counted is a mailbox.
 
-        config = team_dir / "config.json"
+        config = self.roster_in(team_dir)
         if not config.is_file():
             return "no config.json"
         try:
@@ -2090,11 +2109,11 @@ class Resolver:
         what was archived - belongs to reap_team and archive_inbox.
         """
         if only is not None:
-            wanted = [team_dir / "inboxes" / only]
+            wanted = [self.inboxes_in(team_dir) / only]
         else:
-            wanted = [team_dir / "config.json"]
+            wanted = [self.roster_in(team_dir)]
             try:
-                wanted += sorted((team_dir / "inboxes").glob("*.json"))
+                wanted += sorted(self.inboxes_in(team_dir).glob("*.json"))
             except OSError:
                 pass
         reads = {}
@@ -2415,8 +2434,7 @@ class Resolver:
             if wants_delivery:
                 last_write[name] = newest
                 try:
-                    inbox = json.loads(
-                        (self.teams_dir / team / "inboxes" / f"{name}.json").read_text())
+                    inbox = json.loads(self.inbox_path(team, name).read_text())
                     boxes[name] = [m.get("text") or str(m.get("message", ""))
                                    for m in inbox if isinstance(m, dict)]
                 except (OSError, ValueError):
@@ -6014,7 +6032,7 @@ def forge_team(ctx, dry, evidence=None, team=None):
             # run would proceed on. Enumerating it separately for the preview
             # would be a second implementation, free to drift from this one.
             return config
-        (cfg.parent / "inboxes").mkdir(parents=True, exist_ok=True)
+        RESOLVER.inboxes_in(cfg.parent).mkdir(parents=True, exist_ok=True)
         edit_team_config(cfg, lambda _: config, f"forged for the lead being resumed ({rebuilt})",
                          create=config)
         for member in members:
@@ -6055,7 +6073,7 @@ def forge_team(ctx, dry, evidence=None, team=None):
     if dry:
         step(True, f"would forge {cfg} (lead + {name}) and seed both inboxes", "")
         return
-    (cfg.parent / "inboxes").mkdir(parents=True, exist_ok=True)
+    RESOLVER.inboxes_in(cfg.parent).mkdir(parents=True, exist_ok=True)
     edit_team_config(cfg, lambda _: config, "forged (a graceful lead exit had deleted)", create=config)
     for inbox in ("team-lead", name):
         ensure_inbox(team, inbox, dry)
@@ -8149,7 +8167,7 @@ def reap_team(team, dry=False, prefix=""):
     directory once and says what a receipt taken at that moment would hold;
     anything written after that read is in no preview.
     """
-    team_dir = RESOLVER.teams_dir / team
+    team_dir = RESOLVER.team_dir(team)
     # Where it goes at the cut. The name is settled here; the rename that uses
     # it is the last thing before the staged read.
     staged = staged_path(team_dir)
@@ -8216,7 +8234,7 @@ def reap_team(team, dry=False, prefix=""):
             path.unlink()
         except OSError as exc:
             strays.append(f"{path.relative_to(staged)} ({exc})")
-    for empty in (staged / "inboxes", staged):
+    for empty in (RESOLVER.inboxes_in(staged), staged):
         try:
             empty.rmdir()
         except OSError:
@@ -8279,7 +8297,7 @@ def archive_inbox(team, name):
     the staged file once the receipt naming those bytes is on disk, so a crash
     in between leaves the mail in the staged copy rather than nowhere.
     """
-    team_dir = RESOLVER.teams_dir / team
+    team_dir = RESOLVER.team_dir(team)
     box = RESOLVER.inbox_path(team, name)
     key = f"inboxes/{box.name}"
     live = RESOLVER.receipt_contents(team_dir, only=box.name)
@@ -12108,7 +12126,8 @@ def _check_team_dir_read_engine_only(s):
             return node.id in tainted or node.id == "TEAMS_DIR"
         if isinstance(node, ast.Call):
             return (isinstance(node.func, ast.Attribute)
-                    and node.func.attr in {"roster_path", "inbox_path"})
+                    and node.func.attr in {"team_dir", "roster_path", "roster_in",
+                                           "inbox_path", "inboxes_in"})
         if isinstance(node, ast.Attribute):
             return node.attr == "teams_dir" or in_a_team_dir(node.value, tainted)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
@@ -18863,6 +18882,74 @@ def _check_asking_is_not_resuming(s):
           not quiet, "; ".join(quiet))
     return checked
 
+
+
+@unit(("team-layout-one-owner", "what a team directory holds is named in one place"))
+def _check_team_layout_one_owner(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    ast = s.ast
+    funcs = s.funcs
+    tree = s.tree
+
+    forked = []
+    owners = ("team_dir", "roster_in", "inboxes_in")
+    # named_parts collects whatever roster_in and inboxes_in each join onto the
+    # directory they are given, which is "config.json" and "inboxes". Point one
+    # of them at a different file and the search below moves to that one.
+    named_parts = set()
+    for named in owners:
+        node = funcs.get(named)
+        if not node:
+            forked.append(f"{named} is gone, so nothing answers where that is")
+            continue
+        named_parts |= {sub.right.value for sub in ast.walk(node)
+                        if isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Div)
+                        and isinstance(sub.right, ast.Constant)
+                        and isinstance(sub.right.value, str)}
+    if funcs.get("roster_in") and funcs.get("inboxes_in") and len(named_parts) < 2:
+        forked.append("the roster and the mailboxes are not named apart, so there "
+                      "is nothing to hold the rest of the file to")
+
+    if not forked:
+        # Each row calls the engine twice and compares the two paths:
+        # roster_path("crew") against roster_in(team_dir("crew")), and so on.
+        # No path is spelled out here.
+        eng = s.corpus_engine()
+        for named, got, want in (
+                ("roster_path", eng.roster_path("crew"), eng.roster_in(eng.team_dir("crew"))),
+                ("inbox_path", eng.inbox_path("crew", "mate").parent,
+                 eng.inboxes_in(eng.team_dir("crew"))),
+                ("team_dir", eng.team_dir("crew").parent, eng.teams_dir)):
+            if got != want:
+                forked.append(f"{named} lands at {got}, not {want}")
+
+    # Every other `something / "config.json"`, `something / "inboxes"` and
+    # `teams_dir / something` in the file. The suite is left out: its fixtures
+    # build the directories the engine then has to find, so they write the
+    # layout out.
+    spans = [(fn.lineno, fn.end_lineno or fn.lineno, fn.name)
+             for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)]
+    tops = [(node.lineno, node.end_lineno or node.lineno, node.name) for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef))]
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)):
+            continue
+        inner = sorted(span for span in spans if span[0] <= node.lineno <= span[1])
+        outer = [top for top in tops if top[0] <= node.lineno <= top[1]]
+        where = inner[-1][2] if inner else "<module>"
+        if (outer and outer[0][2] in s.suite_fns) or where in owners:
+            continue
+        if isinstance(node.right, ast.Constant) and node.right.value in named_parts:
+            forked.append(f"{where} joins {node.right.value!r} onto a path at line {node.lineno}")
+        elif isinstance(node.left, ast.Attribute) and node.left.attr == "teams_dir":
+            forked.append(f"{where} builds a team's directory at line {node.lineno}")
+    check("team-layout-one-owner", "what a team directory holds is named in one place",
+          not forked, "; ".join(sorted(set(forked))[:3]))
+    return checked
 
 
 @unit(("implicit-team-shape-one-owner", "one place says what a lazily minted team is named after"))
