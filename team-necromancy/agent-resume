@@ -6511,11 +6511,11 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     reached one. Only this function knows which, and an agent that noops still
     has a pane worth attaching to, so the caller is told rather than left to
     read it off a field set partway through.
+
+    A refusal is left to propagate. Whether one agent's refusal ends the run is
+    a question about the batch, not about this agent, so run_agents answers it.
     """
-    try:
-        ctx = build(args)
-    except SystemExit:
-        return Outcome("failed", None, False, None)
+    ctx = build(args)
     agent_id = RESOLVER.field(ctx, "agentId")
 
     if args.explain:
@@ -8633,6 +8633,7 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
         die(f"{', '.join(twice)} appears twice in this run; that would start a "
             f"second process on one transcript")
     results, outcomes = [], []
+    refused = None
     for label, sub_args in jobs:
         if label is not None:
             print(f"\n[{label}]")
@@ -8640,8 +8641,20 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
             print(f"{prefix}skipped")
             results.append((label, "skipped"))
             continue
-        outcome = run_one(sub_args, passthrough, table, prefix=prefix,
-                          pending=[o.pending_write for o in outcomes if o.pending_write])
+        try:
+            outcome = run_one(sub_args, passthrough, table, prefix=prefix,
+                              pending=[o.pending_write for o in outcomes if o.pending_write])
+        except SystemExit as exc:
+            # A member's refusal is that member's problem, the way a member's
+            # pane is: the rest of the team still comes up, and the summary,
+            # the flag check and the write report still reach every agent that
+            # did. The refusal itself is kept, not discarded, and the run ends
+            # in it below. Discarding it here left main returning an ordinary
+            # code, which reads as a verb that did its work, so the end-of-run
+            # audit judged it as one and refused a declaration the run never
+            # got far enough to exercise.
+            refused = refused or exc
+            outcome = Outcome("failed", None, False, None)
         results.append((label, outcome.status))
         outcomes.append(outcome)
         socket = socket or outcome.socket
@@ -8651,21 +8664,26 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
             print(f"  {label:<24} {status}")
     report_transcript_writes([o.pending_write for o in outcomes if o.pending_write], args)
     check_flags_took_effect(passthrough, results, args)
-    if any(o.is_lead and o.status == "manual" for o in outcomes):
-        # The run ends by handing over the lead's command, and attaching would
-        # bury it. Keyed on that handover rather than on the lead being in the
-        # run: a lead that was already up leaves this shell with nothing to look
-        # at, so the swarm is the only thing left to offer.
-        return 1 if any(s == "failed" for _, s in results) else 0
+    # The run ends by handing over the lead's command, and attaching would
+    # bury it. Keyed on that handover rather than on the lead being in the
+    # run: a lead that was already up leaves this shell with nothing to look
+    # at, so the swarm is the only thing left to offer.
+    handover = any(o.is_lead and o.status == "manual" for o in outcomes)
     # Offered only where a server exists to attach to: after a launch one
     # does, and a noop on a dead socket must not promise a keypress whose
     # only outcome is "nothing to attach to".
-    if (not args.dry_run and socket and RESOLVER.socket_alive(socket)
+    if (not handover and not args.dry_run and socket and RESOLVER.socket_alive(socket)
             and any(s in ("launched", "noop") for _, s in results)):
         print()
         targets = [a.agent_id for _, a in jobs if a is not None and getattr(a, "agent_id", None)]
         if confirm_attach(targets, table, socket):
             maybe_attach(args, socket)
+    if refused:
+        # Last, so everything the run did manage has already been reported.
+        # A run that refused ends in its refusal: the exit code is the one the
+        # refusal asked for, and the end-of-run audit, which judges what a verb
+        # computed against what it declared, has nothing to judge here.
+        raise refused
     return 1 if any(s == "failed" for _, s in results) else 0
 
 
@@ -10905,6 +10923,87 @@ def run_selftest(live=False, failed_only=False, list_only=False):
 
     wrong = sorted(k for k, ok in contract.items() if not ok)
     check("compute-declared-and-audited", "compute is declared at construction and audited at the end",
+          not wrong, ", ".join(wrong))
+
+    # The audit above judges a verb that did its work, so a refusal has to
+    # arrive at audited() as a raise rather than as an exit code. It did not:
+    # run_one caught the refusal from build() and returned a "failed" outcome,
+    # main returned an ordinary code, and the audit then refused a declaration
+    # the run had refused too early to exercise. That crashed the three most
+    # ordinary shapes there are - a name that is not there, a name@team that is
+    # not there, a uuid nothing holds - with a traceback after a good message.
+    #
+    # Both halves are driven here: the batch, which decides whether one job's
+    # refusal ends the run, and audited(), which decides what gets judged.
+    class _RefusalJob:
+        dry_run, no_attach, attach, agent_id, socket = True, False, False, None, None
+
+        def __init__(self, label):
+            self.label = label
+
+    took_part, real_one_fn = [], globals()["run_one"]
+    # Built out here rather than inside the stub: a noop outcome has one
+    # construction site in this file and a check that says so, and a stub is
+    # not a second one.
+    went_quietly = Outcome("noop", None, False, None)
+
+    def _one_or_refuse(a, p, t, prefix="", pending=()):
+        took_part.append(a.label)
+        if a.label.startswith("miss"):
+            die(f"no transcript found for {a.label}")
+        return went_quietly
+
+    def batch(*labels):
+        """(code, did it end in a refusal, who was run) for one run_agents."""
+        took_part.clear()
+        jobs = [(label, _RefusalJob(label)) for label in labels]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                return run_agents(jobs[0][1], [], {}, jobs), False, list(took_part)
+            except SystemExit as exc:
+                return exc.code, True, list(took_part)
+
+    try:
+        globals()["run_one"] = _one_or_refuse
+        alone = batch("miss")
+        whole = batch("found-1")
+        partly = batch("miss", "found-2")
+    finally:
+        globals()["run_one"] = real_one_fn
+
+    # And the seam the refusal has to pass through on its way out. A fat
+    # declaration on a run that returned must still die here, as loudly as it
+    # does today; a run that raised must reach the raise instead.
+    real_engine = globals()["RESOLVER"]
+    try:
+        globals()["RESOLVER"] = Resolver(needs=Needs(hard={NEED.SPAWNS}))
+        try:
+            audited(lambda: 0)
+            judged = "nothing was refused"
+        except RuntimeError as err:
+            judged = str(err)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                audited(lambda: die("nothing to resume"))
+            refused_as = "returned a code"
+        except SystemExit as exc:
+            refused_as = f"exit {exc.code}"
+        except RuntimeError:
+            refused_as = "the audit"
+    finally:
+        globals()["RESOLVER"] = real_engine
+
+    ending = {
+        "a lone job's refusal ends the run in that refusal": alone == (1, True, ["miss"]),
+        "a batch that refused nothing still returns a code": whole == (0, False, ["found-1"]),
+        "one member's refusal does not take the rest of the team down":
+            partly[2] == ["miss", "found-2"],
+        "and the run still ends in it": partly[0] == 1 and partly[1],
+        "a verb that did its work is still audited": "SPAWNS" in judged,
+        "a verb that refused ends in its refusal, not in the audit": refused_as == "exit 1",
+    }
+    wrong = sorted(k for k, ok in ending.items() if not ok)
+    check("refusal-ends-the-run", "a refused run ends in its refusal, not in the audit",
           not wrong, ", ".join(wrong))
 
     # A pane id is per-server: a recorded one is a fact only while its server
@@ -15142,6 +15241,12 @@ def audited(entry):
 
     Only a completed verb is audited: a refusal mid-run proves nothing
     about what the whole verb would have used, and an exec never returns.
+
+    That holds because nothing on the way out swallows a refusal: die() raises,
+    the raise passes through here, and the audit below is never reached. The
+    one place that used to catch one and return an ordinary code instead
+    (run_one, so a team would not lose four members over the fifth) now hands
+    it back to run_agents, which ends the run in it.
     """
     code = entry()
     RESOLVER.audit_needs()
