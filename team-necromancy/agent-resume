@@ -4927,8 +4927,29 @@ COLOR_ANSI = {
 # The harness's titler sometimes echoes an agent name instead of titling,
 # and repeats it down the file. Real ai titles are natural language, so
 # any whitespace-free ai title is treated as absent; this set catches multiword
-# junk. Custom titles are exempt: the user typed those deliberately.
+# junk. A custom title gets the benefit of the doubt on its wording, since a
+# person may have typed it, but not on its authorship: see _harness_wrote.
 JUNK_TITLES = {"new session"}
+
+# What the harness wraps around its own records. A slash command, its output,
+# and the caveat prepended to a local command all arrive wearing a user's hat.
+HARNESS_TAGS = ("<command-name>", "<command-message>", "<command-args>",
+                "<local-command-caveat>", "<local-command-stdout>",
+                "<local-command-stderr>", "<system-reminder>")
+
+
+def _harness_wrote(text):
+    """Is this text the machinery talking rather than the person?
+
+    Asked in one place because both paths to a title need the same answer and
+    only one of them had it: the title records the harness writes, and the
+    first user message read when there are none. The filtered path was the
+    rarely taken one, so a conversation whose opening prompt was a slash
+    command was titled with the caveat wrapped around it, which describes the
+    tool the person was running rather than the work they were doing.
+    """
+    text = text.lstrip()
+    return text.startswith("Caveat:") or any(tag in text for tag in HARNESS_TAGS)
 
 
 def _json_str(raw):
@@ -4949,10 +4970,8 @@ def _first_user_message(head_lines):
         content = (rec.get("message") or {}).get("content")
         if isinstance(content, list):
             content = next((c.get("text") for c in content if isinstance(c, dict) and c.get("type") == "text"), None)
-        if not isinstance(content, str) or content.startswith("Caveat:"):
-            continue
-        if any(tag in content for tag in ("<command-name>", "<local-command-caveat>", "<local-command-stdout>")):
-            continue  # slash-command records wear a user hat but title nothing
+        if not isinstance(content, str) or _harness_wrote(content):
+            continue  # the machinery wearing a user's hat titles nothing
         text = TAG_RE.sub(" ", content).strip()  # unwrap teammate-message/command tags
         if text:
             return text
@@ -4973,6 +4992,8 @@ def session_title(path, limit=60):
             text = " ".join(_json_str(raw).split())
             if not text:
                 continue
+            if _harness_wrote(text):
+                continue  # a title the harness took from its own scaffolding
             if kind == b"ai" and (" " not in text or text.lower() in JUNK_TITLES):
                 continue  # name echo, not a title
             return text
@@ -12943,6 +12964,61 @@ def _check_refusal_ends_the_run(s):
     }
     wrong = sorted(k for k, ok in ending.items() if not ok)
     check("refusal-ends-the-run", "a refused run ends in its refusal, not in the audit",
+          not wrong, ", ".join(wrong))
+    return checked
+
+
+@unit(('title-skips-the-harness', 'a title says what the work was, not what command wrapped it'))
+def _check_title_skips_the_harness(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    # A conversation opened with a slash command carries the caveat the harness
+    # wraps around it, and the harness titles the file from that, so the title
+    # named the tool rather than the work. Both paths to a title are driven
+    # here: the title record, which is the one that usually wins, and the first
+    # user message, which is what a file with no usable record falls back to.
+    caveat = ("<local-command-caveat>Caveat: The messages below were generated "
+              "by the user while running local commands.</local-command-caveat>")
+    said = "Can you teleport a session into here?"
+
+    def transcript(into, name, records):
+        path = into / f"{name}.jsonl"
+        path.write_text("\n".join(json.dumps(r, separators=(",", ":"))
+                                  for r in records) + "\n")
+        return path
+
+    def titled(text):
+        return {"type": "custom-title", "customTitle": text}
+
+    def spoken(text):
+        return {"type": "user", "message": {"role": "user", "content": text}}
+
+    with tempfile.TemporaryDirectory() as td:
+        into = Path(td)
+        # The specimen: the harness titled the file from its own caveat, and
+        # the person's first sentence is further down.
+        wrapped = transcript(into, "wrapped", [spoken(caveat), spoken(said),
+                                               titled(caveat)])
+        # A title a person typed still wins, or this check would pass just as
+        # well against a version that threw every title away.
+        chosen = transcript(into, "chosen", [spoken(caveat), titled("Rewrite the parser")])
+        # Nothing but machinery: the honest answer is no title, not the caveat.
+        only_machinery = transcript(into, "only", [spoken(caveat), titled(caveat)])
+
+        got = {
+            "the caveat does not become the title":
+                session_title(wrapped, limit=200) == said,
+            "a title a person typed still wins":
+                session_title(chosen, limit=200) == "Rewrite the parser",
+            "machinery alone yields no title":
+                session_title(only_machinery, limit=200) is None,
+        }
+    wrong = sorted(k for k, ok in got.items() if not ok)
+    check("title-skips-the-harness",
+          "a title says what the work was, not what command wrapped it",
           not wrong, ", ".join(wrong))
     return checked
 
