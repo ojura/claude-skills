@@ -992,11 +992,30 @@ class Resolver:
         self._procs = None
     def _grep_files(self, needle, scope, recursive):
         """Files containing this literal."""
-        result = subprocess.run(self._searcher("files", needle, scope, recursive), capture_output=True, text=True)
+        result = self._search("files", needle, scope, recursive)
         if result.returncode > 1:
             warn(f"search failed ({result.stderr.strip() or 'unknown'}); falling back to a full scan")
             return None
         return [Path(p) for p in result.stdout.splitlines() if p]
+
+    def _search(self, kind, needle, paths, recursive):
+        """Run one literal search. The only place a search is started.
+
+        The environment it runs with is ours minus RIPGREP_CONFIG_PATH. rg
+        reads the file that names and prepends its flags to every invocation,
+        so somebody's config decides which transcripts a search finds, and a
+        transcript a search fails to find reads here as a transcript that does
+        not exist. Not every option gets through: the --glob this builds comes
+        later on the command line and wins over a --glob in a config. The ones
+        with no counterpart here do get through, and they are worse. Measured
+        against these two files: a config holding --max-filesize=1 returns
+        nothing at all, and so does --max-depth=0. grep reads no config, so
+        dropping the variable costs nothing on a machine without rg.
+        """
+        env = {name: value for name, value in os.environ.items()
+               if name != "RIPGREP_CONFIG_PATH"}
+        return subprocess.run(self._searcher(kind, needle, paths, recursive),
+                              capture_output=True, text=True, env=env)
 
     def _searcher(self, kind, needle, paths, recursive):
         """argv for a literal search, preferring ripgrep when installed.
@@ -1086,7 +1105,7 @@ class Resolver:
             self._spawns[path.stem], self._spawn_log[path.stem] = {}, []
         if not paths:
             return
-        result = subprocess.run(self._searcher("lines", SPAWN_MARKER, paths, False), capture_output=True, text=True)
+        result = self._search("lines", SPAWN_MARKER, paths, False)
         if result.returncode > 1:
             warn(f"search failed reading spawn records ({result.stderr.strip() or 'unknown'})")
             return
@@ -13480,6 +13499,37 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         if any("subagents" in p.parts for p in hits):
             leaks.append("the recursive searcher")
     check("sidechain-not-evidence", "a sidechain line is not evidence", not leaks, ", ".join(leaks))
+
+    # The other subprocess whose answer the caller's environment could shape.
+    # rg reads the config file RIPGREP_CONFIG_PATH names and prepends its flags
+    # to every invocation, so a --max-count or an --ignore-case sitting in
+    # somebody's config decides which transcripts a search finds. A search that
+    # misses a file reads here as a file that is not there, and the tool goes
+    # on to say there is nothing to resurrect. The poison is --max-filesize,
+    # picked by measuring rather than guessing: a --glob in a config is
+    # overridden by the --glob the searcher builds afterwards, and this one has
+    # no counterpart to override it, so it takes the answer to nothing. On a
+    # machine with no rg the search runs grep, which reads no config; the check
+    # still holds, it just has nothing left to prove.
+    with tempfile.TemporaryDirectory() as td:
+        for name in ("one", "two"):
+            (Path(td) / f"{name}.jsonl").write_text(
+                json.dumps({"status": SPAWN_MARKER}) + "\n")
+        poison = Path(td) / "rg.conf"
+        poison.write_text("--max-filesize=1\n")
+        was = os.environ.get("RIPGREP_CONFIG_PATH")
+        os.environ["RIPGREP_CONFIG_PATH"] = str(poison)
+        try:
+            found = sorted(p.name for p in
+                           RESOLVER._grep_files(SPAWN_MARKER, [Path(td)], True) or [])
+        finally:
+            if was is None:
+                os.environ.pop("RIPGREP_CONFIG_PATH", None)
+            else:
+                os.environ["RIPGREP_CONFIG_PATH"] = was
+    check("search-ignores-rg-config", "a search finds the same files whatever rg is configured to do",
+          found == ["one.jsonl", "two.jsonl"],
+          f"with a config excluding two.jsonl, the search found {found or 'nothing'}")
 
     # --- side transcripts: the file classifies itself; the meta only decorates
     with tempfile.TemporaryDirectory() as td:
