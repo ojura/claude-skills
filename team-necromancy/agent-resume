@@ -9531,6 +9531,161 @@ def live_checks():
     check("poison-preview-changes-nothing", "a --poison preview changes no server environment",
           not wrong, ", ".join(wrong))
 
+    for cid, name, ok, detail in completion_tab_checks():
+        check(cid, name, ok, detail)
+    return out
+
+
+# What one TAB costs, pinned by shape rather than by a clock, because a timing
+# assertion on someone else's machine is a coin toss. Two things made a TAB
+# unusable, and each has a check below.
+#
+# The first: zsh reruns the whole completion once per matcher-list spec until
+# one of them produces matches, and oh-my-zsh sets three. Nothing was kept
+# between those runs, so a word that matched nothing read the corpus three
+# times over, about 0.7s each here.
+#
+# The second: a bare TAB offered every agent, team and lead on the machine, 315
+# of them here. zsh lists at most LISTMAX (100 by default) before it stops and
+# asks "do you wish to see all 315 possibilities", then waits for a key. With
+# nothing yet on screen that reads as a hang, which is what it was reported as.
+#
+# What they cannot say: nothing here measures how long a TAB takes, so a change
+# that keeps the shape and loses the speed passes both. They are also read
+# through a terminal, so a zsh that lays a listing out differently would need
+# the row count taken differently.
+COMPLETION_DRIVER = r"""
+emulate -L zsh
+zmodload zsh/zpty
+zmodload zsh/datetime
+local bindir=$1 fpdir=$2 fakehome=$3 calls=$4 tool=$5
+local chunk buf
+local -F deadline
+drain() { while zpty -r -t z chunk 0.1 2>/dev/null; do :; done }
+await() {  # marker seconds
+  deadline=$(( EPOCHREALTIME + $2 ))
+  buf=''
+  while (( EPOCHREALTIME < deadline )); do
+    zpty -r -t z chunk 0.1 2>/dev/null && buf+=$chunk
+    [[ $buf == *$1* ]] && return 0
+  done
+  return 1
+}
+settle() {  # quiet-seconds cap-seconds: read until the shell stops talking
+  local -F quiet=$1 cap=$2 last=0 t0=$EPOCHREALTIME
+  buf=''
+  while (( EPOCHREALTIME - t0 < cap )); do
+    if zpty -r -t z chunk 0.05 2>/dev/null; then
+      buf+=$chunk; last=$EPOCHREALTIME
+    elif (( last > 0 && EPOCHREALTIME - last > quiet )); then
+      return 0
+    fi
+  done
+}
+zpty -b z "HOME=$fakehome CLAUDE_CONFIG_DIR= PATH=$bindir:\$PATH zsh -f -i" \
+  || { print DRIVE_FAIL no-pty; return 1 }
+await READY 10 || { zpty -w z 'print READY'; await READY 10 }
+drain
+# -f skipped every rc file, so the setup is sent instead: a terminal tall and
+# wide enough that no row of the listing scrolls or wraps, the three matcher
+# specs oh-my-zsh sets, and LISTMAX left at its own default, so "would zsh stop
+# and ask" is asked of the default rather than of whatever this machine uses.
+zpty -w z "stty rows 400 cols 200; fpath=($fpdir \$fpath); autoload -Uz compinit; compinit -u -D; zstyle ':completion:*' matcher-list 'm:{a-z}={A-Z}' 'r:|=*' 'l:|=* r:|=*'; LISTMAX=100; print SETUP-DONE"
+await SETUP-DONE 30 || { print DRIVE_FAIL no-setup; zpty -d z; return 1 }
+drain
+zpty -w -n z "$tool zzqqxxnothing"$'\t'
+settle 2.0 40
+cp -- $calls $calls.after-one-tab
+zpty -w -n z $'\025'
+drain
+zpty -w -n z "$tool "$'\t'
+settle 2.0 40
+print -r -- "$buf" > $calls.bare
+zpty -w -n z $'\025'
+zpty -d z
+print DRIVE_OK
+"""
+
+
+def completion_tab_checks():
+    """Both TAB checks off one drive of a real interactive zsh.
+
+    The corpus is a stub emitter printing 320 candidates in the shape the real
+    one prints, and HOME is a temporary directory, so this reads and writes
+    nothing of the machine's own: what is being tested is the completion file,
+    not this machine's teams.
+    """
+    out = []
+    zsh = shutil.which("zsh")
+    if not zsh:
+        for cid, name in (("completion-reads-corpus-once",
+                           "one TAB reads the corpus once, however often zsh reruns it"),
+                          ("completion-bare-tab-bounded",
+                           "a bare TAB offers few enough rows that zsh lists them")):
+            out.append((cid, name, False, "no zsh on this machine, and only zsh can answer this"))
+        return out
+
+    stage = Path(tempfile.mkdtemp(prefix=f"{TOOL}-tab-"))
+    try:
+        binned, fpdir, home = stage / "bin", stage / "fp", stage / "home"
+        for path in (binned, fpdir, home / ".claude" / "teams", home / ".claude" / "projects"):
+            path.mkdir(parents=True)
+        # Five session clusters of forty, then teams and leads: the shape and
+        # the order the real emitter prints, at about the size it prints here.
+        lines = [f"names\tsession-{g:08x}  2026-08-0{g + 1} 10:00:00\t"
+                 f"agent{g}-{m:02d}@session-{g:08x}\ttask {g}.{m}\t"
+                 for g in range(5) for m in range(40)]
+        lines += [f"teams\tsession-{i:08x}:2 members, 2026-08-01 10:00:00" for i in range(60)]
+        lines += [f"leads\tteam-lead@session-{i:08x}\tled something, joined 2026-08-01 10:00:00\t"
+                  for i in range(60)]
+        (stage / "lines").write_text("\n".join(lines) + "\n")
+        calls = stage / "calls"
+        calls.touch()
+        stub = binned / TOOL
+        stub.write_text(f'#!/bin/sh\necho x >> {calls}\n'
+                        f'[ "$1" = "--complete" ] && [ "$2" = "selector" ] '
+                        f'&& exec cat {stage / "lines"}\nexit 0\n')
+        stub.chmod(0o755)
+        shutil.copy2(Path(__file__).resolve().parent / f"_{TOOL}", fpdir / f"_{TOOL}")
+        (stage / "drive.zsh").write_text(COMPLETION_DRIVER)
+
+        # Its own session, so the backstop timeout can take the whole group:
+        # the drive holds an interactive shell open on a pty, and killing only
+        # the script it started would leave that shell behind for the checks
+        # that count what is running.
+        drive = subprocess.Popen([zsh, str(stage / "drive.zsh"), str(binned), str(fpdir),
+                                  str(home), str(calls), TOOL],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, start_new_session=True)
+        try:
+            run = subprocess.CompletedProcess(drive.args, 0, *drive.communicate(timeout=300))
+        except subprocess.TimeoutExpired:
+            os.killpg(os.getpgid(drive.pid), 9)
+            run = subprocess.CompletedProcess(drive.args, -1, *drive.communicate())
+        drove = "DRIVE_OK" in run.stdout
+        first = calls.with_suffix(".after-one-tab")
+        reads = len(first.read_text().split()) if first.exists() else -1
+        listing = calls.with_suffix(".bare")
+        shown = listing.read_text(errors="replace") if listing.exists() else ""
+        # The pty carries the escapes the terminal would have acted on; strip
+        # them, and \r as well, so one displayed row reads as one line here.
+        plain = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", shown).replace("\r", "\n")
+        rows = [row for row in plain.split("\n") if " -- " in row]
+        asked = "possibilities" in plain
+
+        said = run.stdout.strip().splitlines()[-1:] or [(run.stderr or "no output").strip()[:80]]
+        stalled = f"the drive did not finish: {said[0]}"
+        out.append(("completion-reads-corpus-once",
+                    "one TAB reads the corpus once, however often zsh reruns it",
+                    drove and reads == 1,
+                    f"{reads} read(s) of the emitter" if drove else stalled))
+        out.append(("completion-bare-tab-bounded",
+                    "a bare TAB offers few enough rows that zsh lists them",
+                    drove and not asked and 0 < len(rows) <= 100,
+                    f"{len(rows)} rows of {len(lines)} offered, zsh asked first: {asked}"
+                    if drove else stalled))
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
     return out
 
 
