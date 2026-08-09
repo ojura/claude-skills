@@ -900,15 +900,22 @@ class Resolver:
         raise from __del__ is swallowed, so the run calls this when its verb
         completes. Conditional declarations are the escape for branchy paths
         and pass silently when unexercised.
+
+        The message sets a task rather than offering a menu. Naming the
+        conditional bucket as one of two ready answers made it the cheap one,
+        and a declaration edited from the message instead of from the code
+        stops describing the code. What this run did compute is included
+        because the difference between that and the declaration is where the
+        reading starts.
         """
         fat = self.needs.hard - self.exercised
         if fat:
+            named = ", ".join(sorted(n.name for n in fat))
+            computed = ", ".join(sorted(n.name for n in self.exercised)) or "nothing"
             raise RuntimeError(
-                "declared and never computed: "
-                + ", ".join(sorted(n.name for n in fat))
-                + "; a smaller declaration would have served this run, so "
-                  "drop it or move it to the maybe bucket if some runs of "
-                  "this verb genuinely use it")
+                f"declared and never computed: {named}; this run computed "
+                f"{computed}. Read this verb's paths, work out which of them "
+                f"reach {named}, and declare what they do.")
 
     def refresh_procs(self):
         self._procs = None
@@ -10897,8 +10904,16 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         "a side path refuses like the front door":
             "transcript identity stamps" in side_refused,
         "a declared one answers, and a lean run audits clean": answered and lean_ok,
-        "a fat declaration is refused at the end": "PROCS" in fat_refused
-            and "STAMPS" not in fat_refused,
+        "a fat declaration is refused at the end":
+            fat_refused.startswith("declared and never computed: PROCS;"),
+        # The refusal is read by whoever edits the verb next. It names what the
+        # run did compute, because the difference between that and the
+        # declaration is the evidence they start from, and it sends them to the
+        # verb's paths rather than offering the conditional bucket as one of two
+        # ready answers - which is how a declaration stops describing the code.
+        "and says what this run did compute": "this run computed STAMPS" in fat_refused,
+        "and sets a task rather than offering a bucket":
+            "Read this verb's paths" in fat_refused and "maybe bucket" not in fat_refused,
         "a conditional declaration is excused unexercised": maybe_ok,
         "the verbs declare before anything computes":
             "RESOLVER = Resolver(needs=verb_needs(args, selector))" in main_src
