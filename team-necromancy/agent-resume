@@ -10097,20 +10097,27 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     funcs = {n.name: n for n in ast.walk(tree)
              if isinstance(n, ast.FunctionDef) and not is_delegate(n)}
 
+    # What each function calls, by either spelling, indexed in one pass. The
+    # question below is asked a few dozen times and used to walk every function
+    # each time: 6942 walks in a run, 2.0s of a 9.7s tier, most of it this.
+    _calls_in = {}
+    for _name, _node in funcs.items():
+        _called = set()
+        for _sub in ast.walk(_node):
+            if isinstance(_sub, ast.Call):
+                _spelled = getattr(_sub.func, "id", None)
+                if _spelled is None and isinstance(_sub.func, ast.Attribute):
+                    _spelled = _sub.func.attr
+                if _spelled is not None:
+                    _called.add(_spelled)
+        _calls_in[_name] = _called
+
     def callers_of(target):
         """Callers by either spelling: a module function calls `target(...)`, an
         engine method calls `self.target(...)`. Matching only the first lets
         every invariant below pass by vacuity for an engine that is a class,
         which is the opposite of what they are for."""
-        out = set()
-        for name, node in funcs.items():
-            for sub in ast.walk(node):
-                if not isinstance(sub, ast.Call):
-                    continue
-                if getattr(sub.func, "id", None) == target or (
-                        isinstance(sub.func, ast.Attribute) and sub.func.attr == target):
-                    out.add(name)
-        return out
+        return {name for name, called in _calls_in.items() if target in called}
 
     # -- structural
     dupes = [n for n in ("resolve_transcript", "edit_team_config", "socket_alive", "lead_pid",
