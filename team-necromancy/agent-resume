@@ -1396,7 +1396,7 @@ class Resolver:
         carries no transcript evidence and is reported with None rather than
         dropped, so a caller can still see it is there.
         """
-        table = self.ps_table() if table is None else table
+        table = self.process_table() if table is None else table
         return (self._wearer_pairs(self.live_agent_procs(agent_id, table)),
                 self._wearer_pairs(self.self_wears(agent_id, table)))
 
@@ -1424,7 +1424,7 @@ class Resolver:
                 "started": data.get("startedAt") or 0,
                 "alive": self.pid_alive(pid, data.get("procStart")),
             }
-        for pid, _, args in self.ps_table():
+        for pid, _, args in self.process_table():
             if not self.is_claude(args):
                 continue
             pairs = self._argv_pairs(args)
@@ -1644,11 +1644,12 @@ class Resolver:
         except OSError:
             return ""
 
-    def ps_table(self, refresh=False):
+    def process_table(self, refresh=False):
         """[(pid, ppid, args)] for every process we can see, snapshotted once.
 
-        One run judges liveness against one consistent picture, and a single
-        resolve was reading the process list three times.
+        Snapshotted because one run has to judge liveness against one
+        consistent picture, and because of what it cost not to: a single
+        resolve used to read the process list three times.
 
         Read out of /proc, not out of ps. ps is a program that reads these
         same files and then formats them for a terminal, and the formatting
@@ -2313,7 +2314,7 @@ class Resolver:
             elif (last_write.get(addressee) or 0) <= (send["sent"] or 0):
                 entry.update(state="pending", detail="the recipient has not "
                              "written since the send")
-            elif any(self.transcript_holders(people[addressee].stem, self.ps_table())):
+            elif any(self.transcript_holders(people[addressee].stem, self.process_table())):
                 # Marked read on queueing, held in the recipient's RAM: the
                 # drain-then-die window is open until its turn ends. Both
                 # halves of the holder question, because the recipient may be
@@ -3925,7 +3926,7 @@ class Resolver:
         Not seat_note, which says what became of the pane id a roster wrote
         down. That is a record. This is where the process is.
         """
-        table = self.ps_table() if table is None else table
+        table = self.process_table() if table is None else table
         sock, _why = self.socket_hosting([agent_id], table)
         if sock:
             return "seated", sock
@@ -5517,7 +5518,7 @@ LAUNCH_WRITE_S = 45.0    # a large session takes tens of seconds to load and wri
 
 
 def launch_present(socket, pane, agent_id):
-    fresh = RESOLVER.ps_table(refresh=True)
+    fresh = RESOLVER.process_table(refresh=True)
     # The strangers half only: whoever we already were was there before this
     # launch, so counting it would call every launch a success.
     appeared, _worn_by_us = RESOLVER.wearers(agent_id, fresh) if agent_id else ([], [])
@@ -7339,7 +7340,7 @@ def cleanup_teams(dry=False):
     is still only rendered under --dry-run, since the hook wants silence.
     """
     removed, kept = [], []
-    table = RESOLVER.ps_table()
+    table = RESOLVER.process_table()
     for cfg in sorted(RESOLVER.roster_path(d.name) for d in RESOLVER.team_dirs()):
         keep = team_keep_reason(cfg, table)
         if keep:
@@ -7461,7 +7462,7 @@ def diagnose_team(team, table=None, deep=False):
     which reads every member transcript in full and so runs only for a named
     team, never in the sweep.
     """
-    table = RESOLVER.ps_table() if table is None else table
+    table = RESOLVER.process_table() if table is None else table
     pid, alive, how, _exact = RESOLVER.lead_pid(None, team)
     lead_team, exact_team = RESOLVER.team_minted_by(pid) if (pid and alive) else (None, False)
     worn = RESOLVER.worn_team(pid) if (pid and alive) else None
@@ -8129,7 +8130,7 @@ def reap_blockers(stamped, args, table=None):
     holding is the strict one, since --force cannot rewrite a file under a
     live writer.
     """
-    table = RESOLVER.ps_table() if table is None else table
+    table = RESOLVER.process_table() if table is None else table
     rows = RESOLVER.reap_objections(stamped, table, archive_mail=args.with_mail)
     held = [r for r in rows if "holds" in r["kinds"]]
     alive = [r for r in rows if "holds" not in r["kinds"]
@@ -8173,7 +8174,7 @@ def rebind_reap(stamped, dest, args, prefix="", path=None, fatal=True):
     init is structurally unreachable with the stamped team absent); a
     restamped life keeps its hooks, since the destination roster loads.
     """
-    table = RESOLVER.ps_table()
+    table = RESOLVER.process_table()
     lines = reap_blockers(stamped, args, table)
     if lines:
         said = (f"a rebind onto {dest} needs {stamped} retired, and it "
@@ -8287,7 +8288,7 @@ def run_demote(args):
     if not path:
         die(f"no transcript for {args.demote!r}; name the session uuid")
     stored = load_receipt(path.stem)
-    table = RESOLVER.ps_table()
+    table = RESOLVER.process_table()
     # Both halves of the holder question, self first: the agent demoting the
     # very transcript it is running is the caller this gate most needs to
     # stop. No --force: embedding the file one's own harness will next flush
@@ -9370,7 +9371,7 @@ def live_checks():
         are not narrowed: only this tool makes a claude-swarm socket, and one
         appearing here is worth a look whichever shape made it.
         """
-        return ({str(pid) for pid, _ppid, cmd in RESOLVER.ps_table(refresh=True)
+        return ({str(pid) for pid, _ppid, cmd in RESOLVER.process_table(refresh=True)
                  if "--agent-id" in cmd and "session-corpus-" in cmd}
                 | {sock.name for sock in RESOLVER.swarm_sockets()})
 
@@ -9506,7 +9507,7 @@ def live_checks():
         os.environ["COLUMNS"] = columns
         try:
             eng = Resolver(needs=Needs(maybe=set(NEED)))
-            eng.ps_table(refresh=True)
+            eng.process_table(refresh=True)
             return eng
         finally:
             if was is None:
@@ -9517,8 +9518,8 @@ def live_checks():
     try:
         time.sleep(0.3)          # let it reach the process table
         narrow, wide = engine_at("100"), engine_at("1000")
-        narrow_rows = {pid: (ppid, args) for pid, ppid, args in narrow.ps_table()}
-        wide_rows = {pid: (ppid, args) for pid, ppid, args in wide.ps_table()}
+        narrow_rows = {pid: (ppid, args) for pid, ppid, args in narrow.process_table()}
+        wide_rows = {pid: (ppid, args) for pid, ppid, args in wide.process_table()}
         # Only the pids both snapshots hold. This machine starts and ends
         # processes while the suite runs, and a pid that came or went between
         # two reads is churn, not width. A pid in both that says two different
@@ -9928,7 +9929,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
 
     # -- structural
     dupes = [n for n in ("resolve_transcript", "edit_team_config", "socket_alive", "lead_pid",
-                         "stamp_index", "ps_table", "session_registry")
+                         "stamp_index", "process_table", "session_registry")
              if sum(1 for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
                     and f.name == n and not is_delegate(f)) != 1]
     check("engine-primitives-once", "engine primitives defined exactly once", not dupes, ", ".join(dupes))
@@ -10161,7 +10162,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         # mutable is what lets launch_survived run for real instead of being
         # told the answer.
         live = list(table)
-        eng.ps_table = lambda refresh=False: list(live)
+        eng.process_table = lambda refresh=False: list(live)
         who, team = agent_id.partition("@")[0], agent_id.partition("@")[2]
         cfg = eng.roster_path(team)
         roster = json.loads(cfg.read_text())
@@ -10314,7 +10315,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         stem = promote_the_fork(root)
         eng = Resolver(needs=Needs(maybe=set(NEED)))
         eng.projects_dir, eng.teams_dir = root / "projects", root / "teams"
-        eng.ps_table = lambda refresh=False: []
+        eng.process_table = lambda refresh=False: []
         eng.session_registry = lambda: []
         agent_id = f"{PROMOTED[0]}@{PROMOTED[1]}"
         with contextlib.redirect_stderr(io.StringIO()):
@@ -10358,7 +10359,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             separators=(",", ":")) + "\n")
         blank_eng = Resolver(needs=Needs(maybe=set(NEED)))
         blank_eng.projects_dir, blank_eng.teams_dir = root / "projects", root / "teams"
-        blank_eng.ps_table = lambda refresh=False: []
+        blank_eng.process_table = lambda refresh=False: []
         blank_eng.session_registry = lambda: []
         with contextlib.redirect_stderr(io.StringIO()) as refusal:
             try:
@@ -10507,7 +10508,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         eng = Resolver(needs=Needs(maybe=set(NEED)))
         eng.projects_dir = Path(td) / "projects"
         eng.teams_dir = Path(td) / "teams"
-        eng.ps_table = lambda refresh=False: []
+        eng.process_table = lambda refresh=False: []
         eng.session_registry = lambda: []
         with contextlib.redirect_stderr(io.StringIO()) as quiet:
             where = eng.agent_cwd(eng.identity(session_uuid=moved))
@@ -10517,7 +10518,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         (proj / f"{parent}.jsonl").unlink()
         stale = Resolver(needs=Needs(maybe=set(NEED)))
         stale.projects_dir, stale.teams_dir = eng.projects_dir, eng.teams_dir
-        stale.ps_table = lambda refresh=False: []
+        stale.process_table = lambda refresh=False: []
         stale.session_registry = lambda: []
         with contextlib.redirect_stderr(io.StringIO()) as loud:
             fell_back = stale.agent_cwd(stale.identity(session_uuid=moved))
@@ -11074,9 +11075,9 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     starters = {"run", "Popen", "call", "check_call", "check_output", "getoutput",
                 "system", "popen", "spawnv", "spawnvp", "execv", "execvp", "which"}
     table_node = next((m for m in engine_node.body
-                       if isinstance(m, ast.FunctionDef) and m.name == "ps_table"), None)
+                       if isinstance(m, ast.FunctionDef) and m.name == "process_table"), None)
     if table_node is None:
-        started = ["the engine has no ps_table to check"]
+        started = ["the engine has no process_table to check"]
     else:
         started = sorted({
             f"{sub.func.attr if isinstance(sub.func, ast.Attribute) else sub.func.id}()"
@@ -11430,7 +11431,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             setattr(RESOLVER, attr, value)
 
     census_asked = []
-    _rewire(ps_table=lambda refresh=False: [],
+    _rewire(process_table=lambda refresh=False: [],
             lead_pid=lambda parent, team: (None, False, None, False),
             team_population=lambda team: {"alpha": ("unrecorded", None),
                                           "beta": ("unrecorded", None),
@@ -11869,7 +11870,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         "the verbs declare before anything computes":
             "RESOLVER = Resolver(needs=verb_needs(args, selector))" in main_src
             and main_src.index("Resolver(needs=verb_needs")
-                < main_src.index("RESOLVER.ps_table()"),
+                < main_src.index("RESOLVER.process_table()"),
     }
     # One reader. A declaration's buckets are the engine's business; anything
     # else asks needs[X] and gets one of three answers. Two readers of one
@@ -12187,7 +12188,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         agent_id, resume, team = "a@session-x", None, None
 
     stop_engine = Resolver(needs=verb_needs(_StopArgs, None))
-    stop_engine.ps_table()      # what a stop really does compute
+    stop_engine.process_table()      # what a stop really does compute
     audited_clean = True
     try:
         stop_engine.audit_needs()
@@ -12698,7 +12699,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
                       {"agentId": f"{survivor}@session-selftest-held", "name": survivor}]) \
             if survivor else None
         with contextlib.redirect_stderr(io.StringIO()):
-            table = RESOLVER.ps_table()
+            table = RESOLVER.process_table()
             reapable = team_keep_reason(gone, table) is None
             kept = team_keep_reason(held, table) is not None if held else True
     finally:
@@ -13283,7 +13284,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         eng10.session_registry = lambda: [
             {"pid": me, "sessionId": "fedcba98-fedc-4ba9-8fed-cba98fedcba9",
              "startedAt": 1000 + TEAM_MINT_WINDOW_MS - 1, "updatedAt": 0}]
-        eng10.ps_table = lambda refresh=False: []      # no masquerade to find in argv
+        eng10.process_table = lambda refresh=False: []      # no masquerade to find in argv
         got_pid, got_alive, got_how, got_exact = eng10.lead_pid(None, paired)
         picked = {
             "the timing pairing is what answered": got_pid == me and got_alive,
@@ -13931,8 +13932,8 @@ def run_selftest(live=False, failed_only=False, list_only=False):
             throughout: the arms that get past both gates plan and print,
             and nothing here writes.
             """
-            real_ps = RESOLVER.ps_table
-            RESOLVER.ps_table = lambda: table
+            real_table = RESOLVER.process_table
+            RESOLVER.process_table = lambda: table
             said, printed = io.StringIO(), io.StringIO()
             try:
                 with contextlib.redirect_stderr(said), \
@@ -13942,7 +13943,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
                     except SystemExit:
                         pass
             finally:
-                RESOLVER.ps_table = real_ps
+                RESOLVER.process_table = real_table
             return " ".join((said.getvalue() + " " + printed.getvalue()).split())
 
         real_projects, real_teams = RESOLVER.projects_dir, RESOLVER.teams_dir
@@ -15353,7 +15354,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # "restored" rather than "orphaned" and there is something to compare.
     eng = corpus_engine()
     eng.session_registry = lambda: []
-    eng.ps_table = lambda refresh=False: [
+    eng.process_table = lambda refresh=False: [
         (424242, 0, "claude --resume 1e5701ed-1fe5-4701-8ed1-e5701ed1fe57 "
                     "--agent-id team-lead@session-corpus-alpha")]
     torn, sighted, restored_n, incomplete = [], 0, 0, 0
@@ -15427,7 +15428,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # reason) rather than as a spawned member corroborating it.
     eng = corpus_engine()
     eng.session_registry = lambda: []
-    eng.ps_table = lambda refresh=False: [
+    eng.process_table = lambda refresh=False: [
         (424242, 0, "claude --resume d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1 "
                     "--agent-id drift@session-corpus-contested-b")]
     claimed = {t: {path for _st, path in hits} for t, hits in eng.led_teams().items()}
@@ -15462,7 +15463,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # multiteam-a is the "stale" address and multiteam-b the "live" one.
     eng = corpus_engine()
     eng.session_registry = lambda: []
-    eng.ps_table = lambda refresh=False: [
+    eng.process_table = lambda refresh=False: [
         (424242, 0, "claude --resume aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa "
                     "--agent-id team-lead@session-corpus-multiteam-b")]
     stem = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -15509,14 +15510,14 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # swift is listed but never live.
     eng = corpus_engine()
     eng.session_registry = lambda: []
-    eng.ps_table = lambda refresh=False: [
+    eng.process_table = lambda refresh=False: [
         (424242, 0, "claude --agent-id petrel@session-corpus-crew"),
         (424243, 0, "claude --agent-id sparrow@session-corpus-crew")]
     live_wearers = {"petrel@session-corpus-crew", "sparrow@session-corpus-crew"}
     eng.socket_hosting = lambda ids, table: (
         ("sock-crew", "live pane of the crew") if any(i in live_wearers for i in ids)
         else (None, None))
-    table = eng.ps_table()
+    table = eng.process_table()
     # The population comes from live argv, not from the thing under test: drawing
     # it from crew_socket let a neutered crew_socket skip the check instead of
     # failing it. Sorted, so the same team is examined on every run.
@@ -15577,7 +15578,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     real_resolver = globals()["RESOLVER"]
     globals()["RESOLVER"] = eng = corpus_engine()
     eng.session_registry = lambda: []
-    eng.ps_table = lambda refresh=False: []
+    eng.process_table = lambda refresh=False: []
     try:
         wanted = collections.defaultdict(set)
         for team in sorted(eng.known_teams()):
@@ -15652,7 +15653,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     real_resolver = globals()["RESOLVER"]
     globals()["RESOLVER"] = counting = corpus_engine()
     counting.session_registry = lambda: []
-    counting.ps_table = lambda refresh=False: []
+    counting.process_table = lambda refresh=False: []
     try:
         with contextlib.redirect_stdout(io.StringIO()) as census_out, \
                 contextlib.redirect_stderr(io.StringIO()):
@@ -15702,11 +15703,11 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     real_resolver = globals()["RESOLVER"]
     globals()["RESOLVER"] = eng = corpus_engine()
     eng.session_registry = lambda: []
-    eng.ps_table = lambda refresh=False: [
+    eng.process_table = lambda refresh=False: [
         (424242, 0, "claude --resume aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa "
                     "--agent-id team-lead@session-corpus-multiteam-b")]
     try:
-        table = eng.ps_table()
+        table = eng.process_table()
         verdicts = {}
         for team in sorted(eng.live_teams()):
             try:
@@ -15833,7 +15834,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     arms = {}
     try:
         for arm, (rows, hosting, said_word) in fixtures.items():
-            eng.ps_table = lambda refresh=False, rows=rows: rows
+            eng.process_table = lambda refresh=False, rows=rows: rows
             eng.socket_hosting = hosting
             try:
                 with contextlib.redirect_stderr(io.StringIO()):
@@ -15866,7 +15867,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     eng.session_registry = lambda: []
     eng.team_minted_by = lambda pid: (crew, True)
     crew_rows = [lead_row, _wearing(771002, "petrel"), _wearing(771004, "sparrow")]
-    eng.ps_table = lambda refresh=False: crew_rows
+    eng.process_table = lambda refresh=False: crew_rows
     blocks = {}
     try:
         for arm, hosting in (
@@ -15908,7 +15909,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     real_resolver = globals()["RESOLVER"]
     globals()["RESOLVER"] = eng = corpus_engine()
     eng.session_registry = lambda: []
-    eng.ps_table = lambda refresh=False: [
+    eng.process_table = lambda refresh=False: [
         (771005, 0, f"{FAKE_AGENT_BIN} --resume "
                     f"22222222-2222-4222-8222-222222222222 --agent-id petrel@{crew}")]
     dossier = io.StringIO()
@@ -15943,7 +15944,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     eng.team_minted_by = lambda pid: (crew, True)
     mine_row = [(os.getpid(), 0, f"{FAKE_AGENT_BIN} --resume "
                                  f"22222222-2222-4222-8222-222222222222 --agent-id petrel@{crew}")]
-    eng.ps_table = lambda refresh=False: mine_row
+    eng.process_table = lambda refresh=False: mine_row
     dossier = io.StringIO()
     try:
         seat = eng.seat_of(f"petrel@{crew}", mine_row)
@@ -15989,7 +15990,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     real_resolver = globals()["RESOLVER"]
     globals()["RESOLVER"] = eng = corpus_engine()
     eng.session_registry = lambda: []
-    eng.ps_table = lambda refresh=False: [
+    eng.process_table = lambda refresh=False: [
         (424242, 0, "claude --resume aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa "
                     "--agent-id team-lead@session-corpus-multiteam-b")]
     eng.inbox_state = lambda team: {"team-lead": (3, "2026-01-01T00:00:00Z")}
@@ -16011,7 +16012,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     real_resolver = globals()["RESOLVER"]
     globals()["RESOLVER"] = eng = corpus_engine()
     eng.session_registry = lambda: []
-    eng.ps_table = lambda refresh=False: [
+    eng.process_table = lambda refresh=False: [
         (424242, 0, "claude --resume aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa "
                     "--agent-id team-lead@session-corpus-multiteam-b")]
     eng.team_minted_by = lambda pid: (None, False)
@@ -16536,7 +16537,7 @@ def main():
         set_tmux_target(args.tmux_session, args.tmux_window)
 
     check_substrate()
-    table = RESOLVER.ps_table()
+    table = RESOLVER.process_table()
     if selector:
         apply_selector(selector, args, table)
 
