@@ -10,11 +10,15 @@
 # patterns are generated from those exact displays so per-agent colors match.
 
 _ra_parse() {  # line -> cand desc color (caller's locals, via dynamic scope)
+  # One split rather than a chain of strips. Reaching the second tab with
+  # ${rest#*<tab>} costs a match attempt per character of the description, and
+  # descriptions here run to 400 characters: that single expansion was most of
+  # what a TAB spent in the shell. Descriptions cannot themselves hold a tab,
+  # because session_title collapses every run of whitespace to one space.
+  local -a parts
   if [[ $1 == *$'\t'* ]]; then
-    cand=${1%%$'\t'*}
-    local rest=${1#*$'\t'}
-    desc=${rest%%$'\t'*} color=${rest#*$'\t'}
-    [[ $color == $rest ]] && color=''
+    parts=("${(@ps:\t:)1}")
+    cand=$parts[1] desc=$parts[2] color=$parts[3]
   else
     cand=${1%%:*} desc=${1#*:} color=''
   fi
