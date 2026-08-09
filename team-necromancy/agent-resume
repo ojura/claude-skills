@@ -1302,8 +1302,10 @@ class Resolver:
         if len(backed) == 1:
             return backed[0][0], f"spawn payloads naming {team}, corroborated by {backed[0][1]}"
         if len(hits) == 1:
-            warn(f"resuming the only transcript claiming {team}; nothing corroborates it. "
-                 f"If that is the wrong conversation, name the right one with --resume")
+            # The answer says it is uncorroborated; it does not warn about it.
+            # Reports ask this question too, and a listing that said "resuming"
+            # would describe an act nobody asked for. Whoever resumes says so,
+            # from this provenance.
             return hits[0][1], f"sole payload claimant for {team}, uncorroborated"
         listed = ", ".join(path.stem[:8] for _, path in hits)
         if len(backed) > 1:
@@ -9051,6 +9053,12 @@ def rebuild_roster(team, args, passthrough, table):
     path, why = RESOLVER.lead_transcript_for(team)
     if not path:
         die(f"no roster for {team} and none can be rebuilt: {why}")
+    if "uncorroborated" in why:
+        # Said here rather than by the answer, because this is the run that
+        # acts on it: a listing asks the same question and has nothing to warn
+        # about.
+        warn(f"resuming the only transcript claiming {team}; nothing corroborates it. "
+             f"If that is the wrong conversation, name the right one with --resume")
     print(f"team     {team} has no roster; rebuilding from {path.stem[:8]} ({why})")
     lead = copy.copy(args)
     lead.team, lead.agent_id, lead.resume = None, None, path.stem
@@ -16373,6 +16381,34 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("team-sentence-one-owner", "the team listing states no facts of its own",
           not built_here and "team_line(" in teams_branch,
           f"builds {', '.join(built_here)}" if built_here else "does not call team_line")
+
+    # Asking which transcript led a team is not resuming it. The answer used to
+    # warn "resuming the only transcript claiming X" from inside the engine, so
+    # every report that asked, the listing included, spoke as though it were
+    # about to act. The provenance carries the fact; the run that acts on it
+    # says so.
+    eng = corpus_engine()
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = eng
+    said = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(said):
+            uncorroborated = [t for t in eng.known_teams()
+                              if "uncorroborated" in (eng.lead_transcript_for(t)[1] or "")]
+            for team in uncorroborated:
+                team_line(team, eng.scan_teams(), limit=COMPLETION_TITLE)
+    finally:
+        globals()["RESOLVER"] = real_resolver
+    acts = ast.get_source_segment(source, funcs["rebuild_roster"]) or ""
+    quiet = []
+    if not uncorroborated:
+        quiet.append("the corpus has no uncorroborated team, so this compares nothing")
+    if said.getvalue().strip():
+        quiet.append(f"describing one warned: {said.getvalue().strip().splitlines()[0][:60]}")
+    if "nothing corroborates it" not in acts:
+        quiet.append("the run that rebuilds no longer says the claim is uncorroborated")
+    check("asking-is-not-resuming", "describing a team warns about nothing; rebuilding it does",
+          not quiet, "; ".join(quiet))
 
     if live:
         results.extend(live_checks())
