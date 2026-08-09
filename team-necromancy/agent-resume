@@ -62,8 +62,8 @@ TOOL = Path(__file__).resolve().name
 
 # The parser's description, so --help says this before the flags; the module
 # docstring above is what it says after them. This is the half a reader needs
-# first, because without it a bare token in the command line has no meaning,
-# and it used to print underneath all forty-four flags. Wrapped by hand: the
+# first, because without it a bare token in the command line has no meaning.
+# Wrapped by hand: the
 # formatter keeps a description verbatim, which is what holds the table's
 # columns together.
 SELECTOR_HELP = f"""Resume a Claude Code teammate in its swarm tmux session.
@@ -917,11 +917,9 @@ class Cache:
     """One of the engine's held answers, and its own entry in the list of them.
 
     The fence that keeps callers out of the engine's storage needs to know what
-    that storage is called. Written down by hand, that list went stale in both
-    directions at once: it carried `_ps`, which was never the name of anything,
-    and it was missing `_procs` and `_carried`, which are two of the seven real
-    ones. Declaring a cache is what registers it here, so the list cannot say
-    something the class does not.
+    that storage is called. Declaring a cache is what registers it here, so the
+    list of names is the set of caches themselves and says exactly what the
+    class holds.
 
     `empty` is what the cache holds before anything fills it, called per engine
     when it is a factory, so two engines never share one dict.
@@ -1687,19 +1685,13 @@ class Resolver:
         """[(pid, ppid, args)] for every process we can see, snapshotted once.
 
         Snapshotted because one run has to judge liveness against one
-        consistent picture, and because of what it cost not to: a single
-        resolve used to read the process list three times.
+        consistent picture, and because one resolve asks for it many times over.
 
-        Read out of /proc, not out of ps. ps is a program that reads these
-        same files and then formats them for a terminal, and the formatting
-        was the bug: it cuts every line to COLUMNS, which a subprocess takes
-        from whatever shell the tool was typed in. Measured on this machine at
-        COLUMNS=100, a 342-character claude command line lost its --agent-id
-        and --team-name, so a running agent read as not running, --stop said
-        there was nothing to stop, and a resume that should have nooped
-        offered to split a second process onto a transcript that already had
-        one. A wider terminal only moved the cut. Reading the files ourselves
-        has no width, and no COLUMNS, LANG, PATH or TERM can shape it.
+        Read out of /proc, which is where a command line lives and where ps
+        reads it from. A file read carries the whole of argv, so an identity
+        that sits 342 characters into a command line arrives intact and every
+        liveness answer is the same in any terminal, under any COLUMNS, LANG,
+        PATH or TERM.
 
         A row is a process with a command line. Kernel threads have none, and
         neither does a zombie, which pid_alive already answers no for and
@@ -2405,8 +2397,8 @@ class Resolver:
         A row is {"pid", "kinds", "said"}: which process it is about (None for
         mail), which of wears/operates/holds/mail it raises, and the sentence
         for it. One process is one row however many ways it objects, because
-        the argv walk and the transcript walk each used to emit their own
-        line, and a reader counting the processes to stop counted one twice.
+        the argv walk and the transcript walk can both raise the same one, and
+        a reader counting the processes to stop must not count it twice.
         Typed rows rather than sentences because the caller groups by remedy,
         and grouping by which words a sentence happens to contain is how a
         merged sentence lands in the wrong group.
@@ -2906,10 +2898,8 @@ class Resolver:
             swap it for a candidate that is that same value followed by "[",
             longest first, so it can never reach a different value. That holds
             of the strings themselves, so it needs no field to be named and no
-            argument to be passed. It used to be an argument: build_command and
-            the roster writer passed it and --explain did not, so --explain
-            printed claude-opus-5 for the field the launch emitted as
-            claude-opus-5[1m].
+            argument to be passed. It takes no parameter, so every caller gets
+            the same answer and the report names the value the launch emits.
 
             Applying it to every field would go wrong on a field where
             "<value>[..." means something other than a fuller spelling of
@@ -3178,10 +3168,7 @@ class Resolver:
         # `agent name@team` and `session <uuid>`: a source is named for the
         # object it is, in the spelling the rest of the report uses for that
         # object. A team by its name, a transcript by its session id, and
-        # nothing by a path or a file name. The legend used to carry
-        # team:<full path to config.json> beside jsonl:<uuid>.jsonl, which was
-        # two spellings of two things the reader had already been handed, in
-        # two different shapes.
+        # nothing by a path or a file name.
         if team_entry:
             member, ts, src = (team_entry["member"], team_entry["ts"],
                                f"roster of {team_entry['team']}")
@@ -5082,10 +5069,9 @@ def team_facts(team, entries, limit=60):
     outlived its directory answers from the lead transcript that spawned it,
     which is where its members were recorded in the first place.
 
-    The listing used to ask this twice in two grammars, so a team with a
-    roster read as a title and a count while a team without one read as a
-    sentence about evidence, and the second kind never gained a title
-    although the topic below it was already fetching exactly that.
+    One grammar for both kinds. A team with a roster and a team without read
+    the same way, differing in the facts they carry while the shape of the
+    sentence stays one shape.
     """
     listed = [e for e in entries if e["team"] == team]
     if listed:
@@ -5629,7 +5615,7 @@ LAUNCH_WRITE_S = 45.0    # a large session takes tens of seconds to load and wri
 
 def launch_present(socket, pane, agent_id):
     fresh = RESOLVER.process_table(refresh=True)
-    # The strangers half only: whoever we already were was there before this
+    # The strangers half only: our own lineage was in place before this
     # launch, so counting it would call every launch a success.
     appeared, _worn_by_us = RESOLVER.wearers(agent_id, fresh) if agent_id else ([], [])
     if appeared:
@@ -6319,10 +6305,9 @@ EXPLAIN_VALUE = 46
 def explain(ctx):
     """Every assembled field, where it came from, and what disagreed.
 
-    Sources are tagged rather than repeated. Two sources answered twelve of
-    thirteen fields on the run this was written for, so the column that exists
-    for comparing sources was the same two names written down the page; the
-    legend carries each source's full text once and the rows carry a letter.
+    Sources are tagged rather than repeated. A few sources answer most fields, so a column
+    carrying each source's full text is that text written down the page; the
+    legend carries it once and the rows carry a letter.
 
     The legend prints whatever the merge called each source. What that is
     follows one rule, stated where the sources are added: the object, in the
@@ -7162,8 +7147,8 @@ def _complete(topic):
             # The first long spelling is the one offered; the rest are aliases,
             # which is what this completion has always done with --terminate,
             # --cleanup-sockets and --no-colour. -h/--help is why the rule says
-            # first *long* rather than first: declaring the short spelling first
-            # used to drop --help from the completion by accident.
+            # first *long* rather than first: the first long option names the flag whatever
+            # order its spellings are declared in.
             if not longs or action.help is argparse.SUPPRESS:
                 continue
             # A flag with no declared row is a failed check, not a broken TAB:
@@ -7764,12 +7749,10 @@ def diagnose_team(team, table=None, deep=False):
 def doctor_target(args, selector):
     """The team this run was pointed at, or None when it was pointed at nothing.
 
-    The classifier answers six kinds and this used to read two of them, so a
-    token that named no team fell through to the sweep: a typo answered about
-    every team on the machine and took its exit code from the worst of them,
-    and a name in two rosters came back as a list and died on it. Naming
-    something the doctor cannot ask about is now a refusal, because widening a
-    question nobody asked is the one thing this verb says it must not do.
+    All six kinds the classifier answers are read here. A token that names no
+    team is refused, so a run answers about the team it was handed and takes
+    its exit code from that team. Widening a question nobody asked is the one
+    thing this verb must not do.
 
     Only an empty hand sweeps. Where the token names a conversation rather than
     a team, the team it is stamped with is named, since that is the question
@@ -8021,7 +8004,7 @@ def said_reads(reads):
 
 
 def reap_team(team, dry=False, prefix=""):
-    """Retire a team so restore can no longer adopt it. The rebind's one act.
+    """Retire a team so a restore of it finds nothing. The rebind's one act.
 
     Claim, then catch. The receipt is prepared from a read of the live
     directory and held in memory; the directory is then renamed aside in one
@@ -8256,9 +8239,8 @@ def reap_blockers(stamped, args, table=None):
 
     The lines are shaped for warn/die: a heading, then its bullets, so ten
     objections read as a list rather than a wall, and a bounded list says how
-    much it left out. The way out used to sit under the last bullet of its
-    group, where it read as a note about that one bullet instead of about the
-    whole group.
+    much it left out. The way out heads its group rather than trailing its
+    last bullet, so it reads as belonging to the group.
 
     A process that both wears the team and holds a transcript stamped with it
     arrives as one row and is listed once, in the group whose remedy it needs:
@@ -8473,7 +8455,7 @@ def run_demote(args):
 
 # One layout for the ledger's header and its rows, so a label cannot drift
 # off the column it names. The state column is as wide as the longest state
-# ("unknown recipient"), which used to run into the summary beside it.
+# ("unknown recipient"), so every summary starts in the same column.
 MAIL_ROW = "{sent:<19}  {sender:>14} -> {to:<14} {state:<17} {summary}"
 
 
@@ -9303,7 +9285,7 @@ def _live_context():
     # The child is where the read-only tier runs for a live invocation. Its
     # stderr is what the check below is about, and its verdicts are the tier's
     # own, so they are taken here rather than computed a second time in the
-    # parent: one invocation used to run all of them twice.
+    # parent, so one invocation answers each check once.
     quiet = sp.run([sys.executable, str(Path(__file__).resolve()), "--selftest"],
                    capture_output=True, text=True, timeout=900)
     inherited, summary = [], None
@@ -9660,8 +9642,8 @@ def _check_smoke_typed_commands(s):
                  if "--agent-id" in cmd and "session-corpus-" in cmd}
                 | {sock.name for sock in RESOLVER.swarm_sockets()})
 
-    # A copy of the fixture rather than the fixture: a shape that turned out to
-    # write would otherwise edit the corpus every other check reads.
+    # A copy of the fixture, so a shape that writes writes here and the corpus
+    # every other check reads stays as it is.
     smoke_home = Path(tempfile.mkdtemp(prefix=f"{TOOL}-smoke-"))
     smoke_cfg = smoke_home / "claude"
     shutil.copytree(Path(__file__).resolve().parent / "test" / "corpus", smoke_cfg)
@@ -9758,7 +9740,8 @@ def _check_stop_preview_ends_nothing(s):
         # survival alone proves nothing here; asking at all is the fault.
         "the preview asks nothing": "abort these?" not in said,
         "the preview exits 0": code == 0,
-        # The arm that used to kill: --yes skipped the question and the kill ran.
+        # The arm that matters: --yes skips the question, so a preview here
+        # stays a preview with nothing asked.
         "--yes leaves the preview a preview": yes_survived and "would abort" in yes_said,
         "--dry-run --yes exits 0": yes_code == 0,
         # Without --dry-run the same command line still ends it, so a preview
@@ -10340,8 +10323,8 @@ def _suite_context():
              if isinstance(n, ast.FunctionDef) and not is_delegate(n)}
 
     # What each function calls, by either spelling, indexed in one pass. The
-    # question below is asked a few dozen times and used to walk every function
-    # each time: 6942 walks in a run, 2.0s of a 9.7s tier, most of it this.
+    # question below is asked a few dozen times and each answer is a lookup:
+    # one walk over the tree serves them all.
     _calls_in = {}
     for _name, _node in funcs.items():
         _called = set()
@@ -11725,9 +11708,8 @@ def _check_team_dir_read_engine_only(s):
     team_peekers = sorted(
         hit
         for node in tree.body if isinstance(node, ast.FunctionDef)
-        # The reads the reap and the demote used to do for themselves are now
-        # the engine's receipt_contents, which hands back the bytes and the
-        # stat facts they were read under. run_selftest stages team dirs as
+        # The reap and the demote read through the engine's receipt_contents,
+        # which hands back the bytes and the stat facts they were read under. run_selftest stages team dirs as
         # fixtures and holds this check's own text.
         and node.name not in s.suite_fns
         for hit in team_dir_reads(node))
@@ -12681,7 +12663,7 @@ def _check_two_verbs_refused(s):
             0 <= backwards.find("--census") < backwards.find("--doctor"),
         "an alias is named as typed": "--terminate" in aliased and "--stop" not in aliased,
         "three verbs are all named": all(f in three for f in ("--doctor", "--census", "--sides")),
-        # The two pairs that had their own hand-written refusal before this.
+        # Two pairs that exclude each other for their own reasons.
         "--promote with --demote is refused": bool(verbs_said("--promote", "--demote")),
         "--poison with --unpoison is refused": bool(verbs_said("--poison", "--unpoison")),
         "a verb with its modifiers runs":
@@ -13271,8 +13253,7 @@ def _check_stop_miss_names_target(s):
             "every miss carries the tool's name": all(
                 said.startswith(f"{TOOL}: ")
                 for said in (no_team, empty, dead, agent, session)),
-            # A miss exited 1 before this said anything useful, and moving the
-            # sentence must not move the code.
+            # Naming the target must not change the code a miss exits with.
             "a miss still exits 1": {code_no_team, code_empty, code_dead,
                                      code_agent, code_session} == {1},
         }
@@ -15186,9 +15167,8 @@ def _check_side_selector_names_the_task_id(s):
               not wrong, ", ".join(wrong))
 
         # --as-agent settles the name before the team is looked at, so the team
-        # is the only half that can be missing here. The refusal used to print
-        # "name@team" whole, which reads as both halves missing, and a caller
-        # who had typed a name retyped it.
+        # is the only half that can be missing here. Printing "name@team" whole would read as
+        # both halves missing, and a caller who typed a name would retype it.
         flat = lambda text: " ".join(text.split())
         real_resolver = globals()["RESOLVER"]
         globals()["RESOLVER"] = eng
@@ -18443,9 +18423,9 @@ def _check_check_line_one_owner(s):
     def check(cid, name, ok, detail=""):
         checked.append((cid, name, ok, detail))
 
-    # Three places used to put a check's id next to its name, so a listing
-    # could stop printing the name and the other two would still look right.
-    # Anything assembling both fields itself is a fourth spelling.
+    # One place puts a check's id next to its name. Anything assembling both
+    # fields itself is a second spelling, and the three renderings move
+    # together only while there is one.
     ast = s.ast
 
     printers = set()
@@ -18578,8 +18558,8 @@ def verb_needs(args, selector):
         return Needs(hard={NEED.PROCS, NEED.SPAWNS}, maybe={NEED.STAMPS})
     if by_uuid and not args.team:
         # A uuid resolves without the stamps, but a rebind typed against one
-        # still asks them who else is stamped with the team it is retiring,
-        # which used to end the run in the loader's refusal instead.
+        # still asks them who else is stamped with the team it is
+        # retiring, so the declaration says so here.
         return Needs(hard={NEED.PROCS, NEED.SPAWNS},
                      maybe={NEED.STAMPS} if args.to_team else set())
     return Needs(hard={NEED.PROCS, NEED.SPAWNS, NEED.STAMPS})
@@ -18593,9 +18573,8 @@ def audited(entry):
 
     That holds because nothing on the way out swallows a refusal: die() raises,
     the raise passes through here, and the audit below is never reached. The
-    one place that used to catch one and return an ordinary code instead
-    (run_one, so a team would not lose four members over the fifth) now hands
-    it back to run_agents, which ends the run in it.
+    one place that catches one, run_one, hands it back to run_agents, which
+    reports every member it managed and then ends the run in that refusal.
     """
     code = entry()
     RESOLVER.audit_needs()
@@ -18898,9 +18877,8 @@ def main():
         return run_poison(args)
 
     if args.help or not (selector or args.agent_id or args.resume or args.team):
-        # Order unchanged: the flags, then the notes. The blank line is new,
-        # because the last group's last flag and the notes' first line used to
-        # touch, and the notes read as a continuation of that group.
+        # The flags, then the notes, with a blank line between them, so the
+        # notes read as their own section.
         parser.print_help()
         print("\n" + __doc__)
         return 0 if args.help else 2

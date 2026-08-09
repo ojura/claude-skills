@@ -184,7 +184,7 @@ boot the minted id is the transcript filename, but for a resumed life it is
 generated at that boot and appears nowhere on disk (4 of 23 team
 directories here name such an id).
 
-What is provable from disk bounds the guess, which was the missing half.
+What is provable from disk bounds the guess.
 A team records its minting boot's session id as `leadSessionId`. For a fresh
 boot that id is also the transcript's filename, so the team is derivable and
 confirmable and needs no window at all. For a resumed life the id names no
@@ -335,8 +335,7 @@ engine answer fatter than the declared need taxes every caller: the mail
 ledger joined a whole team to render one agent's line, one typed side
 classified nine hundred, the doctor swept a census only the sweep branch
 reads, and the standing verdict walked the spawn corpus for a field its
-caller discarded. Per-method toggles were the first cut and did not
-survive review; the contract that did: a run declares its needs to the
+caller discarded. The contract: a run declares its needs to the
 constructor (Resolver(needs=...), Maybe(NEED.X) for a genuinely
 conditional path), an undeclared compute refuses at the loader by name,
 and a hard need never exercised refuses when the verb completes, so a fat
@@ -344,5 +343,5 @@ declaration dies as loudly as a missing one. Narrowing within a question
 stays a question parameter (mail_ledger's to=), parentage became its own
 question (spawn_parent_of) that only the verb printing it asks, and each
 narrowing was proven answer-identical and checked by name. The cost of a
-field is measured, never presumed cached: "approximately free" turned out
-to mean "someone else usually pays" the one time it went unmeasured.
+field is measured, never presumed cached: "approximately free" means
+"someone else usually pays" until somebody measures which.
