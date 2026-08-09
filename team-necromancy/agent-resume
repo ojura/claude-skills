@@ -314,6 +314,67 @@ def check_identity_flags(args, passthrough):
                 f"fact, and the name is what addresses the mailbox. Pass one, or matching ones")
 
 
+# Every flag that is a whole run by itself, keyed by the attribute argparse
+# files it under, valued with the spellings a person can type for it. main
+# dispatches down a ladder and returns on the first of these it reaches, so two
+# on one command line means one of them was never going to run.
+#
+# What is not here is a modifier: --dry-run, --explain, --force, --yes, --all,
+# --no-lead, --failed/--live/--list, and everything that shapes where a resumed
+# agent comes up. Those change how a verb runs. A selector is not here either:
+# it says which agents a run is about, not what the run does, so a selector
+# beside a verb is an ordinary command line.
+VERBS = {
+    "selftest": ("--selftest",),
+    "doctor": ("--doctor",),
+    "census": ("--census",),
+    "sides": ("--sides",),
+    "promote": ("--promote",),
+    "demote": ("--demote",),
+    "mail_ledger": ("--mail-ledger",),
+    "stop": ("--stop", "--terminate"),
+    "standing": ("--standing",),
+    "cleanup": ("--cleanup", "--cleanup-sockets"),
+    "install": ("--install",),
+    "complete": ("--complete",),
+    "poison": ("--poison",),
+    "unpoison": ("--unpoison",),
+    # --help prints and returns like the rest of them, so it is dropped by
+    # whichever verb sits above it in the ladder just as silently.
+    "help": ("-h", "--help"),
+}
+
+
+def check_one_verb(args, argv):
+    """Refuse a command line naming two verbs, and name the ones it named.
+
+    Only one of them can run: --doctor --census ran the doctor and dropped the
+    census, and --census --doctor also ran the doctor, because the ladder's
+    order decided and said nothing. A flag that silently does nothing reads as
+    having worked, which is why --into-team on a lead was made to refuse rather
+    than be ignored.
+
+    Named as the person spelled them, in the order they typed them: --stop and
+    --terminate are one attribute and two spellings, and a refusal about a
+    command line has to quote the command line.
+    """
+    typed = [token.split("=", 1)[0] for token in argv]
+    given = []
+    for dest, spellings in VERBS.items():
+        if not getattr(args, dest, None):
+            continue
+        # Not every set attribute was typed: argparse also fills defaults, and
+        # a flag we cannot find in argv is still named, at the end, by its
+        # first spelling.
+        at = [typed.index(opt) for opt in spellings if opt in typed]
+        given.append((min(at) if at else len(typed),
+                      typed[min(at)] if at else spellings[0]))
+    named = [name for _at, name in sorted(given)]
+    if len(named) > 1:
+        said = ", ".join(named[:-1]) + f" and {named[-1]}"
+        die(f"{said} are separate verbs, and a run does one of them; pick one")
+
+
 def check_flag_scope(passthrough, count):
     """Refuse a flag that names one agent when the run covers several.
 
@@ -437,18 +498,28 @@ def stop_targets(args, table):
             for pid, path in held]
 
 
-def abort_agents(running, assume_yes=False):
+def abort_agents(running, assume_yes=False, dry=False):
     """Kill these processes, after showing what each one is working on.
 
     Ending a conversation cannot be undone, so the listing comes first and
     describes every process by its own transcript. Returns how many stopped.
+
+    A dry run lists them and ends nothing. It asks nothing either: there is no
+    consent to take when the answer changes nothing, and a prompt that killed
+    on y would make --dry-run the flag that decides whether the question is
+    real. kill_holder does the same for the holder a move takes over.
     """
     if not running:
         print("nothing running for that")
         return 0
-    print(f"about to abort {len(running)} process(es):")
+    step(dry, f"would abort {len(running)} process(es):",
+         f"about to abort {len(running)} process(es):", indent="")
     for pid, agent_id, desc, colour in running:
         print(f"  {pid:<8} {paint(agent_id, colour)}  {desc}")
+    if dry:
+        print(fill(f"  a dry run ends nothing, so "
+                   f"{'it is' if len(running) == 1 else 'they are'} still running"))
+        return 0
     if not assume_yes:
         try:
             answer = input("abort these? [y/N] ").strip().lower()
@@ -9026,6 +9097,7 @@ def live_checks():
         spared.kill()
         spared.wait()
 
+<<<<<<< ours
     # -- the program driven the way a person types it
     #
     # Every other check in this suite calls a function against fixtures that
@@ -9151,6 +9223,64 @@ def live_checks():
     shown = told[:3] + ([f"and {len(told) - 3} more"] if len(told) > 3 else [])
     check("smoke-typed-commands", "the commands a person types end in a message, not a traceback",
           not told, "; ".join(shown))
+=======
+    # --stop --dry-run, driven as a command line rather than by calling
+    # abort_agents with dry=True. The defect was at the seam: abort_agents had
+    # no preview at all, and the fix is only worth anything if main hands it
+    # --dry-run, which a direct call cannot see. Each arm gets its own process,
+    # spawned here and killed here, wearing an agent id nothing real uses.
+    stop_home = Path(tempfile.mkdtemp())
+    (stop_home / "projects").mkdir()
+    (stop_home / "teams").mkdir()
+    ident = "preview@selftest-stop"
+
+    def stop_arm(*flags):
+        """(what a --stop printed, its exit code, whether the fixture survived)."""
+        # argv[0] is what decides whether a process is a claude, and the
+        # binary that actually runs is python; the id in argv is what --stop
+        # matches on. No --resume, so it holds no transcript to resolve.
+        victim = sp.Popen([FAKE_AGENT_BIN, "-c", '__import__("time").sleep(60)',
+                           "--agent-id", ident], executable=sys.executable)
+        try:
+            time.sleep(0.3)          # let it reach the process table
+            run = sp.run([sys.executable, str(Path(__file__).resolve()),
+                          "--agent-id", ident, "--stop", *flags],
+                         capture_output=True, text=True, timeout=300,
+                         stdin=sp.DEVNULL,   # no terminal, so no prompt can be answered
+                         env=dict(os.environ, CLAUDE_CONFIG_DIR=str(stop_home),
+                                  NO_COLOR="1"))
+            time.sleep(0.3)
+            return run.stdout, run.returncode, victim.poll() is None
+        finally:
+            victim.kill()
+            victim.wait()
+
+    try:
+        said, code, survived = stop_arm("--dry-run")
+        yes_said, yes_code, yes_survived = stop_arm("--dry-run", "--yes")
+        real_said, real_code, real_survived = stop_arm("--yes")
+    finally:
+        shutil.rmtree(stop_home, ignore_errors=True)
+    preview = {
+        "the preview leaves it running": survived,
+        "the preview says what it would end":
+            "would abort" in said and ident in said,
+        # On a pipe the prompt reads EOF and spares the process anyway, so
+        # survival alone proves nothing here; asking at all is the fault.
+        "the preview asks nothing": "abort these?" not in said,
+        "the preview exits 0": code == 0,
+        # The arm that used to kill: --yes skipped the question and the kill ran.
+        "--yes leaves the preview a preview": yes_survived and "would abort" in yes_said,
+        "--dry-run --yes exits 0": yes_code == 0,
+        # Without --dry-run the same command line still ends it, so a preview
+        # that ends nothing is not a --stop that ends nothing.
+        "a real stop still ends it": not real_survived
+            and "aborted 1 of 1" in real_said and real_code == 0,
+    }
+    wrong = sorted(k for k, ok in preview.items() if not ok)
+    check("stop-preview-ends-nothing", "a --stop preview ends nothing and says what it would end",
+          not wrong, ", ".join(wrong))
+>>>>>>> theirs
 
     return out
 
@@ -10899,6 +11029,79 @@ def run_selftest(live=False, failed_only=False, list_only=False):
           f"not on a group: {ungrouped}; declared more than once: {said_twice}"
           if (ungrouped or said_twice) else
           f"{len(group_names)} group(s), {len(declared)} declaration(s)")
+
+    # VERBS mirrors main's ladder by hand, and a hand-kept mirror drifts. A verb
+    # added to the ladder and not to the table is dropped in silence by whichever
+    # verb sits above it, which is the thing the table exists to stop. Read from
+    # the same walk as the two checks above, so this cannot drift from them
+    # either: a dispatch is a top-level `if args.X` in main whose body returns.
+    dispatch = [node for node in funcs["main"].body
+                if isinstance(node, ast.If)
+                and any(isinstance(sub, ast.Return) for sub in ast.walk(node))]
+    dispatched = {n.attr for node in dispatch for n in ast.walk(node.test)
+                  if isinstance(n, ast.Attribute) and getattr(n.value, "id", None) == "args"}
+    # The help gate's test names the selectors beside --help, and a selector
+    # says which agents a run is about rather than what the run does.
+    dispatched -= {"agent_id", "resume", "team"}
+    by_first = {opts[0]: tuple(opts) for opts, _on in declared}
+    asked = [node.lineno for node in ast.walk(funcs["main"])
+             if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "check_one_verb"]
+    mirrors = {
+        "the table holds the ladder's verbs": dispatched == set(VERBS),
+        "the table spells them as the parser does": all(
+            by_first.get(spellings[0]) == tuple(spellings) for spellings in VERBS.values()),
+        # Asked before the ladder, because once the ladder has returned there
+        # is nothing left to refuse.
+        "main asks before it dispatches": bool(asked) and bool(dispatch)
+            and min(asked) < min(node.lineno for node in dispatch),
+    }
+    wrong = sorted(k for k, ok in mirrors.items() if not ok)
+    check("verb-table-matches-dispatch", "the verb table holds what main dispatches on",
+          not wrong, ", ".join(wrong) + (
+              f"; differing: {sorted(dispatched ^ set(VERBS))}"
+              if dispatched != set(VERBS) else ""))
+
+    # Two verbs on one command line used to run whichever the ladder reached
+    # first and drop the other without a word. The refusal quotes the command
+    # line, so an alias comes back as the alias the person typed.
+    class _Verbs:
+        """An args with each verb set by whether one of its spellings was typed."""
+        def __init__(self, *typed):
+            for dest, spellings in VERBS.items():
+                setattr(self, dest, any(opt in typed for opt in spellings))
+
+    def verbs_said(*typed):
+        """What check_one_verb said about this command line, "" if it let it run."""
+        with contextlib.redirect_stderr(io.StringIO()) as told:
+            try:
+                check_one_verb(_Verbs(*typed), list(typed))
+                return ""
+            except SystemExit:
+                return " ".join(told.getvalue().split())
+
+    both = verbs_said("--doctor", "--census")
+    backwards = verbs_said("--census", "--doctor")
+    aliased = verbs_said("--terminate", "--census")
+    three = verbs_said("--doctor", "--census", "--sides")
+    collisions = {
+        "two verbs are refused": bool(both),
+        "the refusal names both": "--doctor" in both and "--census" in both,
+        "they are named in the order typed":
+            0 <= backwards.find("--census") < backwards.find("--doctor"),
+        "an alias is named as typed": "--terminate" in aliased and "--stop" not in aliased,
+        "three verbs are all named": all(f in three for f in ("--doctor", "--census", "--sides")),
+        # The two pairs that had their own hand-written refusal before this.
+        "--promote with --demote is refused": bool(verbs_said("--promote", "--demote")),
+        "--poison with --unpoison is refused": bool(verbs_said("--poison", "--unpoison")),
+        "a verb with its modifiers runs":
+            not verbs_said("--selftest", "--failed", "--live", "--list"),
+        "a stop with --yes and --dry-run runs": not verbs_said("--stop", "--yes", "--dry-run"),
+        "a verb with a selector runs": not verbs_said("--doctor", "session-corpus-alpha"),
+        "one verb alone runs": not verbs_said("--census"),
+    }
+    wrong = sorted(k for k, ok in collisions.items() if not ok)
+    check("two-verbs-refused", "naming two verbs is refused, naming the ones typed",
+          not wrong, ", ".join(wrong))
 
     # The sides sweep groups under each parent session and bounds itself,
     # saying what it folded and how to see it; a named parent lists in full.
@@ -15494,7 +15697,8 @@ def main():
     placing.add_argument("--claude-bin",
                          help="launch this claude binary instead of the one on PATH")
     careful.add_argument("--dry-run", action="store_true",
-                         help="preview without launching")
+                         help="say what would happen and do none of it: nothing "
+                              "is launched, written or ended")
     careful.add_argument("--force", action="store_true",
                          help="override the running-copy and identity guards; with --into-team, "
                               "also take the rewrite route when the old team cannot be retired")
@@ -15548,6 +15752,9 @@ def main():
     check_passthrough(passthrough, parser)
     selector, passthrough = classify_passthrough(passthrough)
     check_identity_flags(args, passthrough)
+    # Before anything is resolved or run: which verb this is decides everything
+    # below, and the ladder cannot ask the question once it has started down it.
+    check_one_verb(args, argv)
     # The one place compute is declared: the engine is constructed knowing
     # what this verb may ask, and the end of the run refuses declarations a
     # smaller set would have satisfied.
@@ -15577,8 +15784,6 @@ def main():
         # yet; a named session must not be silently swept into the machine.
         return run_sides(selector)
 
-    if args.promote and args.demote:
-        die("--promote and --demote are opposite verbs; pick one")
     if args.promote:
         return run_promote(args)
     if args.demote:
@@ -15600,8 +15805,6 @@ def main():
     if args.complete:
         return run_complete(args.complete)
 
-    if args.poison and args.unpoison:
-        die("--poison and --unpoison are mutually exclusive")
     if args.poison or args.unpoison:
         if selector or args.agent_id or args.resume or args.team:
             die("--poison/--unpoison stand alone; they act on the server, not an agent")
@@ -15637,7 +15840,11 @@ def main():
         if named:
             die(f"{', '.join(named)} {'configures' if len(named) == 1 else 'configure'} "
                 f"a process being started, and --stop starts nothing")
-        return 0 if abort_agents(stop_targets(args, table), assume_yes=args.yes) else 1
+        stopped = abort_agents(stop_targets(args, table), assume_yes=args.yes,
+                               dry=args.dry_run)
+        # A preview did the whole of what it was asked for, so it exits 0. Only
+        # a real stop that ended nothing exits 1, which is what it did before.
+        return 0 if stopped or args.dry_run else 1
 
     if args.team:
         return run_team(args, passthrough, table)
