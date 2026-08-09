@@ -40,16 +40,28 @@ _RA_BARE_GROUP=16   # ... and from the selector's teams, and from its leads
 # description can be up to _RA_CACHE_TTL seconds behind. Titles, join times and
 # the "nothing left to resurrect" markers do not drift on that scale.
 _RA_CACHE_TTL=60
-typeset -g _RA_CACHE_STAMP=
-typeset -g _RA_CACHE_AT=0
-typeset -gA _RA_CACHE
+typeset -gA _RA_CACHE _RA_CACHE_KEY _RA_CACHE_AT
 
-_ra_stamp() {  # -> stamp (caller's local), or nonzero when it cannot be taken
-  local claude=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+_ra_stamp() {  # topic -> stamp (caller's local), or nonzero when it cannot be taken
   local -a st
+  if [[ $1 == flags ]]; then
+    # The flags are a property of the tool and of nothing on this machine: same
+    # binary, same flags. Stamping them with the corpus threw the answer away
+    # every time a session appeared, to recompute a list that had not moved.
+    # zstat takes one +field, not two, and asking for two failed the whole call
+    # silently, which left this topic with no stamp and so no cache at all. The
+    # path is in the stamp as well, so a different binary earlier on PATH counts
+    # as a change even if the two happen to share an mtime.
+    local tool=${commands[$service]}
+    [[ -n $tool ]] || return 1
+    zstat -A st +mtime $tool 2>/dev/null || return 1
+    stamp="tool $tool $st[1]"
+    return 0
+  fi
+  local claude=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
   zstat -A st +mtime $claude/teams(N) $claude/projects(N) \
         $claude/teams/*(N/) $claude/projects/*(N/) 2>/dev/null || return 1
-  stamp="$#st ${(j: :)st}"
+  stamp="corpus $#st ${(j: :)st}"
 }
 
 # A shell's own table dies with the shell, and the first TAB in a new terminal
@@ -65,17 +77,28 @@ _ra_cache_dir() {  # -> dir (caller's local), or nonzero when there is nowhere t
 
 _ra_emit() {  # topic -> its candidate lines in `lines` (caller's local)
   local topic=$1 stamp= dir= body
-  # No stamp (no zsh/stat, or neither directory there) leaves stamp empty, and
-  # then age is the only thing that can retire an entry: the file is not read or
-  # written at all, and the shell's own table stands for _RA_CACHE_TTL seconds.
-  _ra_stamp
-  if [[ $stamp != $_RA_CACHE_STAMP ]] || (( SECONDS - _RA_CACHE_AT >= _RA_CACHE_TTL )); then
-    _RA_CACHE=()
-    _RA_CACHE_STAMP=$stamp
-    _RA_CACHE_AT=$SECONDS
+  # Each topic stands or falls on its own stamp. No stamp (no zsh/stat, or
+  # nothing to stat) leaves it empty, and then age is all that can retire an
+  # entry: the file is neither read nor written, and the shell's own table
+  # stands for _RA_CACHE_TTL seconds.
+  _ra_stamp $topic
+  # The corpus stamp cannot see a transcript that only grew, so corpus entries
+  # age out as well. The tool stamp misses nothing, so the flags do not need to.
+  local -i stale=0
+  [[ ${_RA_CACHE_KEY[$topic]} != $stamp ]] && stale=1
+  [[ $topic != flags ]] && (( SECONDS - ${_RA_CACHE_AT[$topic]:-0} >= _RA_CACHE_TTL )) && stale=1
+  if (( stale )); then
+    unset "_RA_CACHE[$topic]"
+    _RA_CACHE_KEY[$topic]=$stamp
+    _RA_CACHE_AT[$topic]=$SECONDS
   fi
   if (( ! ${+_RA_CACHE[$topic]} )) && [[ -n $stamp ]] && _ra_cache_dir; then
-    local -a fresh=($dir/${service}-$topic(N.ms-$_RA_CACHE_TTL))
+    local -a fresh
+    if [[ $topic == flags ]]; then
+      fresh=($dir/${service}-$topic(N.))
+    else
+      fresh=($dir/${service}-$topic(N.ms-$_RA_CACHE_TTL))
+    fi
     if (( $#fresh )); then
       body="$(<$fresh[1])"          # stamp on the first line, candidates after it
       [[ ${body%%$'\n'*} == $stamp ]] && _RA_CACHE[$topic]=${body#*$'\n'}
