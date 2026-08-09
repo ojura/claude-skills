@@ -104,15 +104,16 @@ _agent_resume_flags() {  # -> spec (caller's array): one _arguments spec per fla
   for line in $lines; do
     parts=("${(@ps:\t:)line}")
     flag=$parts[1] row=$parts[2] completer=$parts[3] value=$parts[4]
-    # _arguments reads a description up to the matching ], so a ] or a
-    # backslash inside the prose has to be escaped for it. Nothing else does:
+    # _arguments reads a description up to the first unescaped ], so a ] or a
+    # backslash inside the prose has to be escaped for it. A [ does not: it is
+    # only the closer that ends the field, which probing the two separately is
+    # how we know. Nothing else needs escaping either:
     # each spec is an array element rather than a quoted shell word written out
     # in this file, so an apostrophe is just an apostrophe. The hand-kept list
     # had to break out of its own single quotes for the three flags whose prose
     # has one, and got that right three times out of three; there is now nothing
     # left to get right.
     row=${row//\\/\\\\}
-    row=${row//\[/\\[}
     row=${row//\]/\\]}
     if [[ -z $value ]]; then
       spec+=("${flag}[${row}]")
@@ -218,6 +219,11 @@ _agent_resume_topic() {  # single group, self-scoped widths
 }
 
 _agent_resume_selector() {  # names/teams/leads in one call, widths shared
+  # _arguments offers this position even when the word plainly cannot be a
+  # selector, so a TAB on --something used to read the whole corpus to offer
+  # candidates none of which could match. A flag is the option parser's, not
+  # ours.
+  [[ $PREFIX == -* ]] && return 1
   local -a all n t l s lines
   local -i maxname=0 maxid=0 ret=1
   local line
@@ -243,7 +249,10 @@ _agent_resume_selector() {  # names/teams/leads in one call, widths shared
   done
   # Transcripts are only worth listing once you are clearly typing a uuid:
   # hundreds of them would bury the names on a blank tab.
-  if (( ${#PREFIX} >= 2 )) && [[ -z ${PREFIX//[0-9a-fA-F-]/} ]]; then
+  # A uuid is hex and hyphens, but hyphens alone are not one: "--" passed this
+  # and pulled in every transcript on the machine to offer against a word that
+  # is not a selector at all. At least one hex digit has to be there.
+  if (( ${#PREFIX} >= 2 )) && [[ -z ${PREFIX//[0-9a-fA-F-]/} && $PREFIX == *[0-9a-fA-F]* ]]; then
     _ra_emit sessions
     s=($lines)
   fi
