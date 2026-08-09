@@ -5047,6 +5047,56 @@ def lead_title(team_entries, team, limit=60):
     return None
 
 
+def team_facts(team, entries, limit=60):
+    """(title, how many members, when it was last touched, what stands in the
+    way of resuming it) for one team, roster or no roster.
+
+    A reader picking a team off a list wants the same four things whether or
+    not the directory survived: what the work was, how big it was, when it
+    last moved, and whether typing it will get them anywhere. Where those
+    come from differs, which is the only thing this function knows and its
+    callers do not: a roster answers from its own entries, and a team that
+    outlived its directory answers from the lead transcript that spawned it,
+    which is where its members were recorded in the first place.
+
+    The listing used to ask this twice in two grammars, so a team with a
+    roster read as a title and a count while a team without one read as a
+    sentence about evidence, and the second kind never gained a title
+    although the topic below it was already fetching exactly that.
+    """
+    listed = [e for e in entries if e["team"] == team]
+    if listed:
+        # This team's own rows, not the whole listing: team_souls reads the
+        # lead session out of the first entry it is handed, so the global list
+        # would answer about whichever team happened to sort first.
+        return (lead_title(entries, team, limit), len(listed),
+                ms_str(listed[0]["ts"]),
+                None if RESOLVER.team_souls(team, listed) else "nothing left to resurrect")
+    # No directory. The lead's transcript is the roster that outlived it: the
+    # payloads in it name the members, and it carries the title and the clock.
+    path, _why = RESOLVER.lead_transcript_for(team)
+    if not path:
+        # Offered and then refused is worse than a shorter list, so the row
+        # says now what the run would say later.
+        return None, 0, None, "no roster, and nothing to rebuild one from"
+    return (session_title(path, limit),
+            len(RESOLVER.members_spawned_into(path.stem, team)),
+            ms_str(int(path.stat().st_mtime * 1000)),
+            "no roster")
+
+
+def team_line(team, entries, limit=60):
+    """One team as one line of a listing. The only place that sentence exists."""
+    title, count, when, standing = team_facts(team, entries, limit)
+    plural = "member" if count == 1 else "members"
+    said = [standing] if standing else []
+    if when:
+        said.append(f"{count} {plural}")
+        said.append(when)
+    facts = ", ".join(said)
+    return f"{title}  [{facts}]" if title else facts
+
+
 
 
 def flatten_cwd(cwd):
@@ -7115,31 +7165,19 @@ def _complete(topic):
         return 0
 
     if topic == "teams":
-        seen = set()
-        for entry in entries:
-            team = entry["team"]
-            if team in seen:
-                continue
-            seen.add(team)
-            count = sum(1 for e in entries if e["team"] == team)
-            plural = "member" if count == 1 else "members"
-            title = lead_title(entries, team, limit=COMPLETION_TITLE)
-            when = ms_str(entry["ts"])
-            if title:
-                desc = f"{title}  [{count} {plural}, {when}]"
-            elif not RESOLVER.team_souls(team):
-                # Nothing in it resolves any more, which is also what the reaper
-                # checks before removing the directory.
-                desc = f"nothing left to resurrect, {count} {plural}, {when}"
-            else:
-                desc = f"{count} {plural}, {when}"
-            print(f"{team}:{desc}")
         # A team outlives its directory, and the selector accepts and rebuilds
         # these, so listing only the tidy ones offers less than the tool takes.
-        for team, evidence in sorted(RESOLVER.known_teams().items()):
-            if team in seen:
-                continue
-            print(f"{team}:no roster, rebuildable from {evidence}")
+        # Rostered first, newest first, because entries arrive that way; the
+        # rest after them. Both kinds are described by the same function, so a
+        # reader reads one grammar down the whole list.
+        seen, order = set(), []
+        for entry in entries:
+            if entry["team"] not in seen:
+                seen.add(entry["team"])
+                order.append(entry["team"])
+        order += [t for t in sorted(RESOLVER.known_teams()) if t not in seen]
+        for team in order:
+            print(f"{team}:{team_line(team, entries, limit=COMPLETION_TITLE)}")
         return 0
 
     if topic == "leads":
@@ -16283,6 +16321,58 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         lines = [line for line in buffer.getvalue().splitlines() if line]
         malformed = [line for line in lines if "\t" not in line and ":" not in line]
         check(f"completion-parses-{topic}", f"completion emits parseable {topic}", not malformed, f"{len(lines)} candidates")
+
+    # A team reads the same whether or not its directory survived. The listing
+    # used to build that sentence four times, so the fourth case got a grammar
+    # of its own and never gained a title although the facts were reachable;
+    # this asserts the sentence has one owner and that every kind goes through
+    # it. Driven over the corpus, which carries both kinds.
+    eng = corpus_engine()
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = eng
+    try:
+        entries = eng.scan_teams()
+        rostered = [t for t in eng.known_teams() if eng.has_roster(t)]
+        adrift = [t for t in eng.known_teams() if not eng.has_roster(t)]
+        told = {t: team_line(t, entries, limit=COMPLETION_TITLE) for t in rostered + adrift}
+    finally:
+        globals()["RESOLVER"] = real_resolver
+    described = []
+    if not rostered or not adrift:
+        described.append(f"the corpus carries {len(rostered)} rostered and {len(adrift)} adrift "
+                         "teams, so this cannot compare the two kinds")
+    # The grammar every row shares: facts in brackets after a title, or the
+    # facts alone when nothing titles it. A row that says only what evidence
+    # found it is the shape this replaced.
+    for team, line in told.items():
+        if "rebuildable from" in line:
+            described.append(f"{team} still describes itself by its evidence: {line}")
+        elif line.count("[") != (1 if "]" in line else 0):
+            described.append(f"{team} reads in another grammar: {line}")
+    titled = [t for t in adrift if "[" in told[t]]
+    if not titled:
+        described.append("no team without a roster carries a title, which is what this is for")
+    for t in titled:
+        if "member" not in told[t]:
+            described.append(f"{t} has a title but no member count: {told[t]}")
+    # The offered-and-then-refused case says so on the row rather than at the
+    # moment someone types it.
+    hopeless = [t for t in adrift if not eng.lead_transcript_for(t)[0]]
+    for t in hopeless:
+        if "nothing to rebuild" not in told[t]:
+            described.append(f"{t} cannot be rebuilt and does not say so: {told[t]}")
+    check("team-described-one-way", "a team reads the same with or without its roster",
+          not described, "; ".join(described[:3]))
+
+    # And the sentence itself lives in one place: the topic that prints teams
+    # assembles no part of it.
+    teams_branch = ast.get_source_segment(source, funcs["_complete"]) or ""
+    teams_branch = teams_branch.partition('if topic == "teams":')[2].partition("if topic ==")[0]
+    built_here = [what for what in ("member", "members", "no roster", "resurrect", "rebuildable")
+                  if f'"{what}' in teams_branch or f"'{what}" in teams_branch]
+    check("team-sentence-one-owner", "the team listing states no facts of its own",
+          not built_here and "team_line(" in teams_branch,
+          f"builds {', '.join(built_here)}" if built_here else "does not call team_line")
 
     if live:
         results.extend(live_checks())
