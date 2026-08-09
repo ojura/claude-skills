@@ -9136,7 +9136,6 @@ def live_checks():
         spared.kill()
         spared.wait()
 
-<<<<<<< ours
     # -- the program driven the way a person types it
     #
     # Every other check in this suite calls a function against fixtures that
@@ -9262,7 +9261,6 @@ def live_checks():
     shown = told[:3] + ([f"and {len(told) - 3} more"] if len(told) > 3 else [])
     check("smoke-typed-commands", "the commands a person types end in a message, not a traceback",
           not told, "; ".join(shown))
-=======
     # --stop --dry-run, driven as a command line rather than by calling
     # abort_agents with dry=True. The defect was at the seam: abort_agents had
     # no preview at all, and the fix is only worth anything if main hands it
@@ -9319,7 +9317,6 @@ def live_checks():
     wrong = sorted(k for k, ok in preview.items() if not ok)
     check("stop-preview-ends-nothing", "a --stop preview ends nothing and says what it would end",
           not wrong, ", ".join(wrong))
->>>>>>> theirs
 
     # --install --dry-run against a fake home. A child with HOME and
     # CLAUDE_CONFIG_DIR moved, because the installer's targets are the real
