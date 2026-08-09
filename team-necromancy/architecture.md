@@ -237,8 +237,13 @@ transcripts instead.
 
 The tool's own receipts are deliberately not a realm. A realm is something the
 world owns and this tool observes; a receipt is this tool's own writing. The
-engine does read receipts and conclude membership from them, so the exclusion is
-a decision rather than an oversight.
+engine does read receipts and conclude from them, both a team's membership and,
+for a promoted transcript, the identity to resume it under, so the exclusion is
+a decision rather than an oversight. Being this tool's own writing is also what
+fixes where a receipt ranks against the realms: it records what the tool did,
+while a roster entry, a stamp or a live process's argv each record what the
+world did afterwards, so the receipt enters the merge at timestamp 0 and loses
+to all of them.
 
 The rule is about reading and concluding, not about acting. A launch runs
 `tmux split-window`, a reap removes a directory, a stop signals a pid: none of
@@ -298,7 +303,11 @@ misdiagnoses. The middle is to ship with a field acceptance attached, so a
 wrong vocabulary collapses on the first live team while the correction is
 still cheap. It has paid twice: a mail ledger's two unmatched states became
 five on first contact, and a promote's roster write dissolved into the
-receipt being the membership.
+receipt being the membership. The second was not free. With the roster write
+gone, nothing told the resume path which team a promoted member was on, and
+the first agent promoted in the field could not be resumed at all until the
+receipt was made readable by the merge too. Deleting a record is not finished
+until every reader of it has been handed the replacement.
 
 A fourth, cheaper to state than to learn: a suite run is evidence only about
 a tree nobody is editing. Python reads a file to execute it and again to

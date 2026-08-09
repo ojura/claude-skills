@@ -9566,6 +9566,34 @@ def run_selftest(live=False, failed_only=False, list_only=False):
           "a promoted member's first launch is what puts it in the roster",
           not wrong, ", ".join(wrong) or f"{prom_status}, entry {prom_entry}")
 
+    # And the other half of that decision: the promote itself writes no roster
+    # entry, so the receipt stays the only record of the membership until a
+    # launch has a seat to record with it. Two records of one membership would
+    # outlive each other in opposite directions - a graceful lead exit deletes
+    # the team dir, a demote deletes the file - and then they disagree.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "corpus"
+        shutil.copytree(Path(__file__).resolve().parent / "test" / "corpus", root)
+        cfg = root / "teams" / PROMOTED[1] / "config.json"
+        before_bytes = cfg.read_bytes()
+        stem = promote_the_fork(root)
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
+        eng.projects_dir, eng.teams_dir = root / "projects", root / "teams"
+        population = eng.team_population(PROMOTED[1])
+        deferred = {
+            "the roster is left exactly as it was": cfg.read_bytes() == before_bytes,
+            "the receipt carries the membership":
+                eng.converted_members(PROMOTED[1]).get(PROMOTED[0], {}).get("dest_stem") == stem,
+            "the population still counts the member":
+                population.get(PROMOTED[0], (None,))[0] == "converted",
+            "and says the launch is what registers it":
+                "registers on first launch" in (population.get(PROMOTED[0]) or ("", ""))[1],
+        }
+        wrong = sorted(k for k, ok in deferred.items() if not ok)
+        check("promote-leaves-the-roster-alone",
+              "a promote records the member in its receipt and writes no roster entry",
+              not wrong, ", ".join(wrong))
+
     # --- where a promoted agent starts
     # The file was moved into the project dir of the session it was forked out
     # of, so the conversation's own directories send `claude --resume` looking in
