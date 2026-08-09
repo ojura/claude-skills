@@ -174,9 +174,12 @@ stamps disagree the run refuses and points at the flag (see the rebind section
 below). Members come up first: the mailbox is a directory, not a
 process, so nobody has to wait for the lead.
 
-`--dry-run` previews (it does not cover `--install`/`--poison`, which refuse
-it), `--explain` shows per-field provenance, and `--selftest` checks the tool's own
-invariants while changing nothing, which is what lets it run from a hook.
+`--dry-run` previews every verb, including `--stop`, `--install` and
+`--poison`: nothing is launched, written or ended, and a preview asks no
+question it would act on.
+`--explain` says where each launch fact came from, and `--selftest` checks the
+tool's own invariants while changing nothing, which is what lets it run from a
+hook.
 `--selftest --live` adds the checks that need a real process, a terminal or a
 directory change; each undoes itself. Flags for the resumed session are an
 allowlist rather than a passthrough, so a misspelling of one of ours is caught

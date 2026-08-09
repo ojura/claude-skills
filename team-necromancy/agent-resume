@@ -8469,8 +8469,14 @@ def write_settings(settings, data):
     replace_json(settings, data)
 
 
-def install_hook(command):
-    """Add the SessionStart janitor hook, preserving everything else."""
+def install_hook(command, dry=False):
+    """Add the SessionStart janitor hook, preserving everything else.
+
+    A dry run reads the file and writes neither it nor its backup. The two
+    outcomes it can preview are different enough to be worth telling apart:
+    adding a hook that is not there, and replacing an older command of ours
+    that is.
+    """
     settings = CLAUDE_DIR / "settings.json"
     try:
         data = json.loads(settings.read_text()) if settings.exists() else {}
@@ -8491,28 +8497,34 @@ def install_hook(command):
             if TOOL in existing or "resume-agent --cleanup" in existing:
                 # An older command for this same tool: update in place rather
                 # than leave two hooks reaping the same things.
-                hook["command"] = command
-                write_settings(settings, data)
-                print(f"rehooked  SessionStart in {settings} (was: {existing})")
+                if not dry:
+                    hook["command"] = command
+                    write_settings(settings, data)
+                step(dry, f"would update the SessionStart hook already in {settings} "
+                          f"(now: {existing})",
+                     f"rehooked  SessionStart in {settings} (was: {existing})", indent="")
                 return True
-    entries.append(
-        {
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": command,
-                    "async": True,  # a janitor must never delay session start
-                    "timeout": 10,
-                }
-            ]
-        }
-    )
-    write_settings(settings, data)
-    print(f"hooked    SessionStart in {settings} (backup: settings.json.bak-{TOOL})")
+    if not dry:
+        entries.append(
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": command,
+                        "async": True,  # a janitor must never delay session start
+                        "timeout": 10,
+                    }
+                ]
+            }
+        )
+        write_settings(settings, data)
+    step(dry, f"would add the SessionStart cleanup hook to {settings} ({command})",
+         f"hooked    SessionStart in {settings} (backup: settings.json.bak-{TOOL})",
+         indent="")
     return True
 
 
-def drop_stale_compdumps():
+def drop_stale_compdumps(dry=False):
     """Delete completion caches that predate this install.
 
     zsh does not rescan fpath when a cached dump exists, and oh-my-zsh only
@@ -8524,23 +8536,33 @@ def drop_stale_compdumps():
     for dump in sorted(Path.home().glob(".zcompdump*")):
         try:
             if dump.suffix == ".zwc" or TOOL not in dump.read_text(errors="replace"):
-                dump.unlink()
+                if not dry:
+                    dump.unlink()
                 stale.append(dump.name)
         except OSError:
             continue
     if stale:
-        print(f"  cleared stale completion cache: {', '.join(stale)}")
+        step(dry, f"would clear stale completion cache: {', '.join(stale)}",
+             f"cleared stale completion cache: {', '.join(stale)}")
 
 
-def run_install():
-    """Symlink the script into ~/.local/bin and its zsh completion onto fpath."""
+def run_install(dry=False):
+    """Symlink the script into ~/.local/bin and its zsh completion onto fpath.
+
+    Under a dry run every act says what it would do and none of them happen:
+    no directory is made, no symlink created, no settings file or backup
+    written, no completion cache deleted. What a real run would refuse it
+    still refuses out loud, so the preview's exit code is the one the install
+    would come back with.
+    """
     src = Path(__file__).resolve()
     comp_src = src.parent / f"_{TOOL}"
     failed = False
 
     def link(target, dest):
         nonlocal failed
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dry:
+            dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.resolve() == target:
             print(f"ok        {dest} -> {target} (already)")
             return
@@ -8549,13 +8571,14 @@ def run_install():
             failed = True
             return
         rel = os.path.relpath(target, dest.parent)
-        dest.symlink_to(rel)
-        print(f"linked    {dest} -> {rel}")
+        if not dry:
+            dest.symlink_to(rel)
+        step(dry, f"would link {dest} -> {rel}", f"linked    {dest} -> {rel}", indent="")
 
     link(src, Path.home() / ".local/bin" / TOOL)
 
     bin_path = Path.home() / ".local/bin" / TOOL
-    if not install_hook(f"{bin_path} {HOOK_MARKER} >/dev/null 2>&1"):
+    if not install_hook(f"{bin_path} {HOOK_MARKER} >/dev/null 2>&1", dry):
         failed = True
 
     if not comp_src.exists():
@@ -8566,8 +8589,9 @@ def run_install():
     omz = Path(os.environ.get("ZSH") or Path.home() / ".oh-my-zsh")
     if omz.is_dir():
         link(comp_src, omz / "custom/completions" / f"_{TOOL}")
-        drop_stale_compdumps()
-        print("completion active in new shells; reload this one with: exec zsh")
+        drop_stale_compdumps(dry)
+        step(dry, "completion would be active in new shells",
+             "completion active in new shells; reload this one with: exec zsh", indent="")
     else:
         comp_dir = Path.home() / ".zsh/completions"
         link(comp_src, comp_dir / f"_{TOOL}")
@@ -8581,6 +8605,11 @@ def run_poison(args):
     While poisoned, every NEW pane's claude dies at TCP connect: $0 billed, no
     5-hour window anchored. Processes already running keep the env they were
     born with, in both directions; env is fixed at exec.
+
+    A dry run names the socket and what it would set or clear, and runs no
+    tmux command that changes anything. It still reads the server's current
+    value, which changes nothing and is the useful half of the preview: it
+    says what the set would replace.
     """
     sock = args.socket or RESOLVER.newest_live_socket()
     if not sock:
@@ -8588,22 +8617,32 @@ def run_poison(args):
     if not RESOLVER.socket_alive(sock):
         die(f"socket {sock} has no live tmux server; poison lives in server env, nothing to set")
 
+    # Both directions in one shape: what to run, what it would do, what it did,
+    # and what to say after. Written as two branches they had to grow a dry
+    # guard each, and the guard is the part that must not be got wrong twice.
     if args.poison:
-        res = tmux(sock, "set-environment", "-g", "ANTHROPIC_BASE_URL", POISON_URL)
-        if res.returncode != 0:
-            die(f"set-environment failed on {sock}: {res.stderr.strip()}")
-        print(f"poisoned {sock}: new panes get ANTHROPIC_BASE_URL={POISON_URL}")
-        print(f"placeholders will sit in an API error; unpoison with: {TOOL} --unpoison --socket {sock}")
+        setenv = ("-g", "ANTHROPIC_BASE_URL", POISON_URL)
+        would = f"would poison {sock}: new panes would get ANTHROPIC_BASE_URL={POISON_URL}"
+        did = f"poisoned {sock}: new panes get ANTHROPIC_BASE_URL={POISON_URL}"
+        after = (f"placeholders will sit in an API error; unpoison with: "
+                 f"{TOOL} --unpoison --socket {sock}")
     else:
-        res = tmux(sock, "set-environment", "-gu", "ANTHROPIC_BASE_URL")
+        setenv = ("-gu", "ANTHROPIC_BASE_URL")
+        would = f"would unpoison {sock}: new panes would get a working API again"
+        did = f"unpoisoned {sock}: new panes get a working API again"
+        after = "live placeholders keep their poisoned env; the swap's env scrub handles the pane"
+    if not args.dry_run:
+        res = tmux(sock, "set-environment", *setenv)
         if res.returncode != 0:
-            die(f"set-environment -gu failed on {sock}: {res.stderr.strip()}")
-        print(f"unpoisoned {sock}: new panes get a working API again")
-        print("live placeholders keep their poisoned env; the swap's env scrub handles the pane")
+            die(f"set-environment {' '.join(setenv)} failed on {sock}: {res.stderr.strip()}")
+    step(args.dry_run, would, did, indent="")
+    if not args.dry_run:
+        # What the poison does to a pane, which a preview has not done to one.
+        print(after)
 
     cur = tmux(sock, "show-environment", "-g", "ANTHROPIC_BASE_URL")
     state = cur.stdout.strip() if cur.returncode == 0 else "-ANTHROPIC_BASE_URL (unset)"
-    print(f"server env now: {state}")
+    print(f"server env {'still' if args.dry_run else 'now'}: {state}")
     return 0
 
 
@@ -9281,6 +9320,119 @@ def live_checks():
     check("stop-preview-ends-nothing", "a --stop preview ends nothing and says what it would end",
           not wrong, ", ".join(wrong))
 >>>>>>> theirs
+
+    # --install --dry-run against a fake home. A child with HOME and
+    # CLAUDE_CONFIG_DIR moved, because the installer's targets are the real
+    # home's and an in-process call would have to patch the way it finds them.
+    # The owner's own settings file and completion caches are live, and this
+    # never runs a real install against them.
+    def home_state(root):
+        """Every path under root and what it holds. "Nothing was written" is
+        measured over the whole tree rather than over the files we thought of,
+        so a preview that writes something nobody named still fails."""
+        state = {}
+        for path in sorted(root.rglob("*")):
+            rel = str(path.relative_to(root))
+            if path.is_symlink():
+                state[rel] = "-> " + os.readlink(path)
+            elif path.is_file():
+                state[rel] = path.read_text(errors="replace")
+            else:
+                state[rel] = "<a directory>"
+        return state
+
+    def install_preview(hook_command):
+        """(what --install --dry-run said, its exit code, what it changed)."""
+        home = Path(tempfile.mkdtemp())
+        try:
+            (home / ".claude").mkdir()
+            (home / ".oh-my-zsh" / "custom" / "completions").mkdir(parents=True)
+            (home / ".zcompdump").write_text("a cache that never mentions the tool\n")
+            (home / ".claude" / "settings.json").write_text(json.dumps(
+                {"hooks": {"SessionStart": [
+                    {"hooks": [{"type": "command", "command": hook_command}]}]}}))
+            before = home_state(home)
+            run = sp.run([sys.executable, str(Path(__file__).resolve()),
+                          "--install", "--dry-run"],
+                         capture_output=True, text=True, timeout=300,
+                         env=dict(os.environ, HOME=str(home),
+                                  CLAUDE_CONFIG_DIR=str(home / ".claude"),
+                                  ZSH=str(home / ".oh-my-zsh"), NO_COLOR="1"))
+            after = home_state(home)
+            return run.stdout, run.returncode, sorted(
+                set(before) ^ set(after)
+                | {k for k in set(before) & set(after) if before[k] != after[k]})
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    fresh, fresh_code, fresh_wrote = install_preview("/usr/bin/somebody-elses-hook")
+    ours, ours_code, ours_wrote = install_preview(f"/elsewhere/{TOOL} {HOOK_MARKER}")
+    installing = {
+        "the preview writes nothing": not fresh_wrote and not ours_wrote,
+        "it says it would link the script": "would link" in fresh and TOOL in fresh,
+        "it says it would clear the stale completion cache":
+            "would clear stale completion cache" in fresh,
+        "a hook that is not there is one it would add":
+            "would add the SessionStart cleanup hook" in fresh,
+        "an older hook of ours is one it would update":
+            "would update the SessionStart hook already in" in ours,
+        "the preview exits 0": fresh_code == 0 and ours_code == 0,
+    }
+    wrong = sorted(k for k, ok in installing.items() if not ok)
+    check("install-preview-writes-nothing", "an --install preview writes nothing and says what it would do",
+          not wrong, ", ".join(wrong) + (f"; wrote {fresh_wrote + ours_wrote}"
+                                         if fresh_wrote or ours_wrote else ""))
+
+    # --poison/--unpoison --dry-run against a server stood up for this check,
+    # whose environment is read before and after. Wording is not the measure:
+    # the server's own value is.
+    poison_sock = f"{TOOL}-selftest-poison"
+    poison_home = Path(tempfile.mkdtemp())   # nothing reads it; nothing may
+    tmux(poison_sock, "kill-server")
+    tmux(poison_sock, "new-session", "-d", "-s", TMUX_SESSION, "sleep", "30")
+
+    def server_env():
+        got = tmux(poison_sock, "show-environment", "-g", "ANTHROPIC_BASE_URL")
+        return got.stdout.strip() if got.returncode == 0 else "(unset)"
+
+    def poison_run(*flags):
+        run = sp.run([sys.executable, str(Path(__file__).resolve()),
+                      *flags, "--socket", poison_sock],
+                     capture_output=True, text=True, timeout=300,
+                     env=dict(os.environ, CLAUDE_CONFIG_DIR=str(poison_home),
+                              NO_COLOR="1"))
+        return run.stdout, run.returncode
+
+    try:
+        was = server_env()
+        set_said, set_code = poison_run("--poison", "--dry-run")
+        after_set_preview = server_env()
+        real_said, real_code = poison_run("--poison")
+        now_poisoned = server_env()
+        clear_said, clear_code = poison_run("--unpoison", "--dry-run")
+        after_clear_preview = server_env()
+    finally:
+        tmux(poison_sock, "kill-server")
+        shutil.rmtree(poison_home, ignore_errors=True)
+    poisoning = {
+        "a fresh server holds no base url": was == "(unset)",
+        "the poison preview sets nothing": after_set_preview == was,
+        "it names the socket and the url it would set":
+            "would poison" in set_said and poison_sock in set_said and POISON_URL in set_said,
+        "it says the value is still what it was": "server env still:" in set_said,
+        # Without --dry-run the same command line still sets it, so a preview
+        # that sets nothing is not a --poison that sets nothing.
+        "a real poison still sets it":
+            now_poisoned == f"ANTHROPIC_BASE_URL={POISON_URL}" and real_code == 0
+            and "poisoned" in real_said,
+        "the unpoison preview clears nothing": after_clear_preview == now_poisoned,
+        "it says what it would clear":
+            "would unpoison" in clear_said and poison_sock in clear_said,
+        "both previews exit 0": set_code == 0 and clear_code == 0,
+    }
+    wrong = sorted(k for k, ok in poisoning.items() if not ok)
+    check("poison-preview-changes-nothing", "a --poison preview changes no server environment",
+          not wrong, ", ".join(wrong))
 
     return out
 
@@ -10381,12 +10533,14 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     # has to avoid saying either. install_hook is the installer's
     # read-modify-write, which adds a hook and puts the file back rather than
     # concluding anything from it, and hands the path it opened to
-    # write_settings.
+    # write_settings. live_checks stages a settings file in a fake home for the
+    # installer to read, the way run_selftest stages team dirs: a fixture is
+    # not a second opinion about what the operator asked for.
     settings_names = {"settings.json", "teammateMode"}
     settings_readers = sorted(
         f"{node.name} names {sub.value!r} at line {sub.lineno}"
         for node in tree.body if isinstance(node, ast.FunctionDef)
-        and node.name not in {"install_hook", "run_selftest"}
+        and node.name not in {"install_hook", "run_selftest", "live_checks"}
         for sub in ast.walk(node)
         if isinstance(sub, ast.Constant) and sub.value in settings_names)
     check("settings-read-engine-only", "the settings file is read only inside the engine",
@@ -11030,11 +11184,12 @@ def run_selftest(live=False, failed_only=False, list_only=False):
           if (ungrouped or said_twice) else
           f"{len(group_names)} group(s), {len(declared)} declaration(s)")
 
-    # VERBS mirrors main's ladder by hand, and a hand-kept mirror drifts. A verb
-    # added to the ladder and not to the table is dropped in silence by whichever
-    # verb sits above it, which is the thing the table exists to stop. Read from
-    # the same walk as the two checks above, so this cannot drift from them
-    # either: a dispatch is a top-level `if args.X` in main whose body returns.
+    # VERBS is a copy of main's dispatch kept by hand, and a hand-kept copy
+    # drifts. A verb added to the dispatch and not to the table is dropped in
+    # silence by whichever verb sits above it, which is the thing the table
+    # exists to stop. Read from the same walk as the two checks above, so this
+    # cannot drift from them either: a dispatch is a top-level `if args.X` in
+    # main whose body returns.
     dispatch = [node for node in funcs["main"].body
                 if isinstance(node, ast.If)
                 and any(isinstance(sub, ast.Return) for sub in ast.walk(node))]
@@ -15796,11 +15951,8 @@ def main():
     if args.cleanup:
         return run_cleanup(args.dry_run)
 
-    if args.dry_run and (args.install or args.poison or args.unpoison):
-        die("--dry-run does not cover --install/--poison/--unpoison; they mutate on purpose")
-
     if args.install:
-        return run_install()
+        return run_install(args.dry_run)
 
     if args.complete:
         return run_complete(args.complete)
