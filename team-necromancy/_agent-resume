@@ -9,15 +9,16 @@
 # columns align (globally, across groups sharing one listing), and list-colors
 # patterns are generated from those exact displays so per-agent colors match.
 #
-# The flag list below is a second copy of what argparse already declares. For
-# now the completion-flag-parity check holds the two together: it fails on a
-# flag the parser takes that is not offered here, and on one offered here the
-# parser would refuse. Two flags that check does not cover: the per-flag prose,
-# and which completion action fills a flag's value. Both are written only here,
-# which is why the copy exists at all rather than being generated. Generating
-# the spec from the parser is the direction, and the objection that used to
-# stand against it, an interpreter start on the TAB path, is answered by the
-# cache below.
+# The flags are not written out here. They come from the tool, like every other
+# candidate: `--complete flags` runs the real parser and prints one line per
+# flag, and _agent_resume_flags turns those into _arguments specs. This file
+# held a hand-kept copy of all forty-odd of them until it did not have to.
+#
+# The tool declares two registers of prose for a reason worth keeping: argparse
+# help= is the help page, where a flag gets a sentence, and a row= beside it is
+# the one line this menu gives it, where it gets a phrase. See offers() in the
+# tool. Twenty-one flags differ between the two; the rest declare help= only and
+# the menu falls back to it.
 
 # A bare TAB used to offer everything on the machine, which here is 315 rows.
 # zsh lists at most LISTMAX rows (100 by default) before it stops and asks "do
@@ -94,6 +95,36 @@ _ra_emit() {  # topic -> its candidate lines in `lines` (caller's local)
     fi
   fi
   lines=(${(f)_RA_CACHE[$topic]})
+}
+
+_agent_resume_flags() {  # -> spec (caller's array): one _arguments spec per flag
+  local -a lines parts
+  local line flag row completer value
+  _ra_emit flags
+  for line in $lines; do
+    parts=("${(@ps:\t:)line}")
+    flag=$parts[1] row=$parts[2] completer=$parts[3] value=$parts[4]
+    # _arguments reads a description up to the matching ], so a ] or a
+    # backslash inside the prose has to be escaped for it. Nothing else does:
+    # each spec is an array element rather than a quoted shell word written out
+    # in this file, so an apostrophe is just an apostrophe. The hand-kept list
+    # had to break out of its own single quotes for the three flags whose prose
+    # has one, and got that right three times out of three; there is now nothing
+    # left to get right.
+    row=${row//\\/\\\\}
+    row=${row//\[/\\[}
+    row=${row//\]/\\]}
+    if [[ -z $value ]]; then
+      spec+=("${flag}[${row}]")
+      continue
+    fi
+    value=${value//:/\\:}   # a colon would end the spec's field early
+    case $completer in
+      '')  spec+=("${flag}[${row}]:${value}:") ;;
+      _*)  spec+=("${flag}[${row}]:${value}:${completer}") ;;   # _files and friends
+      *)   spec+=("${flag}[${row}]:${value}:{_agent_resume_topic ${completer} \"${value}\"}") ;;
+    esac
+  done
 }
 
 _ra_parse() {  # line -> cand desc color (caller's locals, via dynamic scope)
@@ -253,49 +284,11 @@ _agent_resume_selector() {  # names/teams/leads in one call, widths shared
 _agent-resume() {
   zmodload -i zsh/complist 2>/dev/null  # list-colors renders through complist
   zmodload -F zsh/stat b:zstat 2>/dev/null  # zstat takes the stamp _ra_emit keys on
-  _arguments -S \
-    '--agent-id[resume this agent (by its full id, name@team)]:agent id:{_agent_resume_topic agent-ids "agent id"}' \
-    '--resume[resume this session transcript (by uuid)]:session uuid:{_agent_resume_topic sessions "session uuid"}' \
-    '--team[resume this whole team by name: the members, then the lead]:team:{_agent_resume_topic teams team}' \
-    '--no-lead[skip the lead when bringing up the whole team]' \
-    '--into-team[move this agent onto another team (live = the team its live lead now runs as); a running one is restarted]:team:{_agent_resume_topic teams team}' \
-    '--keep-team[resume a member on its recorded team even when its lead now runs as another one]' \
-    '--socket[use this swarm tmux socket instead of detecting or creating one]:socket:{_agent_resume_topic sockets socket}' \
-    '--tmux-session[use this tmux session name instead of the default claude-swarm]:session:' \
-    '--tmux-window[use this tmux window name instead of the default swarm-view]:window:' \
-    '--claude-bin[launch this claude binary instead of the one on PATH]:binary:_files' \
-    '--force[override the running-copy and identity guards; with --into-team, take the rewrite route]' \
-    '--dry-run[preview without launching]' \
-    '--explain[say where each launch fact came from before launching]' \
-    '--no-update-config[do not write resumed agents into the team roster]' \
-    '--attach[attach to the swarm tmux session even when another client is already attached]' \
-    '--no-attach[never attach to the swarm tmux session; just report]' \
-    '--here[run this agent in this terminal instead of a tmux pane]' \
-    '--bare[resume the conversation with no identity: claude --resume <uuid> and nothing else]' \
-    '--no-tint[do not tint the tmux pane]' \
-    '--no-color[print without colour (the NO_COLOR environment variable does the same)]' \
-    '--install[symlink into ~/.local/bin, install zsh tab completion, and add the Claude Code startup hook that runs --cleanup]' \
-    '--cleanup[clean up dead swarm tmux sockets and team dirs with nothing left to resume; the installed Claude Code startup hook runs this]' \
-    '--selftest[run the test suite against this machine; changes nothing]' \
-    '--failed[with --selftest, print only the checks that failed]' \
-    '--live[with --selftest, also run the checks that launch real processes]' \
-    '--list[with --selftest, print every check id and its prose, one per line]' \
-    '--doctor[say whether each team'"'"'s lead is connected to it; reports only]' \
-    '--standing[where the named agent stands with its lead: liveness, team, whether its mail is read]' \
-    '--census[count what ~/.claude contains, through the tool'"'"'s own readers]' \
-    '--sides[list subagent side transcripts, each classified; reports only]' \
-    '--mail-ledger[join a team'"'"'s sends against its deliveries]' \
-    '--promote[convert a subagent side transcript into a resumable teammate]:side:{_agent_resume_topic sides side}' \
-    '--demote[convert a teammate transcript back into a side transcript]:session:{_agent_resume_topic sessions session}' \
-    '--as-agent[the identity a promoted teammate joins as (name@team)]:identity:' \
-    '--into-session[the parent session a demoted transcript embeds under]:session:{_agent_resume_topic sessions session}' \
-    '--no-launch[promote writes files and prints the launch line instead of launching]' \
-    '--with-mail[archive unread inbox mail into the receipt instead of refusing]' \
-    '--stop[stop the agent, session or team instead of resuming it]' \
-    '--yes[do not ask before ending a process: a --stop, or the holder a move takes over]' \
-    '--all[with a team, also resume members the roster no longer lists]' \
-    '--poison[point the swarm server at a dead port so placeholder spawns die at connect instead of reaching the API]' \
-    '--unpoison[remove the dead-port override from the swarm server]' \
+  local -a spec
+  _agent_resume_flags
+  # An emitter that fails leaves spec empty, and the selector still completes:
+  # fewer candidates is a worse TAB, a broken _arguments call is no TAB at all.
+  _arguments -S $spec \
     '1:selector:_agent_resume_selector' \
     '*:forwarded to claude:'
 }

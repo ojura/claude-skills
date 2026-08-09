@@ -7119,6 +7119,43 @@ def run_complete(topic):
 def _complete(topic):
     """Emit completion candidates. `selector` prefixes each line with its group
     so one process serves all three, instead of paying interpreter startup thrice."""
+    if topic == "flags":
+        # Tab separated, where teams and sessions are colon separated. Not a
+        # style choice: seven of these help strings contain a colon of their
+        # own, so a colon-separated line would split inside the prose and hand
+        # zsh half a sentence. No help string contains a tab, and
+        # completion-flags-are-parseable is what keeps that true.
+        #
+        # Four fields: the flag, the line the menu gives it, the topic that
+        # completes its value, and the word standing for that value. The last
+        # two are empty for a flag that takes no value, which the parser
+        # already knows and is not asked about here.
+        #
+        # _actions is argparse's own list and has no public spelling. Reading
+        # it is still the point of this topic: the alternative is scraping this
+        # file for add_argument calls, and two flags interpolate a constant
+        # into their help, where a scraper sees an f-string and the person at
+        # the prompt needs the sentence.
+        for action in build_parser()._actions:
+            longs = [opt for opt in action.option_strings if opt.startswith("--")]
+            # The first long spelling is the one offered; the rest are aliases,
+            # which is what this completion has always done with --terminate,
+            # --cleanup-sockets and --no-colour. -h/--help is why the rule says
+            # first *long* rather than first: declaring the short spelling first
+            # used to drop --help from the completion by accident.
+            if not longs or action.help is argparse.SUPPRESS:
+                continue
+            # A flag with no declared row is a failed check, not a broken TAB:
+            # the listing falls back to the help page's sentence and the suite
+            # says so. See every-flag-declares-a-menu-row.
+            row = getattr(action, "menu_row", None) or action.help or ""
+            if action.nargs == 0:
+                print(f"{longs[0]}\t{row}\t\t")
+                continue
+            value = (action.metavar or action.dest).lower().replace("_", " ")
+            print(f"{longs[0]}\t{row}\t{getattr(action, 'completer', None) or ''}\t{value}")
+        return 0
+
     if topic == "selector":
         # A uuid is a valid selector, so the selector position offers them too;
         # they were previously reachable only behind --resume.
@@ -9785,6 +9822,9 @@ def live_checks():
 # that keeps the shape and loses the speed passes both. They are also read
 # through a terminal, so a zsh that lays a listing out differently would need
 # the row count taken differently.
+HOSTILE_ROW = "a [bracket] pair, a colon: an apostrophe's, a \"quote\""
+
+
 COMPLETION_DRIVER = r"""
 emulate -L zsh
 zmodload zsh/zpty
@@ -9833,6 +9873,11 @@ zpty -w -n z "$tool "$'\t'
 settle 2.0 40
 print -r -- "$buf" > $calls.bare
 zpty -w -n z $'\025'
+drain
+zpty -w -n z "$tool --"$'\t'
+settle 2.0 40
+print -r -- "$buf" > $calls.flags
+zpty -w -n z $'\025'
 zpty -d z
 print DRIVE_OK
 """
@@ -9873,9 +9918,21 @@ def completion_tab_checks():
         calls = stage / "calls"
         calls.touch()
         stub = binned / TOOL
-        stub.write_text(f'#!/bin/sh\necho x >> {calls}\n'
+        # One flag whose menu row carries every character that means something
+        # to _arguments or to the shell: a bracket pair, a colon, an apostrophe
+        # and a double quote. Proving the escaping against these is the point;
+        # proving it against the flags that happen to exist today would only
+        # say that today's prose is tame.
+        hostile = HOSTILE_ROW
+        (stage / "flags").write_text(
+            "--plain\ta plain row\t\t\n"
+            f"--hostile\t{hostile}\t\t\n"
+            "--valued\ttakes something\t\tthing\n")
+        stub.write_text(f'#!/bin/sh\necho "$2" >> {calls}\n'
                         f'[ "$1" = "--complete" ] && [ "$2" = "selector" ] '
-                        f'&& exec cat {stage / "lines"}\nexit 0\n')
+                        f'&& exec cat {stage / "lines"}\n'
+                        f'[ "$1" = "--complete" ] && [ "$2" = "flags" ] '
+                        f'&& exec cat {stage / "flags"}\nexit 0\n')
         stub.chmod(0o755)
         shutil.copy2(Path(__file__).resolve().parent / f"_{TOOL}", fpdir / f"_{TOOL}")
         (stage / "drive.zsh").write_text(COMPLETION_DRIVER)
@@ -9895,7 +9952,12 @@ def completion_tab_checks():
             run = subprocess.CompletedProcess(drive.args, -1, *drive.communicate())
         drove = "DRIVE_OK" in run.stdout
         first = calls.with_suffix(".after-one-tab")
-        reads = len(first.read_text().split()) if first.exists() else -1
+        topics = first.read_text().split() if first.exists() else []
+        # One read per topic is the floor: a TAB asks for flags always and for
+        # the selector when the word is in the selector's place. Twice for the
+        # same topic is the fault, because that is zsh running the whole
+        # completion again under the next matcher spec with nothing kept.
+        twice = sorted({t for t in topics if topics.count(t) > 1})
         listing = calls.with_suffix(".bare")
         shown = listing.read_text(errors="replace") if listing.exists() else ""
         # The pty carries the escapes the terminal would have acted on; strip
@@ -9907,9 +9969,24 @@ def completion_tab_checks():
         said = run.stdout.strip().splitlines()[-1:] or [(run.stderr or "no output").strip()[:80]]
         stalled = f"the drive did not finish: {said[0]}"
         out.append(("completion-reads-corpus-once",
-                    "one TAB reads the corpus once, however often zsh reruns it",
-                    drove and reads == 1,
-                    f"{reads} read(s) of the emitter" if drove else stalled))
+                    "one TAB reads each topic once, however often zsh reruns it",
+                    drove and bool(topics) and not twice,
+                    f"read twice: {twice}" if twice else f"{len(topics)} read(s): {topics}"
+                    if drove else stalled))
+        flagfile = calls.with_suffix(".flags")
+        flagged = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "",
+                         flagfile.read_text(errors="replace") if flagfile.exists() else ""
+                         ).replace("\r", "\n")
+        # zsh wraps a listing at the terminal width, so the row is compared
+        # with its own line breaks taken back out.
+        unwrapped = flagged.replace("\n", "")
+        intact = HOSTILE_ROW.replace("\n", "") in unwrapped
+        offered_hostile = "--hostile" in flagged
+        out.append(("completion-flag-row-survives-escaping",
+                    "a menu row keeps its brackets, colon and quotes on the way into zsh",
+                    drove and offered_hostile and intact,
+                    (f"offered: {offered_hostile}, row intact: {intact}")
+                    if drove else stalled))
         out.append(("completion-bare-tab-bounded",
                     "a bare TAB offers few enough rows that zsh lists them",
                     drove and not asked and 0 < len(rows) <= 100,
@@ -11701,18 +11778,18 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("launch-report-fits-exact", "the launch report fits the terminal and keeps its command exact",
           not wrong, ", ".join(wrong))
 
-    # The zsh completion file is kept by hand beside the tool, so the two can
-    # drift apart by whole verbs. Every long flag the parser takes must be
-    # offered (aliases and the hidden emitter excepted), and completion must
-    # offer nothing the parser would refuse.
+    # Where completion gets its flags. It used to hold a hand-kept copy of all
+    # of them and this checked the two lists against each other; it now asks
+    # the tool, so what is left to check is that the asking works and that the
+    # copy has not crept back.
     comp_path = Path(__file__).resolve().parent / f"_{TOOL}"
     comp_text = comp_path.read_text() if comp_path.exists() else ""
-    # Read out of the tree rather than by regex over main's text. The flags are
-    # declared on argument groups, so the receiver differs from call to call,
-    # and a regex that matched add_argument( wherever it appeared would still
-    # find them but could not say which group each went to. One walk answers
-    # both questions, so the grouping check below is not a second scrape that
-    # can drift away from this one.
+    # Read out of the tree rather than by regex over the source text. The flags
+    # are declared on argument groups, so the receiver differs from call to
+    # call, and a regex that matched add_argument( wherever it appeared would
+    # still find them but could not say which group each went to. One walk
+    # answers both questions, so the grouping check below is not a second
+    # scrape that can drift away from this one.
     # main is where the ladder lives and where the engine is constructed, which
     # a check further down reads; the flags moved out to build_parser.
     main_src = ast.get_source_segment(source, funcs["main"]) or ""
@@ -11725,6 +11802,7 @@ def run_selftest(live=False, failed_only=False, list_only=False):
                 if isinstance(a, ast.Constant) and str(a.value).startswith("-")]
         if opts:
             declared.append((opts, getattr(node.func.value, "id", "?")))
+
     # Every flag says which line the menu gives it, even when that is the help
     # page's own sentence, which AS_HELP is how an author says. Defaulting to
     # the help would mean a flag added later put whatever its help page says
@@ -11738,26 +11816,39 @@ def run_selftest(live=False, failed_only=False, list_only=False):
     check("every-flag-declares-a-menu-row", "every offered flag says what the menu row is",
           not rowless, ", ".join(rowless) or f"{len(declared)} declaration(s) carry one")
 
-    # The first option string of each call, as the regex before it took: the
-    # rest are aliases, which completion is not asked to offer.
-    parser_flags = {opts[0] for opts, _on in declared if opts[0].startswith("--")}
-    comp_flags = set(re.findall(r"'(--[a-z-]+)\[", comp_text))
-    aliases = {"--no-colour", "--terminate", "--cleanup-sockets"}
-    missing = sorted(parser_flags - comp_flags - {"--complete"})
-    unknown = sorted(comp_flags - parser_flags - aliases)
-    # Three states, and each says which one it is. An absent file already fails
-    # here, because every flag then reads as missing, but the list of all of
-    # them is a wall that does not say the file is not there. A pass used to
-    # print "no completion file found", which is the one thing that cannot have
-    # happened: nothing can be offered by a file that was never read.
-    if not comp_text:
-        said = f"no completion file at {comp_path}"
-    elif missing or unknown:
-        said = f"missing from completion: {missing}; unknown to the parser: {unknown}"
-    else:
-        said = f"{len(parser_flags)} flags compared against {comp_path.name}"
-    check("completion-flag-parity", "completion offers every flag the parser takes, and nothing else",
-          comp_text and not missing and not unknown, said)
+    # The emitter is the only source of flags now, so its shape is what the
+    # completion depends on. Four tab-separated fields, and the tab is load-
+    # bearing here in the literal sense: seven of these help strings contain a
+    # colon, which is why this topic is not colon separated like teams.
+    emitted = io.StringIO()
+    with contextlib.redirect_stdout(emitted):
+        run_complete("flags")
+    flag_lines = [line for line in emitted.getvalue().splitlines() if line]
+    malformed = [line.split("\t")[0] for line in flag_lines
+                 if len(line.split("\t")) != 4 or not line.startswith("--")
+                 or not line.split("\t")[1].strip()]
+    offered = {line.split("\t")[0] for line in flag_lines}
+    # The parser's own answer to "which flags would you take", computed the way
+    # the emitter is supposed to: first long spelling, nothing suppressed.
+    takes = {opt for opts, _on in declared
+             for opt in [next((o for o in opts if o.startswith("--")), None)]
+             if opt} - {"--complete"}
+    wrong = sorted(offered ^ takes)
+    check("completion-flags-are-parseable",
+          "the flags topic emits four fields a shell can split, one per flag the parser takes",
+          bool(flag_lines) and not malformed and not wrong,
+          f"malformed: {malformed[:3]}; offered but not taken or the other way: {wrong[:5]}"
+          if (malformed or wrong) else f"{len(flag_lines)} flags")
+
+    # What the rewrite bought, stated as a check so it cannot quietly come
+    # back: a second list of flags in the completion file, which is what used
+    # to drift and what completion-flag-parity existed to catch.
+    hardcoded = sorted(set(re.findall(r"'(--[a-z-]+)\[", comp_text)))
+    check("completion-holds-no-flag-list", "the completion file names no flag of its own",
+          bool(comp_text) and not hardcoded,
+          f"no completion file at {comp_path}" if not comp_text
+          else (f"{len(hardcoded)} hardcoded: {hardcoded[:4]}" if hardcoded
+                else f"{comp_path.name} asks the tool for all {len(offered)}"))
 
     # Forty-four flags in one list printed a nine-line usage and put --failed,
     # --live and --list, which do nothing without --selftest, between --bare
