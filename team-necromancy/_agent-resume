@@ -18,6 +18,74 @@
 _RA_BARE_ROWS=48    # most rows a bare TAB takes from one list
 _RA_BARE_GROUP=16   # ... and from the selector's teams, and from its leads
 
+# Reading the corpus takes about 0.7s on the machine this was measured on, and
+# one TAB asks for it more than once: with three matcher-list specs (what
+# oh-my-zsh sets) zsh reruns the whole completion under each until one produces
+# matches, so a word matching nothing paid for three full reads. Keep the answer
+# while the corpus still looks the same from outside, which is the mtime of the
+# teams and projects directories and of their immediate children: 123 stats
+# here, and it moves when a session or a team appears or goes. It does not move
+# when a transcript that already exists grows, so a "last active" time in a
+# description can be up to _RA_CACHE_TTL seconds behind. Titles, join times and
+# the "nothing left to resurrect" markers do not drift on that scale.
+_RA_CACHE_TTL=60
+typeset -g _RA_CACHE_STAMP=
+typeset -g _RA_CACHE_AT=0
+typeset -gA _RA_CACHE
+
+_ra_stamp() {  # -> stamp (caller's local), or nonzero when it cannot be taken
+  local claude=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+  local -a st
+  zstat -A st +mtime $claude/teams(N) $claude/projects(N) \
+        $claude/teams/*(N/) $claude/projects/*(N/) 2>/dev/null || return 1
+  stamp="$#st ${(j: :)st}"
+}
+
+# A shell's own table dies with the shell, and the first TAB in a new terminal
+# is the one being complained about. The same answer goes to a file under the
+# same stamp, so a new shell reads that instead of the corpus. Where it goes is
+# the cache-path style if the user set one (oh-my-zsh does), so this leaves no
+# files anywhere the shell was not already keeping completion caches.
+_ra_cache_dir() {  # -> dir (caller's local), or nonzero when there is nowhere to write
+  zstyle -s ":completion:*:*:${service}:*" cache-path dir
+  : ${dir:=${XDG_CACHE_HOME:-$HOME/.cache}/$service}
+  [[ -d $dir ]] || mkdir -p $dir 2>/dev/null || return 1
+}
+
+_ra_emit() {  # topic -> its candidate lines in `lines` (caller's local)
+  local topic=$1 stamp= dir= body
+  # No stamp (no zsh/stat, or neither directory there) leaves stamp empty, and
+  # then age is the only thing that can retire an entry: the file is not read or
+  # written at all, and the shell's own table stands for _RA_CACHE_TTL seconds.
+  _ra_stamp
+  if [[ $stamp != $_RA_CACHE_STAMP ]] || (( SECONDS - _RA_CACHE_AT >= _RA_CACHE_TTL )); then
+    _RA_CACHE=()
+    _RA_CACHE_STAMP=$stamp
+    _RA_CACHE_AT=$SECONDS
+  fi
+  if (( ! ${+_RA_CACHE[$topic]} )) && [[ -n $stamp ]] && _ra_cache_dir; then
+    local -a fresh=($dir/${service}-$topic(N.ms-$_RA_CACHE_TTL))
+    if (( $#fresh )); then
+      body="$(<$fresh[1])"          # stamp on the first line, candidates after it
+      [[ ${body%%$'\n'*} == $stamp ]] && _RA_CACHE[$topic]=${body#*$'\n'}
+    fi
+  fi
+  if (( ! ${+_RA_CACHE[$topic]} )); then
+    _RA_CACHE[$topic]="$($service --complete $topic 2>/dev/null)"
+    # Written aside and renamed, so a second shell reading this at the same
+    # moment sees either the old file whole or the new one, never half of one.
+    # Nothing is written for an empty answer: a topic with no candidates costs
+    # little to ask again, and an emitter that failed would otherwise have its
+    # silence served to every shell for the next _RA_CACHE_TTL seconds.
+    if [[ -n $dir && -n $_RA_CACHE[$topic] ]]; then
+      print -r -- "$stamp"$'\n'"$_RA_CACHE[$topic]" >! $dir/${service}-$topic.$$ 2>/dev/null &&
+        mv -f $dir/${service}-$topic.$$ $dir/${service}-$topic 2>/dev/null ||
+        rm -f $dir/${service}-$topic.$$ 2>/dev/null
+    fi
+  fi
+  lines=(${(f)_RA_CACHE[$topic]})
+}
+
 _ra_parse() {  # line -> cand desc color (caller's locals, via dynamic scope)
   # One split rather than a chain of strips. Reaching the second tab with
   # ${rest#*<tab>} costs a match attempt per character of the description, and
@@ -99,7 +167,7 @@ _ra_render() {  # topic descr session-colour lines...  (maxname/maxid from calle
 _agent_resume_topic() {  # single group, self-scoped widths
   local -a lines
   local -i maxname=0 maxid=0
-  lines=(${(f)"$($service --complete $1 2>/dev/null)"})
+  _ra_emit $1
   (( $#lines )) || return 1
   # Every topic the emitter has is newest first, so the head of the list is what
   # a bare TAB wants. --resume alone offered 791 session transcripts before this.
@@ -109,7 +177,7 @@ _agent_resume_topic() {  # single group, self-scoped widths
 }
 
 _agent_resume_selector() {  # names/teams/leads in one call, widths shared
-  local -a all n t l s
+  local -a all n t l s lines
   local -i maxname=0 maxid=0 ret=1
   local line
   # names arrive as "names<TAB>group<TAB>cand<TAB>desc<TAB>colour", already
@@ -117,7 +185,8 @@ _agent_resume_selector() {  # names/teams/leads in one call, widths shared
   local -a groups
   local rest group
   typeset -A grouped
-  all=(${(f)"$($service --complete selector 2>/dev/null)"})
+  _ra_emit selector
+  all=($lines)
   for line in $all; do
     case $line in
       names$'\t'*)
@@ -134,7 +203,8 @@ _agent_resume_selector() {  # names/teams/leads in one call, widths shared
   # Transcripts are only worth listing once you are clearly typing a uuid:
   # hundreds of them would bury the names on a blank tab.
   if (( ${#PREFIX} >= 2 )) && [[ -z ${PREFIX//[0-9a-fA-F-]/} ]]; then
-    s=(${(f)"$($service --complete sessions 2>/dev/null)"})
+    _ra_emit sessions
+    s=($lines)
   fi
   # A bare TAB takes the newest instead of all of it (see _RA_BARE_ROWS). Whole
   # session clusters, and the newest cluster entire however big it is: that is
@@ -172,6 +242,7 @@ _agent_resume_selector() {  # names/teams/leads in one call, widths shared
 
 _agent-resume() {
   zmodload -i zsh/complist 2>/dev/null  # list-colors renders through complist
+  zmodload -F zsh/stat b:zstat 2>/dev/null  # zstat takes the stamp _ra_emit keys on
   _arguments -S \
     '--agent-id[resume this agent (by its full id, name@team)]:agent id:{_agent_resume_topic agent-ids "agent id"}' \
     '--resume[resume this session transcript (by uuid)]:session uuid:{_agent_resume_topic sessions "session uuid"}' \
