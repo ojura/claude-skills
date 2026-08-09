@@ -38,6 +38,7 @@ import tempfile
 from pathlib import Path
 
 TOOL = Path(__file__).resolve().parent / "agent-resume"
+COMP = TOOL.parent / f"_{TOOL.name}"
 
 
 def verdicts(path, live):
@@ -91,20 +92,28 @@ def main(argv):
                   f"--selftest --list prints them all. Some real ids: {examples}")
             return 2
 
-    source = TOOL.read_text()
-    hits = source.count(old)
-    if hits != 1:
-        print(f"the text to replace appears {hits} times; a probe replaces "
-              "exactly one thing, so narrow it")
+    # Either file beside the other is fair game: the suite drives the zsh
+    # completion through a real shell now, so a probe aimed at it has to be able
+    # to break it. Whichever file holds the text once is the one mutated, and
+    # text in both is refused rather than guessed at.
+    holders = [path for path in (TOOL, COMP) if path.exists() and path.read_text().count(old) == 1]
+    if len(holders) != 1:
+        counts = ", ".join(f"{path.name}: {path.read_text().count(old) if path.exists() else 0}"
+                           for path in (TOOL, COMP))
+        print(f"the text to replace has to appear exactly once, in one file ({counts}); "
+              "a probe replaces exactly one thing, so narrow it")
         return 2
+    target = holders[0]
 
     with tempfile.TemporaryDirectory() as scratch:
         copy = Path(scratch) / TOOL.name
+        # The suite reads its own source for the structural checks and reads the
+        # completion file beside it for the TAB checks, so both copies must be
+        # what runs; nothing here touches either real file.
         shutil.copy2(TOOL, copy)
-        # The suite reads its own source for the structural checks, so the
-        # copy must be what runs; nothing here touches the real file.
-        copy.write_text(source.replace(old, new, 1))
-        shutil.copy2(TOOL.parent / "_agent-resume", Path(scratch) / "_agent-resume")
+        shutil.copy2(COMP, Path(scratch) / COMP.name)
+        mutated = Path(scratch) / target.name
+        mutated.write_text(target.read_text().replace(old, new, 1))
         # The portable behavioural checks read test/corpus/ next to the tool
         # itself; without it they find no data and some paths that assume a
         # transcript resolves would die instead of failing cleanly.
