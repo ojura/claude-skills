@@ -3777,6 +3777,15 @@ class Resolver:
         """
         return bool(pane) and any(p["pane"] == pane for p in self.list_panes(socket))
 
+    def descendants_of(self, root_pid, table=None):
+        """Every live pid under this one, as a question rather than a transform.
+
+        A caller asking what it started asks this, so what counts as under a
+        process is decided in one place. The suite asks it to tell the
+        processes a run made from the ones the machine was already running.
+        """
+        return self._descendants(root_pid, self.process_table() if table is None else table)
+
     def _descendants(self, root_pid, table):
         """Every pid under this one, from a table already in hand. A transform,
         not a reading: nothing here goes back to the process realm."""
@@ -9629,19 +9638,6 @@ def _check_smoke_typed_commands(s):
         ("refuses", ["--frobnicate", "willow"]),
     ]
 
-    def swarm_now():
-        """Anything a launch from this tier would have added to the machine.
-
-        The processes are narrowed to agents wearing a fixture identity,
-        because this machine runs real agents of its own and one somebody else
-        spawns while the tier is running is not the tier's doing. The servers
-        are not narrowed: only this tool makes a claude-swarm socket, and one
-        appearing here is worth a look whichever shape made it.
-        """
-        return ({str(pid) for pid, _ppid, cmd in RESOLVER.process_table(refresh=True)
-                 if "--agent-id" in cmd and "session-corpus-" in cmd}
-                | {sock.name for sock in RESOLVER.swarm_sockets()})
-
     # A copy of the fixture, so a shape that writes writes here and the corpus
     # every other check reads stays as it is.
     smoke_home = Path(tempfile.mkdtemp(prefix=f"{TOOL}-smoke-"))
@@ -9649,7 +9645,7 @@ def _check_smoke_typed_commands(s):
     shutil.copytree(Path(__file__).resolve().parent / "test" / "corpus", smoke_cfg)
     smoke_env = dict(os.environ, CLAUDE_CONFIG_DIR=str(smoke_cfg), NO_COLOR="1")
     crashed, misbehaved, codes = [], [], set()
-    was_up = swarm_now()
+    was_up = started_here()
     try:
         for expect, argv in shapes:
             typed = f"{TOOL} {' '.join(argv)}"
@@ -9676,7 +9672,7 @@ def _check_smoke_typed_commands(s):
                 misbehaved.append(f"{typed}: exit {run.returncode} and said nothing")
     finally:
         shutil.rmtree(smoke_home, ignore_errors=True)
-    left_behind = sorted(swarm_now() - was_up)
+    left_behind = sorted(started_here() - was_up)
     if left_behind:
         misbehaved.append(f"started something and left it: {', '.join(left_behind)}")
     if 0 not in codes or not codes - {0}:
@@ -10033,6 +10029,94 @@ def _check_live_fixtures_are_own(s):
     check("live-fixtures-are-this-run's", "a live fixture name belongs to the run that made it",
           not shared, ", ".join(sorted(set(shared))))
     return checked
+
+
+
+@unit(("smoke-counts-only-what-it-started",
+       "the smoke tier counts processes it started, not the machine's"), live=True)
+def _check_smoke_counts_only_what_it_started(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    # A process wearing a fixture identity that this run did not start is
+    # another run's, or a person's. The tier asks what it started, so it must
+    # not see one. Demonstrated with a process put outside this lineage on
+    # purpose: it is started by a child that exits, so init adopts it and its
+    # parent chain never reaches us. Nothing here waits on a clock.
+    sp = s.sp
+    sp = s.sp
+    told_pid = Path(tempfile.mkdtemp(prefix=f"{TOOL}-stray-")) / "pid"
+    # setsid puts it in its own session, so its parent chain never reaches
+    # this run. It writes its own pid, and the read below waits on that file
+    # appearing rather than on a clock.
+    # --fork makes setsid detach even when it is not already a group leader;
+    # without it setsid execs in place and the fixture stays this run's child,
+    # which is the opposite of what this check needs.
+    sp.Popen(["setsid", "--fork", sys.executable, "-c",
+              "import os, sys, time;"
+              "open(sys.argv[1], 'w').write(str(os.getpid()));"
+              "time.sleep(30)",
+              str(told_pid), "--agent-id", "stray@session-corpus-alpha"]).wait()
+    orphan = 0
+    while not orphan:
+        try:
+            orphan = int(told_pid.read_text().strip() or 0)
+        except (OSError, ValueError):
+            orphan = 0
+    try:
+        table = RESOLVER.process_table(refresh=True)
+        rows = {pid: cmd for pid, _ppid, cmd in table}
+        # The tier's own question, not a copy of it: a narrowing removed from
+        # started_here has to show up here, or this check is asserting its own
+        # arithmetic rather than the code the tier runs.
+        counted = started_here()
+        wearing = {str(pid) for pid, cmd in rows.items()
+                   if "--agent-id" in cmd and "session-corpus-" in cmd}
+        told = {
+            "the stray is running and wears a fixture identity":
+                orphan in rows and "session-corpus-alpha" in rows.get(orphan, ""),
+            "it is not in this run's lineage":
+                orphan not in RESOLVER.descendants_of(os.getpid(), table),
+            "so what this run started does not count it":
+                str(orphan) not in counted,
+            # Without the narrowing there is nothing to prove: the machine-wide
+            # question is the one that would have counted it.
+            "though the machine-wide question would have":
+                str(orphan) in wearing,
+        }
+    finally:
+        # Nobody else will: it is in its own session by design.
+        try:
+            os.kill(orphan, 9)
+        except OSError:
+            pass
+    wrong = sorted(k for k, ok in told.items() if not ok)
+    check("smoke-counts-only-what-it-started",
+          "the smoke tier counts processes it started, not the machine's",
+          not wrong, ", ".join(wrong))
+    return checked
+
+
+def started_here():
+    """Anything a launch from this run would have added to the machine.
+
+    Narrowed twice, because the question is what this run started and the
+    machine answers about everything: to agents wearing a fixture identity,
+    since real agents run here too, and then to processes descending from this
+    run and sockets this run named. Another run's fixture is its own business,
+    and counting it reports a leak nobody here made.
+
+    One function rather than one per caller, so the check that this narrowing
+    holds asks the same question the tier asks rather than a copy of it.
+    """
+    table = RESOLVER.process_table(refresh=True)
+    mine = RESOLVER.descendants_of(os.getpid(), table)
+    return ({str(pid) for pid, _ppid, cmd in table
+             if pid in mine and "--agent-id" in cmd and "session-corpus-" in cmd}
+            | {sock.name for sock in RESOLVER.swarm_sockets()
+               if sock.name.endswith(f"-{os.getpid()}")})
 
 
 def live_checks():
