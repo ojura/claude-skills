@@ -1492,6 +1492,28 @@ class Resolver:
         not an identity: every team has a "team-lead"."""
         return {e["team"] for e in self.scan_teams() if e["member"].get("name") == name}
 
+    def same_name_other_case(self, name, team=None):
+        """Agent ids a roster carries that differ from this one only in case.
+
+        Asked on the way out of a refusal. A name nobody has and a name
+        somebody has under different capitals fail identically today, and the
+        second is what a retyped or copied id looks like. Rosters only: they
+        are read here already, and a name the stamps carry but no roster does
+        belongs to an agent this refusal has other things to say about.
+        """
+        if not name:
+            return []
+        near = set()
+        for entry in self.scan_teams():
+            theirs = entry["member"].get("name")
+            if not theirs or theirs == name:
+                continue
+            if team and entry["team"].lower() != team.lower():
+                continue
+            if theirs.lower() == name.lower():
+                near.add(f"{theirs}@{entry['team']}")
+        return sorted(near)
+
     def _pid_running_team(self, team):
         """The live process whose transcript records spawning into this team.
 
@@ -2019,7 +2041,17 @@ class Resolver:
                 return Resolution(
                     *hits[0], via="agentName only (unique across rosters)", strength=NAME_ONLY, others=hits[1:]
                 )
-        return Resolution(reason=f"no transcript found for {name or '?'}@{team or '?'}")
+        label = f"{name or '?'}@{team or '?'}"
+        # Every rung is spent. If a roster carries this word under different
+        # capitals, saying so is the whole difference between a dead end and a
+        # typo, and it costs one pass over rosters already read.
+        near = self.same_name_other_case(name, team)
+        if near:
+            return Resolution(answered=True, reason=(
+                f"no transcript found for {label}; {some_of(near)} "
+                f"{'differs' if len(near) == 1 else 'differ'} from it only in case"
+            ))
+        return Resolution(reason=f"no transcript found for {label}")
 
     def _boot_join(self):
         """[(team, pid, createdAt)] pairing each implicit team with the live process
@@ -2945,10 +2977,9 @@ class Resolver:
             is_lead=is_lead_member,
         )
         if not res:
-            die(
+            die(res.reason if res.answered else
                 f"{res.reason}; a truly in-process agent leaves only a sidechain under the lead's "
-                "subagents/ dir, which no CLI can resume"
-            )
+                "subagents/ dir, which no CLI can resume")
         objections = self.objections(res, name, team)
         transcript = (res.path, res.fields, res.last_ts)
         others = [(p, f, t) for p, f, t in res.others]
@@ -4892,9 +4923,15 @@ EXACT, STAMPS, NAME_ONLY = 3, 2, 1
 class Resolution:
     """A chosen transcript plus how it was chosen. `path` None means no evidence."""
 
-    def __init__(self, path=None, fields=None, last_ts=0, via="", strength=0, others=(), reason=""):
+    def __init__(self, path=None, fields=None, last_ts=0, via="", strength=0, others=(),
+                 reason="", answered=False):
         self.path, self.fields, self.last_ts = path, fields or {}, last_ts
         self.via, self.strength, self.others, self.reason = via, strength, list(others), reason
+        # A refusal that already names what to do about it. Callers add their
+        # own general explanation of an unresolvable name, which is worth
+        # reading when nothing else is known and is noise beside a reason that
+        # points at the answer.
+        self.answered = answered
 
     def __bool__(self):
         return self.path is not None
@@ -9979,6 +10016,49 @@ def run_selftest(live=False, failed_only=False, list_only=False):
         check("transcript-with-no-identity-refused",
               "a transcript nothing on disk names still gets the honest refusal",
               not wrong, ", ".join(wrong))
+
+    # A name nobody has and a name somebody has under different capitals used to
+    # refuse in the same words. The near match costs one pass over rosters that
+    # were read already, and it is the whole difference between a dead end and a
+    # retyped id. The control arm is what stops this passing on a refusal that
+    # says "only in case" about everything, and the two roster assertions are
+    # what stop it passing on a corpus that carries neither spelling.
+    eng_case = corpus_engine()
+    roster_names = {e["member"].get("name") for e in eng_case.scan_teams()}
+    typo = eng_case.resolve_transcript(name="WILLOW", team="session-corpus-alpha", quick=True)
+    plain = eng_case.resolve_transcript(name="zzzznotreal", team="session-corpus-alpha", quick=True)
+    # Driven through the caller too, because the flag is only worth setting if
+    # the caller reads it: the message a person sees is the one built here.
+    def cased_refusal(asked):
+        """What identity() printed when it refused this name, as one line."""
+        with contextlib.redirect_stderr(io.StringIO()) as told:
+            try:
+                corpus_engine().identity(agent_id=f"{asked}@session-corpus-alpha")
+            except SystemExit:
+                pass
+        return " ".join(told.getvalue().split())
+
+    typo_said, plain_said = cased_refusal("WILLOW"), cased_refusal("zzzznotreal")
+    tail = "a truly in-process agent"
+    cased = {
+        "the corpus carries the name in the other case": "willow" in roster_names,
+        "and not the way this asks for it": "WILLOW" not in roster_names,
+        "the refusal names the near match":
+            "willow@session-corpus-alpha" in (typo.reason or ""),
+        "and says what is different about it": "only in case" in (typo.reason or ""),
+        "it needs no further explaining": typo.answered,
+        "a name nobody has claims no near match":
+            "only in case" not in (plain.reason or ""),
+        "and still leaves its caller to explain": not plain.answered,
+        "the printed refusal names the near match too":
+            "willow@session-corpus-alpha" in typo_said and "only in case" in typo_said,
+        "and drops the explanation it does not need": tail not in typo_said,
+        "which the refusal that needs it still carries": tail in plain_said,
+    }
+    wrong = sorted(k for k, ok in cased.items() if not ok)
+    check("refusal-names-a-case-near-match",
+          "a selector that differs only in case is told which one it missed",
+          not wrong, ", ".join(wrong) or f"said {(typo.reason or '')[:60]!r}")
 
     # The first launch is what registers it, driven end to end: the roster gains
     # the entry the design defers to launch time, with the seat it actually got.
