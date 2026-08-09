@@ -9455,7 +9455,7 @@ def _check_launch_baseurl_carriers(s):
             if had is not None:
                 os.environ["ANTHROPIC_BASE_URL"] = had
 
-    probe_sock = f"{TOOL}-selftest-baseurl"
+    probe_sock = own(f"{TOOL}-selftest-baseurl")
     tmux(probe_sock, "new-session", "-d", "-s", TMUX_SESSION, "sleep", "20")
     try:
         tmux(probe_sock, "set-environment", "-g", "ANTHROPIC_BASE_URL", "https://gateway.example")
@@ -9466,8 +9466,8 @@ def _check_launch_baseurl_carriers(s):
         keeps_real_from_poisoned_shell = not scrubs(probe_sock, POISON_URL)
         tmux(probe_sock, "set-environment", "-g", "ANTHROPIC_BASE_URL", POISON_URL)
         drops_server = scrubs(probe_sock, None)
-        drops_inherited = scrubs(f"{TOOL}-selftest-absent", POISON_URL)
-        keeps_inherited_real = not scrubs(f"{TOOL}-selftest-absent", "https://gateway.example")
+        drops_inherited = scrubs(own(f"{TOOL}-selftest-absent"), POISON_URL)
+        keeps_inherited_real = not scrubs(own(f"{TOOL}-selftest-absent"), "https://gateway.example")
     finally:
         tmux(probe_sock, "kill-server")
     carriers = {
@@ -9489,7 +9489,7 @@ def _check_team_fits_window(s):
     def check(cid, name, ok, detail=""):
         checked.append((cid, name, ok, detail))
 
-    geom_sock = f"{TOOL}-selftest-geometry"
+    geom_sock = own(f"{TOOL}-selftest-geometry")
     tmux(geom_sock, "kill-server")
     wanted = 7
     placed, refused = [], None
@@ -9703,7 +9703,7 @@ def _check_stop_preview_ends_nothing(s):
     stop_home = Path(tempfile.mkdtemp())
     (stop_home / "projects").mkdir()
     (stop_home / "teams").mkdir()
-    ident = "preview@selftest-stop"
+    ident = own("preview@selftest-stop")
 
     def stop_arm(*flags):
         """(what a --stop printed, its exit code, whether the fixture survived)."""
@@ -9764,7 +9764,7 @@ def _check_process_table_width_independent(s):
 
     sp = s.sp
 
-    width_id = "widths@selftest-columns"
+    width_id = own("widths@selftest-columns")
     padded = sp.Popen([FAKE_AGENT_BIN, "-c", '__import__("time").sleep(60)',
                        "--pad", "p" * 400, "--agent-id", width_id],
                       executable=sys.executable)
@@ -9918,7 +9918,7 @@ def _check_poison_preview_changes_nothing(s):
 
     sp = s.sp
 
-    poison_sock = f"{TOOL}-selftest-poison"
+    poison_sock = own(f"{TOOL}-selftest-poison")
     poison_home = Path(tempfile.mkdtemp())   # nothing reads it; nothing may
     tmux(poison_sock, "kill-server")
     tmux(poison_sock, "new-session", "-d", "-s", TMUX_SESSION, "sleep", "30")
@@ -9977,6 +9977,61 @@ def _check_completion_reads_corpus_once(s):
 
     for cid, name, ok, detail in completion_tab_checks():
         check(cid, name, ok, detail)
+    return checked
+
+
+def own(name):
+    """A fixture name this run alone answers to.
+
+    Sockets and agent ids are machine-global. Two live tiers at once used to
+    stand up the same server and wear the same id, so each run's --stop found
+    the other's fixture and ended it: measured as "aborted 2 of 2" against a
+    check that wants one. The pid makes a name this run owns.
+    """
+    return f"{name}-{os.getpid()}"
+
+
+
+@unit(("live-fixtures-are-this-run's", "a live fixture name belongs to the run that made it"))
+def _check_live_fixtures_are_own(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    ast = s.ast
+    # A socket or an agent id is machine-global, so a name fixed in the source
+    # is a name every concurrent run answers to. Two live tiers then stand up
+    # one server between them and each run's --stop ends the other's fixture.
+    # own() is what makes a name this run's; a literal here is a name shared.
+    # What the machine shares is a tmux socket, named for this tool, and an
+    # agent id, worn by a real process. A team directory named in a fixture
+    # lives under that run's own config dir and collides with nobody.
+    shared = []
+    for fnode in ast.walk(s.tree):
+        if not (isinstance(fnode, ast.FunctionDef) and fnode.name in s.suite_fns):
+            continue
+        for node in ast.walk(fnode):
+            if not isinstance(node, ast.Assign):
+                continue
+            machine_wide = False
+            for piece in ast.walk(node.value):
+                if isinstance(piece, ast.Constant) and isinstance(piece.value, str):
+                    if "@selftest" in piece.value:
+                        machine_wide = True
+                elif isinstance(piece, ast.JoinedStr):
+                    spelled = ast.dump(piece)
+                    if "'TOOL'" in spelled and "selftest" in spelled:
+                        machine_wide = True
+            if not machine_wide:
+                continue
+            owned = any(isinstance(p, ast.Call) and getattr(p.func, "id", None) == "own"
+                        for p in ast.walk(node.value))
+            if not owned:
+                where = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                shared.append(f"{fnode.name}: {where[0] if where else '?'}")
+    check("live-fixtures-are-this-run's", "a live fixture name belongs to the run that made it",
+          not shared, ", ".join(sorted(set(shared))))
     return checked
 
 
