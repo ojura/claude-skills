@@ -9,6 +9,15 @@
 # columns align (globally, across groups sharing one listing), and list-colors
 # patterns are generated from those exact displays so per-agent colors match.
 
+# A bare TAB used to offer everything on the machine, which here is 315 rows.
+# zsh lists at most LISTMAX rows (100 by default) before it stops and asks "do
+# you wish to see all 315 possibilities", then waits for a key, and waiting for
+# a key with nothing on screen reads as a hang. A bare TAB now offers the newest
+# rows instead. Type one character and the whole corpus is back in play: from
+# there zsh is matching against what was typed, so the listing is small anyway.
+_RA_BARE_ROWS=48    # most rows a bare TAB takes from one list
+_RA_BARE_GROUP=16   # ... and from the selector's teams, and from its leads
+
 _ra_parse() {  # line -> cand desc color (caller's locals, via dynamic scope)
   # One split rather than a chain of strips. Reaching the second tab with
   # ${rest#*<tab>} costs a match attempt per character of the description, and
@@ -92,6 +101,9 @@ _agent_resume_topic() {  # single group, self-scoped widths
   local -i maxname=0 maxid=0
   lines=(${(f)"$($service --complete $1 2>/dev/null)"})
   (( $#lines )) || return 1
+  # Every topic the emitter has is newest first, so the head of the list is what
+  # a bare TAB wants. --resume alone offered 791 session transcripts before this.
+  [[ -z $PREFIX$SUFFIX ]] && lines=(${lines[1,_RA_BARE_ROWS]})
   _ra_widths $lines
   _ra_render "$1" "$2" "" $lines
 }
@@ -123,6 +135,25 @@ _agent_resume_selector() {  # names/teams/leads in one call, widths shared
   # hundreds of them would bury the names on a blank tab.
   if (( ${#PREFIX} >= 2 )) && [[ -z ${PREFIX//[0-9a-fA-F-]/} ]]; then
     s=(${(f)"$($service --complete sessions 2>/dev/null)"})
+  fi
+  # A bare TAB takes the newest instead of all of it (see _RA_BARE_ROWS). Whole
+  # session clusters, and the newest cluster entire however big it is: that is
+  # the team this shell is most likely sitting in, and half of it offered is
+  # worse than a shorter list that is whole.
+  if [[ -z $PREFIX$SUFFIX ]]; then
+    local -a kept members
+    local -i taken=0
+    n=()
+    for group in $groups; do
+      members=(${(f)${grouped[$group]%$'\n'}})
+      (( taken && taken + $#members > _RA_BARE_ROWS )) && break
+      kept+=($group)
+      n+=($members)
+      (( taken += $#members ))
+    done
+    groups=($kept)
+    t=(${t[1,_RA_BARE_GROUP]})
+    l=(${l[1,_RA_BARE_GROUP]})
   fi
   _ra_widths $n $t $l $s
   # one colour per session cluster, cycled
