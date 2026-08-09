@@ -6988,10 +6988,10 @@ def _complete(topic):
         return 0
 
     if topic == "sessions":
-        files = sorted(
-            RESOLVER.transcripts_by_mtime()
-        )
-        for path in files:
+        # transcripts_by_mtime is newest first already, and re-sorting it here
+        # put the listing back in path order. Every topic is offered newest
+        # first, which is also the order the completion's bare-TAB cap assumes.
+        for path in RESOLVER.transcripts_by_mtime():
             when = ms_str(int(path.stat().st_mtime * 1000))
             title = session_title(path, limit=COMPLETION_TITLE)
             desc = f"{title}  [{path.parent.name}, {when}]" if title else f"{path.parent.name}, {when}"
@@ -6999,7 +6999,9 @@ def _complete(topic):
         return 0
 
     if topic == "sides":
-        for e in RESOLVER.side_transcripts():
+        # side_transcripts lists in path order, which is what --sides reports
+        # want; a completion wants the newest first, like every other topic.
+        for e in sorted(RESOLVER.side_transcripts(), key=lambda e: e["mtime"], reverse=True):
             name = e["name"] or e["task_id"]
             print(f"{e['parent'][:8]}/{name}:{e['grammar']}, {ms_str(e['mtime'])}")
         return 0
