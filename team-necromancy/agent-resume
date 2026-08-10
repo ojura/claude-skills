@@ -864,6 +864,33 @@ def said_when(iso):
     return ms_str(iso_ms(iso)) if iso_ms(iso) else str(iso)
 
 
+@contextlib.contextmanager
+def capturing(stream, into=None):
+    """Take what this process writes to one stream instead of letting it out.
+
+    stream is "out" or "err". The buffer comes back whether or not the caller
+    reads it: a caller that only wants quiet ignores it, and one that asserts
+    on what was said reads getvalue(). `into` writes into a buffer the caller
+    already holds, which is what the few places filling one across more than
+    one block need.
+
+    Both streams at once is two of these, so where each stream goes is written
+    where it is chosen rather than folded into a mode, and two streams sharing
+    one buffer says so by passing the same one to both.
+
+    Nothing here catches anything. A call that refuses inside a capture exits
+    through SystemExit with its reason in this buffer, and whether that was the
+    answer or the fault is the caller's to say.
+    """
+    if stream not in ("out", "err"):
+        raise ValueError(f"capturing takes 'out' or 'err', not {stream!r}")
+    buffer = io.StringIO() if into is None else into
+    redirect = (contextlib.redirect_stdout if stream == "out"
+                else contextlib.redirect_stderr)
+    with redirect(buffer):
+        yield buffer
+
+
 STAGING = ".reaping-"
 
 
@@ -7122,7 +7149,7 @@ def run_complete(topic):
     claimant, a stale roster) are the ordinary state of the corpus rather than
     anything a completion should interrupt to report.
     """
-    with contextlib.redirect_stderr(io.StringIO()):
+    with capturing("err"):
         return _complete(topic)
 
 
@@ -7171,7 +7198,7 @@ def _complete(topic):
         # they were previously reachable only behind --resume.
         for group in ("names", "teams", "leads"):
             buffer = io.StringIO()
-            with contextlib.redirect_stdout(buffer):
+            with capturing("out", into=buffer):
                 run_complete(group)
             for line in buffer.getvalue().splitlines():
                 print(f"{group}\t{line}")
@@ -9470,14 +9497,14 @@ def _check_launch_enters_agent_cwd(s):
     real_cwd = RESOLVER.agent_cwd
     try:
         RESOLVER.agent_cwd = lambda ctx: str(moved)
-        with contextlib.redirect_stdout(io.StringIO()):
+        with capturing("out"):
             enter_agent_cwd({})
         went = os.path.realpath(os.getcwd()) == os.path.realpath(moved)
-        with contextlib.redirect_stdout(io.StringIO()) as quiet:
+        with capturing("out") as quiet:
             enter_agent_cwd({})
         stayed = quiet.getvalue() == ""
         RESOLVER.agent_cwd = lambda ctx: "/no-such-dir-for-a-check"
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with capturing("out"), capturing("err"):
             try:
                 enter_agent_cwd({})
                 refused = False
@@ -9513,7 +9540,7 @@ def _check_launch_baseurl_carriers(s):
             if shell_value:
                 os.environ["ANTHROPIC_BASE_URL"] = shell_value
             said = io.StringIO()
-            with contextlib.redirect_stdout(said), contextlib.redirect_stderr(io.StringIO()):
+            with capturing("out", into=said), capturing("err"):
                 launch(socket, "%0", "/tmp", ["claude", "--resume", "x"], True)
             return "-u ANTHROPIC_BASE_URL" in said.getvalue()
         finally:
@@ -9566,7 +9593,7 @@ def _check_team_fits_window(s):
                 # A launch says what it ran, which is for an operator watching
                 # one. Here it is seven fixtures, and the lines landed between
                 # the verdicts.
-                with contextlib.redirect_stdout(io.StringIO()):
+                with capturing("out"):
                     pane, _action = launch(geom_sock, placed[0] if placed else None,
                                            "/tmp", ["sleep", "30"], False)
                 placed.append(pane)
@@ -9597,7 +9624,7 @@ def _check_abort_stops_listed(s):
     running = [(v.pid, f"probe-{i}@check", "a sleep standing in for an agent", "")
                for i, v in enumerate(victims)]
     try:
-        with contextlib.redirect_stdout(io.StringIO()) as said:
+        with capturing("out") as said:
             killed = abort_agents(running, assume_yes=True)
         gone = all(not RESOLVER.pid_alive(v.pid) for v in victims)
         check("abort-stops-listed", "an abort stops what it listed", killed == 2 and gone,
@@ -9625,7 +9652,7 @@ def _check_abort_refusal_spares(s):
     real_input = globals()["input"] if "input" in globals() else None
     try:
         globals()["input"] = lambda prompt="": "n"
-        with contextlib.redirect_stdout(io.StringIO()):
+        with capturing("out"):
             killed = abort_agents([(spared.pid, "spared@check", "still working", "")])
         check("abort-refusal-spares", "answering no leaves the process alone",
               killed == 0 and RESOLVER.pid_alive(spared.pid))
@@ -10912,7 +10939,7 @@ def _check_roster_add_missing_member(s):
         RESOLVER.roster_path(team).write_text(json.dumps({
             "name": team, "leadAgentId": f"team-lead@{team}", "leadSessionId": "x",
             "members": [{"agentId": f"team-lead@{team}", "name": "team-lead"}]}))
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with capturing("out"), capturing("err"):
             register_member({"name": "newcomer", "team": team,
                              "agentId": f"newcomer@{team}"}, "%9", False, True)
         listed = [m.get("name") for m in
@@ -10952,7 +10979,7 @@ def _check_claim_carries_identity_not_seat(s):
             members = json.loads(RESOLVER.roster_path(pteam).read_text()).get("members", [])
             return next((m for m in members if m.get("agentId") == prec["agentId"]), None)
 
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with capturing("out"), capturing("err"):
             claimed_new = reserve_member(prec, False)
             on_claim = claimant_entry()
             claimed_again = reserve_member(prec, False)
@@ -11171,7 +11198,7 @@ def _check_resume_places_a_member_in_a_pane(s):
         globals().update(RESOLVER=eng, tmux=watched)
         said = io.StringIO()
         try:
-            with contextlib.redirect_stdout(said), contextlib.redirect_stderr(said):
+            with capturing("out", into=said), capturing("err", into=said):
                 try:
                     out = run_one(_Run(agent_id=agent_id, socket="claude-swarm-test",
                                        **flags), [], list(table))
@@ -11300,7 +11327,7 @@ def _check_promoted_member_resolves_by_its_receipt(s):
         real_resolver, real_receipts = globals()["RESOLVER"], globals()["RECEIPTS_DIR"]
         globals().update(RESOLVER=eng, RECEIPTS_DIR=root / "receipts")
         try:
-            with contextlib.redirect_stdout(io.StringIO()):
+            with capturing("out"):
                 run_promote(_Promote(as_=f"{into[0]}@{into[1]}"))
         finally:
             globals().update(RESOLVER=real_resolver, RECEIPTS_DIR=real_receipts)
@@ -11320,13 +11347,13 @@ def _check_promoted_member_resolves_by_its_receipt(s):
         eng.process_table = lambda refresh=False: []
         eng.session_registry = lambda: []
         agent_id = f"{PROMOTED[0]}@{PROMOTED[1]}"
-        with contextlib.redirect_stderr(io.StringIO()):
+        with capturing("err"):
             by_id = eng.identity(agent_id=agent_id)
             by_uuid = eng.identity(session_uuid=stem)
         real_resolver = globals()["RESOLVER"]
         globals()["RESOLVER"] = eng
         try:
-            with contextlib.redirect_stderr(io.StringIO()):
+            with capturing("err"):
                 sock, _why = resolve_socket(by_id, _Run(), [])
         finally:
             globals()["RESOLVER"] = real_resolver
@@ -11362,7 +11389,7 @@ def _check_promoted_member_resolves_by_its_receipt(s):
         blank_eng.projects_dir, blank_eng.teams_dir = root / "projects", root / "teams"
         blank_eng.process_table = lambda refresh=False: []
         blank_eng.session_registry = lambda: []
-        with contextlib.redirect_stderr(io.StringIO()) as refusal:
+        with capturing("err") as refusal:
             try:
                 blank_eng.identity(session_uuid=blank)
                 refused = False
@@ -11411,7 +11438,7 @@ def _check_refusal_names_a_case_near_match(s):
 
     def cased_refusal(asked):
         """What identity() printed when it refused this name, as one line."""
-        with contextlib.redirect_stderr(io.StringIO()) as told:
+        with capturing("err") as told:
             try:
                 corpus_engine().identity(agent_id=f"{asked}@session-corpus-alpha")
             except SystemExit:
@@ -11552,7 +11579,7 @@ def _check_promoted_starts_where_its_file_is(s):
         eng.teams_dir = Path(td) / "teams"
         eng.process_table = lambda refresh=False: []
         eng.session_registry = lambda: []
-        with contextlib.redirect_stderr(io.StringIO()) as quiet:
+        with capturing("err") as quiet:
             where = eng.agent_cwd(eng.identity(session_uuid=moved))
         silent = quiet.getvalue().strip() == ""
         # With that session's file gone there is nothing left that fits, and the
@@ -11562,7 +11589,7 @@ def _check_promoted_starts_where_its_file_is(s):
         stale.projects_dir, stale.teams_dir = eng.projects_dir, eng.teams_dir
         stale.process_table = lambda refresh=False: []
         stale.session_registry = lambda: []
-        with contextlib.redirect_stderr(io.StringIO()) as loud:
+        with capturing("err") as loud:
             fell_back = stale.agent_cwd(stale.identity(session_uuid=moved))
         told = " ".join(loud.getvalue().split())
         starts = {
@@ -12468,7 +12495,7 @@ def _check_explain_tags_its_sources(s):
                          ("cwd", "/tmp")):
         merged_fake.add(field, value, 1_700_000_100_000, jsonl_source)
     merged_fake.add("model", "fable", 1_600_000_000_000, roster_source)  # a conflict
-    with contextlib.redirect_stdout(io.StringIO()) as explained:
+    with capturing("out") as explained:
         explain({"merged": merged_fake,
                  "other_transcripts": [(Path("/nowhere/older.jsonl"), None, 1_500_000_000_000)]})
     told = explained.getvalue()
@@ -12670,7 +12697,7 @@ def _check_doctor_shared_fact_once(s):
             nameless_receipts=lambda: [],
             known_teams=lambda: (census_asked.append(1), {})[1])
     try:
-        with contextlib.redirect_stderr(io.StringIO()):
+        with capturing("err"):
             _v, lines_none, _r = diagnose_team("session-probe")
             _rewire(lead_pid=lambda parent, team: (
                         7717, True, "pid 7717, whose session id names team session-probe", True),
@@ -12697,7 +12724,7 @@ def _check_doctor_shared_fact_once(s):
             globals()["diagnose_team"] = (
                 lambda team, table=None, deep=False: ("CONNECTED", [], []))
             try:
-                with contextlib.redirect_stdout(io.StringIO()) as told_doc:
+                with capturing("out") as told_doc:
                     run_doctor(_DocArgs())
             finally:
                 globals()["diagnose_team"] = real_diag
@@ -12843,7 +12870,7 @@ def _check_launch_report_fits_exact(s):
     real_columns = os.environ.get("COLUMNS")
     os.environ["COLUMNS"] = "80"
     try:
-        with contextlib.redirect_stdout(io.StringIO()) as told_report:
+        with capturing("out") as told_report:
             report_launch(report_ctx, report_argv, prefix="", role="agent",
                           agent_id="someone@session-abcdef12",
                           extra=[("socket", "claude-swarm-4242  [lead pid 4242] (live)")])
@@ -12947,7 +12974,7 @@ def _check_completion_flags_are_parseable(s):
     hidden = s.hidden
 
     emitted = io.StringIO()
-    with contextlib.redirect_stdout(emitted):
+    with capturing("out", into=emitted):
         run_complete("flags")
     flag_lines = [line for line in emitted.getvalue().splitlines() if line]
     malformed = [line.split("\t")[0] for line in flag_lines
@@ -13071,7 +13098,7 @@ def _check_two_verbs_refused(s):
 
     def verbs_said(*typed):
         """What check_one_verb said about this command line, "" if it let it run."""
-        with contextlib.redirect_stderr(io.StringIO()) as told:
+        with capturing("err") as told:
             try:
                 check_one_verb(_Verbs(*typed), list(typed))
                 return ""
@@ -13123,9 +13150,9 @@ def _check_sides_sweep_folds(s):
     RESOLVER.transcript_title = lambda stem: (
         "Fixture Parent Title" if stem == "aaaa1111-fixture" else None)
     try:
-        with contextlib.redirect_stdout(io.StringIO()) as swept:
+        with capturing("out") as swept:
             run_sides()
-        with contextlib.redirect_stdout(io.StringIO()) as listed_out:
+        with capturing("out") as listed_out:
             run_sides("aaaa1111")
     finally:
         RESOLVER.side_transcripts = real_sides_fn
@@ -13325,7 +13352,7 @@ def _check_refusal_ends_the_run(s):
         """(code, did it end in a refusal, who was run) for one run_agents."""
         took_part.clear()
         jobs = [(label, _RefusalJob(label)) for label in labels]
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with capturing("out"), capturing("err"):
             try:
                 return run_agents(jobs[0][1], [], {}, jobs), False, list(took_part)
             except SystemExit as exc:
@@ -13351,7 +13378,7 @@ def _check_refusal_ends_the_run(s):
         except RuntimeError as err:
             judged = str(err)
         try:
-            with contextlib.redirect_stderr(io.StringIO()):
+            with capturing("err"):
                 audited(lambda: die("nothing to resume"))
             refused_as = "returned a code"
         except SystemExit as exc:
@@ -13485,7 +13512,7 @@ def _check_attach_only_if_server(s):
 
         class _AttachJob:
             dry_run, no_attach, attach, agent_id = False, False, False, None
-        with contextlib.redirect_stdout(io.StringIO()):
+        with capturing("out"):
             for sock in ("sock-dead", "sock-live"):
                 job = _AttachJob()
                 job.socket = sock
@@ -13512,7 +13539,7 @@ def _check_noop_says_live_location(s):
     RESOLVER.lead_pid_for = lambda uuid: (777, "x", True)
     RESOLVER.socket_hosting = lambda ids, table: (None, None)
     try:
-        with contextlib.redirect_stderr(io.StringIO()):
+        with capturing("err"):
             unseated = already_running({"session_uuid": "seat-uuid"}, _NoForceSeat,
                                        is_lead=False, agent_id="m@t", table=[])
             RESOLVER.socket_hosting = lambda ids, table: ("sock-z", "live pane of pid 9")
@@ -13552,7 +13579,7 @@ def _check_selector_found_anywhere(s):
     def check(cid, name, ok, detail=""):
         checked.append((cid, name, ok, detail))
 
-    with contextlib.redirect_stderr(io.StringIO()):
+    with capturing("err"):
         two_selectors = False
         try:
             classify_passthrough(["a@b", "c@d"])
@@ -13651,7 +13678,7 @@ def _check_stop_miss_names_target(s):
 
         def missed(**kw):
             """What --stop says, and its exit code, when nothing is running."""
-            with contextlib.redirect_stderr(io.StringIO()) as told:
+            with capturing("err") as told:
                 try:
                     stop_targets(_Sel(**kw), [])
                     return "", 0
@@ -13731,7 +13758,7 @@ def _check_forward_only_known_flags(s):
         _actions = [type("a", (), {"option_strings": ["--dry-run", "--force"]})()]
 
     def _dies(fn, *a, **kw):
-        with contextlib.redirect_stderr(io.StringIO()) as err:
+        with capturing("err") as err:
             try:
                 fn(*a, **kw)
                 return False, ""
@@ -13880,7 +13907,7 @@ def _check_lead_told_loading_before_takeover(s):
             return Outcome("manual", None, True, None)
         globals()["run_one"] = _fake_one
         globals()["report_transcript_writes"] = lambda *a, **kw: None
-        with contextlib.redirect_stdout(io.StringIO()):
+        with capturing("out"):
             job_args = _Args(no_attach=True, attach=False)
             run_agents(job_args, [], {},
                        [("m1", job_args), ("m2", job_args), ("lead", job_args)], socket="s")
@@ -13996,7 +14023,7 @@ def _check_identity_can_assemble(s):
     eng = corpus_engine()
     name, team = "willow", "session-corpus-alpha"
     try:
-        with contextlib.redirect_stderr(io.StringIO()):
+        with capturing("err"):
             assembled = eng.identity(agent_id=f"{name}@{team}")
         got = eng.field(assembled, "agentId")
         why = assembled.get("via")
@@ -14026,7 +14053,7 @@ def _check_explain_sources_named_as_objects(s):
     real_resolver = globals()["RESOLVER"]
     globals()["RESOLVER"] = eng
     try:
-        with contextlib.redirect_stdout(io.StringIO()) as legend_out:
+        with capturing("out") as legend_out:
             explain(assembled)
     finally:
         globals()["RESOLVER"] = real_resolver
@@ -14061,7 +14088,7 @@ def _check_id_name_mismatch_refused(s):
         def __init__(self, agent_id):
             self.agent_id = agent_id
 
-    with contextlib.redirect_stderr(io.StringIO()):
+    with capturing("err"):
         try:
             check_identity_flags(_Flags("auth@session-x"), ["--agent-name", "katalog"])
             refused_mismatch = False
@@ -14091,7 +14118,7 @@ def _check_launch_wears_one_identity(s):
             self.claude_bin, self.no_color = None, True
 
     mismatched = []
-    with contextlib.redirect_stderr(io.StringIO()):
+    with capturing("err"):
         for entry in RESOLVER.scan_teams():
             agent_id = entry["member"].get("agentId")
             if not agent_id:
@@ -14128,7 +14155,7 @@ def _check_bare_passes_only_the_conversation(s):
     real_resolver = globals()["RESOLVER"]
     globals()["RESOLVER"] = corpus_engine()
     try:
-        with contextlib.redirect_stderr(io.StringIO()):
+        with capturing("err"):
             who = "willow@session-corpus-alpha"
             dressed = build_command(RESOLVER.identity(agent_id=who), _Emit(who), [])
             stripped_args = _Emit(who)
@@ -14231,10 +14258,10 @@ def _check_explain_value_is_what_the_launch_emits(s):
         globals()["RESOLVER"] = lossy_eng
         printed, launched = {}, {}
         try:
-            with contextlib.redirect_stderr(io.StringIO()):
+            with capturing("err"):
                 for mate in fx_mates:
                     lossy_ctx = lossy_eng.identity(agent_id=f"{mate}@{fx_team}")
-                    with contextlib.redirect_stdout(io.StringIO()) as lossy_out:
+                    with capturing("out") as lossy_out:
                         explain(lossy_ctx)
                     printed[mate] = explained_row(lossy_out.getvalue(), "model")
                     emitted = build_command(lossy_ctx, _Emit(f"{mate}@{fx_team}"), [])
@@ -14291,7 +14318,7 @@ def _check_bare_joins_no_team(s):
     try:
         joining = _Emit(who)
         joining.bare, joining.no_update_config = True, False
-        with contextlib.redirect_stderr(io.StringIO()):
+        with capturing("err"):
             record_membership(RESOLVER.identity(agent_id=who), joining, None)
     finally:
         globals()["register_member"], globals()["ensure_inbox"] = real_reg, real_inbox
@@ -14314,13 +14341,13 @@ def _check_contradicted_stamp_refused(s):
     eng = corpus_engine()
     team = "session-corpus-contradicted"
     path, _why = eng.lead_transcript_for(team)
-    with contextlib.redirect_stderr(io.StringIO()):
+    with capturing("err"):
         found = eng.resolve_transcript(lead_session=path.stem, team=team, is_lead=True)
     contradicted = eng.objections(found, "team-lead", team)
     raised = [o for o in contradicted if o[0] == "name_mismatch"]
     spoken = ""
     if raised:
-        with contextlib.redirect_stderr(io.StringIO()) as said:
+        with capturing("err") as said:
             try:
                 enforce_identity(found, raised, allow_team_change=False, force=False)
             except SystemExit:
@@ -14371,7 +14398,7 @@ def _check_reaper_spares_resurrectable(s):
                      [{"agentId": "team-lead@session-selftest-held", "name": "team-lead"},
                       {"agentId": f"{survivor}@session-selftest-held", "name": survivor}]) \
             if survivor else None
-        with contextlib.redirect_stderr(io.StringIO()):
+        with capturing("err"):
             table = RESOLVER.process_table()
             reapable = team_keep_reason(gone, table) is None
             kept = team_keep_reason(held, table) is not None if held else True
@@ -14420,12 +14447,12 @@ def _check_cleanup_opens_with_outcome(s):
         # directory too young for its emptiness to mean anything.
         sweep_stage("session-sweep-empty", True)
         sweep_stage("session-sweep-kept", False)
-        with contextlib.redirect_stderr(io.StringIO()):
-            with contextlib.redirect_stdout(io.StringIO()) as previewed:
+        with capturing("err"):
+            with capturing("out") as previewed:
                 run_cleanup(dry=True)
-            with contextlib.redirect_stdout(io.StringIO()) as swept:
+            with capturing("out") as swept:
                 run_cleanup(dry=False)
-            with contextlib.redirect_stdout(io.StringIO()) as again:
+            with capturing("out") as again:
                 run_cleanup(dry=False)
         preview = [each for each in previewed.getvalue().splitlines() if each.strip()]
         acted = [each for each in swept.getvalue().splitlines() if each.strip()]
@@ -14474,7 +14501,7 @@ def _check_completion_lists_every_team(s):
     known = s.known
 
     offered = io.StringIO()
-    with contextlib.redirect_stdout(offered):
+    with capturing("out", into=offered):
         run_complete("teams")
     listed = {line.split(":", 1)[0] for line in offered.getvalue().splitlines() if line}
     unlisted = sorted(set(known) - listed)
@@ -14493,7 +14520,7 @@ def _check_named_lead_still_leads(s):
 
     eng = corpus_engine()
     team, uuid = "session-corpus-orphan", "44444444-4444-4444-8444-444444444444"
-    with contextlib.redirect_stderr(io.StringIO()):
+    with capturing("err"):
         assembled = eng.identity(session_uuid=uuid, for_team=team)
     check("named-lead-still-leads", "a lead with a name of its own still leads its team",
           assembled.get("leads_team") == team
@@ -14516,9 +14543,9 @@ def _check_named_team_outranks_stamps(s):
 
     eng = corpus_engine()
     other, uuid = "session-corpus-new", "55555555-5555-4555-8555-555555555555"
-    with contextlib.redirect_stderr(io.StringIO()):
+    with capturing("err"):
         stamped = eng.stamp_index().get(eng.lead_transcript_for(other)[0], (None, None))[1]
-    with contextlib.redirect_stderr(io.StringIO()):
+    with capturing("err"):
         assembled = eng.identity(session_uuid=uuid, for_team=other)
     check("named-team-outranks-stamps", "a named team outranks the stamps of an earlier life",
           assembled.get("lead_agent_id") == f"team-lead@{other}",
@@ -14653,7 +14680,7 @@ def _check_unknown_team_names_lacking_evidence(s):
 
     _Args = s._Args
 
-    with contextlib.redirect_stderr(io.StringIO()) as diag:
+    with capturing("err") as diag:
         try:
             apply_selector("session-deadbeef", _Args(resume=None, agent_id=None, team=None), {})
         except SystemExit:
@@ -14690,11 +14717,11 @@ def _check_attach_prompt_keys(s):
                 ("Ctrl-X aborts", "\x18", False, True)):
             globals()["read_one_key"] = (lambda k: (lambda: k))(key)
             aborted.clear()
-            with contextlib.redirect_stdout(io.StringIO()):
+            with capturing("out"):
                 got = confirm_attach([], {}, "sock")
             keys[name] = got == want_attach and bool(aborted) == want_abort
         sys.stdin = types.SimpleNamespace(isatty=lambda: False)
-        with contextlib.redirect_stdout(io.StringIO()) as out:
+        with capturing("out") as out:
             keys["no terminal does not prompt"] = confirm_attach([], {}, "sock") and not out.getvalue()
     finally:
         globals()["read_one_key"], globals()["abort_agents"] = real_key, real_abort
@@ -14723,8 +14750,8 @@ def _check_launch_followup_per_agent(s):
             path.write_text("x")
             os.utime(path, (1000, 1000))
         os.utime(wrote_path, None)
-        with contextlib.redirect_stdout(io.StringIO()) as out, \
-                contextlib.redirect_stderr(io.StringIO()) as err:
+        with capturing("out") as out, \
+                capturing("err") as err:
             report_transcript_writes([("wrote-one", wrote_path, 1000),
                                       ("silent-one", silent_path, 1000)], _Args(), grace=0.5)
         told = [line for line in out.getvalue().splitlines() if line.startswith("wrote")]
@@ -14733,7 +14760,7 @@ def _check_launch_followup_per_agent(s):
             "the silent one is warned about": "silent-one" in err.getvalue(),
             "and is not claimed as written": "silent-one" not in out.getvalue(),
         }
-        with contextlib.redirect_stdout(io.StringIO()) as quiet:
+        with capturing("out") as quiet:
             report_transcript_writes([], _Args(), grace=0.1)
             report_transcript_writes([("x", wrote_path, 1000)], _Args(dry_run=True), grace=0.1)
         writes["nothing to say stays silent"] = quiet.getvalue() == ""
@@ -14771,7 +14798,7 @@ def _check_swarm_offer_fallback(s):
                         else Outcome("launched", "sock", False, None))
             globals()["run_one"] = stub
             asked.clear()
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with capturing("out"), capturing("err"):
                 run_agents(_Args(), [], {}, [("lead", _Args()), ("member", _Args())], None)
             offers[label] = bool(asked) == (status == "noop")
     finally:
@@ -14801,18 +14828,18 @@ def _check_redirect_offered_not_silent(s):
                                    ("no stays put", "n", False),
                                    ("a bare return takes the offer", "", True)):
             globals()["input"] = lambda prompt="", _r=reply: _r
-            with contextlib.redirect_stdout(io.StringIO()):
+            with capturing("out"):
                 asks[label] = confirm_redirect("a@src", 1, "session-dest", "src") is want
         globals()["input"] = lambda prompt="": "y"
         RESOLVER.sole_mint_pairing = lambda pid: "session-other"
-        with contextlib.redirect_stdout(io.StringIO()) as quiet:
+        with capturing("out") as quiet:
             asks["an ambiguous pairing is not offered"] = (
                 confirm_redirect("a@src", 1, "session-dest", "src") is False
                 and quiet.getvalue() == "")
         RESOLVER.sole_mint_pairing = lambda pid: "session-dest"
         sys.stdin = types.SimpleNamespace(isatty=lambda: False)
-        with contextlib.redirect_stdout(io.StringIO()) as quiet, \
-                contextlib.redirect_stderr(io.StringIO()):
+        with capturing("out") as quiet, \
+                capturing("err"):
             asks["no terminal does not ask"] = (
                 confirm_redirect("a@src", 1, "session-dest", "src") is False
                 and quiet.getvalue() == "")
@@ -14836,8 +14863,8 @@ def _check_interrupt_answered_not_dumped(s):
     def check(cid, name, ok, detail=""):
         checked.append((cid, name, ok, detail))
 
-    with contextlib.redirect_stdout(io.StringIO()), \
-            contextlib.redirect_stderr(io.StringIO()) as said:
+    with capturing("out"), \
+            capturing("err") as said:
         def _interrupted():
             raise KeyboardInterrupt
         code = interruptible(_interrupted)
@@ -14927,7 +14954,7 @@ def _check_report_list_and_summary(s):
             for k, v in over.items():
                 setattr(_RedirArgs, k, v)
             said = io.StringIO()
-            with contextlib.redirect_stderr(said), contextlib.redirect_stdout(io.StringIO()):
+            with capturing("err", into=said), capturing("out"):
                 try:
                     auto_redirect(dict(ctx), _RedirArgs, [], "")
                     return "launched", said.getvalue()
@@ -15002,7 +15029,7 @@ def _check_terminal_declares_reach(s):
     try:
         RESOLVER.classify = lambda token: ("team", token, "a roster on disk")
         told = io.StringIO()
-        with contextlib.redirect_stderr(told), contextlib.redirect_stdout(io.StringIO()):
+        with capturing("err", into=told), capturing("out"):
             try:
                 apply_selector("session-many", _Here, [])
                 terminal.append("a team selector took this terminal")
@@ -15010,7 +15037,7 @@ def _check_terminal_declares_reach(s):
                 if "one agent" not in told.getvalue():
                     terminal.append("the refusal does not say what it wants instead")
         _Here.here = False
-        with contextlib.redirect_stdout(io.StringIO()):
+        with capturing("out"):
             apply_selector("session-many", _Here, [])
         if _Here.team != "session-many":
             terminal.append("a team selector stopped setting the team")
@@ -15255,7 +15282,7 @@ def _check_lead_member_report_parity(s):
     printed = io.StringIO()
     fake = {"session_uuid": "s-1", "transcript": [Path("/nonexistent/t.jsonl")],
             "via": "test", "placed": None}
-    with contextlib.redirect_stdout(printed):
+    with capturing("out", into=printed):
         report_launch(fake, ["claude", "--resume", "s-1"], role="lead",
                       agent_id="team-lead@t")
     if "command  claude --resume s-1" not in printed.getvalue():
@@ -15961,8 +15988,8 @@ def _check_demote_cannot_embed_self(s):
             RESOLVER.process_table = lambda: table
             said, printed = io.StringIO(), io.StringIO()
             try:
-                with contextlib.redirect_stderr(said), \
-                        contextlib.redirect_stdout(printed):
+                with capturing("err", into=said), \
+                        capturing("out", into=printed):
                     try:
                         run_demote(args)
                     except SystemExit:
@@ -16284,7 +16311,7 @@ def _check_ledger_detail_once_per_addressee(s):
         real_resolver, real_columns = globals()["RESOLVER"], os.environ.get("COLUMNS")
         globals()["RESOLVER"], os.environ["COLUMNS"] = eng6, "100"
         try:
-            with contextlib.redirect_stdout(io.StringIO()) as ledger_out:
+            with capturing("out") as ledger_out:
                 run_mail_ledger(fx_team)
         finally:
             globals()["RESOLVER"] = real_resolver
@@ -16362,7 +16389,7 @@ def _check_census_zero_note_only_when_nonzero(s):
         for arm, stamps in (("zero", stamped),
                             ("nonzero", {**stamped, Path("loose.jsonl"): ("bob", None)})):
             eng7.stamp_index = lambda stamps=stamps: stamps
-            with contextlib.redirect_stdout(io.StringIO()) as census_out:
+            with capturing("out") as census_out:
                 run_census()
             census_told[arm] = census_out.getvalue()
     finally:
@@ -16594,7 +16621,7 @@ def _check_restamp_window_start(s):
             class _Quiet:
                 force, dry_run, with_mail = False, True, False
             RESOLVER.reap_objections = lambda *a, **k: []
-            with contextlib.redirect_stdout(io.StringIO()) as out:
+            with capturing("out") as out:
                 took = rebind_reap("OLD", "NEW", _Quiet, path=target, fatal=False)
             if not (took and "reap" in out.getvalue()):
                 stray.append("an unobjected team was not reaped for the redirect")
@@ -16603,7 +16630,7 @@ def _check_restamp_window_start(s):
                  "said": "3 unread for m, oldest x"},
                 {"pid": 9, "kinds": frozenset({"wears"}), "said": "pid 9 wears it"}]
             told = io.StringIO()
-            with contextlib.redirect_stderr(told), contextlib.redirect_stdout(io.StringIO()):
+            with capturing("err", into=told), capturing("out"):
                 took = rebind_reap("OLD", "NEW", _Quiet, path=target, fatal=False)
             if took is not False:
                 stray.append("a blocked redirect claimed the move")
@@ -16812,8 +16839,8 @@ def _check_rebind_retires_if_unnoticed(s):
         real_teams = RESOLVER.teams_dir
         RESOLVER.teams_dir = eng6.teams_dir
         try:
-            with contextlib.redirect_stderr(io.StringIO()), \
-                    contextlib.redirect_stdout(io.StringIO()):
+            with capturing("err"), \
+                    capturing("out"):
                 reap_team("TEAMA")
             stored = load_receipt("TEAMA")
             if not stored or stored.get("config") != '{"name": "TEAMA", "members": []}':
@@ -16931,8 +16958,8 @@ def _check_reap_catches_a_late_write(s):
         RESOLVER.teams_dir, RESOLVER.receipt_contents = teams, landing_late
         globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
         try:
-            with contextlib.redirect_stdout(io.StringIO()), \
-                    contextlib.redirect_stderr(io.StringIO()):
+            with capturing("out"), \
+                    capturing("err"):
                 reap_team("TEAMLATE")
             stored = load_receipt("TEAMLATE")
         finally:
@@ -16991,8 +17018,8 @@ def _check_reap_aborts_on_a_write_past_the_cut(s):
         globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
         said, outcome = io.StringIO(), "returned without refusing"
         try:
-            with contextlib.redirect_stderr(said), \
-                    contextlib.redirect_stdout(io.StringIO()):
+            with capturing("err", into=said), \
+                    capturing("out"):
                 try:
                     reap_team("TEAMHELD")
                 except SystemExit:
@@ -17043,8 +17070,8 @@ def _check_reap_keeps_what_it_did_not_make(s):
         globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
         said = io.StringIO()
         try:
-            with contextlib.redirect_stderr(said), \
-                    contextlib.redirect_stdout(io.StringIO()):
+            with capturing("err", into=said), \
+                    capturing("out"):
                 reap_team("TEAMSTRAY")
             archived = load_receipt("TEAMSTRAY")
         finally:
@@ -17162,8 +17189,8 @@ def _check_demote_catches_a_late_send(s):
         RESOLVER.receipt_contents = landing_on_the_inbox
         globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
         try:
-            with contextlib.redirect_stdout(io.StringIO()), \
-                    contextlib.redirect_stderr(io.StringIO()):
+            with capturing("out"), \
+                    capturing("err"):
                 try:
                     run_demote(_MailArgs)
                 except SystemExit:
@@ -17218,7 +17245,7 @@ def _check_unread_mail_refusal_no_crash(s):
         RESOLVER.projects_dir, RESOLVER.teams_dir = Path(td), Path(td) / "teams"
         told, outcome = io.StringIO(), None
         try:
-            with contextlib.redirect_stderr(told):
+            with capturing("err", into=told):
                 try:
                     run_demote(_DemoteArgs)
                     outcome = "returned without refusing"
@@ -17497,7 +17524,7 @@ def _check_restore_reads_window_start(s):
         try:
             said = io.StringIO()
             fired = False
-            with contextlib.redirect_stderr(said):
+            with capturing("err", into=said):
                 try:
                     enforce_restore({"resolution": _RebindRes(wt), "to_team": "teamZ"},
                                     _RebindArgs)
@@ -17507,7 +17534,7 @@ def _check_restore_reads_window_start(s):
                     stray.append(f"the rebind guard crashed: {err.__class__.__name__}")
             if not (fired and "comes back as teamC" in " ".join(said.getvalue().split())):
                 stray.append("a rebind onto a restoring transcript was not refused")
-            with contextlib.redirect_stderr(io.StringIO()):
+            with capturing("err"):
                 try:
                     enforce_restore({"resolution": _RebindRes(wt), "to_team": "teamC"},
                                     _RebindArgs)
@@ -17642,7 +17669,7 @@ def _check_unresolved_team_claimed(s):
     eng = corpus_engine()
     claimed = {t: {path for _st, path in hits} for t, hits in eng.led_teams().items()}
     raw = {t for t, paths in claimed.items() if len(paths) > 1}
-    with contextlib.redirect_stderr(io.StringIO()):
+    with capturing("err"):
         unresolved = {t for t in raw if not eng.lead_transcript_for(t)[0]}
     check("unresolved-team-claimed", "an unresolved team is a claimed team",
           unresolved <= raw and "session-corpus-contested" in unresolved,
@@ -17687,7 +17714,7 @@ def _check_claimant_corroborated_by_children(s):
     claimed = {t: {path for _st, path in hits} for t, hits in eng.led_teams().items()}
     live_kids = {}
     for team, paths in claimed.items():
-        with contextlib.redirect_stderr(io.StringIO()):
+        with capturing("err"):
             found = eng.lead_transcript_for(team)
         why = (found[1] or "") if found else ""
         if "live members it spawned" not in why:
@@ -17736,7 +17763,7 @@ def _check_address_locates_evidence_places(s):
     serving, stale = "session-corpus-multiteam-b", "session-corpus-multiteam-a"
     res = eng.resolve_transcript(session_uuid=stem)
     placed = {}
-    with contextlib.redirect_stderr(io.StringIO()):
+    with capturing("err"):
         placed["as addressed with a stale team"] = eng.place(res, stale)[0] == serving
         placed["addressed with the live team"] = eng.place(res, serving)[0] == serving
         placed["--keep-team pins what was typed"] = (
@@ -17843,7 +17870,7 @@ def _check_doctor_target_honoured(s):
     real_resolver = globals()["RESOLVER"]
     globals()["RESOLVER"] = corpus_engine()
     try:
-        with contextlib.redirect_stdout(io.StringIO()) as out:
+        with capturing("out") as out:
             run_doctor(_Args(team=None, agent_id=None, all_members=False),
                       selector="session-corpus-alpha")
     finally:
@@ -17877,9 +17904,9 @@ def _check_sweep_shared_remedy_once(s):
         for team in sorted(eng.known_teams()):
             for _what, cost in diagnose_team(team)[2]:
                 wanted[cost].add(team)
-        with contextlib.redirect_stdout(io.StringIO()) as swept_doc:
+        with capturing("out") as swept_doc:
             run_doctor(_Args(team=None, agent_id=None, all_members=True))
-        with contextlib.redirect_stdout(io.StringIO()) as named_doc:
+        with capturing("out") as named_doc:
             run_doctor(_Args(team=None, agent_id=None, all_members=False),
                        selector=doctor_team)
     finally:
@@ -17965,15 +17992,15 @@ def _check_census_and_doctor_count_the_same_teams(s):
     counting.session_registry = lambda: []
     counting.process_table = lambda refresh=False: []
     try:
-        with contextlib.redirect_stdout(io.StringIO()) as census_out, \
-                contextlib.redirect_stderr(io.StringIO()):
+        with capturing("out") as census_out, \
+                capturing("err"):
             run_census()
         # Both sweeps: under --all the two numbers coincide, so only the bare
         # one says whether the second is the whole population or a repeat of
         # the first.
-        with contextlib.redirect_stdout(io.StringIO()) as pop_out:
+        with capturing("out") as pop_out:
             run_doctor(_Args(team=None, agent_id=None, all_members=True))
-        with contextlib.redirect_stdout(io.StringIO()) as some_out:
+        with capturing("out") as some_out:
             run_doctor(_Args(team=None, agent_id=None, all_members=False))
     finally:
         globals()["RESOLVER"] = real_resolver
@@ -18029,7 +18056,7 @@ def _check_verdict_names_actionable(s):
         verdicts = {}
         for team in sorted(eng.live_teams()):
             try:
-                with contextlib.redirect_stderr(io.StringIO()):
+                with capturing("err"):
                     verdict, lines, _rem = diagnose_team(team, table)
             except BaseException as exc:  # a diagnosis that crashes is a failed one
                 verdicts[team] = f"diagnosis raised {type(exc).__name__}"
@@ -18166,7 +18193,7 @@ def _check_degraded_arms_named_and_remedied(s):
             eng.process_table = lambda refresh=False, rows=rows: rows
             eng.socket_hosting = hosting
             try:
-                with contextlib.redirect_stderr(io.StringIO()):
+                with capturing("err"):
                     verdict, lines, rem = diagnose_team(crew, rows)
             except BaseException as exc:  # a diagnosis that crashes is a failed one
                 arms[arm] = f"diagnosis raised {type(exc).__name__}"
@@ -18217,7 +18244,7 @@ def _check_unseated_member_said_not_judged(s):
                                                  else (None, None)))):
             eng.socket_hosting = hosting
             try:
-                with contextlib.redirect_stderr(io.StringIO()):
+                with capturing("err"):
                     blocks[arm] = diagnose_team(crew, crew_rows)
             except BaseException as exc:  # a diagnosis that crashes is a failed one
                 blocks[arm] = (f"diagnosis raised {type(exc).__name__}", [], [])
@@ -18264,8 +18291,8 @@ def _check_standing_says_the_seat(s):
                     f"22222222-2222-4222-8222-222222222222 --agent-id petrel@{crew}")]
     dossier = io.StringIO()
     try:
-        with contextlib.redirect_stderr(io.StringIO()), \
-                contextlib.redirect_stdout(dossier):
+        with capturing("err"), \
+                capturing("out", into=dossier):
             run_standing(_Args(agent_id=f"petrel@{crew}"))
     except BaseException as exc:  # a dossier that crashes is a failed one
         dossier.write(f"seat     dossier raised {type(exc).__name__}\n")
@@ -18303,10 +18330,10 @@ def _check_own_lineage_wearer_is_live(s):
     try:
         seat = eng.seat_of(f"petrel@{crew}", mine_row)
         halves = eng.wearers(f"petrel@{crew}", mine_row)
-        with contextlib.redirect_stderr(io.StringIO()):
+        with capturing("err"):
             verdict_mine, mine_lines, _rem = diagnose_team(crew, mine_row)
-        with contextlib.redirect_stderr(io.StringIO()), \
-                contextlib.redirect_stdout(dossier):
+        with capturing("err"), \
+                capturing("out", into=dossier):
             run_standing(_Args(agent_id=f"petrel@{crew}"))
     except BaseException as exc:  # a report that crashes is a failed one
         seat, halves, mine_lines = (f"raised {type(exc).__name__}", ([], []), [])
@@ -18355,7 +18382,7 @@ def _check_connected_legend_claims_what_it_tested(s):
                     "--agent-id team-lead@session-corpus-multiteam-b")]
     eng.inbox_state = lambda team: {"team-lead": (3, "2026-01-01T00:00:00Z")}
     try:
-        with contextlib.redirect_stderr(io.StringIO()):
+        with capturing("err"):
             verdict, lines, _rem = diagnose_team("session-corpus-multiteam-b")
     finally:
         globals()["RESOLVER"] = real_resolver
@@ -18387,7 +18414,7 @@ def _check_no_grade_without_an_answer(s):
                     "--agent-id team-lead@session-corpus-multiteam-b")]
     eng.team_minted_by = lambda pid: (None, False)
     try:
-        with contextlib.redirect_stderr(io.StringIO()):
+        with capturing("err"):
             _v, ungraded, _r = diagnose_team("session-corpus-multiteam-b")
     finally:
         globals()["RESOLVER"] = real_resolver
@@ -18411,8 +18438,8 @@ def _check_no_duplicate_launch_in_run(s):
 
     said = ""
     try:
-        with contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(io.StringIO()) as err:
+        with capturing("out"), \
+                capturing("err") as err:
             run_agents(_Args(), [], {}, [("twin", _Args()), ("twin", _Args())], None)
     except BaseException:  # a crash is not a refusal, and must not read as one
         said = err.getvalue()
@@ -18572,7 +18599,7 @@ def _check_identity_gate_refuses_mismatch(s):
     team = s.team
 
     try:
-        with contextlib.redirect_stderr(io.StringIO()):  # the refusal is the point, not its noise
+        with capturing("err"):  # the refusal is the point, not its noise
             enforce_identity(res, eng.objections(res, "definitely-not-" + name, team),
                              allow_team_change=False, force=False)
         check("identity-gate-refuses-mismatch", "identity gate refuses a mismatch", False, "it allowed one")
@@ -18594,7 +18621,7 @@ def _check_identity_judged_not_enforced(s):
 
     judged, raised = None, None
     try:
-        with contextlib.redirect_stderr(io.StringIO()):
+        with capturing("err"):
             judged = eng.identity(agent_id=f"{name}@definitely-not-{team}")
     except SystemExit as exc:
         raised = exc
@@ -18617,7 +18644,7 @@ def _check_override_evidence_direction(s):
     seen_dirs, wrong = set(), []
     for other, uuid in (("session-corpus-new", "55555555-5555-4555-8555-555555555555"),
                         ("session-corpus-rebound-old", "7ebc7ebc-7ebc-47bc-87bc-7ebc7ebc7ebc")):
-        with contextlib.redirect_stderr(io.StringIO()):
+        with capturing("err"):
             res = eng.resolve_transcript(session_uuid=uuid)
         steam = res.stamped("teamName") if res else None
         why = next((w for kind, _s, _w2, w in eng.objections(res, None, other)
@@ -18701,7 +18728,7 @@ def _check_mail_mid_removal_not_deleted(s):
 
         real_teams = RESOLVER.teams_dir
         RESOLVER.scaffolding_objection, RESOLVER.teams_dir = racing, base
-        with contextlib.redirect_stderr(io.StringIO()):  # the refusal is the point
+        with capturing("err"):  # the refusal is the point
             removed = remove_if_cruft(race, False, "team")
         RESOLVER.scaffolding_objection, RESOLVER.teams_dir = real_reason, real_teams
         check("mail-mid-removal-not-deleted", "mail arriving mid-removal is not deleted",
@@ -18709,7 +18736,7 @@ def _check_mail_mid_removal_not_deleted(s):
 
         # one row per agent, even when several rosters claim the name
         buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer):
+        with capturing("out", into=buffer):
             run_complete("names")
         names = [line.split("\t")[1].split("@", 1)[0] for line in buffer.getvalue().splitlines() if line]
         check("completion-agent-once", "completion offers each agent once", len(names) == len(set(names)),
@@ -18738,7 +18765,7 @@ def _check_completion_parses_leads(s):
 
     for topic in ("names", "teams", "leads", "sockets", "sessions", "sides"):
         buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer):
+        with capturing("out", into=buffer):
             run_complete(topic)
         lines = [line for line in buffer.getvalue().splitlines() if line]
         malformed = [line for line in lines if "\t" not in line and ":" not in line]
@@ -18830,7 +18857,7 @@ def _check_asking_is_not_resuming(s):
     globals()["RESOLVER"] = eng
     said = io.StringIO()
     try:
-        with contextlib.redirect_stderr(said):
+        with capturing("err", into=said):
             uncorroborated = [t for t in eng.known_teams()
                               if "uncorroborated" in (eng.lead_transcript_for(t)[1] or "")]
             for team in uncorroborated:
@@ -18889,6 +18916,67 @@ def _check_fixture_line_one_spelling(s):
         if inside:
             forked.append(f"{inside[0]} spells a fixture line itself at line {node.lineno}")
     check("fixture-line-one-spelling", "a fixture transcript's records are written one way",
+          not forked, "; ".join(sorted(set(forked))[:3]))
+    return checked
+
+
+@unit(("output-taken-one-way", "this process's own output is taken in one place"))
+def _check_output_taken_one_way(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    ast = s.ast
+    funcs = s.funcs
+    tree = s.tree
+
+    forked = []
+    owner = funcs.get("capturing")
+    # The redirects capturing reaches for, read off its own body, then looked
+    # for everywhere else. A block that redirects a stream itself is a second
+    # place deciding where this process's output goes.
+    reaches = {node.attr for node in (ast.walk(owner) if owner else ())
+               if isinstance(node, ast.Attribute) and node.attr.startswith("redirect_")}
+    if not owner:
+        forked.append("capturing is gone, so nothing owns where the output goes")
+    elif not reaches:
+        forked.append("capturing redirects nothing, so there is no spelling to hold")
+    else:
+        # Put to capturing itself: what it takes, what it hands back, what it
+        # leaves alone, and that a stream it does not know is refused rather
+        # than quietly captured nowhere.
+        with capturing("out") as said:
+            print("taken")
+        with capturing("err") as grumbled:
+            print("also taken", file=sys.stderr)
+        kept = io.StringIO()
+        with capturing("out", into=kept):
+            print("into the caller's own")
+        for asked, got, want in (("out", said.getvalue(), "taken\n"),
+                                 ("err", grumbled.getvalue(), "also taken\n"),
+                                 ("into", kept.getvalue(), "into the caller's own\n")):
+            if got != want:
+                forked.append(f"capturing {asked} gives {got!r}, not {want!r}")
+        try:
+            with capturing("stdout"):
+                pass
+        except ValueError:
+            pass
+        else:
+            forked.append("a stream capturing does not know is taken anyway")
+
+        spans = [(fn.lineno, fn.end_lineno or fn.lineno, fn.name)
+                 for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)]
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Attribute) and node.attr in reaches):
+                continue
+            if owner.lineno <= node.lineno <= (owner.end_lineno or owner.lineno):
+                continue
+            inside = sorted(span for span in spans if span[0] <= node.lineno <= span[1])
+            forked.append(f"{inside[-1][2] if inside else '<module>'} redirects a "
+                          f"stream itself at line {node.lineno}")
+    check("output-taken-one-way", "this process's own output is taken in one place",
           not forked, "; ".join(sorted(set(forked))[:3]))
     return checked
 
@@ -19298,7 +19386,7 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=N
         # Captured rather than silenced, so the check below can say the tier was
         # noisy instead of the noise merely vanishing.
         said = io.StringIO()
-        with contextlib.redirect_stdout(said):
+        with capturing("out", into=said):
             results, register = (_live_in_parallel(jobs) if jobs > 1
                                  else live_checks(share, child))
         if jobs > 1:
