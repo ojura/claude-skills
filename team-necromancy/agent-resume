@@ -2098,6 +2098,56 @@ class Resolver:
             return None, False, raw
         return owner, not self.pid_alive(owner["pid"], owner["procStart"]), raw
 
+    def lock_objection(self, lock):
+        """Why this roster lock stops its team's directory from being removed,
+        or None when nothing about it does.
+
+        The sweep removes a whole team directory, and the lock is one of the
+        names inside it, so a reap that never asked about the lock would take it
+        away from whoever is inside it, along with the roster that writer is part
+        way through changing. Whether a team can still be resurrected and whether
+        something is writing its roster right now are independent facts, and only
+        the first of them was ever asked.
+
+        The answer comes from lock_holder, which is what a roster write waits on
+        too, so the sweep and the writer cannot reach different conclusions about
+        who holds a lock.
+
+        A directory here is the harness's, made by proper-lockfile, which mkdirs
+        at this path and never writes a file. It clears its own with rmdir when
+        it next wants the lock, so one it is inside and one it abandoned are both
+        its to keep and its to clear.
+
+        A record naming a live process is a run of this tool inside team_lock.
+
+        A record naming a process that is gone objects to nothing: the record is
+        the proof that no writer is left, and sweep_dead_lock unlinks exactly
+        this file in a directory the sweep keeps, so calling it an objection
+        would keep a whole directory standing on the strength of a leftover this
+        tool already removes.
+
+        A regular file carrying no record this tool can read means either a run
+        between the exclusive create and the write that publishes its record, or
+        one killed inside that gap. The bytes are identical either way, so
+        nothing here can tell them apart, and it objects. team_lock waits for one
+        rather than taking it and sweep_dead_lock leaves one alone however old it
+        is; removing the directory would unlink that same file as one of its
+        entries. Keeping costs one stale directory that nothing else was going to
+        clean anyway. Removing costs a roster deleted under the run writing it.
+        """
+        if lock.is_dir():
+            return f"{lock.name} is a directory, which is the harness's own lock on this roster"
+        owner, gone, seen = self.lock_holder(lock)
+        if seen is not None:
+            if owner:
+                return None if gone else f"{lock.name} is held by pid {owner['pid']}, which is running"
+            return (f"{lock.name} carries no owner record, so a run of this tool is either "
+                    "inside it or was killed inside it")
+        # Not a directory and not a file whose bytes can be read: nothing at that
+        # name at all, or a socket, a fifo, a file this user may not open.
+        # Only the first of those lets the directory go.
+        return None if not lock.exists() else f"{lock.name} is not a regular file"
+
     def inbox_path(self, team, name):
         """Where this member's mailbox lives."""
         return self.inboxes_in(self.team_dir(team)) / f"{name}.json"
@@ -2165,15 +2215,25 @@ class Resolver:
     def scaffolding_objection(self, team_dir):
         """What in this directory is NOT pure scaffolding, or None if nothing is.
 
-        Both halves of what a team dir holds, answered together because the
+        Three arms of what a team dir holds, answered together because the
         reaper needs one verdict: the roster arm (is there a config.json, and
-        does it read as a roster) and the mailbox arm (is every inbox a real
-        mailbox, and is every mailbox empty). Every entry must be something
-        this tool or the harness is known to create, from SCAFFOLDING, and
-        known to be contentless. Anything unrecognised, anything nested, any
-        symlink, and any inbox holding mail means the directory is spared.
+        does it read as a roster), the mailbox arm (is every inbox a real
+        mailbox, and is every mailbox empty), and the lock arm (may this team's
+        roster lock be taken away). Every entry must be something this tool or
+        the harness is known to create, from SCAFFOLDING, and known to be
+        contentless. Anything unrecognised, anything nested, any symlink, any
+        inbox holding mail, and any lock a writer may still be inside means the
+        directory is spared.
+
+        The lock arm is what stops a reap from deleting a lock out from under a
+        live writer. Being past resurrecting says nothing about whether
+        something is writing the roster right now; the sweep asked only the
+        first question and then removed config.json.lock along with everything
+        else, as an ordinary entry of the directory, because that name is in
+        SCAFFOLDING.
         """
         known = SCAFFOLDING
+        lock = self.lock_for(self.roster_in(team_dir))
         try:
             entries = list(team_dir.iterdir())
         except OSError as exc:
@@ -2184,6 +2244,11 @@ class Resolver:
                 return f"{item.name} is a symlink"
             if item.name not in known:
                 return f"unexpected entry {item.name!r}"
+            if item.name == lock.name:
+                held = self.lock_objection(item)
+                if held:
+                    return held
+                continue
             if item.name != "inboxes":
                 if not item.is_file():
                     return f"{item.name} is not a regular file"
@@ -7873,6 +7938,32 @@ def remove_if_cruft(path, dry, kind):
     # Take the directory out of reach with an atomic rename, THEN re-prove it,
     # so a writer racing us either lands before the rename (and is seen) or
     # finds the path gone. Anything unexpected is put straight back.
+    #
+    # The roster lock is part of that re-prove now that scaffolding_objection
+    # asks who holds it, and the timing is worth spelling out. The check above
+    # runs before the rename, so a run of this tool can take the lock between the
+    # two; the re-prove asks the staged copy the same question, and a lock taken
+    # before the rename is seen whether or not its record was published yet,
+    # since a file with no record objects as well. Measured, both of them, by
+    # writing the lock from inside the pre-rename check.
+    #
+    # A writer that had not created its file by the time of the rename is not
+    # seen, and does not need to be: its exclusive create then resolves a
+    # directory that is no longer at that path, so it never takes a lock inside
+    # what is about to be deleted. team_lock catches that ENOENT with the OSError
+    # arm it already has and refuses by name, saying the roster is unchanged,
+    # which it is. A writer arriving through edit_team_config recreates the
+    # directory first and then finds no roster in it, so it refuses there
+    # instead; only forge_team passes `create`, and that one means to write a
+    # roster where there is none.
+    #
+    # What is left is the interval between the re-prove and the unlink loop.
+    # drop_lock has an interval of the same kind before its own unlink and
+    # narrows it by comparing the bytes it read against the bytes still at that
+    # name; the loop below has no equivalent, because it deletes whatever entries
+    # the staged directory holds rather than one file it read. Closing it needs
+    # the sweep to hold this team's lock across the check, the rename and the
+    # delete, which changes how the sweep takes locks and is not done here.
     staged = staged_path(path)
     try:
         os.rename(path, staged)
@@ -13344,13 +13435,16 @@ def _check_preview_line_counterpart(s):
 
 @unit(('lock-verdict-one-place', 'whether a roster lock may be taken away is decided in one place'))
 def _check_lock_verdict_one_place(s):
-    """Two callers remove this lockfile and they must never disagree.
+    """Three places act on this lockfile and they must never disagree.
 
-    A roster write takes the lock over when the run that left it is gone, and
-    the startup sweep clears the same leftover when nothing ever wants that
-    team's lock again. A private second answer in either of them is how the
-    sweep ends up removing a lock a live run is inside, so the question is the
-    engine's and the removal is one actor both of them call.
+    A roster write takes the lock over when the run that left it is gone, the
+    startup sweep clears the same leftover when nothing ever wants that team's
+    lock again, and the sweep's keep-check asks whether anything is inside the
+    lock before removing the directory it sits in. A private second answer in
+    any of them is how the sweep ends up removing a lock a live run is inside,
+    so the question is the engine's and the removal is one actor both removers
+    call. lock_objection asks the question and never reaches that actor, because
+    it removes nothing.
     """
     checked = []
 
@@ -13372,16 +13466,17 @@ def _check_lock_verdict_one_place(s):
                      if isinstance(sub, ast.Constant) and sub.value == "config.json.lock")
     if spelled:
         forked.append("the lockfile is named outside the engine at " + ", ".join(spelled))
-    for question, want in (("lock_holder", {"team_lock", "sweep_dead_lock"}),
-                           ("drop_lock", {"team_lock", "sweep_dead_lock"})):
+    for question, want in (("lock_holder", {"team_lock", "sweep_dead_lock", "lock_objection"}),
+                           ("drop_lock", {"team_lock", "sweep_dead_lock"}),
+                           ("lock_objection", {"scaffolding_objection"})):
         asked = callers_of(question) - s.suite_fns
         if asked != want:
             forked.append(f"{question} is reached from {sorted(asked)}, not from "
                           f"{sorted(want)}")
-    for named in ("team_lock", "sweep_dead_lock", "drop_lock"):
+    for named in ("team_lock", "sweep_dead_lock", "drop_lock", "lock_objection"):
         node = funcs.get(named)
         if node is None:
-            forked.append(f"{named} is gone, so the pair this holds together is not there")
+            forked.append(f"{named} is gone, so the set this holds together is not there")
         elif "pid_alive" in {getattr(sub.func, "attr", None) for sub in ast.walk(node)
                              if isinstance(sub, ast.Call)}:
             forked.append(f"{named} tests the owner's liveness itself")
@@ -15911,6 +16006,113 @@ def _check_cleanup_clears_our_own_dead_lock(s):
     check("cleanup-keeps-a-lock-that-is-not-ours-to-clear",
           "the sweep leaves every other lock exactly where it is",
           all(kept.values()), ", ".join(sorted(k for k, ok in kept.items() if not ok)))
+    return checked
+
+
+@unit(('sweep-spares-a-held-lock',
+       "a team whose roster lock a writer may be inside is not swept"))
+def _check_sweep_spares_a_held_lock(s):
+    """The other half of the lock question: not whether the lock may go, whether
+    the directory around it may.
+
+    A team can be past resurrecting and still have a run of this tool writing its
+    roster, and until the lock became an objection the sweep removed the whole
+    directory, config.json.lock included, without asking who was inside it. Four
+    lock shapes in four teams the sweep would otherwise take, in one sweep,
+    because what is worth proving is which three it now keeps and that it still
+    takes the fourth.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    tempfile = s.tempfile
+
+    held_sweep = Path(tempfile.mkdtemp())
+    real_teams_dir, real_sockets = RESOLVER.teams_dir, RESOLVER.dead_sockets
+    aged = time.time() - 86400
+    try:
+        RESOLVER.teams_dir = held_sweep
+        RESOLVER.dead_sockets = lambda: []   # this fixture is about team dirs
+
+        def unresurrectable(name, shape):
+            """A team nothing can bring back, holding a lock of this shape.
+
+            Nothing live runs as it, neither its lead nor its member resolves to
+            a transcript, and every mtime is a day old, so the only thing left
+            between it and the sweep is what its lock says.
+            """
+            team_dir = held_sweep / name
+            (team_dir / "inboxes").mkdir(parents=True)
+            (team_dir / "inboxes" / "team-lead.json").write_text("[]")
+            RESOLVER.roster_path(name).write_text(json.dumps(
+                {"name": name, "leadAgentId": agent_id_of("team-lead", name),
+                 "leadSessionId": "no-such-session-uuid",
+                 "members": [{"agentId": agent_id_of("team-lead", name), "name": "team-lead"},
+                             {"agentId": agent_id_of("nobody-here-at-all", name),
+                              "name": "nobody-here-at-all"}]}))
+            lock = RESOLVER.lock_for(RESOLVER.roster_path(name))
+            if shape is None:
+                lock.mkdir()      # the shape the harness's own lock helper makes
+            else:
+                lock.write_bytes(shape)
+            # The directory last: writing into it is what set its mtime, and its
+            # mtime is what the sweep's grace period reads.
+            for path in (lock, RESOLVER.roster_path(name),
+                         team_dir / "inboxes" / "team-lead.json",
+                         team_dir / "inboxes", team_dir):
+                os.utime(path, (aged, aged))
+            return team_dir
+
+        ours = {"tool": TOOL, "pid": os.getpid()}
+        planted = [unresurrectable("session-held-live", json.dumps(
+                       {**ours, "procStart": RESOLVER.proc_start(os.getpid())}).encode()),
+                   unresurrectable("session-held-empty", b""),
+                   unresurrectable("session-held-dir", None),
+                   unresurrectable("session-held-dead",
+                                   json.dumps({**ours, "procStart": "1"}).encode())]
+
+        with capturing("err"):
+            with capturing("out") as previewed:
+                run_cleanup(dry=True)
+            with capturing("out") as swept:
+                run_cleanup(dry=False)
+        # Wrapped for a terminal on the way out, so the words are read back as
+        # one run of them rather than at whatever width this ran under.
+        preview = " ".join(previewed.getvalue().split())
+        acted = " ".join(swept.getvalue().split())
+        # Read before the fixture goes, or every answer below says "not there"
+        # because the tree was removed rather than because the sweep took it.
+        standing = {team.name: team.is_dir() for team in planted}
+    finally:
+        RESOLVER.teams_dir, RESOLVER.dead_sockets = real_teams_dir, real_sockets
+        shutil.rmtree(held_sweep, ignore_errors=True)
+
+    spared = {
+        "a lock a live run holds keeps its team": standing["session-held-live"],
+        "and the preview says who holds it":
+            f"keeping session-held-live: config.json.lock is held by pid {os.getpid()}, "
+            "which is running" in preview,
+        "a lock with no owner record keeps its team": standing["session-held-empty"],
+        "and the preview says why":
+            "keeping session-held-empty: config.json.lock carries no owner record, so a "
+            "run of this tool is either inside it or was killed inside it" in preview,
+        "the harness's own lock keeps its team": standing["session-held-dir"],
+        "and the preview names the harness":
+            "keeping session-held-dir: config.json.lock is a directory, which is the "
+            "harness's own lock on this roster" in preview,
+        "none of the three is named as removed":
+            not any(name in acted for name in ("session-held-live", "session-held-empty",
+                                               "session-held-dir")),
+        "a lock whose owner is gone keeps nothing": not standing["session-held-dead"],
+        "and the sweep says which team it took": "session-held-dead" in acted,
+        "the outcome still comes before the reasons":
+            preview.startswith("would remove 1 empty team(s): session-held-dead"),
+    }
+    check("sweep-spares-a-held-lock",
+          "a team whose roster lock a writer may be inside is not swept",
+          all(spared.values()), ", ".join(sorted(k for k, ok in spared.items() if not ok)))
     return checked
 
 

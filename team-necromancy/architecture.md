@@ -128,7 +128,12 @@ channel between the leader and an out-of-process teammate:
   the file and writing its record leaves an empty file nothing can judge, and
   nothing removes it automatically: the harness cannot, and this tool will not,
   because removing an unreadable lock on sight would take the lock away from a
-  live run in the microseconds before it publishes its record. Preparing the
+  live run in the microseconds before it publishes its record. That window also
+  decides a sweep, because `--cleanup` removes a whole team directory and would
+  unlink the lock as one of its entries: a lock whose recorded owner is alive,
+  a lock carrying no record this tool can read, and the harness's own directory
+  each keep the directory standing, and only a lock whose recorded owner is
+  gone lets it go. Preparing the
   record in a temporary file and taking the name with a hard link would close
   that window without changing protocols, and is not built. And a remover
   compares the record it read against the file's bytes immediately before
