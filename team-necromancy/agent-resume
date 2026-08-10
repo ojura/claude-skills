@@ -1830,6 +1830,16 @@ class Resolver:
             return False
         return procstart in (None, "", st)
 
+    def proc_start(self, pid):
+        """The start time the kernel records for this pid, or "" for one we
+        cannot read.
+
+        The other half of the identity pid_alive checks: anything writing a pid
+        down for a later run to test asks here for the value to write beside it,
+        so both sides of that test come from one parser.
+        """
+        return self._proc_stat(pid)[2] or ""
+
     def state_note(self, pid):
         """Suffix for a pid we are reporting as alive, when it needs a nudge."""
         state = self._proc_stat(pid)[0]
@@ -6042,34 +6052,122 @@ def forge_team(ctx, dry, evidence=None, team=None):
         ctx["lead_agent_id"] = matches[0].get("leadAgentId")
 
 
+# How long a roster write waits for the lockfile before refusing. The harness
+# takes this same lock through proper-lockfile with stale=10s, which is that
+# protocol's own statement of how long a hold may go unrefreshed before it
+# counts as abandoned. Nothing the harness does comes near it: every mutator it
+# hands updateTeamFile is synchronous, and a spawn happens between two separate
+# locked writes rather than inside one, so its hold is a read of the roster and
+# a write of it. Ten seconds is therefore well past any hold its code can
+# produce, and waiting longer only postpones a refusal that is already decided.
+# The harness itself waits about 0.65s on this lock (retries 10, 5ms to 100ms)
+# and then gives up, so this is the patient side of the two.
+LOCK_WAIT_S = 10.0
+
+
+def lock_owner(lock):
+    """The owner record this tool wrote into a lockfile, or None if it did not
+    write it.
+
+    None is every shape that is not one of ours: a directory, which is what the
+    harness's own lock helper makes at this path, an empty file, bytes that are
+    not our JSON, and a record missing either half of the process identity. That
+    is the whole difference between a lock we may reason about and one we may
+    only wait for, so it is decided here once.
+
+    An incomplete record reads as somebody else's on purpose. The pid alone
+    cannot be checked safely, because pid numbers are reused, so a record whose
+    start time did not survive the write is worth no more than no record at all.
+    """
+    try:
+        owner = json.loads(lock.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(owner, dict) or owner.get("tool") != TOOL:
+        return None
+    if not isinstance(owner.get("pid"), int) or not isinstance(owner.get("procStart"), str):
+        return None
+    return owner if owner["procStart"] else None
+
+
 @contextlib.contextmanager
-def team_lock(cfg, timeout=5.0):
+def team_lock(cfg, timeout=LOCK_WAIT_S):
     """Hold the roster's config.json.lock, the same lockfile the harness's own
     locked write helper uses (architecture.md). Without it, patching the roster
     of a live lead races that lead's own spawn and shutdown writes, and one of
-    the two updates is simply lost."""
+    the two updates is simply lost.
+
+    Not getting the lock refuses. The caller's whole read-modify-write happens
+    inside this block, so entering it unlocked would be a deliberate race for
+    exactly the case the lock exists for: two real writers contending, one
+    change silently dropped. A roster left alone is recoverable; a roster
+    holding half of two writes is not.
+
+    What we hold is a regular file carrying our pid and that process's start
+    time. The harness cannot see those bytes: its helper only ever mkdirs,
+    stats, utimes and rmdirs this path, and never opens it (proper-lockfile,
+    read out of the 2.1.220 bundle). It also never writes anything there
+    itself, which is what makes the record decisive below. The same asymmetry
+    is why the recovery below has to exist: the harness clears a lock it
+    considers stale with rmdir, and rmdir on a regular file answers ENOTDIR,
+    so a lock this tool leaves behind after a kill is nobody's to clear but
+    ours.
+    """
     lock = cfg.with_name("config.json.lock")
-    deadline = time.time() + timeout
-    handle = None
+    started = time.time()
+    handle, said_waiting = None, False
     while handle is None:
         try:
             handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
-            if time.time() > deadline:
-                warn(f"{lock.name} held by someone else for {timeout}s; writing anyway")
-                break
+            owner = lock_owner(lock)
+            # This is the harness's lockfile as much as ours, and the harness
+            # puts no owner in it, so a lock with none is most likely the
+            # harness holding it legitimately and is never removed, whatever
+            # its age. Only a lock carrying our own record is even a candidate,
+            # and then only when the process it names is provably gone: same
+            # pid, same start time, so a reused pid number cannot answer for a
+            # stranger. Anything else is waited for.
+            if owner and not RESOLVER.pid_alive(owner["pid"], owner["procStart"]):
+                try:
+                    lock.unlink()
+                except OSError:
+                    # Judged stale and still there: another run removed it first,
+                    # or this one is not allowed to. Fall through to the wait, so
+                    # a steal that cannot finish ends at the deadline like any
+                    # other lock we could not get instead of spinning on it.
+                    pass
+                else:
+                    warn(f"{lock.name} was left by pid {owner['pid']}, which is gone; taking it over")
+                    continue
+            held = f"pid {owner['pid']}" if owner else "another writer"
+            # Who that other writer is, as far as anything here can tell, and
+            # the reason this run will not simply take the lock from it.
+            whose = "" if owner else (" It left no owner record, which this tool always "
+                                      "writes and the harness never does, so the holder "
+                                      "is most likely the harness itself.")
+            if time.time() - started > timeout:
+                die(f"{lock} is held by {held} and did not come free in {timeout:g}s; "
+                    f"{cfg.name} is unchanged, so no other writer's change was lost."
+                    f"{whose} Run this again once that writer is done")
+            if not said_waiting and time.time() - started > 1.0:
+                # A wait this long is worth explaining while it happens rather
+                # than accounting for afterwards.
+                warn(f"waiting for {lock.name}, held by {held}")
+                said_waiting = True
             time.sleep(0.05)
-        except OSError:
-            break  # unwritable dir: the write below will report the real error
+        except OSError as exc:
+            die(f"cannot take {lock} ({exc}); {cfg.name} is unchanged")
     try:
+        os.write(handle, json.dumps({"tool": TOOL, "pid": os.getpid(),
+                                     "procStart": RESOLVER.proc_start(os.getpid())}).encode())
         yield
     finally:
-        if handle is not None:
-            os.close(handle)
-            try:
-                lock.unlink()
-            except OSError:
-                pass
+        os.close(handle)
+        try:
+            lock.unlink()
+        except OSError:
+            pass
 
 
 _BACKED_UP = set()
@@ -6675,9 +6773,23 @@ def reserve_membership(ctx, args):
 
 
 def release_membership(record, args):
-    """Give back a claim whose launch never happened. No record, nothing to give."""
-    if record:
+    """Give back a claim whose launch never happened. No record, nothing to give.
+
+    A roster that refuses the write keeps the claim, and nothing here can change
+    that: taking the entry out needs the same lock that was refused. So the
+    refusal is reported rather than raised. The caller is on its way to say why
+    the launch failed, which is what the reader is here for, and a refusal
+    thrown over the top of it would replace that with a message about a file.
+    The entry left behind is named instead, so both facts arrive.
+    """
+    if not record:
+        return
+    try:
         release_member(record, args.dry_run)
+    except Refusal:
+        warn(f"{record['agentId']} stays listed in "
+             f"{RESOLVER.roster_path(record.get('team'))}, claimed for a launch that did "
+             "not happen; resuming that member again takes the entry over")
 
 
 def report_launch(ctx, command, prefix="", role="agent", agent_id=None, extra=()):
@@ -7138,9 +7250,15 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             except OSError as exc:
                 # exec replaces this process or it does not happen at all, so
                 # reaching here means the member the roster was just told about
-                # does not exist. Take the claim back before failing.
+                # does not exist. Take the claim back before failing, and if the
+                # roster refuses that too, say what is left listed and still end
+                # in the exec error: that is the failure the reader came for.
                 if ctx.get("to_team"):
-                    retire_member(ctx, False)
+                    try:
+                        retire_member(ctx, False)
+                    except Refusal:
+                        warn(f"{ctx['team_entry']['cfg']} still lists {agent_id} as "
+                             "active, for a process that never started")
                 die(f"cannot exec {command[0]}: {exc}")
 
     try:
@@ -11177,6 +11295,182 @@ def _check_release_gives_the_claim_back(s):
     check("release-gives-the-claim-back",
           "releasing a claim removes the entry it inserted",
           after_release is None, f"after release {after_release}")
+    return checked
+
+
+@unit(('lock-refused-leaves-the-roster-alone', 'a roster whose lock cannot be taken is left byte for byte'),
+      ('lock-without-an-owner-is-never-taken', 'a lock carrying no owner record is waited for, never taken'),
+      ('lock-left-by-a-dead-run-is-taken', 'a lock whose recorded owner is gone is taken, and the run says so'),
+      ('lock-of-a-live-owner-is-kept', 'a lock whose recorded owner is still running is left alone'))
+def _check_team_lock_fails_closed(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    tempfile = s.tempfile
+
+    lock_base = Path(tempfile.mkdtemp())
+    real_teams_dir = RESOLVER.teams_dir
+    real_lock = globals()["team_lock"]
+    try:
+        RESOLVER.teams_dir = lock_base
+        lteam = "session-lockcheck"
+        (lock_base / lteam / "inboxes").mkdir(parents=True)
+        lcfg = RESOLVER.roster_path(lteam)
+        lcfg.write_text(json.dumps({
+            "name": lteam, "leadAgentId": f"team-lead@{lteam}", "leadSessionId": "x",
+            "members": [{"agentId": f"team-lead@{lteam}", "name": "team-lead"}]}))
+        untouched = lcfg.read_bytes()
+        lock = lcfg.with_name("config.json.lock")
+
+        def add_a_member(data):
+            data["members"].append({"agentId": f"late@{lteam}", "name": "late"})
+            return data
+
+        def write_against(shape, aged=False):
+            """One roster write against a lock of this shape.
+
+            Returns what it refused with or None, and everything it said. A
+            tenth of a second stands in for the ten a real run waits: which
+            locks it will take is the question here, not how long it waits
+            before saying it could not take one.
+            """
+            if shape is None:
+                lock.mkdir()   # the shape the harness's own lock helper makes
+            else:
+                lock.write_bytes(shape)
+            if aged:
+                old = time.time() - 3600
+                os.utime(lock, (old, old))
+            globals()["team_lock"] = lambda held, timeout=0.1: real_lock(held, timeout)
+            with capturing("out") as out, capturing("err") as err:
+                try:
+                    edit_team_config(lcfg, add_a_member, "wrote")
+                    refused = None
+                except Refusal as refusal:
+                    refused = refusal.said
+            return refused, out.getvalue() + err.getvalue()
+
+        def clear_lock():
+            if lock.is_dir():
+                lock.rmdir()
+            elif lock.exists():
+                lock.unlink()
+
+        # Our own pid and start time: a live owner, and the record a run really
+        # writes. Only the start time differs in the dead case, so what answers
+        # there is the recycled-pid guard rather than the pid being absent.
+        live_owner = json.dumps({"tool": TOOL, "pid": os.getpid(),
+                                 "procStart": RESOLVER.proc_start(os.getpid())}).encode()
+        dead_owner = json.dumps({"tool": TOOL, "pid": os.getpid(),
+                                 "procStart": "1"}).encode()
+
+        live_said, live_out = write_against(live_owner)
+        live_roster, live_there = lcfg.read_bytes() == untouched, lock.is_file()
+        clear_lock()
+
+        empty_said, empty_out = write_against(b"", aged=True)
+        empty_kept = lock.is_file() and "taking it over" not in empty_out
+        clear_lock()
+
+        dir_said, dir_out = write_against(None, aged=True)
+        dir_kept = lock.is_dir() and "taking it over" not in dir_out
+        clear_lock()
+
+        taken_said, taken_out = write_against(dead_owner)
+        taken_listed = [m.get("name") for m in
+                        json.loads(lcfg.read_text()).get("members", [])]
+        taken_gone = not lock.exists()
+    finally:
+        globals()["team_lock"] = real_lock
+        RESOLVER.teams_dir = real_teams_dir
+        shutil.rmtree(lock_base, ignore_errors=True)
+
+    check("lock-refused-leaves-the-roster-alone",
+          "a roster whose lock cannot be taken is left byte for byte",
+          bool(live_said) and live_roster,
+          f"refused with {live_said!r}, roster unchanged {live_roster}")
+    check("lock-without-an-owner-is-never-taken",
+          "a lock carrying no owner record is waited for, never taken",
+          empty_kept and dir_kept,
+          f"empty: kept {empty_kept}, said {empty_said!r}; "
+          f"directory: kept {dir_kept}, said {dir_said!r}")
+    check("lock-left-by-a-dead-run-is-taken",
+          "a lock whose recorded owner is gone is taken, and the run says so",
+          taken_said is None and "late" in taken_listed and taken_gone
+          and f"pid {os.getpid()}" in taken_out and "taking it over" in taken_out,
+          f"refused {taken_said!r}, roster lists {taken_listed}, "
+          f"said {taken_out.strip()!r}")
+    check("lock-of-a-live-owner-is-kept",
+          "a lock whose recorded owner is still running is left alone",
+          live_there and "taking it over" not in live_out,
+          f"lock still there {live_there}, said {live_out.strip()!r}")
+    return checked
+
+
+@unit(('refused-release-says-what-stays-claimed', 'a claim that cannot be given back is reported, not raised'),
+      ('refused-retire-keeps-the-exec-error', 'a failed exec is still the reason a run ends, even when the roster refuses too'))
+def _check_refused_teardown_reports(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    funcs = s.funcs
+    src_of = s.src_of
+    tempfile = s.tempfile
+
+    give_base = Path(tempfile.mkdtemp())
+    real_teams_dir = RESOLVER.teams_dir
+    real_lock = globals()["team_lock"]
+    try:
+        RESOLVER.teams_dir = give_base
+        gteam = "session-givebackcheck"
+        (give_base / gteam / "inboxes").mkdir(parents=True)
+        gcfg = RESOLVER.roster_path(gteam)
+        gcfg.write_text(json.dumps({
+            "name": gteam, "leadAgentId": f"team-lead@{gteam}", "leadSessionId": "x",
+            "members": [{"agentId": f"team-lead@{gteam}", "name": "team-lead"},
+                        {"agentId": f"claimant@{gteam}", "name": "claimant"}]}))
+        # An empty lock is one this tool will never take, so the release below
+        # meets a refusal it cannot get around, which is the case being asked
+        # about. A tenth of a second stands in for the ten a real run waits.
+        gcfg.with_name("config.json.lock").write_bytes(b"")
+        globals()["team_lock"] = lambda held, timeout=0.1: real_lock(held, timeout)
+        with capturing("out") as gout, capturing("err") as gerr:
+            try:
+                release_membership({"agentId": f"claimant@{gteam}", "name": "claimant",
+                                    "team": gteam},
+                                   types.SimpleNamespace(dry_run=False))
+                gave_up = None
+            except Refusal as refusal:
+                gave_up = refusal.said
+        gsaid = gout.getvalue() + gerr.getvalue()
+        gstill = [m.get("name") for m in
+                  json.loads(gcfg.read_text()).get("members", [])]
+    finally:
+        globals()["team_lock"] = real_lock
+        RESOLVER.teams_dir = real_teams_dir
+        shutil.rmtree(give_base, ignore_errors=True)
+
+    check("refused-release-says-what-stays-claimed",
+          "a claim that cannot be given back is reported, not raised",
+          gave_up is None and "stays listed" in gsaid and "claimant" in gstill,
+          f"raised {gave_up!r}, said {gsaid.strip()!r}, roster lists {gstill}")
+
+    # The other teardown, read rather than driven: the exec that fails there
+    # replaces this process when it does not, so there is no run to observe.
+    one_src = src_of(funcs["run_one"]) or ""
+    retire_at = one_src.find("retire_member(ctx, False)")
+    around = one_src[max(0, retire_at - 300):retire_at + 400] if retire_at >= 0 else ""
+    check("refused-retire-keeps-the-exec-error",
+          "a failed exec is still the reason a run ends, even when the roster refuses too",
+          retire_at >= 0 and "except Refusal" in around
+          and 'die(f"cannot exec {command[0]}: {exc}")' in around,
+          f"retire at {retire_at}, caught: {'except Refusal' in around}, "
+          f"still dies with the exec error: "
+          f"""{'die(f"cannot exec {command[0]}: {exc}")' in around}""")
     return checked
 
 

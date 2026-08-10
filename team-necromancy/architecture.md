@@ -99,9 +99,17 @@ channel between the leader and an out-of-process teammate:
   memory, so file-only members never appear in mention completion, colors,
   or the tasks pill. Spawn and shutdown paths also read-modify-write it.
   Every spawn backend writes a roster entry through the same locked
-  reservation helper (`updateTeamFile`, lockfile at `config.json.lock`):
-  in-process teammates included, written twice (a bare reservation, then a
-  patch setting `tmuxPaneId` and `backendType` to `"in-process"`). The exit
+  reservation helper (`updateTeamFile`, lockfile at `config.json.lock`).
+  That helper is proper-lockfile, and its lock is a *directory*: it mkdirs,
+  stats, utimes and rmdirs that path and never reads its bytes, so content in
+  a lock file there is invisible to it and a lock holding no content is very
+  likely its own. It waits about 0.65s (retries 10, 5ms to 100ms) before
+  giving up, calls an unrefreshed lock stale after 10s, and clears a stale one
+  with rmdir, which answers ENOTDIR on a regular file: a lock file this tool
+  leaves behind is ours to clear, not something the harness can recover from.
+  In-process teammates go through the same helper, written twice (a bare
+  reservation, then a patch setting `tmuxPaneId` and `backendType` to
+  `"in-process"`). The exit
   reaper skips them (its filter wants a pane-type backend), but the
   undertaker's `rm -rf` of the team dir takes their registration with it, so
   after a graceful leader exit an in-process teammate's name resolves
