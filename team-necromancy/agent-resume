@@ -6276,7 +6276,12 @@ def team_lock(cfg, timeout=LOCK_WAIT_S):
         # it would hand the lock to a third writer while two are inside it.
         # Device and inode settle that exactly, where a record inside the file
         # could not: the replacement may be a directory, which holds no bytes
-        # to read.
+        # to read. They are the right test here and the wrong one in drop_lock
+        # for a reason worth stating, since the two sit in one file and read as
+        # a contradiction otherwise: this descriptor is still open, which keeps
+        # the inode allocated and its number out of the pool, so a replacement
+        # cannot land on it. A remover holding no descriptor has no such
+        # footing, and compares the record's bytes instead.
         try:
             mine, there = os.fstat(handle), os.stat(lock)
             still_ours = (mine.st_dev, mine.st_ino) == (there.st_dev, there.st_ino)

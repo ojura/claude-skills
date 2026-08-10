@@ -39,14 +39,15 @@ still reads as identical.
 ## What did not change
 
 **The roster lock.** 14,274 characters, identical in both builds, 143 minified
-names renamed and nothing else. The region does `mkdir`, `rmdir`, `utimes` and
-`stat`, and no `readFile`, `open`, `writeFile` or `unlink`. The roster lock's
-own settings are the same: `realpath:false`, retries 10 from 5ms to 100ms, an
-`onCompromised` that does nothing, and no explicit staleness, so the library
-default of 10 seconds still applies. The lock path is still
-`<team>/config.json.lock`. Everything `architecture.md` says about the lock
-holds on 2.1.226, including that a lock file this tool leaves behind is ours
-to clear because the harness's recovery calls `rmdir` and gets ENOTDIR.
+names renamed and nothing else. Filesystem calls counted separately in each
+build and matching exactly: `mkdir` 2, `rmdir` 4, `utimes` 3, `stat` 6, and
+zero each of `readFile`, `open`, `writeFile`, `unlink` and `readdir`. The
+roster lock's own options and its path are unchanged too.
+
+What those facts mean for this tool is in `architecture.md`, which owns the
+lock and now states the range they were measured over. Restating the mechanism
+here would give it two homes to keep in step, and the point of this entry is
+only that the comparison found nothing moved.
 
 **The session registry schema.** `~/.claude/sessions/<pid>.json` reads the same
 fields in both builds. In particular there is still no record of the internal

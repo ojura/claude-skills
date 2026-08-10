@@ -100,7 +100,8 @@ channel between the leader and an out-of-process teammate:
   or the tasks pill. Spawn and shutdown paths also read-modify-write it.
   Every spawn backend writes a roster entry through the same locked
   reservation helper (`updateTeamFile`, lockfile at `config.json.lock`).
-  That helper is proper-lockfile, and its lock is a *directory*: it mkdirs,
+  That helper is stock proper-lockfile from npm, loaded lazily rather than
+  forked, so its documented behaviour applies. Its lock is a *directory*: it mkdirs,
   stats, utimes and rmdirs that path and never reads its bytes, so content in
   a lock file there is invisible to it and a lock holding no content is very
   likely its own. It waits about 0.65s (retries 10, 5ms to 100ms) before
@@ -129,6 +130,11 @@ channel between the leader and an out-of-process teammate:
   can have taken the lock by the time the first acts. Device and inode do not
   work for that comparison: the freed inode number is reused by the replacement
   written a moment later, measured here.
+  Everything in this bullet was read from 2.1.200 and re-measured on 2.1.226:
+  the locking module is identical across those builds apart from minified
+  renaming, so it describes that range rather than one build. `upstream.md`
+  records how that comparison was made and what the releases between them
+  did change.
   In-process teammates go through the same helper, written twice (a bare
   reservation, then a patch setting `tmuxPaneId` and `backendType` to
   `"in-process"`). The exit
