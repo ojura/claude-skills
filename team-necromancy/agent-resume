@@ -6114,13 +6114,17 @@ def team_lock(cfg, timeout=LOCK_WAIT_S):
     ours.
     """
     lock = cfg.with_name("config.json.lock")
-    started = time.time()
+    # Monotonic, because this is a duration and nothing else. A clock
+    # correction landing mid-wait would otherwise lengthen or cut short how
+    # long a roster write is prepared to wait for another writer.
+    started = time.monotonic()
     handle, said_waiting = None, False
     while handle is None:
         try:
             handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
             owner = lock_owner(lock)
+            stuck = ""
             # This is the harness's lockfile as much as ours, and the harness
             # puts no owner in it, so a lock with none is most likely the
             # harness holding it legitimately and is never removed, whatever
@@ -6131,29 +6135,39 @@ def team_lock(cfg, timeout=LOCK_WAIT_S):
             if owner and not RESOLVER.pid_alive(owner["pid"], owner["procStart"]):
                 try:
                     lock.unlink()
-                except OSError:
-                    # Judged stale and still there: another run removed it first,
-                    # or this one is not allowed to. Fall through to the wait, so
-                    # a steal that cannot finish ends at the deadline like any
-                    # other lock we could not get instead of spinning on it.
-                    pass
+                except FileNotFoundError:
+                    # Another run cleared it between the read and here, which is
+                    # the outcome this wanted; the create above is what claims it.
+                    continue
+                except OSError as exc:
+                    # Stale and still here, and this run may not remove it. Wait
+                    # it out at the ordinary deadline rather than spinning on a
+                    # removal that keeps failing, and say what is true instead of
+                    # calling a process that is gone the holder.
+                    stuck = str(exc)
                 else:
                     warn(f"{lock.name} was left by pid {owner['pid']}, which is gone; taking it over")
                     continue
-            held = f"pid {owner['pid']}" if owner else "another writer"
-            # Who that other writer is, as far as anything here can tell, and
-            # the reason this run will not simply take the lock from it.
-            whose = "" if owner else (" It left no owner record, which this tool always "
-                                      "writes and the harness never does, so the holder "
-                                      "is most likely the harness itself.")
-            if time.time() - started > timeout:
-                die(f"{lock} is held by {held} and did not come free in {timeout:g}s; "
-                    f"{cfg.name} is unchanged, so no other writer's change was lost."
-                    f"{whose} Run this again once that writer is done")
-            if not said_waiting and time.time() - started > 1.0:
+            if stuck:
+                situation = (f"was left by pid {owner['pid']}, which is gone, and this run "
+                             f"cannot remove it ({stuck})")
+                remedy = "Remove that file by hand once nothing is writing this roster"
+            elif owner:
+                situation = f"is held by pid {owner['pid']}"
+                remedy = "Run this again once that writer is done"
+            else:
+                situation = ("is held by another writer and carries no owner record, "
+                             "which this tool always writes and the harness never does, "
+                             "so the holder is most likely the harness itself")
+                remedy = "Run this again once that writer is done"
+            if time.monotonic() - started > timeout:
+                die(f"{lock} {situation}; it did not come free in {timeout:g}s and "
+                    f"{cfg.name} is unchanged, so no other writer's change was lost. "
+                    f"{remedy}")
+            if not said_waiting and time.monotonic() - started > 1.0:
                 # A wait this long is worth explaining while it happens rather
                 # than accounting for afterwards.
-                warn(f"waiting for {lock.name}, held by {held}")
+                warn(f"waiting for {lock.name}, which {situation}")
                 said_waiting = True
             time.sleep(0.05)
         except OSError as exc:
@@ -6163,11 +6177,24 @@ def team_lock(cfg, timeout=LOCK_WAIT_S):
                                      "procStart": RESOLVER.proc_start(os.getpid())}).encode())
         yield
     finally:
-        os.close(handle)
+        # Removed only while the file this descriptor holds is still the file at
+        # that name. If our lock is taken away mid-write and another writer
+        # creates its own there, what sits at the path is theirs, and unlinking
+        # it would hand the lock to a third writer while two are inside it.
+        # Device and inode settle that exactly, where a record inside the file
+        # could not: the replacement may be a directory, which holds no bytes
+        # to read.
         try:
-            lock.unlink()
+            mine, there = os.fstat(handle), os.stat(lock)
+            still_ours = (mine.st_dev, mine.st_ino) == (there.st_dev, there.st_ino)
         except OSError:
-            pass
+            still_ours = False
+        os.close(handle)
+        if still_ours:
+            try:
+                lock.unlink()
+            except OSError:
+                pass
 
 
 _BACKED_UP = set()
@@ -11301,7 +11328,9 @@ def _check_release_gives_the_claim_back(s):
 @unit(('lock-refused-leaves-the-roster-alone', 'a roster whose lock cannot be taken is left byte for byte'),
       ('lock-without-an-owner-is-never-taken', 'a lock carrying no owner record is waited for, never taken'),
       ('lock-left-by-a-dead-run-is-taken', 'a lock whose recorded owner is gone is taken, and the run says so'),
-      ('lock-of-a-live-owner-is-kept', 'a lock whose recorded owner is still running is left alone'))
+      ('lock-of-a-live-owner-is-kept', 'a lock whose recorded owner is still running is left alone'),
+      ('stale-lock-that-will-not-come-away-refuses', 'a stale lock this run cannot remove ends at the deadline, not in a spin'),
+      ('release-leaves-a-replacement-lock-alone', 'a lock that replaced ours while we held it is not removed on the way out'))
 def _check_team_lock_fails_closed(s):
     checked = []
 
@@ -11328,15 +11357,19 @@ def _check_team_lock_fails_closed(s):
             data["members"].append({"agentId": f"late@{lteam}", "name": "late"})
             return data
 
-        def write_against(shape, aged=False):
+        def write_against(shape, aged=False, exists=False):
             """One roster write against a lock of this shape.
 
             Returns what it refused with or None, and everything it said. A
             tenth of a second stands in for the ten a real run waits: which
             locks it will take is the question here, not how long it waits
-            before saying it could not take one.
+            before saying it could not take one. `exists` is for a lock the
+            caller has already put in place, because the directory it sits in
+            is no longer writable by the time this runs.
             """
-            if shape is None:
+            if exists:
+                pass
+            elif shape is None:
                 lock.mkdir()   # the shape the harness's own lock helper makes
             else:
                 lock.write_bytes(shape)
@@ -11378,11 +11411,37 @@ def _check_team_lock_fails_closed(s):
         dir_kept = lock.is_dir() and "taking it over" not in dir_out
         clear_lock()
 
+        # A lock this run judges stale and then cannot remove: the parent
+        # directory is read-only, so the create still answers EEXIST and the
+        # unlink answers EACCES. An earlier draft looped on that pair without
+        # ever reaching its deadline.
+        lock.write_bytes(dead_owner)
+        os.chmod(lock.parent, 0o500)
+        try:
+            stuck_said, stuck_out = write_against(dead_owner, exists=True)
+        finally:
+            os.chmod(lock.parent, 0o700)
+        stuck_kept = lock.is_file() and lcfg.read_bytes() == untouched
+        clear_lock()
+
+        # Somebody else takes the name while we are inside the lock. What sits
+        # there at the end is theirs, and a release that removed it would hand
+        # the lock out while two writers were in it. A regular file rather than
+        # a directory on purpose: unlink really would take this one away, so
+        # what keeps it is the guard and not a removal that happens to fail.
+        stranger = b'{"tool": "somebody else"}'
+        with real_lock(lcfg, 0.1):
+            lock.unlink()
+            lock.write_bytes(stranger)
+        replacement_kept = lock.is_file() and lock.read_bytes() == stranger
+        clear_lock()
+
         taken_said, taken_out = write_against(dead_owner)
         taken_listed = [m.get("name") for m in
                         json.loads(lcfg.read_text()).get("members", [])]
         taken_gone = not lock.exists()
     finally:
+        os.chmod(lock_base / lteam, 0o700)
         globals()["team_lock"] = real_lock
         RESOLVER.teams_dir = real_teams_dir
         shutil.rmtree(lock_base, ignore_errors=True)
@@ -11406,6 +11465,14 @@ def _check_team_lock_fails_closed(s):
           "a lock whose recorded owner is still running is left alone",
           live_there and "taking it over" not in live_out,
           f"lock still there {live_there}, said {live_out.strip()!r}")
+    check("stale-lock-that-will-not-come-away-refuses",
+          "a stale lock this run cannot remove ends at the deadline, not in a spin",
+          bool(stuck_said) and stuck_kept and "cannot remove it" in (stuck_said or "")
+          and "taking it over" not in stuck_out,
+          f"refused {stuck_said!r}, lock and roster untouched {stuck_kept}")
+    check("release-leaves-a-replacement-lock-alone",
+          "a lock that replaced ours while we held it is not removed on the way out",
+          replacement_kept, f"replacement still there {replacement_kept}")
     return checked
 
 
@@ -11417,8 +11484,8 @@ def _check_refused_teardown_reports(s):
     def check(cid, name, ok, detail=""):
         checked.append((cid, name, ok, detail))
 
+    ast = s.ast
     funcs = s.funcs
-    src_of = s.src_of
     tempfile = s.tempfile
 
     give_base = Path(tempfile.mkdtemp())
@@ -11436,7 +11503,9 @@ def _check_refused_teardown_reports(s):
         # An empty lock is one this tool will never take, so the release below
         # meets a refusal it cannot get around, which is the case being asked
         # about. A tenth of a second stands in for the ten a real run waits.
-        gcfg.with_name("config.json.lock").write_bytes(b"")
+        glock = gcfg.with_name("config.json.lock")
+        glock.write_bytes(b"")
+        gbefore = gcfg.read_bytes()
         globals()["team_lock"] = lambda held, timeout=0.1: real_lock(held, timeout)
         with capturing("out") as gout, capturing("err") as gerr:
             try:
@@ -11447,8 +11516,12 @@ def _check_refused_teardown_reports(s):
             except Refusal as refusal:
                 gave_up = refusal.said
         gsaid = gout.getvalue() + gerr.getvalue()
-        gstill = [m.get("name") for m in
-                  json.loads(gcfg.read_text()).get("members", [])]
+        # The bytes, not a name read back out of them: a roster that still
+        # happens to mention the claimant is not the same fact as one nothing
+        # wrote to. And what was said has to name the entry and the file it is
+        # in, or the reader is told a claim leaked without being told which.
+        gkept = gcfg.read_bytes() == gbefore and glock.is_file()
+        gnamed = f"claimant@{gteam}" in gsaid and str(gcfg) in gsaid
     finally:
         globals()["team_lock"] = real_lock
         RESOLVER.teams_dir = real_teams_dir
@@ -11456,21 +11529,50 @@ def _check_refused_teardown_reports(s):
 
     check("refused-release-says-what-stays-claimed",
           "a claim that cannot be given back is reported, not raised",
-          gave_up is None and "stays listed" in gsaid and "claimant" in gstill,
-          f"raised {gave_up!r}, said {gsaid.strip()!r}, roster lists {gstill}")
+          gave_up is None and gkept and gnamed,
+          f"raised {gave_up!r}, roster and lock untouched {gkept}, "
+          f"named the entry and its file {gnamed}, said {gsaid.strip()!r}")
 
-    # The other teardown, read rather than driven: the exec that fails there
-    # replaces this process when it does not, so there is no run to observe.
-    one_src = src_of(funcs["run_one"]) or ""
-    retire_at = one_src.find("retire_member(ctx, False)")
-    around = one_src[max(0, retire_at - 300):retire_at + 400] if retire_at >= 0 else ""
+    # The other teardown, read out of the tree rather than driven: the exec
+    # that fails there replaces this process when it does not fail, so there is
+    # no run left to observe. Read rather than grepped because a substring
+    # matches a comment and code nothing reaches equally well. What this says,
+    # and the whole of what it says, is that the handler has one shape: the
+    # retire sits inside a try, its Refusal arm says something and does not
+    # re-raise, and the exec error is what ends the run after it. Which roster
+    # that retire reaches is a separate question and not one this asks.
+    def says(call, text):
+        for arg in call.args:
+            parts = arg.values if isinstance(arg, ast.JoinedStr) else [arg]
+            if any(isinstance(part, ast.Constant) and isinstance(part.value, str)
+                   and text in part.value for part in parts):
+                return True
+        return False
+
+    def calling(node, name):
+        return [sub for sub in ast.walk(node) if isinstance(sub, ast.Call)
+                and getattr(sub.func, "id", None) == name]
+
+    shaped = []
+    for handler in ast.walk(funcs["run_one"]):
+        if not isinstance(handler, ast.ExceptHandler):
+            continue
+        dies = [call for call in calling(handler, "die") if says(call, "cannot exec")]
+        guards = [sub for sub in ast.walk(handler)
+                  if isinstance(sub, ast.Try) and calling(sub, "retire_member")]
+        if not (dies and guards):
+            continue
+        caught = [arm for arm in guards[0].handlers
+                  if isinstance(arm.type, ast.Name) and arm.type.id == "Refusal"]
+        shaped.append(
+            bool(caught)
+            and all(calling(arm, "warn") for arm in caught)
+            and not any(isinstance(sub, ast.Raise)
+                        for arm in caught for sub in ast.walk(arm))
+            and max(call.lineno for call in dies) > (guards[0].end_lineno or 0))
     check("refused-retire-keeps-the-exec-error",
           "a failed exec is still the reason a run ends, even when the roster refuses too",
-          retire_at >= 0 and "except Refusal" in around
-          and 'die(f"cannot exec {command[0]}: {exc}")' in around,
-          f"retire at {retire_at}, caught: {'except Refusal' in around}, "
-          f"still dies with the exec error: "
-          f"""{'die(f"cannot exec {command[0]}: {exc}")' in around}""")
+          shaped == [True], f"handlers of that shape: {shaped}")
     return checked
 
 
