@@ -40,9 +40,14 @@ still reads as identical.
 
 **The roster lock.** 14,274 characters, identical in both builds, 143 minified
 names renamed and nothing else. Filesystem calls counted separately in each
-build and matching exactly: `mkdir` 2, `rmdir` 4, `utimes` 3, `stat` 6, and
-zero each of `readFile`, `open`, `writeFile`, `unlink` and `readdir`. The
-roster lock's own options and its path are unchanged too.
+build and matching exactly, over the whole module — bounded by graceful-fs's
+tail and the next caller's options, the two divergence points the region
+comparison itself reports: `mkdir` 2, `rmdir` 4, `utimes` 3, `stat` 5, and
+zero each of `readFile`, `open`, `writeFile`, `unlink` and `readdir`. A census
+is only as good as its stated bounds: a narrower window from the ELOCKED
+literal to `onCompromised` answers `rmdir` 1, `stat` 2 for the same module,
+and an earlier count of `stat` 6 here included a neighbour. The roster lock's
+own options and its path are unchanged too.
 
 What those facts mean for this tool is in `architecture.md`, which owns the
 lock and now states the range they were measured over. Restating the mechanism
