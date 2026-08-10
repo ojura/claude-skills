@@ -89,6 +89,12 @@ flag `tengu_harbor_kite` (default false in the binary) or the
 on from the server, which is consistent with the docs saying it is on with
 nothing to enable.
 
+On this machine it is on regardless of the server: since 2026-08-10,
+`CLAUDE_CODE_HARBOR_KITE=1` sits in `settings.json`'s env block, taking effect
+for each session at its next start. Anything below that weighs a consequence
+as dormant because the feature ships off should weigh it as live here — in
+particular the masqueraded lead's lost reachability in item 3.
+
 What it puts on the machine when enabled:
 
 - a unix socket per session at `$XDG_RUNTIME_DIR/cc-socks/<pid>.sock`, falling
