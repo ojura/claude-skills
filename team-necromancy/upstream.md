@@ -87,8 +87,11 @@ What it puts on the machine when enabled:
   unix socket length limit, chmod 0600
 - `CLAUDE_CODE_MESSAGING_SOCKET` in that session's environment, holding the path
 - `messagingSocketPath` written into that session's `sessions/<pid>.json`
-- a reaper that unlinks peer socket files and registry entries whose owner is
-  gone, deciding liveness from pid plus process start time, skipped on WSL
+- a reaper that unlinks registry entries whose owner is gone, deciding
+  liveness from pid plus process start time, skipped on WSL. It walks the
+  registry, not the socket directory: the socket file itself is unlinked by
+  its owner's graceful shutdown, so a SIGKILLed session's socket outlives
+  everything and only the runtime dir clearing at logout removes it
 
 `isolatePeerMachines` in settings requires approval before a message leaves the
 machine, and in 2.1.226 it became immune to bypass permission mode.
@@ -163,21 +166,46 @@ the running identity, so its other fields deserve the same suspicion.
 Whatever is adopted belongs behind an engine answer, not read at call sites,
 and each adoption needs its own named check.
 
-### 3. Establish what happens to a resurrected teammate under messaging
+### 3. What happens to a resurrected agent under messaging: measured
 
-Unknown and untested. Concretely:
+Answered on the 2.1.226 binary against a scratch `CLAUDE_CONFIG_DIR`, gate
+forced on with `CLAUDE_CODE_HARBOR_KITE=1`, real credentials lifted from a
+live lead's environ by the same mechanism `inherit_credentials` uses, both
+launches reaching the full REPL:
 
-- does a teammate this tool launches write a `sessions/<pid>.json` and bind a
-  messaging socket, or is that suppressed for flag-bound launches the way team
-  registration is
-- if it does, does it appear in `/list-agents` alongside ordinary sessions
-- if it does not, is a resurrected teammate unreachable by a feature the user
-  will reasonably expect to work
+- a plain launch registers `sessions/<pid>.json`, records its
+  `messagingSocketPath` in it, and binds the socket
+- the same launch wearing `--agent-id` binds the socket but **never
+  registers**. The register function refuses any process wearing an agentId,
+  the same `!agentId` condition that keeps flag-bound launches out of
+  implicit-team registration.
 
-The third is the one that would make this a defect rather than a curiosity.
-Test with the real binary against a scratch `CLAUDE_CONFIG_DIR`, with messaging
-forced on through `CLAUDE_CODE_HARBOR_KITE`, since the server-side flag cannot
-be relied on for a test.
+Getting the measurement right had a trap worth keeping: run the binary from a
+tool-driven shell and it inherits `CLAUDE_CODE_CHILD_SESSION=1`, which the
+register function also refuses, so a plain launch appears not to register and
+the flag-bound result looks unremarkable. The env must be built with `env -i`.
+
+Consequences, in order of who notices:
+
+- **Members: no defect.** Teammates were never in peer discovery; the docs
+  say they are messaged through the team's roster, not listed. A resurrected
+  member is exactly as reachable as a native one, through the mailbox.
+- **The masqueraded lead loses reachability the original had.** A normal
+  lead registers and can be listed and messaged from the user's other
+  sessions. The masquerade wears `--agent-id`, so a resurrected lead never
+  registers: outbound messaging still works from inside it (discovery reads
+  others' records), but no other session can discover or message it. This is
+  the one place resurrection now subtracts a capability users can see.
+- **The bound socket is inert and, after a SIGKILL, immortal.** Its path is
+  recorded nowhere but the process's own environment, so nothing can dial it;
+  graceful exit unlinks it, but the harness's reaper walks registry records
+  and a recordless socket is invisible to it. It sits in the runtime dir
+  until logout clears it. Same nuisance class as the tmux socket litter that
+  motivated `--cleanup-sockets`; cleanup deferred per item 4.
+
+The session-name half of the collision question dissolves with this: names
+live in registry records, a flag-bound launch writes none, so a resurrected
+agent never enters the session-name namespace at all.
 
 ### 4. Decide whether this tool should clean up after a kill
 
@@ -237,9 +265,13 @@ maintenance script, run by hand when a release lands.
 
 ## Open questions for Juraj
 
-- Whether adopting registry fields is wanted at all, or whether this tool
-  should stay independent of a record it does not write and cannot verify.
-- Whether a resurrected teammate should carry a session name, which decides
-  the collision question in item 3.
+- Whether adopting registry fields is wanted at all. "Cannot verify" was the
+  wrong axis: `pid`, `procStart`, `cwd` and `tmux` are checkable against
+  `/proc` and a pane list, and adoption there is ordinary corroboration. The
+  real line runs through the self-asserted fields, `status`, `tempo`, `name`,
+  `waitingFor`, `state`, where nothing else on disk says the same thing and a
+  wedged session's last self-report is indistinguishable from truth.
 - Whether cleaning Claude Code's registry entries and sockets after a kill is
-  in scope, per item 4.
+  in scope, per item 4. Ruled: deferred. The motivation that made tmux socket
+  litter worth cleaning was tab completion growing a nuisance; nothing
+  completes over `cc-socks`, so the pressure is absent until it isn't.
