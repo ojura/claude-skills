@@ -10717,20 +10717,15 @@ def _suite_context():
              if sum(1 for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
                     and f.name == n and not is_delegate(f)) != 1]
 
-    s._called = _called
-    s._calls_in = _calls_in
-    s._name = _name
-    s._node = _node
-    s._segments = _segments
-    s._source_lines = _source_lines
-    s._spelled = _spelled
-    s._sub = _sub
+    # What the units read. The rest of what this function binds is read here,
+    # through the closures that need it: callers_of holds _calls_in, src_of
+    # holds _segments and _source_lines, and is_delegate is called by funcs and
+    # by dupes above.
     s.ast = ast
     s.callers_of = callers_of
     s.corpus_engine = corpus_engine
     s.dupes = dupes
     s.funcs = funcs
-    s.is_delegate = is_delegate
     s.source = source
     s.src_of = src_of
     s.tempfile = tempfile
@@ -18835,6 +18830,62 @@ def _check_asking_is_not_resuming(s):
         quiet.append("the run that rebuilds no longer says the claim is uncorroborated")
     check("asking-is-not-resuming", "describing a team warns about nothing; rebuilding it does",
           not quiet, "; ".join(quiet))
+    return checked
+
+
+@unit(("context-handover-is-taken", "every name a suite context hands over is read by something"))
+def _check_context_handover_is_taken(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    ast = s.ast
+    tree = s.tree
+
+    # Every name put on the shared namespace against every name read back off
+    # it. A context computes what the units need and a unit publishes back what
+    # a later one takes, so a name stored and never loaded is a handover nobody
+    # takes: the value is computed, carried and dropped, and no linter says so
+    # because the store is an attribute on a live object and the name is bound.
+    stored, read = {}, set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name) and node.value.id == "s"):
+            continue
+        if isinstance(node.ctx, ast.Store):
+            stored.setdefault(node.attr, node.lineno)
+        else:
+            read.add(node.attr)
+    dropped = [f"s.{attr} is handed over at line {line} and nothing reads it"
+               for attr, line in sorted(stored.items(), key=lambda pair: pair[1])
+               if attr not in read]
+
+    # What the sweep above cannot see, and the arm that keeps it from narrowing
+    # in silence. It matches s.<name> as written, so it is right only while
+    # every read of the namespace is spelled that way. getattr(s, name),
+    # vars(s) and s.__dict__ each read a name without writing one, and a name
+    # reached by any of the three would be called dead here while it was in
+    # use. None of the three is in this file; if one arrives, this says so and
+    # whoever added it decides what the sweep should do about it, rather than
+    # the sweep quietly answering for less than it says.
+    blind = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) in ("getattr", "vars")
+                and node.args and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "s"):
+            blind.append(f"{node.func.id}(s, ...) at line {node.lineno}, "
+                         "which the sweep cannot follow")
+        if (isinstance(node, ast.Attribute) and node.attr == "__dict__"
+                and isinstance(node.value, ast.Name) and node.value.id == "s"):
+            blind.append(f"s.__dict__ at line {node.lineno}, "
+                         "which the sweep cannot follow")
+
+    forked = blind + dropped
+    check("context-handover-is-taken",
+          "every name a suite context hands over is read by something",
+          not forked, "; ".join(forked[:3]))
     return checked
 
 
