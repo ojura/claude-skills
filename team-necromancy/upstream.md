@@ -58,7 +58,7 @@ team-to-pid join is still temporal. Searched and absent in both builds:
 in 2.1.220, logging "Prior session exited uncleanly" for interactive ones. Not
 new, no change needed.
 
-**The teams gate.** `isAgentSwarmsEnabled` is byte-identical modulo renaming:
+**How teams are enabled.** `isAgentSwarmsEnabled` is byte-identical modulo renaming:
 the `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` env var or `--agent-teams`, then the
 `tengu_amber_flint` killswitch. Note both shipped builds have dropped the
 `USER_TYPE === 'ant'` arm that the leaked source still shows.
@@ -73,7 +73,7 @@ diff nearly missed it. Teams are a lead spawning and supervising members;
 this is messaging between independent sessions you started yourself, with
 `ListAgents` to discover and `SendMessage` to deliver.
 
-The gate is new in 2.1.226 and reads: not Windows, and either the server-side
+The check that turns it on is new in 2.1.226 and reads: not Windows, and either the server-side
 flag `tengu_harbor_kite` (default false in the binary) or the
 `CLAUDE_CODE_HARBOR_KITE` environment variable. So it ships off and is turned
 on from the server, which is consistent with the docs saying it is on with
@@ -174,19 +174,26 @@ Unknown and untested. Concretely:
   will reasonably expect to work
 
 The third is the one that would make this a defect rather than a curiosity.
-Test with the real binary against a scratch `CLAUDE_CONFIG_DIR`, with the
-messaging gate forced on through `CLAUDE_CODE_HARBOR_KITE`, since the
-server-side flag cannot be relied on for a test.
+Test with the real binary against a scratch `CLAUDE_CONFIG_DIR`, with messaging
+forced on through `CLAUDE_CODE_HARBOR_KITE`, since the server-side flag cannot
+be relied on for a test.
 
 ### 4. Decide whether this tool should clean up after a kill
 
 When this tool stops a process, Claude Code's registry entry and messaging
 socket for that pid are left behind until some later Claude Code run reaps
-them. This mirrors the roster lock question already being handled: the tool
-knows the owner is gone and could clear its own mess. The difference worth
-weighing is that these are the harness's files, not this tool's, and the
-harness does reap them on its own schedule. Decide deliberately; do not drift
-into deleting Claude Code's files because it is easy.
+them.
+
+The roster lock invites a comparison here, since that is a leftover this tool
+does clear. The deciding fact is not shared. Claude Code cannot remove a lock
+file this tool leaves, ever, because its recovery calls `rmdir` and gets
+ENOTDIR; if this tool does not clear it, nothing will, and roster writes for
+that team stay broken. Registry entries and sockets are the opposite: Claude
+Code removes its own, on its own schedule, from pid plus process start time.
+Acting there would only make the removal sooner, not possible.
+
+So the bar is higher, not equal. Decide deliberately, and do not drift into
+deleting Claude Code's files because it is easy.
 
 ### 5. Watch the v5 storage layer
 
@@ -204,9 +211,10 @@ engine and no service name in the bundle. The honest limit: the top-level
 value could not be traced to its binding, so this says nothing constructs a
 backend here, not that one can never be supplied.
 
-If it ever becomes real it does not damage this tool, it deletes its
-foundation: every realm the engine reads is a file today. Nothing to build
-now. What to watch for, in order of how early it would show:
+If it ever becomes real, every read the engine does stops working: each of the
+eight realms it examines is a file today, and it would have to learn to ask a
+key-value store instead. Nothing to build now. What to watch for, in order of
+how early it would show:
 
 - a namespace switch that maps a key to a path, which would mean the first
   backend is file-backed and the damage is containable
