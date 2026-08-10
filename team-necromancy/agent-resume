@@ -42,7 +42,6 @@ import io
 import json
 import os
 import re
-import select
 import shlex
 import shutil
 import socket as socketlib
@@ -4959,22 +4958,6 @@ _MISSING = object()
 
 
 RESOLVER = Resolver()
-
-
-def hook_event():
-    """The SessionStart payload on stdin, or None when there is nothing to read.
-
-    A hook is handed its event on stdin; the same flag run by hand is not, and
-    reading unconditionally would hang the janitor on a terminal.
-    """
-    if sys.stdin is None or sys.stdin.closed or sys.stdin.isatty():
-        return None
-    try:
-        if not select.select([sys.stdin], [], [], 0.25)[0]:
-            return None
-        return json.loads(sys.stdin.read() or "null")
-    except (OSError, ValueError):
-        return None
 
 
 # What a revived pane needs from the lead's environment. The harness's swarm
