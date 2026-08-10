@@ -214,12 +214,17 @@ socket for that pid are left behind until some later Claude Code run reaps
 them.
 
 The roster lock invites a comparison here, since that is a leftover this tool
-does clear. The deciding fact is not shared. Claude Code cannot remove a lock
-file this tool leaves, ever, because its recovery calls `rmdir` and gets
-ENOTDIR; if this tool does not clear it, nothing will, and roster writes for
-that team stay broken. Registry entries and sockets are the opposite: Claude
-Code removes its own, on its own schedule, from pid plus process start time.
-Acting there would only make the removal sooner, not possible.
+does clear. The deciding fact is not shared, and the two kinds of leftover
+earn their answers differently. Claude Code cannot remove a lock file this
+tool leaves, ever, because its recovery calls `rmdir` and gets ENOTDIR; if
+this tool does not clear it, nothing will, and roster writes for that team
+stay broken. Registry entries the harness does reap, from pid plus process
+start time, so acting there would only make the removal sooner. Sockets the
+measurement in item 3 corrected: the reaper never looks at the socket
+directory, so after an ungraceful end the file sits there until logout clears
+the runtime dir — but it is recorded nowhere and nothing can dial it, so what
+remains is a dead file, not a broken capability. In every case the leftover
+either gets removed without us or costs nothing by staying.
 
 So the bar is higher, not equal. Decide deliberately, and do not drift into
 deleting Claude Code's files because it is easy.
