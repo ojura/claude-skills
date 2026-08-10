@@ -834,9 +834,35 @@ def warn(msg):
     sys.stderr.flush()
 
 
+class Refusal(BaseException):
+    """The run refused, and what it refused with.
+
+    BaseException rather than Exception, which is the one property sys.exit had
+    here and is worth keeping: a refusal is not a fault for an `except
+    Exception` around some call to handle, and library code that catches
+    broadly must not swallow one.
+
+    The reason travels on the signal. It is still written to stderr at the
+    point of refusal, so a run that refuses part way through a team still says
+    so beside that member rather than at the end, but every caller that treats
+    a refusal as an answer now reads `said` off the exception instead of
+    capturing a stream and pairing the two up by hand.
+
+    What may not catch this is as much the point as what may. audited() must
+    not: a refusal has to pass through it so the needs audit never judges a
+    verb that did not finish, which is why the entry point converts one and
+    nothing between here and there does.
+    """
+
+    def __init__(self, said, code=1):
+        super().__init__(said)
+        self.said = said
+        self.code = code
+
+
 def die(msg, code=1):
     warn(msg)
-    sys.exit(code)
+    raise Refusal(msg, code)
 
 
 def iso_ms(value):
@@ -9067,7 +9093,7 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix=""):
         try:
             outcome = run_one(sub_args, passthrough, table, prefix=prefix,
                               pending=[o.pending_write for o in outcomes if o.pending_write])
-        except SystemExit as exc:
+        except Refusal as exc:
             # A member's refusal is that member's problem, the way a member's
             # pane is: the rest of the team still comes up, and the summary,
             # the flag check and the write report still reach every agent that
@@ -9289,19 +9315,23 @@ def ran_unit(run, s):
     restores them on its way out, so a unit after one that never got there
     would be answering against whatever was left set.
 
-    KeyboardInterrupt is not caught. interruptible() answers a Ctrl-C with a
+    KeyboardInterrupt is not caught. answered() turns a Ctrl-C into a
     sentence about what is still running, and a catch here would take that
     away.
 
     A raising unit's traceback still reaches the real stderr, printed here
-    because catching the exception is what stops Python printing it. A unit
-    that exits has none to print: die() writes its reason to whatever stderr is
-    in force, and inside a unit's redirect that is a buffer the unit discards.
+    because catching the exception is what stops Python printing it. A refusal
+    has none to print and needs none: it carries what it refused with, so the
+    row names the reason even when die() wrote it into a buffer the unit
+    discarded. SystemExit is still caught beside it, for a unit ended by
+    something that is not a refusal at all.
     """
     try:
         return run(s), None
     except KeyboardInterrupt:
         raise
+    except Refusal as refused:
+        return [], f"refused: {refused.said}"
     except SystemExit as exc:
         return [], f"SystemExit: {exc.code}"
     except BaseException as exc:
@@ -9508,7 +9538,7 @@ def _check_launch_enters_agent_cwd(s):
             try:
                 enter_agent_cwd({})
                 refused = False
-            except SystemExit:
+            except Refusal:
                 refused = True
         RESOLVER.agent_cwd = lambda ctx: None
         stood = enter_agent_cwd({}) is None
@@ -11203,7 +11233,7 @@ def _check_resume_places_a_member_in_a_pane(s):
                     out = run_one(_Run(agent_id=agent_id, socket="claude-swarm-test",
                                        **flags), [], list(table))
                     status = out.status
-                except SystemExit:
+                except Refusal:
                     status = "refused"
             return status, entry(), fake, said.getvalue()
         finally:
@@ -11393,7 +11423,7 @@ def _check_promoted_member_resolves_by_its_receipt(s):
             try:
                 blank_eng.identity(session_uuid=blank)
                 refused = False
-            except SystemExit:
+            except Refusal:
                 refused = True
         said = " ".join(refusal.getvalue().split())
         honest = {
@@ -11441,7 +11471,7 @@ def _check_refusal_names_a_case_near_match(s):
         with capturing("err") as told:
             try:
                 corpus_engine().identity(agent_id=f"{asked}@session-corpus-alpha")
-            except SystemExit:
+            except Refusal:
                 pass
         return " ".join(told.getvalue().split())
 
@@ -13102,7 +13132,7 @@ def _check_two_verbs_refused(s):
             try:
                 check_one_verb(_Verbs(*typed), list(typed))
                 return ""
-            except SystemExit:
+            except Refusal:
                 return " ".join(told.getvalue().split())
 
     both = verbs_said("--doctor", "--census")
@@ -13355,7 +13385,7 @@ def _check_refusal_ends_the_run(s):
         with capturing("out"), capturing("err"):
             try:
                 return run_agents(jobs[0][1], [], {}, jobs), False, list(took_part)
-            except SystemExit as exc:
+            except Refusal as exc:
                 return exc.code, True, list(took_part)
 
     try:
@@ -13381,7 +13411,7 @@ def _check_refusal_ends_the_run(s):
             with capturing("err"):
                 audited(lambda: die("nothing to resume"))
             refused_as = "returned a code"
-        except SystemExit as exc:
+        except Refusal as exc:
             refused_as = f"exit {exc.code}"
         except RuntimeError:
             refused_as = "the audit"
@@ -13583,7 +13613,7 @@ def _check_selector_found_anywhere(s):
         two_selectors = False
         try:
             classify_passthrough(["a@b", "c@d"])
-        except SystemExit:
+        except Refusal:
             two_selectors = True
     classified = {
         "bare alone": classify_passthrough(["a@b"]) == ("a@b", []),
@@ -13682,7 +13712,7 @@ def _check_stop_miss_names_target(s):
                 try:
                     stop_targets(_Sel(**kw), [])
                     return "", 0
-                except SystemExit as exc:
+                except Refusal as exc:
                     return " ".join(told.getvalue().split()), exc.code
 
         no_team, code_no_team = missed(team="session-miss-absent")
@@ -13762,7 +13792,7 @@ def _check_forward_only_known_flags(s):
             try:
                 fn(*a, **kw)
                 return False, ""
-            except SystemExit:
+            except Refusal:
                 return True, err.getvalue()
 
     typo_died, typo_msg = _dies(check_passthrough, ["--dry-ryn"], _Parser())
@@ -14027,7 +14057,7 @@ def _check_identity_can_assemble(s):
             assembled = eng.identity(agent_id=f"{name}@{team}")
         got = eng.field(assembled, "agentId")
         why = assembled.get("via")
-    except (Exception, SystemExit) as exc:         # the point is that it runs
+    except (Exception, Refusal) as exc:         # the point is that it runs
         got, why = None, f"{type(exc).__name__}: {exc}"
     check("identity-can-assemble", "an identity can actually be assembled", bool(got and why),
           f"{name}@{team} -> {got or why}")
@@ -14092,12 +14122,12 @@ def _check_id_name_mismatch_refused(s):
         try:
             check_identity_flags(_Flags("auth@session-x"), ["--agent-name", "katalog"])
             refused_mismatch = False
-        except SystemExit:
+        except Refusal:
             refused_mismatch = True
         try:
             check_identity_flags(_Flags("auth@session-x"), ["--agent-name", "auth"])
             allowed_match = True
-        except SystemExit:
+        except Refusal:
             allowed_match = False
     check("id-name-mismatch-refused", "an id and a name that disagree are refused", refused_mismatch and allowed_match,
           f"mismatch refused: {refused_mismatch}, match allowed: {allowed_match}")
@@ -14126,7 +14156,7 @@ def _check_launch_wears_one_identity(s):
             try:
                 command = build_command(RESOLVER.identity(agent_id=agent_id),
                                         _Emit(agent_id), [])
-            except SystemExit:
+            except Refusal:
                 continue
             flags = dict(zip(command, command[1:]))
             wore = flags.get("--agent-id") or ""
@@ -14350,7 +14380,7 @@ def _check_contradicted_stamp_refused(s):
         with capturing("err") as said:
             try:
                 enforce_identity(found, raised, allow_team_change=False, force=False)
-            except SystemExit:
+            except Refusal:
                 pass
         spoken = said.getvalue()
     check("contradicted-stamp-refused", "a contradicted stamp is refused, with a way forward",
@@ -14683,7 +14713,7 @@ def _check_unknown_team_names_lacking_evidence(s):
     with capturing("err") as diag:
         try:
             apply_selector("session-deadbeef", _Args(resume=None, agent_id=None, team=None), {})
-        except SystemExit:
+        except Refusal:
             pass
     # Normalised before matching: the refusal wraps for the terminal, and this
     # asserts what it says, not where its line breaks fall.
@@ -14867,7 +14897,7 @@ def _check_interrupt_answered_not_dumped(s):
             capturing("err") as said:
         def _interrupted():
             raise KeyboardInterrupt
-        code = interruptible(_interrupted)
+        code = answered(_interrupted)
     check("interrupt-answered-not-dumped", "an interrupt is answered, not dumped",
           code == 130 and "still running" in said.getvalue(),
           f"exit {code}, said {said.getvalue().strip()[:50]!r}")
@@ -14958,7 +14988,7 @@ def _check_report_list_and_summary(s):
                 try:
                     auto_redirect(dict(ctx), _RedirArgs, [], "")
                     return "launched", said.getvalue()
-                except SystemExit:
+                except Refusal:
                     return "stopped", said.getvalue()
                 except Exception as err:
                     return f"crashed: {err.__class__.__name__}", said.getvalue()
@@ -15033,7 +15063,7 @@ def _check_terminal_declares_reach(s):
             try:
                 apply_selector("session-many", _Here, [])
                 terminal.append("a team selector took this terminal")
-            except SystemExit:
+            except Refusal:
                 if "one agent" not in told.getvalue():
                     terminal.append("the refusal does not say what it wants instead")
         _Here.here = False
@@ -15992,7 +16022,7 @@ def _check_demote_cannot_embed_self(s):
                         capturing("out", into=printed):
                     try:
                         run_demote(args)
-                    except SystemExit:
+                    except Refusal:
                         pass
             finally:
                 RESOLVER.process_table = real_table
@@ -17022,7 +17052,7 @@ def _check_reap_aborts_on_a_write_past_the_cut(s):
                     capturing("out"):
                 try:
                     reap_team("TEAMHELD")
-                except SystemExit:
+                except Refusal:
                     outcome = "refused"
         finally:
             del RESOLVER.receipt_contents
@@ -17193,7 +17223,7 @@ def _check_demote_catches_a_late_send(s):
                     capturing("err"):
                 try:
                     run_demote(_MailArgs)
-                except SystemExit:
+                except Refusal:
                     pass
             posted_receipt = load_receipt("MATELATE")
         finally:
@@ -17249,7 +17279,7 @@ def _check_unread_mail_refusal_no_crash(s):
                 try:
                     run_demote(_DemoteArgs)
                     outcome = "returned without refusing"
-                except SystemExit:
+                except Refusal:
                     outcome = None if "wait in TEAMM's inbox for maily" \
                         in told.getvalue() else f"refused oddly: {told.getvalue()[-80:]}"
                 except Exception as err:
@@ -17528,7 +17558,7 @@ def _check_restore_reads_window_start(s):
                 try:
                     enforce_restore({"resolution": _RebindRes(wt), "to_team": "teamZ"},
                                     _RebindArgs)
-                except SystemExit:
+                except Refusal:
                     fired = True
                 except Exception as err:  # a guard that crashes is not a guard
                     stray.append(f"the rebind guard crashed: {err.__class__.__name__}")
@@ -17538,7 +17568,7 @@ def _check_restore_reads_window_start(s):
                 try:
                     enforce_restore({"resolution": _RebindRes(wt), "to_team": "teamC"},
                                     _RebindArgs)
-                except SystemExit:
+                except Refusal:
                     stray.append("a rebind onto the restored team itself was refused")
                 except Exception as err:
                     stray.append(f"the matching-team path crashed: {err.__class__.__name__}")
@@ -18603,7 +18633,7 @@ def _check_identity_gate_refuses_mismatch(s):
             enforce_identity(res, eng.objections(res, "definitely-not-" + name, team),
                              allow_team_change=False, force=False)
         check("identity-gate-refuses-mismatch", "identity gate refuses a mismatch", False, "it allowed one")
-    except SystemExit:
+    except Refusal:
         check("identity-gate-refuses-mismatch", "identity gate refuses a mismatch", True)
     return checked
 
@@ -18623,7 +18653,7 @@ def _check_identity_judged_not_enforced(s):
     try:
         with capturing("err"):
             judged = eng.identity(agent_id=f"{name}@definitely-not-{team}")
-    except SystemExit as exc:
+    except Refusal as exc:
         raised = exc
     check("identity-judged-not-enforced", "an identity is judged without being enforced",
           raised is None and judged is not None and bool(judged.get("objections")),
@@ -18916,6 +18946,73 @@ def _check_fixture_line_one_spelling(s):
         if inside:
             forked.append(f"{inside[0]} spells a fixture line itself at line {node.lineno}")
     check("fixture-line-one-spelling", "a fixture transcript's records are written one way",
+          not forked, "; ".join(sorted(set(forked))[:3]))
+    return checked
+
+
+@unit(("refusal-carries-its-reason", "a refusal is its own signal and says what it refused"))
+def _check_refusal_carries_its_reason(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    ast = s.ast
+    funcs = s.funcs
+    tree = s.tree
+
+    forked = []
+    if "Refusal" not in {node.name for node in ast.walk(tree)
+                         if isinstance(node, ast.ClassDef)}:
+        forked.append("Refusal is gone, so a refusal is somebody else's exception again")
+    elif "die" not in funcs:
+        forked.append("die is gone, so nothing raises one")
+    else:
+        # Put to die itself: what a refusal carries, and that it is not the
+        # kind of exception a broad catch around a call is allowed to take.
+        with capturing("err") as said:
+            try:
+                die("the reason", 3)
+            except Refusal as refused:
+                got = (refused.said, refused.code, said.getvalue().strip().endswith("the reason"))
+            except BaseException as exc:
+                got = f"{type(exc).__name__} instead"
+        if got != ("the reason", 3, True):
+            forked.append(f"die answers {got}, not its reason, its code and having said it")
+        if issubclass(Refusal, Exception):
+            forked.append("a refusal is an Exception, so a broad catch around a call swallows one")
+
+        # A refusal is raised as one and caught as one. ran_unit is the
+        # exception: it catches whatever ends a unit, and something that is not
+        # a refusal is still worth naming there.
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.ExceptHandler) and node.type is not None):
+                continue
+            named = ([node.type.id] if isinstance(node.type, ast.Name)
+                     else [getattr(part, "id", "") for part in node.type.elts]
+                     if isinstance(node.type, ast.Tuple) else [])
+            if "SystemExit" not in named:
+                continue
+            holder = sorted((fn.lineno, fn.end_lineno or fn.lineno, fn.name)
+                            for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)
+                            and fn.lineno <= node.lineno <= (fn.end_lineno or fn.lineno))
+            where = holder[-1][2] if holder else "<module>"
+            if where != "ran_unit":
+                forked.append(f"{where} catches SystemExit at line {node.lineno}, "
+                              "where a refusal now arrives as a Refusal")
+
+        # And the exit itself is one call, outside every function, so a refusal
+        # cannot be turned into a code anywhere but at the end of the run.
+        exits = [node.lineno for node in ast.walk(tree)
+                 if isinstance(node, ast.Call)
+                 and getattr(node.func, "attr", None) == "exit"
+                 and getattr(node.func.value, "id", None) == "sys"]
+        inside = [line for line in exits
+                  if any(fn.lineno <= line <= (fn.end_lineno or fn.lineno)
+                         for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef))]
+        if len(exits) != 1 or inside:
+            forked.append(f"sys.exit is called at {exits}, {len(inside)} of them inside a function")
+    check("refusal-carries-its-reason", "a refusal is its own signal and says what it refused",
           not forked, "; ".join(sorted(set(forked))[:3]))
     return checked
 
@@ -19860,13 +19957,21 @@ def main():
     return run_agents(args, passthrough, table, [(None, args)])
 
 
-def interruptible(entry):
-    """Run `entry`, and answer Ctrl-C with a sentence instead of a traceback.
+def answered(entry):
+    """Run `entry`, and answer what ended it with a code instead of a traceback.
 
-    An interrupt lands wherever the run happens to be, most often the wait
-    that watches a launched agent for its first transcript write. A stack
-    dump there reads as a crash, and the run is anything but: whatever was
-    launched is still running, and saying so is the whole message.
+    Two things end a run without a return. An interrupt lands wherever the run
+    happens to be, most often the wait that watches a launched agent for its
+    first transcript write. A stack dump there reads as a crash, and the run is
+    anything but: whatever was launched is still running, and saying so is the
+    whole message.
+
+    A refusal is the other, and this is the only place one is turned into an
+    exit code. It sits outside audited() on purpose: the refusal passes through
+    that on its way here, so the needs audit never runs on a verb that stopped
+    part way and never refuses a declaration the run had no chance to exercise.
+    Nothing is printed for it here, because die() already said it where it
+    happened.
     """
     try:
         return entry()
@@ -19875,7 +19980,9 @@ def interruptible(entry):
         warn("interrupted; anything already launched is still running "
              "(--doctor <team> shows what)")
         return 130
+    except Refusal as refused:
+        return refused.code
 
 
 if __name__ == "__main__":
-    sys.exit(interruptible(lambda: audited(main)))
+    sys.exit(answered(lambda: audited(main)))
