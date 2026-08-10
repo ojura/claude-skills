@@ -218,6 +218,9 @@ when every one of these holds:
   keeping
 - the directory contains only this tool's own scaffolding: a parseable roster,
   and inboxes that are `.json` arrays holding no undelivered mail
+- nothing holds its roster lock: a lock whose recorded owner is running, one
+  carrying no readable owner record, and the harness's own lock directory each
+  keep the team
 - it is older than 300s, covering the gap between a team being minted and its
   session becoming visible
 
