@@ -50,6 +50,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import traceback
 import types
 from collections import defaultdict
 from datetime import datetime
@@ -9240,6 +9241,46 @@ RUNNER_CHECKS = (("live-checks-say-nothing-mid-run",
 SHARED_CHECKS = (("live-shares-report-in-full",
                   "every share of a split live run reported every verdict it ran"),)
 
+# The runner's own check that its tier got to the end, keyed by whether the
+# tier is the live one. A tier prints only once it has run everything, so a
+# unit that exits or raises takes every verdict gathered before it; this row is
+# what says which unit did that. Two ids because a live run inherits the
+# read-only tier's rows from the child that ran it, and one id cannot be
+# registered twice in one run.
+UNIT_ENDED = {
+    False: ("every-unit-reported", "no unit ended the read-only run before it reported"),
+    True: ("every-live-unit-reported", "no unit ended the live run before it reported"),
+}
+
+
+def ran_unit(run, s):
+    """One unit's rows, and what ended the run when the unit did not report.
+
+    Returns (rows, None) from a unit that reported, and ([], what ended it)
+    from one that exited or raised. The tier stops there rather than running
+    what is left: a unit patches RESOLVER, tmux, sys.stdin and globals and
+    restores them on its way out, so a unit after one that never got there
+    would be answering against whatever was left set.
+
+    KeyboardInterrupt is not caught. interruptible() answers a Ctrl-C with a
+    sentence about what is still running, and a catch here would take that
+    away.
+
+    A raising unit's traceback still reaches the real stderr, printed here
+    because catching the exception is what stops Python printing it. A unit
+    that exits has none to print: die() writes its reason to whatever stderr is
+    in force, and inside a unit's redirect that is a buffer the unit discards.
+    """
+    try:
+        return run(s), None
+    except KeyboardInterrupt:
+        raise
+    except SystemExit as exc:
+        return [], f"SystemExit: {exc.code}"
+    except BaseException as exc:
+        traceback.print_exc()
+        return [], f"{type(exc).__name__}: {exc}"
+
 
 def unit(*ids, live=False):
     """Register one unit of the suite under the ids it produces."""
@@ -10278,7 +10319,11 @@ def _live_in_parallel(jobs):
     out, register = check_rows()
     for row in s.inherited:
         register(*row)
-    workers, short, watched = [], [], []
+    workers, short = [], []
+    # The two ids every share reports under, held back as they arrive and
+    # folded once each below. Both are a statement about one share's own run,
+    # and the merge has to state them for the run as a whole.
+    held = {RUNNER_CHECKS[0][0]: [], UNIT_ENDED[True][0]: []}
     with tempfile.TemporaryDirectory(prefix=f"{TOOL}-shares-") as room:
         inherit = hand_down(s.quiet, Path(room) / "read-only.json")
         try:
@@ -10301,12 +10346,9 @@ def _live_in_parallel(jobs):
                 if counted is None or int(counted) != len(rows):
                     short.append(f"share {at}/{jobs}: {len(rows)} row(s), "
                                  f"it said {summary!r}")
-                # Every share reports on its own printing under the one id, so
-                # those rows are held back for the fold below and never
-                # registered as they arrive. Everything else goes in as it is.
                 for row in rows:
-                    if row[0] == RUNNER_CHECKS[0][0]:
-                        watched.append(row)
+                    if row[0] in held:
+                        held[row[0]].append(row)
                     else:
                         register(*row)
         finally:
@@ -10327,14 +10369,16 @@ def _live_in_parallel(jobs):
     # One verdict for the shares between them, reported whether or not any fell
     # short, so the run says the merge was whole rather than saying nothing.
     register(SHARED_CHECKS[0][0], SHARED_CHECKS[0][1], not short, "; ".join(short))
-    # The units ran in the workers, so the workers are what watched them print.
-    # The jobs rows held back above become this one, and counting them keeps a
-    # worker that never reached the check from reading as a quiet one.
-    noisy = "; ".join(detail for _c, _n, ok, detail in watched if not ok)
-    register(RUNNER_CHECKS[0][0], RUNNER_CHECKS[0][1],
-             len(watched) == jobs and not noisy,
-             noisy or (f"{len(watched)} of {jobs} share(s) said"
-                       if len(watched) != jobs else ""))
+    # The units ran in the workers, so the workers are what watched them print
+    # and what saw one of them end a share. Each id's jobs rows become one, and
+    # counting them keeps a worker that never reached the row from reading as a
+    # worker with nothing to report.
+    for cid, said in (RUNNER_CHECKS[0], UNIT_ENDED[True]):
+        rows = held[cid]
+        wrong = "; ".join(detail for _c, _n, ok, detail in rows if not ok)
+        register(cid, said, len(rows) == jobs and not wrong,
+                 wrong or (f"{len(rows)} of {jobs} share(s) said"
+                           if len(rows) != jobs else ""))
     return out, register
 
 
@@ -10359,9 +10403,18 @@ def live_checks(share=None, child=None):
         for row in s.inherited:
             register(*row)
     live_units = [run for _n, _i, run, is_live in UNITS if is_live]
+    ended = ""
     for at in in_share(len(live_units), share):
-        for row in live_units[at](s):
+        produced, stopped = ran_unit(live_units[at], s)
+        if stopped:
+            ended = f"{live_units[at].__name__} ended the run with {stopped}"
+            break
+        for row in produced:
             register(*row)
+    # Registered by a share too, so a unit that ends one worker is named rather
+    # than read as a worker that simply had less to say. The merge folds the
+    # shares' rows into one, the way it folds what they each watched.
+    register(*UNIT_ENDED[True], not ended, ended)
     return out, register
 
 # What one TAB costs, pinned by shape rather than by a clock, because a timing
@@ -19228,6 +19281,9 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=N
         # the tier can see. It is listed here so the listing stays complete.
         rows += list(RUNNER_CHECKS) if live else []
         rows += list(SHARED_CHECKS) if live and jobs > 1 else []
+        # Every run of either tier states whether it got to the end of its
+        # units, so the row is here whichever tier is being listed.
+        rows.append(UNIT_ENDED[bool(live)])
         column = max((len(cid) for cid, _said in rows), default=0)
         for cid, said in rows:
             print(check_line(cid, said, idwidth=column))
@@ -19256,10 +19312,14 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=N
     s = _suite_context()
     results, register = check_rows()
     misdeclared = []
+    ended = ""
     for _name, ids, run, is_live in UNITS:
         if is_live:
             continue
-        produced = run(s)
+        produced, stopped = ran_unit(run, s)
+        if stopped:
+            ended = f"{_name} ended the run with {stopped}"
+            break
         for row in produced:
             register(*row)
         # The registry is a claim about what a unit does, and a claim this
@@ -19275,6 +19335,7 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=N
         register("registry-declares-what-it-runs",
                  "a unit produces the ids it registered", False,
                  "; ".join(misdeclared))
+    register(*UNIT_ENDED[False], not ended, ended)
     return _selftest_report(results, failed_only)
 
 
