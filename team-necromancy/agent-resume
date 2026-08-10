@@ -9249,6 +9249,22 @@ def unit(*ids, live=False):
     return take
 
 
+def fixture_line(record):
+    """One record of a fixture transcript, as the line a .jsonl file holds.
+
+    Every fixture in this suite that stands up a transcript writes its records
+    through here: one record per line, no spaces, which is what the harness
+    writes and what this tool's readers parse a line at a time.
+
+    Deliberately not the writer under test. _codec_dump is what the product
+    spells a line with, and it passes ensure_ascii=False so a conversion hands
+    back the bytes it was given; a fixture that asked it could not see it go
+    wrong. Nothing in this file is non-ASCII, so the two agree today on every
+    record here, and they are still two answers to two questions.
+    """
+    return json.dumps(record, separators=(",", ":"))
+
+
 def check_rows():
     """One place says what registering a check means.
 
@@ -11285,11 +11301,10 @@ def _check_promoted_member_resolves_by_its_receipt(s):
         # stamps, no receipt and no spawn payloads: nothing on disk says who it
         # is, and saying so is the right answer.
         blank = "0b1a0b1a-0b1a-4b1a-8b1a-0b1a0b1a0b1a"
-        (root / "projects" / "corpus" / f"{blank}.jsonl").write_text(json.dumps(
+        (root / "projects" / "corpus" / f"{blank}.jsonl").write_text(fixture_line(
             {"type": "user", "uuid": "bl-root", "parentUuid": None,
              "sessionId": blank, "timestamp": "2026-05-01T00:00:00Z",
-             "message": {"role": "user", "content": "nobody"}},
-            separators=(",", ":")) + "\n")
+             "message": {"role": "user", "content": "nobody"}}) + "\n")
         blank_eng = Resolver(needs=Needs(maybe=set(NEED)))
         blank_eng.projects_dir, blank_eng.teams_dir = root / "projects", root / "teams"
         blank_eng.process_table = lambda refresh=False: []
@@ -11458,7 +11473,7 @@ def _check_promoted_starts_where_its_file_is(s):
         # The session it came from: it ran in the directory this project dir is
         # named after, and later somewhere else, so "newest that fits" is what
         # the answer has to be and not "the newest" or "the first".
-        (proj / f"{parent}.jsonl").write_text("\n".join(json.dumps(rec, separators=(",", ":")) for rec in (
+        (proj / f"{parent}.jsonl").write_text("\n".join(fixture_line(rec) for rec in (
             {"type": "user", "uuid": "pa-1", "parentUuid": None, "sessionId": parent,
              "cwd": str(home / "deep"), "timestamp": "2026-05-01T00:00:00Z",
              "message": {"role": "user", "content": "a"}},
@@ -11471,15 +11486,14 @@ def _check_promoted_starts_where_its_file_is(s):
         # The promoted conversation: it only ever ran under a directory of its
         # own, which is the whole problem.
         own = str(Path(td) / "elsewhere")
-        (proj / f"{moved}.jsonl").write_text("\n".join([json.dumps(
+        (proj / f"{moved}.jsonl").write_text("\n".join([fixture_line(
             {"type": "user", "uuid": "mv-1", "parentUuid": None, "sessionId": moved,
              "cwd": own, "timestamp": "2026-05-01T01:00:00Z",
-             "message": {"role": "user", "content": "d"}}, separators=(",", ":")),
-            json.dumps({"type": RECEIPT_RECORD, "receipt": {
+             "message": {"role": "user", "content": "d"}}),
+            fixture_line({"type": RECEIPT_RECORD, "receipt": {
                 "dest_stem": moved, "grammar": "pointer", "name": "wanderer",
                 "parent": parent, "root": moved, "task_id": "awanderer",
-                "team": "session-corpus-alpha"}},
-                separators=(",", ":"), sort_keys=True)]) + "\n")
+                "team": "session-corpus-alpha"}})]) + "\n")
         eng = Resolver(needs=Needs(maybe=set(NEED)))
         eng.projects_dir = Path(td) / "projects"
         eng.teams_dir = Path(td) / "teams"
@@ -11579,7 +11593,7 @@ def _check_lead_rebind_crew_report(s):
         Planted per run rather than in the shared corpus, which every other
         check counts."""
         (root / "projects" / "corpus" / f"{STRANGER}.jsonl").write_text("\n".join(
-            json.dumps(rec, separators=(",", ":")) for rec in (
+            fixture_line(rec) for rec in (
                 {"type": "user", "uuid": "dr-root", "parentUuid": None,
                  "timestamp": "2026-04-01T00:00:00Z", "sessionId": STRANGER,
                  "agentName": "drift", "teamName": "session-corpus-alpha",
@@ -11745,9 +11759,9 @@ def _check_member_rebind_preview_launches(s):
         Planted per run rather than in the shared corpus, which every other
         check reads."""
         held = root / "projects" / "corpus" / f"{MEMBER_STAMPED}.jsonl"
-        held.write_text(held.read_text() + json.dumps(
+        held.write_text(held.read_text() + fixture_line(
             {"type": "last-prompt", "leafUuid": "an-2", "sessionId": MEMBER_STAMPED,
-             "lastPrompt": "go"}, separators=(",", ":")) + "\n")
+             "lastPrompt": "go"}) + "\n")
 
     def member_move(**over):
         return resume_run("willow@session-corpus-alpha", to_team="session-corpus-crew",
@@ -12456,14 +12470,11 @@ def _check_demote_parent_refusal_says_why(s):
         proj = eng_demote.projects_dir / "proj"
         proj.mkdir(parents=True)
 
-        def line(d):
-            return json.dumps(d, separators=(",", ":"))
-
         def demote_fixture(stem, name, extra=()):
             """A transcript stamped for `name`, plus whatever else it must carry."""
             stamps = {"agentName": name, "teamName": "TEAMX"} if name else {}
             (proj / f"{stem}.jsonl").write_text("\n".join(
-                [line({"parentUuid": None, "type": "user", "uuid": f"{stem}-root",
+                [fixture_line({"parentUuid": None, "type": "user", "uuid": f"{stem}-root",
                        "timestamp": "2026-01-01T00:00:01Z", **stamps}), *extra]) + "\n")
             return proj / f"{stem}.jsonl"
 
@@ -12471,10 +12482,10 @@ def _check_demote_parent_refusal_says_why(s):
         lonely = demote_fixture("LONE", "lone")
         unstamped = demote_fixture("PLAIN", None)
         # A promoted file's own trailing record, carrying everything but a parent.
-        receipted = demote_fixture("CARRIED", "borne", extra=[line(
+        receipted = demote_fixture("CARRIED", "borne", extra=[fixture_line(
             {"type": RECEIPT_RECORD, "receipt": {"grammar": "rooted", "root": "x"}})])
         # The lead whose spawn payload names one of them.
-        (proj / "LEADER.jsonl").write_text(line(
+        (proj / "LEADER.jsonl").write_text(fixture_line(
             {"parentUuid": None, "type": "assistant", "uuid": "lead-root",
              "timestamp": "2026-01-01T00:00:00Z",
              "message": {"content": [{"type": "tool_result", "content": [
@@ -13330,7 +13341,7 @@ def _check_title_skips_the_harness(s):
 
     def transcript(into, name, records):
         path = into / f"{name}.jsonl"
-        path.write_text("\n".join(json.dumps(r, separators=(",", ":"))
+        path.write_text("\n".join(fixture_line(r)
                                   for r in records) + "\n")
         return path
 
@@ -14118,8 +14129,6 @@ def _check_explain_value_is_what_the_launch_emits(s):
         # The stamps are read off the bytes, and the pattern the reader uses has
         # no space after the colon, which is how the harness writes them.
 
-        def dense(record):
-            return json.dumps(record, separators=(",", ":"))
         fx_team, fx_lead = "session-lossy", "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
         fx_mates = {"tern": ("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "claude-opus-5[1m]"),
                     "gull": ("ffffffff-ffff-4fff-8fff-ffffffffffff", "claude-opus-5-20260101")}
@@ -14139,11 +14148,11 @@ def _check_explain_value_is_what_the_launch_emits(s):
                for mate in fx_mates]}))
         # The spawn records are merged at timestamp 0, so each is the older
         # candidate for its member whatever date the roster carries.
-        spawns = [dense({"type": "user", "uuid": "lossy-root", "parentUuid": None,
+        spawns = [fixture_line({"type": "user", "uuid": "lossy-root", "parentUuid": None,
                          "timestamp": "2026-01-01T00:00:00Z", "sessionId": fx_lead,
                          "message": {"role": "user", "content": "spawn them"}})]
         for mate, (uuid, spawn_model) in fx_mates.items():
-            spawns.append(dense({
+            spawns.append(fixture_line({
                 "type": "assistant", "uuid": f"lossy-{mate}", "parentUuid": "lossy-root",
                 "timestamp": "2026-01-01T00:00:05Z", "sessionId": fx_lead,
                 "toolUseResult": {"status": "teammate_spawned", "name": mate,
@@ -14153,11 +14162,11 @@ def _check_explain_value_is_what_the_launch_emits(s):
             # no model of its own, so the merge holds the two candidates the
             # check is about and no third one.
             (fx / "projects" / "lossy" / f"{uuid}.jsonl").write_text("\n".join([
-                dense({"type": "user", "uuid": f"{mate}-1", "parentUuid": None,
+                fixture_line({"type": "user", "uuid": f"{mate}-1", "parentUuid": None,
                        "timestamp": "2026-01-02T00:00:00Z", "sessionId": uuid,
                        "agentName": mate, "teamName": fx_team,
                        "message": {"role": "user", "content": "go"}}),
-                dense({"type": "assistant", "uuid": f"{mate}-2",
+                fixture_line({"type": "assistant", "uuid": f"{mate}-2",
                        "parentUuid": f"{mate}-1",
                        "timestamp": "2026-01-02T00:00:05Z", "sessionId": uuid,
                        "agentName": mate, "teamName": fx_team}),
@@ -15383,7 +15392,7 @@ def _check_sidechain_not_evidence(s):
     leaks = []
     with tempfile.TemporaryDirectory() as td:
         planted = Path(td) / "side.jsonl"
-        planted.write_text(json.dumps(side, separators=(",", ":")) + "\n" +
+        planted.write_text(fixture_line(side) + "\n" +
                            json.dumps(side) + "\n")
         fields, _ = RESOLVER._scan_transcript(planted)
         if "agentName" in fields or "teamName" in fields:
@@ -15596,8 +15605,6 @@ def _check_conversion_proves_inverse(s):
         sub = Path(td) / "proj" / "PARENT" / "subagents"
         sub.mkdir(parents=True)
 
-        def compact(d):
-            return json.dumps(d, separators=(",", ":"))
         rows = [
             {"parentUuid": None, "isSidechain": True, "sessionId": "PARENT",
              "agentId": "t1", "type": "user", "uuid": "cv-root",
@@ -15607,7 +15614,7 @@ def _check_conversion_proves_inverse(s):
              "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}},
         ]
         rooted = sub / "agent-t1.jsonl"
-        rooted_bytes = "".join(compact(r) + "\n" for r in rows)
+        rooted_bytes = "".join(fixture_line(r) + "\n" for r in rows)
         rooted.write_text(rooted_bytes)
         (sub / "agent-t1.meta.json").write_text('{"agentType":"x","name":"t"}')
         eng = Resolver(needs=Needs(maybe=set(NEED)))
@@ -15629,13 +15636,13 @@ def _check_conversion_proves_inverse(s):
         # a born teammate: no isSidechain anywhere, harness trailers in place
         mate = Path(td) / "proj" / "MATE.jsonl"
         mate.write_text(
-            compact({"parentUuid": None, "sessionId": "MATE", "agentId": "m1",
+            fixture_line({"parentUuid": None, "sessionId": "MATE", "agentId": "m1",
                      "type": "user", "uuid": "mate-root"}) + "\n" +
-            compact({"type": "last-prompt", "lastPrompt": "hi",
+            fixture_line({"type": "last-prompt", "lastPrompt": "hi",
                      "leafUuid": "mate-root", "sessionId": "MATE"}) + "\n" +
-            compact({"parentUuid": "mate-root", "sessionId": "MATE", "agentId": "m1",
+            fixture_line({"parentUuid": "mate-root", "sessionId": "MATE", "agentId": "m1",
                      "type": "assistant", "uuid": "mate-2"}) + "\n" +
-            compact({"type": "last-prompt", "lastPrompt": "hi again",
+            fixture_line({"type": "last-prompt", "lastPrompt": "hi again",
                      "leafUuid": "mate-2", "sessionId": "MATE"}) + "\n")
         dplan = eng.conversion_plan(mate, "demote", into="PARENT", dest="m1")
         if dplan["objections"] or not dplan["proved"]:
@@ -15677,21 +15684,21 @@ def _check_conversion_proves_inverse(s):
         # the destination carries the referenced entry. Both answers, against
         # one specimen, or the refusal could pass by refusing everything.
         pref = sub / "agent-p2.jsonl"
-        pref.write_text(compact({"type": "fork-context-ref", "agentId": "p2",
+        pref.write_text(fixture_line({"type": "fork-context-ref", "agentId": "p2",
                                  "parentSessionId": "PARENT",
                                  "parentLastUuid": "anchor-1",
                                  "contextLength": 3}) + "\n" +
-                        compact({"parentUuid": None, "isSidechain": True,
+                        fixture_line({"parentUuid": None, "isSidechain": True,
                                  "sessionId": "PARENT", "type": "user",
                                  "uuid": "p2-root",
                                  "message": {"role": "user", "content": "go"}}) + "\n")
         (sub / "agent-p2.meta.json").write_text('{"agentType":"fork","isFork":true}')
         (Path(td) / "proj" / "PARENT.jsonl").write_text(
-            compact({"uuid": "anchor-1", "type": "assistant"}) + "\n")
+            fixture_line({"uuid": "anchor-1", "type": "assistant"}) + "\n")
         (Path(td) / "proj" / "HASIT.jsonl").write_text(
-            compact({"uuid": "anchor-1", "type": "assistant"}) + "\n")
+            fixture_line({"uuid": "anchor-1", "type": "assistant"}) + "\n")
         (Path(td) / "proj" / "LACKS.jsonl").write_text(
-            compact({"uuid": "not-it", "type": "assistant"}) + "\n")
+            fixture_line({"uuid": "not-it", "type": "assistant"}) + "\n")
         pplan = eng.conversion_plan(pref, "promote", identity=("p2", "T"))
         pdest = Path(td) / "proj" / "p2-root.jsonl"
         pdest.write_text("\n".join(pplan["lines"]) + "\n")
@@ -15704,11 +15711,11 @@ def _check_conversion_proves_inverse(s):
         # And the case that is really broken: the session the ref names has
         # lost the entry, so the prefix resolves nowhere wherever it is moved.
         orphan = sub / "agent-p3.jsonl"
-        orphan.write_text(compact({"type": "fork-context-ref", "agentId": "p3",
+        orphan.write_text(fixture_line({"type": "fork-context-ref", "agentId": "p3",
                                    "parentSessionId": "LACKS",
                                    "parentLastUuid": "anchor-1",
                                    "contextLength": 3}) + "\n" +
-                          compact({"parentUuid": None, "isSidechain": True,
+                          fixture_line({"parentUuid": None, "isSidechain": True,
                                    "sessionId": "PARENT", "type": "user",
                                    "uuid": "p3-root",
                                    "message": {"role": "user", "content": "go"}}) + "\n")
@@ -15723,7 +15730,7 @@ def _check_conversion_proves_inverse(s):
         # Last means last. With a turn written past it the record is history,
         # so the demote leaves it where it sits instead of eating it.
         grown = Path(td) / "proj" / "cv-grown.jsonl"
-        grown.write_text("\n".join(plan["lines"]) + "\n" + compact(
+        grown.write_text("\n".join(plan["lines"]) + "\n" + fixture_line(
             {"parentUuid": "cv-2", "sessionId": "cv-root", "type": "assistant",
              "uuid": "cv-3"}) + "\n")
         after = eng.conversion_plan(grown, "demote", into="PARENT", dest="t1")
@@ -15745,7 +15752,7 @@ def _check_conversion_proves_inverse(s):
         # rather than guessing at a shape. There is no salvage path: the
         # transcripts that needed one are not produced any more.
         messy = sub / "agent-c1.jsonl"
-        messy.write_text("".join(compact(r) + "\n" for r in [
+        messy.write_text("".join(fixture_line(r) + "\n" for r in [
             {"parentUuid": "ghost-above", "isSidechain": True, "sessionId": "PARENT",
              "type": "user", "uuid": "mid-chain",
              "message": {"role": "user", "content": "no root in this file"}},
@@ -15779,9 +15786,7 @@ def _check_writers_move_receipt_back(s):
         sub = Path(td) / "proj" / "PARENT" / "subagents"
         sub.mkdir(parents=True)
 
-        def compact(d):
-            return json.dumps(d, separators=(",", ":"))
-        body = "\n".join(compact(r) for r in [
+        body = "\n".join(fixture_line(r) for r in [
             {"type": "fork-context-ref", "agentId": "x1", "parentSessionId": "PARENT",
              "parentLastUuid": "pl-leaf", "contextLength": 9},
             {"parentUuid": None, "isSidechain": True, "sessionId": "PARENT",
@@ -15861,19 +15866,17 @@ def _check_demote_cannot_embed_self(s):
         proj = Path(td) / "proj"
         proj.mkdir(parents=True)
 
-        def compact(d):
-            return json.dumps(d, separators=(",", ":"))
         # A teammate that really does demote, so the arms where nothing stops
         # it show the demote going through rather than meeting some later
         # refusal that would make a broken gate look the same as a working one.
         (proj / "MATEHELD.jsonl").write_text(
-            compact({"parentUuid": None, "sessionId": "MATEHELD", "agentName": "heldy",
+            fixture_line({"parentUuid": None, "sessionId": "MATEHELD", "agentName": "heldy",
                      "teamName": "TEAMH", "type": "user", "uuid": "mh-root"}) + "\n" +
-            compact({"type": "last-prompt", "lastPrompt": "hi", "leafUuid": "mh-root",
+            fixture_line({"type": "last-prompt", "lastPrompt": "hi", "leafUuid": "mh-root",
                      "sessionId": "MATEHELD"}) + "\n" +
-            compact({"parentUuid": "mh-root", "sessionId": "MATEHELD", "agentName": "heldy",
+            fixture_line({"parentUuid": "mh-root", "sessionId": "MATEHELD", "agentName": "heldy",
                      "teamName": "TEAMH", "type": "assistant", "uuid": "mh-2"}) + "\n" +
-            compact({"type": "last-prompt", "lastPrompt": "again", "leafUuid": "mh-2",
+            fixture_line({"type": "last-prompt", "lastPrompt": "again", "leafUuid": "mh-2",
                      "sessionId": "MATEHELD"}) + "\n")
 
         class _HeldArgs:
@@ -16112,17 +16115,14 @@ def _check_mail_ledger_joins_deliveries(s):
         proj = Path(td) / "proj"
         proj.mkdir(parents=True)
 
-        def compact(d):
-            return json.dumps(d, separators=(",", ":"))
-
         def send_rec(body, ts):
-            return compact({"type": "assistant", "agentName": "alice",
+            return fixture_line({"type": "assistant", "agentName": "alice",
                             "teamName": "TML", "timestamp": ts, "uuid": f"s-{body}",
                             "parentUuid": None, "message": {"content": [
                                 {"type": "tool_use", "name": "SendMessage",
                                  "input": {"to": "bob", "summary": body,
                                            "message": body}}]}})
-        chatter = [compact({"type": "assistant", "agentName": "alice",
+        chatter = [fixture_line({"type": "assistant", "agentName": "alice",
                             "teamName": "TML", "timestamp": f"2026-01-01T00:01:{n:02d}Z",
                             "uuid": f"c-{n}", "parentUuid": None,
                             "message": {"content": []}}) for n in range(20)]
@@ -16133,11 +16133,11 @@ def _check_mail_ledger_joins_deliveries(s):
             send_rec("four", "2026-01-01T00:00:09Z"),
         ] + chatter) + "\n")
         (proj / "BOB.jsonl").write_text("\n".join([
-            compact({"type": "user", "agentName": "bob", "teamName": "TML",
+            fixture_line({"type": "user", "agentName": "bob", "teamName": "TML",
                      "timestamp": "2026-01-01T00:00:04Z", "uuid": "b-1",
                      "parentUuid": None, "message": {"content":
                      '<teammate-message teammate_id="alice">\none\n</teammate-message>'}}),
-            compact({"type": "assistant", "agentName": "bob", "teamName": "TML",
+            fixture_line({"type": "assistant", "agentName": "bob", "teamName": "TML",
                      "timestamp": "2026-01-01T00:00:05Z", "uuid": "b-2",
                      "parentUuid": "b-1", "message": {"content": []}}),
         ]) + "\n")
@@ -16204,14 +16204,12 @@ def _check_ledger_detail_once_per_addressee(s):
         proj = Path(td) / "proj"
         proj.mkdir(parents=True)
 
-        def compact(d):
-            return json.dumps(d, separators=(",", ":"))
         fx_team = "session-ledgerfx"
         wordy = ("a summary long enough to run off the end of the column the "
                  "ledger leaves for it")
 
         def fx_send(to, summary, n):
-            return compact({"type": "assistant", "agentName": "alice",
+            return fixture_line({"type": "assistant", "agentName": "alice",
                             "teamName": fx_team, "uuid": f"fx-{n}",
                             "timestamp": f"2026-01-01T00:00:{n:02d}Z",
                             "parentUuid": None, "message": {"content": [
@@ -16420,8 +16418,6 @@ def _check_restamp_window_start(s):
         proj = Path(td) / "proj"
         proj.mkdir()
 
-        def compact(d):
-            return json.dumps(d, separators=(",", ":"))
         rows = [
             {"parentUuid": None, "agentName": "mate", "teamName": "OLD",
              "type": "user", "uuid": "rs-root",
@@ -16434,7 +16430,7 @@ def _check_restamp_window_start(s):
         rows.append({"type": "last-prompt", "leafUuid": "rs-tail",
                      "sessionId": "RS"})
         target = proj / "RS.jsonl"
-        target.write_text("".join(compact(r) + "\n" for r in rows))
+        target.write_text("".join(fixture_line(r) + "\n" for r in rows))
         target.chmod(0o600)
         eng7 = Resolver(needs=Needs(maybe=set(NEED)))
         eng7.projects_dir = Path(td)
@@ -16452,7 +16448,7 @@ def _check_restamp_window_start(s):
                     stray.append("a no-rename restamp did not set teamName")
                 if loaded.get("agentName") != "mate":
                     stray.append("a no-rename restamp touched agentName")
-                if plan["lines"][1] != compact(rows[1]):
+                if plan["lines"][1] != fixture_line(rows[1]):
                     stray.append("the tail line changed under a window-start edit")
             # renaming touches both fields
             rplan = eng7.restamp_plan(target, "NEW", name="newmate")
@@ -16497,7 +16493,7 @@ def _check_restamp_window_start(s):
                     # The trace records the net change from where the conversation
                     # started, so coming back to the origin leaves nothing to
                     # record and the bytes are the ones it had before any of it.
-                    was = "".join(compact(r) + "\n" for r in rows)
+                    was = "".join(fixture_line(r) + "\n" for r in rows)
                     if target.read_text() != was:
                         stray.append("the round trip did not restore the original bytes")
                     # And three moves leave one record of the net change, not two
@@ -16584,9 +16580,6 @@ def _check_restamp_refuses_a_third_field(s):
         proj = Path(td) / "proj"
         proj.mkdir()
 
-        def compact(d):
-            return json.dumps(d, separators=(",", ":"))
-
         def one_window(stem, extra=None):
             """A transcript whose window-start carries both stamps, plus extra."""
             start = {"parentUuid": None, "agentName": "mate", "teamName": "OLD",
@@ -16594,7 +16587,7 @@ def _check_restamp_refuses_a_third_field(s):
                      "timestamp": "2026-01-01T00:00:01Z"}
             start.update(extra or {})
             path = proj / f"{stem}.jsonl"
-            path.write_text(compact(start) + "\n" + compact(
+            path.write_text(fixture_line(start) + "\n" + fixture_line(
                 {"type": "last-prompt", "leafUuid": f"{stem}-root",
                  "sessionId": stem}) + "\n")
             return path
@@ -16630,9 +16623,6 @@ def _check_restamp_refuses_an_unrestorable_line(s):
         proj = Path(td) / "proj"
         proj.mkdir()
 
-        def compact(d):
-            return json.dumps(d, separators=(",", ":"))
-
         def twinned(stem, first_uuid):
             """Two records under one window, the earlier one unstamped."""
             rows = [{"parentUuid": None, "type": "user", "uuid": first_uuid,
@@ -16644,7 +16634,7 @@ def _check_restamp_refuses_an_unrestorable_line(s):
                     {"type": "last-prompt", "leafUuid": f"{stem}-root",
                      "sessionId": stem}]
             path = proj / f"{stem}.jsonl"
-            path.write_text("".join(compact(r) + "\n" for r in rows))
+            path.write_text("".join(fixture_line(r) + "\n" for r in rows))
             return path
 
         eng9 = Resolver(needs=Needs(maybe=set(NEED)))
@@ -16680,9 +16670,6 @@ def _check_restamp_refuses_a_non_record_line(s):
         proj = Path(td) / "proj"
         proj.mkdir()
 
-        def compact(d):
-            return json.dumps(d, separators=(",", ":"))
-
         def with_array(stem, lead):
             """A stamped window-start, optionally preceded by a bare array."""
             rows = [{"parentUuid": None, "agentName": "mate", "teamName": "OLD",
@@ -16691,9 +16678,9 @@ def _check_restamp_refuses_a_non_record_line(s):
                      "message": {"role": "user", "content": "hi"}},
                     {"type": "last-prompt", "leafUuid": f"{stem}-root",
                      "sessionId": stem}]
-            body = "".join(compact(r) + "\n" for r in rows)
+            body = "".join(fixture_line(r) + "\n" for r in rows)
             if lead:
-                body = compact([f"{stem}-root"]) + "\n" + body
+                body = fixture_line([f"{stem}-root"]) + "\n" + body
             path = proj / f"{stem}.jsonl"
             path.write_text(body)
             return path
@@ -16750,11 +16737,9 @@ def _check_rebind_retires_if_unnoticed(s):
         (adir / "inboxes" / "mate.json").write_text(
             json.dumps([{"text": "hi", "timestamp": "2026-01-01T00:00:00Z"}]))
 
-        def compact(d):
-            return json.dumps(d, separators=(",", ":"))
         proj = Path(td) / "proj"
         proj.mkdir()
-        (proj / "MATE-A.jsonl").write_text(compact(
+        (proj / "MATE-A.jsonl").write_text(fixture_line(
             {"parentUuid": None, "agentName": "mate", "teamName": "TEAMA",
              "type": "user", "uuid": "ra-root",
              "timestamp": "2026-01-01T00:00:01Z"}) + "\n")
@@ -17090,12 +17075,10 @@ def _check_demote_catches_a_late_send(s):
         proj = Path(td) / "proj"
         proj.mkdir(parents=True)
 
-        def compact(d):
-            return json.dumps(d, separators=(",", ":"))
         (proj / "MATELATE.jsonl").write_text(
-            compact({"parentUuid": None, "sessionId": "MATELATE", "agentName": "posty",
+            fixture_line({"parentUuid": None, "sessionId": "MATELATE", "agentName": "posty",
                      "teamName": "TEAMP", "type": "user", "uuid": "ml-root"}) + "\n" +
-            compact({"type": "last-prompt", "lastPrompt": "hi", "leafUuid": "ml-root",
+            fixture_line({"type": "last-prompt", "lastPrompt": "hi", "leafUuid": "ml-root",
                      "sessionId": "MATELATE"}) + "\n")
         box = Path(td) / "teams" / "TEAMP" / "inboxes" / "posty.json"
         box.parent.mkdir(parents=True)
@@ -17167,10 +17150,8 @@ def _check_unread_mail_refusal_no_crash(s):
         proj = Path(td) / "proj"
         proj.mkdir(parents=True)
 
-        def compact(d):
-            return json.dumps(d, separators=(",", ":"))
         (proj / "MATEDEMO.jsonl").write_text(
-            compact({"parentUuid": None, "sessionId": "MATEDEMO", "agentName": "maily",
+            fixture_line({"parentUuid": None, "sessionId": "MATEDEMO", "agentName": "maily",
                      "teamName": "TEAMM", "type": "user", "uuid": "md-root"}) + "\n")
         boxdir = Path(td) / "teams" / "TEAMM" / "inboxes"
         boxdir.mkdir(parents=True)
@@ -18813,6 +18794,49 @@ def _check_asking_is_not_resuming(s):
         quiet.append("the run that rebuilds no longer says the claim is uncorroborated")
     check("asking-is-not-resuming", "describing a team warns about nothing; rebuilding it does",
           not quiet, "; ".join(quiet))
+    return checked
+
+
+@unit(("fixture-line-one-spelling", "a fixture transcript's records are written one way"))
+def _check_fixture_line_one_spelling(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    ast = s.ast
+    funcs = s.funcs
+    tree = s.tree
+
+    forked = []
+    owner = funcs.get("fixture_line")
+    if not owner:
+        forked.append("fixture_line is gone, so nothing says how a fixture writes a record")
+    else:
+        # The record goes to fixture_line and comes back as the line a .jsonl
+        # file holds: one record, no spaces, and nothing added.
+        made = fixture_line({"type": "user", "uuid": "x"})
+        if made != '{"type":"user","uuid":"x"}' or "\n" in made:
+            forked.append(f"a record comes back as {made!r}")
+
+    # A json.dumps carrying separators inside a unit is a unit spelling the
+    # line itself. The product's three sites are outside the units and pass
+    # ensure_ascii=False, which is a different call for a different job: a
+    # conversion hands back the bytes it was given, and a fixture here has no
+    # non-ASCII to hand back.
+    units = [(node.lineno, node.end_lineno or node.lineno, node.name)
+             for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+             and any(isinstance(dec, ast.Call) and getattr(dec.func, "id", None) == "unit"
+                     for dec in node.decorator_list)]
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "dumps"
+                and any(word.arg == "separators" for word in node.keywords)):
+            continue
+        inside = [name for first, last, name in units if first <= node.lineno <= last]
+        if inside:
+            forked.append(f"{inside[0]} spells a fixture line itself at line {node.lineno}")
+    check("fixture-line-one-spelling", "a fixture transcript's records are written one way",
+          not forked, "; ".join(sorted(set(forked))[:3]))
     return checked
 
 
