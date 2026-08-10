@@ -344,10 +344,20 @@ VERBS = {
     "complete": ("--complete",),
     "poison": ("--poison",),
     "unpoison": ("--unpoison",),
-    # --help prints and returns like the rest of them, so it is dropped by
-    # whichever verb sits above it in the ladder just as silently.
-    "help": ("-h", "--help"),
 }
+# --help is not among them. Asking what the flags are is a question about the
+# command line rather than a verb competing to be the run, so it is answered
+# beside whatever else was typed instead of refusing to choose between them.
+
+
+def say_help(parser):
+    """The flags, then the notes, with a blank line between them.
+
+    One place says it, because two callers ask: --help, and a run that named
+    nothing to work on. They differ in what they return, not in what they say.
+    """
+    parser.print_help()
+    print("\n" + __doc__)
 
 
 def check_one_verb(args, argv):
@@ -13085,9 +13095,14 @@ def _check_verb_table_matches_dispatch(s):
     declared = s.declared
     funcs = s.funcs
 
+    # The help answer is not part of the ladder: it is answered before the
+    # ladder starts, beside whatever else was typed, so it neither competes
+    # with a verb nor has to wait for the question about which verb this is.
     dispatch = [node for node in funcs["main"].body
                 if isinstance(node, ast.If)
-                and any(isinstance(sub, ast.Return) for sub in ast.walk(node))]
+                and any(isinstance(sub, ast.Return) for sub in ast.walk(node))
+                and not any(getattr(n, "attr", None) == "help"
+                            for n in ast.walk(node.test))]
     dispatched = {n.attr for node in dispatch for n in ast.walk(node.test)
                   if isinstance(n, ast.Attribute) and getattr(n.value, "id", None) == "args"}
     # The help gate's test names the selectors beside --help, and a selector
@@ -13111,6 +13126,51 @@ def _check_verb_table_matches_dispatch(s):
               f"; differing: {sorted(dispatched ^ set(VERBS))}"
               if dispatched != set(VERBS) else ""))
     return checked
+
+
+@unit(('help-answers-beside-a-verb', 'asking for the flags is answered whatever else was typed'))
+def _check_help_answers_beside_a_verb(s):
+    """Driven as command lines, because the property is about argv.
+
+    --help is not in VERBS, so check_one_verb cannot be asked about it; what
+    has to hold is that main answers it before the ladder and beside anything
+    else. A verb pair with no --help in it is here too, so a run that answered
+    everything would fail rather than pass.
+    """
+    import subprocess as sp
+    me = str(Path(__file__).resolve())
+    quiet = dict(os.environ, NO_COLOR="1")
+
+    def ran(*argv):
+        """(exit code, whether it said the whole help)."""
+        out = sp.run([sys.executable, me, *argv], capture_output=True, text=True,
+                     env=quiet, stdin=sp.DEVNULL, timeout=60)
+        # Both halves: the flags argparse prints, and the notes beside them.
+        # Asserting only the usage line would pass a caller that printed the
+        # flags and dropped the notes, which is half an answer.
+        said = out.stdout
+        return out.returncode, ("usage: " in said
+                                and __doc__.strip().splitlines()[0] in said)
+
+    beside_after = ran("--doctor", "--help")
+    beside_first = ran("--help", "--census")
+    short = ran("-h", "--sides", "x")
+    alone = ran("--help")
+    pair = ran("--doctor", "--census")
+    answered = {
+        "--help after a verb answers": beside_after == (0, True),
+        "--help before a verb answers": beside_first == (0, True),
+        "-h beside a verb that takes a value answers": short == (0, True),
+        "--help alone still answers": alone == (0, True),
+        # The control: without it, a main that answered every command line
+        # with the flags would pass everything above.
+        "two verbs are still refused": pair[0] == 1 and not pair[1],
+        "help is not a verb": "help" not in VERBS,
+    }
+    wrong = sorted(k for k, ok in answered.items() if not ok)
+    return [("help-answers-beside-a-verb",
+             "asking for the flags is answered whatever else was typed",
+             not wrong, ", ".join(wrong))]
 
 
 @unit(('two-verbs-refused', 'naming two verbs is refused, naming the ones typed'))
@@ -19559,7 +19619,7 @@ def verb_needs(args, selector):
         # liveness only for the rows a live holder would explain
         return Needs(hard={NEED.STAMPS, NEED.MAIL},
                      maybe={NEED.PROCS, NEED.SPAWNS})
-    if args.install or args.poison or args.unpoison or args.help:
+    if args.install or args.poison or args.unpoison:
         return Needs()
     if not (selector or args.agent_id or args.resume or args.team):
         return Needs()  # the help gate answers this run
@@ -19855,6 +19915,12 @@ def main():
     check_passthrough(passthrough, parser)
     selector, passthrough = classify_passthrough(passthrough)
     check_identity_flags(args, passthrough)
+    # Answered first, and beside anything else typed: a person reaching for
+    # --help while composing a command wants the flags, not a refusal to
+    # choose between it and the verb they were half way through writing.
+    if args.help:
+        say_help(parser)
+        return 0
     # Before anything is resolved or run: which verb this is decides everything
     # below, and the ladder cannot ask the question once it has started down it.
     check_one_verb(args, argv)
@@ -19916,12 +19982,9 @@ def main():
             die("--poison/--unpoison stand alone; they act on the server, not an agent")
         return run_poison(args)
 
-    if args.help or not (selector or args.agent_id or args.resume or args.team):
-        # The flags, then the notes, with a blank line between them, so the
-        # notes read as their own section.
-        parser.print_help()
-        print("\n" + __doc__)
-        return 0 if args.help else 2
+    if not (selector or args.agent_id or args.resume or args.team):
+        say_help(parser)
+        return 2
 
     if args.tmux_session or args.tmux_window:
         # One constant, set once: everything downstream reads these.
