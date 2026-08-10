@@ -9971,21 +9971,6 @@ def _check_install_preview_writes_nothing(s):
 
     sp = s.sp
 
-    def home_state(root):
-        """Every path under root and what it holds. "Nothing was written" is
-        measured over the whole tree rather than over the files we thought of,
-        so a preview that writes something nobody named still fails."""
-        state = {}
-        for path in sorted(root.rglob("*")):
-            rel = str(path.relative_to(root))
-            if path.is_symlink():
-                state[rel] = "-> " + os.readlink(path)
-            elif path.is_file():
-                state[rel] = path.read_text(errors="replace")
-            else:
-                state[rel] = "<a directory>"
-        return state
-
     def install_preview(hook_command):
         """(what --install --dry-run said, its exit code, what it changed)."""
         home = Path(tempfile.mkdtemp())
@@ -9996,14 +9981,14 @@ def _check_install_preview_writes_nothing(s):
             (home / ".claude" / "settings.json").write_text(json.dumps(
                 {"hooks": {"SessionStart": [
                     {"hooks": [{"type": "command", "command": hook_command}]}]}}))
-            before = home_state(home)
+            before = tree_state(home)
             run = sp.run([sys.executable, str(Path(__file__).resolve()),
                           "--install", "--dry-run"],
                          capture_output=True, text=True, timeout=300,
                          env=dict(os.environ, HOME=str(home),
                                   CLAUDE_CONFIG_DIR=str(home / ".claude"),
                                   ZSH=str(home / ".oh-my-zsh"), NO_COLOR="1"))
-            after = home_state(home)
+            after = tree_state(home)
             return run.stdout, run.returncode, sorted(
                 set(before) ^ set(after)
                 | {k for k in set(before) & set(after) if before[k] != after[k]})
@@ -10086,6 +10071,84 @@ def _check_poison_preview_changes_nothing(s):
     wrong = sorted(k for k, ok in poisoning.items() if not ok)
     check("poison-preview-changes-nothing", "a --poison preview changes no server environment",
           not wrong, ", ".join(wrong))
+    return checked
+
+
+@unit(('help-is-inert', 'asking for the flags beside a verb does that verb no work'), live=True)
+def _check_help_is_inert(s):
+    """--help answers a question about the command line, so it must act like
+    --dry-run acts: say something and change nothing.
+
+    The verbs paired with it here are the ones with something to lose. Three
+    write (--install links and edits settings, --promote converts files,
+    --cleanup deletes), one changes a server (--poison), and one starts a
+    process and a tmux server (a bare selector). A shape that only refuses
+    would prove nothing, since a refusal changes nothing either.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    sp = s.sp
+    home = Path(tempfile.mkdtemp(prefix=f"{TOOL}-help-"))
+    cfg = home / "claude"
+    shutil.copytree(Path(__file__).resolve().parent / "test" / "corpus", cfg)
+    (home / ".oh-my-zsh" / "custom" / "completions").mkdir(parents=True)
+    (home / ".zcompdump").write_text("a cache that never mentions the tool\n")
+    side = next(iter(sorted((cfg / "projects").rglob("subagents/*.jsonl"))), None)
+    asked, appeared = {}, set()
+    try:
+        pairs = [
+            ("--install", ["--install"]),
+            ("--cleanup", ["--cleanup"]),
+            ("--poison", ["--poison"]),
+            ("a launch", ["willow@session-corpus-alpha"]),
+            ("--promote", ["--promote", side.stem if side else "nosuchside",
+                           "--as-agent", "borne@session-corpus-alpha"]),
+        ]
+        for named, argv in pairs:
+            before, was_up = tree_state(home), started_here()
+            run = sp.run([sys.executable, str(Path(__file__).resolve()), *argv, "--help"],
+                         capture_output=True, text=True, stdin=sp.DEVNULL, timeout=120,
+                         env=dict(os.environ, HOME=str(home), CLAUDE_CONFIG_DIR=str(cfg),
+                                  ZSH=str(home / ".oh-my-zsh"), NO_COLOR="1"))
+            after, up_now = tree_state(home), started_here()
+            wrote = sorted(set(before) ^ set(after)
+                           | {k for k in set(before) & set(after) if before[k] != after[k]})
+            started = up_now - was_up
+            appeared |= started
+            asked[named] = (run.returncode, run.stdout, wrote, sorted(started))
+    finally:
+        # A shape here starts something only when the tool is broken, which is
+        # exactly when nothing else is going to clean it up: the run that
+        # started it has already exited. So this ends what it saw appear
+        # rather than leaving a real agent and its server on the machine.
+        for name in appeared:
+            if name.isdigit():
+                with contextlib.suppress(OSError):
+                    os.kill(int(name), 9)
+            else:
+                with contextlib.suppress(OSError):
+                    (RESOLVER.socket_dir() / name).unlink()
+        shutil.rmtree(home, ignore_errors=True)
+
+    inert = {
+        "nothing under the home is written": not any(w for _c, _o, w, _u in asked.values()),
+        "nothing is started": not any(u for _c, _o, _w, u in asked.values()),
+        "every one answers the question asked": all(
+            out.startswith("usage: ") for _c, out, _w, _u in asked.values()),
+        "every one exits 0": {code for code, _o, _w, _u in asked.values()} == {0},
+        # Without this the arms above pass on a build where --help refuses
+        # beside a verb: a refusal writes nothing and starts nothing either.
+        "a verb with something to lose was really named": len(asked) == 5,
+    }
+    wrong = sorted(k for k, ok in inert.items() if not ok)
+    said = "; ".join(f"{named}: exit {code}, wrote {w or 'nothing'}, started {u or 'nothing'}"
+                     for named, (code, _o, w, u) in sorted(asked.items())
+                     if code != 0 or w or u)
+    check("help-is-inert", "asking for the flags beside a verb does that verb no work",
+          not wrong, ", ".join(wrong) + (f" ({said})" if said else ""))
     return checked
 
 
@@ -10315,6 +10378,27 @@ def verdicts_from(said):
         elif "checks passed" in verdict:
             summary = verdict
     return rows, summary
+
+
+def tree_state(root):
+    """Every path under root and what it holds.
+
+    Nothing was written is measured over the whole tree rather than over the
+    files somebody thought of, so a run that writes something nobody named
+    still fails. Two checks ask it, a preview that must write nothing and a
+    help that must do nothing, and one function keeps them asking the same
+    question.
+    """
+    state = {}
+    for path in sorted(root.rglob("*")):
+        rel = str(path.relative_to(root))
+        if path.is_symlink():
+            state[rel] = "-> " + os.readlink(path)
+        elif path.is_file():
+            state[rel] = path.read_text(errors="replace")
+        else:
+            state[rel] = "<a directory>"
+    return state
 
 
 def started_here():
