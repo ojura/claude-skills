@@ -602,21 +602,40 @@ def abort_agents(running, assume_yes=False, dry=False):
             return 0
     killed = 0
     for pid, agent_id, _desc, _colour in running:
-        result = subprocess.run(["kill", str(pid)], capture_output=True)
-        # A healthy claude takes a moment to shut down cleanly, so poll rather
-        # than declare failure after one short sleep and warn about a process
-        # that was merely still on its way out.
-        for _ in range(10):
-            time.sleep(0.15)
-            if not RESOLVER.pid_alive(pid):
-                break
-        if result.returncode == 0 and not RESOLVER.pid_alive(pid):
+        gone, why = stopped(pid)
+        if gone:
             killed += 1
             continue
-        warn(f"pid {pid} ({agent_id}) did not stop"
-             f"{': ' + result.stderr.decode().strip() if result.stderr else ''}")
+        warn(f"pid {pid} ({agent_id}) did not stop: {why}")
     print(f"aborted {killed} of {len(running)}")
     return killed
+
+
+def stopped(pid):
+    """Ask this process to stop, wait for it to go, and say whether it did.
+
+    (it is gone, why it is not). One policy in one place: the signal a kill
+    sends by default, then up to ten looks a seventh of a second apart,
+    because a healthy claude takes a moment to shut down cleanly and calling
+    that a failure reports a process that was merely on its way out. The two
+    callers phrase their own sentence; what they must not each decide is how
+    long to wait or what counts as gone.
+
+    Written twice before this and already drifting: one slept before its first
+    look and the other looked first, so the same process was given ten waits
+    by one caller and nine by the other.
+
+    A fixture in the suite is a different question and stays where it is: it
+    ends now, with no signal to be polite about and nothing to wait for.
+    """
+    sent = subprocess.run(["kill", str(pid)], capture_output=True)
+    for _ in range(10):
+        if not RESOLVER.pid_alive(pid):
+            break
+        time.sleep(0.15)
+    if sent.returncode == 0 and not RESOLVER.pid_alive(pid):
+        return True, ""
+    return False, (sent.stderr or b"").decode().strip() or "still running"
 
 
 def read_one_key():
@@ -6508,18 +6527,12 @@ def kill_holder(pid, where, args, indent="  "):
         print(fill(f"{indent}a dry run ends nothing, so what follows is measured "
                    f"with pid {pid} still running"))
         return False
-    killed = subprocess.run(["kill", str(pid)], capture_output=True)
-    # A healthy claude takes a moment to shut down cleanly, so poll rather than
-    # call it a failure while it is still on its way out.
-    for _ in range(10):
-        if not RESOLVER.pid_alive(pid):
-            break
-        time.sleep(0.15)
-    if killed.returncode != 0 or RESOLVER.pid_alive(pid):
+    gone, why = stopped(pid)
+    if not gone:
         # Two processes appending to one transcript is the state this prevents,
         # so a kill that did not work has to be said out loud rather than
         # reported as a clean move.
-        warn(f"pid {pid} did not die ({(killed.stderr or b'').decode().strip() or 'still running'}); "
+        warn(f"pid {pid} did not die ({why}); "
              "it is still appending to this transcript")
         return False
     # Nothing may answer a liveness question from a table taken before this.
@@ -15501,7 +15514,7 @@ def _check_lead_rebind_one_mechanism(s):
     return checked
 
 
-@unit(('holder-kill-one-site', 'a migration and a lead move end the holder through one function'))
+@unit(('holder-kill-one-site', 'a process is asked to stop in one place, and waited for there'))
 def _check_holder_kill_one_site(s):
     checked = []
 
@@ -15525,20 +15538,26 @@ def _check_holder_kill_one_site(s):
                 return True
         return False
 
-    # abort_agents is --stop, the verb whose whole job is ending processes; it
-    # asks its own question, of a list, before it ends anything.
-    killers = {n for n, node in funcs.items() if ends_a_process(node)} - {"abort_agents"}
+    # stopped() sends the signal and waits; kill_holder is the one route a
+    # migration and a lead move take to it, and abort_agents is --stop, the
+    # verb whose whole job is ending processes, which asks its own question of
+    # a list before it ends anything. Everything else reaches a process through
+    # one of those two.
+    killers = {n for n, node in funcs.items() if ends_a_process(node)}
     reached = callers_of("kill_holder") - s.suite_fns
+    asked_to_stop = callers_of("stopped") - s.suite_fns
     sites = []
-    if killers != {"kill_holder"}:
-        sites.append("a holder is killed in " + (", ".join(sorted(killers)) or "nowhere"))
+    if killers != {"stopped"}:
+        sites.append("a process is ended in " + (", ".join(sorted(killers)) or "nowhere"))
+    if asked_to_stop != {"abort_agents", "kill_holder"}:
+        sites.append("stopped is asked by " + (", ".join(sorted(asked_to_stop)) or "nobody"))
     if reached != {"run_one", "lead_kill_gate"}:
         sites.append("reached from " + (", ".join(sorted(reached)) or "nowhere"))
     if "kill_holder(" not in member_block:
         sites.append("the member migration does not reach it")
     if "lead_kill_gate(" not in lead_block:
         sites.append("the lead move does not reach it")
-    check("holder-kill-one-site", "a migration and a lead move end the holder through one function",
+    check("holder-kill-one-site", "a process is asked to stop in one place, and waited for there",
           not sites, ", ".join(sites))
     return checked
 
