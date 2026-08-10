@@ -7948,19 +7948,25 @@ def run_doctor(args, selector=None):
                        if (shape, cost) in shared
                        else f"  remedy   {what}  ({cost})"))
     if not target:
-        # The population, said once. --census counts teams on the same machine
-        # and prints a bigger number, because it counts every team any evidence
-        # names while a bare sweep looks only at the ones worth looking at. The
-        # two are read side by side, so each says which set it is counting.
-        print(fill(f"\n{len(teams)} of {len(everything)} team(s) examined, a team "
-                   f"being anything some evidence proves is one; --census counts "
-                   f"that same set, split by which evidence proves each"))
-    if skipped:
-        print(fill(f"the {skipped} not examined have nothing live and no waiting "
-                   f"mail; --all covers them"))
-    if not target and teams:
-        print(fill("\nmail beyond the inbox files is joined for a named team only; "
-                   "--mail-ledger <team> shows it for any team"))
+        # How many of how many, and why the rest were passed over. The second
+        # number is the same population --census totals, which is what lets a
+        # reader lay the two reports side by side; what a team is and how the
+        # evidence for one splits are the census's own subject, and saying them
+        # here put a definition in the middle of a count.
+        said = f"\n{len(teams)} of {len(everything)} teams examined"
+        if skipped:
+            said += (f"; the other {skipped} have nothing live and no mail "
+                     "waiting, and --all covers them")
+        print(fill(said))
+    # Only where mail was actually reported: a sweep counts it from the inbox
+    # files, and the join that also finds mail taken into a recipient's memory
+    # runs for a named team. A reader looking at mail counts can act on that;
+    # printed under a sweep that found none, it was a fact about nothing.
+    if not target and any(line.startswith("mail ")
+                          for _team, _verdict, lines, _shaped in blocks
+                          for line in lines):
+        print(fill("\nthese counts come from the inbox files; --mail-ledger <team> "
+                   "joins sends against deliveries for one team"))
     for stem in RESOLVER.nameless_receipts():
         print(fill(f"\nnote     receipt {stem[:8]} is materialized without a recorded "
                    "identity, so no team can count it; re-promote to record one"))
@@ -18199,7 +18205,7 @@ def _check_census_and_doctor_count_the_same_teams(s):
         globals()["RESOLVER"] = real_resolver
 
     def said(text):
-        return re.search(r"(\d+) of (\d+) team\(s\) examined", flat(text))
+        return re.search(r"(\d+) of (\d+) teams examined", flat(text))
     total = re.search(r"(\d+) teams in all", flat(census_out.getvalue()))
     swept_pop, some_pop = said(pop_out.getvalue()), said(some_out.getvalue())
     printed_blocks = len([ln for ln in pop_out.getvalue().splitlines()
