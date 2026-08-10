@@ -63,6 +63,15 @@ new, no change needed.
 the `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` env var or `--agent-teams`, then the
 `tengu_amber_flint` killswitch. Note both shipped builds have dropped the
 `USER_TYPE === 'ant'` arm that the leaked source still shows.
+Two consequences measured while unifying this tool's exec paths, identical in
+both builds. The identity triple binds only inside that check: boot-time
+handling of `--agent-id`/`--agent-name`/`--team-name` sits in an
+`if (isAgentSwarmsEnabled())` block, so with teams disabled the flags are
+silently ignored - not even the flags-go-together error fires - and the
+conversation resumes plain. And the harness's own teammate spawn commands
+embed `CLAUDECODE=1` and the teams var inline (in 2.1.226 the embed list no
+longer carries `CLAUDE_CODE_ENTRYPOINT`, which the child sets for itself);
+inheritance is not a channel it trusts, and this tool's TEAM_ENV copies that.
 
 ## What changed: cross-session messaging went public
 

@@ -580,9 +580,18 @@ echo '[]' > ~/.claude/teams/<team>/inboxes/team-lead.json
 2. Resume the dead leader session claiming the team-lead identity:
 
 ```bash
-claude --resume <dead-main-session-id> \
+env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 CLAUDE_CODE_ENTRYPOINT=cli \
+  claude --resume <dead-main-session-id> \
   --agent-id team-lead@<team> --agent-name team-lead --team-name <team>
 ```
+
+The env prefix is not decoration. The binary binds the identity flags only
+when teams are enabled in its environment; without that, the flags are
+silently ignored - no error, the session resumes plain, wearing no identity
+and reading no roster (verified in the shipped 2.1.220 and 2.1.226 bundles:
+the whole triple sits inside `isAgentSwarmsEnabled`). A shell that exports
+`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` survives without the prefix, but a
+tmux pane's shell never saw your exports (seam 6), so spell it.
 
 This boots as a "teammate" whose id equals `leadAgentId`, so it reads the
 right roster, watches the leader's inbox, and can SendMessage every member

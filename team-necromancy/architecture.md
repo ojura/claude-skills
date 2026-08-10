@@ -58,7 +58,13 @@ Consequences:
   resumed transcript. Leaders have neither: the flag triple forces teammate
   classification, and their transcripts are unstamped. That is the structural
   reason a dead leader cannot be resumed *as* a leader, and why the masquerade
-  goes through the teammate branch.
+  goes through the teammate branch. The flag trigger has a precondition worth
+  spelling: the triple binds only when teams are enabled in the booting
+  process's environment (`isAgentSwarmsEnabled` wraps the whole block,
+  verified in 2.1.220 and 2.1.226). Absent that, the flags are silently
+  ignored and the session resumes plain - which is why every launch this tool
+  makes, exec and pane alike, carries TEAM_ENV inline rather than trusting
+  the shell it happens to be in.
 
 ## The implicit team and its death warrant
 

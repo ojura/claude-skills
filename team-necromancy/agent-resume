@@ -129,8 +129,16 @@ TMUX_WINDOW = "swarm-view"
 SWARM_COLS, SWARM_ROWS = 220, 50
 SOCKET_PREFIX = "claude-swarm-"
 
-# New panes inherit the tmux server's environment, which is whatever started the
-# server; the harness's own spawn command re-exports these, so we do too.
+# What a flag-bound boot must find in its environment. The binary binds
+# --agent-id/--agent-name/--team-name only when teams are enabled there: in the
+# shipped 2.1.220 and 2.1.226 bundles the whole triple sits inside
+# isAgentSwarmsEnabled, so with the var unset and no --agent-teams the flags
+# are silently ignored - not even the flags-go-together error fires - and the
+# conversation resumes plain, wearing no identity and reading no roster. The
+# harness embeds these into every teammate spawn of its own for the same
+# reason, and seam 6 says why inheritance cannot be trusted: a pane's shell
+# never saw your exports. So every launch this tool makes carries them inline,
+# pane command and exec alike.
 TEAM_ENV = ("CLAUDECODE=1", "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1", "CLAUDE_CODE_ENTRYPOINT=cli")
 
 # Recipe 1's API poison: placeholder spawns die at TCP connect, $0 billed, no
@@ -148,6 +156,22 @@ def base_url_is_poison(value):
     wrong endpoint.
     """
     return bool(value) and value.strip().rstrip("/") == POISON_URL
+
+
+def poison_said(value, carrier):
+    """The strip decision and its sentence, together.
+
+    Every launch path that drops the poison says so, and they all say it the
+    same way because they all come through here: naming the carrier is what
+    lets the reader find the poison and remove it at the source. A caller that
+    only wants the decision without a launch (a printed command, a report)
+    reads base_url_is_poison directly.
+    """
+    if not base_url_is_poison(value):
+        return False
+    warn(f"{carrier} carries the Recipe 1 poison; dropping it for this launch")
+    return True
+
 
 # Title lookup reads the tail first (titles are rewritten every few turns, so the
 # current one is almost always there) and only falls back to the head.
@@ -5894,9 +5918,7 @@ def launch(socket, want_pane, cwd, command, dry, replace_pane=None):
         carrier = socket
     else:
         value, carrier = os.environ.get("ANTHROPIC_BASE_URL", ""), "this shell"
-    scrub = "-u ANTHROPIC_BASE_URL " if base_url_is_poison(value) else ""
-    if scrub:
-        warn(f"{carrier} carries the Recipe 1 poison; dropping it for this launch")
+    scrub = "-u ANTHROPIC_BASE_URL " if poison_said(value, carrier) else ""
     quoted = (
         "exec env " + scrub
         + " ".join(TEAM_ENV) + " "
@@ -6632,6 +6654,63 @@ def exec_failed(undo, agent_id, command, exc):
     die(f"cannot exec {command[0]}: {exc}")
 
 
+def become_agent(ctx, command, prefix, agent_id=None, undo=None):
+    """The one way a run of this tool ends by turning into the agent it resolved.
+
+    Owns the steps every exec shares, in order: the environment a flag-bound
+    boot needs, the move into the agent's directory, and the exec. Three routes
+    come through here - a member run in the pane you are standing in, a member
+    given this terminal by --here, and the lead taking the foreground - and
+    each used to hold its own copy of these steps. The copies had drifted
+    twice over: two of the three execed bare, inheriting whatever the invoking
+    shell happened to export, and one rolled back a roster the run had not
+    written.
+
+    The environment is prepared rather than inherited because the binary binds
+    --agent-id/--agent-name/--team-name only when teams are enabled in the
+    environment it wakes in; absent that, the flags are silently ignored and
+    the conversation resumes plain, wearing no identity and reading no roster
+    (see TEAM_ENV). An exec that trusts the shell it happens to be in works on
+    a machine that exports the var and silently sheds the identity anywhere
+    else - a tmux pane, a systemd unit, a bare xterm.
+
+    undo is what record_membership answered, for the member routes that wrote
+    a roster entry on the way in. The lead passes none: its team scaffolding
+    is forged with every member inactive and a retry needs it, so there is
+    nothing to take back. Both failure doors behave the same either way - the
+    agent's own directory refusing is re-raised as it stands after the entry
+    goes back, and a failed exec ends the run in the exec error.
+    """
+    environ = dict(os.environ)
+    if poison_said(environ.get("ANTHROPIC_BASE_URL"), "this shell"):
+        environ.pop("ANTHROPIC_BASE_URL", None)
+    environ.update(pair.split("=", 1) for pair in TEAM_ENV)
+    try:
+        enter_agent_cwd(ctx, prefix)
+    except Refusal:
+        unwind_launch(undo, agent_id)
+        raise
+    try:
+        os.execvpe(command[0], command, environ)
+    except OSError as exc:
+        exec_failed(undo, agent_id, command, exc)
+
+
+def env_prefixed(command):
+    """The paste form of the exec become_agent performs.
+
+    Same vars, same scrub, spelled as an env prefix so the shell a reader
+    pastes this into reproduces the environment the exec would have built -
+    that shell is exactly the one whose exports cannot be assumed. The scrub
+    decision is read bare rather than through poison_said: the -u appearing in
+    the printed line is its disclosure, and the warning sentence announces a
+    launch this call does not make.
+    """
+    scrub = (["-u", "ANTHROPIC_BASE_URL"]
+             if base_url_is_poison(os.environ.get("ANTHROPIC_BASE_URL")) else [])
+    return ["env", *scrub, *TEAM_ENV, *command]
+
+
 def claude_binary(args):
     """Always the `claude` on PATH, never the pinned version the transcript was
     written by, and never CLAUDE_CODE_EXECPATH, both of which can be stale."""
@@ -7308,18 +7387,16 @@ def run_one(args, passthrough, table, prefix="", pending=()):
                 names = ", ".join(label for label, _path, _since in pending)
                 print(f"{prefix}loading  {len(pending)} member(s) had not written a transcript "
                       f"yet when this took over: {names}")
-            enter_agent_cwd(ctx, prefix)
             print(f"{prefix}exec     taking over this terminal")
-            try:
-                os.execvp(command[0], command)
-            except OSError as exc:
-                # exec either replaces this process or does not happen, so reaching
-                # here means the lead never started; say so rather than unwinding a
-                # traceback through a tool that has already moved the cwd.
-                die(f"cannot exec {command[0]}: {exc}")
+            # No undo: forge_team wrote every member inactive and a retry needs
+            # that scaffolding, so a lead that fails to exec has nothing to
+            # take back and ends in the exec error alone.
+            become_agent(ctx, command, prefix, agent_id=agent_id)
         print(f"{prefix}run this in your terminal (leads are not spawned into tmux):")
-        # still pastes as one command however it wrapped
-        print(wrap_command(command, f"{prefix}  ", f"{prefix}    ", paste=True))
+        # still pastes as one command however it wrapped; the env prefix is
+        # part of the command, because the shell this lands in may not export
+        # what the identity flags need to bind
+        print(wrap_command(env_prefixed(command), f"{prefix}  ", f"{prefix}    ", paste=True))
         return Outcome("manual", None, True, None)
 
     if args.to_team:
@@ -7377,18 +7454,7 @@ def run_one(args, passthrough, table, prefix="", pending=()):
               f"{'would become' if args.dry_run else 'becomes'} {agent_id}")
         if args.dry_run:
             return Outcome("manual", None, False, None)
-        try:
-            enter_agent_cwd(ctx, prefix)
-        except Refusal:
-            # The agent's own directory refused. No launch is going to happen,
-            # so the roster must not be left saying one did; the refusal itself
-            # is re-raised untouched, because it already says what went wrong.
-            unwind_launch(undo, agent_id)
-            raise
-        try:
-            os.execvp(command[0], command)
-        except OSError as exc:
-            exec_failed(undo, agent_id, command, exc)
+        become_agent(ctx, command, prefix, agent_id=agent_id, undo=undo)
 
     socket, how = resolve_socket(ctx, args, table)
     if not socket:
@@ -7481,28 +7547,9 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             step(args.dry_run, f"would {rendered}", rendered, indent=prefix)
             if args.dry_run:
                 return Outcome("launched", socket, False, None)
-            # The same environment and cwd launch() would have given it: the
-            # team vars a flag-bound boot needs, the poison dropped if present, and
-            # the project dir --resume looks the transcript up under.
-            environ = dict(os.environ)
-            if base_url_is_poison(environ.get("ANTHROPIC_BASE_URL")):
-                warn("this shell carries the Recipe 1 poison; dropping it for the exec")
-                environ.pop("ANTHROPIC_BASE_URL", None)
-            environ.update(dict(pair.split("=", 1) for pair in TEAM_ENV))
             if not args.no_tint:
                 tint_pane(socket, in_pane, RESOLVER.field(ctx, "color"), RESOLVER.field(ctx, "agentName"), False)
-            try:
-                enter_agent_cwd(ctx, prefix)
-            except Refusal:
-                # The agent's own directory refused, so no launch is going to
-                # happen here either; the roster goes back and the refusal is
-                # re-raised as it stands.
-                unwind_launch(undo, agent_id)
-                raise
-            try:
-                os.execvpe(command[0], command, environ)
-            except OSError as exc:
-                exec_failed(undo, agent_id, command, exc)
+            become_agent(ctx, command, prefix, agent_id=agent_id, undo=undo)
 
     try:
         launched_at = ctx["transcript"][0].stat().st_mtime
@@ -11832,7 +11879,7 @@ def _check_team_lock_fails_closed(s):
 
 @unit(('refused-release-says-what-stays-claimed', 'a claim that cannot be given back is reported, not raised'),
       ('refused-rollback-keeps-the-exec-error', 'a failed exec is still the reason a run ends, even when the roster refuses too'),
-      ('failed-exec-unwinds-the-roster-write', 'every exec that wrote a roster first unwinds it through one place'))
+      ('become-the-agent-one-place', 'one function turns a run into the agent, and a launch that dies there unwinds what it wrote'))
 def _check_refused_teardown_reports(s):
     checked = []
 
@@ -11948,50 +11995,96 @@ def _check_refused_teardown_reports(s):
           "a failed exec is still the reason a run ends, even when the roster refuses too",
           not wrong, "; ".join(wrong))
 
-    # And everything that wrote a roster on the way in comes back through it.
-    # Two steps after that write can still end the run: the exec, and entering
-    # the agent's own directory a moment before it. run_one reaches each of them
-    # three times and the split is the same both times, because they are the
-    # same three routes: the two member routes write a member into a roster
-    # first and unwind, and the lead route writes no member entry at all, so it
-    # ends in its own reason with nothing to take back. A fourth route added
-    # here fails this until somebody says which of the two it is.
-    def guarded_by(inner, rollback, kind):
-        """(handlers that unwind, handlers that do not, every call of inner)."""
-        held, bare = [], []
-        for node in ast.walk(funcs["run_one"]):
-            if not isinstance(node, ast.Try):
-                continue
-            if not any(isinstance(sub, ast.Call)
-                       and (getattr(sub.func, kind, "") in inner)
-                       for stmt in node.body for sub in ast.walk(stmt)):
-                continue
-            for arm in node.handlers:
-                reached = {getattr(sub.func, "id", None)
-                           for sub in ast.walk(arm) if isinstance(sub, ast.Call)}
-                (held if rollback in reached else bare).append(arm.lineno)
-        calls = [sub.lineno for sub in ast.walk(funcs["run_one"])
-                 if isinstance(sub, ast.Call) and getattr(sub.func, kind, "") in inner]
-        return held, bare, calls
+    # And the way a run becomes the agent has one owner. become_agent holds the
+    # environment, the cwd move and the exec; the three routes through run_one
+    # ask it rather than keeping copies, because the copies had drifted twice
+    # over - a rollback aimed at a roster the run had not written, and two of
+    # three execs booting bare, inheriting whatever the shell exported, which
+    # silently sheds the identity anywhere the teams var is not exported. The
+    # execs allowed outside it boot something other than the resolved agent:
+    # maybe_attach execs tmux, and run_promote execs this tool, whose child
+    # run prepares its own launch.
+    told = []
+    becomer = funcs.get("become_agent")
+    if becomer is None:
+        told.append("become_agent is gone, so becoming the agent has no owner")
+    else:
+        homes = {}
+        for fn in funcs.values():
+            for sub in ast.walk(fn):
+                if (isinstance(sub, ast.Call)
+                        and getattr(sub.func, "attr", "") in ("execvp", "execvpe")):
+                    homes.setdefault(fn.name, []).append(sub.func.attr)
+        booting = {name: kinds for name, kinds in homes.items()
+                   if name not in s.suite_fns}
+        if booting != {"become_agent": ["execvpe"], "maybe_attach": ["execvp"],
+                       "run_promote": ["execvp"]}:
+            told.append(f"execs live at {booting}")
 
-    unwound, straight, execs = guarded_by({"execvp", "execvpe"}, "exec_failed", "attr")
-    cwd_unwound, cwd_straight, cwds = guarded_by({"enter_agent_cwd"}, "unwind_launch", "id")
+        def guarded(inner, rollback, kind):
+            """Handler linenos that reach the rollback / that do not, for tries
+            holding a call of inner inside become_agent."""
+            held, bare = [], []
+            for node in ast.walk(becomer):
+                if not isinstance(node, ast.Try):
+                    continue
+                if not any(isinstance(sub, ast.Call)
+                           and getattr(sub.func, kind, "") in inner
+                           for stmt in node.body for sub in ast.walk(stmt)):
+                    continue
+                for arm in node.handlers:
+                    reached = {getattr(sub.func, "id", None)
+                               for sub in ast.walk(arm) if isinstance(sub, ast.Call)}
+                    (held if rollback in reached else bare).append(arm.lineno)
+            return held, bare
+
+        unwound, straight = guarded({"execvpe"}, "exec_failed", "attr")
+        if not unwound or straight:
+            told.append("the exec is not guarded by exec_failed alone")
+        cwd_unwound, cwd_straight = guarded({"enter_agent_cwd"}, "unwind_launch", "id")
+        refusals = [node for node in ast.walk(becomer)
+                    if isinstance(node, ast.ExceptHandler)
+                    and getattr(node.type, "id", None) == "Refusal"]
+        if not cwd_unwound or cwd_straight:
+            told.append("the cwd move does not unwind the roster write")
+        elif not any(isinstance(sub, ast.Raise) and sub.exc is None
+                     for arm in refusals for sub in ast.walk(arm)):
+            told.append("a refused cwd move is not re-raised as it stands")
+        names = {getattr(sub, "id", None) for sub in ast.walk(becomer)}
+        if "TEAM_ENV" not in names:
+            told.append("the exec environment does not carry TEAM_ENV")
+        if "poison_said" not in {getattr(sub.func, "id", None)
+                                 for sub in ast.walk(becomer)
+                                 if isinstance(sub, ast.Call)}:
+            told.append("the poison is not asked about where the strip is loud")
+
+        callers = [sub for sub in ast.walk(funcs["run_one"])
+                   if isinstance(sub, ast.Call)
+                   and getattr(sub.func, "id", "") == "become_agent"]
+        carrying = [c for c in callers
+                    if any(kw.arg == "undo" for kw in c.keywords)]
+        if len(callers) != 3 or len(carrying) != 2:
+            told.append(f"run_one reaches it {len(callers)} time(s), "
+                        f"{len(carrying)} with a roster write to take back; "
+                        "the routes are two members with an undo and a lead without")
+        outside = s.callers_of("enter_agent_cwd") - s.suite_fns
+        if outside != {"become_agent"}:
+            told.append(f"the cwd move is made from {sorted(outside)}, not one place")
     # A handler that writes a roster instead of taking one back is the bug this
     # whole unit came from, in the one place it would be invisible.
-    still_writing = [node.lineno for node in ast.walk(funcs["run_one"])
+    still_writing = [node.lineno
+                     for fn in (funcs["run_one"],) + ((becomer,) if becomer else ())
+                     for node in ast.walk(fn)
                      if isinstance(node, ast.ExceptHandler)
                      for sub in ast.walk(node)
                      if isinstance(sub, ast.Call) and getattr(sub.func, "id", "") in
                      {"retire_member", "register_member", "update_team_config",
                       "record_membership"}]
-    check("failed-exec-unwinds-the-roster-write",
-          "every exec that wrote a roster first unwinds it through one place",
-          len(execs) == 3 and len(unwound) == 2 and len(straight) == 1
-          and len(cwds) == 3 and len(cwd_unwound) == 2 and not cwd_straight
-          and not still_writing,
-          f"{len(execs)} exec(s), unwound at {unwound}, ended without unwinding at "
-          f"{straight}; {len(cwds)} cwd move(s), unwound at {cwd_unwound}, left "
-          f"unguarded at {cwd_straight}; wrote a roster from a handler at {still_writing}")
+    if still_writing:
+        told.append(f"wrote a roster from a handler at {still_writing}")
+    check("become-the-agent-one-place",
+          "one function turns a run into the agent, and a launch that dies there unwinds what it wrote",
+          not told, "; ".join(told))
     return checked
 
 
@@ -12107,6 +12200,85 @@ def _check_failed_exec_puts_the_roster_back(s):
           and source_after == source_after_write,
           f"source entry {retired_source}, untouched by the rollback "
           f"{source_after == source_after_write}")
+    return checked
+
+
+@unit(('exec-environment-is-prepared-not-inherited',
+       'the process an exec becomes finds the team vars set and the poison gone'))
+def _check_exec_environment(s):
+    """become_agent driven with the exec replaced, asserting on the environment
+    it hands over rather than on the code that builds it.
+
+    The claim under test is the boot condition: the binary binds the identity
+    flags only when teams are enabled in the environment it wakes in, so an
+    exec that inherits its environment silently sheds the identity anywhere
+    the var is not exported (see TEAM_ENV). The poison is the other direction,
+    a var that must not survive, and its strip must be said. The parent's own
+    environment is asserted unchanged, because a launch that cleans its shell
+    rather than its child would look identical from inside the child.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    seen = {}
+
+    def taken(_prog, _argv, env):
+        seen["env"] = env
+        raise OSError(8, "Exec format error")
+
+    real_exec, real_cwd = os.execvpe, RESOLVER.agent_cwd
+    had = os.environ.get("ANTHROPIC_BASE_URL")
+    # The suite itself runs where these vars are exported (a Claude Code tool
+    # shell carries all three), so leaving them in the parent would let an
+    # exec that merely inherits pass this check - the exact failure it
+    # exists to catch. Absent from the parent, present at the exec, is the
+    # only arrangement that proves preparation.
+    worn = {name: os.environ.pop(name, None)
+            for name in (pair.split("=", 1)[0] for pair in TEAM_ENV)}
+    os.execvpe = taken
+    RESOLVER.agent_cwd = lambda ctx: None
+    os.environ["ANTHROPIC_BASE_URL"] = POISON_URL
+    said = io.StringIO()
+    outcome, parent_after = "", None
+    try:
+        with capturing("out", into=said), capturing("err", into=said):
+            try:
+                become_agent({}, [f"{TOOL}-selftest-absent", "--resume", "u"], "")
+            except Refusal as refused:
+                outcome = str(refused)
+        parent_after = os.environ.get("ANTHROPIC_BASE_URL")
+    finally:
+        os.execvpe = real_exec
+        RESOLVER.agent_cwd = real_cwd
+        if had is None:
+            os.environ.pop("ANTHROPIC_BASE_URL", None)
+        else:
+            os.environ["ANTHROPIC_BASE_URL"] = had
+        for name, value in worn.items():
+            if value is not None:
+                os.environ[name] = value
+
+    env = seen.get("env") or {}
+    wanted = dict(pair.split("=", 1) for pair in TEAM_ENV)
+    arrived = {name: env.get(name) for name in wanted}
+    stated = []
+    if not seen:
+        stated.append("the exec was never reached")
+    if arrived != wanted:
+        stated.append(f"the team vars arrived as {arrived}")
+    if "ANTHROPIC_BASE_URL" in env:
+        stated.append("the poison survived into the exec environment")
+    if "poison" not in said.getvalue():
+        stated.append("the strip was silent")
+    if parent_after != POISON_URL:
+        stated.append("the parent environment was mutated")
+    if "cannot exec" not in outcome:
+        stated.append(f"the run ended in {outcome!r}, not the exec error")
+    check("exec-environment-is-prepared-not-inherited",
+          "the process an exec becomes finds the team vars set and the poison gone",
+          not stated, "; ".join(stated))
     return checked
 
 
