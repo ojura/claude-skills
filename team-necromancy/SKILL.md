@@ -224,7 +224,15 @@ when every one of these holds:
 The check is re-proved immediately before deletion, refuses anything that
 appeared since, removes `config.json` last so an interrupted sweep is retried
 rather than orphaned, and never touches a path outside `teams/` and `tasks/`.
-`agent-resume --cleanup --dry-run` lists every decision with its reason.
+
+In a team it keeps, the hook also removes `config.json.lock` when that file
+carries this tool's own owner record and the process it names is gone. The
+harness cannot clear one of these: its lock artifact is a directory and it
+clears a stale lock with `rmdir`, which answers ENOTDIR on our regular file, so
+four of its roster operations silently do nothing and spawning a teammate into
+that team fails until the file goes. A lock with no owner record is never
+touched, whatever its age, and neither is a directory or a lock whose owner is
+still running. `agent-resume --cleanup --dry-run` lists every decision with its reason.
 Completion candidates (names, teams, sockets, sessions with their titles)
 come from the script's hidden `--complete <topic>` emitter, so the candidate
 lists cannot drift from reality. The flag list in `_agent-resume` is

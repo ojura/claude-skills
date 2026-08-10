@@ -107,6 +107,28 @@ channel between the leader and an out-of-process teammate:
   giving up, calls an unrefreshed lock stale after 10s, and clears a stale one
   with rmdir, which answers ENOTDIR on a regular file: a lock file this tool
   leaves behind is ours to clear, not something the harness can recover from.
+  The two artifacts exclude each other in both directions, which is the point:
+  our exclusive create answers EEXIST against its directory, its mkdir answers
+  EEXIST against our file. What that costs when a run of ours is killed inside
+  its hold is measured rather than assumed. Four of the harness's roster
+  operations (`removeTeamMember`, `setMemberActive`, `setMemberMode`,
+  `removeMemberByAgentId`) catch the ENOTDIR and log it, so they silently do
+  nothing; `reserveTeammateIdentity` does not catch it, so spawning a teammate
+  into that team fails outright and keeps failing. Until `--cleanup` learned to
+  clear our own leftovers, the only thing that ever removed one was another run
+  of this tool wanting that same team's lock, which may never happen.
+  Two windows in that recovery are worth knowing. A run killed between creating
+  the file and writing its record leaves an empty file nothing can judge, and
+  nothing removes it automatically: the harness cannot, and this tool will not,
+  because removing an unreadable lock on sight would take the lock away from a
+  live run in the microseconds before it publishes its record. Preparing the
+  record in a temporary file and taking the name with a hard link would close
+  that window without changing protocols, and is not built. And a remover
+  compares the record it read against the file's bytes immediately before
+  unlinking, because two runs can both find the same dead owner and the second
+  can have taken the lock by the time the first acts. Device and inode do not
+  work for that comparison: the freed inode number is reused by the replacement
+  written a moment later, measured here.
   In-process teammates go through the same helper, written twice (a bare
   reservation, then a patch setting `tmuxPaneId` and `backendType` to
   `"in-process"`). The exit

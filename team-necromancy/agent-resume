@@ -2008,6 +2008,72 @@ class Resolver:
         """
         return bool(team) and self.roster_path(team).exists()
 
+    def lock_for(self, cfg):
+        """Where the lock for this roster lives.
+
+        By roster path rather than by team name: both callers already hold the
+        roster whose lock they are about to take or clear, and the layout is
+        answered here so neither has to spell the filename.
+        """
+        return cfg.with_name("config.json.lock")
+
+    def lock_holder(self, lock):
+        """(the owner record this tool wrote into this lockfile, whether the
+        process that record names is gone, which file the answer was read from).
+
+        One answer to the one question anyone has about this file: may it be
+        taken away. A roster write waiting on it asks, and so does the sweep
+        that clears what a killed run left behind. A second answer written
+        somewhere else could disagree with this one, and then the sweep would
+        remove a lock a live run is inside.
+
+        The owner is None for every shape that is not one of ours: a directory,
+        which is what the harness's own lock helper makes at this path, an empty
+        file, bytes that are not our JSON, and a record missing either half of
+        the process identity. That is the whole difference between a lock we may
+        reason about and one we may only wait for, so it is decided here once.
+
+        An incomplete record reads as somebody else's on purpose. The pid alone
+        cannot be checked safely, because pid numbers are reused, so a record
+        whose start time did not survive the write is worth no more than no
+        record at all.
+
+        Gone is never true without an owner, so a lock the harness is holding is
+        never a candidate for removal, whatever its age. Age is not part of this
+        answer at all: a pid and the start time recorded beside it settle it,
+        and both are read by one parser.
+
+        The third value is the bytes this answer was read from, and None when the
+        path holds no readable regular file. It carries two facts a caller needs.
+        Which file the answer describes, for a remover: between the read and the
+        unlink another run can take a dead owner's lock away and put its own live
+        one at that name, and a remover working from the name alone would delete
+        that. The record is what tells the two apart, and it cannot be forged,
+        because only the process a record names writes that record and this one
+        names a process that is gone. Device and inode cannot: an inode number is
+        reused the moment the file it belonged to is unlinked with nothing
+        holding it open, which is exactly the moment a replacement is written.
+
+        And whether the path holds a regular file at all: the harness's helper
+        only ever mkdirs here, so a regular file is never the harness's, whatever
+        its bytes say.
+        """
+        try:
+            raw = lock.read_bytes()
+        except OSError:
+            return None, False, None
+        try:
+            owner = json.loads(raw)
+        except ValueError:
+            return None, False, raw
+        if not isinstance(owner, dict) or owner.get("tool") != TOOL:
+            return None, False, raw
+        if not isinstance(owner.get("pid"), int) or not isinstance(owner.get("procStart"), str):
+            return None, False, raw
+        if not owner["procStart"]:
+            return None, False, raw
+        return owner, not self.pid_alive(owner["pid"], owner["procStart"]), raw
+
     def inbox_path(self, team, name):
         """Where this member's mailbox lives."""
         return self.inboxes_in(self.team_dir(team)) / f"{name}.json"
@@ -6065,29 +6131,46 @@ def forge_team(ctx, dry, evidence=None, team=None):
 LOCK_WAIT_S = 10.0
 
 
-def lock_owner(lock):
-    """The owner record this tool wrote into a lockfile, or None if it did not
-    write it.
+def drop_lock(lock, seen):
+    """Unlink a lockfile, and only while it still holds the record the verdict
+    was read from. Returns (whether this call removed it, why it could not).
 
-    None is every shape that is not one of ours: a directory, which is what the
-    harness's own lock helper makes at this path, an empty file, bytes that are
-    not our JSON, and a record missing either half of the process identity. That
-    is the whole difference between a lock we may reason about and one we may
-    only wait for, so it is decided here once.
+    The re-read is what keeps a takeover from deleting a live lock. A run that
+    has just read a dead owner's record can be descheduled while a second run
+    removes that same file and takes the lock itself; an unlink by name would
+    then take the second run's lock away while it is inside it. The record tells
+    them apart and cannot be faked: only the process a record names ever writes
+    that record, and this one names a process that is gone, so nothing can put
+    those bytes back.
 
-    An incomplete record reads as somebody else's on purpose. The pid alone
-    cannot be checked safely, because pid numbers are reused, so a record whose
-    start time did not survive the write is worth no more than no record at all.
+    Device and inode were tried first and do not work here. The old file is
+    unlinked with nothing holding it open, which frees its inode number for
+    immediate reuse, and the replacement written a moment later gets it: a probe
+    that swapped a dead owner's lock for a live one landed on the same (device,
+    inode) and the removal went through.
+
+    It narrows the race rather than closing it. Two syscalls still sit between
+    the re-read and the unlink, the same residue the release path's own guard
+    leaves. Closing it needs an flock held on the descriptor across both, by
+    every run that might remove this file; that changes how the lock is taken
+    and not only how it is read, and it is not done here.
+
+    Not removing is not a failure: gone and replaced both mean this caller has
+    nothing left to take away, and it goes back to ask about whatever is at that
+    name now.
     """
     try:
-        owner = json.loads(lock.read_text())
-    except (OSError, ValueError):
-        return None
-    if not isinstance(owner, dict) or owner.get("tool") != TOOL:
-        return None
-    if not isinstance(owner.get("pid"), int) or not isinstance(owner.get("procStart"), str):
-        return None
-    return owner if owner["procStart"] else None
+        if lock.read_bytes() != seen:
+            return False, ""
+    except OSError:
+        return False, ""
+    try:
+        lock.unlink()
+    except FileNotFoundError:
+        return False, ""
+    except OSError as exc:
+        return False, str(exc)
+    return True, ""
 
 
 @contextlib.contextmanager
@@ -6111,9 +6194,10 @@ def team_lock(cfg, timeout=LOCK_WAIT_S):
     is why the recovery below has to exist: the harness clears a lock it
     considers stale with rmdir, and rmdir on a regular file answers ENOTDIR,
     so a lock this tool leaves behind after a kill is nobody's to clear but
-    ours.
+    ours. Here when a later run wants the same team, and in --cleanup at the
+    next session start when none ever does.
     """
-    lock = cfg.with_name("config.json.lock")
+    lock = RESOLVER.lock_for(cfg)
     # Monotonic, because this is a duration and nothing else. A clock
     # correction landing mid-wait would otherwise lengthen or cut short how
     # long a roster write is prepared to wait for another writer.
@@ -6123,31 +6207,26 @@ def team_lock(cfg, timeout=LOCK_WAIT_S):
         try:
             handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
-            owner = lock_owner(lock)
+            owner, gone, seen = RESOLVER.lock_holder(lock)
             stuck = ""
-            # This is the harness's lockfile as much as ours, and the harness
-            # puts no owner in it, so a lock with none is most likely the
-            # harness holding it legitimately and is never removed, whatever
-            # its age. Only a lock carrying our own record is even a candidate,
-            # and then only when the process it names is provably gone: same
-            # pid, same start time, so a reused pid number cannot answer for a
-            # stranger. Anything else is waited for.
-            if owner and not RESOLVER.pid_alive(owner["pid"], owner["procStart"]):
-                try:
-                    lock.unlink()
-                except FileNotFoundError:
-                    # Another run cleared it between the read and here, which is
-                    # the outcome this wanted; the create above is what claims it.
-                    continue
-                except OSError as exc:
-                    # Stale and still here, and this run may not remove it. Wait
-                    # it out at the ordinary deadline rather than spinning on a
-                    # removal that keeps failing, and say what is true instead of
-                    # calling a process that is gone the holder.
-                    stuck = str(exc)
-                else:
+            # This is the harness's lockfile as much as ours, and whether a lock
+            # here may be taken away is the engine's answer, asked here and by
+            # the sweep that clears one a killed run left. Anything it does not
+            # call gone is waited for, whatever its age.
+            if gone:
+                took, stuck = drop_lock(lock, seen)
+                if took:
                     warn(f"{lock.name} was left by pid {owner['pid']}, which is gone; taking it over")
                     continue
+                if not stuck:
+                    # Gone from under us, or replaced by another run's own lock.
+                    # Either way this run has nothing to take away and no verdict
+                    # left about what is there; the create above asks again.
+                    continue
+                # Stale and still here, and this run may not remove it. Wait it
+                # out at the ordinary deadline rather than spinning on a removal
+                # that keeps failing, and say what is true instead of calling a
+                # process that is gone the holder.
             if stuck:
                 situation = (f"was left by pid {owner['pid']}, which is gone, and this run "
                              f"cannot remove it ({stuck})")
@@ -6155,11 +6234,25 @@ def team_lock(cfg, timeout=LOCK_WAIT_S):
             elif owner:
                 situation = f"is held by pid {owner['pid']}"
                 remedy = "Run this again once that writer is done"
-            else:
-                situation = ("is held by another writer and carries no owner record, "
-                             "which this tool always writes and the harness never does, "
-                             "so the holder is most likely the harness itself")
+            elif seen is None:
+                situation = ("carries no owner record and is not a regular file, which "
+                             "is the shape the harness's own lock helper makes and this "
+                             "tool never does, so the holder is most likely the harness "
+                             "itself")
                 remedy = "Run this again once that writer is done"
+            else:
+                # A regular file this tool cannot read a record out of. The
+                # harness only ever mkdirs here, so it is not the harness's: it
+                # is a run of ours between creating the file and publishing its
+                # record, or one killed inside that gap. Removing it on sight
+                # would hand the lock to a second writer while the first is
+                # inside it, so it is waited for like any other, and a leftover
+                # from the killed case is the one shape nothing here can clear.
+                situation = ("is a file this tool wrote and carries no owner record "
+                             "it can read, so it is either a run that has not yet "
+                             "published its record or one killed before it could")
+                remedy = ("Run this again; if it is still there when no run of this "
+                          "tool is going, remove that file by hand")
             if time.monotonic() - started > timeout:
                 die(f"{lock} {situation}; it did not come free in {timeout:g}s and "
                     f"{cfg.name} is unchanged, so no other writer's change was lost. "
@@ -6193,8 +6286,15 @@ def team_lock(cfg, timeout=LOCK_WAIT_S):
         if still_ours:
             try:
                 lock.unlink()
-            except OSError:
-                pass
+            except OSError as exc:
+                # Said rather than swallowed. The file left there names this
+                # process, which is alive, so every later roster write from this
+                # same run reads a live owner, waits the whole deadline and then
+                # refuses. Nothing here can undo that, so the file is named and
+                # the reader can remove it.
+                warn(f"cannot remove {lock} ({exc}); it names this run, which is "
+                     f"still alive, so any further write to {cfg.name} from here "
+                     "will wait for it and then refuse. Remove that file by hand")
 
 
 _BACKED_UP = set()
@@ -6263,17 +6363,24 @@ def register_member(record, pane, dry, alive=True):
 
     The record says both what to write and where: on a rebind the engine has
     already reprojected the id onto the destination team.
+
+    Returns what this write found where it wrote, so a run that fails after it
+    can put that back, or None when it wrote nothing. Both outcomes matter and
+    they are not the same undo: an entry this call inserted has to go, and one
+    it only updated has to go back to the values it had.
     """
     team = record.get("team")
     name = record.get("name")
     agent_id = record["agentId"]
     cfg = RESOLVER.roster_path(team)
+    found = []
 
     def mutate(data):
         if agent_id == data.get("leadAgentId"):
             warn(f"refusing to register the lead {agent_id} as a pane-backed member")
             return None
         member = next((m for m in data.get("members", []) if m.get("agentId") == agent_id), None)
+        found.append(copy.deepcopy(member))
         if member is None:
             member = {
                 "agentId": agent_id,
@@ -6291,9 +6398,11 @@ def register_member(record, pane, dry, alive=True):
 
     if dry:
         step(True, f"would register {agent_id} in {cfg}", "")
-        return
-    if edit_team_config(cfg, mutate, f"registered {agent_id} in"):
-        ensure_inbox(team, name, dry)
+        return None
+    if not edit_team_config(cfg, mutate, f"registered {agent_id} in"):
+        return None
+    ensure_inbox(team, name, dry)
+    return {"cfg": cfg, "agentId": agent_id, "found": found[0]}
 
 
 def reserve_member(record, dry):
@@ -6398,11 +6507,17 @@ def retire_member(ctx, dry):
 
 
 def update_team_config(ctx, record, pane, dry, alive=True):
+    """Sync this member's existing roster entry to the launch just performed.
+
+    Returns what the entry held before, in register_member's shape, so a run
+    that fails after this can put it back, or None when nothing was written.
+    """
     entry = ctx["team_entry"]
     if not entry:
-        return
+        return None
     cfg = entry["cfg"]
     agent_id = entry["member"].get("agentId")
+    found = []
 
     def mutate(data):
         if agent_id and agent_id == data.get("leadAgentId"):
@@ -6415,6 +6530,7 @@ def update_team_config(ctx, record, pane, dry, alive=True):
         for member in data.get("members", []):
             if member.get("agentId") != agent_id:
                 continue
+            was = copy.deepcopy(member)
             # Sync the roster to the launch we just performed, rather than only
             # filling blanks: a roster saying claude-opus-5 while the process
             # runs claude-opus-5[1m] describes something that does not exist.
@@ -6424,12 +6540,91 @@ def update_team_config(ctx, record, pane, dry, alive=True):
                 if value is not None and member.get(key) != value:
                     member[key] = value
                     changed = True
+            if changed and not found:
+                found.append(was)
         return data if changed else None
 
     if dry:
         step(True, f"would update {cfg}", "")
+        return None
+    if not edit_team_config(cfg, mutate, "updated") or not found:
+        return None
+    return {"cfg": cfg, "agentId": agent_id, "found": found[0]}
+
+
+def restore_member(undo):
+    """Put a roster entry back the way this run found it, for a launch that did
+    not happen.
+
+    `undo` is what register_member or update_team_config answered, or None when
+    neither wrote anything and there is nothing to put back. An entry this run
+    inserted is removed, because the member did not fail, it never existed; one
+    that was already there goes back to the values it held, because those were
+    somebody else's writing and this run only borrowed the entry for a launch.
+
+    No dry-run half. The only caller is a failed exec, and a dry run returns
+    before it reaches one, so a preview tense here would describe a call that
+    cannot happen.
+
+    The mailbox the write seeded is left alone. It holds `[]` at worst and mail
+    at best, and deleting it to tidy up a failed launch is the one way this
+    could lose a message.
+    """
+    if not undo:
         return
-    edit_team_config(cfg, mutate, "updated")
+    cfg, agent_id, found = undo["cfg"], undo["agentId"], undo["found"]
+
+    def mutate(data):
+        members = data.get("members", [])
+        at = [i for i, m in enumerate(members) if m.get("agentId") == agent_id]
+        if not at:
+            # Gone since the write. Putting it back would be this run inventing
+            # an entry rather than undoing one, and removing it is already done.
+            return None
+        if found is None:
+            data["members"] = [m for i, m in enumerate(members) if i not in set(at)]
+            return data
+        if all(m == found for m in (members[i] for i in at)):
+            return None
+        for i in at:
+            members[i] = copy.deepcopy(found)
+        return data
+
+    edit_team_config(cfg, mutate,
+                     f"took back the entry it wrote for {agent_id} in" if found is None
+                     else f"put {agent_id} back as this run found it in")
+
+
+def unwind_launch(undo, agent_id):
+    """Put back what this run wrote for a launch that is now not going to happen.
+
+    One implementation for every way a launch dies after its roster write, and
+    there is more than one: the exec itself failing, and the agent's own
+    directory refusing to be entered a moment before it. Each of them leaves the
+    same thing behind, so each undoes it the same way.
+
+    A roster that refuses the rollback cannot be made to accept it here: taking
+    the entry back needs the lock that was just refused. So what stays listed is
+    named, and the caller's own reason is still what ends the run, rather than a
+    refusal about a file replacing the failure the reader came for.
+    """
+    try:
+        restore_member(undo)
+    except Refusal:
+        warn(f"{undo['cfg']} still lists {agent_id} as active, "
+             "for a process that never started")
+
+
+def exec_failed(undo, agent_id, command, exc):
+    """End a run whose exec did not happen, with the roster back as it was.
+
+    exec either replaces this process or does not happen at all, so reaching
+    here means the member the roster was just told about does not exist. What
+    this run wrote goes back first, and then the run ends in the exec error,
+    which is the failure the reader came for.
+    """
+    unwind_launch(undo, agent_id)
+    die(f"cannot exec {command[0]}: {exc}")
 
 
 def claude_binary(args):
@@ -6756,25 +6951,35 @@ def record_membership(ctx, args, pane, alive=True):
     and never be read from it. That is true of an agent already running just as
     much as of one this run started, and a run that noops has still established
     that the agent is there.
+
+    Returns what a rollback would need if the launch this describes never
+    happens: the entry written and what stood there before it, or None when no
+    roster was written. Only the entry this run wrote is in it. On a rebind the
+    source is retired here as well, and that retirement is not part of the undo:
+    it says the member is not running in the team it left, which stays true when
+    the launch fails, and putting `isActive` back would leave that roster
+    claiming a live member for a process that does not exist.
     """
     # A bare resume joins no team, so writing it into a roster would record a
     # membership the launch does not carry. Its inbox is left alone for the
     # same reason: nothing is going to read it under that name.
     if getattr(args, "bare", False):
-        return
+        return None
     if ctx.get("to_team"):
-        register_member(RESOLVER.roster_record(ctx, team=ctx["to_team"]), pane, args.dry_run, alive)
+        undo = register_member(RESOLVER.roster_record(ctx, team=ctx["to_team"]),
+                               pane, args.dry_run, alive)
         if ctx["to_team"] != RESOLVER.field(ctx, "teamName"):
             retire_member(ctx, args.dry_run)
-        return
+        return undo
     team = RESOLVER.field(ctx, "teamName")
     ensure_inbox(team, RESOLVER.field(ctx, "agentName"), args.dry_run)
     if args.no_update_config:
-        return
+        return None
     if ctx.get("team_entry"):
-        update_team_config(ctx, RESOLVER.roster_record(ctx), pane, args.dry_run, alive)
-    elif RESOLVER.has_roster(team):
-        register_member(RESOLVER.roster_record(ctx, team=team), pane, args.dry_run, alive)
+        return update_team_config(ctx, RESOLVER.roster_record(ctx), pane, args.dry_run, alive)
+    if RESOLVER.has_roster(team):
+        return register_member(RESOLVER.roster_record(ctx, team=team), pane, args.dry_run, alive)
+    return None
 
 
 def reserve_membership(ctx, args):
@@ -7152,21 +7357,33 @@ def run_one(args, passthrough, table, prefix="", pending=()):
         if running:
             return noop_outcome(ctx, args, prefix, why=running[0], report=running[1])
         enforce_ctx(ctx, args)
+        # Check what we are about to run before writing anything, the same order
+        # the lead path takes: writing the roster first and finding the binary
+        # unusable second lists a member for a launch that never happened, and
+        # this exit is not one the rollback below can reach.
+        if not args.dry_run and not shutil.which(command[0]):
+            die(f"cannot exec {command[0]}: not found or not executable")
         # Listed with no pane: a member that is running and reachable, which a
-        # later team run places in a pane like any other.
-        record_membership(ctx, args, None)
+        # later team run places in a pane like any other. What that write found
+        # is kept, because nothing from here on is certain to start the agent.
+        undo = record_membership(ctx, args, None)
         # One line, both tenses, so the preview cannot drift from the act.
         print(f"{prefix}exec     this terminal "
               f"{'would become' if args.dry_run else 'becomes'} {agent_id}")
         if args.dry_run:
             return Outcome("manual", None, False, None)
-        if not shutil.which(command[0]):
-            die(f"cannot exec {command[0]}: not found or not executable")
-        enter_agent_cwd(ctx, prefix)
+        try:
+            enter_agent_cwd(ctx, prefix)
+        except Refusal:
+            # The agent's own directory refused. No launch is going to happen,
+            # so the roster must not be left saying one did; the refusal itself
+            # is re-raised untouched, because it already says what went wrong.
+            unwind_launch(undo, agent_id)
+            raise
         try:
             os.execvp(command[0], command)
         except OSError as exc:
-            die(f"cannot exec {command[0]}: {exc}")
+            exec_failed(undo, agent_id, command, exc)
 
     socket, how = resolve_socket(ctx, args, table)
     if not socket:
@@ -7249,14 +7466,12 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             and not getattr(args, "in_team", False) and not os.environ.get("CLAUDECODE")):
         if in_pane == want_pane or not RESOLVER.pane_exists(socket, want_pane):
             print(f"{prefix}exec     you are in {in_pane} on {socket}; running here rather than splitting")
-            if ctx.get("to_team"):
-                register_member(RESOLVER.roster_record(ctx, team=ctx["to_team"]), in_pane, args.dry_run)
-                if ctx["to_team"] != RESOLVER.field(ctx, "teamName"):
-                    retire_member(ctx, args.dry_run)
-            else:
-                ensure_inbox(RESOLVER.field(ctx, "teamName"), RESOLVER.field(ctx, "agentName"), args.dry_run)
-                if not args.no_update_config:
-                    update_team_config(ctx, RESOLVER.roster_record(ctx), in_pane, args.dry_run)
+            # The same roster write every other launch makes, through the one
+            # function that decides which roster a member belongs in. A second
+            # copy of that routing lived here and had already drifted: it wrote
+            # the destination on a rebind and rolled the source back, so a
+            # failed exec left the destination claiming a live member.
+            undo = record_membership(ctx, args, in_pane)
             rendered = f"exec in {cwd or os.getcwd()}: {' '.join(shlex.quote(c) for c in command)}"
             step(args.dry_run, f"would {rendered}", rendered, indent=prefix)
             if args.dry_run:
@@ -7271,22 +7486,18 @@ def run_one(args, passthrough, table, prefix="", pending=()):
             environ.update(dict(pair.split("=", 1) for pair in TEAM_ENV))
             if not args.no_tint:
                 tint_pane(socket, in_pane, RESOLVER.field(ctx, "color"), RESOLVER.field(ctx, "agentName"), False)
-            enter_agent_cwd(ctx, prefix)
+            try:
+                enter_agent_cwd(ctx, prefix)
+            except Refusal:
+                # The agent's own directory refused, so no launch is going to
+                # happen here either; the roster goes back and the refusal is
+                # re-raised as it stands.
+                unwind_launch(undo, agent_id)
+                raise
             try:
                 os.execvpe(command[0], command, environ)
             except OSError as exc:
-                # exec replaces this process or it does not happen at all, so
-                # reaching here means the member the roster was just told about
-                # does not exist. Take the claim back before failing, and if the
-                # roster refuses that too, say what is left listed and still end
-                # in the exec error: that is the failure the reader came for.
-                if ctx.get("to_team"):
-                    try:
-                        retire_member(ctx, False)
-                    except Refusal:
-                        warn(f"{ctx['team_entry']['cfg']} still lists {agent_id} as "
-                             "active, for a process that never started")
-                die(f"cannot exec {command[0]}: {exc}")
+                exec_failed(undo, agent_id, command, exc)
 
     try:
         launched_at = ctx["transcript"][0].stat().st_mtime
@@ -7677,25 +7888,69 @@ def team_keep_reason(cfg, table):
     return RESOLVER.scaffolding_objection(cfg.parent)
 
 
-def cleanup_teams(dry=False):
-    """Remove team dirs that hold nothing resurrectable, and their task dirs.
+def sweep_dead_lock(cfg, dry):
+    """Remove this roster's lock when the run that took it was killed holding it.
 
-    Returns (removed names, [(team, why it was kept)]). The kept list is
-    answered rather than printed so the caller can lead with the outcome; it
-    is still only rendered under --dry-run, since the hook wants silence.
+    Returns what to say about the removal, or None when there was nothing to
+    remove.
+
+    A lock this tool takes is a regular file carrying the pid and start time of
+    the run inside it. The harness's own helper makes a directory at this path
+    and clears one it calls stale with rmdir, which answers ENOTDIR on a regular
+    file, so the harness cannot clear a lock this tool left behind. Four of its
+    roster operations catch that and log, and so do nothing; the reservation it
+    makes when spawning a teammate does not catch it, so spawning into that team
+    fails and keeps failing until the file goes. Until this ran, the only thing
+    that removed it was another run of this tool wanting the same team's lock,
+    which may never happen.
+
+    Whether a lock may be taken away is the engine's answer, and it is the same
+    answer a roster write waits on; the removal goes through the same actor
+    too, so a lock a live run took over between the verdict and the unlink is
+    left alone here exactly as it is there. A lock carrying no owner record is
+    most likely the harness's own and is left alone however old it is, and so
+    is a directory at this path and a lock whose recorded owner is running.
     """
-    removed, kept = [], []
+    lock = RESOLVER.lock_for(cfg)
+    owner, gone, seen = RESOLVER.lock_holder(lock)
+    if not gone:
+        return None
+    said = f"{cfg.parent.name} (pid {owner['pid']}, which is gone)"
+    if dry:
+        return said
+    took, stuck = drop_lock(lock, seen)
+    if stuck:
+        warn(f"cannot remove {lock}: {stuck}")
+    return said if took else None
+
+
+def cleanup_teams(dry=False):
+    """Remove team dirs that hold nothing resurrectable, their task dirs, and
+    the roster locks killed runs of this tool left behind.
+
+    Returns (removed names, [(team, why it was kept)], what to say about each
+    lock removed). The kept list is answered rather than printed so the caller
+    can lead with the outcome; it is still only rendered under --dry-run, since
+    the hook wants silence.
+
+    A lock is swept only in a directory this sweep keeps. One it removes takes
+    the lock with it, since config.json.lock is in SCAFFOLDING.
+    """
+    removed, kept, locks = [], [], []
     table = RESOLVER.process_table()
     for cfg in sorted(RESOLVER.roster_path(d.name) for d in RESOLVER.team_dirs()):
         keep = team_keep_reason(cfg, table)
         if keep:
             kept.append((cfg.parent.name, keep))
+            left = sweep_dead_lock(cfg, dry)
+            if left:
+                locks.append(left)
             continue
         if not remove_if_cruft(cfg.parent, dry, "team"):
             continue
         remove_if_cruft(CLAUDE_DIR / "tasks" / cfg.parent.name, dry, "tasks")
         removed.append(cfg.parent.name)
-    return removed, kept
+    return removed, kept, locks
 
 
 def run_standing(args):
@@ -8922,14 +9177,17 @@ def run_cleanup(dry=False):
     still silent unless something was actually removed.
     """
     sockets = cleanup_sockets(dry)
-    removed, kept = cleanup_teams(dry)
+    removed, kept, locks = cleanup_teams(dry)
     said = "would remove" if dry else "removed"
     if sockets:
         print(fill(f"{said} {len(sockets)} dead socket(s): {', '.join(sockets)}"))
     if removed:
         print(fill(f"{said} {len(removed)} empty team(s): {', '.join(removed)}"))
+    if locks:
+        print(fill(f"{said} {len(locks)} roster lock(s) this tool left behind: "
+                   f"{', '.join(locks)}"))
     if dry:
-        if not (sockets or removed):
+        if not (sockets or removed or locks):
             print(f"nothing to clean up: {len(kept)} team(s) kept, no dead sockets")
         for team, why in kept:
             print(fill(f"  keeping {team}: {why}"))
@@ -11330,8 +11588,11 @@ def _check_release_gives_the_claim_back(s):
       ('lock-left-by-a-dead-run-is-taken', 'a lock whose recorded owner is gone is taken, and the run says so'),
       ('lock-of-a-live-owner-is-kept', 'a lock whose recorded owner is still running is left alone'),
       ('stale-lock-that-will-not-come-away-refuses', 'a stale lock this run cannot remove ends at the deadline, not in a spin'),
+      ('lock-replaced-mid-verdict-is-not-taken', "a dead owner's lock replaced by a live one before the removal is left alone"),
       ('release-leaves-a-replacement-lock-alone', 'a lock that replaced ours while we held it is not removed on the way out'))
 def _check_team_lock_fails_closed(s):
+    import threading
+
     checked = []
 
     def check(cid, name, ok, detail=""):
@@ -11339,6 +11600,10 @@ def _check_team_lock_fails_closed(s):
 
     tempfile = s.tempfile
 
+    # Long enough that a loaded machine finishing a hundredth-of-a-second wait
+    # never trips it, short enough that a wait which never ends is reported
+    # rather than sat through.
+    WRITE_DEADLINE = 5.0
     lock_base = Path(tempfile.mkdtemp())
     real_teams_dir = RESOLVER.teams_dir
     real_lock = globals()["team_lock"]
@@ -11353,11 +11618,13 @@ def _check_team_lock_fails_closed(s):
         untouched = lcfg.read_bytes()
         lock = lcfg.with_name("config.json.lock")
 
+        stragglers = []
+
         def add_a_member(data):
             data["members"].append({"agentId": f"late@{lteam}", "name": "late"})
             return data
 
-        def write_against(shape, aged=False, exists=False):
+        def write_against(shape, aged=False, exists=False, meanwhile=None):
             """One roster write against a lock of this shape.
 
             Returns what it refused with or None, and everything it said. A
@@ -11366,6 +11633,21 @@ def _check_team_lock_fails_closed(s):
             before saying it could not take one. `exists` is for a lock the
             caller has already put in place, because the directory it sits in
             is no longer writable by the time this runs.
+
+            The write runs in a thread with a deadline of its own, because one
+            of the cases below exists to catch a wait that never reaches its
+            own deadline. Left in this thread, that regression hangs the whole
+            suite: nothing is reported, the probe reads no verdict at all
+            rather than a failure, and somebody has to kill the run by hand. A
+            write that outlives the deadline answers "did not finish", which
+            fails whichever check it belongs to. Daemon, so a thread still
+            spinning cannot hold the interpreter open, and the capture stays in
+            this thread so a stuck writer cannot leave stdout swapped for the
+            rest of the suite.
+
+            `meanwhile` runs after the engine has answered what is at the lock
+            and before anything acts on that answer, which is where another run
+            can take a dead owner's lock away and put its own there.
             """
             if exists:
                 pass
@@ -11377,13 +11659,34 @@ def _check_team_lock_fails_closed(s):
                 old = time.time() - 3600
                 os.utime(lock, (old, old))
             globals()["team_lock"] = lambda held, timeout=0.1: real_lock(held, timeout)
-            with capturing("out") as out, capturing("err") as err:
+            real_holder = RESOLVER.lock_holder
+            if meanwhile:
+                def racing(path):
+                    answer = real_holder(path)
+                    meanwhile()
+                    return answer
+                RESOLVER.lock_holder = racing
+            got = []
+
+            def attempt():
                 try:
                     edit_team_config(lcfg, add_a_member, "wrote")
-                    refused = None
+                    got.append(None)
                 except Refusal as refusal:
-                    refused = refusal.said
-            return refused, out.getvalue() + err.getvalue()
+                    got.append(refusal.said)
+
+            writer = threading.Thread(target=attempt, daemon=True)
+            try:
+                with capturing("out") as out, capturing("err") as err:
+                    writer.start()
+                    writer.join(WRITE_DEADLINE)
+            finally:
+                RESOLVER.lock_holder = real_holder
+            said = out.getvalue() + err.getvalue()
+            if not got:
+                stragglers.append(writer)
+                return f"did not finish in {WRITE_DEADLINE:g}s", said
+            return got[0], said
 
         def clear_lock():
             if lock.is_dir():
@@ -11414,14 +11717,30 @@ def _check_team_lock_fails_closed(s):
         # A lock this run judges stale and then cannot remove: the parent
         # directory is read-only, so the create still answers EEXIST and the
         # unlink answers EACCES. An earlier draft looped on that pair without
-        # ever reaching its deadline.
+        # ever reaching its deadline. It runs last of all, at the bottom of this
+        # block: the regression it catches is a write that never returns, and
+        # the thread carrying it is still spinning on this same lockfile when
+        # the deadline hands the run back. Anything staged after it would be
+        # answering against a fixture that thread is still writing to.
+
+        # A second run takes a dead owner's lock over in the gap between this
+        # run reading that record and acting on it. What sits at the name by
+        # then is a live lock with its owner inside, and an unlink by name would
+        # take it away. A real takeover leaves a different inode carrying a live
+        # record, which is what this puts there.
         lock.write_bytes(dead_owner)
-        os.chmod(lock.parent, 0o500)
-        try:
-            stuck_said, stuck_out = write_against(dead_owner, exists=True)
-        finally:
-            os.chmod(lock.parent, 0o700)
-        stuck_kept = lock.is_file() and lcfg.read_bytes() == untouched
+        swapped = []
+
+        def swap_in_a_live_lock():
+            if swapped:
+                return   # once: the wait below reads the replacement each pass
+            swapped.append(True)
+            lock.unlink()
+            lock.write_bytes(live_owner)
+
+        raced_said, raced_out = write_against(dead_owner, exists=True,
+                                              meanwhile=swap_in_a_live_lock)
+        raced_kept = lock.is_file() and lock.read_bytes() == live_owner
         clear_lock()
 
         # Somebody else takes the name while we are inside the lock. What sits
@@ -11440,6 +11759,31 @@ def _check_team_lock_fails_closed(s):
         taken_listed = [m.get("name") for m in
                         json.loads(lcfg.read_text()).get("members", [])]
         taken_gone = not lock.exists()
+        lcfg.write_bytes(untouched)
+        clear_lock()
+
+        # A lock this run judges stale and then cannot remove: the parent
+        # directory is read-only, so the create still answers EEXIST and the
+        # unlink answers EACCES. Root ignores those bits, so on a run as root
+        # the removal succeeds and this case reports a failure rather than a
+        # hang, which is the safe way round.
+        lock.write_bytes(dead_owner)
+        os.chmod(lock.parent, 0o500)
+        try:
+            stuck_said, stuck_out = write_against(dead_owner, exists=True)
+        finally:
+            os.chmod(lock.parent, 0o700)
+        stuck_kept = lock.is_file() and lcfg.read_bytes() == untouched
+
+        # A write that missed its deadline is still going. Whatever it says when
+        # it does land would otherwise arrive on the real stdout in the middle
+        # of the suite's own report, where a reader, and the probe reading this
+        # suite's failures, take it for a verdict. Give it the fixture's last
+        # moments with the capture still up; one that never finishes at all is a
+        # daemon thread and ends with the interpreter.
+        with capturing("out"), capturing("err"):
+            for straggler in stragglers:
+                straggler.join(WRITE_DEADLINE)
     finally:
         os.chmod(lock_base / lteam, 0o700)
         globals()["team_lock"] = real_lock
@@ -11470,6 +11814,11 @@ def _check_team_lock_fails_closed(s):
           bool(stuck_said) and stuck_kept and "cannot remove it" in (stuck_said or "")
           and "taking it over" not in stuck_out,
           f"refused {stuck_said!r}, lock and roster untouched {stuck_kept}")
+    check("lock-replaced-mid-verdict-is-not-taken",
+          "a dead owner's lock replaced by a live one before the removal is left alone",
+          raced_kept and bool(raced_said) and "taking it over" not in raced_out,
+          f"replacement still there {raced_kept}, refused {raced_said!r}, "
+          f"said {raced_out.strip()!r}")
     check("release-leaves-a-replacement-lock-alone",
           "a lock that replaced ours while we held it is not removed on the way out",
           replacement_kept, f"replacement still there {replacement_kept}")
@@ -11477,7 +11826,8 @@ def _check_team_lock_fails_closed(s):
 
 
 @unit(('refused-release-says-what-stays-claimed', 'a claim that cannot be given back is reported, not raised'),
-      ('refused-retire-keeps-the-exec-error', 'a failed exec is still the reason a run ends, even when the roster refuses too'))
+      ('refused-rollback-keeps-the-exec-error', 'a failed exec is still the reason a run ends, even when the roster refuses too'),
+      ('failed-exec-unwinds-the-roster-write', 'every exec that wrote a roster first unwinds it through one place'))
 def _check_refused_teardown_reports(s):
     checked = []
 
@@ -11533,14 +11883,13 @@ def _check_refused_teardown_reports(s):
           f"raised {gave_up!r}, roster and lock untouched {gkept}, "
           f"named the entry and its file {gnamed}, said {gsaid.strip()!r}")
 
-    # The other teardown, read out of the tree rather than driven: the exec
-    # that fails there replaces this process when it does not fail, so there is
-    # no run left to observe. Read rather than grepped because a substring
-    # matches a comment and code nothing reaches equally well. What this says,
-    # and the whole of what it says, is that the handler has one shape: the
-    # retire sits inside a try, its Refusal arm says something and does not
-    # re-raise, and the exec error is what ends the run after it. Which roster
-    # that retire reaches is a separate question and not one this asks.
+    # The other teardown, read out of the tree rather than driven: an exec that
+    # does not fail replaces this process, so there is no run left to observe.
+    # Read rather than grepped, because a substring matches a comment as well as
+    # code. It is still a statement about what the file says and not about what
+    # runs: code no branch reaches has the same syntax as code every branch
+    # does, so this proves the rollback is written where a failure lands, and
+    # the two behavioural checks below prove what the rollback then does.
     def says(call, text):
         for arg in call.args:
             parts = arg.values if isinstance(arg, ast.JoinedStr) else [arg]
@@ -11553,26 +11902,206 @@ def _check_refused_teardown_reports(s):
         return [sub for sub in ast.walk(node) if isinstance(sub, ast.Call)
                 and getattr(sub.func, "id", None) == name]
 
-    shaped = []
-    for handler in ast.walk(funcs["run_one"]):
-        if not isinstance(handler, ast.ExceptHandler):
-            continue
-        dies = [call for call in calling(handler, "die") if says(call, "cannot exec")]
-        guards = [sub for sub in ast.walk(handler)
-                  if isinstance(sub, ast.Try) and calling(sub, "retire_member")]
-        if not (dies and guards):
-            continue
-        caught = [arm for arm in guards[0].handlers
-                  if isinstance(arm.type, ast.Name) and arm.type.id == "Refusal"]
-        shaped.append(
-            bool(caught)
-            and all(calling(arm, "warn") for arm in caught)
-            and not any(isinstance(sub, ast.Raise)
-                        for arm in caught for sub in ast.walk(arm))
-            and max(call.lineno for call in dies) > (guards[0].end_lineno or 0))
-    check("refused-retire-keeps-the-exec-error",
+    # One place puts the roster back, and this is its shape: the rollback sits
+    # inside a try, a roster that refuses it is said out loud and not re-raised
+    # over the reason the launch failed, and the exec error is what ends the run
+    # afterwards.
+    wrong = []
+    putter = funcs.get("unwind_launch")
+    ender = funcs.get("exec_failed")
+    if putter is None:
+        wrong.append("unwind_launch is gone, so nothing says how the roster goes back")
+    else:
+        guards = [sub for sub in ast.walk(putter)
+                  if isinstance(sub, ast.Try) and calling(sub, "restore_member")]
+        if not guards:
+            wrong.append("the rollback is not guarded against a roster that refuses it")
+        else:
+            caught = [arm for arm in guards[0].handlers
+                      if isinstance(arm.type, ast.Name) and arm.type.id == "Refusal"]
+            if not caught:
+                wrong.append("a refusal from the rollback is not caught")
+            elif not all(calling(arm, "warn") for arm in caught):
+                wrong.append("a caught refusal is swallowed without a word")
+            elif any(isinstance(sub, ast.Raise) for arm in caught for sub in ast.walk(arm)):
+                wrong.append("a caught refusal is re-raised over the reason the run ends")
+    puts_back = s.callers_of("restore_member") - s.suite_fns
+    if puts_back != {"unwind_launch"}:
+        wrong.append(f"the roster is put back from {sorted(puts_back)}, not from one place")
+    if ender is None:
+        wrong.append("exec_failed is gone, so nothing says what a failed exec does")
+    else:
+        dies = [call for call in calling(ender, "die") if says(call, "cannot exec")]
+        unwinds = calling(ender, "unwind_launch")
+        if not dies:
+            wrong.append("nothing in it ends the run in the exec error")
+        if not unwinds:
+            wrong.append("a failed exec does not put the roster back")
+        if dies and unwinds and max(c.lineno for c in dies) <= min(c.lineno for c in unwinds):
+            wrong.append("the exec error is not the last thing that happens")
+    check("refused-rollback-keeps-the-exec-error",
           "a failed exec is still the reason a run ends, even when the roster refuses too",
-          shaped == [True], f"handlers of that shape: {shaped}")
+          not wrong, "; ".join(wrong))
+
+    # And everything that wrote a roster on the way in comes back through it.
+    # Two steps after that write can still end the run: the exec, and entering
+    # the agent's own directory a moment before it. run_one reaches each of them
+    # three times and the split is the same both times, because they are the
+    # same three routes: the two member routes write a member into a roster
+    # first and unwind, and the lead route writes no member entry at all, so it
+    # ends in its own reason with nothing to take back. A fourth route added
+    # here fails this until somebody says which of the two it is.
+    def guarded_by(inner, rollback, kind):
+        """(handlers that unwind, handlers that do not, every call of inner)."""
+        held, bare = [], []
+        for node in ast.walk(funcs["run_one"]):
+            if not isinstance(node, ast.Try):
+                continue
+            if not any(isinstance(sub, ast.Call)
+                       and (getattr(sub.func, kind, "") in inner)
+                       for stmt in node.body for sub in ast.walk(stmt)):
+                continue
+            for arm in node.handlers:
+                reached = {getattr(sub.func, "id", None)
+                           for sub in ast.walk(arm) if isinstance(sub, ast.Call)}
+                (held if rollback in reached else bare).append(arm.lineno)
+        calls = [sub.lineno for sub in ast.walk(funcs["run_one"])
+                 if isinstance(sub, ast.Call) and getattr(sub.func, kind, "") in inner]
+        return held, bare, calls
+
+    unwound, straight, execs = guarded_by({"execvp", "execvpe"}, "exec_failed", "attr")
+    cwd_unwound, cwd_straight, cwds = guarded_by({"enter_agent_cwd"}, "unwind_launch", "id")
+    # A handler that writes a roster instead of taking one back is the bug this
+    # whole unit came from, in the one place it would be invisible.
+    still_writing = [node.lineno for node in ast.walk(funcs["run_one"])
+                     if isinstance(node, ast.ExceptHandler)
+                     for sub in ast.walk(node)
+                     if isinstance(sub, ast.Call) and getattr(sub.func, "id", "") in
+                     {"retire_member", "register_member", "update_team_config",
+                      "record_membership"}]
+    check("failed-exec-unwinds-the-roster-write",
+          "every exec that wrote a roster first unwinds it through one place",
+          len(execs) == 3 and len(unwound) == 2 and len(straight) == 1
+          and len(cwds) == 3 and len(cwd_unwound) == 2 and not cwd_straight
+          and not still_writing,
+          f"{len(execs)} exec(s), unwound at {unwound}, ended without unwinding at "
+          f"{straight}; {len(cwds)} cwd move(s), unwound at {cwd_unwound}, left "
+          f"unguarded at {cwd_straight}; wrote a roster from a handler at {still_writing}")
+    return checked
+
+
+@unit(('failed-exec-takes-back-the-entry-it-wrote',
+       'a launch that never happened leaves no entry this run inserted, in the roster it wrote'),
+      ('failed-exec-restores-an-entry-it-found',
+       'an entry that predates the run goes back to the values it had'),
+      ('failed-exec-leaves-the-source-retired',
+       'the team a rebind left keeps saying the member is not running there'))
+def _check_failed_exec_puts_the_roster_back(s):
+    """What the rollback does, driven rather than read.
+
+    The bug this holds shut was a rollback aimed at the wrong file: it undid the
+    source of a rebind, which the write above it had already retired, while the
+    destination kept the entry it had just been given for a process that never
+    started. So both halves are asked here, and about both rosters.
+
+    roster_record and field are answered by hand. Everything else runs
+    unmodified: record_membership does its own routing, and the writes and the
+    rollback go through edit_team_config and the real lock. Assembling a whole
+    ctx would mean a transcript, a merge and a cwd resolution, none of which
+    this asks anything about.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    tempfile = s.tempfile
+
+    back_base = Path(tempfile.mkdtemp())
+    real_teams_dir = RESOLVER.teams_dir
+    real_record, real_field = RESOLVER.roster_record, RESOLVER.field
+    steam, dteam = "session-rollback-src", "session-rollback-dest"
+    try:
+        RESOLVER.teams_dir = back_base
+
+        def stage(team, members):
+            (back_base / team / "inboxes").mkdir(parents=True)
+            cfg = RESOLVER.roster_path(team)
+            cfg.write_text(json.dumps({
+                "name": team, "leadAgentId": agent_id_of("team-lead", team),
+                "leadSessionId": "x", "members": members}, indent=2))
+            return cfg
+
+        def entry_for(team, cfg):
+            return next((m for m in json.loads(cfg.read_text()).get("members", [])
+                         if m.get("agentId") == agent_id_of("mover", team)), None)
+
+        RESOLVER.roster_record = lambda ctx, team=None: {
+            "name": "mover", "team": team or steam,
+            "agentId": agent_id_of("mover", team or steam),
+            "parentSession": "", "agentType": "general-purpose",
+            "planModeRequired": False, "cwd": "/tmp",
+            "color": "blue", "model": "claude-opus-5"}
+        RESOLVER.field = lambda ctx, name: {"teamName": steam, "agentName": "mover"}.get(name)
+        running = types.SimpleNamespace(bare=False, dry_run=False, no_update_config=False)
+
+        # A rebind onto a team this member is not in yet: the entry the run
+        # writes there is one nothing had before it.
+        scfg = stage(steam, [{"agentId": agent_id_of("team-lead", steam), "name": "team-lead"},
+                             {"agentId": agent_id_of("mover", steam), "name": "mover",
+                              "tmuxPaneId": "%1", "backendType": "tmux", "isActive": True}])
+        dcfg = stage(dteam, [{"agentId": agent_id_of("team-lead", dteam), "name": "team-lead"}])
+        ctx = {"to_team": dteam,
+               "team_entry": {"cfg": scfg, "member": {"agentId": agent_id_of("mover", steam)}}}
+        with capturing("out"), capturing("err"):
+            fresh = record_membership(ctx, running, "%7")
+        wrote_dest = entry_for(dteam, dcfg)
+        retired_source = entry_for(steam, scfg)
+        source_after_write = scfg.read_bytes()
+        with capturing("out"), capturing("err"):
+            restore_member(fresh)
+        dest_after = entry_for(dteam, dcfg)
+        source_after = scfg.read_bytes()
+
+        # And the same rebind onto a team that already carries this member, from
+        # a life before this run. That entry is somebody else's writing.
+        shutil.rmtree(back_base / dteam)
+        was = {"agentId": agent_id_of("mover", dteam), "name": "mover",
+               "joinedAt": 17, "subscriptions": [], "agentType": "general-purpose",
+               "tmuxPaneId": "%9", "backendType": "tmux", "isActive": False,
+               "color": "red", "model": "claude-sonnet-4"}
+        dcfg = stage(dteam, [{"agentId": agent_id_of("team-lead", dteam), "name": "team-lead"},
+                             copy.deepcopy(was)])
+        with capturing("out"), capturing("err"):
+            older = record_membership(ctx, running, "%7")
+        changed = entry_for(dteam, dcfg)
+        with capturing("out"), capturing("err"):
+            restore_member(older)
+        put_back = entry_for(dteam, dcfg)
+    finally:
+        RESOLVER.roster_record, RESOLVER.field = real_record, real_field
+        RESOLVER.teams_dir = real_teams_dir
+        shutil.rmtree(back_base, ignore_errors=True)
+
+    check("failed-exec-takes-back-the-entry-it-wrote",
+          "a launch that never happened leaves no entry this run inserted, "
+          "in the roster it wrote",
+          bool(wrote_dest) and wrote_dest.get("isActive") is True and dest_after is None,
+          f"written as {wrote_dest}, left as {dest_after}")
+    check("failed-exec-restores-an-entry-it-found",
+          "an entry that predates the run goes back to the values it had",
+          changed != was and put_back == was,
+          f"written as {changed}, put back as {put_back}, was {was}")
+    # The retirement is not undone, and this says why rather than only that.
+    # After a failed exec nothing is running as this member anywhere, which is
+    # what the source now records; putting isActive back would leave the team it
+    # left claiming a live member for a process that does not exist.
+    check("failed-exec-leaves-the-source-retired",
+          "the team a rebind left keeps saying the member is not running there",
+          bool(retired_source) and retired_source.get("isActive") is False
+          and source_after == source_after_write,
+          f"source entry {retired_source}, untouched by the rollback "
+          f"{source_after == source_after_write}")
     return checked
 
 
@@ -12633,6 +13162,55 @@ def _check_preview_line_counterpart(s):
     unpaired = [line.strip()[:60] for line in source.splitlines()
                 if "print(" in line and "would " in line and " else " not in line]
     check("preview-line-counterpart", "every preview line has a real counterpart", not unpaired, "; ".join(unpaired))
+    return checked
+
+
+@unit(('lock-verdict-one-place', 'whether a roster lock may be taken away is decided in one place'))
+def _check_lock_verdict_one_place(s):
+    """Two callers remove this lockfile and they must never disagree.
+
+    A roster write takes the lock over when the run that left it is gone, and
+    the startup sweep clears the same leftover when nothing ever wants that
+    team's lock again. A private second answer in either of them is how the
+    sweep ends up removing a lock a live run is inside, so the question is the
+    engine's and the removal is one actor both of them call.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    ast = s.ast
+    tree = s.tree
+    funcs = s.funcs
+    callers_of = s.callers_of
+
+    forked = []
+    # The engine's methods live in a class, so top-level functions are exactly
+    # what is outside it. SCAFFOLDING sits at module level and is not one.
+    spelled = sorted(f"{node.name} at line {sub.lineno}"
+                     for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name not in s.suite_fns
+                     for sub in ast.walk(node)
+                     if isinstance(sub, ast.Constant) and sub.value == "config.json.lock")
+    if spelled:
+        forked.append("the lockfile is named outside the engine at " + ", ".join(spelled))
+    for question, want in (("lock_holder", {"team_lock", "sweep_dead_lock"}),
+                           ("drop_lock", {"team_lock", "sweep_dead_lock"})):
+        asked = callers_of(question) - s.suite_fns
+        if asked != want:
+            forked.append(f"{question} is reached from {sorted(asked)}, not from "
+                          f"{sorted(want)}")
+    for named in ("team_lock", "sweep_dead_lock", "drop_lock"):
+        node = funcs.get(named)
+        if node is None:
+            forked.append(f"{named} is gone, so the pair this holds together is not there")
+        elif "pid_alive" in {getattr(sub.func, "attr", None) for sub in ast.walk(node)
+                             if isinstance(sub, ast.Call)}:
+            forked.append(f"{named} tests the owner's liveness itself")
+    check("lock-verdict-one-place",
+          "whether a roster lock may be taken away is decided in one place",
+          not forked, "; ".join(forked))
     return checked
 
 
@@ -15062,6 +15640,100 @@ def _check_cleanup_opens_with_outcome(s):
     wrong = sorted(k for k, ok in sweep.items() if not ok)
     check("cleanup-opens-with-outcome", "the sweep says its outcome before its reasons",
           not wrong, ", ".join(wrong))
+    return checked
+
+
+@unit(('cleanup-clears-a-lock-we-left',
+       'the sweep removes a roster lock whose recorded owner is gone, and says so'),
+      ('cleanup-keeps-a-lock-that-is-not-ours-to-clear',
+       'the sweep leaves every other lock exactly where it is'))
+def _check_cleanup_clears_our_own_dead_lock(s):
+    """The sweep's half of the leftover a killed run leaves.
+
+    Our lock is a regular file; the harness's is a directory, and it clears one
+    it calls stale with rmdir, which answers ENOTDIR on a file. So a lock this
+    tool leaves behind is one the harness can never clear, and until this ran the
+    only thing that cleared it was another run of this tool wanting the same
+    team's lock. Four shapes in four kept teams, in one sweep, because what is
+    worth proving is that the sweep tells them apart.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    tempfile = s.tempfile
+
+    lock_sweep = Path(tempfile.mkdtemp())
+    real_teams_dir, real_sockets = RESOLVER.teams_dir, RESOLVER.dead_sockets
+    try:
+        RESOLVER.teams_dir = lock_sweep
+        RESOLVER.dead_sockets = lambda: []   # this fixture is about lockfiles
+
+        def with_a_lock(name, shape):
+            """A team young enough that the sweep keeps it, holding this lock."""
+            (lock_sweep / name / "inboxes").mkdir(parents=True)
+            RESOLVER.roster_path(name).write_text(json.dumps(
+                {"name": name, "leadAgentId": agent_id_of("team-lead", name),
+                 "leadSessionId": "no-such-session-uuid",
+                 "members": [{"agentId": agent_id_of("team-lead", name), "name": "team-lead"}]}))
+            lock = RESOLVER.lock_for(RESOLVER.roster_path(name))
+            if shape is None:
+                lock.mkdir()   # the shape the harness's own lock helper makes
+            else:
+                lock.write_bytes(shape)
+            # Old enough that anything deciding by age would take it. Nothing
+            # here decides by age, and this is what says so.
+            old = time.time() - 86400
+            os.utime(lock, (old, old))
+            return lock
+
+        ours = {"tool": TOOL, "pid": os.getpid()}
+        dead = with_a_lock("session-lock-dead", json.dumps({**ours, "procStart": "1"}).encode())
+        live = with_a_lock("session-lock-live", json.dumps(
+            {**ours, "procStart": RESOLVER.proc_start(os.getpid())}).encode())
+        empty = with_a_lock("session-lock-empty", b"")
+        theirs = with_a_lock("session-lock-dir", None)
+
+        with capturing("err"):
+            with capturing("out") as previewed:
+                run_cleanup(dry=True)
+            previewed_still_there = dead.is_file()
+            with capturing("out") as swept:
+                run_cleanup(dry=False)
+            with capturing("out") as again:
+                run_cleanup(dry=False)
+        preview, acted, quiet = previewed.getvalue(), swept.getvalue(), again.getvalue()
+        # Read before the tree goes, or every one of these answers "not there"
+        # because the fixture was removed rather than because the sweep took it.
+        dead_gone, live_there = not dead.exists(), live.is_file()
+        empty_there, theirs_there = empty.is_file(), theirs.is_dir()
+    finally:
+        RESOLVER.teams_dir, RESOLVER.dead_sockets = real_teams_dir, real_sockets
+        shutil.rmtree(lock_sweep, ignore_errors=True)
+
+    cleared = {
+        "the preview names the team and the pid that left it":
+            "session-lock-dead" in preview and f"pid {os.getpid()}" in preview,
+        "the preview removes nothing": previewed_still_there,
+        "the sweep removes it": dead_gone,
+        "the sweep says which team it was": "session-lock-dead" in acted,
+        "a sweep with nothing to do stays silent": quiet == "",
+    }
+    kept = {
+        "a live owner's lock stays": live_there,
+        "a lock with no owner record stays": empty_there,
+        "a directory lock stays": theirs_there,
+        "none of them is named as removed":
+            not any(name in acted for name in ("session-lock-live", "session-lock-empty",
+                                               "session-lock-dir")),
+    }
+    check("cleanup-clears-a-lock-we-left",
+          "the sweep removes a roster lock whose recorded owner is gone, and says so",
+          all(cleared.values()), ", ".join(sorted(k for k, ok in cleared.items() if not ok)))
+    check("cleanup-keeps-a-lock-that-is-not-ours-to-clear",
+          "the sweep leaves every other lock exactly where it is",
+          all(kept.values()), ", ".join(sorted(k for k, ok in kept.items() if not ok)))
     return checked
 
 
