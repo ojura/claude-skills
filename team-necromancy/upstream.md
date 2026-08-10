@@ -275,13 +275,29 @@ how early it would show:
   v5 flag. The lock artifact path is unchanged, so contention is unaffected
   today, but it is the first place the roster itself moves.
 
-### 6. Keep the comparison reproducible
+### 6. Keep the comparison reproducible — done
 
-The two mistakes at the top of this file cost more than the comparison did.
-The token-level region comparison and the literal diffs should become a small
-script rather than being retyped each release, so the next comparison starts
-from a known-good method. Not part of `agent-resume` and not in its suite; a
-maintenance script, run by hand when a release lands.
+The two mistakes at the top of this file cost more than the comparison did, so
+the method is now a script rather than something retyped each release:
+`~/claude-patches/util/cc-release-diff.py`. It lives there, not in this repo,
+because it imports `bun_handler.py` from the same directory to fetch and unpack
+a build. Four subcommands, each avoiding one matching trap:
+
+- `fetch <version|stable|latest>` downloads and extracts, caching under `/tmp`
+- `literals <tengu|env|flags|prose> A.js B.js [keyword]` diffs a literal family
+  on the literals themselves, so renaming cannot move an entry; the broad
+  `prose` family needs a keyword to be anything but noise
+- `region <anchor> A.js B.js` reports the corresponding span around an anchor
+  (identifiers mapped one-to-one, property names and keys pinned) and prints
+  both divergence points instead of a boolean that renaming makes meaningless
+- `fs-ops <start> <end> A.js B.js` counts filesystem calls between two anchors;
+  it takes two anchors rather than a pad because a pad reached into a
+  neighbouring function and reported a difference that was not in the region
+
+Reproduces the 2.1.220→2.1.226 findings above: tengu literals 90 new / 33 gone,
+the lock region 6382 corresponding tokens with 143 renames diverging only into
+unrelated neighbours, the lock's fs-call census identical. Not part of
+`agent-resume` and not in its suite; run by hand when a release lands.
 
 ## Open questions for Juraj
 
