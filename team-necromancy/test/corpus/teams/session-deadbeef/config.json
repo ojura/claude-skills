@@ -1,0 +1,12 @@
+{
+  "name": "session-deadbeef",
+  "leadAgentId": "team-lead@session-deadbeef",
+  "leadSessionId": "deadbeef-dead-4bee-8bee-deadbeef0001",
+  "createdAt": 1,
+  "members": [
+    {
+      "name": "gamma",
+      "agentId": "gamma@session-deadbeef"
+    }
+  ]
+}

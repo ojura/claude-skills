@@ -20,15 +20,6 @@
 # tool. Twenty-one flags differ between the two; the rest declare help= only and
 # the menu falls back to it.
 
-# A bare TAB used to offer everything on the machine, which here is 315 rows.
-# zsh lists at most LISTMAX rows (100 by default) before it stops and asks "do
-# you wish to see all 315 possibilities", then waits for a key, and waiting for
-# a key with nothing on screen reads as a hang. A bare TAB now offers the newest
-# rows instead. Type one character and the whole corpus is back in play: from
-# there zsh is matching against what was typed, so the listing is small anyway.
-_RA_BARE_ROWS=48    # most rows a bare TAB takes from one list
-_RA_BARE_GROUP=16   # ... and from the selector's teams, and from its leads
-
 # Reading the corpus takes about 0.7s on the machine this was measured on, and
 # one TAB asks for it more than once: with three matcher-list specs (what
 # oh-my-zsh sets) zsh reruns the whole completion under each until one produces
@@ -76,7 +67,19 @@ _ra_cache_dir() {  # -> dir (caller's local), or nonzero when there is nowhere t
 }
 
 _ra_emit() {  # topic -> its candidate lines in `lines` (caller's local)
-  local topic=$1 stamp= dir= body
+  local topic=$1 stamp= dir= body cache_style=
+  local -i disk_cache=1 use_cache=1
+  if zstyle -s ":completion:*:*:${service}:*" use-cache cache_style; then
+    [[ ${(L)cache_style} == (false|no|off|0) ]] && use_cache=0
+  fi
+  if (( ! use_cache )); then
+    lines=( ${(f)"$($service --complete $topic 2>/dev/null)"} )
+    return
+  fi
+  # Context-bearing topics include a selected side/session after a colon. Keep
+  # those in this shell's exact-key table, but do not turn selectors containing
+  # slashes into cache paths or collapse distinct selectors into one file name.
+  [[ $topic == *:* ]] && disk_cache=0
   # Each topic stands or falls on its own stamp. No stamp (no zsh/stat, or
   # nothing to stat) leaves it empty, and then age is all that can retire an
   # entry: the file is neither read nor written, and the shell's own table
@@ -92,7 +95,7 @@ _ra_emit() {  # topic -> its candidate lines in `lines` (caller's local)
     _RA_CACHE_KEY[$topic]=$stamp
     _RA_CACHE_AT[$topic]=$SECONDS
   fi
-  if (( ! ${+_RA_CACHE[$topic]} )) && [[ -n $stamp ]] && _ra_cache_dir; then
+  if (( disk_cache && ! ${+_RA_CACHE[$topic]} )) && [[ -n $stamp ]] && _ra_cache_dir; then
     local -a fresh
     if [[ $topic == flags ]]; then
       fresh=($dir/${service}-$topic(N.))
@@ -111,7 +114,7 @@ _ra_emit() {  # topic -> its candidate lines in `lines` (caller's local)
     # Nothing is written for an empty answer: a topic with no candidates costs
     # little to ask again, and an emitter that failed would otherwise have its
     # silence served to every shell for the next _RA_CACHE_TTL seconds.
-    if [[ -n $dir && -n $_RA_CACHE[$topic] ]]; then
+    if (( disk_cache )) && [[ -n $dir && -n $_RA_CACHE[$topic] ]]; then
       print -r -- "$stamp"$'\n'"$_RA_CACHE[$topic]" >! $dir/${service}-$topic.$$ 2>/dev/null &&
         mv -f $dir/${service}-$topic.$$ $dir/${service}-$topic 2>/dev/null ||
         rm -f $dir/${service}-$topic.$$ 2>/dev/null
@@ -234,9 +237,8 @@ _agent_resume_topic() {  # single group, self-scoped widths
   local -i maxname=0 maxid=0
   _ra_emit $1
   (( $#lines )) || return 1
-  # Every topic the emitter has is newest first, so the head of the list is what
-  # a bare TAB wants. --resume alone offered 791 session transcripts before this.
-  [[ -z $PREFIX$SUFFIX ]] && lines=(${lines[1,_RA_BARE_ROWS]})
+  # Every topic the emitter has is newest first. A bare TAB offers that complete
+  # ordered answer; zsh's own listing mode decides how it is displayed.
   _ra_widths $lines
   _ra_render "$1" "$2" "" $lines
 }
@@ -279,25 +281,6 @@ _agent_resume_selector() {  # names/teams/leads in one call, widths shared
     _ra_emit sessions
     s=($lines)
   fi
-  # A bare TAB takes the newest instead of all of it (see _RA_BARE_ROWS). Whole
-  # session clusters, and the newest cluster entire however big it is: that is
-  # the team this shell is most likely sitting in, and half of it offered is
-  # worse than a shorter list that is whole.
-  if [[ -z $PREFIX$SUFFIX ]]; then
-    local -a kept members
-    local -i taken=0
-    n=()
-    for group in $groups; do
-      members=(${(f)${grouped[$group]%$'\n'}})
-      (( taken && taken + $#members > _RA_BARE_ROWS )) && break
-      kept+=($group)
-      n+=($members)
-      (( taken += $#members ))
-    done
-    groups=($kept)
-    t=(${t[1,_RA_BARE_GROUP]})
-    l=(${l[1,_RA_BARE_GROUP]})
-  fi
   _ra_widths $n $t $l $s
   # one colour per session cluster, cycled
   local -a cluster_colours=(36 33 35 32 34 31 96 93)
@@ -311,6 +294,54 @@ _agent_resume_selector() {  # names/teams/leads in one call, widths shared
   (( $#l )) && _ra_render leads "team lead" "" $l && ret=0
   (( $#s )) && _ra_render sessions "session transcript" "" $s && ret=0
   return ret
+}
+
+_ra_option_value() {  # option -> REPLY, last spelling before the cursor wins
+  local wanted=$1 token
+  local -i i
+  REPLY=
+  for (( i = 1; i <= $#words; i++ )); do
+    token=$words[i]
+    if [[ $token == $wanted ]]; then
+      (( i < $#words )) && REPLY=$words[i+1]
+    elif [[ $token == ${wanted}=* ]]; then
+      REPLY=${token#*=}
+    fi
+  done
+}
+
+_agent_resume_as_agent() {
+  local side name
+  local -a lines
+  local -i maxname=0 maxid=0
+  _ra_option_value --promote
+  side=$REPLY
+  [[ -n $side ]] || return 1
+  if [[ $PREFIX != *@* ]]; then
+    _ra_emit "as-agent-name:$side"
+    (( $#lines )) || return 1
+    name=$lines[1]
+    _wanted -V as-agent-name expl 'promoted agent name' \
+      compadd -S '' -- "${name}@"
+    return
+  fi
+  _ra_emit "as-agent:$side"
+  (( $#lines )) || return 1
+  _ra_widths $lines
+  _ra_render as-agent-teams 'team for promoted agent' '' $lines
+}
+
+_agent_resume_into_session() {
+  local subject
+  local -a lines
+  local -i maxname=0 maxid=0
+  _ra_option_value --demote
+  subject=$REPLY
+  [[ -n $subject ]] || return 1
+  _ra_emit "into-session:$subject"
+  (( $#lines )) || return 1
+  _ra_widths $lines
+  _ra_render into-session 'parent session for demote' '' $lines
 }
 
 _agent-resume() {
