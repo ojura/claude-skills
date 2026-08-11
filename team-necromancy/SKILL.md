@@ -96,7 +96,18 @@ Three flags name a destination, and they are the only ones that do: `--into-team
 is the team an agent comes up on, `--into-session` the parent a demoted
 transcript embeds under, `--as-agent` the identity a promoted transcript comes up
 as. `--team` is not one of them: it says which agents a run is about, so it is
-not spelled that way.
+not spelled that way. A promote takes its name from the side transcript and its
+team from the side transcript's current parent session. If the final record is a
+demote receipt whose exact undo would restore another team, it offers that undo
+as `y/N`; declining keeps the current parent's team. `--as-agent` overrides
+either half. Its completion inserts `name@` first, then lists teams with the
+current parent's team first.
+
+A demote takes its parent from the latest promotion receipt. With no such receipt,
+a teammate currently in a team is offered that team's lead session as `y/N`;
+there is no unattended yes. `--into-session` overrides the choice, and its
+completion lists the receipt parent first, then the current team's sessions,
+then the remaining sessions.
 
 `--into-team TEAM|live` exists because a plain `claude --resume` boots the lead
 into a **brand new implicit team**, orphaning the members registered under the
@@ -204,6 +215,15 @@ printed fpath line otherwise, clearing any stale compdump), and adds an async
 SessionStart hook running `agent-resume --cleanup`. All of it is idempotent,
 refuses to clobber foreign files, and updates an older hook of its own in place
 rather than adding a second.
+
+Completion caches each emitter briefly in the shell and on disk. To inspect or
+profile the uncached path without deleting those entries, set:
+
+```zsh
+zstyle ':completion:*:*:agent-resume:*' use-cache false
+```
+
+Unset that style, or set it to `true`, to use the cache again.
 
 **That hook deletes things**, so its conditions are worth knowing. It reaps
 `claude-swarm-*` socket files whose tmux server is gone (a connect() probe, no
