@@ -26,21 +26,30 @@ durable turn flushing is the requirement for a supported bg mode.
 
 `agent-resume` reports seating separately from team health. `--doctor` prints
 the team verdict followed by one dossier per member for a directly named team or
-agent. `run_doctor` computes one member order and passes it to the summary roster
-and dossier loop. A requested member comes first, then the genuine lead; a
-directly named team starts with the lead. `team_runtime` resolves each member's
-process answer, full title, identity color, and the shared lead and polling facts
-once. The summary uses the existing PID, identity, and title renderer. That
-renderer clips each roster title to the terminal space left on its row; the full
-title remains available to the dossier. ANSI is inserted around the identity
-after plain-text layout, so `--no-color` changes no spacing. Dossier headers carry
+agent. `Resolver.team_runtime` answers only roster-backed population and process
+runtime, retaining one runtime object per name. `Resolver.team_diagnosis` is the
+complete public doctor question. It builds one immutable member record per agent
+ID, ordered requested member first, genuine lead second, then stable roster order.
+Each record retains the canonical runtime, transcript `Resolution` and transcript
+fact, parent answer and fact, identity color, delivery evidence, and addressed
+ledger rows. It then derives the shared facts, team verdict, and remedies from
+those records inside Resolver. The summary, team conclusions, and dossier loop
+receive those exact member objects and completed conclusions. They do not call
+Resolver, read evidence again, or derive another verdict.
+
+The summary uses the existing PID, identity, and title renderer. That renderer
+clips each roster title to the terminal space left on its row; the full title
+remains available to the dossier. ANSI is inserted around the identity after
+plain-text layout, so `--no-color` changes no spacing. Dossier headers carry
 explicit requested, membership, and runtime labels. Session UUID and title use
 separate labeled rows, followed by parent and live seat. Lead identity, operative
 team, polling, common delivery failure, and common remedies print once in the
 team report. Recipient-specific ledger evidence and member-specific remedies stay
-in the matching dossier. Direct diagnosis uses the ordinary selector and
-immutable target, but does not infer a launch destination. The team verdict still
-measures whether a live lead reads the team, and remains the command's exit status.
+in the matching dossier. A named diagnosis resolves the deeper parent, delivery,
+and ledger evidence; the empty-hand sweep omits that work. Direct diagnosis uses
+the ordinary selector and immutable target, but does not infer a launch
+destination. The team verdict still measures whether a live lead reads the team,
+and remains the command's exit status.
 
 The unnamed Agent tool runs its query loop inside the leader and writes a
 sidechain transcript. Its work therefore resumes through an internal query
@@ -298,16 +307,24 @@ the source separately. An edit between those reads can make the executed code
 and the assertions describe different files. Accept a passing run only when the
 tree remained unchanged.
 
+Mutation scripts import `probe` and call `probe.expect(...)`. The function runs
+one clean suite and isolated mutants, then raises `ProbeFailure` if the clean run
+fails, a mutant crashes, no check bites, or the expected check does not bite.
+There is no probe command-line interface whose exit status can be separated from
+its report by redirection or a surrounding shell command.
+
 Every remedy named in a refusal needs an implementation and a test because the
 refusal promises that the remedy preserves the user's data.
 
-Reporters receive the immutable resume target and render it. The canonical
-transcript fact carries path, optional title, and activity time together; there
-is no separate title lookup. A full transcript snapshot is keyed by device,
-inode, size, and nanosecond modification time. It derives the restored window
-root and, when requested, compact mail evidence from one stable read;
-restored-identity and mail questions reuse that answer until any key field
-changes. Runtime reads produce
+Reporters receive completed immutable answers and render them. Resume reporters
+receive the immutable target. Doctor reporters receive the canonical member
+records from `team_diagnosis`; summary and dossier title rows therefore retain the
+same transcript fact by object identity. The canonical transcript fact carries
+path, optional title, and activity time together; there is no separate title
+lookup. A full transcript snapshot is keyed by device, inode, size, and
+nanosecond modification time. It derives the restored window root and, when
+requested, compact mail evidence from one stable read; restored-identity and mail
+questions reuse that answer until any key field changes. Runtime reads produce
 one immutable snapshot whose PID records are the exact objects referenced by its
 process, agent, transcript, pane, and session indexes. A question that receives
 a process table carries that snapshot through every helper instead of reading the
@@ -317,9 +334,11 @@ runtime APIs. Diagnosis does not declare `PLACEMENT`.
 
 Callers also declare the computations they need. `Resolver(needs=...)` receives
 hard requirements and a `maybe` set for computations reached on selected paths.
-Loaders accept declared computations, and the end-of-run audit requires
-every hard requirement to be used. Narrowing one question remains a parameter,
-such as `mail_ledger(to=...)`; a distinct question gets a distinct method, such
-as `spawn_parent_of`. Tests compare narrowed and complete answers where they
-should be identical. Measure each computation directly so its declaration
-matches its cost.
+Loaders accept declared computations, and the end-of-run audit requires every
+hard requirement to be used. Narrowing one question remains a parameter, such as
+`mail_ledger(to=...)`; a complete question used outside Resolver gets a public
+method, such as `team_diagnosis` or `demote_parent_objection`. Evidence helpers
+such as `_spawn_parent_of` remain private. `TranscriptRewriter` consumes the
+finished demotion objection instead of combining stamp and spawn evidence itself.
+Tests compare narrowed and complete answers where they should be identical.
+Measure each computation directly so its declaration matches its cost.

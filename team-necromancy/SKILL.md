@@ -72,10 +72,13 @@ agent-resume --doctor                         # summary of teams with something 
 
 `--doctor` uses the same selector resolution as resume. A direct team or agent
 prints the ordinary team report followed by every member exactly once. It resolves
-the addressed identity without inferring a launch destination. One ordered member
-list feeds both sections: a requested member comes first, then the genuine lead;
-a team selector starts with the lead; the rest follow stable roster order. The
-summary roster keeps its PID, colored identity, and one-line title columns. Each
+the addressed identity without inferring a launch destination. Resolver builds
+one canonical member record per agent ID; the summary, team conclusions, and
+dossiers reuse its exact runtime, transcript, parent, color, delivery, and ledger
+facts without resolving them again. One ordered member list feeds both sections:
+a requested member comes first, then the genuine lead; a team selector starts
+with the lead; the rest follow stable roster order. The summary roster keeps its
+PID, colored identity, and one-line title columns. Each
 dossier repeats the identity color and adds explicit requested, membership, and
 runtime labels. Its session UUID and title occupy separate rows. Lead identity,
 operative team, polling, common delivery failure, and common remedies print once
