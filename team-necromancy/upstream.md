@@ -136,9 +136,11 @@ a session name and a roster name collide in the same listing.
 carries `cwd`, `kind`, `entrypoint`, `name`, `nameSource`, `status`,
 `statusUpdatedAt`, `version`, `peerProtocol`, and in the 2.1.226 reader also
 `tmux`, `agent`, `logPath`, `jobId`, `parkedJobId`, `bridgeSessionId`,
-`waitingFor`, `state`, `detail`, `tempo`, `needs`. `session_registry()` parses
-the file, and `live_sessions()` consumes `pid`, `sessionId`, `procStart`,
-`updatedAt` and `startedAt`. Everything else is read by nobody.
+`waitingFor`, `state`, `detail`, `tempo`, `needs`. `Resolver._session_registry()`
+parses the files. `Resolver.runtime()` consumes `pid`, `sessionId`, `procStart`,
+`updatedAt` and `startedAt` into one immutable snapshot. Live registry
+observations are attached to the canonical PID records, and every process index
+references those exact record objects. Everything else is read by nobody.
 
 ## Work items
 

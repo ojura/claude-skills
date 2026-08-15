@@ -1,268 +1,206 @@
 # How teammates actually work
 
-Companion to SKILL.md. Everything here was verified against the shipped
-Claude Code 2.1.200 binary during one long night of spelunking (July 2026),
-mostly by extracting the relevant functions from the bundle and then testing
-the conclusions live. The leaked TypeScript tree is useful for orientation,
-but it lags the binary by months; every load-bearing claim below was checked
-in the binary. Where a claim rests on a specific build, assume it can drift.
+Companion to SKILL.md. The claims describe Claude Code 2.1.200 bundle functions
+and live behavior. The leaked TypeScript tree helps locate those functions but
+lags the binary by months. Build-specific behavior needs verification against
+the installed release.
 
-## The three substrates
+## Execution arrangements
 
-"Teammate" is not an execution model. It is a communication layer (roster +
-file mailboxes + idle protocol) that can be draped over three different ways
-of running an agent:
+A teammate combines a roster, file mailboxes, and an idle protocol with one of
+several execution arrangements:
 
-| | plain subagent | in-process teammate | tmux/iterm2 teammate | bg job (hand-rolled) |
+| | plain subagent | in-process teammate | tmux/iterm2 teammate | bg job (hand-built) |
 |---|---|---|---|---|
 | process | leader's | leader's | own, child of tmux server | own, child of daemon's pty host |
-| transcript | sidechain (`agent-<id>.jsonl`) | sidechain | **main session JSONL** | main session JSONL, **but turns never flush** |
-| survives leader exit | no | no | no (reaped) | yes (reaper skips it) |
+| transcript | sidechain (`agent-<id>.jsonl`) | sidechain | **main session JSONL** | main session JSONL; turns remain in process memory |
+| leader exit | exits | exits | reaped | survives |
 | talks via | tool result | mailbox + in-memory queue | mailbox | mailbox |
 | colors | n/a | n/a | 256-cube, downsampled by the app | native truecolor |
 
-`teammateMode` in 2.1.200 is an enum of `auto, tmux, iterm2, in-process`.
-The bg substrate is not in it; we assembled it by hand from shipped parts
-(`claude --bg` accepts the teammate identity flags and the mailbox does not
-care who reads it). It arguably beats the tmux backend on every axis except
-transcript flushing, and would make a fine fifth mode.
+`teammateMode` in 2.1.200 covers `auto`, `tmux`, `iterm2`, and `in-process`.
+A hand-built bg arrangement works because `claude --bg` accepts teammate
+identity flags and mailboxes use files. It provides supervision, truecolor, and
+survival across leader exit. Transcript turns remain in process memory, so
+durable turn flushing is the requirement for a supported bg mode.
 
-Because that is a deliberate way to run a member rather than a fault,
-`agent-resume` states a live member that is in no tmux pane and never demotes a
-verdict for it: the doctor adds a warning line naming the member and what
-changes operationally, and `--standing` prints its seat. A verdict answers only
-whether a live lead reads the team, so demoting one for an unseated member would
-report a working arrangement as broken.
+`agent-resume` reports seating separately from team health. `--doctor` prints
+the team verdict followed by one dossier per member for a directly named team or
+agent. A requested member comes first, then the genuine lead; a directly named
+team starts with the lead. Each dossier includes the member's live seat. The team
+verdict still measures whether a live lead reads the team, and remains the
+command's exit status.
 
-A subagent can never get a pane: the Agent tool without `name` runs a query
-loop inside the leader, and its sidechain transcript is not a session, so no
-CLI could adopt it. The SendMessage resurrection path converts a dead tmux
-teammate into an in-process one for the same reason in reverse: replaying a
-JSONL into an internal query loop is cheap, booting a CLI around a sidechain
-is not built.
+The unnamed Agent tool runs its query loop inside the leader and writes a
+sidechain transcript. Its work therefore resumes through an internal query
+loop. SendMessage uses this path to resume a dead tmux teammate in-process by
+replaying its JSONL.
 
-## Transcripts are stamped by teammates only
+## Teammate transcript stamps
 
-Every JSONL line records `sessionKind`, and teammate processes additionally
-stamp `agentName` and `teamName` on each line. Leader sessions stamp nothing.
-Consequences:
+Every JSONL line records `sessionKind`. Teammate processes also record
+`agentName` and `teamName`; leader records carry session identity alone. These
+fields control two behaviors:
 
-- The /resume picker takes its metadata from the **first line** of the file.
-  A session born as a bg fork wears the `bg` badge forever, even after being
-  resumed interactively (behavior follows the live process's env, not the
-  badge). `claude -c` skips any session whose first line carries a
-  non-interactive kind. Forking a session clears the stamps on the copied
-  lines, so the fork sheds the badge.
-- Reconnection (the boot-time module that answers "am I in a team, and as
-  whom?") has two triggers: identity flags on the CLI, or stamps in the
-  resumed transcript. Leaders have neither: the flag triple forces teammate
-  classification, and their transcripts are unstamped. That is the structural
-  reason a dead leader cannot be resumed *as* a leader, and why the masquerade
-  goes through the teammate branch. The flag trigger has a precondition worth
-  spelling: the triple binds only when teams are enabled in the booting
-  process's environment (`isAgentSwarmsEnabled` wraps the whole block,
-  verified in 2.1.220 and 2.1.226). Absent that, the flags are silently
-  ignored and the session resumes plain - which is why every launch this tool
-  makes, exec and pane alike, carries TEAM_ENV inline rather than trusting
-  the shell it happens to be in.
+- The /resume picker reads metadata from the **first line**. A session created
+  as a bg fork therefore keeps the `bg` badge across interactive resumes, while
+  the live process environment determines its behavior. `claude -c` selects
+  transcripts whose first line carries an interactive kind. Forking clears the
+  copied identity stamps and gives the fork its own picker classification.
+- Reconnection binds team identity from CLI identity flags or transcript
+  stamps. Plain leads launch with session arguments, and their transcripts
+  carry session identity alone, so recovery binds a dead lead through the
+  teammate path. `isAgentSwarmsEnabled` activates identity-flag binding in
+  2.1.220 and 2.1.226. Every exec and pane launch therefore carries `TEAM_ENV`
+  inline, independent of the invoking shell's environment.
 
-## The implicit team and its death warrant
+## Implicit-team cleanup
 
-A leader mints its team lazily, named `session-<its internal live session
-id>`. That internal id is not the transcript filename and changes across
-resumes, so the team name cannot be predicted before boot (learned the hard
-way; discover it post hoc from which team file a spawn just wrote, or skip the
-problem entirely with the masquerade, which sets the team name by flag).
+A leader names its lazily created team `session-<internal-live-session-id>`.
+The internal ID changes across resumes and differs from the transcript filename,
+so the team file written by a spawn provides the discoverable name. A
+masquerade can also set the name explicitly.
 
-Registration happens at session startup: the implicit-team initializer
-(`initializeSessionTeam`) ends with `registerTeamForSessionCleanup`, adding
-the team to an in-memory set. The whole branch is gated by `!agentId`, so any
-flag-bound launch (teammates, the masquerade) never registers. On graceful
-leader exit, `cleanupSessionTeams` walks the set in two passes: the reaper
-kills every member whose `backendType` is a pane type (in-process members
-carry `backendType`/`tmuxPaneId` of `"in-process"` and are skipped), then the
-undertaker removes member worktrees and `rm -rf`s the whole team directory.
-The log line calls them "orphan team dir(s)": to the harness, a team without
-its leader process is garbage by definition. (Verified in the 2.1.202 bundle;
-the original 2.1.200 analysis attributed registration to TeamCreate, which
-was close but one level off.)
+At startup, the implicit-team initializer (`initializeSessionTeam`) calls
+`registerTeamForSessionCleanup` and adds the team to an in-memory set. Plain
+lead launches take this initializer path. Identity-bound launches take the
+reconnection path and retain their team directory across exit. On graceful
+lead exit, `cleanupSessionTeams` walks the registered set in two passes. Its
+backend filter selects pane members for termination; in-process members carry
+`backendType` or `tmuxPaneId` of `"in-process"` and continue until their query
+loop ends. Cleanup then removes member worktrees and the team directory with
+`rm -rf`. The 2.1.202 bundle places registration in the implicit-team
+initializer, assigning cleanup ownership to plain lead startup.
 
-So teams die with their leader **on purpose**, but only on the graceful path.
-A crashed or SIGKILLed leader leaves everything standing. Bg-substrate members
-have no pane id, so the reaper skips them even on graceful exit. And a
-masqueraded lead never registered the cleanup, so its exit disbands nothing.
+Graceful exit runs this cleanup. A crash or SIGKILL bypasses it and leaves the
+team state intact. Bg processes use a daemon pty backend outside the pane-member
+filter and therefore keep running. A masqueraded lead uses the identity-bound
+path, so its exit also leaves the team directory intact.
 
 ## The mailbox and the roster
 
-All cross-process team state rides the filesystem, because there is no other
-channel between the leader and an out-of-process teammate:
+Cross-process teammates communicate through files:
 
 - `~/.claude/teams/<team>/config.json` is the roster. `SendMessage` resolves
   recipients from the in-memory teammates map and agent registry first, then
-  falls back to reading this file at send time; that fallback is why
-  hand-injected members are tool-addressable immediately. The reverse
-  direction does not exist: nothing imports the roster file into leader
-  memory, so file-only members never appear in mention completion, colors,
-  or the tasks pill. Spawn and shutdown paths also read-modify-write it.
-  Every spawn backend writes a roster entry through the same locked
-  reservation helper (`updateTeamFile`, lockfile at `config.json.lock`).
-  That helper is stock proper-lockfile from npm, loaded lazily rather than
-  forked, so its documented behaviour applies. Its lock is a *directory*: it mkdirs,
-  stats, utimes and rmdirs that path and never reads its bytes, so content in
-  a lock file there is invisible to it and a lock holding no content is very
-  likely its own. It waits about 0.65s (retries 10, 5ms to 100ms) before
-  giving up, calls an unrefreshed lock stale after 10s, and clears a stale one
-  with rmdir, which answers ENOTDIR on a regular file: a lock file this tool
-  leaves behind is ours to clear, not something the harness can recover from.
-  The two artifacts exclude each other in both directions, which is the point:
-  our exclusive create answers EEXIST against its directory, its mkdir answers
-  EEXIST against our file. What that costs when a run of ours is killed inside
-  its hold is measured rather than assumed. Four of the harness's roster
-  operations (`removeTeamMember`, `setMemberActive`, `setMemberMode`,
-  `removeMemberByAgentId`) catch the ENOTDIR and log it, so they silently do
-  nothing; `reserveTeammateIdentity` does not catch it, so spawning a teammate
-  into that team fails outright and keeps failing. Until `--cleanup` learned to
-  clear our own leftovers, the only thing that ever removed one was another run
-  of this tool wanting that same team's lock, which may never happen.
-  Two windows in that recovery are worth knowing. A run killed between creating
-  the file and writing its record leaves an empty file nothing can judge, and
-  nothing removes it automatically: the harness cannot, and this tool will not,
-  because removing an unreadable lock on sight would take the lock away from a
-  live run in the microseconds before it publishes its record. That window also
-  decides a sweep, because `--cleanup` removes a whole team directory and would
-  unlink the lock as one of its entries: a lock whose recorded owner is alive,
-  a lock carrying no record this tool can read, and the harness's own directory
-  each keep the directory standing, and only a lock whose recorded owner is
-  gone lets it go. Preparing the
-  record in a temporary file and taking the name with a hard link would close
-  that window without changing protocols, and is not built. And a remover
-  compares the record it read against the file's bytes immediately before
-  unlinking, because two runs can both find the same dead owner and the second
-  can have taken the lock by the time the first acts. Device and inode do not
-  work for that comparison: the freed inode number is reused by the replacement
-  written a moment later, measured here.
-  Everything in this bullet was read from 2.1.200 and re-measured on 2.1.226:
-  the locking module is identical across those builds apart from minified
-  renaming, so it describes that range rather than one build. `upstream.md`
-  records how that comparison was made and what the releases between them
-  did change.
-  In-process teammates go through the same helper, written twice (a bare
-  reservation, then a patch setting `tmuxPaneId` and `backendType` to
-  `"in-process"`). The exit
-  reaper skips them (its filter wants a pane-type backend), but the
-  undertaker's `rm -rf` of the team dir takes their registration with it, so
-  after a graceful leader exit an in-process teammate's name resolves
-  nowhere and only its transcript remains.
+  reads this file at send time. A hand-inserted roster member therefore becomes
+  addressable immediately. Mention completion, colors, and the tasks pill use
+  the leader's in-memory `teamContext`, which is updated by the leader's actions
+  and mail events. Spawn and shutdown paths read, modify, and write the roster.
+
+  Every spawn backend reserves its roster entry through `updateTeamFile`, with
+  a lock at `config.json.lock`. This helper is the stock npm `proper-lockfile`
+  package, so it treats the lock path as a directory and operates with `mkdir`,
+  `stat`, `utimes`, and `rmdir`. Path type and timestamps carry its state. It
+  retries for about 0.65 seconds (10 retries, from 5 ms to 100 ms), declares an
+  unrefreshed lock stale after 10 seconds, and clears stale locks with `rmdir`.
+
+  `agent-resume` uses an exclusive regular file at the same path. The two forms
+  exclude each other through `EEXIST`. A regular-file lock makes `rmdir` return
+  `ENOTDIR`, so `agent-resume --cleanup` owns removal of regular-file leftovers.
+  `removeTeamMember`, `setMemberActive`, `setMemberMode`, and
+  `removeMemberByAgentId` catch `ENOTDIR` and retain the current roster state.
+  `reserveTeammateIdentity` propagates it, so the leftover blocks later spawns.
+
+  Cleanup removes a regular-file lock when its record names a dead owner. A
+  live owner, an unreadable or empty record, and a `proper-lockfile` directory
+  each preserve the team directory. An empty record can result when a process
+  exits between exclusive creation and writing its ownership record; preserving
+  it avoids deleting a lock whose writer may still be alive. An atomic variant
+  can write the record to a temporary file and claim the lock name with a hard
+  link, removing that empty-record interval while keeping the protocol.
+
+  Removal compares the record bytes it read with the bytes present immediately
+  before unlinking. This catches another process taking the lock between those
+  two operations. Device and inode identity can repeat after replacement because
+  the filesystem reuses the freed inode immediately, so byte equality is the
+  useful ownership check. Claude Code 2.1.200 and 2.1.226 contain the same
+  locking module apart from minified names; `upstream.md` records the comparison.
+
+  In-process teammates use the reservation helper twice: first for a bare
+  reservation, then for a patch that sets `tmuxPaneId` and `backendType` to
+  `"in-process"`. The exit filter selects pane-type backends, so their query
+  loops can continue while team-directory cleanup removes their registration.
+  Their transcript remains available for later recovery.
 - `~/.claude/teams/<team>/inboxes/<name>.json` is a JSON array of messages
-  (`{id, from, text, timestamp, status}`). It must contain `[]` when empty;
-  a zero-byte file is a parse error that wedges both reader and writer.
-- Teammates resolve `team-lead` through their *own* recorded team name. If
-  that team is dead, the mail lands in a dir nobody reads, and there is no
-  escape hatch: `@main` is the background-agent channel to the parent session
-  and is documented as background subagents ONLY, so a pane-backed teammate
-  cannot use it. An agent grafted across team generations is mute until its
-  recorded team name matches a team the lead is actually running as.
+  (`{id, from, text, timestamp, status}`). An empty inbox contains `[]`; a
+  zero-byte file causes parse failures in both reader and writer.
+- Teammates resolve `team-lead` through their recorded team name. A stale team
+  name routes mail to the inactive team's inbox. `@main` serves background
+  subagents, while pane teammates use team mailboxes. Moving an agent across team
+  generations therefore requires restamping its recorded team name.
 
-The leader's in-memory picture (`teamContext` in AppState) is a different
-animal: an event-sourced projection updated only by the leader's own actions
-plus death announcements arriving in the mail. Nothing ever reconciles it
-against the roster file, and rendering reads only the memory. Hence every
-observed divergence: chips keep stale colors, Ctrl+C'd teammates stay
-"active", counters for tmux teammates tick until a formal goodbye, because
-turn-state and death only reach the leader if the teammate announces them.
-One sentence covers all of it: actions consult the file, pixels consult a
-snapshot.
+The leader renders its event-sourced `teamContext`, updated by its own actions
+and death announcements in mail. Roster-backed actions read `config.json`.
+This division explains stale chip colors, Ctrl+C'd teammates remaining active,
+and tmux counters continuing until a formal goodbye.
 
-Binding matters as much as the file: a leader whose `teamContext` is unset
-cannot resolve any name, no matter what the roster says. Real TeamCreate
-(first teammate spawn) or identity flags at boot are the only binders.
+Name resolution requires an initialized `teamContext`. The first teammate spawn
+or identity flags at boot initialize it.
 
-## Session id vs transcript id
+## Session ID and transcript filename
 
-The pid files in `~/.claude/sessions/` record the session id the process was
-**resumed from**, i.e. its transcript filename, NOT its current internal id
-(verified live on 2.1.220: a lead resumed from a52cb2af... shows sessionId
-a52cb2af... in the registry while running internally as 1d040460..., proven by
-the team it minted). Team names come from the internal id, so after a resume no
-file on disk maps team name to pid, and the join has to be temporal: the team
-dir is created a few hundred ms before the session file (measured 281, 252 and
-402ms). Before the first resume the two ids are the same, so a fresh lead's
-team name does match a registry sessionId and an exact join is available.
-When something team-related does not add up, check both ids before reasoning.
+The PID files in `~/.claude/sessions/` record the resumed transcript ID. Each
+process also has an internal session ID, and implicit team names use that
+internal ID. A fresh process starts with equal transcript and internal IDs, so
+its team name joins exactly to the registry. A resumed process receives a new
+internal ID while its registry record keeps the transcript ID. Resolver must
+therefore keep these identities separate.
 
-## Wanted from the harness: a record of the id a life minted
+An eagerly created team appears shortly before the session registry file; three
+measurements gave 281, 252, and 402 ms. This timing supports corroboration for a
+resumed lead, while exact joins come from explicit identity or durable records.
 
-One structural record would close the gap above: the internal session id a
-boot minted, written where a later reader can find it. Either shape works, a
-line in the boot's own transcript (which already carries identity stamps) or
-the internal id alongside the resumed-transcript id in
-`~/.claude/sessions/<pid>.json`. Nothing else records it, so today it exists
-only in the running process and in the name of the team directory.
+## Required harness record
 
-Without it, "which team is this live process running as" has two exact rungs
-and a guess. The exact ones are `--team-name` in argv, which only a
-flag-bound agent has, and a spawn payload written by this life, which needs
-the lead to have spawned someone since it resumed and needs a process start
-time to tell this life's payloads from an earlier life's. Everything else
-falls to pairing the team's `createdAt` against a live process's `startedAt`.
+Team-to-process resolution needs the internal session ID that each boot creates.
+A transcript identity line or an `internalSessionId` beside the transcript ID in
+`~/.claude/sessions/<pid>.json` would preserve it. The running process and its
+implicit team-directory name currently carry that value.
 
-That pairing is weaker than a tolerance suggests, because the mint is not one
-event. Minted eagerly at boot it lands a few hundred ms before the session
-file (measured 281, 252 and 402ms), but a team can instead be minted at the
-first spawn, minutes later, which no window centred on boot covers at all. So
-the join does not merely lose precision on the second shape, it does not
-apply, and a pairing that survives the window still has to be shown unique in
-both directions before it means anything: several processes can start inside
-one team's window, and one process can start inside several teams' windows.
+Resolver ranks available evidence as follows:
 
-Downstream this is why `agent-resume` will not rebind a member onto a team it
-inferred from timing without asking.
+1. `--team-name` in a flag-bound process identifies the team exactly.
+2. A spawn payload from the current process life identifies the lead exactly;
+   process start time distinguishes it from payloads written by earlier lives.
+3. A team's `leadSessionId` identifies a fresh lead exactly because the fresh
+   internal ID equals its transcript filename.
+4. A unique, bidirectional match between team `createdAt` and process
+   `startedAt` corroborates a resumed lead.
 
-This tool tried to keep the record for itself and failed, which is worth
-recording so nobody tries the same way twice. `SessionStart` is handed a
-`session_id`, and a hook wrote it down each boot. That payload carries the
-id of the transcript, not the id the team is named after: measured against
-the live processes on one machine, the resulting ledger claimed teams that
-had never existed for seven of eight resumed sessions, and it outranked the
-timing join, so it answered confidently and wrongly exactly where the guess
-was right. The ledger is deleted. Deriving the mint from the session id is
-the same mistake in another spelling, and is not there either: for a fresh
-boot the minted id is the transcript filename, but for a resumed life it is
-generated at that boot and appears nowhere on disk (4 of 23 team
-directories here name such an id).
+Timing needs bidirectional uniqueness because several processes can start in one
+team's interval and one process can fit several team intervals. It also covers
+only eager team creation: a team created at first spawn may appear minutes after
+boot. `agent-resume` therefore asks before applying a timing-based rebind.
 
-What is provable from disk bounds the guess.
-A team records its minting boot's session id as `leadSessionId`. For a fresh
-boot that id is also the transcript's filename, so the team is derivable and
-confirmable and needs no window at all. For a resumed life the id names no
-file, which is a signature only a resumed life leaves. So a resumed process
-could only have minted a team of that second shape (4 of 23 here), and every
-fresh-boot team is provably somebody else's however the timing falls.
+The `SessionStart` hook carries the transcript ID, which associates a process
+with its resumed transcript. Team inference needs the internal ID used in the
+implicit team name. In the measured corpus, one of eight resumed hook IDs mapped
+to an implicit team name, and four of 23 team directories used IDs unique to a
+process life.
 
-That leaves three grades rather than two: exact for a fresh boot, corroborated
-for a resumed life uniquely paired, both directions, with a resumed-shape team,
-and nothing at all when neither holds. Corroborated is offered rather than
-taken, and the offer defaults to yes. The residual is coverage, not ambiguity:
-a team minted at the first spawn falls outside any window centred on boot, so
-it never enters the pool to be chosen between. A harness-side record is what
-would close that, and it is still the ask:
-## Adopt, in one paragraph
+Resolver returns an exact result for durable identity, a corroborated result for
+a unique timing match, and an unknown result for the remaining cases. A
+corroborated result is offered with confirmation and defaults to yes. A durable
+internal-session record would turn late-created teams into exact results as
+well.
 
-Adopt is the orphaned-work recovery system: on exit or backgrounding, running
-shells are detached with their pid and start-time recorded, and an
-`adopt.json` checkpoint describes everything the session owned (shells,
-agents, workflows, cron). A later resume claims the checkpoint by atomic
-rename, re-attaches still-running shells after verifying the pid is really
-the same process, and restarts agents that have no completion record from
-their saved transcripts. `CLAUDE_DISABLE_ADOPT=1` turns all of it off.
-Teammates are not in adopt's inventory, which is the missing piece that would
-make team resume a real feature instead of this skill.
+## Adopt
 
-## The engine owns the environment
+Adopt recovers work after a process exits or moves to the background. It records
+running shells with PID and start time, and `adopt.json` checkpoints the
+session's shells, agents, workflows, and cron jobs. A later resume claims the
+checkpoint by atomic rename, verifies process identity before reattaching
+shells, and restarts agents whose transcripts show unfinished work.
+`CLAUDE_DISABLE_ADOPT=1` disables this behavior. Adding teammate identity and
+team state to the checkpoint would make team resume part of Adopt.
 
-The environment this tool reasons about is eight realms:
+## Resolver inputs
+
+Resolver reads nine kinds of state:
 
 - transcripts, both main sessions and the side transcripts under `subagents/`
+- schema-versioned conversion receipts carried inside converted transcripts
 - team configs, the rosters at `teams/<team>/config.json`
 - mailboxes, the message files at `teams/<team>/inboxes/<name>.json`
 - claude sessions
@@ -272,123 +210,97 @@ The environment this tool reasons about is eight realms:
 - the claude binary, both which one a launch uses and the pattern that decides
   whether a process on the table is a claude at all
 
-Only the engine may examine a realm and draw a conclusion from what it finds.
-Everything else asks the engine a question and consumes the answer.
+Resolver owns inspection and interpretation of this state. Other code receives
+structured answers from Resolver.
 
-Mailboxes are their own realm rather than part of a team's config, because they
-answer a different question and answer it worse: the file is pruned the moment a
-busy recipient takes a message into memory, so an empty mailbox is not evidence
-that nothing was sent. Reading one and concluding is exactly where this tool has
-already been wrong, which is why `mail_ledger` exists to answer from the
-transcripts instead.
+A mailbox records messages waiting on disk and is pruned when a busy recipient
+takes them into memory. `mail_ledger` therefore derives delivery state from
+transcript events, whose history remains available after mailbox uptake. Team
+config and mailbox data answer separate questions and carry separate evidence.
 
-The tool's own receipts are deliberately not a realm. A realm is something the
-world owns and this tool observes; a receipt is this tool's own writing. The
-engine does read receipts and conclude from them, both a team's membership and,
-for a promoted transcript, the identity to resume it under, so the exclusion is
-a decision rather than an oversight. Being this tool's own writing is also what
-fixes where a receipt ranks against the realms: it records what the tool did,
-while a roster entry, a stamp or a live process's argv each record what the
-world did afterwards, so the receipt enters the merge at timestamp 0 and loses
-to all of them.
+Conversion receipts are versioned, tool-written evidence carried by the
+converted transcript. Resolver reads them to recover team membership, copied
+parent-record ownership, and the intentional identity assigned by promotion.
+Ordinary later stamps and roster observations do not silently replace that
+assignment. An explicit complete identity or an intentional move can replace it.
 
-The rule is about reading and concluding, not about acting. A launch runs
-`tmux split-window`, a reap removes a directory, a stop signals a pid: none of
-those is an examination. What may not happen outside the engine is looking at a
-realm and deciding from it what is true, because then two places answer the same
-question and they drift apart. That drift is most of this file's bug list: a
-report that judged mail from the inbox file while the ledger judged it from the
-transcripts, a liveness gate that could not see its own caller, a redirect aimed
-by a timing coincidence while the stamps said otherwise.
+Resolution produces one immutable target containing the exact session, canonical
+transcript fact and path, resolved cwd, effective identity and role, provenance,
+selection reason, and identity objections. Identity-bearing launch flags, reports,
+roster and mailbox writes, liveness checks, and migration decisions read identity,
+role, conversation, and cwd from that target rather than accepting those facts a
+second time as parameters. Resolver keeps process, seat, roster, and conversion
+evidence beside it for decisions that need those distinct records.
 
-Enforcement is per realm, and every realm now has a check that fails by name.
-Transcripts and sessions are held by `transcript-pick-engine-only`,
-`tree-reached-via-engine` and their siblings: the tree's names cannot be loaded
-outside the engine, and the picking happens in one place. Team configs and
-mailboxes are held together by `team-dir-read-engine-only`, because both live in
-one directory; it follows the engine's own path answers through local variables
-and attribute chains, and fails on a filesystem read applied to one, with
-`roster-read-one-place` still keeping the parse in a single reader. Settings are
-held by `settings-read-engine-only`, which bars the file's name and the key's.
-Processes are held by `proc-read-engine-only`, which bars `/proc` paths and
-signal-0 kills, the two ways a second liveness test gets written. tmux is held
-by two checks rather than one, because a server nobody can find and a seat
-nobody confirmed are different bugs: `server-liveness-engine-only` bars an
-AF_UNIX probe and the subcommands that answer whether a server, a session or a
-client is there, and `pane-question-engine-only` bars the subcommands that
-answer which panes exist and the environment variables that say which pane we
-are in. The binary is held by `claude-pattern-engine-only`, which bars
-`CLAUDE_PROC` outside the engine; that realm never had a violation, so the check
-records a state rather than repairing one.
+Resolver supplies the facts used by actions. A launch can run
+`tmux split-window`, cleanup can remove a directory, and stop can signal a PID
+after Resolver identifies the target. One reader keeps delivery, liveness, and
+identity precedence consistent across all callers.
 
-Every check stops where acting begins, and the line is worth naming because that
-is what each of them is drawn around. `claude_binary` still chooses what a
-launch runs. `launch` still picks its tmux subcommand, from a pane list the
-engine handed it. A reap still stages a directory, re-proves it and unlinks it,
-asking the engine for the verdict both times. An archive still copies a roster's
-or a mailbox's bytes into a receipt before deleting them, and the installer
-still reads `settings.json`, adds its hook and writes it back. An actor that
-kills a process still checks it died, by asking the engine the same question
-every other liveness answer comes from.
+Each state class has a named structural check that requires its reads to occur
+in Resolver:
 
-Each check is narrower than the rule above it, and the gaps are worth stating. A
-team path handed to a helper as an argument and read there is not seen. A
-matcher written out by hand rather than reached for by name is not seen. What
-makes the narrow checks worth having is that every route this file actually has
-runs through the engine's own answers, so a second reader would have to be
-written oddly on purpose to avoid them.
+- `transcript-pick-engine-only`, `tree-reached-via-engine`, and their siblings
+  require transcript discovery and selection to use Resolver's transcript tree.
+- `team-dir-read-engine-only` follows team and mailbox paths through local
+  variables and attribute chains and requires filesystem reads on those paths to
+  occur in Resolver. `roster-read-one-place` keeps roster parsing in one reader.
+- `settings-read-engine-only` assigns settings inspection to Resolver.
+- `proc-read-engine-only` assigns `/proc` reads and signal-0 liveness probes to
+  Resolver.
+- `server-liveness-engine-only` assigns AF_UNIX probes and tmux server, session,
+  and client queries to Resolver. `pane-question-engine-only` assigns pane lists
+  and pane-identifying environment reads to Resolver. These are separate checks
+  because server availability and member seating answer different questions.
+- `claude-pattern-engine-only` assigns the `CLAUDE_PROC` process matcher to
+  Resolver.
 
-## Method
+The structural checks distinguish reads from actions. `claude_binary` chooses
+an executable. `launch` chooses a tmux command from Resolver's pane answer. A
+cleanup action stages a directory, asks Resolver to check it again, and unlinks
+it. An archive copies roster or mailbox bytes into a receipt before deletion.
+The installer edits `settings.json`. Process termination asks Resolver to
+confirm exit.
 
-Carried out of this file's construction rather than designed up front.
-Prove the inverse before acting: a conversion computes its own undo in
-memory and byte-compares against the source before any writer may touch
-disk. And its process-level analogue: design before field contact, field
-contact before consumers. A design that waits for specimens never ships;
-one that reaches consumers before specimens ships its collapse into their
-misdiagnoses. The middle is to ship with a field acceptance attached, so a
-wrong vocabulary collapses on the first live team while the correction is
-still cheap. It has paid twice: a mail ledger's two unmatched states became
-five on first contact, and a promote's roster write dissolved into the
-receipt being the membership. The second was not free. With the roster write
-gone, nothing told the resume path which team a promoted member was on, and
-the first agent promoted in the field could not be resumed at all until the
-receipt was made readable by the merge too. Deleting a record is not finished
-until every reader of it has been handed the replacement.
+The checks follow established helpers, path values, and named matchers. Current
+read paths use those forms; a new form requires a corresponding check update.
 
-A fourth, cheaper to state than to learn: a suite run is evidence only about
-a tree nobody is editing. Python reads a file to execute it and again to
-render a traceback, and this suite reads its own source for the structural
-checks, so an edit landing between those reads produces one run whose
-behavior and whose assertions disagree, and then vanishes. That is the
-quiescent-specimen rule from the conversion battery, one level up: do not
-write a file another writer owns, and do not trust a green from a tree in
-motion.
+## Implementation rules
 
-A third rule earned its place the hard way: a refusal that names an unbuilt
-remedy is making a claim about that remedy, and claims in refusal strings
-deserve the same verification as claims in code. One refusal presented a
-conversation-wiping graft as the durable fix for a whole day, because no
-check runs on unbuilt designs; a single angry question did what the suite
-could not.
+Verify the conversion round trip in memory before writing. Apply the
+conversion, apply its reverse, and compare the result byte-for-byte with the
+source. Writers act only after that comparison succeeds.
 
-A fifth, earned in one afternoon of readability work that kept striking
-engine rot: a reporter renders engine answers and gathers nothing, and a
-caller declares to the engine what it needs, so the engine resolves no more.
-Both directions bite. A renderer reaching for a path helper has found an
-engine gap, and the fix is a new engine answer (transcript_title), never a
-widened exemption on the fence that keeps pickers out of the tree. And an
-engine answer fatter than the declared need taxes every caller: the mail
-ledger joined a whole team to render one agent's line, one typed side
-classified nine hundred, the doctor swept a census only the sweep branch
-reads, and the standing verdict walked the spawn corpus for a field its
-caller discarded. The contract: a run declares its needs to the
-constructor (Resolver(needs=...), Maybe(NEED.X) for a genuinely
-conditional path), an undeclared compute refuses at the loader by name,
-and a hard need never exercised refuses when the verb completes, so a fat
-declaration dies as loudly as a missing one. Narrowing within a question
-stays a question parameter (mail_ledger's to=), parentage became its own
-question (spawn_parent_of) that only the verb printing it asks, and each
-narrowing was proven answer-identical and checked by name. The cost of a
-field is measured, never presumed cached: "approximately free" means
-"someone else usually pays" until somebody measures which.
+Define the expected runtime fields before reading live specimens, then test the
+reader against those specimens before callers depend on it. The mail ledger
+distinguishes five unmatched states because inbox, process, and transcript
+evidence describe different delivery stages. A promotion receipt records
+membership before the first launch, so identity resolution can recover it before
+the roster entry is written. Replacing a record includes updating every reader.
+
+Run the suite only while the source tree is unchanged. Python reads the file to
+execute it and may read it again for tracebacks, while structural checks parse
+the source separately. An edit between those reads can make the executed code
+and the assertions describe different files. Accept a passing run only when the
+tree remained unchanged.
+
+Every remedy named in a refusal needs an implementation and a test because the
+refusal promises that the remedy preserves the user's data.
+
+Reporters receive the immutable resume target and render it. The canonical
+transcript fact carries path, optional title, and activity time together; there
+is no separate title lookup. Runtime reads produce one immutable snapshot whose
+PID records are the exact objects referenced by its process, agent, transcript,
+pane, and session indexes. A question that receives a process table carries that
+snapshot through every helper instead of reading the default table partway
+through. Callers declare optional `REGISTRY` and `SEATS` evidence through `NEED`
+rather than selecting among alternate runtime APIs.
+
+Callers also declare the computations they need. `Resolver(needs=...)` receives
+hard requirements and a `maybe` set for computations reached on selected paths.
+Loaders accept declared computations, and the end-of-run audit requires
+every hard requirement to be used. Narrowing one question remains a parameter,
+such as `mail_ledger(to=...)`; a distinct question gets a distinct method, such
+as `spawn_parent_of`. Tests compare narrowed and complete answers where they
+should be identical. Measure each computation directly so its declaration
+matches its cost.

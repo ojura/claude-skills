@@ -1,66 +1,59 @@
 ---
 name: team-necromancy
-description: Resurrect dead Claude Code teammates and whole teams, transcripts intact. Covers reviving a teammate into a tmux pane (spawn-then-swap), reviving one as a supervised background job (claude --bg --resume), and resuming an entire dead team by resuming its leader session under the team-lead identity (the masquerade). Use when the user wants to bring back, revive, resurrect, or resume a teammate, agent, swarm, or team whose process has died, or to move a teammate between tmux / in-process / bg substrates.
+description: Resume dead Claude Code teammates and whole teams with their transcripts intact. Covers tmux panes, supervised background jobs with claude --bg --resume, and whole-team recovery by resuming the leader under the team-lead identity. Use when the user wants to resume a teammate, agent, swarm, or team whose process has died, or move a teammate between tmux, in-process, and bg execution modes.
 ---
 
 # Team necromancy
 
-The harness only offers one resurrection path: SendMessage to a dead teammate
-brings it back in-process, inside the leader, with no pane and no independent
-life. Everything else here is hand-rolled, verified end to end against
-Claude Code 2.1.200 (see architecture.md for how the machinery works and
-seams-and-bugs.md for what is broken around it).
+SendMessage resumes a dead teammate in-process inside the leader. This skill
+also covers pane recovery, supervised bg recovery, and whole-team recovery.
+The procedures describe Claude Code 2.1.200 behavior; `architecture.md`
+explains the machinery and `seams-and-bugs.md` records known defects.
 
-## agent-resume: Recipes 1b and 3, scripted
+## `agent-resume`
 
-`agent-resume` in this directory automates the
-common cases: finding the soul, merging identity from six sources (the
-roster, the agent's own transcript, the lead transcript's record of
-spawning it, and three conditional ones: the identity a live process wears
-when a live pid is what found the transcript, a dead-team lead's own spawn
-payloads, and the engine's lead-session lookup for a missing parent) with
-the most recent winning, except that spawn records always
-lose ties and a bracketed model variant beats a plainer newer one, resolving
-the swarm socket (the session registry feeds that, not identity), forging the
-team dir if a graceful lead exit deleted it (see Forging below), and
-relaunching into a pane with the identity flags, team env vars, and seeded
-inboxes.
+`agent-resume` automates pane and whole-team recovery. Resolver combines
+identity from the roster, the agent transcript, and the lead transcript's spawn
+records. Depending on the selector, it can also use a live process identity,
+a promotion receipt, the dead lead's spawn records, and the lead-session lookup
+for a missing parent. Dated observations use newest-first precedence, while an
+explicit complete identity or promotion receipt intentionally assigns identity
+until another explicit move replaces it. Spawn records rank below dated evidence;
+a model name carrying a bracketed variant ranks above a newer plain name. The
+session registry identifies the tmux server.
+The tool rebuilds a missing team directory and launches the resumed transcript
+with identity flags, team environment variables, and initialized inboxes.
 
-Finding the soul is one engine with a stated evidence ladder, not a pile of
-fallbacks. Strongest first: a session uuid you typed; a live process wearing
-that agent id, whose `--resume` value is what it is working on right now; the
-roster's `leadSessionId`; both stamps (`agentName` AND `teamName` on the
-transcript's own lines); `agentName` alone, refused when the name lives in more
-than one roster, which on any box with several teams is exactly what
-`team-lead` does; and, for a lead only, the transcript whose spawn payloads name
-this team.
+Resolver selects transcripts in this order:
 
-The last rung is there because a lead writes no stamps, and `leadSessionId`
-sometimes names nothing resumable. A team minted on a fresh boot is named after
-its lead's transcript and records it, so that lead resolves at the roster rung. A
-lead already resumed when it minted the team carries the *internal* session id of
-that later life instead, and that id has no file.
+1. an explicit session UUID
+2. a live process whose agent ID matches, using its `--resume` value
+3. the roster's `leadSessionId`
+4. a promotion receipt assigning the requested member identity
+5. matching `agentName` and `teamName` transcript stamps
+6. an `agentName` stamp that identifies one roster member
+7. for a lead, a transcript whose spawn records name the team
 
-Neither shape is the default to reason from, and counting a machine will not
-tell you which is: its rosters were written by the harness, by `agent-resume`,
-and by the hand-forging recipes below, so a census of them measures what has been
-done to that machine as much as what the harness does. What a lead leaves behind
-either way is a spawn payload per teammate, each naming the team it was running
-as. Several transcripts can claim
-one team, so that rung corroborates before it answers, against a live process
-running as the team, a roster naming the transcript, the payload names matching
-the roster's members, or the team-name block; a sole uncorroborated claimant is
-still taken, and says so, because the ordinary dead-team case is exactly that.
+A bare name shared by several rosters remains ambiguous. This commonly affects
+`team-lead` because every team uses that name.
 
-A live process outranks the roster and the stamps because argv is frozen at exec
-and a migration is kill-and-restart: a roster entry or a stamp records what was
-true when it was written, while argv records what is true. Whatever rung fires, the conclusion is
-then checked against the identity about to be claimed, and a mismatch stops
-the run: launching `--agent-id X` on Y's conversation is the worst thing this
-tool could do. The chosen rung is printed as `via` on every run. It noops when the same agent already runs in its recorded pane,
-splits a new pane when something else squats there, rebuilds a dead
-socket/session, and treats a ctrl-z'd process as alive (nudges you to
-`kill -CONT` instead of double-spawning).
+Lead resolution needs spawn records because lead transcript lines carry session
+identity alone. A fresh lead's implicit team records the transcript ID in
+`leadSessionId`. A resumed lead creates its implicit team from a new internal
+session ID, represented by the live process and team-directory name. Its spawn
+records also name the team.
+Resolver corroborates competing lead claims with a live process, a roster entry,
+member names shared by roster and spawn records, or the team-name block. A sole
+claim remains usable for ordinary dead-team recovery and is reported as
+uncorroborated.
+
+Live process arguments outrank roster entries and transcript stamps because argv
+describes the current process identity, while files describe identity at their
+write time. Resolver checks the selected transcript against the identity about
+to be claimed and stops on disagreement. Every run prints the selected evidence
+as `via`. An already-correct pane returns as running; an occupied pane gets a new
+pane; a dead tmux server is recreated. A stopped process counts as alive and the
+tool recommends `kill -CONT`, preventing a second writer on one transcript.
 
 ```bash
 agent-resume teammate                        # bare name, newest generation
@@ -72,217 +65,231 @@ agent-resume NAME --into-team live           # rebind onto the team the lead now
 agent-resume <lead-uuid> --into-team TEAM    # move the lead itself; its crew stays put
 agent-resume NAME --stop                     # stop it, listing what it is working on first
 agent-resume session-xxxx --stop             # stop the whole team
+agent-resume --doctor session-xxxx            # team verdict, then lead-first member dossiers
+agent-resume --doctor NAME@session-xxxx       # team verdict, requested member first, then lead
+agent-resume --doctor                         # summary of teams with something live or waiting
 ```
+
+`--doctor` uses the same selector resolution as resume. A direct team or agent
+prints the ordinary team report followed by every member exactly once. A requested
+member comes first, then the genuine lead; a team selector starts with the lead.
+The remaining dossiers follow stable roster order and include members that are
+stopped or have no transcript. The team verdict remains the command's exit status.
+The empty-hand sweep stays at team-summary level.
 
 The selector may sit anywhere among the flags. The forwarded flags are an
 allowlist that records which of them take a value, so a bare token is either
-that value or the selector and position carries no meaning; `--model x NAME`,
+that value or the selector, independent of position; `--model x NAME`,
 `NAME --model x` and `--stop NAME` are the same command. Two bare tokens are an
 error naming both, since one would otherwise reach the resumed session as a
 prompt nobody typed. Put anything genuinely meant for claude after `--`.
 
-A team whose directory a graceful lead exit removed is still a team: it is
-recognised from the payloads or the stamps, and rebuilt from its lead's
-transcript with the members, colours and models those payloads recorded. A
-rebuild driven by an uncorroborated claimant leaves `leadSessionId` empty rather
-than recording a guess in a field later read as fact, so the evidence is
-re-derived, and re-warned about, on every resume until it genuinely improves.
+Team identity survives deletion of its directory in transcript stamps and lead
+spawn records. The tool reconstructs the roster with the recorded members,
+colors, and models. `leadSessionId` receives only corroborated evidence because
+later resolution treats that field as exact. An uncorroborated lead remains
+reachable through the lower-priority evidence and produces the same warning on
+each run.
 
-A bare name is resolved only when it is unambiguous; if several rosters carry
-it (every team has a `team-lead`) the tool lists the candidates and refuses
-rather than picking one for you.
+A bare name selects one transcript. When several distinct transcripts match,
+the tool lists them and asks for a qualified selector. If several promotion
+receipts assign one `name@team` to different conversations, it prints one full
+UUID-and-title row per conversation and requires `--resume`. If the same UUID
+exists in several project directories, it prints those rows and refuses rather
+than choosing by file modification time.
 
-Three flags name a destination, and they are the only ones that do: `--into-team`
-is the team an agent comes up on, `--into-session` the parent a demoted
-transcript embeds under, `--as-agent` the identity a promoted transcript comes up
-as. `--team` is not one of them: it says which agents a run is about, so it is
-not spelled that way. A promote takes its name from the side transcript and its
-team from the side transcript's current parent session. If the final record is a
-demote receipt whose exact undo would restore another team, it offers that undo
-as `y/N`; declining keeps the current parent's team. `--as-agent` overrides
-either half. Its completion inserts `name@` first, then lists teams with the
-current parent's team first.
+Three flags name destinations:
 
-A demote takes its parent from the latest promotion receipt. With no such receipt,
-a teammate currently in a team is offered that team's lead session as `y/N`;
-there is no unattended yes. `--into-session` overrides the choice, and its
-completion lists the receipt parent first, then the current team's sessions,
-then the remaining sessions.
+- `--into-team` selects the team used at launch.
+- `--into-session` selects the parent embedded by demotion.
+- `--as-agent` selects the identity used by promotion.
 
-`--into-team TEAM|live` exists because a plain `claude --resume` boots the lead
-into a **brand new implicit team**, orphaning the members registered under the
-old one: the lead's SendMessage resolves against the team it is now running as,
-so the old roster is unreachable. The rebind relaunches the member with the
-destination team's identity, replaces whichever process still holds its
-transcript (killing any holder it cannot reach in a pane), registers it in the
-destination roster and retires the source entry. `live` finds the destination from the lead's own transcript: every teammate it
-spawned records the team name it was running as, so the newest such record
-**written since this process started** names the team it runs as now. The life
-filter matters: a resumed lead keeps appending to one transcript, so an older
-life's record would name a team it has already left. Where this life has
-spawned nobody, the fallback is a time join of team `createdAt` against live
-sessions' `startedAt`, which only covers teams minted at boot.
+`--team` selects the set of agents operated on. Promotion derives the name from
+the side transcript and the team from its current parent session. A final demote
+receipt from another team represents an exact undo, so promotion offers it as
+`y/N`; declining uses the current parent's team. `--as-agent` overrides either
+part. Completion inserts `name@`, then lists teams with the current parent's team
+first.
 
-It composes with `--team`, which is the one-command answer to "I resumed my
-lead and my team is orphaned":
+Promotion also makes known `origin.kind: human` persistence records visible.
+The default keeps Claude Code's complete wrapper text. `--unwrap` instead stores
+only the inner human text in the promoted record. Both variants record the edit
+in the transcript's schema-version-1 conversion receipt, so demotion restores
+the original side transcript bytes. `visible_human_wrapper_edits` stores UUID
+intervals; unwrapped intervals reference the original wrapper payloads needed for
+the inverse, while complete-wrapper intervals copy no payload text. When
+promotion consumes a carried demote receipt and `--unwrap` is omitted, it
+preserves that receipt's previous mode; an exact inverse replays only the
+recorded intervals. `side_meta_b64` and `side_meta_mode` store the original
+`.meta.json` bytes and file mode when promotion removes that sidecar, so demotion
+restores them exactly. Missing receipt fields and unsupported schema versions are
+refused rather than inferred. Unknown wrappers and coordinator, peer,
+task-notification, hook, image, and tool-result records remain unchanged. The
+generated `last-prompt` uses the latest human message's inner text in either
+variant.
+
+A member promotion stamps its own root with the assigned name and team so plain
+Claude Code resume restores member identity. The receipt records the root's prior
+field presence and values for exact demotion. Lead promotion does not apply the
+member-root edit. A fork-reference promotion keeps its copied parent prefix as
+model context, but those UUIDs contribute neither transcript identity nor spawn,
+lead, or roster-recovery actions.
+
+Demotion derives its parent from the latest promotion receipt. When parent
+inference reaches current-team evidence, the tool offers that team's lead
+session as `y/N`, with decline as the default. `--into-session` overrides this
+choice. Completion
+lists the receipt parent first, current-team sessions next, and remaining
+sessions last.
+
+`--into-team TEAM|live` moves an agent to the team used by a live lead. A plain
+`claude --resume` gives the lead a new implicit team, while existing members
+remain registered under the previous team. Rebinding relaunches the member with
+the destination identity, stops any process still holding the transcript,
+registers the destination roster entry, and retires the source entry.
+
+`live` derives the destination from spawn records written during the current
+process life. A resumed lead appends several lives to one transcript, so process
+start time excludes records for earlier teams. Before the current life writes
+its first spawn, Resolver can corroborate an eagerly created team by matching
+team `createdAt` with live-session `startedAt`.
+
+It composes with `--team`:
 
 ```bash
-agent-resume session-<old-team> --into-team live   # whole roster, redirected
+agent-resume session-<previous-team> --into-team live   # redirect the whole roster
 ```
 
-Two operations hide behind the word rebind, and the tool separates them:
+Rebinding has two operations:
 
-- **redirect** picks the identity flags for a launch that is happening anyway
-  and writes the roster entries. It kills nothing.
-- **migrate** changes a *live* member's team, which is necessarily kill and
-  restart: identity is frozen in argv at exec, and two processes must never
-  append to one transcript. That is what `--into-team`'s kills are, the mechanism
-  rather than a policy.
+- **redirect** selects identity flags for a pending launch and updates roster
+  entries.
+- **migrate** stops and restarts a live member under the destination identity.
+  Identity is fixed in argv at exec, and stopping the holder first preserves one
+  writer per transcript.
 
-A lead moves the same way, and `--into-team TEAM` is the only way to ask for it:
-the run ends whoever is running that conversation (asking first, `--yes` to
-skip), retires the team its window-start stamps name so the flags win after the
-next restart, and execs it as TEAM's lead. Under `--force` against a team
-something is still running as, it restamps those two fields instead and the old
-team stays up. The lead moves alone: no member is restarted or re-stamped, so
-the report names who stays behind, what mail waits for them there, and that
-`--into-team live` on each member is what moves one.
+`--into-team TEAM` migrates a lead. The command asks before stopping the process
+holding that conversation; `--yes` accepts in advance. It retires the team named
+by window-start stamps and execs the transcript as the destination lead. With
+`--force`, it restamps a team that still has a live process and leaves that team
+running. Member processes keep their existing identities, so the report lists
+them, their waiting mail, and the per-member `--into-team live` command.
 
-The team inside an agent id is an address, never a destination. Writing
-`agent-resume team-lead@TEAM --resume <uuid>` says which agent to come back as;
-it never moves one. Where the stamps on that conversation name a different team,
-the run refuses and names `--into-team TEAM` as the flag that performs the move
-(`--force` launches it as it stands, split between the two teams). Where the
-conversation carries no stamps, it is the plain masquerade it always was: a
-launch, with no crew report and nothing retired.
+The team component in an agent ID addresses an identity. `--into-team` selects a
+destination. When transcript stamps name another team, the command points to
+`--into-team TEAM`; `--force` permits a split identity. An unstamped conversation
+uses the plain lead launch; team retirement applies to stamped source teams.
 
-So the default may redirect, and only `--into-team` may migrate. Reviving a dead
-member while its lead is live under a different team redirects automatically,
-saying so, and `--keep-team` opts out. A member that is still running is left
-alone with a hint, because restarting it costs its in-flight turn. Redirect
-also demands exact evidence (the registry hop, or a spawn payload from this
-life); the mint-window join is a heuristic and never triggers it.
+Dead members redirect automatically when exact registry or current-life spawn
+evidence identifies a live lead under another team. `--keep-team` preserves the
+recorded team. Live members keep their in-flight turn and receive a migration
+hint. Automatic redirect requires exact registry or current-life spawn
+evidence; timing corroboration remains advisory.
 
-Without a redirect, reviving into an old roster still works and still lands on
-the right socket, but the member is **mailbox-orphaned**: the live lead's
-SendMessage resolves against the team it runs as now, so mail to that member
-goes to an inbox directory nobody reads. There is no fallback channel: `@main`
-is background-subagent only, so a pane-backed member has no way out. That is a
-real workflow, not only an accident: Recipe 3 rebuilds members under the old or
-forged team first and masquerades the lead into it afterwards, which is what
-`--keep-team` is for.
+`--keep-team` also supports whole-team recovery in stages: members first resume
+under the recorded or reconstructed team, then the lead resumes into that team.
+During the member-first stage, SendMessage calls use the lead's current team and
+route there. `@main` serves background subagents; pane teammates
+use the team mailbox.
 
-This automation implements the tmux substrate only, and warns if your
-`teammateMode` says otherwise; for a bg resurrection use Recipe 2 by hand.
+The automation launches tmux panes and warns when `teammateMode` selects another
+execution mode. Recipe 2 covers explicit bg recovery.
 
-Leads are never spawned into a pane. Selecting one builds the Recipe 3
-masquerade command and execs it in your terminal (or prints it, under
-`--team`, `--dry-run`, or a non-tty), because a masqueraded lead is an
-interactive session you drive, and a pane-backed one would be reaped by the
-next lead's exit. `--into-team` moves it onto a team it did not lead; naming that
-team inside the agent id instead only addresses it, and where the conversation's
-stamps disagree the run refuses and points at the flag (see the rebind section
-below). Members come up first: the mailbox is a directory, not a
-process, so nobody has to wait for the lead.
+Lead recovery executes in the current terminal because the resumed lead is the
+interactive session the user drives. Under `--team`, `--dry-run`, or a non-tty,
+the tool prints the command. A pane-backed lead would be selected by the next
+lead's exit cleanup. `--into-team` migrates it; the team component of an agent ID
+only addresses it. Members launch first because mailbox directories accept
+messages before the lead process starts.
 
-`--dry-run` previews every verb, including `--stop`, `--install` and
-`--poison`: nothing is launched, written or ended, and a preview asks no
-question it would act on.
-`--explain` says where each launch fact came from, and `--selftest` checks the
-tool's own invariants while changing nothing, which is what lets it run from a
-hook.
-`--selftest --live` adds the checks that need a real process, a terminal or a
-directory change; each undoes itself. Flags for the resumed session are an
-allowlist rather than a passthrough, so a misspelling of one of ours is caught
-instead of reaching claude as an unknown argument. After a
-launch it attaches you to the swarm unless a Claude Code tool is driving, there
-is no tty, you are already inside tmux, or somebody is watching it already;
-`--attach` and `--no-attach` force either way. Run from inside the target pane,
-it execs the agent there instead of splitting a new one.
+`--dry-run` is read-only and previews every verb, including `--stop`, `--install`,
+and `--poison`. `--explain` reports the source of each launch fact. `--selftest`
+runs read-only invariant checks suitable for a hook, while `--selftest --live`
+adds checks that create temporary processes, terminals, and directories and
+then remove them. Resumed-session flags use an allowlist, so misspellings are
+reported by `agent-resume`.
 
-It also tints the pane the way the harness tints its own (three pane options
-plus the bold titled border, with the roster colour mapped to tmux's names), so
-a revived member is not the one grey pane in a coloured swarm; only a real
-spawn gets a tint otherwise. `--no-color` skips the tint and drops the colours
-from completion output. `--force` overrides not only the liveness guards but the identity
-ones: with it the tool will resume a transcript stamped for a different agent
-or team, saying so loudly each time. It is the one flag that can produce the
-outcome the tool exists to prevent.
-`agent-resume --install` sets everything up on a new box: symlinks the script
-into `~/.local/bin` and the `_agent-resume` zsh completion onto fpath
-(oh-my-zsh `custom/completions` when present, `~/.zsh/completions` plus a
-printed fpath line otherwise, clearing any stale compdump), and adds an async
-SessionStart hook running `agent-resume --cleanup`. All of it is idempotent,
-refuses to clobber foreign files, and updates an older hook of its own in place
-rather than adding a second.
+After launch, the tool attaches from an available user terminal outside tmux
+when it becomes the watching client. `--attach` and `--no-attach` select
+the behavior explicitly. From inside the target pane, it replaces that pane's
+process instead of splitting another one.
 
-Completion caches each emitter briefly in the shell and on disk. To inspect or
-profile the uncached path without deleting those entries, set:
+Pane launches apply the harness tint: three pane options, a bold titled border,
+and roster-color mapping to tmux color names. `--no-color` disables pane and
+completion colors. `--force` permits liveness and identity conflicts, including
+resuming a transcript under a different agent or team, and reports each
+conflict.
+
+`agent-resume --install` links the script into `~/.local/bin`, installs
+`_agent-resume` on zsh's fpath, clears a stale completion dump, and adds an async
+SessionStart hook running `agent-resume --cleanup`. It uses the oh-my-zsh custom
+completion directory when present; otherwise it uses `~/.zsh/completions` and
+prints the required fpath line. Repeated installation updates its own files and
+preserves unrelated files.
+
+Completion caches each emitter briefly in memory and on disk. This zstyle runs
+the uncached path while leaving cache files intact:
 
 ```zsh
 zstyle ':completion:*:*:agent-resume:*' use-cache false
 ```
 
-Unset that style, or set it to `true`, to use the cache again.
+Unset the style or set it to `true` to enable caching.
 
-**That hook deletes things**, so its conditions are worth knowing. It reaps
-`claude-swarm-*` socket files whose tmux server is gone (a connect() probe, no
-tmux spawns, skipping sockets younger than 60s so a server mid-bind survives),
-and team directories that hold nothing resurrectable. A team is only removed
-when every one of these holds:
+### Cleanup hook
 
-- nothing live is running as it, by any of the four rungs (registry, argv,
-  spawn payload, mint window)
-- neither its lead nor any member resolves to a transcript, asked through the
-  same resolver that would resurrect them, so a false positive errs toward
-  keeping
-- the directory contains only this tool's own scaffolding: a parseable roster,
-  and inboxes that are `.json` arrays holding no undelivered mail
-- nothing holds its roster lock: a lock whose recorded owner is running, one
-  carrying no readable owner record, and the harness's own lock directory each
-  keep the team
-- it is older than 300s, covering the gap between a team being minted and its
-  session becoming visible
+The cleanup hook removes dead `claude-swarm-*` sockets and empty team
+directories. Socket cleanup uses a `connect()` probe and gives new sockets 60
+seconds to finish binding. Team-directory removal requires every condition
+below:
 
-The check is re-proved immediately before deletion, refuses anything that
-appeared since, removes `config.json` last so an interrupted sweep is retried
-rather than orphaned, and never touches a path outside `teams/` and `tasks/`.
+- process evidence classifies the team as stopped
+- Resolver's transcript search returns an empty result for the lead and every
+  member
+- the directory contains a parseable roster and JSON inbox arrays whose messages
+  are all delivered
+- its roster lock permits removal; a live owner, an unreadable owner record, or a
+  `proper-lockfile` directory preserves the team
+- the directory is older than 300 seconds, covering the interval between team
+  creation and session discovery
 
-In a team it keeps, the hook also removes `config.json.lock` when that file
-carries this tool's own owner record and the process it names is gone. The
-harness cannot clear one of these: its lock artifact is a directory and it
-clears a stale lock with `rmdir`, which answers ENOTDIR on our regular file, so
-four of its roster operations silently do nothing and spawning a teammate into
-that team fails until the file goes. A lock with no owner record is never
-touched, whatever its age, and neither is a directory or a lock whose owner is
-still running. `agent-resume --cleanup --dry-run` lists every decision with its reason.
-Completion candidates (names, teams, sockets, sessions with their titles)
-come from the script's hidden `--complete <topic>` emitter, so the candidate
-lists cannot drift from reality. The flag list in `_agent-resume` is
-hand-maintained and has drifted before; add new flags there too. For Recipe 1's
-placeholder ritual, `agent-resume --poison` / `--unpoison` set and clear the
-server-level ANTHROPIC_BASE_URL poison (newest live swarm socket by default,
-`--socket` to aim). A launch agent-resume performs drops
-ANTHROPIC_BASE_URL only when it holds that poison, so an interrupted run cannot
-starve a real resurrection while a base url you set on purpose still reaches the
-agent. A stripped poison is announced; anything else is passed through, since
-the swarm's own agents are running with it. Use the manual
-recipes below when the automation's assumptions break (forged teams, bg
-substrate, argv surgery) or when you need to understand what just went wrong.
-Known limits, shared with the recipes: a masqueraded lead cannot spawn
-teammates, and revived members are invisible to a running lead's in-memory
-roster (@-mentions and UI surfaces never see them; SendMessage sees them only
-from a lead whose teamContext is bound, see Recipe 1b's caveat). Close with
-the memory ping as always.
+Cleanup repeats these checks immediately before deletion and preserves entries
+that appeared between the checks. It removes `config.json` last so an interrupted
+run remains eligible for the next cleanup. Deletion is confined to `teams/` and
+`tasks/`.
 
-The one fact everything rests on: **a teammate's identity is its transcript.**
-A tmux or bg teammate is a full `claude` CLI process, so its conversation is a
-normal main-session JSONL in the project dir of its cwd. Teams, rosters, panes,
-swarm tmux servers and job dirs are all scaffolding that the harness rebuilds
-on demand. If you have the JSONL, you can bring the agent back on any
-substrate, with its memory intact.
+For a retained team, the hook removes a regular-file `config.json.lock` when its
+owner record belongs to this tool and names a stopped process. Claude Code uses
+a lock directory and clears it with `rmdir`; that operation returns `ENOTDIR` on
+the regular file. Its roster updates then retain their previous state, and
+teammate spawn remains blocked. Unreadable lock records, lock directories, and
+live owners preserve the lock. `agent-resume --cleanup --dry-run` lists every
+decision and reason.
 
-## Finding the soul
+Completion candidates and flag specifications come from the script's hidden
+`--complete <topic>` emitters. `_agent-resume` formats those answers for zsh, so
+parser flags and completion flags share one definition.
+
+For Recipe 1, `agent-resume --poison` and `--unpoison` set and clear a
+server-level `ANTHROPIC_BASE_URL` value on the selected tmux server. A launch
+removes that value only when it matches the tool's poison, preserving a base URL
+set by the user. Manual recipes cover custom team configs, bg execution, and
+argv replacement.
+
+A lead launched under teammate identity follows the teammate code path and can
+message existing members. A running lead's mention completion and UI use its
+in-memory roster; hand-registered members remain addressable through
+SendMessage once `teamContext` is initialized. Recipe 1b describes this limit.
+Finish recovery with the memory check under “Verify the resurrection.”
+
+Recovery depends on the teammate transcript. A tmux or bg teammate is a full
+`claude` process, and its conversation is a main-session JSONL under the project
+directory for its cwd. Team configs, panes, tmux servers, and job directories
+are runtime state that can be reconstructed around that transcript. The JSONL
+allows the agent to resume in any supported execution mode with its memory
+intact.
+
+## Find the transcript
 
 Teammate transcripts live in `~/.claude/projects/<flattened-cwd>/` (teammates
 usually run in `/tmp` or the leader's cwd). Every line carries the identity:
@@ -294,63 +301,50 @@ for f in ~/.claude/projects/-tmp/*.jsonl; do
 done
 ```
 
-One name can have several generations (each respawn under the same name minted
-a new session file). Pick the generation whose life you want back; check
-content, not just mtime. A resurrection resumes that file and keeps appending
-to it, so the lineage stays in one place.
+One name can have several generations because each respawn creates a session
+file. Choose by transcript content as well as mtime. Resume appends to the chosen
+file and keeps that conversation in one lineage.
 
-Do not trust the harness's backend labels when hunting for the soul.
-`TaskStop` reports `task_type: "in_process_teammate"` (and rosters say
-`backendType: "in-process"`) for teammates that are in fact full `claude`
-CLI processes; the labels are unreliable. The transcript's location is the
-only reliable discriminator: a main-session JSONL in
-`~/.claude/projects/<flattened-cwd>/` means a full CLI process (resumable by
-every recipe here), while a truly in-process agent's transcript lives under
-the leader session's `subagents/` dir (`agent-*.jsonl`) and has no
-independent life to resume. Also mind the cwd: an agent whose cwd was the
-leader's scratchpad flattens to a project dir named after that scratchpad
-path, not `/tmp`. Search all of `~/.claude/projects/` for the
-`"agentName"` stamp before concluding a transcript does not exist
-(verified 2026-07-19: a TaskStop-killed "in_process_teammate" left a normal
-205-line main transcript under
-`projects/-tmp-claude-1000--tmp-<session>-scratchpad/`).
+Transcript location distinguishes full CLI teammates from in-process agents.
+A main-session JSONL in `~/.claude/projects/<flattened-cwd>/` belongs to a full
+CLI process and works with every recipe here. An `agent-*.jsonl` under the lead
+session's `subagents/` directory belongs to an in-process query loop. Backend
+labels can disagree with this distinction: `TaskStop` may report
+`task_type: "in_process_teammate"`, and a roster may report
+`backendType: "in-process"`, for a full CLI process.
 
-## Choosing the team
+The flattened project path follows the process cwd. An agent launched from the
+lead's scratchpad therefore appears under that scratchpad's flattened path. A
+measured 205-line main transcript carrying the `in_process_teammate` task label
+lived under `projects/-tmp-claude-1000--tmp-<session>-scratchpad/`. Search all of
+`~/.claude/projects/` for the `agentName` stamp.
 
-Every `<team>` is a directory name under `~/.claude/teams/`. Every recipe
-needs one. Two cases:
+## Choose the team
 
-- **A leader is alive and you are it (or driving it):** use its current team.
-  Find it as the team file its last spawn wrote, or the newest
-  `~/.claude/teams/session-*` dir. Do not try to predict it: the implicit team is
-  named after the leader's internal live session id. On a first boot that is also
-  its transcript id, which is why most teams do match their lead's transcript, but
-  a resume mints a new internal id and the two part company from then on.
-- **No live leader (full team resurrection):** invent a name and forge the
-  team file yourself; Recipe 3's identity flags bind the resumed leader to
-  whatever name you chose.
+Every `<team>` is a directory name under `~/.claude/teams/`.
 
-## Forging a team file
+- With a live lead, use its current team. Its latest spawn record or team config
+  provides the name. Implicit team names use the lead's internal live session
+  ID. A fresh lead shares that ID with its transcript; a resumed lead receives a
+  new internal ID.
+- For whole-team recovery with a stopped lead, choose a team name and create its
+  config. Recipe 3 binds the resumed lead to that name through identity flags.
 
-`agent-resume` forges automatically when it finds a transcript whose team dir is
-gone. Resuming a member forges the lead entry plus that member. Resuming a team
-or its lead rebuilds the whole roster from the lead's transcript, every teammate
-its payloads name, so forging by hand is now only for a custom team name in a
-masquerade. Colour and the model's `[1m]` suffix are not lost: they live only in
-the roster, but the lead's transcript keeps the harness's spawn payload and the
-forge recovers them from there. Nothing recovers them if the lead's transcript
-is gone too.
+## Rebuild a team config
 
-`leadSessionId` is written only when the lead was identified by evidence the
-engine will later honour at that field's strength. Rung 1 reads it as exact and
-asks nothing further, so a rebuild resting on a sole uncorroborated claimant
-leaves it empty instead: the lead is still reachable, through the corroboration
-ladder, and the run says every time that nothing corroborates it. A roster with
-no `leadSessionId` also cannot corroborate a claim about the lead, or a roster
-derived from a lead's payloads would vouch for those same payloads.
+`agent-resume` rebuilds a missing team directory automatically. Member recovery
+creates the lead and selected member entries. Team or lead recovery reconstructs
+the full roster from lead spawn records. Manual construction is useful for a
+custom team name.
 
-The complete shape, learned by copying real ones. Every field shown is
-consumed somewhere; do not trim:
+Colors and bracketed model variants live in the roster and in the lead's spawn
+records, so reconstruction preserves them when the lead transcript is
+available. `leadSessionId` receives only evidence that Resolver treats as exact.
+An uncorroborated lead remains reachable through spawn-record evidence and is
+reported as such on each run. This prevents a roster reconstructed from a claim
+from corroborating that same claim.
+
+The complete team config follows. Every field is consumed:
 
 ```bash
 mkdir -p ~/.claude/teams/<team>/inboxes
@@ -378,30 +372,26 @@ echo '[]' > ~/.claude/teams/<team>/inboxes/NAME.json
 Inbox files must contain `[]`. A zero-byte file is invalid JSON and wedges
 the mailbox code on both ends.
 
-This template is a manual recipe for hand-building a team, not a spec of what
-`agent-resume` forges: the tool writes the member as `backendType: "tmux"` with
-its real pane and cwd, since it is about to put a live process in one.
+This manual template uses `backendType: "in-process"`. `agent-resume` writes
+`backendType: "tmux"` with the actual pane and cwd because it launches a pane
+process immediately.
 
-## Recipe 1: resurrect into a tmux pane (spawn-then-swap)
+## Recipe 1: resume into a tmux pane with spawn-then-swap
 
-Best when you want the teammate visible in the swarm view and fully registered
-with the leader. The trick: let the harness do all its registration around a
-placeholder, then swap the process inside the pane. Every piece of harness
-state points at the pane id, which survives the swap.
+Use this recipe when the teammate should appear in the lead's in-memory team
+view. A placeholder Agent spawn creates the roster entry, pane, tint, mailbox,
+and runtime registration. Replacing the process inside that pane preserves the
+pane ID referenced by those records.
 
-The placeholder must never reach the API. Its one turn buys nothing: all the
-registration happens at spawn time, the swap needs only the pane id and the
-argv, and nothing ever reads its answer. What the turn does cost is a cache
-write of the shared prefix, and on a fresh org it is a billed request that
-starts that org's 5-hour window clock. Kill the call at the network, not the
-process: the Agent tool offers no per-spawn env, but new panes inherit the
-tmux server environment, and the harness's spawn command only re-exports the
-vars it embeds (CLAUDECODE etc.), so a server-level poison reaches the
-placeholder's claude untouched.
+Block the placeholder's API request because registration completes at spawn
+time and the replacement needs only its pane ID and argv. An API turn would
+write the shared prompt prefix to cache and can start the organization's billing
+window. New panes inherit tmux server environment, while the spawn command
+re-exports only its embedded variables. A server-level `ANTHROPIC_BASE_URL`
+therefore blocks the placeholder before the request reaches the API.
 
-0. Poison the swarm server, so the placeholder's API attempts die at TCP
-   connect ($0 billed, no window anchored; it just sits in the pane wearing
-   an API error, which is exactly what a corpse-to-be should do):
+0. Set the server poison so the placeholder gets a TCP connection error before
+   billing:
 
 ```bash
 agent-resume --poison            # newest live swarm socket; or --socket claude-swarm-<pid>
@@ -410,18 +400,15 @@ SOCK=$(ls -t /tmp/tmux-1000/claude-swarm-* | head -1)
 tmux -S $SOCK set-environment -g ANTHROPIC_BASE_URL http://127.0.0.1:9
 ```
 
-   If no swarm socket exists yet, the first spawn is what creates it: on a
-   virgin server, either spawn one sacrificial placeholder first or accept
-   one paid stub turn.
+   The first teammate spawn creates the swarm socket. On a new server, that
+   initial spawn incurs one stub turn before the socket can carry the poison.
 
-1. Spawn a placeholder teammate under the dead teammate's name, via the Agent
-   tool with `name:` set, and pass `model: haiku` (belt and braces for the
-   case where the poison misses). The harness creates the team if needed,
-   writes the roster entry, creates the pane, applies the tint, wires the
-   mailbox. Do not wait for the placeholder to answer anything; it can't.
-2. Unpoison immediately, before the swap, so the respawned process and every
-   future real spawn get a working API back (the live placeholder keeps its
-   poisoned env regardless; env is fixed at exec):
+1. Spawn a placeholder teammate under the dead teammate's name with `name:` set
+   and `model: haiku`. Haiku limits the fallback cost if the network block misses.
+   Continue as soon as the team, roster entry, pane, tint, and mailbox exist.
+2. Clear the poison before replacement so the resumed process and later spawns
+   receive the normal API configuration. The placeholder keeps its launch-time
+   environment until replacement:
 
 ```bash
 agent-resume --unpoison          # or: tmux -S $SOCK set-environment -gu ANTHROPIC_BASE_URL
@@ -437,44 +424,41 @@ PID=$(tmux -S $SOCK list-panes -a -F '#{pane_id} #{pane_pid}' | awk -v p="$PANE"
 ARGS=$(ps -o args --no-headers -p $PID)
 ```
 
-4. Replace the process in the same pane, resuming the old transcript, with an
+4. Replace the process in the same pane and resume the selected transcript, with an
    explicit scrub in case the pane still carries the poison:
 
 ```bash
 tmux -S $SOCK respawn-pane -k -c /tmp -t "$PANE" \
-  "env -u ANTHROPIC_BASE_URL CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 CLAUDE_CODE_ENTRYPOINT=cli $ARGS --resume <old-session-id>"
+  "env -u ANTHROPIC_BASE_URL CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 CLAUDE_CODE_ENTRYPOINT=cli $ARGS --resume <session-id>"
 ```
 
-The poison steps (0, 2, the `env -u`) are derived from verified parts (seam 6
-in seams-and-bugs.md: spawn commands embed their own env; tmux server env
-reaches panes otherwise) but the poisoned flow as a whole is not yet
-battle-tested; the failure mode is the old behavior, one cheap haiku turn.
+Validation covers the environment propagation used by steps 0, 2, and
+`env -u`: spawn commands embed selected variables and panes inherit the server
+environment. Haiku limits a missed poison to one inexpensive turn.
 
-`-c` must match the transcript's project dir, or resume will not find the
-session. You can edit the argv on the way through: `--agent-color`, `--model`,
-`--effort`, `--permission-mode` all take effect for the new incarnation.
+`-c` selects the project directory containing the transcript. The replacement
+argv can also change `--agent-color`, `--model`, `--effort`, and
+`--permission-mode`.
 
 Costs and caveats:
-- The placeholder still leaves a tiny orphan session file; with the poison in
-  place it holds one failed turn and zero billed tokens.
-- The kill is rude, so the placeholder never announces its death; the leader
-  never notices the swap (that blindness is structural, see architecture.md).
-- The leader's in-memory color/roster beliefs keep whatever the placeholder
-  had. Disk edits will not update a running leader's UI.
+- The placeholder leaves a small session file containing one failed turn and
+  zero billed tokens when the poison works.
+- Abrupt process replacement leaves the placeholder's runtime entry in the lead
+  because death announcements run during graceful exit.
+- The lead's in-memory color and roster state keep the placeholder values.
+  Roster edits affect actions; the current UI follows memory.
 
-## Recipe 1b: pane resurrection with no placeholder at all
+## Recipe 1b: resume into a tmux pane by roster registration
 
-When the leader's in-memory registration does not matter (post-masquerade
-rebuilds, teams driven purely through the roster file), skip the spawn ritual:
-nothing is born, nothing is billed, no swap race. Hand-build what the harness
-would have built: a pane running the resumed claude, plus a roster entry
-pointing at it.
+Use this recipe when roster-backed messaging is enough. Create a pane running
+the resumed process and add a roster entry that names its pane. It avoids the
+placeholder request and process replacement.
 
 ```bash
 SOCK=$(ls -t /tmp/tmux-1000/claude-swarm-* | head -1)
 PANE=$(tmux -S $SOCK split-window -d -P -F '#{pane_id}' -c /tmp \
   "env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 CLAUDE_CODE_ENTRYPOINT=cli \
-   claude --resume <old-session-id> --agent-id NAME@<team> --agent-name NAME \
+   claude --resume <session-id> --agent-id NAME@<team> --agent-name NAME \
    --team-name <team> --agent-color blue --agent-type claude \
    --dangerously-skip-permissions")
 python3 - "$PANE" <<'PY'
@@ -490,33 +474,21 @@ PY
 echo '[]' > ~/.claude/teams/<team>/inboxes/NAME.json
 ```
 
-Trade-offs vs Recipe 1: zero birth cost; transcripts still flush (it is a
-pane life, not a bg life); with `backendType: tmux` and a real pane id the
-graceful-exit reaper covers it like a real spawn. What you lose is everything
-that lives in the leader's runtime memory, because only real teammate
-creation writes it and nothing ever imports config.json back into it
-(verified in the 2.1.202 bundle): no `teamContext.teammates` entry, no
-registered task. Concretely: absent from the tasks pill and swarm view, no
-color, and the @-mention DM machinery cannot see it, since the completion
-list is built from `teamContext.teammates` plus the agent registry, memory
-only. The one channel that can work is the SendMessage tool itself: its
-resolver checks the in-memory map, then the agent registry, then falls back
-to reading the roster file at send time. But the fallback only fires in a
-leader whose teamContext is bound at all (see architecture.md): a leader that
-has spawned at least one real teammate in its current life. A restarted
-leader that has not spawned since resolves nothing, roster or no roster
-(verified live on 2.1.220: "No agent named 'X' is reachable", and the full
-agent-id form is rejected by the tool schema). Bind first: spawn one real
-teammate via the Agent tool (a poisoned placeholder per Recipe 1 makes that
-free), after which hand-registered members resolve by bare name. Without
-binding, drive the member's pane by keystrokes (see Driving below) and read
-its replies from the team's inbox files directly. @name from the prompt
-never reaches 1b members either way. No tint is
-applied either; for visual parity with spawned teammates, apply it the way
-the harness does (the tint is worth keeping, see bug 2 in seams-and-bugs.md):
+This pane process flushes transcript turns and participates in graceful
+pane-member cleanup through `backendType: "tmux"` and its pane ID. The lead's
+runtime memory contains Agent-tool spawns, while this recipe writes only the
+roster. The tasks pill, swarm view, colors, and `@name` completion therefore
+show spawned members.
+
+SendMessage resolves through the in-memory map, agent registry, and finally the
+roster file. The roster lookup requires an initialized `teamContext`, which a
+real teammate spawn creates for the current lead life. After that initialization,
+hand-registered members resolve by bare name. Before it, drive the pane with
+keystrokes and read replies from inbox files. Apply the tint explicitly for the
+same visual identity as an Agent-tool spawn:
 
 ```bash
-C=blue  # tmux color, not roster color: purple->magenta, orange->colour208,
+C=blue  # tmux color; map roster purple->magenta, orange->colour208,
         # pink->colour205; red/blue/green/yellow/cyan pass through (2.1.202 map)
 tmux -S $SOCK set-option -p -t "$PANE" window-style "bg=default,fg=$C"
 tmux -S $SOCK set-option -p -t "$PANE" pane-border-style "fg=$C"
@@ -525,37 +497,28 @@ tmux -S $SOCK select-pane -t "$PANE" -T NAME
 tmux -S $SOCK set-option -p -t "$PANE" pane-border-format "#[fg=$C,bold] #{pane_title} #[default]"
 ```
 
-That replicates the harness exactly: its tint is three set-options plus the
-bold colored border title, not just window-style.
+The harness tint consists of these three pane styles and the bold colored title.
 
-Status: assembled from individually
-verified parts (hand-registration from Recipe 2, identity-flag resume from
-Recipes 2/3, inline-env pane spawn per seam 6, resolver precedence read from
-the bundle); the combination is not yet battle-tested. Close with the memory
-ping as always.
+Validation covers roster registration, identity-flag resume, inline pane
+environment, and Resolver precedence. Finish with the memory check below.
 
-## Recipe 2: resurrect as a background job (one command)
+## Recipe 2: resume as a background job
 
-Substrate choice is not yours to make: check `teammateMode` in
-`~/.claude/settings.json` first: if it says `tmux`, resurrect into a tmux
-pane (Recipe 1 or 1b), and use this recipe only when the user explicitly
-asks for a background job. Beyond honoring the setting, the bg caveat below
-(no transcript flush) means a bg resurrection is amnesiac, and the wrong
-default for an agent whose memory you just went to the trouble of
-recovering. What bg does offer when asked for: no tmux, native truecolor,
-daemon supervision, `claude agents` / `attach` / `logs` / `stop` management,
-and it survives the leader's exit (the exit reaper only kills pane-backed
-members).
+Check `teammateMode` in `~/.claude/settings.json` first. A `tmux` setting selects
+Recipe 1 or 1b. Use bg when the user explicitly requests it. Bg provides native
+truecolor, daemon supervision, `claude agents`, `attach`, `logs`, `stop`, and
+survival across lead exit. Transcript turns remain in process memory, so bg is
+appropriate for stateless work or work that writes its result elsewhere.
 
 ```bash
-cd /tmp && claude --bg --resume <old-session-id> \
+cd /tmp && claude --bg --resume <session-id> \
   --agent-id NAME@<team> --agent-name NAME --team-name <team> \
   --agent-color blue --agent-type claude \
   --dangerously-skip-permissions --effort low --model <model>
 ```
 
-The child does its half of the wiring (it watches the right inbox), but the
-harness does not know a bg job can be a teammate, so you register it yourself:
+The bg process watches the selected team inbox. Add its roster entry manually so
+team tools can address it:
 
 ```bash
 python3 - <<'PY'
@@ -577,22 +540,18 @@ mailbox code on both ends:
 echo '[]' > ~/.claude/teams/<team>/inboxes/NAME.json
 ```
 
-The big caveat: **bg incarnations do not flush their turns back to the
-transcript.** A teammate that lives three lives as a bg job and is then
-resurrected will remember none of them; only pane and interactive lives leave
-memories. If the work of a bg life matters, have the agent write results
-somewhere durable before it dies, or treat bg lives as stateless workers.
+**Bg turns remain in process memory.** Pane and interactive processes append
+their turns to the transcript. A bg worker should write important results to a
+durable file before exit.
 
-## Recipe 3: resume a whole dead team (the leader masquerade)
+## Recipe 3: resume a whole team through the lead identity
 
-Leaders cannot be resumed as leaders directly. Their transcripts carry no team
-identity (only teammate processes stamp `agentName`/`teamName` onto lines), the
-CLI rejects `--team-name` without `--agent-id` (the three flags are
-all-or-nothing), and a graceful leader exit deletes the team dir and kills the
-pane-backed members anyway. The way in is the teammate branch, wearing the
-lead's own id:
+Lead transcript lines carry session identity, while teammate lines also carry
+`agentName` and `teamName`. The CLI binds team identity from the complete
+`--agent-id`, `--agent-name`, and `--team-name` triple. Resume the lead through
+that teammate-identity path using `team-lead@<team>`:
 
-1. Make sure the team file exists. Forge it if the original was deleted:
+1. Create the team config and leader inbox when cleanup has removed them:
 
 ```bash
 mkdir -p ~/.claude/teams/<team>/inboxes
@@ -608,57 +567,45 @@ env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 CLAUDE_CODE_ENTRYPOINT=c
   --agent-id team-lead@<team> --agent-name team-lead --team-name <team>
 ```
 
-The env prefix is not decoration. The binary binds the identity flags only
-when teams are enabled in its environment; without that, the flags are
-silently ignored - no error, the session resumes plain, wearing no identity
-and reading no roster (verified in the shipped 2.1.220 and 2.1.226 bundles:
-the whole triple sits inside `isAgentSwarmsEnabled`). A shell that exports
-`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` survives without the prefix, but a
-tmux pane's shell never saw your exports (seam 6), so spell it.
+`isAgentSwarmsEnabled` activates identity-flag binding in 2.1.220 and 2.1.226.
+The environment prefix makes that activation explicit for interactive and tmux
+launches. A tmux pane started with an explicit command runs that command
+directly, so the prefix supplies its team environment.
 
-This boots as a "teammate" whose id equals `leadAgentId`, so it reads the
-right roster, watches the leader's inbox, and can SendMessage every member
-immediately. No spawn ritual, no waiting for an implicit team.
+The resumed process takes the `leadAgentId` identity, reads the selected roster,
+watches the lead inbox, and can SendMessage each member immediately.
 
-3. Bring the members back with Recipe 1/1b (or Recipe 2 if explicitly
-   requested, honoring `teammateMode` as above), pointing their `--team-name`
-   at this team.
+3. Resume members with Recipe 1 or 1b. Use Recipe 2 for an explicitly requested
+   bg process. Point every member's `--team-name` at this team.
 
-Limits of the masquerade, both verified:
-- It runs on the teammate code path, so it cannot spawn new teammates
-  ("teammates cannot spawn teammates"). Hire externally via the recipes above.
-- It never registers the team for exit cleanup (only the real TeamCreate path
-  does), so when the impostor exits, the team dir and the members survive.
-  A bug upstream; a feature here.
+The teammate code path rejects nested teammate spawns, so additional members
+must be launched externally. Identity-bound launches use the reconnection path;
+plain-lead startup owns exit-cleanup registration. The team directory and member
+processes therefore remain after this lead exits.
 
-Do not bother with these dead ends, they are tested: `--agent-id ""` fails the
-same falsy check as omitting it. Pre-forging a team named after the leader's
-transcript id is a coin toss: the implicit team is named after the internal live
-session id, which equals the transcript id on a first boot and diverges from it
-after any resume, and which cannot be predicted before boot either way.
+`--agent-id` requires a nonempty value. Implicit team names use the process's
+internal live session ID, which equals the transcript ID on a fresh boot and
+changes on resume. Read or set the team name explicitly.
 
 ## Driving and observing resurrected agents
 
-- To a live teammate, talk normally, but know the two channels differ: the
-  SendMessage tool resolves recipients from leader memory first, then falls
-  back to the roster file at send time; both require the leader's teamContext
-  to be bound (Recipe 1b's caveat), and reach members by bare name only. The
-  `@name` prompt path and every UI surface (mention completion, colors, tasks
-  pill) run on the in-memory roster that only real spawns populate; those work
-  for spawned members only.
-- Driving an interactive pane by keystrokes: send the text and the Enter as
-  two separate `send-keys` calls, with a beat between them. A single call with
-  a trailing Enter pastes a newline into the input instead of submitting.
-- Reading panes: `capture-pane -p` renders the prompt's dim ghost suggestion
-  as if someone typed it. Before believing any input line, re-capture with
-  `-e` and check for the dim SGR code (`\x1b[2m`) in front of it.
-- Do not trust the roster or the leader's task list for liveness. The leader
-  only learns about deaths that announce themselves; a Ctrl+C'd teammate stays
-  "active" forever. Ground truth is the pane, the process, and the job state.
+- SendMessage resolves a bare name through lead memory, the agent registry, and
+  the roster file. These paths require an initialized `teamContext`. The `@name`
+  prompt path, mention completion, colors, and tasks pill use the in-memory
+  roster populated by Agent-tool spawns.
+- To drive an interactive pane by keystrokes, send the text and Enter as two
+  `send-keys` calls with a short delay. One call with trailing Enter pastes a
+  newline into the input.
+- `capture-pane -p` renders the prompt's dim autosuggestion as input text.
+  Re-capture with `-e` and check for the dim SGR code (`\x1b[2m`) before
+  attributing that text to a user.
+- The roster and lead task list reflect announced lifecycle events. Pane,
+  process, and job state provide current liveness for abrupt exits such as
+  Ctrl+C.
 
 ## Verify the resurrection
 
-Always close with a memory ping: SendMessage the teammate a question only the
-resumed transcript can answer, and check the reply arrives through the
-mailbox. That one round trip proves the transcript loaded, the identity flags
-took, the roster resolves, and both inbox directions work.
+Finish with a memory check: SendMessage a question about a specific fact in the
+resumed history and confirm the reply arrives through the mailbox. This round
+trip verifies transcript loading, identity binding, roster resolution, and both
+inbox directions.
