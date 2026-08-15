@@ -81,6 +81,10 @@ the launch facts {TOOL} reconstructs."""
 # Remote hydration replaces the local file with server entries, so a session
 # resumed by URL through an ingress endpoint loses local-only receipts.
 RECEIPT_RECORD = f"{TOOL}-receipt"
+TEAMMATE_MESSAGE_RE = re.compile(
+    r'<teammate-message teammate_id="([^"]+)"[^>]*>\n(.*?)\n</teammate-message>',
+    re.DOTALL,
+)
 # Restamping writes a distinct record type into the rewritten transcript. This
 # lets demotion distinguish conversion receipts from identity changes and keeps
 # the identity history beside the affected conversation.
@@ -1169,6 +1173,7 @@ class NEED(enum.Enum):
     MAIL = "the send-vs-delivery mail join"
     TITLES = "transcript titles"
     CONVERSION_CENSUS = "the promoted-member conversion receipt corpus"
+    PLACEMENT = "launch team placement"
 
 
 class DECLARED(enum.Enum):
@@ -1290,6 +1295,7 @@ class Resolver:
     _procs = Cache()             # [(pid, ppid, args)], read from /proc
     _stamps = Cache()            # transcript stem -> (agentName, teamName)
     _carried = Cache()           # complete path -> receipt conversion census
+    _carried_scope = Cache()     # main transcript paths examined by that census
     _receipts = Cache(dict)      # path -> its one parsed receipt or None
     _spawns = Cache(dict)        # transcript stem -> {name: last payload of that name}
     _spawn_log = Cache(dict)     # transcript stem -> [(stamp, payload)] in file order
@@ -1301,6 +1307,7 @@ class Resolver:
     _runtime_snapshot = Cache()  # canonical records and indexes for that table
     _registry = Cache()          # normalized session-registry observations
     _transcript_facts = Cache(dict)  # path -> immutable transcript fact
+    _transcript_snapshots = Cache(dict)  # path -> stat signature and derived full-file facts
     _copied_prefixes = Cache(dict)   # path -> UUIDs copied from a promoted parent
 
     def __init__(self, needs=None):
@@ -2704,58 +2711,40 @@ class Resolver:
                 people["team-lead"] = lead_path
 
         sends, boxes, wrappers, last_write = [], {}, {}, {}
-        wrapper_re = re.compile(
-            r'<teammate-message teammate_id="([^"]+)"[^>]*>\n(.*?)\n</teammate-message>',
-            re.DOTALL)
         for name, path in people.items():
             # The caller's declared need bounds the walk: sends to the named
             # recipient originate anywhere, so every transcript is opened, but
             # only the recipient's own file pays the delivery side (wrappers,
             # last write, inbox), and everyone else's parses only its sends.
             wants_delivery = to is None or name == to
-            got_wrappers, newest = [], 0
-            try:
-                handle = path.open(errors="replace")
-            except OSError:
-                continue
-            with handle:
-                for line in handle:
-                    if '"SendMessage"' not in line and not (
-                            wants_delivery and ("<teammate-message" in line
-                                                or '"timestamp"' in line)):
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except ValueError:
-                        continue
-                    if rec.get("isSidechain"):
-                        continue
-                    ts = iso_ms(rec.get("timestamp"))
-                    if ts:
-                        newest = max(newest, ts)
-                    content = (rec.get("message") or {}).get("content")
-                    if rec.get("type") == "assistant" and isinstance(content, list):
-                        for block in content:
-                            if (isinstance(block, dict) and block.get("type") == "tool_use"
-                                    and block.get("name") == "SendMessage"):
-                                spec = block.get("input") or {}
-                                body = spec.get("message")
-                                sends.append({
-                                    "sender": name,
-                                    "to": spec.get("to") or spec.get("recipient"),
-                                    "summary": spec.get("summary") or "",
-                                    "sent": ts,
-                                    "body": body if isinstance(body, str) else None})
-                    elif wants_delivery and rec.get("type") == "user":
-                        text = content if isinstance(content, str) else "".join(
-                            part.get("text", "") for part in content or []
-                            if isinstance(part, dict))
-                        if "<teammate-message" in text:
-                            for who, body in wrapper_re.findall(text):
-                                got_wrappers.append((who, body))
-            wrappers[name] = got_wrappers
             if wants_delivery:
-                last_write[name] = newest
+                snapshot = self._transcript_snapshot(path, include_mail=True)
+                if not snapshot:
+                    continue
+                sends.extend({"sender": name, **entry}
+                             for entry in snapshot["sends"])
+                wrappers[name] = snapshot["wrappers"]
+                last_write[name] = snapshot["last_write"]
+            else:
+                try:
+                    handle = path.open(errors="replace")
+                except OSError:
+                    continue
+                with handle:
+                    for line in handle:
+                        if '"SendMessage"' not in line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except ValueError:
+                            continue
+                        if rec.get("isSidechain"):
+                            continue
+                        stamp = iso_ms(rec.get("timestamp"))
+                        sends.extend({"sender": name, **entry}
+                                     for entry in self._send_evidence(rec, stamp))
+                wrappers[name] = ()
+            if wants_delivery:
                 try:
                     inbox = json.loads(self.inbox_path(team, name).read_text())
                     boxes[name] = [m.get("text") or str(m.get("message", ""))
@@ -2882,58 +2871,144 @@ class Resolver:
         """Teams a live process is currently running as, from its own argv."""
         return {e["team"] for e in self.runtime()["live_sessions"] if e.get("team")}
 
+    @staticmethod
+    def _snapshot_signature(stat):
+        """File identity and content-change fields used by transcript snapshots."""
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+    @staticmethod
+    def _send_evidence(rec, stamp):
+        """Structured SendMessage entries carried by one transcript record."""
+        found = []
+        content = (rec.get("message") or {}).get("content")
+        if rec.get("type") == "assistant" and isinstance(content, list):
+            for block in content:
+                if (isinstance(block, dict) and block.get("type") == "tool_use"
+                        and block.get("name") == "SendMessage"):
+                    spec = block.get("input") or {}
+                    body = spec.get("message")
+                    found.append(types.MappingProxyType({
+                        "to": spec.get("to") or spec.get("recipient"),
+                        "summary": spec.get("summary") or "",
+                        "sent": stamp,
+                        "body": body if isinstance(body, str) else None,
+                    }))
+        return tuple(found)
+
+    @staticmethod
+    def _wrapper_evidence(rec):
+        """Sender and verbatim body pairs carried by one delivered user record."""
+        if rec.get("type") != "user":
+            return ()
+        content = (rec.get("message") or {}).get("content")
+        text = content if isinstance(content, str) else "".join(
+            part.get("text", "") for part in content or []
+            if isinstance(part, dict))
+        return tuple(TEAMMATE_MESSAGE_RE.findall(text)) if "<teammate-message" in text else ()
+
+    def _derive_transcript_snapshot(self, lines, include_mail):
+        """Derive requested immutable facts from complete JSONL lines."""
+        records, leaves = {}, []
+        sends, wrappers, newest = [], [], 0
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                # The parent walk consumes object records with type, UUID, and
+                # parentUuid fields. Arrays, strings, and numbers stay outside
+                # that record set.
+                continue
+            if include_mail:
+                mail_candidate = ('"SendMessage"' in raw_line
+                                  or "<teammate-message" in raw_line
+                                  or '"timestamp"' in raw_line)
+                if mail_candidate and not rec.get("isSidechain"):
+                    stamp = iso_ms(rec.get("timestamp"))
+                    if stamp:
+                        newest = max(newest, stamp)
+                    sends.extend(self._send_evidence(rec, stamp))
+                    wrappers.extend(self._wrapper_evidence(rec))
+            if rec.get("type") == "last-prompt":
+                # Preserve file order for the probe that distinguishes
+                # final-record selection from the loader's set-latest rule.
+                if rec.get("leafUuid") and rec["leafUuid"] not in leaves:
+                    leaves.append(rec["leafUuid"])
+                continue
+            if rec.get("uuid"):
+                records[rec["uuid"]] = (rec.get("parentUuid"),
+                                        rec.get("agentName"), rec.get("teamName"),
+                                        iso_ms(rec.get("timestamp")), rec.get("type"))
+        candidates = [(ts, uuid) for uuid, (_p, _a, _t, ts, kind) in records.items()
+                      if uuid in leaves and kind in ("user", "assistant")]
+        start = None
+        if candidates:
+            cursor = max(candidates)[1]
+            seen = set()
+            while cursor in records and cursor not in seen:
+                seen.add(cursor)
+                parent = records[cursor][0]
+                if parent is None:
+                    _p, name, team, _ts, _k = records[cursor]
+                    start = (name, team, cursor) if name and team else None
+                    break
+                cursor = parent
+        return types.MappingProxyType({
+            "start": start,
+            "mail_complete": include_mail,
+            "last_write": newest,
+            "sends": tuple(sends),
+            "wrappers": tuple(wrappers),
+        })
+
+    def _stable_transcript_snapshot(self, path, include_mail):
+        """Derive one complete snapshot while the file stays unchanged."""
+        while True:
+            try:
+                with path.open(errors="replace") as handle:
+                    before = self._snapshot_signature(os.fstat(handle.fileno()))
+                    fact = self._derive_transcript_snapshot(handle, include_mail)
+                    after = self._snapshot_signature(os.fstat(handle.fileno()))
+                current = self._snapshot_signature(path.stat())
+            except OSError:
+                return None
+            if before == after == current:
+                return current, fact
+
+    def _transcript_snapshot(self, path, include_mail=False):
+        """Return cached window-root and requested mail facts for one file snapshot."""
+        path = Path(path)
+        try:
+            current = self._snapshot_signature(path.stat())
+        except OSError:
+            return None
+        cached = self._transcript_snapshots.get(path)
+        if (cached and cached[0] == current
+                and (cached[1]["mail_complete"] or not include_mail)):
+            return cached[1]
+        read = self._stable_transcript_snapshot(path, include_mail)
+        if not read:
+            return None
+        signature, fact = read
+        self._transcript_snapshots[path] = (signature, fact)
+        return fact
+
     def window_start(self, path):
         """Return agentName, teamName, and UUID from the restored window root.
 
         Claude Code 2.1.220 selects the timestamp-latest user or assistant leaf
         named by any `last-prompt` record, walks `parentUuid` to the root, and
         adopts the root's complete identity pair. Restored identity and launch
-        validation share this walk. A corrupt chain can trigger Claude Code's
-        timestamp fallback, which lies outside this reconstruction.
+        validation share one full-file snapshot and this walk. A corrupt chain
+        can trigger Claude Code's timestamp fallback, which lies outside this
+        reconstruction.
         """
-        records, leaves = {}, []
-        try:
-            handle = path.open(errors="replace")
-        except OSError:
-            return None
-        with handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(rec, dict):
-                    # The parent walk consumes object records with type, UUID, and
-                    # parentUuid fields. Arrays, strings, and numbers stay outside
-                    # that record set.
-                    continue
-                if rec.get("type") == "last-prompt":
-                    # Preserve file order for the probe that distinguishes
-                    # final-record selection from the loader's set-latest rule.
-                    if rec.get("leafUuid") and rec["leafUuid"] not in leaves:
-                        leaves.append(rec["leafUuid"])
-                    continue
-                if rec.get("uuid"):
-                    records[rec["uuid"]] = (rec.get("parentUuid"),
-                                            rec.get("agentName"), rec.get("teamName"),
-                                            iso_ms(rec.get("timestamp")), rec.get("type"))
-        candidates = [(ts, uuid) for uuid, (_p, _a, _t, ts, kind) in records.items()
-                      if uuid in leaves and kind in ("user", "assistant")]
-        if not candidates:
-            return None
-        cursor = max(candidates)[1]
-        seen = set()
-        while cursor in records and cursor not in seen:
-            seen.add(cursor)
-            parent = records[cursor][0]
-            if parent is None:
-                _p, name, team, _ts, _k = records[cursor]
-                return (name, team, cursor) if name and team else None
-            cursor = parent
-        return None
+        fact = self._transcript_snapshot(path)
+        return fact["start"] if fact else None
 
     def restored_identity(self, path):
         """Return the window-start team and its restore state.
@@ -3182,6 +3257,7 @@ class Resolver:
         the addressed team. Otherwise a single team with live members wins over
         the addressed team. Several live teams require an explicit selection.
         """
+        self._exercise(NEED.PLACEMENT)
         spoken = to_team or for_team
         if spoken:
             return spoken, "asked for"
@@ -3285,9 +3361,16 @@ class Resolver:
                        if receipt and receipt.get("name")
                        and receipt.get("team") else None)
 
-        # Placement precedes merging. A team change clears source-roster identity
-        # while the spawn record still contributes appearance fields.
-        placed, placed_why = self.place(res, team, for_team, to_team, keep_team)
+        # Placement precedes merging for a launch. Diagnosis resolves the same
+        # canonical target but keeps the addressed identity and performs no launch
+        # placement work.
+        if self.needs[NEED.PLACEMENT] is DECLARED.ABSENT:
+            if for_team or to_team or keep_team:
+                self._exercise(NEED.PLACEMENT)
+            placed, placed_why = team, "as addressed"
+        else:
+            placed, placed_why = self.place(
+                res, team, for_team, to_team, keep_team)
         redirected = bool(placed and placed != team)
         if redirected:
             team, source_team_entry, team_entry = placed, team_entry, None
@@ -4342,10 +4425,12 @@ class Resolver:
         """
         self._exercise(NEED.CONVERSION_CENSUS)
         if self._carried is None:
+            scope = tuple(self.projects_dir.glob("*/*.jsonl"))
+            self._carried_scope = frozenset(scope)
             marker = f'"type":"{RECEIPT_RECORD}"'
             candidates = self._grep_files(marker, [self.projects_dir], True)
             if candidates is None:
-                candidates = list(self.projects_dir.glob("*/*.jsonl"))
+                candidates = scope
             found = {}
             for path in candidates:
                 receipt = self.receipt_carried_by(path)
@@ -4358,8 +4443,10 @@ class Resolver:
         """The canonical parsed conversion receipt for one transcript, or None."""
         path = Path(path)
         if path not in self._receipts:
-            known = self._carried.get(path) if self._carried is not None else None
-            self._receipts[path] = known or self.rewriter.receipt_in_file(path)
+            covered = (self._carried is not None
+                       and path in (self._carried_scope or ()))
+            self._receipts[path] = (self._carried.get(path) if covered
+                                    else self.rewriter.receipt_in_file(path))
         return self._receipts[path]
 
     def copied_prefix_uuids(self, path):
@@ -4367,6 +4454,7 @@ class Resolver:
         self._exercise(NEED.CONVERSION_CENSUS)
         path = Path(path)
         if path not in self._copied_prefixes:
+            self.carried_receipts()
             receipt = self.receipt_carried_by(path)
             prefix = receipt.get("prefix_uuids") if receipt else None
             self._copied_prefixes[path] = frozenset(prefix or ())
@@ -16479,6 +16567,8 @@ def _check_typed_side_classifies_alone(s):
      'compute is declared at construction and audited at the end'),
     ('action-evidence-declares-conversion-census',
      'stamp and spawn evidence declare copied-action ownership at the same strength'),
+    ('launch-placement-declared-only-by-launch',
+     'resume declares launch placement and doctor does not'),
 )
 def _check_compute_declared_and_audited(s):
     checked = []
@@ -16624,6 +16714,18 @@ def _check_compute_declared_and_audited(s):
     check("action-evidence-declares-conversion-census",
           "stamp and spawn evidence declare copied-action ownership at the same strength",
           not mismatched, ", ".join(mismatched))
+    declared = dict(declarations)
+    placement_ok = (
+        declared["doctor"][NEED.PLACEMENT] is DECLARED.ABSENT
+        and declared["doctor-agent"][NEED.PLACEMENT] is DECLARED.ABSENT
+        and all(declared[label][NEED.PLACEMENT] is DECLARED.HARD
+                for label in ("agent-id", "uuid", "selector"))
+    )
+    check("launch-placement-declared-only-by-launch",
+          "resume declares launch placement and doctor does not",
+          placement_ok,
+          ", ".join(f"{label}={needs[NEED.PLACEMENT].name}"
+                    for label, needs in declarations))
     return checked
 
 
@@ -18560,6 +18662,10 @@ def _check_conversion_context_completion(s):
      'the conversion census parses only literal-search candidates, with a full-scan failure fallback'),
     ('conversion-receipt-is-one-canonical-object',
      'a path lookup and the conversion census share one parsed receipt object'),
+    ('conversion-census-caches-known-absence',
+     'a completed conversion census answers known absence without another scan'),
+    ('conversion-census-direct-scans-new-and-outside-paths',
+     'paths outside the conversion census still receive exact direct validation'),
     ('selector-completion-declares-action-ownership',
      'selector completion declares receipt evidence needed to exclude copied parent actions'),
     ('completion-topics-declare-specific-needs',
@@ -18643,6 +18749,36 @@ def _check_completion_conversion_census_boundary(s):
                   direct is census_receipt and canonical_parsed == [carrier],
                   f"same={direct is census_receipt}, parsed={canonical_parsed!r}")
 
+            absent = main_dir / "plain-0.jsonl"
+            zero = Resolver(needs=Needs(hard={NEED.CONVERSION_CENSUS}))
+            zero.projects_dir = projects
+            zero._grep_files = lambda *args: []
+            zero_parsed = []
+            zero_original = zero.rewriter.receipt_in_file
+            zero.rewriter.receipt_in_file = lambda path: (
+                zero_parsed.append(Path(path)) or zero_original(path))
+            zero.carried_receipts()
+            absent.write_text(TranscriptRewriter._receipt_line(receipt) + "\n")
+            absent_receipt = zero.receipt_carried_by(absent)
+            absent_prefix = zero.copied_prefix_uuids(absent)
+            check('conversion-census-caches-known-absence',
+                  'a completed conversion census answers known absence without another scan',
+                  absent_receipt is None and absent_prefix == frozenset()
+                  and zero_parsed == [],
+                  f"receipt={absent_receipt!r}, prefix={sorted(absent_prefix)}, "
+                  f"parsed={zero_parsed!r}")
+
+            late = main_dir / "late.jsonl"
+            late.write_text(TranscriptRewriter._receipt_line(receipt) + "\n")
+            side_receipt = zero.receipt_carried_by(side)
+            late_receipt = zero.receipt_carried_by(late)
+            direct_paths = [side, late]
+            check('conversion-census-direct-scans-new-and-outside-paths',
+                  'paths outside the conversion census still receive exact direct validation',
+                  side_receipt == receipt and late_receipt == receipt
+                  and zero_parsed == direct_paths,
+                  f"parsed={zero_parsed!r}")
+
         selector = completion_needs("selector")
         topics = ("flags", "sockets", "sessions", "sides", "agent-ids", "names",
                   "teams", "leads", "selector", "as-agent-name:x", "as-agent:x",
@@ -18654,16 +18790,21 @@ def _check_completion_conversion_census_boundary(s):
         eng = s.corpus_engine()
         eng.needs = selector
         eng.exercised = set()
-        receipt_reads = []
-        eng.rewriter.receipt_in_file = lambda path: receipt_reads.append(Path(path)) or None
+        ownership_reads = []
+        real_prefixes = eng.copied_prefix_uuids
+        eng.copied_prefix_uuids = lambda path: (
+            ownership_reads.append(Path(path)), real_prefixes(path))[1]
         globals()["RESOLVER"] = eng
         with capturing("out"), capturing("err"):
             run_complete("selector")
         eng.audit_needs()
         check('selector-completion-declares-action-ownership',
               'selector completion declares receipt evidence needed to exclude copied parent actions',
-              selector[NEED.CONVERSION_CENSUS] is DECLARED.MAYBE and bool(receipt_reads),
-              f"receipt reads={len(receipt_reads)}, exercised={sorted(n.name for n in eng.exercised)}")
+              selector[NEED.CONVERSION_CENSUS] is DECLARED.MAYBE
+              and bool(ownership_reads)
+              and NEED.CONVERSION_CENSUS in eng.exercised,
+              f"ownership reads={len(ownership_reads)}, "
+              f"exercised={sorted(n.name for n in eng.exercised)}")
         check('completion-topics-declare-specific-needs',
               'every completion topic declares only its own corpus work',
               specific, repr(selector))
@@ -21284,7 +21425,16 @@ def _check_runtime_api_has_no_legacy_wearers(s):
     return checked
 
 
-@unit(('mail-ledger-joins-deliveries', 'the mail ledger joins sends against deliveries'), ('ledger-recipient-narrows-only', 'a declared recipient narrows the ledger without changing it'), ('torn-inbox-reported', 'a torn inbox is reported, not skipped'))
+@unit(
+    ('mail-ledger-joins-deliveries', 'the mail ledger joins sends against deliveries'),
+    ('mail-ledger-matches-full-scan-reference',
+     'optimized mail rows and states match the complete structured scan'),
+    ('mail-and-window-share-transcript-snapshot',
+     'mail and restored-window reads share one full parse per unchanged transcript'),
+    ('ledger-recipient-narrows-only',
+     'a declared recipient narrows the ledger without changing it'),
+    ('torn-inbox-reported', 'a torn inbox is reported, not skipped'),
+)
 def _check_mail_ledger_joins_deliveries(s):
     checked = []
 
@@ -21297,13 +21447,19 @@ def _check_mail_ledger_joins_deliveries(s):
         proj = Path(td) / "proj"
         proj.mkdir(parents=True)
 
-        def send_rec(body, ts):
-            return fixture_line({"type": "assistant", "agentName": "alice",
-                            "teamName": "TML", "timestamp": ts, "uuid": f"s-{body}",
-                            "parentUuid": None, "message": {"content": [
-                                {"type": "tool_use", "name": "SendMessage",
-                                 "input": {"to": "bob", "summary": body,
-                                           "message": body}}]}})
+        def send_rec(summary, ts, body=None, to="bob", sidechain=False):
+            body = summary if body is None else body
+            return fixture_line({
+                "type": "assistant", "agentName": "alice", "teamName": "TML",
+                "timestamp": ts, "uuid": f"s-{summary}", "parentUuid": None,
+                "isSidechain": sidechain,
+                "message": {"content": [{
+                    "type": "tool_use", "name": "SendMessage",
+                    "input": {"to": to, "summary": summary, "message": body},
+                }]},
+            })
+
+        escaped_body = 'line "quoted"\nsecond \\ path'
         chatter = [fixture_line({"type": "assistant", "agentName": "alice",
                             "teamName": "TML", "timestamp": f"2026-01-01T00:01:{n:02d}Z",
                             "uuid": f"c-{n}", "parentUuid": None,
@@ -21312,52 +21468,225 @@ def _check_mail_ledger_joins_deliveries(s):
             send_rec("one", "2026-01-01T00:00:01Z"),
             send_rec("two", "2026-01-01T00:00:02Z"),
             send_rec("three", "2026-01-01T00:00:03Z"),
+            send_rec("memory", "2026-01-01T00:00:04Z", to="carol"),
+            send_rec("escaped", "2026-01-01T00:00:06Z", body=escaped_body),
+            send_rec("object", "2026-01-01T00:00:07Z", body={"kind": "protocol"}),
+            send_rec("ghost", "2026-01-01T00:00:08Z", to="nobody"),
             send_rec("four", "2026-01-01T00:00:09Z"),
+            send_rec("side-only", "2026-01-01T00:00:10Z", sidechain=True),
         ] + chatter) + "\n")
+        delivered = (
+            '<teammate-message teammate_id="alice">\none\n</teammate-message>\n'
+            '<teammate-message teammate_id="alice">\n'
+            f'{escaped_body}\n</teammate-message>'
+        )
         (proj / "BOB.jsonl").write_text("\n".join([
             fixture_line({"type": "user", "agentName": "bob", "teamName": "TML",
                      "timestamp": "2026-01-01T00:00:04Z", "uuid": "b-1",
-                     "parentUuid": None, "message": {"content":
-                     '<teammate-message teammate_id="alice">\none\n</teammate-message>'}}),
+                     "parentUuid": None, "message": {"content": delivered}}),
+            "{malformed",
             fixture_line({"type": "assistant", "agentName": "bob", "teamName": "TML",
                      "timestamp": "2026-01-01T00:00:05Z", "uuid": "b-2",
                      "parentUuid": "b-1", "message": {"content": []}}),
+            fixture_line({"type": "assistant", "agentName": "bob", "teamName": "TML",
+                     "timestamp": "2026-01-01T00:59:59Z", "uuid": "b-side",
+                     "parentUuid": "b-2", "isSidechain": True,
+                     "message": {"content": []}}),
         ]) + "\n")
+        (proj / "CAROL.jsonl").write_text(fixture_line({
+            "type": "assistant", "agentName": "carol", "teamName": "TML",
+            "timestamp": "2026-01-01T00:00:05Z", "uuid": "carol-1",
+            "parentUuid": None, "message": {"content": []},
+        }) + "\n")
         boxdir = Path(td) / "teams" / "TML" / "inboxes"
         boxdir.mkdir(parents=True)
         (boxdir / "bob.json").write_text(json.dumps([{"text": "two"}]))
-        eng5 = Resolver(needs=Needs(maybe=set(NEED)))
-        eng5.projects_dir, eng5.teams_dir = Path(td), Path(td) / "teams"
+
+        def new_engine():
+            engine = Resolver(needs=Needs(maybe=set(NEED)))
+            engine.projects_dir, engine.teams_dir = Path(td), Path(td) / "teams"
+            engine.runtime = lambda table=None: {
+                "by_transcript": {"CAROL": ({"pid": 424242},)},
+            }
+            return engine
+
+        eng5 = new_engine()
         full_rows = eng5.mail_ledger("TML")
         states = {e["summary"]: e["state"] for e in full_rows}
-        want = {"one": "delivered", "two": "queued",
-                "three": "unexplained", "four": "pending"}
+        want = {
+            "one": "delivered", "two": "queued", "three": "unexplained",
+            "memory": "in memory", "escaped": "delivered", "object": "protocol",
+            "ghost": "unknown recipient", "four": "pending",
+        }
         off = [f"{k}: {states.get(k)} (wanted {v})" for k, v in want.items()
                if states.get(k) != v]
         check("mail-ledger-joins-deliveries", "the mail ledger joins sends against deliveries", not off,
               ", ".join(off) or ", ".join(f"{k}={v}" for k, v in want.items()))
 
+        def reference_ledger(engine, team, recipient=None):
+            """The complete pre-optimization structured scan, retained as an oracle."""
+            people = {}
+            for path, (name, stamped) in engine.stamp_index().items():
+                if stamped == team and name and name not in people:
+                    people[name] = path
+            sends, boxes, wrappers, last_write = [], {}, {}, {}
+            for name, path in people.items():
+                wants_delivery = recipient is None or name == recipient
+                got_wrappers, newest = [], 0
+                try:
+                    handle = path.open(errors="replace")
+                except OSError:
+                    continue
+                with handle:
+                    for line in handle:
+                        if '"SendMessage"' not in line and not (
+                                wants_delivery and ("<teammate-message" in line
+                                                    or '"timestamp"' in line)):
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except ValueError:
+                            continue
+                        if rec.get("isSidechain"):
+                            continue
+                        stamp = iso_ms(rec.get("timestamp"))
+                        if stamp:
+                            newest = max(newest, stamp)
+                        content = (rec.get("message") or {}).get("content")
+                        if rec.get("type") == "assistant" and isinstance(content, list):
+                            for block in content:
+                                if (isinstance(block, dict)
+                                        and block.get("type") == "tool_use"
+                                        and block.get("name") == "SendMessage"):
+                                    spec = block.get("input") or {}
+                                    body = spec.get("message")
+                                    sends.append({
+                                        "sender": name,
+                                        "to": spec.get("to") or spec.get("recipient"),
+                                        "summary": spec.get("summary") or "",
+                                        "sent": stamp,
+                                        "body": body if isinstance(body, str) else None,
+                                    })
+                        elif wants_delivery and rec.get("type") == "user":
+                            text = content if isinstance(content, str) else "".join(
+                                part.get("text", "") for part in content or []
+                                if isinstance(part, dict))
+                            if "<teammate-message" in text:
+                                got_wrappers.extend(TEAMMATE_MESSAGE_RE.findall(text))
+                wrappers[name] = got_wrappers
+                if wants_delivery:
+                    last_write[name] = newest
+                    try:
+                        inbox = json.loads(engine.inbox_path(team, name).read_text())
+                        boxes[name] = [
+                            message.get("text") or str(message.get("message", ""))
+                            for message in inbox if isinstance(message, dict)
+                        ]
+                    except (OSError, ValueError):
+                        boxes[name] = []
+
+            ledger = []
+            for send in sorted(sends, key=lambda item: item["sent"] or 0):
+                addressee = send["to"]
+                if recipient is not None and addressee != recipient:
+                    continue
+                entry = {key: send[key]
+                         for key in ("sender", "to", "summary", "sent")}
+                if send["body"] is None:
+                    entry.update(state="protocol", detail="an object send; not joined")
+                elif addressee not in people:
+                    entry.update(
+                        state="unknown recipient",
+                        detail=f"{addressee!r} has no transcript stamped with this team",
+                    )
+                elif any(who == send["sender"] and body == send["body"]
+                         for who, body in wrappers.get(addressee, [])):
+                    entry.update(state="delivered", detail="the body sits in the "
+                                 "recipient's transcript verbatim")
+                elif any(send["body"] == text for text in boxes.get(addressee, [])):
+                    entry.update(state="queued", detail="still in the inbox file; "
+                                 "delivery is a turn-boundary event")
+                elif (last_write.get(addressee) or 0) <= (send["sent"] or 0):
+                    entry.update(state="pending", detail="the recipient has not "
+                                 "written since the send")
+                elif engine.runtime()["by_transcript"].get(people[addressee].stem):
+                    entry.update(state="in memory", detail="the recipient is live "
+                                 "mid-turn; delivery waits on its next boundary "
+                                 "and dies with its process")
+                else:
+                    entry.update(state="unexplained", detail="the recipient has "
+                                 "written since, no delivery matches, and no live "
+                                 "process holds its transcript")
+                ledger.append(entry)
+            return ledger
+
+        reference_full = reference_ledger(new_engine(), "TML")
+        reference_narrow = reference_ledger(new_engine(), "TML", "bob")
+        reference_ok = (full_rows == reference_full
+                        and "side-only" not in states
+                        and states.get("escaped") == "delivered")
+        check("mail-ledger-matches-full-scan-reference",
+              "optimized mail rows and states match the complete structured scan",
+              reference_ok,
+              f"optimized={full_rows!r}, reference={reference_full!r}")
+
+        shared = new_engine()
+        snapshot_reads = []
+        real_snapshot_read = shared._stable_transcript_snapshot
+
+        def counted_snapshot(path, include_mail=False):
+            snapshot_reads.append(Path(path))
+            return real_snapshot_read(path, include_mail)
+
+        shared._stable_transcript_snapshot = counted_snapshot
+        shared_rows = shared.mail_ledger("TML")
+        reads_after_mail = len(snapshot_reads)
+        team_paths = [path for path, (name, stamped) in shared.stamp_index().items()
+                      if stamped == "TML" and name]
+        for path in team_paths:
+            shared.window_start(path)
+        mail_src = s.src_of(s.funcs["mail_ledger"]) or ""
+        window_src = s.src_of(s.funcs["window_start"]) or ""
+        shared_once = (shared_rows == full_rows
+                       and reads_after_mail == len(team_paths)
+                       and len(snapshot_reads) == reads_after_mail
+                       and mail_src.count("self._transcript_snapshot(") == 1
+                       and window_src.count("self._transcript_snapshot(") == 1
+                       and ".open(" not in window_src)
+        check("mail-and-window-share-transcript-snapshot",
+              "mail and restored-window reads share one full parse per unchanged transcript",
+              shared_once,
+              f"paths={len(team_paths)}, mail reads={reads_after_mail}, "
+              f"final reads={len(snapshot_reads)}")
+
         # A declared recipient gets the same rows the full join would give it,
-        # and buys less: a sender's chatter is not parsed on its behalf.
-        real_loads, parses = json.loads, []
+        # and buys less: a sender's chatter is not parsed on its behalf. Each
+        # measurement uses a cold resolver, so snapshot reuse cannot make the
+        # second call appear cheaper merely because the first already read it.
+        real_loads = json.loads
 
-        def counting_loads(raw, *a, **kw):
-            parses.append(1)
-            return real_loads(raw, *a, **kw)
+        def measured(recipient):
+            measured_engine = new_engine()
+            parses = []
 
-        json.loads = counting_loads
-        try:
-            narrowed = eng5.mail_ledger("TML", to="bob")
-            to_bob = len(parses)
-            parses.clear()
-            everything_rows = eng5.mail_ledger("TML")
-            to_all = len(parses)
-        finally:
-            json.loads = real_loads
+            def counting_loads(raw, *a, **kw):
+                parses.append(1)
+                return real_loads(raw, *a, **kw)
+
+            json.loads = counting_loads
+            try:
+                rows = measured_engine.mail_ledger("TML", to=recipient)
+            finally:
+                json.loads = real_loads
+            return rows, len(parses)
+
+        narrowed, to_bob = measured("bob")
+        everything_rows, to_all = measured(None)
+        nobody, _to_alice = measured("alice")
         declared = {
-            "same rows, same states": narrowed ==
+            "same rows, same states": narrowed == reference_narrow ==
                 [r for r in everything_rows if r["to"] == "bob"],
-            "nobody addressed means no rows": eng5.mail_ledger("TML", to="alice") == [],
+            "nobody addressed means no rows": nobody == [],
             "a sender's chatter is not parsed": to_bob < to_all,
         }
         wrong = sorted(k for k, ok in declared.items() if not ok)
@@ -22609,7 +22938,13 @@ def _check_launch_line_one_spelling(s):
     return checked
 
 
-@unit(('restore-reads-window-start', 'restore reads the window start, not the tail'))
+@unit(
+    ('restore-reads-window-start', 'restore reads the window start, not the tail'),
+    ('window-start-reuses-unchanged-snapshot',
+     'restored window identity is parsed once for one unchanged transcript snapshot'),
+    ('window-start-invalidates-changed-snapshot',
+     'restored window identity is reparsed when transcript identity or contents change'),
+)
 def _check_restore_reads_window_start(s):
     checked = []
 
@@ -22626,6 +22961,12 @@ def _check_restore_reads_window_start(s):
              "type": "user", "uuid": "wa-root", "timestamp": "2026-01-01T00:00:01Z"},
             {"parentUuid": "wa-root", "agentName": "lead", "teamName": "teamB",
              "type": "assistant", "uuid": "wa-leaf", "timestamp": "2026-01-01T00:00:02Z"},
+            # Mail evidence is irrelevant to the restored-window walk. A malformed
+            # tool input must not turn identity reconstruction into a mail parse.
+            {"parentUuid": "wa-leaf", "agentName": "lead", "teamName": "teamB",
+             "type": "assistant", "uuid": "bad-mail",
+             "timestamp": "2026-01-01T00:00:02.500Z", "message": {"content": [
+                 {"type": "tool_use", "name": "SendMessage", "input": []}]}},
             {"parentUuid": None, "agentName": "lead", "teamName": "teamC",
              "type": "user", "uuid": "wc-root", "timestamp": "2026-01-01T00:00:03Z"},
             {"parentUuid": "wc-root", "agentName": "lead", "teamName": "teamB",
@@ -22651,6 +22992,55 @@ def _check_restore_reads_window_start(s):
         eng3.teams_dir = Path(td) / "teams"
         (eng3.teams_dir / "teamC").mkdir(parents=True)
         (eng3.teams_dir / "teamC" / "config.json").write_text("{}")
+        snapshot_reads = []
+        real_snapshot_read = eng3._stable_transcript_snapshot
+
+        def counted_snapshot(path, include_mail=False):
+            snapshot_reads.append(Path(path))
+            return real_snapshot_read(path, include_mail)
+
+        eng3._stable_transcript_snapshot = counted_snapshot
+        first_start = eng3.window_start(wt)
+        second_start = eng3.window_start(wt)
+        check("window-start-reuses-unchanged-snapshot",
+              "restored window identity is parsed once for one unchanged transcript snapshot",
+              first_start is second_start and snapshot_reads == [wt],
+              f"same={first_start is second_start}, reads={len(snapshot_reads)}")
+        changed = [
+            {"parentUuid": None, "agentName": "lead", "teamName": "teamC",
+             "type": "user", "uuid": "wc-new-root",
+             "timestamp": "2026-01-01T00:00:05Z"},
+            {"parentUuid": "wc-new-root", "agentName": "lead", "teamName": "teamC",
+             "type": "assistant", "uuid": "wc-new-leaf",
+             "timestamp": "2026-01-01T00:00:06Z"},
+            {"type": "last-prompt", "leafUuid": "wc-new-leaf", "sessionId": "w"},
+        ]
+        with wt.open("a") as handle:
+            handle.write("".join(json.dumps(row) + "\n" for row in changed))
+        changed_start = eng3.window_start(wt)
+        before_replace = wt.stat()
+        replacement = wt.with_suffix(".replacement")
+        replacement.write_text(
+            wt.read_text().replace("wc-new-root", "wd-new-root")
+            .replace("wc-new-leaf", "wd-new-leaf"))
+        os.utime(replacement, ns=(before_replace.st_atime_ns,
+                                  before_replace.st_mtime_ns))
+        os.replace(replacement, wt)
+        after_replace = wt.stat()
+        replaced_start = eng3.window_start(wt)
+        invalidated = (
+            changed_start == ("lead", "teamC", "wc-new-root")
+            and replaced_start == ("lead", "teamC", "wd-new-root")
+            and before_replace.st_size == after_replace.st_size
+            and before_replace.st_mtime_ns == after_replace.st_mtime_ns
+            and before_replace.st_ino != after_replace.st_ino
+            and snapshot_reads == [wt, wt, wt]
+        )
+        check("window-start-invalidates-changed-snapshot",
+              "restored window identity is reparsed when transcript identity or contents change",
+              invalidated,
+              f"changed={changed_start!r}, replaced={replaced_start!r}, "
+              f"reads={len(snapshot_reads)}")
         if eng3.restored_identity(wt) != ("teamC", "restored"):
             stray.append("a loadable stamped team did not read as restored")
         # The five measured arms, driven as one unit: stamped-and-loadable
@@ -23223,6 +23613,8 @@ def _check_doctor_target_honoured(s):
      'long dossier titles wrap readably under the report label'),
     ('doctor-selection-makes-no-launch-claim',
      'selecting an agent for diagnosis prints no launch-only cwd warning'),
+    ('doctor-selection-skips-launch-placement',
+     'a direct doctor selector resolves one target without launch placement'),
     ('doctor-joins-mail-once',
      'one named-team diagnosis computes one mail ledger for its report and dossiers'),
     ('doctor-builds-team-runtime-once',
@@ -23451,6 +23843,35 @@ def _check_doctor_agent_dossiers(s):
           "selecting an agent for diagnosis prints no launch-only cwd warning",
           "starting in" not in member_errors and "agent starts" not in member_errors,
           member_errors.strip())
+
+    placement_eng = corpus_engine()
+    placement_eng.needs = Needs(maybe=set(NEED) - {NEED.PLACEMENT})
+    placement_eng._session_registry = lambda: []
+    placement_eng.process_table = lambda refresh=False: []
+    placement_calls = []
+    placement_eng.place = lambda *args, **kwargs: (
+        placement_calls.append((args, kwargs)), (args[1], "as addressed"))[1]
+    real_resolver = globals()["RESOLVER"]
+    globals()["RESOLVER"] = placement_eng
+    selected, selection_error = None, None
+    try:
+        with capturing("out"), capturing("err"):
+            selected = doctor_subject(types.SimpleNamespace(
+                team=None, agent_id=member, resume=None))
+    except Exception as err:
+        selection_error = f"{err.__class__.__name__}: {err}"
+    finally:
+        globals()["RESOLVER"] = real_resolver
+    subject_src = s.src_of(s.funcs["doctor_subject"]) or ""
+    placement_clean = (selected == (team, member, True)
+                       and not placement_calls and not selection_error
+                       and subject_src.count("RESOLVER.identity(") == 1
+                       and "RESOLVER.classify(" not in subject_src)
+    check("doctor-selection-skips-launch-placement",
+          "a direct doctor selector resolves one target without launch placement",
+          placement_clean,
+          selection_error or f"selected={selected!r}, place calls={len(placement_calls)}, "
+          f"identity calls={subject_src.count('RESOLVER.identity(')}")
     mail_counts = [member_mail_reads, team_mail_reads, lead_mail_reads,
                    severed_mail_reads]
     check("doctor-joins-mail-once",
@@ -25327,18 +25748,20 @@ def verb_needs(args, selector):
     if args.agent_id or (selector and "@" in selector):
         # An agent ID conditionally reaches stamps through runtime mapping.
         return Needs(hard={NEED.PROCS, NEED.REGISTRY, NEED.SEATS,
-                           NEED.SPAWNS, NEED.TITLES, NEED.CONVERSION_CENSUS},
+                           NEED.SPAWNS, NEED.TITLES, NEED.CONVERSION_CENSUS,
+                           NEED.PLACEMENT},
                      maybe={NEED.STAMPS})
     if by_uuid and not args.team:
         # Exact lookup itself needs no stamps. Runtime mapping and rebind cleanup
         # can read them after the transcript resolves, depending on identity and
         # live process state.
         return Needs(hard={NEED.PROCS, NEED.REGISTRY, NEED.SEATS,
-                           NEED.SPAWNS, NEED.TITLES, NEED.CONVERSION_CENSUS},
+                           NEED.SPAWNS, NEED.TITLES, NEED.CONVERSION_CENSUS,
+                           NEED.PLACEMENT},
                      maybe={NEED.STAMPS})
     return Needs(hard={NEED.PROCS, NEED.REGISTRY, NEED.SEATS,
                        NEED.SPAWNS, NEED.STAMPS, NEED.TITLES,
-                       NEED.CONVERSION_CENSUS})
+                       NEED.CONVERSION_CENSUS, NEED.PLACEMENT})
 
 
 def audited(entry):

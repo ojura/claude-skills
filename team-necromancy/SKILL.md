@@ -71,11 +71,12 @@ agent-resume --doctor                         # summary of teams with something 
 ```
 
 `--doctor` uses the same selector resolution as resume. A direct team or agent
-prints the ordinary team report followed by every member exactly once. A requested
-member comes first, then the genuine lead; a team selector starts with the lead.
-The remaining dossiers follow stable roster order and include members that are
-stopped or have no transcript. The team verdict remains the command's exit status.
-The empty-hand sweep stays at team-summary level.
+prints the ordinary team report followed by every member exactly once. It resolves
+the addressed identity without inferring a launch destination. A requested member
+comes first, then the genuine lead; a team selector starts with the lead. The
+remaining dossiers follow stable roster order and include members that are stopped
+or have no transcript. The team verdict remains the command's exit status. The
+empty-hand sweep stays at team-summary level.
 
 The selector may sit anywhere among the flags. The forwarded flags are an
 allowlist that records which of them take a value, so a bare token is either

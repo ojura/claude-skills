@@ -27,9 +27,10 @@ durable turn flushing is the requirement for a supported bg mode.
 `agent-resume` reports seating separately from team health. `--doctor` prints
 the team verdict followed by one dossier per member for a directly named team or
 agent. A requested member comes first, then the genuine lead; a directly named
-team starts with the lead. Each dossier includes the member's live seat. The team
-verdict still measures whether a live lead reads the team, and remains the
-command's exit status.
+team starts with the lead. Each dossier includes the member's live seat. Direct
+diagnosis uses the ordinary selector and immutable target, but does not infer a
+launch destination. The team verdict still measures whether a live lead reads the
+team, and remains the command's exit status.
 
 The unnamed Agent tool runs its query loop inside the leader and writes a
 sidechain transcript. Its work therefore resumes through an internal query
@@ -221,8 +222,11 @@ config and mailbox data answer separate questions and carry separate evidence.
 Conversion receipts are versioned, tool-written evidence carried by the
 converted transcript. Resolver reads them to recover team membership, copied
 parent-record ownership, and the intentional identity assigned by promotion.
-Ordinary later stamps and roster observations do not silently replace that
-assignment. An explicit complete identity or an intentional move can replace it.
+The corpus census retains the main transcript paths it examined, so a path with
+no matching receipt is a known absence for that Resolver lifetime. A new path or
+one outside that census still receives direct receipt validation. Ordinary later
+stamps and roster observations do not silently replace the assigned identity. An
+explicit complete identity or an intentional move can replace it.
 
 Resolution produces one immutable target containing the exact session, canonical
 transcript fact and path, resolved cwd, effective identity and role, provenance,
@@ -289,12 +293,17 @@ refusal promises that the remedy preserves the user's data.
 
 Reporters receive the immutable resume target and render it. The canonical
 transcript fact carries path, optional title, and activity time together; there
-is no separate title lookup. Runtime reads produce one immutable snapshot whose
-PID records are the exact objects referenced by its process, agent, transcript,
-pane, and session indexes. A question that receives a process table carries that
-snapshot through every helper instead of reading the default table partway
-through. Callers declare optional `REGISTRY` and `SEATS` evidence through `NEED`
-rather than selecting among alternate runtime APIs.
+is no separate title lookup. A full transcript snapshot is keyed by device,
+inode, size, and nanosecond modification time. It derives the restored window
+root and, when requested, compact mail evidence from one stable read;
+restored-identity and mail questions reuse that answer until any key field
+changes. Runtime reads produce
+one immutable snapshot whose PID records are the exact objects referenced by its
+process, agent, transcript, pane, and session indexes. A question that receives
+a process table carries that snapshot through every helper instead of reading the
+default table partway through. Callers declare optional `REGISTRY`, `SEATS`, and
+launch `PLACEMENT` work through `NEED` rather than selecting among alternate
+runtime APIs. Diagnosis does not declare `PLACEMENT`.
 
 Callers also declare the computations they need. `Resolver(needs=...)` receives
 hard requirements and a `maybe` set for computations reached on selected paths.
