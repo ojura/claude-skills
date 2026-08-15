@@ -1,48 +1,31 @@
 #compdef agent-resume
-# Completion for the tool named on the #compdef line above (team-necromancy
-# skill). Everything below refers to it as $service, zsh's own name for the
-# command being completed, so a rename touches only that line, the function
-# name, and this file's name. Candidates come from the
-# script itself via the hidden --complete emitter, so the two never drift.
-# Emitter lines are either "cand:desc" or "cand<TAB>desc<TAB>ansi-color".
-# Display strings are built here (compadd -d): names are padded so the @session
-# columns align (globally, across groups sharing one listing), and list-colors
-# patterns are generated from those exact displays so per-agent colors match.
+# Completion for the tool named on the #compdef line. Zsh supplies that name in
+# $service, so a command rename changes the #compdef line, function name, and
+# filename. The hidden --complete emitter supplies candidates in either
+# "cand:desc" or "cand<TAB>desc<TAB>ansi-color" form. This file pads names for
+# aligned @session columns and generates list-colors patterns from the rendered
+# rows.
 #
-# The flags are not written out here. They come from the tool, like every other
-# candidate: `--complete flags` runs the real parser and prints one line per
-# flag, and _agent_resume_flags turns those into _arguments specs. This file
-# held a hand-kept copy of all forty-odd of them until it did not have to.
-#
-# The tool declares two registers of prose for a reason worth keeping: argparse
-# help= is the help page, where a flag gets a sentence, and a row= beside it is
-# the one line this menu gives it, where it gets a phrase. See offers() in the
-# tool. Twenty-one flags differ between the two; the rest declare help= only and
-# the menu falls back to it.
+# `--complete flags` runs the command parser and prints one line per flag.
+# _agent_resume_flags converts those lines into _arguments specifications. Each
+# flag declares sentence-length argparse help and a shorter completion row;
+# offers() in the tool requires both so menu prose cannot inherit help text.
 
-# Reading the corpus takes about 0.7s on the machine this was measured on, and
-# one TAB asks for it more than once: with three matcher-list specs (what
-# oh-my-zsh sets) zsh reruns the whole completion under each until one produces
-# matches, so a word matching nothing paid for three full reads. Keep the answer
-# while the corpus still looks the same from outside, which is the mtime of the
-# teams and projects directories and of their immediate children: 123 stats
-# here, and it moves when a session or a team appears or goes. It does not move
-# when a transcript that already exists grows, so a "last active" time in a
-# description can be up to _RA_CACHE_TTL seconds behind. Titles, join times and
-# the "nothing left to resurrect" markers do not drift on that scale.
+# Reading the corpus takes about 0.7s on the measured machine. Oh-my-zsh's three
+# matcher-list specifications can run one completion under each matcher, so a
+# cache avoids repeated corpus reads. The stamp combines mtimes for teams,
+# projects, and their immediate children: 123 stats in the measured corpus. A
+# new or removed session or team changes the stamp. Transcript growth ages out
+# through _RA_CACHE_TTL, which bounds staleness for last-active descriptions.
 _RA_CACHE_TTL=60
 typeset -gA _RA_CACHE _RA_CACHE_KEY _RA_CACHE_AT
 
-_ra_stamp() {  # topic -> stamp (caller's local), or nonzero when it cannot be taken
+_ra_stamp() {  # topic -> stamp (caller's local), or nonzero when unavailable
   local -a st
   if [[ $1 == flags ]]; then
-    # The flags are a property of the tool and of nothing on this machine: same
-    # binary, same flags. Stamping them with the corpus threw the answer away
-    # every time a session appeared, to recompute a list that had not moved.
-    # zstat takes one +field, not two, and asking for two failed the whole call
-    # silently, which left this topic with no stamp and so no cache at all. The
-    # path is in the stamp as well, so a different binary earlier on PATH counts
-    # as a change even if the two happen to share an mtime.
+    # Flags belong to the selected executable, so their stamp contains its path
+    # and mtime. The path distinguishes executables that share an mtime. zstat
+    # accepts one +field per call.
     local tool=${commands[$service]}
     [[ -n $tool ]] || return 1
     zstat -A st +mtime $tool 2>/dev/null || return 1
@@ -55,12 +38,10 @@ _ra_stamp() {  # topic -> stamp (caller's local), or nonzero when it cannot be t
   stamp="corpus $#st ${(j: :)st}"
 }
 
-# A shell's own table dies with the shell, and the first TAB in a new terminal
-# is the one being complained about. The same answer goes to a file under the
-# same stamp, so a new shell reads that instead of the corpus. Where it goes is
-# the cache-path style if the user set one (oh-my-zsh does), so this leaves no
-# files anywhere the shell was not already keeping completion caches.
-_ra_cache_dir() {  # -> dir (caller's local), or nonzero when there is nowhere to write
+# The disk cache gives a new shell the candidate list from a previous shell. It
+# uses the configured cache-path style when present and otherwise uses the
+# service directory under XDG_CACHE_HOME.
+_ra_cache_dir() {  # -> dir (caller's local), or nonzero when unavailable
   zstyle -s ":completion:*:*:${service}:*" cache-path dir
   : ${dir:=${XDG_CACHE_HOME:-$HOME/.cache}/$service}
   [[ -d $dir ]] || mkdir -p $dir 2>/dev/null || return 1
@@ -76,17 +57,15 @@ _ra_emit() {  # topic -> its candidate lines in `lines` (caller's local)
     lines=( ${(f)"$($service --complete $topic 2>/dev/null)"} )
     return
   fi
-  # Context-bearing topics include a selected side/session after a colon. Keep
-  # those in this shell's exact-key table, but do not turn selectors containing
-  # slashes into cache paths or collapse distinct selectors into one file name.
+  # Context-bearing topics include a selected side or session after a colon.
+  # Their exact keys stay in memory because selectors can contain slashes and
+  # distinct selectors need distinct cache entries.
   [[ $topic == *:* ]] && disk_cache=0
-  # Each topic stands or falls on its own stamp. No stamp (no zsh/stat, or
-  # nothing to stat) leaves it empty, and then age is all that can retire an
-  # entry: the file is neither read nor written, and the shell's own table
-  # stands for _RA_CACHE_TTL seconds.
+  # Each topic has its own stamp. When stamp collection returns an empty value,
+  # the in-memory entry expires after _RA_CACHE_TTL and disk caching stays idle.
   _ra_stamp $topic
-  # The corpus stamp cannot see a transcript that only grew, so corpus entries
-  # age out as well. The tool stamp misses nothing, so the flags do not need to.
+  # Corpus entries also expire by age because directory mtimes stay stable while
+  # an existing transcript grows. The executable mtime fully identifies flags.
   local -i stale=0
   [[ ${_RA_CACHE_KEY[$topic]} != $stamp ]] && stale=1
   [[ $topic != flags ]] && (( SECONDS - ${_RA_CACHE_AT[$topic]:-0} >= _RA_CACHE_TTL )) && stale=1
@@ -109,11 +88,9 @@ _ra_emit() {  # topic -> its candidate lines in `lines` (caller's local)
   fi
   if (( ! ${+_RA_CACHE[$topic]} )); then
     _RA_CACHE[$topic]="$($service --complete $topic 2>/dev/null)"
-    # Written aside and renamed, so a second shell reading this at the same
-    # moment sees either the old file whole or the new one, never half of one.
-    # Nothing is written for an empty answer: a topic with no candidates costs
-    # little to ask again, and an emitter that failed would otherwise have its
-    # silence served to every shell for the next _RA_CACHE_TTL seconds.
+    # A temporary file and rename present a complete cache version to concurrent
+    # readers. Disk entries store nonempty answers so an emitter failure is
+    # retried on the next request.
     if (( disk_cache )) && [[ -n $dir && -n $_RA_CACHE[$topic] ]]; then
       print -r -- "$stamp"$'\n'"$_RA_CACHE[$topic]" >! $dir/${service}-$topic.$$ 2>/dev/null &&
         mv -f $dir/${service}-$topic.$$ $dir/${service}-$topic 2>/dev/null ||
@@ -130,15 +107,9 @@ _agent_resume_flags() {  # -> spec (caller's array): one _arguments spec per fla
   for line in $lines; do
     parts=("${(@ps:\t:)line}")
     flag=$parts[1] row=$parts[2] completer=$parts[3] value=$parts[4]
-    # _arguments reads a description up to the first unescaped ], so a ] or a
-    # backslash inside the prose has to be escaped for it. A [ does not: it is
-    # only the closer that ends the field, which probing the two separately is
-    # how we know. Nothing else needs escaping either:
-    # each spec is an array element rather than a quoted shell word written out
-    # in this file, so an apostrophe is just an apostrophe. The hand-kept list
-    # had to break out of its own single quotes for the three flags whose prose
-    # has one, and got that right three times out of three; there is now nothing
-    # left to get right.
+    # _arguments ends a description at the first unescaped ], so descriptions
+    # escape backslashes and closing brackets. Each specification is an array
+    # element, which lets apostrophes remain literal characters.
     row=${row//\\/\\\\}
     row=${row//\]/\\]}
     if [[ -z $value ]]; then
@@ -155,11 +126,9 @@ _agent_resume_flags() {  # -> spec (caller's array): one _arguments spec per fla
 }
 
 _ra_parse() {  # line -> cand desc color (caller's locals, via dynamic scope)
-  # One split rather than a chain of strips. Reaching the second tab with
-  # ${rest#*<tab>} costs a match attempt per character of the description, and
-  # descriptions here run to 400 characters: that single expansion was most of
-  # what a TAB spent in the shell. Descriptions cannot themselves hold a tab,
-  # because session_title collapses every run of whitespace to one space.
+  # One split avoids a pattern match per description character. Descriptions can
+  # reach 400 characters, and the title emitter collapses whitespace so tabs remain
+  # available as field separators.
   local -a parts
   if [[ $1 == *$'\t'* ]]; then
     parts=("${(@ps:\t:)1}")
@@ -244,10 +213,9 @@ _agent_resume_topic() {  # single group, self-scoped widths
 }
 
 _agent_resume_selector() {  # names/teams/leads in one call, widths shared
-  # _arguments offers this position even when the word plainly cannot be a
-  # selector, so a TAB on --something used to read the whole corpus to offer
-  # candidates none of which could match. A flag is the option parser's, not
-  # ours.
+  # _arguments also calls this completer for option words. The option parser owns
+  # a prefix beginning with -, so selector completion returns before reading the
+  # corpus.
   [[ $PREFIX == -* ]] && return 1
   local -a all n t l s lines
   local -i maxname=0 maxid=0 ret=1
@@ -272,11 +240,9 @@ _agent_resume_selector() {  # names/teams/leads in one call, widths shared
       leads$'\t'*)    l+=(${line#*$'\t'}) ;;
     esac
   done
-  # Transcripts are only worth listing once you are clearly typing a uuid:
-  # hundreds of them would bury the names on a blank tab.
-  # A uuid is hex and hyphens, but hyphens alone are not one: "--" passed this
-  # and pulled in every transcript on the machine to offer against a word that
-  # is not a selector at all. At least one hex digit has to be there.
+  # Session transcripts enter the list after the prefix resembles a UUID, which
+  # keeps names prominent on a blank TAB. The prefix must include a hex digit so
+  # an option marker such as "--" remains with the option parser.
   if (( ${#PREFIX} >= 2 )) && [[ -z ${PREFIX//[0-9a-fA-F-]/} && $PREFIX == *[0-9a-fA-F]* ]]; then
     _ra_emit sessions
     s=($lines)
@@ -349,8 +315,8 @@ _agent-resume() {
   zmodload -F zsh/stat b:zstat 2>/dev/null  # zstat takes the stamp _ra_emit keys on
   local -a spec
   _agent_resume_flags
-  # An emitter that fails leaves spec empty, and the selector still completes:
-  # fewer candidates is a worse TAB, a broken _arguments call is no TAB at all.
+  # An emitter failure leaves the option specification empty. Selector
+  # completion still runs, preserving the candidate list.
   _arguments -S $spec \
     '1:selector:_agent_resume_selector' \
     '*:forwarded to claude:'
