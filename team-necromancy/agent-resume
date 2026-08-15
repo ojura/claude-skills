@@ -835,6 +835,7 @@ def step(dry, would, did, indent="  "):
 
 
 REPORT_MAX_WIDTH = 140
+REPORT_LABEL_WIDTH = 9
 WRAP_ARROW = "↳ "
 
 
@@ -855,24 +856,33 @@ def term_width():
                        REPORT_MAX_WIDTH))
 
 
-def fill(text, width=None, offset=0):
+def fill(text, width=None, offset=0, continuation_column=None,
+         starts_as_continuation=False):
     """`text` wrapped at spaces for a terminal. Facts reflow, never shrink.
 
     Each input line wraps on its own, keeping its indent. A continuation
-    starts with WRAP_ARROW under the final fixed column: after a `label   `,
-    after the PID and agent-id columns, or after a `- ` bullet. Plain prose
-    hangs two spaces in. A token is never split, so an identifier stays whole
-    and greppable; one wider than the terminal overflows rather than losing
-    characters. `offset` is room a prefix the caller prints (warn's tool name)
-    takes out of the first line.
+    starts with WRAP_ARROW under `continuation_column` when the caller declares
+    one. Otherwise the existing report grammar is recognized: after a fixed
+    label or aligned columns, after a `- ` bullet, or two spaces into plain
+    prose. A token is never split, so an identifier stays whole and greppable;
+    one wider than the terminal overflows rather than losing characters.
+    `starts_as_continuation` puts the same marker on the first physical line,
+    for a separate fact belonging to the row above. `offset` is room a prefix
+    the caller prints (warn's tool name) takes out of the first line.
     """
     width = width or term_width()
     out = []
     for line in str(text).split("\n"):
         head = line[:len(line) - len(line.lstrip(" "))]
-        columns = re.match(r"^(.* {2,})(?=\S)", line)
-        bullet = re.match(r"^ *- ", line)
-        if columns and columns.group(1).strip():
+        columns = None if continuation_column is not None else re.match(
+            r"^(.* {2,})(?=\S)", line)
+        bullet = None if continuation_column is not None else re.match(r"^ *- ", line)
+        if continuation_column is not None:
+            if type(continuation_column) is not int or continuation_column < 0:
+                raise ValueError("continuation_column must be a non-negative integer")
+            lead = ""
+            hang = " " * continuation_column
+        elif columns and columns.group(1).strip():
             lead = columns.group(1)
             hang = " " * len(lead)
         elif bullet:
@@ -883,8 +893,9 @@ def fill(text, width=None, offset=0):
             hang = " " * (len(head) + 2)
         continuation = hang + WRAP_ARROW
         pad = " " * offset if not out else ""
+        initial = continuation if starts_as_continuation else head
         got = textwrap.wrap(line.lstrip(" "), width=width,
-                            initial_indent=pad + head,
+                            initial_indent=pad + initial,
                             subsequent_indent=continuation,
                             break_long_words=False, break_on_hyphens=False)
         if len(got) > 1 and lead.strip() and got[0].strip() == lead.strip():
@@ -904,6 +915,28 @@ def fill(text, width=None, offset=0):
                 got[-2:] = [body.rstrip(), widowed]
         out.extend([got[0][len(pad):], *got[1:]] if got else [""])
     return "\n".join(out)
+
+
+def render_labeled_row(label, value, trailer=None, width=None,
+                       label_width=REPORT_LABEL_WIDTH):
+    """One explicit label/value row, with an optional trailing fact."""
+    if len(label) > label_width:
+        raise ValueError(f"label {label!r} is wider than its {label_width}-column field")
+    width = width or term_width()
+    prefix = f"{label:<{label_width}}"
+    lines = fill(prefix + str(value), width=width,
+                 continuation_column=len(prefix)).splitlines()
+    if trailer is None:
+        return RenderedLine("\n".join(lines))
+    trailer = " ".join(str(trailer).split())
+    suffix = " " + trailer
+    if lines and len(lines[-1]) + len(suffix) <= width:
+        lines[-1] += suffix
+    else:
+        lines.extend(fill(
+            trailer, width=width, continuation_column=len(prefix),
+            starts_as_continuation=True).splitlines())
+    return RenderedLine("\n".join(lines))
 
 
 class HelpLayout(argparse.RawDescriptionHelpFormatter):
@@ -8155,19 +8188,34 @@ def run_one(args, passthrough, table, prefix="", pending=()):
     return Outcome("launched" if alive else "failed", socket, False, unwritten)
 
 
-def render_transcript_row(stem, fact=None, note=None, completion=False, limit=None):
-    """One transcript row, shared by listings, completion, and refusals."""
-    limit = COMPLETION_TITLE if limit is None else limit
+def render_transcript_row(stem, fact=None, note=None, completion=False, limit=None,
+                          report_label=None, width=None):
+    """One transcript row, shared by listings, completion, refusals, and reports."""
+    if completion and report_label is not None:
+        raise ValueError("a transcript row cannot be completion and report output")
+    report = report_label is not None
+    if limit is None:
+        limit = REPORT_TRANSCRIPT_TITLE if report else COMPLETION_TITLE
+    where = None
     if fact:
         path = fact["path"]
         when = ms_str(fact["mtime"]) if fact.get("mtime") else "missing"
-        title = bounded_title(fact.get("title"), limit)
+        raw_title = fact.get("title")
+        title = (clip(raw_title, limit) if report else bounded_title(raw_title, limit))
         where = f"{path.parent.name}, {when}"
-        desc = f"{title}  [{where}]" if title else where
+        if report:
+            desc = title or ""
+        else:
+            desc = f"{title}  [{where}]" if title else where
     else:
         desc = "transcript not found"
     if note:
-        desc = f"{note}; {desc}"
+        desc = f"{note}; {desc}" if desc else note
+    if report:
+        value = f"{stem} — {desc}" if desc else f"{stem} —"
+        return render_labeled_row(
+            report_label, value, trailer=f"[{where}]" if where else None,
+            width=width)
     separator = ":" if completion else "  "
     return f"{stem}{separator}{desc}"
 
@@ -8478,6 +8526,9 @@ TEAM_GRACE_S = 300
 
 # Descriptions in completion have a whole terminal row to themselves.
 COMPLETION_TITLE = 400
+# A dossier carries several facts below one agent. Its transcript title identifies
+# the work without taking over the report the way a completion-sized title can.
+REPORT_TRANSCRIPT_TITLE = 160
 # The abort listing is read under time pressure, with a finger on a key, so it
 # gets a glance-sized title rather than the completion menu's paragraph.
 ABORT_TITLE = 60
@@ -8652,11 +8703,13 @@ def run_agent_dossier(agent_id, team_state, requested=False, ledger=None):
     transcript = getattr(resolved, "transcript", None) if resolved else None
     stem = transcript["session"] if transcript else "(none)"
     note = getattr(resolved, "reason", None) if resolved and not transcript else None
-    print(fill(f"session  {render_transcript_row(stem, transcript, note=note)}"))
+    print(render_transcript_row(
+        stem, transcript, note=note, report_label="session"))
     parent_stem, parent_note = RESOLVER.spawn_parent_of(agent_id)
     parent_fact = RESOLVER.transcript_fact(parent_stem) if parent_stem else None
-    print(fill(f"parent   {render_transcript_row(
-        parent_stem or '(none)', parent_fact, note=parent_note)}"))
+    print(render_transcript_row(
+        parent_stem or "(none)", parent_fact, note=parent_note,
+        report_label="parent"))
     # Runtime resolves process and seat together. The roster's recorded pane is
     # not used here because the process may have moved or may run outside tmux.
     runtime = diagnosis["runtime"]
@@ -15136,6 +15189,8 @@ def _check_process_table_runs_no_program(s):
 @unit(('wrap-width-lossless', 'a long message wraps inside the width and loses nothing'),
       ('wrap-continuations-use-ssot-arrow',
        'every wrapped report continuation uses the one wrap-arrow constant'),
+      ('labeled-row-continuation-is-explicit',
+       'a labeled row wraps at its declared column despite later spacing'),
       ('report-width-uses-wide-terminal',
        'reports use up to 140 columns on a wide terminal'))
 def _check_wrap_width_lossless(s):
@@ -15175,6 +15230,19 @@ def _check_wrap_width_lossless(s):
     check("wrap-continuations-use-ssot-arrow",
           "every wrapped report continuation uses the one wrap-arrow constant",
           arrowed, repr(continuations[:3]))
+    ambiguous = render_labeled_row(
+        "session",
+        "571d30ed-eb70-4f16-8a24-e397ca7e9887  Read-only architecture and "
+        "semantics adjudication with several clauses and coordination  [fixture, missing]",
+        width=72)
+    ambiguous_lines = ambiguous.splitlines()
+    explicit = (len(ambiguous_lines) > 2
+                and all(len(line) <= 72 for line in ambiguous_lines)
+                and all(line.index(WRAP_ARROW) == REPORT_LABEL_WIDTH
+                        for line in ambiguous_lines[1:]))
+    check("labeled-row-continuation-is-explicit",
+          "a labeled row wraps at its declared column despite later spacing",
+          explicit, repr(ambiguous_lines))
     was = os.environ.get("COLUMNS")
     try:
         os.environ["COLUMNS"] = "240"
@@ -23151,6 +23219,8 @@ def _check_doctor_target_honoured(s):
      'member dossiers do not replace the team verdict exit status'),
     ('doctor-dossiers-use-transcript-renderer',
      'agent dossiers render conversation rows through the shared transcript renderer'),
+    ('doctor-transcript-rows-wrap-stably',
+     'long dossier titles wrap readably under the report label'),
     ('doctor-selection-makes-no-launch-claim',
      'selecting an agent for diagnosis prints no launch-only cwd warning'),
     ('doctor-joins-mail-once',
@@ -23292,11 +23362,91 @@ def _check_doctor_agent_dossiers(s):
           severed_code == 1, f"exit {severed_code}")
 
     dossier_src = s.src_of(s.funcs["run_agent_dossier"]) or ""
+    report_rendering = (dossier_src.count("render_transcript_row(") == 2
+                        and dossier_src.count("report_label=") == 2
+                        and 'fill(f"session' not in dossier_src
+                        and 'fill(f"parent' not in dossier_src
+                        and "RESOLVER.agent_runtime(" not in dossier_src)
     check("doctor-dossiers-use-transcript-renderer",
           "agent dossiers render conversation rows through the shared transcript renderer",
-          dossier_src.count("render_transcript_row(") == 2
-          and "RESOLVER.agent_runtime(" not in dossier_src,
-          f"renderer calls={dossier_src.count('render_transcript_row(')}")
+          report_rendering,
+          f"renderer calls={dossier_src.count('render_transcript_row(')}, "
+          f"report labels={dossier_src.count('report_label=')}")
+
+    long_title = (
+        "Read-only architecture and semantics adjudication. Review the sealed task-144 "
+        "packet, compare the corpus layout, verify batch-plan coordination, and report "
+        "promotion rules without dropping identifying facts. Continue with mutation "
+        "evidence and final status.")
+    session_stem = "571d30ed-eb70-4f16-8a24-e397ca7e9887"
+    parent_stem = "453e1b4f-086e-4a09-a28c-b6a9d67c668e"
+    session_project = (
+        "-tmp-structural-matcher-validation-candidates-ast-correspondence-v4-3-0-"
+        "7e8ac382-tests-evidence-task-144-memory-diagnosis")
+    parent_project = "-tmp"
+    session_fact = {"path": Path("/fixtures") / session_project / f"{session_stem}.jsonl",
+                    "mtime": None, "title": long_title}
+    parent_fact = {"path": Path("/fixtures") / parent_project / f"{parent_stem}.jsonl",
+                   "mtime": None, "title": "Parent record. " + long_title}
+    wrapped_rows = {}
+    real_columns = os.environ.get("COLUMNS")
+    try:
+        for width in (120, 72):
+            os.environ["COLUMNS"] = str(width)
+            wrapped_rows[width] = (
+                render_transcript_row(
+                    session_stem, session_fact, report_label="session"),
+                render_transcript_row(
+                    parent_stem, parent_fact, note="spawn payload naming it",
+                    report_label="parent"),
+            )
+    finally:
+        if real_columns is None:
+            os.environ.pop("COLUMNS", None)
+        else:
+            os.environ["COLUMNS"] = real_columns
+    wrap_faults = []
+    for width, rows in wrapped_rows.items():
+        arrow_columns = set()
+        for label, stem, project, rendered in zip(
+                ("session", "parent"), (session_stem, parent_stem),
+                (session_project, parent_project), rows):
+            lines = rendered.splitlines()
+            expected = f"{label:<{REPORT_LABEL_WIDTH}}{stem} — "
+            if not lines or not lines[0].startswith(expected):
+                wrap_faults.append(f"{width}:{label} has no stable first row")
+            plain = " ".join(without_wrap_arrows(rendered).split())
+            if stem not in plain or f"[{project}, missing]" not in plain:
+                wrap_faults.append(f"{width}:{label} lost identifying facts")
+            if "task-144 packet" not in plain or "..." not in plain:
+                wrap_faults.append(f"{width}:{label} lost the bounded title")
+            too_wide = [line for line in lines if len(line) > width
+                        and not (WRAP_ARROW in line
+                                 and len(line.split(WRAP_ARROW, 1)[1].split()) == 1)]
+            if too_wide:
+                wrap_faults.append(f"{width}:{label} exceeds width outside one identifier")
+            if any(re.search(r" {20,}", line) for line in lines):
+                wrap_faults.append(f"{width}:{label} has a large whitespace run")
+            if label == "session" and not any(
+                    line.startswith(" " * REPORT_LABEL_WIDTH + WRAP_ARROW + "[" + project)
+                    for line in lines[1:]):
+                wrap_faults.append(f"{width}:{label} metadata is not an explicit continuation")
+            metadata_continuation = False
+            for line in lines[1:]:
+                if WRAP_ARROW not in line:
+                    wrap_faults.append(f"{width}:{label} has an unmarked continuation")
+                    continue
+                arrow_columns.add(line.index(WRAP_ARROW))
+                words = line.split(WRAP_ARROW, 1)[1].split()
+                metadata_continuation = metadata_continuation or bool(
+                    words and words[0].startswith("["))
+                if len(words) < 2 and not metadata_continuation:
+                    wrap_faults.append(f"{width}:{label} has a one-word continuation")
+        if arrow_columns != {REPORT_LABEL_WIDTH}:
+            wrap_faults.append(f"{width}: continuation columns are {sorted(arrow_columns)}")
+    check("doctor-transcript-rows-wrap-stably",
+          "long dossier titles wrap readably under the report label",
+          not wrap_faults, "; ".join(wrap_faults[:5]))
     check("doctor-selection-makes-no-launch-claim",
           "selecting an agent for diagnosis prints no launch-only cwd warning",
           "starting in" not in member_errors and "agent starts" not in member_errors,
