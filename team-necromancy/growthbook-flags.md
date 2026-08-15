@@ -82,6 +82,180 @@ Done this way for `tengu_harbor_kite` on 2026-08-10; backup
 | `tengu_fleetview_peers` | false | false | Adds other live sessions as rows in the agent-view UI (read behind `YE() && nt("tengu_fleetview_peers",false)`). Cosmetic to the fleet view; messaging works without it. Turn on only if the peer list in agent-view is wanted. |
 | `tengu_harbor_kite_mode_emit` | false | false | Telemetry only: emits the session's messaging mode as an event (`Hoi()`). Off is correct with nonessential traffic disabled. |
 | `tengu_harbor_kite_limits` | `{}` → built-in defaults | absent | Rate-limit config for peer messaging (bucketCapacity, refillPerSecond, dedupWindowMs, maxSelfHops, maxChainLength, maxTrackedSenders, maxQueuedPeerMessages). The validator falls back to built-in defaults per field, so an absent or empty entry is the working default. The cache already holds `{}`. Only override to tighten a specific limit. |
+| `tengu_chair_sermon` | false | false | Broadens how attachment reminders are moved into tool results. It is not the switch for message-level system entries, and on the non-promoted fallback path ordinary text steering can already join a string-valued tool result while this flag is false. Leave it off unless its mixed-content relocation is specifically wanted; details below. |
+
+## Mid-turn attachments: `tengu_chair_sermon`
+
+Traced in both 2.1.220 and 2.1.226. The implementation is unchanged apart
+from minified symbol names.
+
+Once absorbed into a running turn, a queued mid-turn command is recorded in the
+transcript as an `attachment` of type `queued_command`. Its usual transcript
+order after a tool call is:
+
+```text
+assistant tool_use
+user tool_result
+attachment queued_command
+```
+
+### When a queued command is absorbed into the running turn
+
+The query does not inspect the queue continuously. It takes one snapshot only
+after the model has emitted at least one `tool_use`, every tool result has
+finished, and `PostToolBatch` hooks have run. Abort, deferred-tool, hook-stop,
+requested-end-turn, dynamic-loop-end, max-turn, and suspended-fold paths all
+return or skip the snapshot first.
+
+The snapshot asks for commands through priority `next`, which includes `now`
+and `next` but excludes `later`. On the main thread the eligibility filter keeps
+entries addressed to the main agent; in a subagent it only keeps targeted task
+notifications. Slash-like inputs are excluded unless slash processing was
+explicitly skipped. The attachment generator then emits `queued_command` only
+for modes `prompt` and `task-notification`; any other selected mode is ignored by
+that generator and excluded from the command-removal batch.
+
+Selected entries with UUIDs are marked fold-in-flight while their
+`queued_command` attachments are generated. The attachments are appended after
+the tool results, and the model is called recursively with the combined history.
+Commands that arrive after the snapshot wait for a later opportunity or for the
+outer queue drain.
+
+A response with no `tool_use` never reaches this code. Claude Code runs Stop
+hooks and completes the turn before checking the queue. A message typed while
+final prose is streaming, after the last tool-boundary snapshot, or while Stop
+hooks run cannot change that response; it becomes a new top-level user turn.
+This is the timing-dependent reason some messages act as immediate steering and
+others appear one turn later.
+
+Removal happens after each attachment has already been yielded to the transcript:
+
+- If selected commands produce no `queued_command` attachment, they remain queued.
+- A partial emission logs an error but removes the whole selected batch.
+- If the outer abort signal is observed after the yield and before removal, the
+  commands remain queued. The attachment may already be in the aborted
+  transcript, so the same text can appear again when the command later runs.
+- An abort after the removal check does not restore the command.
+- `cancel_async_message` cannot remove a UUID while it is fold-in-flight; it
+  reports `cancelled:false`. An interrupt with `cancel_queued:true` is the
+  separate operation that also cancels fold-in-flight UUIDs.
+
+The attachment converter produces one or more user messages. The normalizer
+then decides whether their content stays as user content, is placed inside the
+preceding tool result, or is promoted to a message-level system entry. The
+chair-sermon flag controls only part of the user/tool-result path.
+
+With `tengu_chair_sermon=false` (the default):
+
+- If the preceding user content ends in a `tool_result`, that result's content
+  is a string, and every new attachment block is text, the text is appended to
+  the `tool_result.content` string, separated by blank lines.
+- Otherwise the attachment blocks remain separate blocks in the same user
+  message, or separate user messages if there is no preceding user carrier.
+
+So false does **not** mean "never fold steering into a tool result". On this
+non-promoted path, plain-text steering next to an ordinary string-valued tool
+result is already folded.
+
+With `tengu_chair_sermon=true`:
+
+- Attachment text not already wrapped as a `<system-reminder>` is wrapped first.
+- When the preceding user carrier ends in a `tool_result`, non-`tool_result`
+  attachment blocks are offered to that result even when its existing content
+  is an array or mixed content. Attachment `tool_result` blocks remain after it.
+- A final pass first merges adjacent user messages, then moves any remaining
+  top-level `<system-reminder>` text blocks into the last `tool_result` in that
+  user message.
+
+The broader merge has deliberate exclusions and lossy cases:
+
+- A tool result containing a `tool_reference` block refuses the relocation.
+- For an error tool result, non-text attachment blocks are discarded before
+  merging; if no text remains, the original error result is retained.
+- Text blocks are trimmed and adjacent text is coalesced. Mixed media can
+  therefore have different placement from the false path.
+
+### Why this flag often has no effect on current steering
+
+Before the chair-sermon branch, the normalizer checks whether the selected
+model supports Anthropic's mid-conversation system messages. If support is on
+and the attachment conversion is text-only, the attachment is consumed by an
+earlier branch and accumulated as `api_system`; execution never reaches the
+chair-sermon code for that attachment.
+
+For the normal post-tool case, the outbound order is then:
+
+```text
+assistant tool_use
+user tool_result
+system steering reminder
+```
+
+The stable Claude Code harness remains in the request's top-level `system`
+field. The later reminder is a separate message-level `role: "system"`; Claude
+Code does not splice it into the top-level system prompt.
+
+This promotion is not controlled by GrowthBook. The capability check, called
+`Ser` in 2.1.220 and `wDr` in 2.1.226, runs in this order:
+
+1. HIPAA mode disables it.
+2. `CLAUDE_CODE_FORCE_MID_CONVERSATION_SYSTEM=1` forces it on otherwise.
+3. Per-model metadata feature `mid_conversation_system`, when present, wins.
+4. Explicit older Claude model families are denied.
+5. Model capability `mid_conv_system`, Mythos 5, or one of the eligible provider
+   routes (`firstParty`, Anthropic AWS/Google Cloud, Foundry, or Mantle) enables
+   it.
+
+When enabled, Claude Code sends the beta
+`mid-conversation-system-2026-04-07`. Sonnet 5 is a special case that retains a
+`<system-reminder>` wrapper inside the message-level system content; other
+eligible models receive the unwrapped text. Only text-only attachments qualify
+for promotion.
+
+If the endpoint rejects the system role or beta, the `midConvFallback` path
+normalizes the request again with promotion disabled, returning the reminder to
+the user/tool-result representation described above.
+
+### Direct CLIProxyAPI behaviour
+
+CLIProxyAPI 7.2.116 already handles Claude's two kinds of system content
+separately on its direct Claude-to-Codex route:
+
+- top-level `system` text becomes a Responses `role: "developer"` message;
+- a message-level `role: "system"` reminder becomes a `role: "user"` message at
+  the same history position, wrapped in `<system-reminder>`.
+
+For the promoted text-only case, the resulting order is therefore:
+
+```text
+assistant function_call
+function_call_output
+user steering reminder
+```
+
+This matches native Codex's output-then-user ordering, although native Codex
+uses plain user text rather than Claude's reminder wrapper and explanatory
+scaffold.
+
+When mid-conversation-system promotion is unavailable, the fallback
+user/tool-result rules matter. With the flag false, all-text input following a
+string-valued tool result is already appended to `function_call_output`. With
+the flag true, the broader merge and final sweep place more mixed-content
+reminders there. Neither form produces a separate steering item once the text
+has entered the tool result.
+
+CLIProxyAPI's message-level-system helper always adds an outer reminder wrapper.
+Sonnet 5's special already-wrapped system content would therefore acquire nested
+`<system-reminder>` tags on this route; the helper does not currently detect a
+complete existing wrapper.
+
+Controlled Codex checks followed the correction in every tested direct form:
+plain user text, the explanatory scaffold, a full reminder wrapper, a
+message-level system reminder, and reminder text appended to tool output. This
+is not evidence that the representations are equivalent. When promotion is
+available, the chair-sermon flag is bypassed and both flag values take the same
+path closest to native user-message ordering; leaving it false avoids the
+broader tool-output merge only on fallback and mixed-content paths.
 
 ## Already in the cache, messaging/teams cluster
 
