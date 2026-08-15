@@ -586,12 +586,15 @@ def implicit_team_block(team):
     return minted.group(1) if minted else None
 
 
-def agent_colour(agent_id, member=None):
+def agent_colour(agent_id, member=None, resolver=None):
     """Return the roster color, falling back to the lead's spawn record.
 
-    Completion and abort reports use this answer so an identity keeps one color.
+    Completion, abort, and doctor reports use this answer so an identity keeps
+    one color. A Resolver passes itself while it builds an immutable report answer;
+    other callers use the process-wide Resolver.
     """
-    colour = (member or {}).get("color") or RESOLVER.spawn_payload(agent_id).get("color")
+    source = resolver if resolver is not None else RESOLVER
+    colour = (member or {}).get("color") or source.spawn_payload(agent_id).get("color")
     return colour or ""
 
 
@@ -606,23 +609,38 @@ class RenderedLine(str):
 
 
 def render_agent_row(pid, agent_id, description, colour="", indent="  ",
-                     agent_width=None, width=None):
+                     agent_width=None, width=None, process_width=8):
     """One aligned process/agent/title row, wrapped through fill()."""
-    process = f"{pid:<8} " if pid is not None else " " * 9
+    process = (f"{pid:<{process_width}} " if pid is not None
+               else " " * (process_width + 1))
     agent_width = agent_width or len(agent_id)
     identity = f"{agent_id:<{agent_width}}"
     raw = f"{indent}{process}{identity}  {description}"
     rendered = fill(raw, width=width)
-    return RenderedLine(rendered.replace(identity, paint(identity, colour), 1))
+    return RenderedLine(rendered.replace(agent_id, paint(agent_id, colour), 1))
 
 
-def render_agent_rows(rows, indent="  ", width=None):
-    """Aligned process/agent/title rows. The one renderer for every report."""
+def render_agent_rows(rows, indent="  ", width=None, clip_descriptions=False):
+    """Aligned process/agent/title rows. The one renderer for every report.
+
+    When `clip_descriptions` is true, each title uses the remainder of its first
+    row and never wraps. Reports that print the full conversation below use this
+    for a compact roster without choosing a separate character limit.
+    """
     rows = list(rows)
+    width = width or term_width()
+    process_width = max(
+        [8] + [len(str(pid)) for pid, _agent_id, _desc, _colour in rows
+               if pid is not None])
     agent_width = max((len(agent_id) for _pid, agent_id, _desc, _colour in rows),
                       default=0)
+    if clip_descriptions:
+        title_column = len(indent) + process_width + 1 + agent_width + 2
+        title_width = max(width - title_column, 4)
+        rows = [(pid, agent_id, clip(description, title_width), colour)
+                for pid, agent_id, description, colour in rows]
     return [render_agent_row(pid, agent_id, description, colour, indent,
-                             agent_width, width)
+                             agent_width, width, process_width)
             for pid, agent_id, description, colour in rows]
 
 
@@ -941,6 +959,13 @@ def render_labeled_row(label, value, trailer=None, width=None,
             trailer, width=width, continuation_column=len(prefix),
             starts_as_continuation=True).splitlines())
     return RenderedLine("\n".join(lines))
+
+
+def render_identity_labeled_row(label, agent_id, detail, colour="", width=None):
+    """One labeled identity row whose ANSI spelling does not affect wrapping."""
+    value = f"{agent_id}  {detail}" if detail else agent_id
+    rendered = render_labeled_row(label, value, width=width)
+    return RenderedLine(str(rendered).replace(agent_id, paint(agent_id, colour), 1))
 
 
 class HelpLayout(argparse.RawDescriptionHelpFormatter):
@@ -2582,16 +2607,22 @@ class Resolver:
         roster_names = set(roster_order)
         member_order = roster_order + sorted(
             name for name in population if name not in roster_names)
-        dossier_order = list(member_order)
-        if "team-lead" not in dossier_order:
-            dossier_order.append("team-lead")
+        report_names = list(member_order)
+        if "team-lead" not in report_names:
+            report_names.append("team-lead")
+        member_colours = {}
+        for name in report_names:
+            agent_id = agent_id_of(name, team)
+            member = roster_members.get(name) or {}
+            member_colours[name] = (
+                agent_colour(agent_id, member, resolver=self)
+                if describe_members else ""
+            )
         member_rows = []
         for name in member_order:
             facts = runtimes[name]
             agent_id = agent_id_of(name, team)
-            member = roster_members.get(name) or {}
-            colour = (member.get("color") or self.spawn_payload(agent_id).get("color") or ""
-                      if describe_members else "")
+            colour = member_colours[name]
             resolved = None
 
             def fallback_session():
@@ -2620,8 +2651,7 @@ class Resolver:
                     "membership": population[name][0],
                     "pid": pid,
                     "session": session,
-                    "title": (bounded_title(
-                        (self.transcript_fact(session) or {}).get("title"), ABORT_TITLE)
+                    "title": ((self.transcript_fact(session) or {}).get("title")
                               if describe_members and session else None),
                     "color": colour,
                 })
@@ -2642,16 +2672,18 @@ class Resolver:
         seat_sockets = {socket for _state, socket, _pane in seating.values() if socket}
         unseated = sorted(name for name, (state, _socket, _pane) in seating.items()
                           if state == "unseated")
+        delivery = self._team_delivery_facts(team, lead, roster)
         return {
             "team": team,
             "population": population,
             "names_by_membership": names_by_membership,
             "runtimes": runtimes,
             "lead": lead,
+            "delivery": delivery,
             "live": live,
             "doubled": doubled,
             "member_order": tuple(member_order),
-            "dossier_order": tuple(dossier_order),
+            "member_colours": member_colours,
             "member_rows": member_rows,
             "seating": seating,
             "seat_sockets": seat_sockets,
@@ -4545,6 +4577,61 @@ class Resolver:
         return next((team for team, owner, _ in self._boot_join(snapshot)
                      if owner == pid and team in candidates["teams"]), None), False
 
+    def _team_delivery_facts(self, team, lead, addressed_roster):
+        """Interpret lead and polling evidence once for every member of a team."""
+        pid, alive, exact_lead = lead["pid"], lead["alive"], lead["exact"]
+        lead_team, exact_team = lead["runs_as"], lead["runs_as_exact"]
+        runtime_roster = (self.roster_of(lead_team)
+                          if lead_team else addressed_roster) or {}
+        runtime_members = [member for member in runtime_roster.get("members", [])
+                           if member.get("name") != "team-lead"]
+        worn = lead["worn_team"]
+        if not (pid and alive):
+            polls = (False, "the lead is stopped")
+        elif not runtime_members:
+            polls = (False, "the roster lists no members")
+        elif worn:
+            polls = (True, "its argv names the team, so it read this roster when it booted")
+        else:
+            polls = (None, "a plain lead reads its own memory of the roster, which a roster "
+                           "written from outside does not reach")
+
+        common_reachable, common_remedies = None, ()
+        if not (pid and alive):
+            common_reachable = (False, f"lead process for {team} is stopped")
+            common_remedies = (("resume the lead", "starts a process"),)
+        elif lead_team and lead_team != team:
+            common_reachable = (
+                False, f"its lead is live but runs as {lead_team}, so mail sent "
+                f"to {team} remains unpolled")
+            common_remedies = (("--into-team live",
+                                "restarts this member, losing its in-flight turn"),)
+            if not exact_team:
+                common_remedies += (("ask before redirecting",
+                                     "needs a terminal to ask at"),)
+        elif lead_team is None:
+            common_reachable = (
+                False, "its lead is live and structural team resolution returned "
+                "unknown, so mailbox polling cannot be located")
+            common_remedies = (
+                ("have the lead start any teammate",
+                 "a spawn records the team it runs as and starts it reading mail; "
+                 "immediate, costs nothing"),
+                ("resume the lead under its own identity",
+                 "restarts it, and it then states its team in argv, at the cost of "
+                 "its current turn"),
+            )
+        return types.MappingProxyType({
+            "lead": {**lead, "grade": "exact" if exact_lead else "inferred"},
+            "lead_team": (lead_team, "exact" if exact_team else
+                          f"paired by a boot within {TEAM_MINT_WINDOW_MS}ms, not proven"),
+            "polls": polls,
+            "common_reachable": common_reachable,
+            "common_remedies": common_remedies,
+            "addressed_members": tuple(addressed_roster.get("members", [])),
+            "addressed_lead_id": addressed_roster.get("leadAgentId"),
+        })
+
     def agent_diagnosis(self, agent_id, parent_session=None, team_state=None):
         """Return composed lead, member, team, and mailbox status.
 
@@ -4558,61 +4645,25 @@ class Resolver:
         if team_state is not None:
             member_runtime = (team_state["runtimes"].get(name)
                               or self.agent_runtime(agent_id))
-            lead = team_state["lead"]
+            delivery = team_state["delivery"]
         else:
             member_runtime = self.agent_runtime(
                 agent_id, parent_session=parent_session if name == "team-lead" else None)
             lead = (member_runtime if name == "team-lead" else self.agent_runtime(
                 agent_id_of("team-lead", team), parent_session=parent_session))
-        pid, alive, exact_lead = lead["pid"], lead["alive"], lead["exact"]
-        lead_team, exact_team = lead["runs_as"], lead["runs_as_exact"]
-        addressed_roster = self.roster_of(team) or {}
-        addressed_members = addressed_roster.get("members", [])
+            delivery = self._team_delivery_facts(
+                team, lead, self.roster_of(team) or {})
+        lead_team = delivery["lead_team"][0]
+        polls = delivery["polls"]
         listed = (any(member.get("agentId") == agent_id
                       or member.get("name") == name
-                      for member in addressed_members)
+                      for member in delivery["addressed_members"])
                   or (name == "team-lead"
-                      and addressed_roster.get("leadAgentId") == agent_id))
-        runtime_roster = (self.roster_of(lead_team) if lead_team else addressed_roster) or {}
-        runtime_members = [member for member in runtime_roster.get("members", [])
-                           if member.get("name") != "team-lead"]
+                      and delivery["addressed_lead_id"] == agent_id))
 
-        # Mail polling starts when the live lead has members in its runtime team
-        # state. Flag-bound startup reads the roster. Plain leads update runtime
-        # members through their own spawns, while external roster edits remain
-        # disk-only.
-        worn = lead["worn_team"]
-        if not (pid and alive):
-            polls = (False, "the lead is stopped")
-        elif not runtime_members:
-            polls = (False, "the roster lists no members")
-        elif worn:
-            polls = (True, "its argv names the team, so it read this roster when it booted")
-        else:
-            polls = (None, "a plain lead reads its own memory of the roster, which a roster "
-                           "written from outside does not reach")
-        if not (pid and alive):
-            reachable, why = False, f"lead process for {team} is stopped"
-            remedies = [("resume the lead", "starts a process")]
-        elif lead_team and lead_team != team:
-            reachable, why = False, (f"its lead is live but runs as {lead_team}, so mail sent "
-                                     f"to {team} remains unpolled")
-            remedies = [("--into-team live", "restarts this member, losing its in-flight turn")]
-            if not exact_team:
-                remedies.append(("ask before redirecting", "needs a terminal to ask at"))
-        elif lead_team is None:
-            reachable, why = False, ("its lead is live and structural team resolution returned "
-                                     "unknown, so mailbox polling cannot be located")
-            # Both ways to make a lead read, always together: a lead learns of
-            # members only from its own spawns or a flag-bound boot, so writing
-            # the roster from outside reaches nothing, and a remedy list naming
-            # only the restart hides the fix that costs nothing.
-            remedies = [("have the lead start any teammate",
-                         "a spawn records the team it runs as and starts it "
-                         "reading mail; immediate, costs nothing"),
-                        ("resume the lead under its own identity",
-                         "restarts it, and it then states its team in argv, at "
-                         "the cost of its current turn")]
+        if delivery["common_reachable"] is not None:
+            reachable, why = delivery["common_reachable"]
+            remedies = list(delivery["common_remedies"])
         elif not listed:
             reachable, why = False, (f"{lead_team} roster member search returned empty, so the "
                                      "lead has no runtime registration for it")
@@ -4638,9 +4689,8 @@ class Resolver:
         return {
             "agent_id": agent_id, "name": name, "team": team,
             "runtime": member_runtime,
-            "lead": {**lead, "grade": "exact" if exact_lead else "inferred"},
-            "lead_team": (lead_team, "exact" if exact_team else
-                          f"paired by a boot within {TEAM_MINT_WINDOW_MS}ms, not proven"),
+            "lead": delivery["lead"],
+            "lead_team": delivery["lead_team"],
             "polls": polls,
             "listed": listed,
             "reachable": (reachable, why),
@@ -8277,10 +8327,12 @@ def run_one(args, passthrough, table, prefix="", pending=()):
 
 
 def render_transcript_row(stem, fact=None, note=None, completion=False, limit=None,
-                          report_label=None, width=None):
+                          report_label=None, report_title_label=None, width=None):
     """One transcript row, shared by listings, completion, refusals, and reports."""
     if completion and report_label is not None:
         raise ValueError("a transcript row cannot be completion and report output")
+    if report_title_label is not None and report_label is None:
+        raise ValueError("a report title label needs a report stem label")
     report = report_label is not None
     if limit is None:
         limit = REPORT_TRANSCRIPT_TITLE if report else COMPLETION_TITLE
@@ -8300,10 +8352,16 @@ def render_transcript_row(stem, fact=None, note=None, completion=False, limit=No
     if note:
         desc = f"{note}; {desc}" if desc else note
     if report:
-        value = f"{stem} — {desc}" if desc else f"{stem} —"
+        trailer = f"[{where}]" if where else None
+        if report_title_label is not None:
+            stem_row = render_labeled_row(report_label, stem, width=width)
+            title_row = render_labeled_row(
+                report_title_label, desc or "(no title)", trailer=trailer,
+                width=width)
+            return RenderedLine(f"{stem_row}\n{title_row}")
+        value = f"{stem}: {desc}" if desc else f"{stem}:"
         return render_labeled_row(
-            report_label, value, trailer=f"[{where}]" if where else None,
-            width=width)
+            report_label, value, trailer=trailer, width=width)
     separator = ":" if completion else "  "
     return f"{stem}{separator}{desc}"
 
@@ -8775,24 +8833,23 @@ def cleanup_teams(dry=False):
     return removed, kept, locks
 
 
-def run_agent_dossier(agent_id, team_state, requested=False, ledger=None):
-    """Print one agent's diagnosis below its team's doctor report."""
+def run_agent_dossier(diagnosis, team_state, shared=None,
+                      requested=False, ledger=None):
+    """Print one member-specific dossier below its team's diagnosis."""
+    agent_id = diagnosis["agent_id"]
     if not agent_id or "@" not in str(agent_id):
         die("an agent dossier needs name@team")
-    diagnosis = RESOLVER.agent_diagnosis(agent_id, team_state=team_state)
-    lead = diagnosis["lead"]
-    pid, alive, detail, grade = (
-        lead["pid"], lead["alive"], lead["detail"], lead["grade"])
-    marker = "  [requested]" if requested else ""
-    print(f"agent    {diagnosis['agent_id']}{marker}")
-    name, team = name_and_team(diagnosis["agent_id"])
+    name, team = name_and_team(agent_id)
+    print(render_doctor_identity(
+        "agent", agent_id, team_state, requested=requested))
     resolved = RESOLVER.resolve_transcript(
         name=name, team=team, quick=True, runtime=diagnosis["runtime"])
     transcript = getattr(resolved, "transcript", None) if resolved else None
     stem = transcript["session"] if transcript else "(none)"
     note = getattr(resolved, "reason", None) if resolved and not transcript else None
     print(render_transcript_row(
-        stem, transcript, note=note, report_label="session"))
+        stem, transcript, note=note, report_label="session",
+        report_title_label="title"))
     parent_stem, parent_note = RESOLVER.spawn_parent_of(agent_id)
     parent_fact = RESOLVER.transcript_fact(parent_stem) if parent_stem else None
     print(render_transcript_row(
@@ -8803,61 +8860,99 @@ def run_agent_dossier(agent_id, team_state, requested=False, ledger=None):
     runtime = diagnosis["runtime"]
     seat = runtime["seat_state"]
     seat_socket, seat_pane = runtime["socket"], runtime["pane"]
-    # Both halves, for the word at the end of the line. The usual way to ask
-    # this is from inside the session being asked about, and "it is live" reads
-    # as some other process unless the line says which one.
+    # The usual caller is inside the session being examined. Say that explicitly
+    # rather than making an unqualified live PID read as another process.
     inside = (f"  (pid {runtime['ours'][0][0]}, which this command is running inside)"
               if runtime["ours"] else "")
-    print(fill("seat     " + {"seated": f"in pane {seat_pane} on {seat_socket}",
-                              "unseated": "none; it is live and in no tmux pane",
-                              "not running": "none; it is not running"}[seat] + inside))
-    if pid:
-        print(fill(f"lead     pid {pid}{'' if alive else ', not running'}"
-                   + (f"  ({detail})" if detail else "") + f" [{grade}]"))
-    else:
-        print("lead     (none)")
-    # A grade rates an answer. With no team to rate, the boot-timing grade would
-    # describe a pairing that never happened, so an unknown says only that.
-    said_team, said_grade = diagnosis["lead_team"]
-    print(fill(f"runs as  {said_team}  [{said_grade}]" if said_team
-               else "runs as  (unknown)"))
-    said = {True: "yes", False: "no", None: "unknowable"}[diagnosis["polls"][0]]
-    print(fill(f"polls    {said}  ({diagnosis['polls'][1]})"))
-    print(f"listed   {'yes' if diagnosis['listed'] else 'no'}")
-    reachable, why = diagnosis["reachable"]
-    # "At its next turn boundary": delivery queues while a recipient's turn
-    # runs, so the dossier must not imply an immediacy nothing guarantees.
-    verdict = {True: "reaches its lead at its next turn boundary",
-               False: "does not reach its lead",
-               None: "may not reach its lead"}[reachable]
-    print(fill(f"mail     {verdict}: {why}"))
+    seat_text = {"seated": f"in pane {seat_pane} on {seat_socket}",
+                 "unseated": "none; live outside tmux",
+                 "not running": "none"}[seat] + inside
+    print(render_labeled_row("seat", seat_text))
+
+    shared = shared or {}
+    if diagnosis["polls"] != shared.get("polls"):
+        said = {True: "yes", False: "no", None: "unknowable"}[diagnosis["polls"][0]]
+        print(render_labeled_row(
+            "polls", f"{said}  ({diagnosis['polls'][1]})"))
+    if diagnosis["reachable"] != shared.get("reachable"):
+        reachable, why = diagnosis["reachable"]
+        verdict = {True: "reaches its lead at its next turn boundary",
+                   False: "does not reach its lead",
+                   None: "may not reach its lead"}[reachable]
+        print(render_labeled_row("mail", f"{verdict}: {why}"))
+
     held = transcript["session"] if transcript else None
     fragile = RESOLVER.rebind_fragility(held, team)
     if fragile:
-        print(fill(f"fragile  {fragile}"))
+        print(render_labeled_row("fragile", fragile))
     addressed = ([row for row in ledger if row["to"] == name]
                  if ledger is not None else RESOLVER.mail_ledger(team, to=name))
     held_count = sum(row["state"] == "in memory" for row in addressed)
     lost = sum(row["state"] == "unexplained" for row in addressed)
     if held_count or lost:
-        print(fill(f"ledger   {held_count} in its memory, {lost} unexplained, of "
-                   f"{len(addressed)} sends addressed to it"))
+        print(render_labeled_row(
+            "ledger", f"{held_count} in its memory, {lost} unexplained, of "
+            f"{len(addressed)} sends addressed to it"))
+    shared_remedies = set(shared.get("remedies", ()))
     for what, cost in diagnosis["remedies"]:
-        print(fill(f"remedy   {what}  ({cost})"))
+        if (what, cost) not in shared_remedies:
+            print(render_labeled_row("remedy", f"{what}  ({cost})"))
     return 0
 
 
-def doctor_dossier_ids(team, state, requested=None):
-    """Agent IDs in doctor order: requested, real lead, then roster order."""
+def doctor_member_ids(team, state, requested=None):
+    """One report order: requested, genuine lead, then stable member order."""
     requested_name, requested_team = name_and_team(requested)
     priority = ([requested_name] if requested_name and requested_team == team else [])
     priority.append("team-lead")
     names, seen = [], set()
-    for name in priority + list(state["dossier_order"]):
+    for name in priority + list(state["member_order"]):
         if name and name not in seen:
             names.append(name)
             seen.add(name)
     return tuple(agent_id_of(name, team) for name in names)
+
+
+def doctor_member_labels(agent_id, state, requested=False):
+    """Explicit membership and runtime labels shared by both report sections."""
+    name, _team = name_and_team(agent_id)
+    membership = (state["population"].get(name) or ("not listed",))[0]
+    runtime = state["runtimes"].get(name) or {}
+    processes = runtime.get("processes") or []
+    labels = (["requested"] if requested else []) + [membership]
+    labels.append("running" if processes else "stopped")
+    if len(processes) > 1:
+        labels.append(f"{len(processes)} processes")
+    return tuple(labels)
+
+
+def render_doctor_identity(label, agent_id, state, requested=False,
+                           suffix=None, width=None):
+    """One consistently ordered, coloured, and explicitly labelled agent."""
+    name, _team = name_and_team(agent_id)
+    labels = " ".join(f"[{value}]" for value in doctor_member_labels(
+        agent_id, state, requested=requested))
+    detail = labels + (f"  {suffix}" if suffix else "")
+    colour = state["member_colours"].get(name, "")
+    return render_identity_labeled_row(
+        label, agent_id, detail, colour=colour, width=width)
+
+
+def doctor_shared_facts(diagnoses):
+    """Facts and remedies that every diagnosis in this team repeats exactly."""
+    rows = list(diagnoses.values())
+    if not rows:
+        return types.MappingProxyType({"remedies": ()})
+    shared = {}
+    for key in ("lead", "lead_team", "polls", "reachable"):
+        first = rows[0][key]
+        if all(row[key] == first for row in rows[1:]):
+            shared[key] = first
+    shared["remedies"] = tuple(
+        remedy for remedy in rows[0]["remedies"]
+        if all(remedy in row["remedies"] for row in rows[1:])
+    )
+    return types.MappingProxyType(shared)
 
 
 # What each verdict claims, in the order of how much is wrong.
@@ -8884,32 +8979,57 @@ def undelivered_mail_lines(rows):
     The inbox file is pruned the moment a busy recipient queues mail into
     memory, so the file's silence proves nothing; these lines carry the two
     states only the send-vs-delivery join can see. The counts are
-    per-recipient facts and stay per-recipient; the physics is shared and
-    is said once, however many recipients hold mail.
+    per-recipient facts and stay per-recipient; the delivery rule is shared
+    and is said once, however many recipients hold mail.
     """
     out = []
+    label_width = REPORT_LABEL_WIDTH + 2
     held = collections.Counter(r["to"] for r in rows if r["state"] == "in memory")
     if held:
-        out.append("mail     " + ", ".join(f"{count} in {to}'s memory"
-                                           for to, count in held.most_common()))
-        out.append(f"{'':9}delivery waits on each holder's next turn boundary "
-                   "and dies with its process")
+        counts = ", ".join(f"{count} in {to}'s memory"
+                           for to, count in held.most_common())
+        out.append(render_labeled_row(
+            "  mail", counts,
+            trailer="delivery waits on each holder's next turn boundary and "
+                    "dies with its process",
+            label_width=label_width))
     for r in rows:
         if r["state"] == "unexplained":
-            out.append(f"mail     unexplained: {r['sender']} -> {r['to']} at "
-                       f"{ms_str(r['sent'])}  {(r['summary'] or '')[:40]}")
+            out.append(render_labeled_row(
+                "  mail",
+                f"unexplained: {r['sender']} -> {r['to']} at {ms_str(r['sent'])}",
+                trailer=(r["summary"] or "")[:40] or None,
+                label_width=label_width))
     return out
 
 
-def doctor_member_lines(runtime):
-    """Render the structured member rows in a team-runtime answer."""
-    return render_agent_rows(
-        (row["pid"], row["agent_id"], row["title"] or "(no title)", row["color"])
-        for row in runtime["member_rows"]
-    )
+def doctor_member_lines(runtime, member_order):
+    """Render each ordered member once as aligned PID, identity, and title."""
+    rows = collections.defaultdict(list)
+    for row in runtime["member_rows"]:
+        rows[row["agent_id"]].append(row)
+    records = []
+    for agent_id in member_order:
+        name, _team = name_and_team(agent_id)
+        processes = (runtime["runtimes"].get(name) or {}).get("processes") or []
+        pid_text = ", ".join(str(pid) for pid, _held in processes) or None
+        title_rows = rows.get(agent_id) or [{}]
+        titles = [row.get("title") or "(no title)" for row in title_rows]
+        if len(set(titles)) == 1:
+            title_text = titles[0]
+        else:
+            title_text = "; ".join(
+                f"{row.get('pid')}: {title}"
+                for row, title in zip(title_rows, titles))
+        records.append((
+            pid_text, agent_id, title_text,
+            runtime["member_colours"].get(name, ""),
+        ))
+    return render_agent_rows(records, clip_descriptions=True)
 
 
-def diagnose_team(team, table=None, deep=False, ledger=None, team_state=None):
+def diagnose_team(team, table=None, deep=False, ledger=None, team_state=None,
+                  member_order=None, requested=None, shared=None):
     """(verdict, lines, remedies) for one team. Asks the engine; reads nothing.
 
     Every fact here is an answer, so the doctor cannot reach a conclusion the
@@ -8920,6 +9040,7 @@ def diagnose_team(team, table=None, deep=False, ledger=None, team_state=None):
     table = RESOLVER.process_table() if table is None else table
     runtime = (RESOLVER.team_runtime(team, table)
                if team_state is None else team_state)
+    member_order = member_order or doctor_member_ids(team, runtime, requested)
     lead = runtime["lead"]
     pid, alive, detail = lead["pid"], lead["alive"], lead["detail"]
     lead_team, exact_team = lead["runs_as"], lead["runs_as_exact"]
@@ -8935,24 +9056,45 @@ def diagnose_team(team, table=None, deep=False, ledger=None, team_state=None):
     live = runtime["live"]
     doubled = runtime["doubled"]
 
+    shared = shared or {}
+    shared_lead = shared.get("lead") or {}
     if pid:
+        lead_grade = f" [{shared_lead['grade']}]" if shared_lead.get("grade") else ""
         lines = [f"lead     pid {pid}{'' if alive else ', not running'}"
-                 + (f"  ({detail})" if detail else "")]
+                 + (f"  ({detail})" if detail else "") + lead_grade]
     else:
         lines = ["lead     (none)"]
     lead_row = next((row for row in runtime["member_rows"]
                      if row["name"] == "team-lead"), None)
     if lead_row and lead_row["title"]:
-        lines.append(f"title    {lead_row['title']}")
-    if pid and alive:
-        # Same rule as the dossier: no answer, no grade for it.
+        lines.append(f"title    {clip(lead_row['title'], REPORT_TRANSCRIPT_TITLE)}")
+    if "lead_team" in shared:
+        said_team, said_grade = shared["lead_team"]
+        lines.append(f"runs as  {said_team}  [{said_grade}]" if said_team
+                     else "runs as  (unknown)")
+    elif pid and alive:
         grade = "exact" if exact_team else "inferred from boot timing"
         lines.append(f"runs as  {lead_team}  [{grade}]" if lead_team
                      else "runs as  (unknown)")
+    if "polls" in shared:
+        said = {True: "yes", False: "no", None: "unknowable"}[shared["polls"][0]]
+        lines.append(f"polls    {said}  ({shared['polls'][1]})")
+    if "reachable" in shared:
+        reachable, why = shared["reachable"]
+        count = len(member_order or ())
+        if count == 1:
+            verdict = {True: "this member reaches its lead at its next turn boundary",
+                       False: "this member does not reach its lead",
+                       None: "this member may not reach its lead"}[reachable]
+        else:
+            verdict = {True: f"all {count} members reach their lead at their next turn boundary",
+                       False: f"all {count} members do not reach their lead",
+                       None: f"all {count} members may not reach their lead"}[reachable]
+        lines.append(f"mail     {verdict}: {why}")
     lines.append(f"members  {len(listed)} listed, {len(unrecorded)} unrecorded, "
                  f"{len(former)} former, {len(live)} live"
                  + (f", {len(converted)} converted" if converted else ""))
-    lines.extend(doctor_member_lines(runtime))
+    lines.extend(doctor_member_lines(runtime, member_order))
     # A lead never sits in a pane, so team_runtime omits it from seating. The
     # doctor reads the one seat answer per live member for both the split and the
     # warning below.
@@ -9066,6 +9208,9 @@ def diagnose_team(team, table=None, deep=False, ledger=None, team_state=None):
             remedies.append((f"{TOOL} {agent_id_of(name, team)}", "starts one of them again"))
     else:
         verdict = "CONNECTED"
+    for remedy in shared.get("remedies", ()):
+        if remedy not in remedies:
+            remedies.append(remedy)
     return verdict, lines, remedies
 
 
@@ -9103,15 +9248,24 @@ def run_doctor(args):
         skipped = 0 if args.all_members else len(everything) - len(teams)
     worst, seen = 0, set()
     blocks = []
-    ledgers, states = {}, {}
+    ledgers, states, orders, diagnoses, shared_facts = {}, {}, {}, {}, {}
     for team in teams:
         state = RESOLVER.team_runtime(team)
         states[team] = state
+        order = doctor_member_ids(team, state, requested)
+        orders[team] = order
+        team_diagnoses = ({agent_id: RESOLVER.agent_diagnosis(
+            agent_id, team_state=state) for agent_id in order}
+                            if target else {})
+        diagnoses[team] = team_diagnoses
+        shared = doctor_shared_facts(team_diagnoses) if target else {}
+        shared_facts[team] = shared
         ledger = RESOLVER.mail_ledger(team) if target else None
         if ledger is not None:
             ledgers[team] = ledger
         verdict, lines, remedies = diagnose_team(
-            team, deep=bool(target), ledger=ledger, team_state=state)
+            team, deep=bool(target), ledger=ledger, team_state=state,
+            member_order=order, requested=requested, shared=shared)
         seen.add(verdict)
         # A remedy is a command plus an explanation of what it does. The
         # command carries the team name and so differs per block; the
@@ -9196,10 +9350,11 @@ def run_doctor(args):
     if show_dossiers:
         for team in teams:
             print(f"\nagent dossiers  {team}")
-            for agent_id in doctor_dossier_ids(team, states[team], requested):
+            for agent_id in orders[team]:
                 print()
                 run_agent_dossier(
-                    agent_id, states[team], requested=agent_id == requested,
+                    diagnoses[team][agent_id], states[team],
+                    shared=shared_facts[team], requested=agent_id == requested,
                     ledger=ledgers[team])
     return worst
 
@@ -15713,7 +15868,7 @@ def _check_no_coinages_in_output(s):
       ('doctor-lists-member-pid-id-title',
        'the doctor lists each member with pid when live, agent id and title'),
       ('doctor-reuses-agent-row-renderer',
-       'the doctor and abort listing use the same process-agent-title renderer'),
+       'the doctor roster keeps the shared PID, identity, and title renderer'),
       ('agent-rows-align-and-arrow-titles',
        'agent rows align title columns and arrow their wrapped continuations'))
 def _check_doctor_shared_fact_once(s):
@@ -15788,7 +15943,7 @@ def _check_doctor_shared_fact_once(s):
             real_known = eng.known_teams
             eng.known_teams = lambda: (census_asked.append(1), real_known())[1]
             globals()["diagnose_team"] = (
-                lambda team, table=None, deep=False, ledger=None, team_state=None: ("CONNECTED", [], []))
+                lambda team, table=None, deep=False, ledger=None, team_state=None, **kwargs: ("CONNECTED", [], []))
             try:
                 with capturing("out") as told_doc:
                     run_doctor(_DocArgs())
@@ -15837,20 +15992,36 @@ def _check_doctor_shared_fact_once(s):
         (None, agent_id_of("gamma", probe_team), "(no title)"),
         (lead_pid, agent_id_of("team-lead", probe_team), "Lead work"),
     }
-    rendered_members = doctor_member_lines(runtime_live)
-    member_ok = expected_members <= member_facts and all(
-        rendered in lines_live for rendered in rendered_members)
+    rendered_members = doctor_member_lines(
+        runtime_live, doctor_member_ids(probe_team, runtime_live))
+    rendered_by_agent = {
+        agent_id: next((str(row).splitlines()[0] for row in rendered_members
+                        if agent_id in str(row)), "")
+        for _pid, agent_id, _title in expected_members
+    }
+    member_ok = (expected_members <= member_facts
+                 and all(rendered in lines_live for rendered in rendered_members)
+                 and rendered_by_agent[agent_id_of("alpha", probe_team)].startswith(
+                     f"  {8822:<8} {agent_id_of('alpha', probe_team)}")
+                 and rendered_by_agent[agent_id_of("team-lead", probe_team)].startswith(
+                     f"  {lead_pid:<8} {agent_id_of('team-lead', probe_team)}")
+                 and rendered_by_agent[agent_id_of("beta", probe_team)].startswith(
+                     " " * (REPORT_LABEL_WIDTH + 2)
+                     + agent_id_of("beta", probe_team)))
     check("doctor-lists-member-pid-id-title",
           "the doctor lists each member with pid when live, agent id and title",
-          member_ok, repr(sorted(member_facts, key=lambda row: str(row))))
+          member_ok, repr(rendered_by_agent))
     doctor_rows_src = src_of(funcs["doctor_member_lines"])
-    abort_src = src_of(funcs["abort_agents"])
+    dossier_src = src_of(funcs["run_agent_dossier"])
+    identity_src = src_of(funcs["render_doctor_identity"])
     reused = (doctor_rows_src.count("render_agent_rows(") == 1
-              and abort_src.count("render_agent_rows(") == 1)
+              and dossier_src.count("render_doctor_identity(") == 1
+              and identity_src.count("render_identity_labeled_row(") == 1)
     check("doctor-reuses-agent-row-renderer",
-          "the doctor and abort listing use the same process-agent-title renderer",
-          reused, f"doctor calls={doctor_rows_src.count('render_agent_rows(')}, "
-                  f"abort calls={abort_src.count('render_agent_rows(')}")
+          "the doctor roster keeps the shared PID, identity, and title renderer",
+          reused, f"roster={doctor_rows_src.count('render_agent_rows(')}, "
+          f"dossier={dossier_src.count('render_doctor_identity(')}, "
+          f"identity={identity_src.count('render_identity_labeled_row(')}")
     rendered = render_agent_rows([
         (8822, "a@team", "A title whose continuation has enough words to wrap " * 3, ""),
         (None, "much-longer-name@team", "Short title", ""),
@@ -15881,7 +16052,11 @@ def _check_doctor_shared_fact_once(s):
 @unit(('runtime-provenance-is-structured',
        'plain-lead evidence and argv identity stay distinct through resolution'),
       ('team-runtime-descriptions-follow-needs',
-       'team runtime reads member descriptions only when NEED.TITLES is declared'))
+       'team runtime reads member descriptions only when NEED.TITLES is declared'),
+      ('team-runtime-keeps-full-titles',
+       'team runtime retains title facts without a display-specific limit'),
+      ('doctor-roster-clips-to-title-column',
+       'the doctor roster clips titles to one line at the terminal width'))
 def _check_runtime_provenance_is_structured(s):
     checked = []
 
@@ -15897,10 +16072,14 @@ def _check_runtime_provenance_is_structured(s):
         session = "11111111-1111-4111-8111-111111111111"
         team = "session-11111111"
         agent_id = agent_id_of("team-lead", team)
+        full_title = (
+            "Plain lead runtime title with enough words to exceed the abort listing "
+            "limit while remaining useful in the doctor report and its aligned roster "
+            "title column, including the final identifying phrase")
         (project / f"{session}.jsonl").write_text(fixture_line({
             "type": "user", "uuid": "root", "parentUuid": None,
             "sessionId": session, "timestamp": "2026-01-01T00:00:00Z",
-            "message": {"role": "user", "content": "Plain lead runtime title"},
+            "message": {"role": "user", "content": full_title},
         }) + "\n")
         directory = teams / team
         directory.mkdir(parents=True)
@@ -15925,6 +16104,19 @@ def _check_runtime_provenance_is_structured(s):
             name="team-lead", team=team, is_lead=True, quick=True)
         with capturing("err"):
             plain_ctx = plain.identity(agent_id=agent_id)
+        plain_state = plain.team_runtime(team, plain_fake.process_rows())
+        plain_rosters = {}
+        real_columns = os.environ.get("COLUMNS")
+        try:
+            for width in (80, 120):
+                os.environ["COLUMNS"] = str(width)
+                plain_rosters[width] = doctor_member_lines(
+                    plain_state, doctor_member_ids(team, plain_state))
+        finally:
+            if real_columns is None:
+                os.environ.pop("COLUMNS", None)
+            else:
+                os.environ["COLUMNS"] = real_columns
 
         argv_pid = plain_pid + 1000000
         argv_fake = _FakeTmux(processes=[(
@@ -15961,6 +16153,38 @@ def _check_runtime_provenance_is_structured(s):
         check("runtime-provenance-is-structured",
               "plain-lead evidence and argv identity stay distinct through resolution",
               not wrong, ", ".join(wrong))
+        stored_title = next(
+            row["title"] for row in plain_state["member_rows"]
+            if row["agent_id"] == agent_id)
+        check("team-runtime-keeps-full-titles",
+              "team runtime retains title facts without a display-specific limit",
+              stored_title == full_title,
+              f"stored {len(stored_title or '')} of {len(full_title)} characters")
+        roster_faults = []
+        clipped_lengths = []
+        for width, rendered in plain_rosters.items():
+            matching = next((str(row) for row in rendered if agent_id in str(row)), "")
+            lines = matching.splitlines()
+            if len(lines) != 1:
+                roster_faults.append(f"{width}: {len(lines)} physical lines")
+                continue
+            line = lines[0]
+            title_at = line.find("Plain lead")
+            if title_at < 0:
+                roster_faults.append(f"{width}: title column is absent")
+                continue
+            expected = clip(full_title, width - title_at)
+            if line[title_at:] != expected or len(line) > width:
+                roster_faults.append(
+                    f"{width}: expected {expected!r}, got {line[title_at:]!r}")
+            clipped_lengths.append(len(line[title_at:]))
+        doctor_rows_src = s.src_of(s.funcs["doctor_member_lines"]) or ""
+        clips_once = (not roster_faults and clipped_lengths == sorted(clipped_lengths)
+                      and len(set(clipped_lengths)) == 2
+                      and "clip_descriptions=True" in doctor_rows_src)
+        check("doctor-roster-clips-to-title-column",
+              "the doctor roster clips titles to one line at the terminal width",
+              clips_once, "; ".join(roster_faults) or repr(clipped_lengths))
 
     lean = s.corpus_engine()
     lean.needs = Needs(maybe=set(NEED) - {NEED.TITLES})
@@ -23603,12 +23827,34 @@ def _check_doctor_target_honoured(s):
      'a directly named team lists its real lead before every member'),
     ('doctor-dossiers-complete-and-stable',
      'the doctor prints every member once in stable roster order'),
+    ('doctor-summary-and-dossiers-share-order',
+     'the team summary and dossiers consume one canonical member order'),
+    ('doctor-identity-colours-match',
+     'the same agent identity colour appears in its summary and dossier rows'),
+    ('doctor-ansi-layout-stable',
+     'identity ANSI changes no report spacing or wrapping'),
+    ('doctor-shared-team-facts-once',
+     'team-wide lead, polling, delivery, and remedy facts print once'),
+    ('doctor-ledger-facts-stay-with-member',
+     'recipient-specific ledger anomalies remain in the matching dossier'),
+    ('doctor-member-statuses-explicit',
+     'dossier headers keep requested, membership, and runtime states explicit'),
+    ('doctor-member-rows-wrap-stably',
+     'roster titles stay on one line and dossier identities wrap under their label'),
+    ('doctor-mail-rows-wrap-stably',
+     'long mail evidence wraps under its report label at every report width'),
+    ('doctor-semantic-facts-preserved',
+     'report restructuring retains every team and member diagnostic fact'),
+    ('doctor-computes-team-delivery-once',
+     'one named report interprets team delivery once for every dossier'),
     ('doctor-dossiers-cover-missing-members',
      'a dead member with no transcript still receives a complete dossier'),
     ('doctor-preserves-team-exit-status',
      'member dossiers do not replace the team verdict exit status'),
     ('doctor-dossiers-use-transcript-renderer',
      'agent dossiers render conversation rows through the shared transcript renderer'),
+    ('doctor-dossier-session-title-separated',
+     'each dossier puts the session identity and title on separate rows'),
     ('doctor-transcript-rows-wrap-stably',
      'long dossier titles wrap readably under the report label'),
     ('doctor-selection-makes-no-launch-claim',
@@ -23645,7 +23891,12 @@ def _check_doctor_agent_dossiers(s):
         if wanted != team or not roster:
             return roster
         roster = copy.deepcopy(roster)
-        roster["members"].append({"name": "birch", "agentId": extra})
+        colours = {"willow": "red", "team-lead": "yellow",
+                   "echo": "blue", "birch": "green"}
+        for roster_member in roster["members"]:
+            roster_member["color"] = colours.get(roster_member.get("name"), "")
+        roster["members"].append(
+            {"name": "birch", "agentId": extra, "color": colours["birch"]})
         rank = {"willow": 0, "echo": 1, "birch": 2, "team-lead": 3}
         roster["members"].sort(key=lambda member: rank.get(member.get("name"), 4))
         return roster
@@ -23653,8 +23904,18 @@ def _check_doctor_agent_dossiers(s):
     eng.roster_of = reordered_roster
     mail_reads = []
     real_mail_ledger = eng.mail_ledger
-    eng.mail_ledger = lambda *args, **kwargs: (
-        mail_reads.append((args, kwargs)), real_mail_ledger(*args, **kwargs))[1]
+    ledger_fixture = [
+        {"sender": "sender", "to": "willow", "summary": "willow-only",
+         "sent": 1, "state": "unexplained", "detail": "fixture"},
+        {"sender": "sender", "to": "echo", "summary": "echo-only",
+         "sent": 2, "state": "in memory", "detail": "fixture"},
+    ]
+
+    def recorded_mail(*args, **kwargs):
+        mail_reads.append((args, kwargs))
+        return real_mail_ledger(*args, **kwargs) + ledger_fixture
+
+    eng.mail_ledger = recorded_mail
     runtime_reads = []
     real_team_runtime = eng.team_runtime
     eng.team_runtime = lambda *args, **kwargs: (
@@ -23663,8 +23924,12 @@ def _check_doctor_agent_dossiers(s):
     real_agent_runtime = eng.agent_runtime
     eng.agent_runtime = lambda *args, **kwargs: (
         agent_reads.append((args, kwargs)), real_agent_runtime(*args, **kwargs))[1]
+    delivery_reads = []
+    real_delivery = eng._team_delivery_facts
+    eng._team_delivery_facts = lambda *args, **kwargs: (
+        delivery_reads.append((args, kwargs)), real_delivery(*args, **kwargs))[1]
 
-    def report(**values):
+    def report(colour=False, width=None, **values):
         fields = dict(team=None, agent_id=None, resume=None, all_members=False)
         fields.update(values)
         args = types.SimpleNamespace(**fields)
@@ -23672,34 +23937,75 @@ def _check_doctor_agent_dossiers(s):
         before_mail = len(mail_reads)
         before_runtime = len(runtime_reads)
         before_agent = len(agent_reads)
-        with capturing("out", into=output), capturing("err", into=errors):
-            code = run_doctor(args)
+        before_delivery = len(delivery_reads)
+        real_no_color = globals()["NO_COLOR"]
+        real_columns = os.environ.get("COLUMNS")
+        globals()["NO_COLOR"] = not colour
+        if width is not None:
+            os.environ["COLUMNS"] = str(width)
+        try:
+            with capturing("out", into=output), capturing("err", into=errors):
+                code = run_doctor(args)
+        finally:
+            globals()["NO_COLOR"] = real_no_color
+            if real_columns is None:
+                os.environ.pop("COLUMNS", None)
+            else:
+                os.environ["COLUMNS"] = real_columns
         return (output.getvalue(), errors.getvalue(), code,
                 len(mail_reads) - before_mail,
                 len(runtime_reads) - before_runtime,
-                len(agent_reads) - before_agent)
+                len(agent_reads) - before_agent,
+                len(delivery_reads) - before_delivery)
+
+    ansi_re = re.compile(r"\x1b\[[0-9;]*m")
+
+    def plain_text(text):
+        return ansi_re.sub("", text)
 
     def agent_rows(text):
-        return [line for line in text.splitlines() if line.startswith("agent    ")]
+        return [line for line in plain_text(text).splitlines()
+                if line.startswith("agent    ")]
 
     def agent_ids(text):
         return [line.split()[1] for line in agent_rows(text)]
 
+    summary_row_re = re.compile(
+        r"^\s+(?:\d+(?:,\s+\d+)*\s+)?(\S+@\S+)\s{2}")
+
+    def summary_rows(text):
+        team_text = plain_text(text).split("\nagent dossiers  ", 1)[0]
+        return [(match.group(1), line)
+                for line in team_text.splitlines()
+                if (match := summary_row_re.match(line))]
+
+    def summary_ids(text):
+        return [agent_id for agent_id, _line in summary_rows(text)]
+
     try:
         (member_report, member_errors, _member_code,
-         member_mail_reads, member_runtime_reads, _member_agent_reads) = report(
-            agent_id=member)
+         member_mail_reads, member_runtime_reads, _member_agent_reads,
+         member_delivery_reads) = report(agent_id=member)
         (team_report, _team_errors, _team_code,
-         team_mail_reads, team_runtime_reads, team_agent_reads) = report(team=team)
+         team_mail_reads, team_runtime_reads, team_agent_reads,
+         team_delivery_reads) = report(team=team)
         (lead_report, _lead_errors, _lead_code,
-         lead_mail_reads, lead_runtime_reads, _lead_agent_reads) = report(agent_id=lead)
+         lead_mail_reads, lead_runtime_reads, _lead_agent_reads,
+         lead_delivery_reads) = report(agent_id=lead)
+        team_colour_report = report(colour=True, team=team)[0]
+        width_reports = {}
+        for width in (80, 120, 140):
+            width_reports[(width, "plain")] = report(
+                width=width, agent_id=member)[0]
+            width_reports[(width, "colour")] = report(
+                colour=True, width=width, agent_id=member)[0]
         real_diagnose = globals()["diagnose_team"]
-        globals()["diagnose_team"] = lambda team, table=None, deep=False, ledger=None, team_state=None: (
+        globals()["diagnose_team"] = lambda team, table=None, deep=False, ledger=None, team_state=None, **kwargs: (
             "SEVERED", [], [])
         try:
             (_severed_report, _severed_errors, severed_code,
              severed_mail_reads, severed_runtime_reads,
-             severed_agent_reads) = report(team=team)
+             severed_agent_reads, severed_delivery_reads) = report(team=team)
         finally:
             globals()["diagnose_team"] = real_diagnose
     finally:
@@ -23714,7 +24020,7 @@ def _check_doctor_agent_dossiers(s):
           member_ids[:2] == [member, lead], repr(member_rows))
     requested_row = next((row for row in member_rows
                           if row.split()[1:2] == [member]), "")
-    labelled = (requested_row.endswith("[requested]")
+    labelled = ("[requested]" in requested_row
                 and sum("[requested]" in row for row in member_rows) == 1)
     check("doctor-requested-member-labelled",
           "the requested member has one unobtrusive label",
@@ -23735,6 +24041,148 @@ def _check_doctor_agent_dossiers(s):
           "the doctor prints every member once in stable roster order",
           stable, repr(member_ids))
 
+    member_summary = summary_ids(member_report)
+    team_summary = summary_ids(team_report)
+    lead_summary = summary_ids(lead_report)
+    run_doctor_src = s.src_of(s.funcs["run_doctor"]) or ""
+    shared_order = (
+        member_summary == member_ids
+        and team_summary == team_ids
+        and lead_summary == lead_ids
+        and all(len(order) == len(set(order))
+                for order in (member_summary, team_summary, lead_summary))
+        and run_doctor_src.count("doctor_member_ids(") == 1
+        and "doctor_dossier_ids" not in s.funcs
+    )
+    check("doctor-summary-and-dossiers-share-order",
+          "the team summary and dossiers consume one canonical member order",
+          shared_order,
+          f"member={member_summary}/{member_ids}, team={team_summary}/{team_ids}, "
+          f"lead={lead_summary}/{lead_ids}")
+
+    colour_report = width_reports[(120, "colour")]
+    colour_faults = []
+    colour_by_agent = {member: "red", lead: "yellow",
+                       missing: "blue", extra: "green"}
+    for agent_id, colour in colour_by_agent.items():
+        painted = f"\033[{COLOR_ANSI[colour]}m{agent_id}\033[0m"
+        if colour_report.count(painted) != 2:
+            colour_faults.append(
+                f"member report {agent_id} appears {colour_report.count(painted)} times")
+        if team_colour_report.count(painted) != 2:
+            colour_faults.append(
+                f"team report {agent_id} appears {team_colour_report.count(painted)} times")
+    team_runtime_src = s.src_of(s.funcs["team_runtime"]) or ""
+    if team_runtime_src.count("agent_colour(") != 1:
+        colour_faults.append("team runtime does not use the shared identity color policy")
+    check("doctor-identity-colours-match",
+          "the same agent identity colour appears in its summary and dossier rows",
+          not colour_faults, "; ".join(colour_faults))
+
+    ansi_faults = []
+    for width in (80, 120, 140):
+        coloured = width_reports[(width, "colour")]
+        plain = width_reports[(width, "plain")]
+        if plain_text(coloured) != plain:
+            ansi_faults.append(f"{width}: stripping ANSI did not recover plain output")
+    boundary_id = "boundary-member@session-corpus-alpha"
+    boundary_detail = " ".join(["status"] * 10)
+    real_no_color = globals()["NO_COLOR"]
+    try:
+        globals()["NO_COLOR"] = True
+        boundary_plain = render_identity_labeled_row(
+            "agent", boundary_id, boundary_detail, colour="red", width=80)
+        globals()["NO_COLOR"] = False
+        boundary_colour = render_identity_labeled_row(
+            "agent", boundary_id, boundary_detail, colour="red", width=80)
+    finally:
+        globals()["NO_COLOR"] = real_no_color
+    if plain_text(boundary_colour) != boundary_plain:
+        ansi_faults.append("80: boundary identity changed wrapping")
+    check("doctor-ansi-layout-stable",
+          "identity ANSI changes no report spacing or wrapping",
+          not ansi_faults, "; ".join(ansi_faults))
+
+    shared_once = {
+        "lead": member_report.count("lead     (none)") == 1,
+        "runs as": member_report.count("runs as  (unknown)") == 1,
+        "polls": member_report.count("polls    no  (the lead is stopped)") == 1,
+        "delivery": member_report.count(
+            "lead process for session-corpus-alpha is stopped") == 1,
+        "remedy": member_report.count(
+            "remedy   resume the lead  (starts a process)") == 1,
+    }
+    repeated_shared = sorted(key for key, ok in shared_once.items() if not ok)
+    check("doctor-shared-team-facts-once",
+          "team-wide lead, polling, delivery, and remedy facts print once",
+          not repeated_shared,
+          ", ".join(repeated_shared) or repr(shared_once))
+
+    status_faults = []
+    for agent_id in (member, lead, missing, extra):
+        dossier_row = next((line for line in member_rows if agent_id in line), "")
+        if not dossier_row or "[stopped]" not in dossier_row or "[listed]" not in dossier_row:
+            status_faults.append(agent_id)
+    if plain_text(member_report).count("[requested]") != 1:
+        status_faults.append("requested is not marked once in the dossier")
+    check("doctor-member-statuses-explicit",
+          "dossier headers keep requested, membership, and runtime states explicit",
+          not status_faults, ", ".join(status_faults))
+
+    wrap_faults = []
+    for width in (80, 120, 140):
+        report_text = width_reports[(width, "plain")]
+        lines = report_text.splitlines()
+        for index, line in enumerate(lines):
+            roster_match = summary_row_re.match(line)
+            dossier_row = line.startswith("agent    ")
+            if not (roster_match or dossier_row):
+                continue
+            if len(line) > width:
+                wrap_faults.append(f"{width}: first line exceeds width: {line[:30]}")
+            at = index + 1
+            while at < len(lines) and lines[at].lstrip().startswith(WRAP_ARROW):
+                column = lines[at].index(WRAP_ARROW)
+                if dossier_row and column != REPORT_LABEL_WIDTH:
+                    wrap_faults.append(f"{width}: dossier continuation moved")
+                if roster_match:
+                    wrap_faults.append(f"{width}: roster title wrapped")
+                if len(lines[at]) > width:
+                    wrap_faults.append(f"{width}: continuation exceeds width")
+                at += 1
+        if any(chr(codepoint) in report_text
+               for codepoint in (0x2014, 0x2013)):
+            wrap_faults.append(f"{width}: Unicode dash remains")
+    check("doctor-member-rows-wrap-stably",
+          "roster titles stay on one line and dossier identities wrap under their label",
+          not wrap_faults, "; ".join(wrap_faults[:6]))
+
+    mail_wrap_faults = []
+    for width in (80, 120, 140):
+        report_text = width_reports[(width, "plain")]
+        in_mail_row = False
+        for line in report_text.splitlines():
+            if line.startswith("  mail"):
+                in_mail_row = True
+            elif in_mail_row and line.lstrip().startswith(WRAP_ARROW):
+                pass
+            else:
+                in_mail_row = False
+                continue
+            if len(line) > width:
+                mail_wrap_faults.append(f"{width}: mail line exceeds width")
+            if WRAP_ARROW in line and line.index(WRAP_ARROW) != REPORT_LABEL_WIDTH + 2:
+                mail_wrap_faults.append(
+                    f"{width}: mail continuation starts at {line.index(WRAP_ARROW)}")
+        plain_mail = " ".join(without_wrap_arrows(report_text).split())
+        for fact in ("unexplained: sender -> willow at", "willow-only",
+                     "1 in echo's memory", "delivery waits on each holder's next turn boundary"):
+            if fact not in plain_mail:
+                mail_wrap_faults.append(f"{width}: lost {fact!r}")
+    check("doctor-mail-rows-wrap-stably",
+          "long mail evidence wraps under its report label at every report width",
+          not mail_wrap_faults, "; ".join(mail_wrap_faults[:6]))
+
     blocks = {}
     current = None
     for line in member_report.splitlines():
@@ -23743,12 +24191,51 @@ def _check_doctor_agent_dossiers(s):
             blocks[current] = []
         elif current:
             blocks[current].append(line)
+    split_faults = []
+    for agent_id, lines in blocks.items():
+        session_at = next((at for at, line in enumerate(lines)
+                           if line.startswith("session  ")), None)
+        if (session_at is None or session_at + 1 >= len(lines)
+                or not lines[session_at + 1].startswith("title    ")):
+            split_faults.append(agent_id)
+    check("doctor-dossier-session-title-separated",
+          "each dossier puts the session identity and title on separate rows",
+          not split_faults, ", ".join(split_faults))
     missing_text = "\n".join(blocks.get(missing, []))
+    missing_header = next((row for row in member_rows if missing in row), "")
     check("doctor-dossiers-cover-missing-members",
           "a dead member with no transcript still receives a complete dossier",
-          "transcript not found" in missing_text
-          and "it is not running" in missing_text and "listed   yes" in missing_text,
-          missing_text[:160])
+          "transcript not found" in missing_text and "seat     none" in missing_text
+          and "[listed]" in missing_header and "[stopped]" in missing_header,
+          (missing_header + "\n" + missing_text)[:200])
+    willow_text = "\n".join(blocks.get(member, []))
+    echo_text = "\n".join(blocks.get(missing, []))
+    other_text = "\n".join(blocks.get(lead, []) + blocks.get(extra, []))
+    ledger_attached = (
+        "1 unexplained" in willow_text and "0 in its memory" in willow_text
+        and "1 in its memory" in echo_text and "0 unexplained" in echo_text
+        and "ledger" not in other_text
+    )
+    check("doctor-ledger-facts-stay-with-member",
+          "recipient-specific ledger anomalies remain in the matching dossier",
+          ledger_attached,
+          f"willow={willow_text!r}, echo={echo_text!r}, other={other_text!r}")
+    semantic_facts = (
+        all("session" in "\n".join(blocks.get(agent_id, []))
+            and "parent" in "\n".join(blocks.get(agent_id, []))
+            and "seat" in "\n".join(blocks.get(agent_id, []))
+            for agent_id in (member, lead, missing, extra))
+        and "lead     (none)" in member_report
+        and "runs as  (unknown)" in member_report
+        and "polls    no" in member_report
+        and "mail     all 4 members do not reach their lead" in member_report
+        and "remedy   resume the lead" in member_report
+        and ledger_attached
+    )
+    check("doctor-semantic-facts-preserved",
+          "report restructuring retains every team and member diagnostic fact",
+          semantic_facts,
+          "one or more team, conversation, parent, seat, delivery, or remedy facts are absent")
     check("doctor-preserves-team-exit-status",
           "member dossiers do not replace the team verdict exit status",
           severed_code == 1, f"exit {severed_code}")
@@ -23756,6 +24243,7 @@ def _check_doctor_agent_dossiers(s):
     dossier_src = s.src_of(s.funcs["run_agent_dossier"]) or ""
     report_rendering = (dossier_src.count("render_transcript_row(") == 2
                         and dossier_src.count("report_label=") == 2
+                        and dossier_src.count("report_title_label=") == 1
                         and 'fill(f"session' not in dossier_src
                         and 'fill(f"parent' not in dossier_src
                         and "RESOLVER.agent_runtime(" not in dossier_src)
@@ -23763,7 +24251,8 @@ def _check_doctor_agent_dossiers(s):
           "agent dossiers render conversation rows through the shared transcript renderer",
           report_rendering,
           f"renderer calls={dossier_src.count('render_transcript_row(')}, "
-          f"report labels={dossier_src.count('report_label=')}")
+          f"report labels={dossier_src.count('report_label=')}, "
+          f"title labels={dossier_src.count('report_title_label=')}")
 
     long_title = (
         "Read-only architecture and semantics adjudication. Review the sealed task-144 "
@@ -23787,7 +24276,8 @@ def _check_doctor_agent_dossiers(s):
             os.environ["COLUMNS"] = str(width)
             wrapped_rows[width] = (
                 render_transcript_row(
-                    session_stem, session_fact, report_label="session"),
+                    session_stem, session_fact, report_label="session",
+                    report_title_label="title"),
                 render_transcript_row(
                     parent_stem, parent_fact, note="spawn payload naming it",
                     report_label="parent"),
@@ -23804,9 +24294,19 @@ def _check_doctor_agent_dossiers(s):
                 ("session", "parent"), (session_stem, parent_stem),
                 (session_project, parent_project), rows):
             lines = rendered.splitlines()
-            expected = f"{label:<{REPORT_LABEL_WIDTH}}{stem} — "
+            expected = (f"{label:<{REPORT_LABEL_WIDTH}}{stem}"
+                        + ("" if label == "session" else ": "))
             if not lines or not lines[0].startswith(expected):
                 wrap_faults.append(f"{width}:{label} has no stable first row")
+            if label == "session":
+                if lines[0] != expected:
+                    wrap_faults.append(f"{width}: session row contains another fact")
+                if len(lines) < 2 or not lines[1].startswith(
+                        f"{'title':<{REPORT_LABEL_WIDTH}}"):
+                    wrap_faults.append(f"{width}: title is not a separate row")
+                continuations = lines[2:]
+            else:
+                continuations = lines[1:]
             plain = " ".join(without_wrap_arrows(rendered).split())
             if stem not in plain or f"[{project}, missing]" not in plain:
                 wrap_faults.append(f"{width}:{label} lost identifying facts")
@@ -23819,12 +24319,12 @@ def _check_doctor_agent_dossiers(s):
                 wrap_faults.append(f"{width}:{label} exceeds width outside one identifier")
             if any(re.search(r" {20,}", line) for line in lines):
                 wrap_faults.append(f"{width}:{label} has a large whitespace run")
-            if label == "session" and not any(
-                    line.startswith(" " * REPORT_LABEL_WIDTH + WRAP_ARROW + "[" + project)
-                    for line in lines[1:]):
+            if label == "session" and not any(line.startswith(
+                    " " * REPORT_LABEL_WIDTH + WRAP_ARROW + "[" + project)
+                    for line in continuations):
                 wrap_faults.append(f"{width}:{label} metadata is not an explicit continuation")
             metadata_continuation = False
-            for line in lines[1:]:
+            for line in continuations:
                 if WRAP_ARROW not in line:
                     wrap_faults.append(f"{width}:{label} has an unmarked continuation")
                     continue
@@ -23882,6 +24382,15 @@ def _check_doctor_agent_dossiers(s):
     check("doctor-builds-team-runtime-once",
           "one named-team diagnosis builds one team runtime for its report and dossiers",
           runtime_counts == [1, 1, 1, 1], repr(runtime_counts))
+    delivery_counts = [member_delivery_reads, team_delivery_reads,
+                       lead_delivery_reads, severed_delivery_reads]
+    agent_diagnosis_src = s.src_of(s.funcs["agent_diagnosis"]) or ""
+    shared_delivery = 'team_state["delivery"]' in agent_diagnosis_src
+    delivery_once = delivery_counts == [1, 1, 1, 1] and shared_delivery
+    check("doctor-computes-team-delivery-once",
+          "one named report interprets team delivery once for every dossier",
+          delivery_once,
+          f"counts={delivery_counts}, shared={shared_delivery}")
     check("doctor-reuses-team-process-answers",
           "member dossiers reuse the process answers from the team report",
           team_agent_reads == 4 and severed_agent_reads == 4,
@@ -24324,7 +24833,9 @@ def _check_doctor_agent_says_the_seat(s):
         team_state = eng.team_runtime(crew, table)
         with capturing("err"), \
                 capturing("out", into=dossier):
-            run_agent_dossier(f"petrel@{crew}", team_state)
+            run_agent_dossier(
+                eng.agent_diagnosis(f"petrel@{crew}", team_state=team_state),
+                team_state)
     except BaseException as exc:  # a dossier that crashes is a failed one
         dossier.write(f"seat     dossier raised {type(exc).__name__}\n")
     finally:
@@ -24333,7 +24844,7 @@ def _check_doctor_agent_says_the_seat(s):
                      if ln.startswith("seat ")), "")
     check("doctor-agent-says-the-seat",
           "the agent dossier says where the member's own process sits",
-          "live and in no tmux pane" in seat_row, f"said {seat_row!r}")
+          "live outside tmux" in seat_row, f"said {seat_row!r}")
 
     s.eng = eng
     return checked
@@ -24367,7 +24878,9 @@ def _check_own_lineage_wearer_is_live(s):
                 crew, mine_row, team_state=team_state)
         with capturing("err"), \
                 capturing("out", into=dossier):
-            run_agent_dossier(f"petrel@{crew}", team_state)
+            run_agent_dossier(
+                eng.agent_diagnosis(f"petrel@{crew}", team_state=team_state),
+                team_state)
     except BaseException as exc:  # a report that crashes is a failed one
         seat, halves, mine_lines = (f"raised {type(exc).__name__}", ([], []), [])
     finally:

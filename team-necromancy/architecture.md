@@ -26,11 +26,21 @@ durable turn flushing is the requirement for a supported bg mode.
 
 `agent-resume` reports seating separately from team health. `--doctor` prints
 the team verdict followed by one dossier per member for a directly named team or
-agent. A requested member comes first, then the genuine lead; a directly named
-team starts with the lead. Each dossier includes the member's live seat. Direct
-diagnosis uses the ordinary selector and immutable target, but does not infer a
-launch destination. The team verdict still measures whether a live lead reads the
-team, and remains the command's exit status.
+agent. `run_doctor` computes one member order and passes it to the summary roster
+and dossier loop. A requested member comes first, then the genuine lead; a
+directly named team starts with the lead. `team_runtime` resolves each member's
+process answer, full title, identity color, and the shared lead and polling facts
+once. The summary uses the existing PID, identity, and title renderer. That
+renderer clips each roster title to the terminal space left on its row; the full
+title remains available to the dossier. ANSI is inserted around the identity
+after plain-text layout, so `--no-color` changes no spacing. Dossier headers carry
+explicit requested, membership, and runtime labels. Session UUID and title use
+separate labeled rows, followed by parent and live seat. Lead identity, operative
+team, polling, common delivery failure, and common remedies print once in the
+team report. Recipient-specific ledger evidence and member-specific remedies stay
+in the matching dossier. Direct diagnosis uses the ordinary selector and
+immutable target, but does not infer a launch destination. The team verdict still
+measures whether a live lead reads the team, and remains the command's exit status.
 
 The unnamed Agent tool runs its query loop inside the leader and writes a
 sidechain transcript. Its work therefore resumes through an internal query
