@@ -26,16 +26,17 @@ durable turn flushing is the requirement for a supported bg mode.
 
 `agent-resume` reports seating separately from team health. `--doctor` prints
 the team verdict followed by one dossier per member for a directly named team or
-agent. `Resolver.team_runtime` answers only roster-backed population and process
-runtime, retaining one runtime object per name. `Resolver.team_diagnosis` is the
-complete public doctor question. It builds one immutable member record per agent
-ID, ordered requested member first, genuine lead second, then stable roster order.
-Each record retains the canonical runtime, transcript `Resolution` and transcript
-fact, parent answer and fact, identity color, delivery evidence, and addressed
-ledger rows. It then derives the shared facts, team verdict, and remedies from
-those records inside Resolver. The summary, team conclusions, and dossier loop
-receive those exact member objects and completed conclusions. They do not call
-Resolver, read evidence again, or derive another verdict.
+agent. `doctor_answer` returns one immutable diagnosis for a selected team or
+agent. Its roster and process readers build one member record per agent ID, ordered
+requested member first, genuine lead second, then stable roster order. Each record
+contains the runtime, transcript `Resolution` and transcript fact, parent result,
+identity color, delivery evidence, and addressed ledger rows. Resolver derives the
+shared facts, team verdict, and remedies from those records. `run_doctor` calls
+`doctor_answer` once; the summary, team conclusions, and dossier loop use that
+answer without calling Resolver or reading evidence again. The privacy rename
+makes `_team_diagnosis`, `_known_teams`, `_teams_with_live_evidence`, and
+`_nameless_receipts` private. The AST caller check rejects module-level calls to
+private Resolver methods.
 
 The summary uses the existing PID, identity, and title renderer. That renderer
 clips each roster title to the terminal space left on its row; the full title
@@ -55,6 +56,239 @@ The unnamed Agent tool runs its query loop inside the leader and writes a
 sidechain transcript. Its work therefore resumes through an internal query
 loop. SendMessage uses this path to resume a dead tmux teammate in-process by
 replaying its JSONL.
+
+## Cross-session UDS coordination
+
+This protocol is separate from team rosters and their file mailboxes. The
+transport statements in this section are from the unpatched Claude Code 2.1.232
+binary at `/home/juraj/.local/share/claude/versions/2.1.232.orig-unpatched`.
+The local `claude-code/src/` tree corroborates task and UI behavior, but is not
+assumed to be an exact 2.1.232 source checkout.
+
+### Endpoint, authentication, and discovery
+
+A session normally listens at:
+
+```text
+$XDG_RUNTIME_DIR/cc-socks/<pid>.sock
+```
+
+The default path uses the fallback when `Buffer.byteLength(path)` exceeds 103.
+If binding still fails with `ENAMETOOLONG`, the error reports a maximum of about
+104 bytes. Startup rejects a socket directory that is relative, owned by another
+user, not a directory, or a symlink. It walks ancestor directories, rejects a
+symlink owned by another user or a loop deeper than 16 links, and requires each
+non-symlink ancestor to be private or sticky and owned by this user or root. It
+creates or fixes the leaf directory to mode `0700`, binds the socket, changes the
+socket to mode `0600`, publishes the peer key, then exports the socket path and
+child token for descendants. Shutdown destroys clients, closes and unlinks the
+socket, removes the active peer key, clears `CLAUDE_CODE_MESSAGING_SOCKET` and
+`CLAUDE_CODE_MESSAGING_TOKEN`, and settles held prompts as described below.
+
+Startup generates two independent random 16-byte tokens, rendered as 32
+lowercase hexadecimal characters. The peer token is published in exactly one
+key file:
+
+```text
+~/.claude/sessions/<pid>.<sha256(canonical-socket-path)>.key
+```
+
+The JSON key record contains `peerToken` and may contain `procStart` and
+`procStartFt`. Key files have mode `0600`; `~/.claude/sessions` and the socket
+directory have mode `0700`. The child token has no key file. It is passed to
+child processes as `CLAUDE_CODE_MESSAGING_TOKEN`.
+
+The first authenticated frame is `{"type":"auth","token":"..."}` followed by a
+newline. A matching token is classified as either `peer` or `child`. Required
+authentication rejects a blank, malformed, non-auth, or bad first frame. On this
+Linux host authentication is optional by default, so a missing or bad auth frame
+is not an authenticated identity. A claimed sender address must never be treated
+as authenticated merely because it arrived over a local socket.
+
+Session discovery and direct addressing are different. Registry records under
+`~/.claude/sessions/` are PID-named JSON files read with a 256 KiB cap. They carry
+socket, PID, session ID, cwd, process-start identity, name, kind, status, and
+bridge facts. The registry reader accepts `interactive`, `bg`, `daemon`, and
+`daemon-worker` kinds and probes a candidate socket with a 250 ms connect. A
+sender that already knows a local socket path and its peer key can send directly;
+it need not find the peer through a registry record. Non-local IPC paths are
+refused.
+
+`ListAgents` reflects these discoverable session records, not every task model.
+An `in_process_teammate` is a team worker with a prompt-wait loop and mailbox
+integration, not one of the registry peer kinds above. Team workers can therefore
+be absent from `ListAgents` even while their task and team mailbox records exist.
+
+### Frames, sender identity, and attachments
+
+The stream carries UTF-8 JSON. Newlines normally delimit frames; blank lines are
+ignored, and a nonempty final fragment is parsed when a connection ends. The
+server first appends decoded text to an unparsed buffer and destroys the
+connection once it exceeds 1 MiB (1,048,576 bytes). This is an unparsed-buffer
+limit, not an independent per-message limit: a large chunk that contains a
+newline can still exceed it before splitting.
+
+A raw client optionally writes the auth frame, writes one JSON frame plus a
+newline, then ends the connection. Its five-second operation resolves when the
+connection closes, not when the receiver approves, queues, or processes the
+prompt. The server sends no general positive acknowledgement. Consequently a
+successful raw send or `SendMessage` result means only that the sender did not
+observe a transport error before close.
+
+A normal raw user frame has this form:
+
+```json
+{
+  "type": "user",
+  "msg_id": "<sender-generated UUID>",
+  "message": {"role": "user", "content": "text"},
+  "priority": "next",
+  "from": "uds:<sender socket address>",
+  "file_attachments": []
+}
+```
+
+For a user frame, `type` must be a string and `message.content` must be a
+nonempty string. `session_id` is optional but, when present, must equal the
+receiver's session ID. `priority` accepts `now`, `next`, or `later` and otherwise
+defaults to `next`; `uuid`, `file_attachments`, `from`, and `msg_id` are optional.
+The server gives an absent `from` the value `unknown`, makes a prompt UUID when
+none was supplied, and retains a syntactically valid `msg_id` in peer-origin
+metadata. Accepted frames become prompt-queue items with `mode: "prompt"`,
+`skipSlashCommands: true`, and `isMeta: true`.
+
+`msg_id` is generated by the sender and is only a transport-frame correlation
+identifier. It is not a receiver delivery acknowledgement or evidence of model
+consumption. Control receipts carry their own frame ID and refer to the original
+user frame through `orig_msg_id`.
+
+Cross-session text uses a canonical envelope:
+
+```xml
+<cross-session-message from="..." from-session="..." hop-chain="..."
+  from-name="..." from-mode="bypass|prompting">
+body
+</cross-session-message>
+```
+
+All envelope attributes are optional. Canonical serialization orders them as
+`from`, `from-session`, `hop-chain`, `from-name`, then `from-mode`; the parser
+accepts an envelope only when reserialization exactly reproduces the input. The
+raw `from` field and these attributes are sender claims. Authentication instead
+comes from token class and, where available, verified Unix-peer PID metadata. The
+receiver permits automatic replies only when a claimed UDS reply address is
+well-formed and belongs to its own socket namespace.
+
+A peer frame may carry at most 16 attachments. Each source or transfer file is
+bounded to 31,457,280 bytes (30 MiB); staged transfer files expire after one day.
+The sender copies a regular source file into `~/.claude/file-transfers`, whose
+directory is mode `0700`, and writes the staged copy mode `0600`. Attachment
+metadata includes `path`, `file_name`, `file_size`, `sha256`, and optional
+`media_type`.
+
+The receiver validates the attachment array and its 16-item limit; requires an
+absolute path without the UNC form; checks that the source is a regular file and
+its parent is a directory named `file-transfers`; bounded-reads the source; and
+compares its declared size and SHA-256. It copies the content into a fresh
+recipient upload using exclusive creation and mode `0600`, and only removes a
+source spool file when that parent equals its own configured spool directory. The
+parent-basename check does not establish the sender's full path ancestry. The size
+and hash checks, plus exclusive creation of the recipient copy, establish the
+properties described here.
+
+### Holds, status receipts, and ordering
+
+The two recognized control forms are:
+
+```json
+{"type":"control", "action":"rename", "name":"..."}
+```
+
+and:
+
+```json
+{
+  "type": "control",
+  "action": "peer_message_status",
+  "status": "held|delivered|denied|expired",
+  "orig_msg_id": "<original user-frame ID>"
+}
+```
+
+`rename` invokes a rename callback only when `name` is a string. It is a
+notification, not an authenticated identity change. It is sent through the raw
+control sender, not ordinary `SendMessage`.
+
+The receiver accepts, refuses, or holds each prompt. An accepted prompt enters
+the queue immediately. A refused prompt is not queued. A held prompt waits for
+user approval or a later permission-mode decision and produces a `held` status
+when its reply address and original message ID can be used safely. Releasing a
+held prompt queues it and sends `delivered`; refusing it later sends `denied`. A
+full hold buffer evicts its oldest item as `expired`; shutdown and the
+cross-session kill switch also settle held items as `expired`. The hold-buffer
+capacity and receipt timeout are unknown.
+
+Every status is sent over a new UDS control connection. Statuses are therefore
+best-effort lifecycle notices, not universal acknowledgements: immediate
+acceptance sends no `delivered` receipt, immediate refusal may send no receipt,
+and an unsafe reply address or an untracked ID prevents a status from reaching
+the sender. The receiver tracks up to 200 outbound IDs; `held` moves a matching
+ID to an awaiting-terminal set, while a later terminal status removes it.
+
+The observed status **Cross-session message held for approval** means the receiver
+accepted the transport frame but withheld the prompt because the permission modes
+differ. The recipient user must approve it before Claude sees it. **Cross-session
+message released after approval** means that approval occurred and the receiver
+released the prompt to the recipient session. The session's prompt queue still
+controls when Claude takes it. Neither status is an ordinary positive
+acknowledgement, proof that the prompt ran, or proof of model consumption.
+
+1. **Transport write success** means the sender saw no local connection error
+   before close.
+2. **Held status** means the receiver parked the prompt for approval.
+3. **Delivered status** means an earlier held prompt was released into the prompt
+   queue.
+4. **Model consumption** happens only when the receiving session later takes the
+   queued prompt. No UDS acknowledgement proves it happened.
+
+Ordinary inbound work enters a processing chain. Control frames and
+attachment-free `priority: "now"` user frames can bypass it, so the protocol does
+not promise global FIFO order across connections. The local source tree implements
+`now > next > later`, FIFO within each priority. This ordering was not independently
+confirmed in the 2.1.232 binary.
+
+### Wrappers, teammate delivery, and tasks
+
+`SendMessage` accepts nonempty plain text for `uds:` recipients and delegates it
+to the raw sender. Its reported `msg_id` is the sender-generated correlation ID,
+not receiver delivery confirmation. Cross-session `SendMessage` rejects the
+structured experimental-team message form; that form belongs to the team mailbox
+path rather than the UDS text transport.
+
+UDS is also distinct from local task delivery. The task model distinguishes
+`local_agent` tasks, whose IDs begin with `a`, from `in_process_teammate` tasks,
+whose IDs begin with `t`. An in-process teammate has isolated context, independent
+idle tracking, a prompt-wait loop, and team mailbox integration. A message to a
+live in-process teammate waits for its next tool round; it is not sent through the
+cross-session socket.
+
+`TaskUpdate` persists each task as JSON at:
+
+```text
+~/.claude/tasks/<task-list-id>/<task-id>.json
+```
+
+The update path locks and rewrites that record. When agent-swarm ownership changes,
+it also appends a durable team mailbox message whose text contains a
+`task_assignment` object with `taskId`, `subject`, `description`, `assignedBy`,
+and `timestamp`. The mailbox is a JSON array at:
+
+```text
+~/.claude/teams/<team>/inboxes/<agent>.json
+```
+
+with lock-protected append and rewrite behavior. The colored assignment box is a
+cyan task-assignment rendering, not a teal transport frame and not a UDS receipt.
 
 ## Teammate transcript stamps
 
@@ -233,8 +467,201 @@ Resolver reads nine kinds of state:
 Resolver owns inspection and interpretation of this state. Other code receives
 structured answers from Resolver.
 
+### Public methods and private readers
+
+Resolver has exactly 34 public methods and no public instance attributes. Every
+public method returns one recursively immutable record for one command. The AST
+checks compare this method and caller table exactly, reject public aliases and
+component access, reject module calls to private Resolver methods, and require an
+empty `PUBLIC_RESOLVER_ATTRIBUTES` map.
+
+| Public method | Module caller or callers |
+|---|---|
+| `attach_decision` | `run_agents` |
+| `audit_answer` | `audited` |
+| `census_answer` | `run_census` |
+| `cleanup_plan` | `run_cleanup` |
+| `complete_lead_migration` | `lead_rebind` |
+| `complete_member_migration` | `apply_member_migration` |
+| `completion_answer` | `_complete` |
+| `demotion_plan` | `run_demote` |
+| `doctor_answer` | `run_doctor` |
+| `launch_observation` | `launch_survived` |
+| `launch_plan` | `build` |
+| `lead_migration_plan` | `run_one` |
+| `mail_answer` | `run_mail_ledger` |
+| `member_redirect_plan` | `auto_redirect`, `run_one` |
+| `membership_plan` | `record_membership`, `release_membership`, `reserve_membership`, `restore_member` |
+| `promotion_plan` | `run_promote` |
+| `rebuild_plan` | `apply_rebuild_plan`, `rebuild_roster`, `rebuild_team` |
+| `revalidate_cleanup` | `run_cleanup` |
+| `revalidate_cleanup_cut` | `remove_cleanup_action` |
+| `revalidate_conversion` | `embed`, `materialize` |
+| `revalidate_launch` | `run_one` |
+| `revalidate_lead_migration` | `lead_rebind` |
+| `revalidate_member_redirect` | `apply_member_migration` |
+| `revalidate_membership` | `apply_membership`, `team_lock` |
+| `revalidate_reap` | `archive_inbox`, `reap_team` |
+| `revalidate_rebuild` | `apply_rebuild_plan` |
+| `revalidate_stop` | `stopped` |
+| `revalidate_team_run` | `run_team` |
+| `selector_answer` | `apply_selector` |
+| `sides_answer` | `run_sides` |
+| `socket_control_answer` | `run_poison` |
+| `stop_plan` | `confirm_attach`, `stop_targets` |
+| `team_run_plan` | `run_team` |
+| `teammate_mode_answer` | `check_teammate_mode` |
+
+`completion_answer` reads the candidates and supporting records for every
+completion topic. `_complete` does not make another Resolver call, read a file, or
+call an evidence helper to make a second candidate list. For team completion,
+`completion_answer("teams")` returns immutable rows and the emitter prints those
+rows.
+
+A conversion plan records source and destination generations. A reap plan records
+the selected team-directory generation; a mailbox archive plan records the inbox
+generation; and a cleanup plan records the selected directory generation. Each
+revalidation compares the current value with the recorded value. A writer does
+not use a later read to choose a different source, destination, or deletion. The
+root-stamp conversion fixture checks four cases through operation answers.
+
+### Operation behavior
+
+`DoctorRequest` is frozen. Its fields are `team`, `agent_id`, and `session_uuid`,
+of which at most one may be set, plus `include_dormant`. `__post_init__` refuses
+more than one selector. `doctor_answer(request)` retains that request, the
+selected target, ordered
+`TeamDiagnosis` records, the shared snapshot and generations, counts, structured
+facts about promoted transcripts without a name, rules that decide which dossiers
+are included, objections or refusal, and the exit code. The eight-check doctor
+unit verifies recursive immutability, exclusive `run_doctor` access, private
+evidence readers, answer-only rendering, and use of credentials held by the answer
+without a later `/proc` or Resolver read.
+
+`MemberRedirectRequest` is immutable and has `kind` `explicit`, `live`, or
+automatic. The explicit branch names a team. The live branch uses the member's
+live lead team. The automatic branch runs only when the required live-lead facts
+are available. `member_redirect_plan(request)` chooses the source and
+destination teams, target identity and parent, confirmation, warnings, objections,
+and any rebind before any write. `auto_redirect` and `run_one` are its only
+callers. Its retained-generation check compares the exact parent transcript
+generation and exact destination-lead runtime generation, and retains the exact
+redirected-launch object. It does not establish a separate roster generation in
+that subcase. A separate explicit-route check refuses destination-roster drift
+before a write.
+
+`apply_member_migration` is the only caller of
+`revalidate_member_redirect(plan)` and
+`complete_member_migration(plan, applied)`. The
+`member-migration-completion-reuses-route-selection` API test verifies that
+completion preserves the explicit `--into-team` provenance selected by
+`member_redirect_plan`, preserves the selected identity, and reuses the selected
+objects. `apply_membership` preserves nonempty inbox bytes, replaces a selected
+zero-byte inbox with exactly `[]`, creates an absent selected inbox with `[]`, and
+refuses generation drift before a write while retaining the changed bytes. The
+applied member-completion test verifies the selected source clearing and
+completion result. The applied member-restamp API check restores the selected
+destination with expected bytes and reuses the selected object and provenance. The
+unstamped-lead API check refuses restamping before any mutation.
+
+`LeadMigrationRequest` is frozen and contains `destination`, `force`, and
+`archive_mail`. It requires a nonempty destination. `complete_member_migration`
+and `complete_lead_migration` receive an `Applied` record, which is frozen and
+contains `operation` and `plan`. `run_one` is the only caller of
+`lead_migration_plan(request)`. `lead_rebind` is the only caller of
+`revalidate_lead_migration(plan)` and `complete_lead_migration(plan, applied)`.
+`_retarget_launch` and generic rebind helpers are private to Resolver plan and
+completion builders, with no module callers. API tests accept lead route selection,
+revalidation, exact caller ownership, the absence of generic or raw module calls,
+and matching dry completion. A non-mutating live check correctly reports that the
+selected effects were not applied. The applied lead-migration test verifies the
+selected route and retained crew facts after the migration. Module code does not
+call `lead_session_for` or `roster_census` to finish either routing operation. The
+team-run entrypoint test reuses the exact destination and inbox generations from
+`team_run_plan` and refuses generation drift. The attach entrypoint test verifies
+that `run_agents` uses `attach_decision` without reading fresh terminal or server
+state.
+
+Renderers and executors do not call process-table, runtime-index, PID-liveness,
+tmux socket or pane, roster-path, mailbox-path, receipt, transcript-selection,
+spawn-payload, or title readers after receiving an operation record. They do not
+combine additional records into another decision.
+
+The runtime reader parses direct argv into structured option values once.
+Identity, process classification, and placement decisions use those values, not
+substrings in rendered argv or explanatory text. A decision never branches on the
+rendered `via`, `how`, or `detail` fields.
+
+Renderers receive immutable records and produce text only. Writers receive a
+selected, revalidated plan and perform its named update, signal, launch, or
+transcript move. A writer may make the final check required by that plan, but it
+does not choose a new identity, parent, destination, or member set.
+
+`selector_answer` selects a conversation without selecting a tmux destination.
+`launch_plan` adds identity, settings, cwd, restore state, provenance, the roster
+record to write, terminal context, lead and member runtime facts, `CrewPlacement`,
+`LaunchDestination`, and `RosterPaneReference`. `_retarget_launch` rebuilds those
+coupled facts after an identity or route change. It does not retain a roster,
+process, or destination record selected for the prior identity.
+
+A `Seat` is an observed pair of socket and pane. A `LaunchDestination` is a
+selected socket and optional pane reference. They are deliberately distinct: a
+recorded pane is meaningful only on the socket whose roster record supplied it,
+and an observed crew seat can select a destination without authorizing reuse of
+that occupied pane. `CrewPlacement` records all observed crew seats, their
+per-socket grouping, whether they are split, and the selected destination with its
+evidence. `TerminalContext` records the current terminal's seat, or a tmux socket
+without its pane ID; it is captured once for a launch or team run and is not read
+again while rendering or attaching.
+
+A transcript title is a `TitleFact`, not a string. It contains the selected title
+text, the event kind, transcript path, timestamp, and source record UUID. Every
+reporting answer carries that one object, so a title's text and the event that
+provided it cannot diverge between a summary, dossier, completion candidate, or
+launch report.
+
+### Verification scope
+
+A read-only, synthetic, mutation, or unit test establishes only the fact it
+checks. Final verification also requires one agreed read-only timing measurement
+on the post-live-fixture source; mutation coverage; live process and tmux checks;
+routing and placement checks; launch, attach, and stop checks; conversion, mail,
+and doctor checks; and c4 verification. Do not treat an isolated fixture, a
+source-level check, or a compile result as evidence for one of those other
+behaviors.
+
+### Generations, revalidation, and conversion
+
+A team-run plan is calculated from one immutable process snapshot and one roster
+census. It chooses the member order, former-member set, and destination from that
+pair and retains the selected roster generation. `revalidate_team_run` compares
+that generation before the run starts. If it changed, execution stops; the later
+roster is not used to choose a replacement member list. Launch observation records
+whether the selected launch appeared, survived, and wrote its transcript.
+
+Every mutation follows the same order: select a plan, print or confirm it, check
+its recorded generations, then act. Roster writes compare the selected roster
+generation; transcript conversion compares the source generation and destination
+collision state; reaping and mailbox archiving compare the bytes at their final
+cut; process actions identify a PID with its kernel start time. A mismatch stops
+the action rather than choosing from later state.
+
+AST checks list the permitted production callers of each public Resolver method.
+They reject a module-level call to a private Resolver reader or
+`RESOLVER.rewriter`, a renderer that builds a second record, and a writer that
+reads new evidence after plan selection. The checks compare exact caller sets and
+shared immutable object identity; a search for method names cannot establish
+either condition.
+
+`TranscriptRewriter` changes transcript records and verifies that applying the
+reverse conversion restores the source bytes. Resolver passes the selected
+identity, parent, side grammar, mailbox, destination, collision, and generation
+facts to the rewriter. The rewriter does not query Resolver or inspect Resolver
+paths. Module-level commands do not reach through `RESOLVER.rewriter`; promotion,
+demotion, restamping, and archive executors use their selected operation plans.
+
 A mailbox records messages waiting on disk and is pruned when a busy recipient
-takes them into memory. `mail_ledger` therefore derives delivery state from
+takes them into memory. `mail_answer` therefore derives delivery state from
 transcript events, whose history remains available after mailbox uptake. Team
 config and mailbox data answer separate questions and carry separate evidence.
 
@@ -318,7 +745,7 @@ refusal promises that the remedy preserves the user's data.
 
 Reporters receive completed immutable answers and render them. Resume reporters
 receive the immutable target. Doctor reporters receive the canonical member
-records from `team_diagnosis`; summary and dossier title rows therefore retain the
+records from `doctor_answer`; summary and dossier title rows therefore retain the
 same transcript fact by object identity. The canonical transcript fact carries
 path, optional title, and activity time together; there is no separate title
 lookup. A full transcript snapshot is keyed by device, inode, size, and
@@ -335,10 +762,11 @@ runtime APIs. Diagnosis does not declare `PLACEMENT`.
 Callers also declare the computations they need. `Resolver(needs=...)` receives
 hard requirements and a `maybe` set for computations reached on selected paths.
 Loaders accept declared computations, and the end-of-run audit requires every
-hard requirement to be used. Narrowing one question remains a parameter, such as
-`mail_ledger(to=...)`; a complete question used outside Resolver gets a public
-method, such as `team_diagnosis` or `demote_parent_objection`. Evidence helpers
-such as `_spawn_parent_of` remain private. `TranscriptRewriter` consumes the
-finished demotion objection instead of combining stamp and spawn evidence itself.
-Tests compare narrowed and complete answers where they should be identical.
-Measure each computation directly so its declaration matches its cost.
+hard requirement to be used. A parameter can narrow a complete operation without
+changing its evidence model. A caller that needs different facts asks a different
+complete operation question; it does not publish an evidence helper as a second
+public view. Evidence helpers such as `_spawn_parent_of` remain private.
+`TranscriptRewriter` receives the selected parent and conversion input instead of
+combining stamp and spawn evidence itself. Tests compare narrowed and complete
+answers where they should be identical. Measure each computation directly so its
+declaration matches its cost.

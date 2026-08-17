@@ -19,9 +19,12 @@ failure is an exception.
 """
 
 import concurrent.futures
+import contextlib
 import io
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -32,6 +35,13 @@ TOOL = Path(__file__).resolve().parent / "agent-resume"
 COMP = TOOL.parent / f"_{TOOL.name}"
 MAX_PARALLEL_SUITES = 4
 ENDED_CHECKS = {"every-unit-reported", "every-live-unit-reported"}
+# What one suite may take before it is treated as having answered nothing. A
+# clean run is seconds; the bound is here for the mutation that loops forever
+# or blocks on a lock, because results are read only once every suite has
+# finished and one hung suite would otherwise cost the whole run's report.
+SUITE_TIMEOUT_S = 120.0
+# How long a stopped suite gets to die before it is killed outright.
+SUITE_GRACE_S = 5.0
 
 
 class ProbeFailure(AssertionError):
@@ -88,13 +98,60 @@ def interpret_run(run, valid):
     return parsed, f"{said}\nstderr:\n{stderr}" if stderr else said
 
 
+def end_group(child, grace=None):
+    """Stop a suite and its process group, politely and then not.
+
+    The signal goes to the group rather than the one process because a suite
+    spawns children of its own. Signalling only the parent leaves those running
+    and holding the pipe open, so the read that was supposed to end never does.
+    """
+    grace = SUITE_GRACE_S if grace is None else grace
+    # A process that leaves the group, by setsid or its own setpgid, is not
+    # reached by this and is not claimed to be.
+    for number in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(child.pid, number)
+        except (ProcessLookupError, PermissionError):
+            return
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            child.wait(timeout=grace)
+            return
+
+
+def run_suite(argv, timeout=None):
+    """Run one bounded suite in its own group. Returns (code, out, err).
+
+    `code` is None when the suite ran out of time, which callers report as
+    having produced no verdict rather than as any kind of result. The bound is
+    read here rather than bound as a default, so the one constant above is what
+    decides it and a caller can lower it without editing this.
+    """
+    timeout = SUITE_TIMEOUT_S if timeout is None else timeout
+    with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, start_new_session=True) as child:
+        try:
+            out, err = child.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            end_group(child)
+            try:
+                out, err = child.communicate(timeout=SUITE_GRACE_S)
+            except subprocess.TimeoutExpired:
+                out, err = "", ""
+            return None, out, err
+        return child.returncode, out, err
+
+
 def verdicts(path, live, valid):
     """Return ({failed check ids}, summary), or (None, reason)."""
     argv = [sys.executable, str(path), "--selftest", "--failed"]
     if live:
         argv.append("--live")
-    run = subprocess.run(argv, capture_output=True, text=True)
-    return interpret_run(run, valid)
+    code, out, err = run_suite(argv)
+    if code is None:
+        return None, (f"the suite did not finish within {SUITE_TIMEOUT_S:g}s; "
+                      "its process group was stopped")
+    return interpret_run(
+        subprocess.CompletedProcess(argv, code, out, err), valid)
 
 
 def verdict_batch(clean_path, mutant_paths, live, valid, run=verdicts):
@@ -114,10 +171,14 @@ def known_checks(path, live):
     argv = [sys.executable, str(path), "--selftest", "--list"]
     if live:
         argv.append("--live")
-    run = subprocess.run(argv, capture_output=True, text=True)
+    code, out, _err = run_suite(argv)
+    if code is None:
+        raise ProbeFailure([
+            f"the check listing did not finish within {SUITE_TIMEOUT_S:g}s, so no "
+            "case can be judged against it"])
     rows = (
         line.strip().partition("  ")
-        for line in run.stdout.splitlines()
+        for line in out.splitlines()
         if line.strip()
     )
     return {
@@ -152,7 +213,7 @@ def _assess_case(expected, before, after, after_said):
             "a crash is not a bite: the check must fail without stopping "
             "the suite from answering",
         ]
-        return lines, "the mutant did not produce a complete verdict", ()
+        return lines, f"{expected!r} produced no complete verdict", ()
 
     bit = tuple(sorted(after - before))
     healed = tuple(sorted(before - after))

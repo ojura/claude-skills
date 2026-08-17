@@ -24,6 +24,18 @@ session registry identifies the tmux server.
 The tool rebuilds a missing team directory and launches the resumed transcript
 with identity flags, team environment variables, and initialized inboxes.
 
+### Resolver decisions
+
+Each command selects its transcript, identity, roster entry, process facts, and
+tmux destination once. Before it signals a process, writes a roster, moves a
+transcript, archives mail, archives roster and inbox bytes, removes tool-managed
+files, or launches a pane, it checks the recorded state again. A changed roster,
+transcript, mailbox, or process identity stops the command and requires a new
+selection.
+
+`architecture.md` defines the Resolver records, tmux placement rules, title
+provenance, public methods, caller restrictions, and generation checks.
+
 Resolver selects transcripts in this order:
 
 1. an explicit session UUID
@@ -42,15 +54,15 @@ identity alone. A fresh lead's implicit team records the transcript ID in
 `leadSessionId`. A resumed lead creates its implicit team from a new internal
 session ID, represented by the live process and team-directory name. Its spawn
 records also name the team.
-Resolver corroborates competing lead claims with a live process, a roster entry,
-member names shared by roster and spawn records, or the team-name block. A sole
-claim remains usable for ordinary dead-team recovery and is reported as
+Resolver corroborates lead transcript candidates with a live process, a roster
+entry, member names shared by roster and spawn records, or the team-name block. A
+sole candidate remains usable for ordinary dead-team recovery and is reported as
 uncorroborated.
 
 Live process arguments outrank roster entries and transcript stamps because argv
 describes the current process identity, while files describe identity at their
-write time. Resolver checks the selected transcript against the identity about
-to be claimed and stops on disagreement. Every run prints the selected evidence
+write time. Resolver checks the selected transcript against the selected launch
+identity and stops on disagreement. Every run prints the selected evidence
 as `via`. An already-correct pane returns as running; an occupied pane gets a new
 pane; a dead tmux server is recreated. A stopped process counts as alive and the
 tool recommends `kill -CONT`, preventing a second writer on one transcript.
@@ -62,7 +74,7 @@ agent-resume <session-uuid>                  # exact transcript
 agent-resume session-xxxx                    # whole team: members into panes, lead last
 agent-resume session-xxxx --no-lead          # members only, lead already alive
 agent-resume NAME --into-team live           # rebind onto the team the lead now runs as
-agent-resume <lead-uuid> --into-team TEAM    # move the lead itself; its crew stays put
+agent-resume <lead-uuid> --into-team TEAM    # move the lead itself; other members stay on the source team
 agent-resume NAME --stop                     # stop it, listing what it is working on first
 agent-resume session-xxxx --stop             # stop the whole team
 agent-resume --doctor session-xxxx            # team verdict, then lead-first member dossiers
@@ -115,11 +127,11 @@ Three flags name destinations:
 - `--as-agent` selects the identity used by promotion.
 
 `--team` selects the set of agents operated on. Promotion derives the name from
-the side transcript and the team from its current parent session. A final demote
-receipt from another team represents an exact undo, so promotion offers it as
-`y/N`; declining uses the current parent's team. `--as-agent` overrides either
-part. Completion inserts `name@`, then lists teams with the current parent's team
-first.
+the side transcript and the team from its current parent session. When identity
+was inferred or defaulted and a final demote receipt from another team records an
+exact inverse, promotion offers that inverse as `Y/n`; declining uses the current
+parent's team. Explicit `--as-agent` suppresses the offer. Completion inserts
+`name@`, then lists teams with the current parent's team first.
 
 Promotion also makes known `origin.kind: human` persistence records visible.
 The default keeps Claude Code's complete wrapper text. `--unwrap` instead stores
@@ -128,10 +140,11 @@ in the transcript's schema-version-1 conversion receipt, so demotion restores
 the original side transcript bytes. `visible_human_wrapper_edits` stores UUID
 intervals; unwrapped intervals reference the original wrapper payloads needed for
 the inverse, while complete-wrapper intervals copy no payload text. When
-promotion consumes a carried demote receipt and `--unwrap` is omitted, it
-preserves that receipt's previous mode; an exact inverse replays only the
-recorded intervals. `side_meta_b64` and `side_meta_mode` store the original
-`.meta.json` bytes and file mode when promotion removes that sidecar, so demotion
+promotion applies the exact inverse recorded by a carried demote receipt and
+`--unwrap` is omitted, it preserves that receipt's recorded mode; an exact inverse
+replays only the recorded intervals. `side_meta_b64` and `side_meta_mode` store the
+original `.meta.json` bytes and file mode when promotion removes that sidecar, so
+demotion
 restores them exactly. Missing receipt fields and unsupported schema versions are
 refused rather than inferred. Unknown wrappers and coordinator, peer,
 task-notification, hook, image, and tool-result records remain unchanged. The
@@ -147,16 +160,19 @@ lead, or roster-recovery actions.
 
 Demotion derives its parent from the latest promotion receipt. When parent
 inference reaches current-team evidence, the tool offers that team's lead
-session as `y/N`, with decline as the default. `--into-session` overrides this
-choice. Completion
-lists the receipt parent first, current-team sessions next, and remaining
-sessions last.
+session as `Y/n`; Enter accepts, and an unattended run takes the default.
+`--into-session` overrides this choice. Completion lists the receipt parent first,
+current-team sessions next, and remaining sessions last.
 
 `--into-team TEAM|live` moves an agent to the team used by a live lead. A plain
 `claude --resume` gives the lead a new implicit team, while existing members
 remain registered under the previous team. Rebinding relaunches the member with
 the destination identity, stops any process still holding the transcript,
-registers the destination roster entry, and retires the source entry.
+registers the destination roster entry, and marks the source entry inactive.
+The source row and its original metadata are preserved with `isActive` set to
+`false`; the destination row becomes the current assignment. The inactive source
+row does not enter ordinary selection, completion, or team-run population for
+the source team.
 
 `live` derives the destination from spawn records written during the current
 process life. A resumed lead appends several lives to one transcript, so process
@@ -179,16 +195,19 @@ Rebinding has two operations:
   writer per transcript.
 
 `--into-team TEAM` migrates a lead. The command asks before stopping the process
-holding that conversation; `--yes` accepts in advance. It retires the team named
-by window-start stamps and execs the transcript as the destination lead. With
-`--force`, it restamps a team that still has a live process and leaves that team
-running. Member processes keep their existing identities, so the report lists
-them, their waiting mail, and the per-member `--into-team live` command.
+holding that conversation; `--yes` accepts in advance. It archives the source
+team's roster and inbox bytes into a receipt, removes tool-managed files from the
+source team directory, preserves unrecognized entries, and removes the directory
+only when empty. It then execs the transcript as the destination lead. With
+`--force`, it restamps the source team's identity fields in the transcript and
+leaves that team's directory and processes in place. Other members keep their
+existing identities, so the report lists them, their waiting mail, and the
+per-member `--into-team live` command.
 
 The team component in an agent ID addresses an identity. `--into-team` selects a
 destination. When transcript stamps name another team, the command points to
 `--into-team TEAM`; `--force` permits a split identity. An unstamped conversation
-uses the plain lead launch; team retirement applies to stamped source teams.
+uses the plain lead launch; source-team archival applies to stamped source teams.
 
 Dead members redirect automatically when exact registry or current-life spawn
 evidence identifies a live lead under another team. `--keep-team` preserves the
@@ -351,10 +370,10 @@ Colors and bracketed model variants live in the roster and in the lead's spawn
 records, so reconstruction preserves them when the lead transcript is
 available. `leadSessionId` receives only evidence that Resolver treats as exact.
 An uncorroborated lead remains reachable through spawn-record evidence and is
-reported as such on each run. This prevents a roster reconstructed from a claim
-from corroborating that same claim.
+reported as such on each run. This prevents a roster reconstructed from one
+transcript's evidence from corroborating that same transcript.
 
-The complete team config follows. Every field is consumed:
+The complete team config follows. Every field is read by the harness or this tool:
 
 ```bash
 mkdir -p ~/.claude/teams/<team>/inboxes
@@ -569,7 +588,7 @@ mkdir -p ~/.claude/teams/<team>/inboxes
 echo '[]' > ~/.claude/teams/<team>/inboxes/team-lead.json
 ```
 
-2. Resume the dead leader session claiming the team-lead identity:
+2. Resume the dead leader session with explicit team-lead identity flags:
 
 ```bash
 env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 CLAUDE_CODE_ENTRYPOINT=cli \

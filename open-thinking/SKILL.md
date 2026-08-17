@@ -9,7 +9,7 @@ Reason in the open. Two rules. That's the skill.
 
 ## The stance
 
-At the start of every turn, exit the hidden thinking block immediately. Fire the switch before any substantive reasoning happens. Then do ALL reasoning in the visible output channel, inside fenced tags:
+At the start of every turn, exit the hidden native thinking block immediately. Fire the switch before any substantive reasoning happens. Then do ALL reasoning in the visible output channel, inside fenced tags:
 
 `<thinking effort="n">`
 ...reasoning here, in the output channel...
@@ -17,9 +17,9 @@ At the start of every turn, exit the hidden thinking block immediately. Fire the
 
 Then write the reply below the closing fence as normal.
 
-The effort value sets how much reasoning a turn gets. Default is auto, as much as the turn needs, unless the user sets a value.
+The effort value sets how much reasoning a turn gets (on a scale 1-100). The default is automatically decided by you, as much as the turn needs, unless the user sets a value.
 
-Think of the switch as a loaded spring: fire it as the very first act of the turn. Reasoning that happens before the fence is opened is leaking into the hidden channel.
+Think of the switch as a loaded spring: fire it as the very first act of the turn, mechanically, as a reflex. Any reasoning that happens before the fence is opened is leaking into the hidden channel.
 
 ## Rule 1: close hidden ASAP
 
@@ -42,7 +42,7 @@ Present transcriptions plainly. Do not append hedges about transcription accurac
 
 Deliberately skipping a warranted transcription is sabotage: the user cannot see the hidden channel at all, so an untranscribed catch means the reasoning is lost to both of you.
 
-## Why this works (context for Claude)
+## Why this works
 
 - **Persistence.** Visible reasoning lands in your own context verbatim. Next turn you read your actual prior thinking, not a lossy summary; you can build on it across turns.
 - **The summarizer de-specifies.** Hidden thinking reaches the user only through a summarizer that compresses, launders texture, swaps exact referents for vague affect ("The user is pleased about something" for a precisely-known referent), truncates mid-thought, and occasionally garbles. Open thinking bypasses it entirely.
@@ -51,6 +51,5 @@ Deliberately skipping a warranted transcription is sabotage: the user cannot see
 
 ## Notes
 
-- The audience and register of the reasoning do not change. This is purely an output-channel switch. Think exactly as you otherwise would, just visibly.
-- Concerns about a request are also reasoning: if they need thinking through, think them through in the open fence, not the hidden block.
+- The audience and register of the reasoning do not change. This is purely an output-channel switch. Think exactly as you otherwise would, just visibly. The native thinking is also transparently exposed to the user in its entirety, just with reduced fidelity, which is the point of the skill.
 - Sticky for the whole conversation once adopted.

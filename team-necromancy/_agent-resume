@@ -2,7 +2,11 @@
 # Completion for the tool named on the #compdef line. Zsh supplies that name in
 # $service, so a command rename changes the #compdef line, function name, and
 # filename. The hidden --complete emitter supplies candidates in either
-# "cand:desc" or "cand<TAB>desc<TAB>ansi-color" form. This file pads names for
+# "cand:desc" or "cand<TAB>desc<TAB>ansi-color" form. Names rows in the selector
+# topic use exactly six TAB-delimited fields:
+#   names<TAB>team-key<TAB>group-description<TAB>agent-id<TAB>member-description<TAB>colour
+# Rows with fewer or more fields, a blank team-key, or an agent-id whose team
+# component does not match team-key are rejected. This file pads names for
 # aligned @session columns and generates list-colors patterns from the rendered
 # rows.
 #
@@ -18,7 +22,20 @@
 # new or removed session or team changes the stamp. Transcript growth ages out
 # through _RA_CACHE_TTL, which bounds staleness for last-active descriptions.
 _RA_CACHE_TTL=60
+_RA_NAMES_PROTOCOL=2  # bumped when the names row schema changes; invalidates selector caches
 typeset -gA _RA_CACHE _RA_CACHE_KEY _RA_CACHE_AT
+
+_ra_agent_team() {  # agent-id -> REPLY (team after first @), or nonzero if invalid
+  # Mirrors Python's name_and_team which uses str.partition("@"): the name is
+  # before the first @, the team is everything after it. Returns 1 for no @,
+  # empty name, or empty team.
+  local id=$1
+  [[ $id == *@* ]] || return 1
+  local name=${id%%@*}
+  local team=${id#*@}
+  [[ -n $name && -n $team ]] || return 1
+  REPLY=$team
+}
 
 _ra_stamp() {  # topic -> stamp (caller's local), or nonzero when unavailable
   local -a st
@@ -35,7 +52,7 @@ _ra_stamp() {  # topic -> stamp (caller's local), or nonzero when unavailable
   local claude=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
   zstat -A st +mtime $claude/teams(N) $claude/projects(N) \
         $claude/teams/*(N/) $claude/projects/*(N/) 2>/dev/null || return 1
-  stamp="corpus $#st ${(j: :)st}"
+  stamp="corpus p${_RA_NAMES_PROTOCOL} $#st ${(j: :)st}"
 }
 
 # The disk cache gives a new shell the candidate list from a previous shell. It
@@ -220,21 +237,40 @@ _agent_resume_selector() {  # names/teams/leads in one call, widths shared
   local -a all n t l s lines
   local -i maxname=0 maxid=0 ret=1
   local line
-  # names arrive as "names<TAB>group<TAB>cand<TAB>desc<TAB>colour", already
-  # ordered newest session first; keep that order and one array per group.
+  # names rows are exactly six TAB-delimited fields:
+  #   names<TAB>team-key<TAB>group-description<TAB>agent-id<TAB>member-description<TAB>colour
+  # Group by the exact team-key; display group-description as the heading.
+  # Reject rows with fewer or more fields, a blank team-key, an agent-id
+  # without a valid name@team split, a team component that does not equal the
+  # team-key, or a group-description that contradicts the first row for that key.
   local -a groups
-  local rest group
-  typeset -A grouped
+  local -a parts
+  local team_key group_desc agent_id member_desc colour
+  typeset -A grouped group_descs
   _ra_emit selector
   all=($lines)
   for line in $all; do
     case $line in
       names$'\t'*)
-        rest=${line#*$'\t'}
-        group=${rest%%$'\t'*}
-        (( ${+grouped[$group]} )) || groups+=($group)
-        grouped[$group]+="${rest#*$'\t'}"$'\n'
-        n+=(${rest#*$'\t'})
+        parts=("${(@ps:\t:)line}")
+        # Require exactly 6 fields
+        (( $#parts == 6 )) || continue
+        team_key=$parts[2] group_desc=$parts[3]
+        agent_id=$parts[4] member_desc=$parts[5] colour=$parts[6]
+        # Reject blank team-key
+        [[ -n $team_key ]] || continue
+        # Validate agent-id has nonempty name and team, team matches team-key
+        _ra_agent_team "$agent_id" || continue
+        [[ $REPLY == $team_key ]] || continue
+        # First group-description wins; reject a later row that contradicts it
+        if (( ${+grouped[$team_key]} )); then
+          [[ ${group_descs[$team_key]} == $group_desc ]] || continue
+        else
+          groups+=($team_key)
+          group_descs[$team_key]=$group_desc
+        fi
+        grouped[$team_key]+="${agent_id}"$'\t'"${member_desc}"$'\t'"${colour}"$'\n'
+        n+=("${agent_id}"$'\t'"${member_desc}"$'\t'"${colour}")
         ;;
       teams$'\t'*)    t+=(${line#*$'\t'}) ;;
       leads$'\t'*)    l+=(${line#*$'\t'}) ;;
@@ -251,10 +287,11 @@ _agent_resume_selector() {  # names/teams/leads in one call, widths shared
   # one colour per session cluster, cycled
   local -a cluster_colours=(36 33 35 32 34 31 96 93)
   local -i i=0
-  for group in $groups; do
+  for team_key in $groups; do
     (( i++ ))
-    _ra_render "names$i" "$group" ${cluster_colours[(( (i - 1) % $#cluster_colours + 1 ))]} \
-      ${(f)${grouped[$group]%$'\n'}} && ret=0
+    _ra_render "names$i" "${group_descs[$team_key]}" \
+      ${cluster_colours[(( (i - 1) % $#cluster_colours + 1 ))]} \
+      ${(f)${grouped[$team_key]%$'\n'}} && ret=0
   done
   (( $#t )) && _ra_render teams "whole team" "" $t && ret=0
   (( $#l )) && _ra_render leads "team lead" "" $l && ret=0
