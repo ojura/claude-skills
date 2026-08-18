@@ -9,6 +9,7 @@ It also includes a reusable, self-contained HTML decision board derived from a r
 - Preserves every source finding and reviewer attribution.
 - Verifies each claim against the current branch before editing.
 - Uses `Resolved` when a comment is already addressed, `Fix` for accepted but unimplemented work, `Discuss` when reviewer input is still needed, `Defer` for intentional later work, and `Reject` when the requested change will not be adopted.
+- Adapts the ruling labels to the material: that default set is the suggested one for code reviews, and `--decisions` (or a `decisions` field in the findings JSON) renames the set for other reviews, such as `Wipe completely`/`Trim`/`Merge with…`/`Keep`/`Discuss` for a memory-bank audit.
 - Consolidates only findings with the same root cause and correction surface.
 - Groups accepted fixes into coherent implementation batches.
 - Requires targeted tests and a final seam review.

@@ -196,13 +196,89 @@ class DecisionBoardBuilderTest(unittest.TestCase):
     def test_resolved_is_purple_and_fix_is_green(self):
         template = TEMPLATE_FILE.read_text(encoding="utf-8")
         self.assertIn("--good: #0ca30c;", template)
-        self.assertIn("--resolved: #7c3aed;", template)
-        self.assertIn(".stat-resolved .stat-mark { background: var(--resolved); }", template)
-        self.assertIn(".stat-fix .stat-mark { background: var(--good); }", template)
-        self.assertIn(".decision-resolved { --row-choice: var(--resolved); }", template)
-        self.assertIn(".decision-fix { --row-choice: var(--good); }", template)
-        self.assertIn('tbody tr[data-decision="resolved"] { --row-status: var(--resolved); }', template)
-        self.assertIn('tbody tr[data-decision="fix"] { --row-status: var(--good); }', template)
+        self.assertIn("--purple: #7c3aed;", template)
+
+        raw = {"findings": [{"id": "F001", "title": "Claim"}]}
+        payload = builder.normalize_payload(raw, Path("findings.json"), None)
+        rendered = builder.render_board(payload, TEMPLATE_FILE)
+        self.assertIn(".stat-resolved .stat-mark { background: var(--purple); }", rendered)
+        self.assertIn(".stat-fix .stat-mark { background: var(--good); }", rendered)
+        self.assertIn(".decision-resolved { --row-choice: var(--purple); }", rendered)
+        self.assertIn(".decision-fix { --row-choice: var(--good); }", rendered)
+        self.assertIn('tbody tr[data-decision="resolved"] { --row-status: var(--purple); }', rendered)
+        self.assertIn('tbody tr[data-decision="fix"] { --row-status: var(--good); }', rendered)
+        self.assertIn('tbody tr[data-decision="undecided"] { --row-status: var(--neutral); }', rendered)
+
+    def test_custom_decisions_render_across_the_board(self):
+        raw = {
+            "decisions": [
+                {"value": "wipe", "label": "Wipe completely", "slot": "red"},
+                "trim:Trim",
+                "merge:Merge with…",
+                "keep:Keep",
+                "discuss:Discuss",
+            ],
+            "findings": [
+                {"id": "M001", "title": "Stale entry", "decision": "wipe", "note": "Superseded."},
+                {"id": "M002", "title": "Long entry"},
+            ],
+        }
+        payload = builder.normalize_payload(raw, Path("findings.json"), None)
+        self.assertEqual(payload["initial_decisions"], {"M001": "wipe"})
+        self.assertEqual(
+            [entry["value"] for entry in payload["decisions"]],
+            ["wipe", "trim", "merge", "keep", "discuss"],
+        )
+        rendered = builder.render_board(payload, TEMPLATE_FILE)
+        self.assertIn('class="decision-option decision-wipe"', rendered)
+        self.assertIn("<span>Wipe completely</span>", rendered)
+        self.assertIn('data-stat-decision="wipe"', rendered)
+        self.assertIn('<option value="merge">Merge with…</option>', rendered)
+        self.assertIn(
+            "const DECISION_VALUES = ['undecided', 'wipe', 'trim', 'merge', 'keep', 'discuss'];",
+            rendered,
+        )
+        self.assertIn("const DECISION_RANK = {'undecided': 0, 'wipe': 1", rendered)
+        self.assertIn(".stat-wipe .stat-mark { background: var(--critical); }", rendered)
+        self.assertNotIn('value="resolved"', rendered)
+        self.assertNotRegex(rendered, builder.TOKEN_PATTERN)
+
+    def test_custom_decisions_reject_reserved_duplicate_and_malformed_entries(self):
+        finding = [{"id": "F001", "title": "Claim"}]
+        cases = {
+            "reserved": [{"value": "undecided", "label": "Undecided"}],
+            "duplicate": ["keep:Keep", "keep:Keep again"],
+            "bad value": ["Keep:Keep"],
+            "bad slot": [{"value": "keep", "label": "Keep", "slot": "mauve"}],
+            "too few": ["keep:Keep"],
+        }
+        for name, decisions in cases.items():
+            with self.subTest(case=name):
+                raw = {"decisions": decisions, "findings": finding}
+                with self.assertRaises(ValueError):
+                    builder.normalize_payload(raw, Path("findings.json"), None)
+        with self.assertRaisesRegex(ValueError, "decision must be one of"):
+            builder.normalize_payload(
+                {
+                    "decisions": ["keep:Keep", "wipe:Wipe"],
+                    "findings": [{"id": "F001", "title": "Claim", "decision": "resolved"}],
+                },
+                Path("findings.json"),
+                None,
+            )
+
+    def test_cli_decisions_string_overrides_the_input_field(self):
+        raw = {
+            "decisions": ["keep:Keep", "wipe:Wipe"],
+            "findings": [{"id": "F001", "title": "Claim"}],
+        }
+        payload = builder.normalize_payload(
+            raw, Path("findings.json"), None, "adopt:Adopt,park:Park:gray"
+        )
+        self.assertEqual(
+            [(entry["value"], entry["label"], entry["slot"]) for entry in payload["decisions"]],
+            [("adopt", "Adopt", "purple"), ("park", "Park", "gray")],
+        )
 
     def test_script_writes_the_requested_output(self):
         with tempfile.TemporaryDirectory() as directory:

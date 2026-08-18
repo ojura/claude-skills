@@ -23,7 +23,7 @@
       --accent-strong: #184f95;
       --button-primary: #184f95;
       --good: #0ca30c;
-      --resolved: #7c3aed;
+      --purple: #7c3aed;
       --warning: #fab219;
       --serious: #ec835a;
       --critical: #d03b3b;
@@ -50,7 +50,7 @@
         --accent-soft: #183f6c;
         --accent-strong: #9ec5f4;
         --button-primary: #256abf;
-        --resolved: #a78bfa;
+        --purple: #a78bfa;
         --shadow: 0 14px 36px rgba(0, 0, 0, 0.32);
         --focus-color: #9ec5f4;
       }
@@ -72,7 +72,7 @@
       --accent-soft: #183f6c;
       --accent-strong: #9ec5f4;
       --button-primary: #256abf;
-      --resolved: #a78bfa;
+      --purple: #a78bfa;
       --shadow: 0 14px 36px rgba(0, 0, 0, 0.32);
       --focus-color: #9ec5f4;
     }
@@ -258,12 +258,7 @@
       background: var(--neutral);
     }
 
-    .stat-undecided .stat-mark { background: var(--neutral); }
-    .stat-resolved .stat-mark { background: var(--resolved); }
-    .stat-fix .stat-mark { background: var(--good); }
-    .stat-discuss .stat-mark { background: var(--accent); }
-    .stat-defer .stat-mark { background: var(--warning); }
-    .stat-reject .stat-mark { background: var(--critical); }
+    @@DECISION_CSS@@
 
     .stat-value {
       grid-area: value;
@@ -531,13 +526,6 @@
       background: color-mix(in srgb, var(--accent-soft) 32%, var(--surface));
     }
 
-    tbody tr[data-decision="resolved"] { --row-status: var(--resolved); }
-    tbody tr[data-decision="fix"] { --row-status: var(--good); }
-    tbody tr[data-decision="discuss"] { --row-status: var(--accent); }
-    tbody tr[data-decision="defer"] { --row-status: var(--warning); }
-    tbody tr[data-decision="reject"] { --row-status: var(--critical); }
-    tbody tr[data-decision="undecided"] { --row-status: var(--neutral); }
-
     tbody tr > :first-child { border-left: 4px solid var(--row-status); }
 
     .reference-cell {
@@ -700,12 +688,6 @@
     .decision-option:has(input:focus-visible) { outline: 3px solid var(--focus-color); outline-offset: 2px; }
     .decision-option input:focus-visible { outline: none; box-shadow: none; }
     .decision-option:has(input:checked) { border-color: var(--row-choice, var(--neutral)); box-shadow: inset 3px 0 0 var(--row-choice, var(--neutral)); }
-    .decision-undecided { --row-choice: var(--neutral); }
-    .decision-resolved { --row-choice: var(--resolved); }
-    .decision-fix { --row-choice: var(--good); }
-    .decision-discuss { --row-choice: var(--accent); }
-    .decision-defer { --row-choice: var(--warning); }
-    .decision-reject { --row-choice: var(--critical); }
 
     .note-cell textarea {
       min-height: 4.25rem;
@@ -988,24 +970,7 @@
         <div class="progress-fill" id="progress-fill"></div>
       </div>
       <div class="summary-stats" aria-label="Decision counts">
-        <button class="stat-button stat-undecided" type="button" data-stat-decision="undecided" aria-pressed="false">
-          <span class="stat-mark" aria-hidden="true"></span><span class="stat-value" id="count-undecided">@@FINDING_COUNT@@</span><span class="stat-label">Undecided</span>
-        </button>
-        <button class="stat-button stat-resolved" type="button" data-stat-decision="resolved" aria-pressed="false">
-          <span class="stat-mark" aria-hidden="true"></span><span class="stat-value" id="count-resolved">0</span><span class="stat-label">Resolved</span>
-        </button>
-        <button class="stat-button stat-fix" type="button" data-stat-decision="fix" aria-pressed="false">
-          <span class="stat-mark" aria-hidden="true"></span><span class="stat-value" id="count-fix">0</span><span class="stat-label">Fix</span>
-        </button>
-        <button class="stat-button stat-discuss" type="button" data-stat-decision="discuss" aria-pressed="false">
-          <span class="stat-mark" aria-hidden="true"></span><span class="stat-value" id="count-discuss">0</span><span class="stat-label">Discuss</span>
-        </button>
-        <button class="stat-button stat-defer" type="button" data-stat-decision="defer" aria-pressed="false">
-          <span class="stat-mark" aria-hidden="true"></span><span class="stat-value" id="count-defer">0</span><span class="stat-label">Defer</span>
-        </button>
-        <button class="stat-button stat-reject" type="button" data-stat-decision="reject" aria-pressed="false">
-          <span class="stat-mark" aria-hidden="true"></span><span class="stat-value" id="count-reject">0</span><span class="stat-label">Reject</span>
-        </button>
+        @@DECISION_STAT_BUTTONS@@
       </div>
     </section>
 
@@ -1040,12 +1005,7 @@
           <label for="decision-filter">Decision</label>
           <select id="decision-filter">
             <option value="all">All decisions</option>
-            <option value="undecided">Undecided</option>
-            <option value="resolved">Resolved</option>
-            <option value="fix">Fix</option>
-            <option value="discuss">Discuss</option>
-            <option value="defer">Defer</option>
-            <option value="reject">Reject</option>
+            @@DECISION_FILTER_OPTIONS@@
           </select>
         </div>
         <div class="field">
@@ -1163,9 +1123,9 @@
     const STORAGE_KEY = DATA.embedded_snapshot_id
       ? `branch-review-findings-snapshot-v1:${DATASET_SIGNATURE}:${DATA.embedded_snapshot_id}`
       : `branch-review-findings-v1:${DATASET_SIGNATURE}`;
-    const DECISION_VALUES = ['undecided', 'resolved', 'fix', 'discuss', 'defer', 'reject'];
+    const DECISION_VALUES = [@@DECISION_VALUES_JS@@];
     const SEVERITY_RANK = {critical: 0, high: 1, 'medium-high': 2, medium: 3, 'low-medium': 4, low: 5};
-    const DECISION_RANK = {undecided: 0, discuss: 1, fix: 2, defer: 3, reject: 4, resolved: 5};
+    const DECISION_RANK = {@@DECISION_RANK_JS@@};
 
     const rows = Array.from(document.querySelectorAll('.finding-row'));
     const rowById = new Map(rows.map((row) => [row.dataset.findingId, row]));
@@ -1493,7 +1453,7 @@
       row.classList.remove('pulse');
       void row.offsetWidth;
       row.classList.add('pulse');
-      const firstAction = row.querySelector('input[type="radio"][value="resolved"]');
+      const firstAction = row.querySelector('input[type="radio"]:not([value="undecided"])');
       window.setTimeout(() => {
         firstAction.focus();
         firstAction.scrollIntoView({behavior: 'smooth', block: 'center', inline: 'nearest'});

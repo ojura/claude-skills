@@ -16,7 +16,16 @@ The included board is a local, self-contained HTML file. It keeps decisions in b
 
 ## Decision meanings
 
-Use the five board decisions consistently:
+The ruling labels are generic: pick a set that fits the material under review. The five decisions below are the suggested set for merge-request and branch code reviews, and the rest of this document uses their names. For other review shapes, rename them to the actual outcomes the decider will choose between; for example, a memory-bank or documentation audit works better with `Wipe completely`, `Trim`, `Merge with…`, `Keep`, and `Discuss`. Whatever the names, keep the structure:
+
+- a small set (2-7) of mutually exclusive outcomes, each still requiring a note that makes it auditable
+- the automatic temporary `Undecided`, which is never a final state
+- one `Discuss`-style ruling for decisions that genuinely need the reviewer or user
+- an explicit statement of which rulings leave the review open (for the default set: `Fix`, `Discuss`, and `Undecided`)
+
+Custom sets are passed to the board builder with `--decisions` or a top-level `decisions` field in the findings JSON (see the build step). Exports carry the custom values, so the resolution ledger and any importer must use the same set.
+
+Use the five default board decisions consistently:
 
 - **Resolved**: the reviewer's comment has already been adopted or otherwise addressed in the current branch. Record the current code, test, reply, or placement evidence that closes it.
 - **Fix**: the reviewer's requested change should be adopted, but it has not been implemented yet. State the intended correction and required verification. Change the decision to Resolved after the implementation is complete and verified.
@@ -65,6 +74,8 @@ The board builder accepts either a raw JSON array or an object with a non-empty 
 ```
 
 Accepted aliases include `summary` for title, `failure_scenario` for evidence, `suggested_fix` for proposed resolution, `reviewers` or `reported_by` for agents, and string locations such as `src/file.cpp:40-52`.
+
+An optional top-level `decisions` array replaces the default ruling set, either as objects (`{"value": "wipe", "label": "Wipe completely", "slot": "red"}`) or as `"value:Label"` / `"value:Label:slot"` strings. Values are lowercase `[a-z][a-z0-9-]*`, 2 to 7 entries, unique; `undecided` and `all` are reserved. The optional `slot` names a board color: `purple`, `green`, `blue`, `amber`, `red`, `orange`, or `gray`; unset slots are assigned in that order. Seeded `decision` fields are validated against the active set.
 
 Severity values are `critical`, `high`, `medium-high`, `medium`, `low-medium`, and `low`. Missing severity defaults to `medium`. Preserve the reviewer's severity until verification, then change it only with a written reason.
 
@@ -123,7 +134,7 @@ Use these verification results internally:
 - `choice-required`: the defect is real but multiple valid contracts remain
 - `blocked`: verification needs unavailable data, hardware, credentials, or a user-owned premise
 
-Do not convert `blocked` into `reject`. Surface the missing evidence.
+Do not convert `blocked` into `reject`. Report the missing evidence.
 
 ### 4. Consolidate only at the root cause
 
@@ -151,6 +162,8 @@ python3 <skill-directory>/scripts/build_decision_board.py \
   /tmp/<repo>-branch-review/decision-board.html \
   --title "<branch> review findings"
 ```
+
+Add `--decisions "wipe:Wipe completely,trim:Trim,merge:Merge with…,keep:Keep,discuss:Discuss"` to rename the ruling set for a non-code review; it overrides the input's `decisions` field. Renaming the rulings for unchanged findings keeps the same dataset signature: saved notes survive, and any stored ruling the new set does not know renders as Undecided again.
 
 The HTML is complete on disk and can be opened directly. It provides:
 
@@ -187,6 +200,8 @@ Every finding needs a decision and a note that makes the decision auditable:
 - **Reject note**: why the requested change will not be adopted, with current code, measured counterevidence, or the superseding contract.
 
 Resolve what code and tests can answer without asking the reviewer. Use Discuss only when the reviewer's intent or acceptance is genuinely required. Group related questions so the reviewer sees the consequences together, but keep each finding's final note specific.
+
+With a custom ruling set, restate this gate in that set's terms before classifying: which rulings close a finding, which keep the review open, and what evidence each note must hold.
 
 Completion gate for classification:
 
