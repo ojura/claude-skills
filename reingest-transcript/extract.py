@@ -49,17 +49,35 @@ import datetime
 SR = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 
 
+DECODER = json.JSONDecoder()
+
+
+def records(line):
+    """The JSON records on one line, in order. Normally one. At spawn the harness writes a
+    teammate's root user entry (the brief) and a metadata record (agent-name, cost-state)
+    with no newline between them, so a strict json.loads refuses the line and the walk
+    loses the root. Raises ValueError when a remainder is not a record."""
+    out, pos = [], 0
+    while pos < len(line):
+        obj, end = DECODER.raw_decode(line, pos)
+        out.append(obj)
+        pos = end
+        while pos < len(line) and line[pos].isspace():
+            pos += 1
+    return out
+
+
 def load(path):
     objs = []
     with open(path, encoding="utf-8") as fh:
-        for line in fh:
+        for n, line in enumerate(fh, 1):
             line = line.strip()
             if not line:
                 continue
             try:
-                objs.append(json.loads(line))
+                objs.extend(records(line))
             except Exception:
-                pass  # non-JSON / partial lines
+                print(f"note: line {n} is not JSON and was skipped (a partial line of a killed write)")
     return objs
 
 

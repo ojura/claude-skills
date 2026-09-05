@@ -23,6 +23,11 @@ Optionally trims a dead tail first (--leaf): keeps everything up to and
 including the target entry, plus an immediately-following last-prompt line
 if it already points at the target.
 
+A physical line holding two records with no newline between them (the
+harness writes fresh-spawned teammate transcripts that way: the founding
+user entry followed by an agent-name or cost-state record) is read as two
+entries and written back unchanged; the tool says which lines it found.
+
 Caveats the tool cannot fix for you:
   - A live `claude --resume <session>` process keeps its old in-memory leaf.
     Kill and re-resume after running this; prompting the stale process
@@ -74,15 +79,56 @@ def resolve_file(arg):
     return hits[0]
 
 
+_DECODER = json.JSONDecoder()
+
+
+def parse_records(line):
+    """The records on one physical line, each paired with the exact text it
+    occupies, so that the pieces written back in order reproduce the line.
+
+    Needed because at spawn the harness writes a teammate's root user entry
+    (the brief) and a metadata record (agent-name, cost-state) with no newline
+    between them; a strict json.loads refuses that line whole. Each record is
+    decoded from where the previous one ended. The first piece keeps the
+    line's leading whitespace and the last keeps its newline. A remainder that
+    is not a record raises JSONDecodeError."""
+    text_end = len(line.rstrip("\r\n"))
+    records, starts, pos = [], [], 0
+    while True:
+        while pos < text_end and line[pos] in " \t":
+            pos += 1
+        if pos >= text_end:
+            break
+        obj, end = _DECODER.raw_decode(line, pos)
+        records.append(obj)
+        starts.append(pos)
+        pos = end
+    bounds = [0] + starts[1:] + [len(line)]
+    return [(records[i], line[bounds[i]:bounds[i + 1]])
+            for i in range(len(records))]
+
+
 def load(path):
-    entries = []
+    """Entries as (line number, dict, raw text), and the lines that hold more
+    than one record. A strict per-line parse refuses such a line whole, and
+    the harness's own loader drops it, root entry included."""
+    entries, glued = [], []
     with open(path) as fh:
         for n, line in enumerate(fh, 1):
             try:
                 entries.append((n, json.loads(line), line))
+                continue
+            except json.JSONDecodeError:
+                pass
+            try:
+                records = parse_records(line)
             except json.JSONDecodeError as e:
                 die(f"line {n} is not valid JSON ({e}); refusing to touch the file")
-    return entries
+            if not records:
+                die(f"line {n} holds no record; refusing to touch the file")
+            glued.append((n, [d.get("type") for d, _ in records]))
+            entries.extend((n, d, raw) for d, raw in records)
+    return entries, glued
 
 
 def ref_check(entries):
@@ -127,7 +173,11 @@ def main():
     args = ap.parse_args()
 
     path = resolve_file(args.session)
-    entries = load(path)
+    entries, glued = load(path)
+    for n, types in glued:
+        print(f"note: line {n} holds {len(types)} records with no newline between "
+              f"them ({', '.join(str(t) for t in types)}); read as separate entries, "
+              "bytes kept as written")
     dangling_before = ref_check(entries)
 
     # --- pick the cut point and logical parent ------------------------------
@@ -208,7 +258,7 @@ def main():
     }
 
     # --- report --------------------------------------------------------------
-    print(f"file:            {path} ({len(entries)} lines)")
+    print(f"file:            {path} ({entries[-1][0]} lines)")
     if trimmed:
         first, last = trimmed[0][0], trimmed[-1][0]
         print(f"trim:            lines {first}-{last} ({len(trimmed)} lines)")
@@ -248,6 +298,10 @@ def main():
     try:
         with open(tmp, "w") as fh:
             fh.writelines(raw for _, _, raw in kept)
+            # a --leaf cut inside a glued line, or a file whose last line has
+            # no newline, would otherwise glue the new entry onto the last record
+            if kept and not kept[-1][2].endswith("\n"):
+                fh.write("\n")
             fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
             fh.write(json.dumps(last_prompt, separators=(",", ":")) + "\n")
         shutil.copymode(path, tmp)
@@ -258,13 +312,13 @@ def main():
         except FileNotFoundError:
             pass
 
-    new_danglers = ref_check(load(path)) - dangling_before
+    new_danglers = ref_check(load(path)[0]) - dangling_before
     if new_danglers:
         shutil.copy2(backup, path)
         die("verification failed, restored backup; newly dangling refs: "
             + ", ".join(f"{f}->{r}" for f, r in sorted(new_danglers)))
 
-    print(f"\nwritten: {len(kept) + 2} lines; backup at {backup}")
+    print(f"\nwritten: {kept[-1][0] + 2} lines; backup at {backup}")
 
 
 if __name__ == "__main__":
