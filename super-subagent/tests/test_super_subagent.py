@@ -19,6 +19,13 @@ super_subagent = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(super_subagent)
 
+TEST_CALLER_INVOCATION_ID = "0123456789abcdef0123456789abcdef"
+TEST_STALE_INVOCATION_ID = "fedcba9876543210fedcba9876543210"
+
+
+def invocation_command(command, invocation_id=TEST_CALLER_INVOCATION_ID):
+    return f"{super_subagent.CALLER_INVOCATION_ENV}={invocation_id} {command}"
+
 
 class SuperSubagentTest(unittest.TestCase):
     def setUp(self):
@@ -33,6 +40,16 @@ class SuperSubagentTest(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def caller_environment(
+        self,
+        invocation_id=TEST_CALLER_INVOCATION_ID,
+        source_id=None,
+    ):
+        values = {super_subagent.CALLER_INVOCATION_ENV: invocation_id}
+        if source_id is not None:
+            values["CLAUDE_CODE_AGENT_ID"] = source_id
+        return mock.patch.dict(os.environ, values)
+
     def write_parent(self, entries):
         self.parent.write_text(
             "".join(json.dumps(entry) + "\n" for entry in entries),
@@ -46,7 +63,7 @@ class SuperSubagentTest(unittest.TestCase):
             "fork_another_model": True,
             "name": None,
             "agent_id": "areview-proxy-retirement-tests-0123456789abcdef",
-            "spawn_depth": 1,
+            "spawn_depth": None,
             "parent_last_uuid": None,
             "from_main": True,
             "from_agent_id": None,
@@ -85,16 +102,28 @@ class SuperSubagentTest(unittest.TestCase):
         values.update(changes)
         return argparse.Namespace(**values)
 
-    def write_source_agent(self, agent_id, records, name="source-fork"):
-        subagents = self.project / self.session_id / "subagents"
+    def write_source_agent(
+        self,
+        agent_id,
+        records,
+        name="source-fork",
+        metadata=None,
+        directory=None,
+    ):
+        subagents = directory or self.project / self.session_id / "subagents"
         subagents.mkdir(parents=True, exist_ok=True)
         transcript = subagents / f"agent-{agent_id}.jsonl"
         transcript.write_text(
             "".join(json.dumps(record) + "\n" for record in records),
             encoding="utf-8",
         )
+        stored_metadata = metadata or {
+            "agentType": "fork",
+            "isFork": True,
+            "name": name,
+        }
         (subagents / f"agent-{agent_id}.meta.json").write_text(
-            json.dumps({"agentType": "fork", "isFork": True, "name": name}) + "\n",
+            json.dumps(stored_metadata) + "\n",
             encoding="utf-8",
         )
         return transcript
@@ -105,6 +134,27 @@ class SuperSubagentTest(unittest.TestCase):
             "write-skill-super-subagent-helper",
         )
         self.assertEqual(super_subagent.description_slug("!!!"), "agent")
+
+    def test_agent_id_validation_matches_send_message_recipient_syntax(self):
+        valid = (
+            "a0123456789abcdef",
+            "areview-worker-0123456789abcdef",
+            f"a{'x' * 63}-0123456789abcdef",
+        )
+        invalid = (
+            "a0123456789abcde",
+            "areview-worker-0123456789abcde",
+            "areview-worker-0123456789ABCDEf",
+            f"a{'x' * 64}-0123456789abcdef",
+            "areview.worker-0123456789abcdef",
+        )
+        for agent_id in valid:
+            with self.subTest(agent_id=agent_id):
+                self.assertEqual(super_subagent.validate_agent_id(agent_id), agent_id)
+        for agent_id in invalid:
+            with self.subTest(agent_id=agent_id):
+                with self.assertRaises(super_subagent.UsageError):
+                    super_subagent.validate_agent_id(agent_id)
 
     def test_prepare_writes_fork_reference_and_arbitrary_model(self):
         root_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -158,6 +208,7 @@ class SuperSubagentTest(unittest.TestCase):
                     "type": "assistant",
                     "uuid": active_uuid,
                     "parentUuid": root_uuid,
+                    "timestamp": time.time(),
                     "message": {
                         "role": "assistant",
                         "content": [
@@ -166,7 +217,7 @@ class SuperSubagentTest(unittest.TestCase):
                                 "id": "call_prepare_main",
                                 "name": "Bash",
                                 "input": {
-                                    "command": (
+                                    "command": invocation_command(
                                         "python3 /home/juraj/claude-skills/"
                                         "super-subagent/scripts/super_subagent.py "
                                         "prepare 'Main child'"
@@ -179,18 +230,38 @@ class SuperSubagentTest(unittest.TestCase):
             ]
         )
 
-        result = super_subagent.prepare_agent(
-            self.prepare_args(
-                model="inherit",
-                fork_another_model=False,
-                from_main=False,
+        with self.caller_environment():
+            result = super_subagent.prepare_agent(
+                self.prepare_args(
+                    description="Main child",
+                    model="inherit",
+                    fork_another_model=False,
+                    from_main=False,
+                )
             )
-        )
         reference = json.loads(Path(result["jsonl"]).read_text().splitlines()[0])
 
         self.assertEqual(reference["parentLastUuid"], root_uuid)
         self.assertNotIn("source_agent_id", result)
         self.assertEqual(result["mode"], "fork")
+
+    def test_automatic_caller_detection_requires_internal_invocation_id(self):
+        self.write_parent(
+            [{"type": "user", "uuid": "parent-root", "parentUuid": None}]
+        )
+        with mock.patch.dict(os.environ):
+            os.environ.pop(super_subagent.CALLER_INVOCATION_ENV, None)
+            with self.assertRaisesRegex(
+                super_subagent.UsageError, "requires the invocation id"
+            ):
+                super_subagent.prepare_agent(
+                    self.prepare_args(
+                        description="Main child",
+                        model="inherit",
+                        fork_another_model=False,
+                        from_main=False,
+                    )
+                )
 
     def test_prepare_requires_acknowledgement_for_another_model(self):
         root_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -252,6 +323,7 @@ class SuperSubagentTest(unittest.TestCase):
         self.assertEqual(metadata["agentType"], "fork")
         self.assertIs(metadata["isFork"], True)
         self.assertEqual(metadata["model"], "inherit")
+        self.assertEqual(metadata["spawnDepth"], 1)
         self.assertEqual(result["mode"], "fork")
         self.assertNotIn("cache_warning", result)
 
@@ -481,6 +553,7 @@ class SuperSubagentTest(unittest.TestCase):
                 "parentUuid": "source-active-thinking",
                 "isSidechain": True,
                 "agentId": source_id,
+                "timestamp": time.time(),
                 "message": {
                     "id": "response-active",
                     "role": "assistant",
@@ -490,7 +563,10 @@ class SuperSubagentTest(unittest.TestCase):
                             "id": "call_active",
                             "name": "Bash",
                             "input": {
-                                "command": "python3 super_subagent.py prepare task"
+                                "command": invocation_command(
+                                    "python3 super_subagent.py prepare "
+                                    "'Continue the source fork'"
+                                )
                             },
                         }
                     ],
@@ -558,6 +634,7 @@ class SuperSubagentTest(unittest.TestCase):
         self.assertEqual(metadata["parentAgentId"], source_id)
         self.assertEqual(metadata["agentType"], "fork")
         self.assertIs(metadata["isFork"], True)
+        self.assertEqual(metadata["spawnDepth"], 2)
 
     def test_prepare_from_worker_rejects_main_uuid_boundary(self):
         self.write_parent(
@@ -580,9 +657,10 @@ class SuperSubagentTest(unittest.TestCase):
         source_id = "asource-fork-0123456789abcdef"
         self.write_source_agent(source_id, self.source_fork_records(source_id))
 
-        result = super_subagent.prepare_agent(
-            self.worker_prepare_args(from_agent_id=None)
-        )
+        with self.caller_environment(source_id=source_id):
+            result = super_subagent.prepare_agent(
+                self.worker_prepare_args(from_agent_id=None)
+            )
 
         self.assertEqual(result["source_agent_id"], source_id)
         self.assertEqual(result["dropped_unmatched_tool_use_ids"], ["call_active"])
@@ -600,23 +678,747 @@ class SuperSubagentTest(unittest.TestCase):
         publisher = threading.Thread(target=publish_source)
         publisher.start()
         try:
-            result = super_subagent.prepare_agent(
-                self.worker_prepare_args(
-                    from_agent_id=None,
-                    caller_discovery_timeout=1.0,
+            with self.caller_environment():
+                result = super_subagent.prepare_agent(
+                    self.worker_prepare_args(
+                        from_agent_id=None,
+                        caller_discovery_timeout=1.0,
+                    )
                 )
-            )
         finally:
             publisher.join()
 
         self.assertEqual(result["source_agent_id"], source_id)
         self.assertEqual(result["dropped_unmatched_tool_use_ids"], ["call_active"])
 
-    def make_workflow_agent(self, run_id, agent_id, metadata=None):
+    def test_prepare_ignores_stale_unresolved_call_while_current_call_is_published(self):
+        description = "Continue the current caller"
+        self.write_parent(
+            [
+                {"type": "user", "uuid": "parent-root-uuid", "parentUuid": None},
+                {
+                    "type": "assistant",
+                    "uuid": "stale-prepare",
+                    "parentUuid": "parent-root-uuid",
+                    "timestamp": time.time() - 1.0,
+                    "message": {
+                        "id": "stale-response",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "call_stale_prepare",
+                                "name": "Bash",
+                                "input": {
+                                    "command": invocation_command(
+                                        "python3 super_subagent.py prepare "
+                                        "'Continue the current caller'",
+                                        TEST_STALE_INVOCATION_ID,
+                                    )
+                                },
+                            }
+                        ],
+                        "stop_reason": "tool_use",
+                    },
+                },
+            ]
+        )
+        top = self.project / self.session_id / "subagents"
+        top.mkdir(parents=True)
+        (top / "agent-abad-id-0123456789abcde.jsonl").write_text("{}\n")
+
+        source_id = "acurrent-caller-0123456789abcdef"
+        records = self.source_fork_records(source_id)
+        records[-1]["message"]["content"][0]["input"]["command"] = invocation_command(
+            "python3 super_subagent.py prepare 'Continue the current caller'"
+        )
+
+        def publish_current_source():
+            time.sleep(0.6)
+            records[-1]["timestamp"] = time.time()
+            self.write_source_agent(source_id, records)
+
+        publisher = threading.Thread(target=publish_current_source)
+        started = time.monotonic()
+        publisher.start()
+        try:
+            with self.caller_environment():
+                result = super_subagent.prepare_agent(
+                    self.worker_prepare_args(
+                        description=description,
+                        from_agent_id=None,
+                        caller_discovery_timeout=2.0,
+                    )
+                )
+        finally:
+            publisher.join()
+        elapsed = time.monotonic() - started
+
+        self.assertGreaterEqual(elapsed, 0.55)
+        self.assertEqual(result["source_agent_id"], source_id)
+        self.assertEqual(result["dropped_unmatched_tool_use_ids"], ["call_active"])
+
+    def test_command_detection_requires_an_executed_prepare_command(self):
+        description = "Review the caller"
+        self.assertFalse(
+            super_subagent.command_invokes_prepare(
+                "printf '%s' super_subagent.py prepare", description
+            )
+        )
+        self.assertFalse(
+            super_subagent.command_invokes_prepare(
+                "rg super_subagent.py prepare .", description
+            )
+        )
+        self.assertFalse(
+            super_subagent.command_invokes_prepare(
+                "python3 other.py super_subagent.py prepare", description
+            )
+        )
+        self.assertTrue(
+            super_subagent.command_invokes_prepare(
+                "python3 /tmp/super_subagent.py prepare 'Review the caller'",
+                description,
+            )
+        )
+        self.assertTrue(
+            super_subagent.command_invokes_prepare(
+                "printf done && env X=1 python3 /tmp/super_subagent.py "
+                "prepare 'Review the caller'",
+                description,
+            )
+        )
+        matching = invocation_command(
+            "python3 /tmp/super_subagent.py prepare 'Review the caller'"
+        )
+        stale = invocation_command(
+            "python3 /tmp/super_subagent.py prepare 'Review the caller'",
+            TEST_STALE_INVOCATION_ID,
+        )
+        self.assertTrue(
+            super_subagent.command_invokes_prepare(
+                matching, description, TEST_CALLER_INVOCATION_ID
+            )
+        )
+        self.assertFalse(
+            super_subagent.command_invokes_prepare(
+                stale, description, TEST_CALLER_INVOCATION_ID
+            )
+        )
+
+    def test_prepare_main_uses_detected_invocation_boundary_after_append(self):
+        root_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        active_uuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        branch_uuid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        self.write_parent(
+            [
+                {"type": "user", "uuid": root_uuid, "parentUuid": None},
+                {
+                    "type": "assistant",
+                    "uuid": active_uuid,
+                    "parentUuid": root_uuid,
+                    "message": {
+                        "id": "active-response",
+                        "role": "assistant",
+                        "content": [],
+                        "stop_reason": "tool_use",
+                    },
+                },
+            ]
+        )
+        invocation = super_subagent.PrepareInvocation(
+            None,
+            self.parent,
+            active_uuid,
+            "active-response",
+            "call_prepare",
+            root_uuid,
+            None,
+        )
+
+        def discover_then_append(*_args):
+            with self.parent.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "uuid": branch_uuid,
+                            "parentUuid": root_uuid,
+                            "message": {
+                                "id": "other-response",
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": "other branch"}],
+                                "stop_reason": "end_turn",
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            return super_subagent.CallerSelection(None, self.parent, invocation)
+
+        with mock.patch.object(
+            super_subagent,
+            "discover_prepare_caller",
+            side_effect=discover_then_append,
+        ):
+            result = super_subagent.prepare_agent(
+                self.prepare_args(
+                    description="Main child",
+                    model="inherit",
+                    fork_another_model=False,
+                    from_main=False,
+                )
+            )
+        reference = json.loads(Path(result["jsonl"]).read_text().splitlines()[0])
+        self.assertEqual(reference["parentLastUuid"], root_uuid)
+        self.assertNotEqual(reference["parentLastUuid"], branch_uuid)
+
+    def test_prepare_main_handles_parallel_pending_tools(self):
+        root_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        first_uuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        prepare_uuid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        description = "Parallel main child"
+        self.write_parent(
+            [
+                {"type": "user", "uuid": root_uuid, "parentUuid": None},
+                {
+                    "type": "assistant",
+                    "uuid": first_uuid,
+                    "parentUuid": root_uuid,
+                    "message": {
+                        "id": "parallel-response",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "call_other",
+                                "name": "Read",
+                                "input": {},
+                            }
+                        ],
+                        "stop_reason": "tool_use",
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "uuid": prepare_uuid,
+                    "parentUuid": first_uuid,
+                    "timestamp": time.time(),
+                    "message": {
+                        "id": "parallel-response",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "call_prepare",
+                                "name": "Bash",
+                                "input": {
+                                    "command": invocation_command(
+                                        "python3 super_subagent.py prepare "
+                                        "'Parallel main child'"
+                                    )
+                                },
+                            }
+                        ],
+                        "stop_reason": "tool_use",
+                    },
+                },
+            ]
+        )
+        with self.caller_environment():
+            result = super_subagent.prepare_agent(
+                self.prepare_args(
+                    description=description,
+                    model="inherit",
+                    fork_another_model=False,
+                    from_main=False,
+                )
+            )
+        reference = json.loads(Path(result["jsonl"]).read_text().splitlines()[0])
+        self.assertEqual(reference["parentLastUuid"], root_uuid)
+
+    def test_prepare_worker_keeps_turns_after_old_interrupted_call(self):
+        self.write_parent(
+            [{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}]
+        )
+        source_id = "asource-fork-0123456789abcdef"
+        description = "Continue after interruption"
+        records = [
+            {
+                "type": "fork-context-ref",
+                "agentId": source_id,
+                "parentSessionId": self.session_id,
+                "parentLastUuid": "parent-root-uuid",
+            },
+            {
+                "type": "user",
+                "uuid": "u1",
+                "parentUuid": None,
+                "isSidechain": True,
+                "agentId": source_id,
+                "message": {"role": "user", "content": "before"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "old-tool",
+                "parentUuid": "u1",
+                "isSidechain": True,
+                "agentId": source_id,
+                "message": {
+                    "id": "old-response",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_old",
+                            "name": "Bash",
+                            "input": {
+                                "command": invocation_command(
+                                    "python3 super_subagent.py prepare "
+                                    "'Continue after interruption'"
+                                )
+                            },
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                },
+            },
+            {
+                "type": "user",
+                "uuid": "u2",
+                "parentUuid": "old-tool",
+                "isSidechain": True,
+                "agentId": source_id,
+                "message": {"role": "user", "content": "later completed turn"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "a2",
+                "parentUuid": "u2",
+                "isSidechain": True,
+                "agentId": source_id,
+                "message": {
+                    "id": "completed-response",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "completed"}],
+                    "stop_reason": "end_turn",
+                },
+            },
+            {
+                "type": "assistant",
+                "uuid": "current-tool",
+                "parentUuid": "a2",
+                "isSidechain": True,
+                "agentId": source_id,
+                "timestamp": time.time(),
+                "message": {
+                    "id": "current-response",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_current",
+                            "name": "Bash",
+                            "input": {
+                                "command": invocation_command(
+                                    "python3 super_subagent.py prepare "
+                                    "'Continue after interruption'"
+                                )
+                            },
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                },
+            },
+        ]
+        self.write_source_agent(source_id, records)
+        with self.caller_environment():
+            result = super_subagent.prepare_agent(
+                self.worker_prepare_args(
+                    description=description,
+                    from_agent_id=None,
+                )
+            )
+        copied = [
+            json.loads(line)
+            for line in Path(result["jsonl"]).read_text().splitlines()[1:]
+        ]
+        rendered = json.dumps(copied)
+        self.assertIn("later completed turn", rendered)
+        self.assertNotIn("call_old", rendered)
+        self.assertNotIn("call_current", rendered)
+        later = next(record for record in copied if record.get("message", {}).get("content") == "later completed turn")
+        first = next(record for record in copied if record.get("message", {}).get("content") == "before")
+        self.assertEqual(later["parentUuid"], first["uuid"])
+
+    def test_prepare_worker_preserves_progress_alias_ancestry(self):
+        self.write_parent(
+            [{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}]
+        )
+        source_id = "asource-fork-0123456789abcdef"
+        records = self.source_fork_records(source_id)[:2]
+        records.extend(
+            [
+                {
+                    "type": "assistant",
+                    "uuid": "tool-assistant",
+                    "parentUuid": "source-user-1",
+                    "isSidechain": True,
+                    "agentId": source_id,
+                    "message": {
+                        "id": "tool-response",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "call_done",
+                                "name": "Read",
+                                "input": {},
+                            }
+                        ],
+                        "stop_reason": "tool_use",
+                    },
+                },
+                {
+                    "type": "progress",
+                    "uuid": "progress-alias",
+                    "parentUuid": "tool-assistant",
+                },
+                {
+                    "type": "user",
+                    "uuid": "tool-result",
+                    "parentUuid": "progress-alias",
+                    "isSidechain": True,
+                    "agentId": source_id,
+                    "sourceToolAssistantUUID": "tool-assistant",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call_done",
+                                "content": "done",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "completed",
+                    "parentUuid": "tool-result",
+                    "isSidechain": True,
+                    "agentId": source_id,
+                    "message": {
+                        "id": "completed-response",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "complete"}],
+                        "stop_reason": "end_turn",
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "current",
+                    "parentUuid": "completed",
+                    "isSidechain": True,
+                    "agentId": source_id,
+                    "message": {
+                        "id": "current-response",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "call_active",
+                                "name": "Bash",
+                                "input": {
+                                    "command": (
+                                        "python3 super_subagent.py prepare "
+                                        "'Continue the source fork'"
+                                    )
+                                },
+                            }
+                        ],
+                        "stop_reason": "tool_use",
+                    },
+                },
+            ]
+        )
+        self.write_source_agent(source_id, records)
+        result = super_subagent.prepare_agent(self.worker_prepare_args())
+        copied = [
+            json.loads(line)
+            for line in Path(result["jsonl"]).read_text().splitlines()[1:]
+        ]
+        progress = next(record for record in copied if record.get("type") == "progress")
+        tool_result = next(record for record in copied if record.get("uuid") != progress["uuid"] and record.get("type") == "user" and super_subagent.message_tool_result_ids(record))
+        self.assertEqual(progress["agentId"], result["agent_id"])
+        self.assertIs(progress["isSidechain"], True)
+        self.assertEqual(tool_result["parentUuid"], progress["uuid"])
+
+    def test_prepare_worker_remaps_compact_metadata_uuids(self):
+        self.write_parent(
+            [{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}]
+        )
+        source_id = "asource-fork-0123456789abcdef"
+        records = [
+            {
+                "type": "fork-context-ref",
+                "agentId": source_id,
+                "parentSessionId": self.session_id,
+                "parentLastUuid": "parent-root-uuid",
+            },
+            {
+                "type": "user",
+                "uuid": "u1",
+                "parentUuid": None,
+                "isSidechain": True,
+                "agentId": source_id,
+                "message": {"role": "user", "content": "before compact"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "parentUuid": "u1",
+                "isSidechain": True,
+                "agentId": source_id,
+                "message": {
+                    "id": "a1-response",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "before"}],
+                    "stop_reason": "end_turn",
+                },
+            },
+            {
+                "type": "system",
+                "subtype": "compact_boundary",
+                "uuid": "compact",
+                "parentUuid": None,
+                "logicalParentUuid": "a1",
+                "isSidechain": True,
+                "agentId": source_id,
+                "compactMetadata": {
+                    "preservedSegment": {
+                        "headUuid": "u1",
+                        "anchorUuid": "a1",
+                        "tailUuid": "a1",
+                    },
+                    "preservedMessages": {
+                        "anchorUuid": "a1",
+                        "uuids": ["u1", "a1"],
+                        "allUuids": ["u1", "a1"],
+                    },
+                },
+            },
+            {
+                "type": "user",
+                "uuid": "u2",
+                "parentUuid": "compact",
+                "isSidechain": True,
+                "agentId": source_id,
+                "message": {"role": "user", "content": "after compact"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "a2",
+                "parentUuid": "u2",
+                "isSidechain": True,
+                "agentId": source_id,
+                "message": {
+                    "id": "a2-response",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "complete"}],
+                    "stop_reason": "end_turn",
+                },
+            },
+            {
+                "type": "assistant",
+                "uuid": "current",
+                "parentUuid": "a2",
+                "isSidechain": True,
+                "agentId": source_id,
+                "message": {
+                    "id": "current-response",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_active",
+                            "name": "Bash",
+                            "input": {
+                                "command": invocation_command(
+                                    "python3 super_subagent.py prepare "
+                                    "'Continue the source fork'"
+                                )
+                            },
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                },
+            },
+        ]
+        self.write_source_agent(source_id, records)
+        result = super_subagent.prepare_agent(self.worker_prepare_args())
+        copied = [
+            json.loads(line)
+            for line in Path(result["jsonl"]).read_text().splitlines()[1:]
+        ]
+        target_uuids = {record["uuid"] for record in copied}
+        source_uuids = {record["uuid"] for record in records if "uuid" in record}
+        compact = next(record for record in copied if record.get("subtype") == "compact_boundary")["compactMetadata"]
+        nested = [
+            compact["preservedSegment"][key]
+            for key in ("headUuid", "anchorUuid", "tailUuid")
+        ] + [
+            compact["preservedMessages"]["anchorUuid"],
+            *compact["preservedMessages"]["uuids"],
+            *compact["preservedMessages"]["allUuids"],
+        ]
+        self.assertTrue(set(nested) <= target_uuids)
+        self.assertTrue(set(nested).isdisjoint(source_uuids))
+
+    def test_prepare_general_worker_without_fork_reference(self):
+        self.write_parent(
+            [{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}]
+        )
+        source_id = "ageneral-worker-0123456789abcdef"
+        records = [
+            {
+                "type": "user",
+                "uuid": "u1",
+                "parentUuid": None,
+                "isSidechain": True,
+                "agentId": source_id,
+                "message": {"role": "user", "content": "general-only-fact"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "parentUuid": "u1",
+                "isSidechain": True,
+                "agentId": source_id,
+                "message": {
+                    "id": "complete",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "done"}],
+                    "stop_reason": "end_turn",
+                },
+            },
+            {
+                "type": "assistant",
+                "uuid": "current",
+                "parentUuid": "a1",
+                "isSidechain": True,
+                "agentId": source_id,
+                "message": {
+                    "id": "current-response",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_active",
+                            "name": "Bash",
+                            "input": {
+                                "command": invocation_command(
+                                    "python3 super_subagent.py prepare "
+                                    "'Continue the source fork'"
+                                )
+                            },
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                },
+            },
+        ]
+        self.write_source_agent(
+            source_id,
+            records,
+            metadata={"agentType": "general-purpose", "spawnDepth": 2},
+        )
+        result = super_subagent.prepare_agent(
+            self.worker_prepare_args(from_agent_id=source_id)
+        )
+        copied = [json.loads(line) for line in Path(result["jsonl"]).read_text().splitlines()]
+        self.assertNotEqual(copied[0].get("type"), "fork-context-ref")
+        self.assertIn("general-only-fact", json.dumps(copied))
+        self.assertIn(
+            super_subagent.FORK_BOILERPLATE,
+            copied[-1]["message"]["content"][0]["text"],
+        )
+        metadata = json.loads(Path(result["meta"]).read_text())
+        self.assertEqual(metadata["spawnDepth"], 3)
+
+    def test_prepare_finds_worker_inside_workflow_directory(self):
+        self.write_parent(
+            [{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}]
+        )
+        source_id = "aworkflow-worker-0123456789abcdef"
+        workflow = (
+            self.project
+            / self.session_id
+            / "subagents"
+            / "workflows"
+            / "wf_worker_test"
+        )
+        self.write_source_agent(
+            source_id,
+            self.source_fork_records(source_id),
+            metadata={"agentType": "fork", "isFork": True, "spawnDepth": 2},
+            directory=workflow,
+        )
+        with self.caller_environment():
+            result = super_subagent.prepare_agent(
+                self.worker_prepare_args(
+                    from_agent_id=None,
+                    description="Continue the source fork",
+                )
+            )
+        self.assertEqual(result["source_agent_id"], source_id)
+        metadata = json.loads(Path(result["meta"]).read_text())
+        self.assertEqual(metadata["spawnDepth"], 3)
+
+        explicit = super_subagent.prepare_agent(
+            self.worker_prepare_args(
+                from_agent_id=source_id,
+                agent_id="aexplicit-workflow-child-0123456789abcdef",
+                spawn_depth=7,
+            )
+        )
+        explicit_metadata = json.loads(Path(explicit["meta"]).read_text())
+        self.assertEqual(explicit["source_agent_id"], source_id)
+        self.assertEqual(explicit_metadata["spawnDepth"], 7)
+
+    def make_workflow_agent(self, run_id, agent_id, metadata=None, records=None):
         source = self.project / self.session_id / "subagents" / "workflows" / run_id
         source.mkdir(parents=True, exist_ok=True)
+        stored_records = records if records is not None else [
+            {
+                "type": "user",
+                "uuid": f"uuid-{agent_id}",
+                "parentUuid": None,
+                "isSidechain": True,
+                "agentId": agent_id,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "resume me"}],
+                },
+            },
+            {
+                "type": "assistant",
+                "uuid": f"assistant-{agent_id}",
+                "parentUuid": f"uuid-{agent_id}",
+                "isSidechain": True,
+                "agentId": agent_id,
+                "timestamp": "2026-01-01T00:00:01Z",
+                "message": {
+                    "id": f"response-{agent_id}",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ready"}],
+                    "stop_reason": "end_turn",
+                },
+            },
+        ]
         (source / f"agent-{agent_id}.jsonl").write_text(
-            json.dumps({"type": "user", "agentId": agent_id}) + "\n"
+            "".join(json.dumps(record) + "\n" for record in stored_records)
         )
         (source / f"agent-{agent_id}.meta.json").write_text(
             json.dumps(metadata or {"agentType": "workflow-subagent"}) + "\n"
@@ -678,6 +1480,12 @@ class SuperSubagentTest(unittest.TestCase):
             source_metadata,
         )
         self.assertEqual(stat.S_IMODE(destination_meta.stat().st_mode), 0o600)
+
+        destination_meta.write_text(json.dumps(resumed_metadata, sort_keys=True) + "\n")
+        repeated = super_subagent.link_workflow_agents(
+            self.link_args(run_id, model="gpt-5.6-terra")
+        )
+        self.assertEqual(repeated["agents"][0]["agent_id"], "a1111111111111111")
 
     def test_link_workflow_preflights_every_destination(self):
         self.write_parent(
@@ -746,6 +1554,269 @@ class SuperSubagentTest(unittest.TestCase):
             self.assertFalse((top / f"agent-{agent_id}.jsonl").is_symlink())
             self.assertFalse((top / f"agent-{agent_id}.meta.json").exists())
             self.assertFalse((top / f"agent-{agent_id}.meta.json").is_symlink())
+
+    def test_link_workflow_rejects_foreign_session_directory(self):
+        self.write_parent(
+            [{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}]
+        )
+        other_session = "99999999-8888-4777-8666-555555555555"
+        foreign = (
+            self.project
+            / other_session
+            / "subagents"
+            / "workflows"
+            / "wf_foreign"
+        )
+        foreign.mkdir(parents=True)
+        agent_id = "aforeign-workflow-0123456789abcdef"
+        self.write_source_agent(
+            agent_id,
+            [
+                {
+                    "type": "user",
+                    "uuid": "foreign-user",
+                    "parentUuid": None,
+                    "isSidechain": True,
+                    "agentId": agent_id,
+                }
+            ],
+            directory=foreign,
+        )
+        with self.assertRaisesRegex(
+            super_subagent.UsageError, "selected parent session"
+        ):
+            super_subagent.link_workflow_agents(self.link_args(str(foreign)))
+
+    def test_link_workflow_rejects_foreign_fork_reference(self):
+        self.write_parent(
+            [{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}]
+        )
+        agent_id = "aforeign-reference-0123456789abcdef"
+        records = [
+            {
+                "type": "fork-context-ref",
+                "agentId": agent_id,
+                "parentSessionId": "another-session",
+                "parentLastUuid": "parent-root-uuid",
+            },
+            {
+                "type": "user",
+                "uuid": "workflow-user",
+                "parentUuid": None,
+                "isSidechain": True,
+                "agentId": agent_id,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "resume me"}],
+                },
+            },
+        ]
+        self.make_workflow_agent("wf_foreign_ref", agent_id, records=records)
+        with self.assertRaisesRegex(
+            super_subagent.UsageError, "another parent session"
+        ):
+            super_subagent.link_workflow_agents(self.link_args("wf_foreign_ref"))
+
+    def test_link_workflow_override_converts_fork_type_without_isfork(self):
+        self.write_parent(
+            [{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}]
+        )
+        agent_id = "afork-without-flag-0123456789abcdef"
+        source_metadata = {
+            "agentType": "fork",
+            "model": "inherit",
+            "parentAgentId": "aparent-workflow-0123456789abcdef",
+        }
+        source = self.make_workflow_agent(
+            "wf_fork_without_flag", agent_id, metadata=source_metadata
+        )
+        result = super_subagent.link_workflow_agents(
+            self.link_args("wf_fork_without_flag", model="gpt-5.6-sol")
+        )
+        resumed = json.loads(Path(result["agents"][0]["meta"]).read_text())
+        self.assertEqual(resumed["agentType"], "general-purpose")
+        self.assertEqual(resumed["model"], "gpt-5.6-sol")
+        self.assertNotIn("isFork", resumed)
+        self.assertEqual(
+            json.loads((source / f"agent-{agent_id}.meta.json").read_text()),
+            source_metadata,
+        )
+
+    def test_link_workflow_rejects_unresumable_sources(self):
+        self.write_parent(
+            [{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}]
+        )
+        cases = (
+            ("wf_empty", "aempty-workflow-0123456789abcdef", [], {"agentType": "fork"}),
+            (
+                "wf_wrong_agent",
+                "awrong-agent-0123456789abcdef",
+                [
+                    {
+                        "type": "user",
+                        "uuid": "wrong-user",
+                        "parentUuid": None,
+                        "isSidechain": True,
+                        "agentId": "a-different-agent",
+                        "timestamp": "2026-01-01T00:00:00Z",
+                    }
+                ],
+                {"agentType": "fork"},
+            ),
+            (
+                "wf_no_timestamp",
+                "ano-timestamp-0123456789abcdef",
+                [
+                    {
+                        "type": "user",
+                        "uuid": "untimestamped-user",
+                        "parentUuid": None,
+                        "isSidechain": True,
+                        "agentId": "ano-timestamp-0123456789abcdef",
+                    }
+                ],
+                {"agentType": "fork"},
+            ),
+        )
+        for run_id, agent_id, records, metadata in cases:
+            with self.subTest(run_id=run_id):
+                self.make_workflow_agent(run_id, agent_id, metadata, records)
+                with self.assertRaisesRegex(
+                    super_subagent.UsageError, "no exact-ID sidechain record"
+                ):
+                    super_subagent.link_workflow_agents(self.link_args(run_id))
+
+        user_only_id = "auser-only-workflow-0123456789abcdef"
+        self.make_workflow_agent(
+            "wf_user_only",
+            user_only_id,
+            {"agentType": "fork"},
+            [
+                {
+                    "type": "user",
+                    "uuid": "user-only",
+                    "parentUuid": None,
+                    "isSidechain": True,
+                    "agentId": user_only_id,
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "enough to resume"}],
+                    },
+                }
+            ],
+        )
+        linked_user_only = super_subagent.link_workflow_agents(
+            self.link_args("wf_user_only")
+        )
+        self.assertTrue(Path(linked_user_only["agents"][0]["jsonl"]).is_symlink())
+
+        missing_parent_id = "amissing-parent-0123456789abcdef"
+        self.make_workflow_agent(
+            "wf_missing_parent",
+            missing_parent_id,
+            {"agentType": "fork"},
+            [
+                {
+                    "type": "user",
+                    "uuid": "latest-user",
+                    "parentUuid": "absent-parent",
+                    "isSidechain": True,
+                    "agentId": missing_parent_id,
+                    "timestamp": "2026-01-01T00:00:00Z",
+                }
+            ],
+        )
+        with self.assertRaisesRegex(
+            super_subagent.UsageError, "missing parent UUID"
+        ):
+            super_subagent.link_workflow_agents(
+                self.link_args("wf_missing_parent")
+            )
+
+        malformed_id = "amalformed-meta-0123456789abcdef"
+        malformed = self.make_workflow_agent("wf_malformed", malformed_id)
+        (malformed / f"agent-{malformed_id}.meta.json").write_text("not-json\n")
+        with self.assertRaisesRegex(
+            super_subagent.UsageError, "cannot read workflow metadata"
+        ):
+            super_subagent.link_workflow_agents(self.link_args("wf_malformed"))
+
+        non_object_id = "anon-object-meta-0123456789abcdef"
+        non_object = self.make_workflow_agent("wf_non_object", non_object_id)
+        (non_object / f"agent-{non_object_id}.meta.json").write_text("[]\n")
+        with self.assertRaisesRegex(
+            super_subagent.UsageError, "metadata is not a JSON object"
+        ):
+            super_subagent.link_workflow_agents(self.link_args("wf_non_object"))
+
+    def test_publish_agent_files_never_replaces_racing_destination(self):
+        self.write_parent(
+            [{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}]
+        )
+        agent_id = "aracing-destination-0123456789abcdef"
+        args = self.prepare_args(
+            agent_id=agent_id,
+            model="inherit",
+            fork_another_model=False,
+        )
+        subagents = self.project / self.session_id / "subagents"
+        competing_meta = subagents / f"agent-{agent_id}.meta.json"
+        original_link = os.link
+        created = False
+
+        def create_competitor_before_link(source, destination, *link_args, **link_kwargs):
+            nonlocal created
+            destination = Path(destination)
+            if destination == competing_meta and not created:
+                competing_meta.write_text("competitor\n")
+                created = True
+            return original_link(source, destination, *link_args, **link_kwargs)
+
+        with mock.patch.object(
+            super_subagent.os,
+            "link",
+            side_effect=create_competitor_before_link,
+        ):
+            with self.assertRaisesRegex(
+                super_subagent.UsageError, "metadata already exists"
+            ):
+                super_subagent.prepare_agent(args)
+        self.assertEqual(competing_meta.read_text(), "competitor\n")
+        self.assertFalse((subagents / f"agent-{agent_id}.jsonl").exists())
+
+    def test_publish_agent_files_rolls_back_metadata_after_transcript_failure(self):
+        self.write_parent(
+            [{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}]
+        )
+        agent_id = "atranscript-failure-0123456789abcdef"
+        args = self.prepare_args(
+            agent_id=agent_id,
+            model="inherit",
+            fork_another_model=False,
+        )
+        subagents = self.project / self.session_id / "subagents"
+        original_link = os.link
+
+        def fail_transcript_link(source, destination, *link_args, **link_kwargs):
+            if str(destination).endswith(".jsonl"):
+                raise OSError("injected transcript publication failure")
+            return original_link(source, destination, *link_args, **link_kwargs)
+
+        with mock.patch.object(
+            super_subagent.os,
+            "link",
+            side_effect=fail_transcript_link,
+        ):
+            with self.assertRaisesRegex(OSError, "injected transcript"):
+                super_subagent.prepare_agent(args)
+        self.assertFalse((subagents / f"agent-{agent_id}.meta.json").exists())
+        self.assertFalse((subagents / f"agent-{agent_id}.jsonl").exists())
+
+        result = super_subagent.prepare_agent(args)
+        self.assertTrue(Path(result["meta"]).is_file())
+        self.assertTrue(Path(result["jsonl"]).is_file())
 
 
 if __name__ == "__main__":
