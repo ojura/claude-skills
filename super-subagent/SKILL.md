@@ -1,6 +1,6 @@
 ---
 name: super-subagent
-description: Prepare an addressable Claude Code worker that inherits the calling conversation, then start it with SendMessage. Supports arbitrary model IDs that the Agent tool schema rejects, generates a readable agent name from the description, and links workflow agents into the session's top-level subagents directory for resumption. Use when the user asks for a super subagent, a nested context-inheriting worker, an unrestricted provider model, or recovery of workflow subagents after a workflow failure.
+description: Prepare an addressable Claude Code worker that inherits the calling conversation or another selected worker, then start it with SendMessage. Supports arbitrary model IDs that the Agent tool schema rejects, generates a readable agent name from the description, and links workflow agents into the session's top-level subagents directory for resumption. Use when the user asks for a super subagent, a nested context-inheriting worker, a child of another worker, an unrestricted provider model, or recovery of workflow subagents after a workflow failure.
 ---
 
 # Super subagent
@@ -38,6 +38,18 @@ Use an explicit source when automatic detection is unavailable or ambiguous:
 ```
 
 `--from-agent-name` must match exactly one metadata file. `--from-agent-id` is unambiguous.
+
+## Fork another worker
+
+Any caller can prepare a child from another worker's completed context:
+
+```bash
+python3 /home/juraj/claude-skills/super-subagent/scripts/super_subagent.py prepare \
+  "Continue their investigation" \
+  --from-agent-id aSOURCE_AGENT_ID
+```
+
+Use `--from-agent-name NAME` instead when the name identifies exactly one worker. The source may be a top-level or workflow worker in the current session. The helper reads the source transcript, writes a remapped copy into the new child's files, and does not modify the source.
 
 Change the discovery wait with:
 
