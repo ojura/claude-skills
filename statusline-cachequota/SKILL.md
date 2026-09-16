@@ -28,6 +28,8 @@ is missing, so a bare harness renders a short line rather than empty fields.
 
 ## Install
 
+### macOS and Linux
+
 ```sh
 ./install.sh
 ```
@@ -44,23 +46,39 @@ settings block if it is not already wired:
 }
 ```
 
-`refreshInterval: 1` is what makes the countdowns tick. It needs `python3` and a C
-compiler, and nothing else: there are no packages to install and no services to run.
+This path needs `python3` and a C compiler.
+
+### Windows
+
+```powershell
+.\install.ps1
+```
+
+This path needs Python 3. The installer copies `statusline-render.py` into the Claude
+config directory, smoke-tests it, and prints a Windows-safe settings block. It accepts
+`-ClaudeConfigDir` and `-PythonExe` overrides. Windows invokes the renderer directly in
+one-shot mode; the resident Unix-socket optimization remains specific to macOS and
+Linux.
+
+`refreshInterval: 1` is what makes the countdowns tick. There are no Python packages or
+services to install on either path.
 
 ## Where things live
 
 | Path | What it is |
 | --- | --- |
-| `statusline-render.py` | The whole renderer: metric engine, formatting, daemon |
-| `statusline-client.c` | Source of the client the harness runs on every refresh |
-| `statusline-command.sh` | Thin wrapper for anyone whose settings still point at the old shell entry point |
-| `~/.claude/statusline-client` | The compiled client (a build artifact, never committed) |
+| `statusline-render.py` | The whole renderer: metric engine, formatting, and POSIX daemon |
+| `statusline-client.c` | Source of the macOS/Linux client the harness runs on every refresh |
+| `statusline-command.sh` | POSIX wrapper for anyone whose settings still point at the old shell entry point |
+| `install.ps1` | Windows installer for the one-shot renderer path |
+| `~/.claude/statusline-client` | Compiled macOS/Linux client (a build artifact, never committed) |
+| `~/.claude/statusline-render.py` | Installed renderer (a link on POSIX, a copy on Windows) |
 | `~/.claude/statusline-cache-health.db` | Per-message state in sqlite, rebuildable from the transcripts |
-| `~/.claude/statusline-cache-health.state.json` | Memo used only by the one-shot fallback path |
-| `~/.claude/statusline.sock` | Daemon socket, mode 0600 |
+| `~/.claude/statusline-cache-health.state.json` | Memo used by the one-shot path |
+| `~/.claude/statusline.sock` | POSIX daemon socket, mode 0600 |
 
-The database, the sidecar and the socket are disposable: delete any of them and the next
-render rebuilds what it needs. The compiled client is not, since nothing rebuilds it but
+The database, sidecar and socket are disposable: delete any of them and the next render
+rebuilds what it needs. The compiled POSIX client is not, since nothing rebuilds it but
 `install.sh`.
 
 Everything resolves through `CLAUDE_CONFIG_DIR` when that is set, falling back to
@@ -136,12 +154,16 @@ harness --stdin JSON--> statusline-client --socket--> daemon (statusline-render.
                               +--> else execs one-shot renderer
 ```
 
-The client is C because the harness runs it once per second per session, and the whole
-path costs about 3ms per render. The daemon holds the sqlite connection and a
+The POSIX client is C because the harness runs it once per second per session, and the
+whole path costs about 3ms per render. Its daemon holds the sqlite connection and a
 per-transcript memo. It exits after 10 idle minutes, and **also right after serving a
 render whenever `statusline-render.py` changes on disk**, so editing the engine deploys
 it (the next client spawns a fresh daemon). If the socket cannot be reached at all, the
 client execs the one-shot renderer, so the line degrades to slow rather than blank.
+
+Windows uses that one-shot renderer directly. Starting Python for every refresh is slower
+than the resident POSIX path, but avoids platform-specific socket, daemon, and symlink
+machinery while retaining every metric and the persistent sqlite/sidecar cache.
 
 A render is split around its time-dependent fragments: `render_core` returns a template
 plus a list of slots, and every serve refills the slots. That is how a cached line can
@@ -172,9 +194,9 @@ one.
 
 | Symptom | Cause and fix |
 | --- | --- |
-| Line is blank | A render raised inside the daemon. Run the one-shot path to see the traceback: `echo '{}' \| python3 -ES ~/.claude/statusline-render.py` |
-| Numbers look impossible | Delete `~/.claude/statusline-cache-health.db*` **and** `~/.claude/statusline.sock`, so the live daemon (which holds an open handle to the deleted file plus an in-memory memo) is replaced by one that rebuilds from the transcripts. `statusline-cache-health.state.json` is the one-shot path's memo and is worth deleting in the same breath |
-| Edits do not show up | The daemon exits on source change; if one is wedged, `rm ~/.claude/statusline.sock` and render again |
+| Line is blank | Run the one-shot path to see the traceback: `echo '{}' \| python3 -ES ~/.claude/statusline-render.py` on POSIX, or `'{}' \| python -X utf8 -ES $HOME\.claude\statusline-render.py` in PowerShell |
+| Numbers look impossible | Delete `~/.claude/statusline-cache-health.db*` and the sidecar. On POSIX also delete `~/.claude/statusline.sock`, so the live daemon is replaced by one that rebuilds from the transcripts |
+| Edits do not show up | POSIX: the daemon exits on source change; if one is wedged, `rm ~/.claude/statusline.sock` and render again. Windows: rerun `install.ps1` to copy the edited renderer |
 | Countdown frozen | The line only re-renders when the harness refreshes it. Check `refreshInterval` is set, and remember an unfocused session does not tick |
 | Health reset to 100% for no reason | The chain of messages broke. An entry whose `parentUuid` names a message that is not in the file continues the current chain by design; only a genuinely null parent starts a new count |
 | `5m` badge on a main session | Almost always overage. Writes are cheaper but the window is twelve times shorter, so gaps get expensive |
