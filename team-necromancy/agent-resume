@@ -5543,7 +5543,7 @@ class Resolver:
         })
 
     def _tmux_server_fact(self, socket):
-        """Return one immutable tmux server and pane generation."""
+        """Return one immutable observation of a tmux server and its panes."""
         path = self._socket_dir() / socket
         try:
             stat = path.stat()
@@ -5602,8 +5602,20 @@ class Resolver:
             "state": state,
         })
 
+    @staticmethod
+    def _tmux_launch_generation(server, action, target, wanted_present):
+        """Facts that can change the selected tmux command or its environment."""
+        process = server["server"]
+        server_identity = ((process["pid"], process["proc_start"])
+                           if process else None)
+        return (
+            server["socket_generation"], server_identity,
+            server["alive"], server["session_live"], server["base_url"],
+            action, target, wanted_present,
+        )
+
     def _tmux_launch_action(self, destination, server=None):
-        """Select one tmux action from one retained server generation."""
+        """Select one tmux action from one retained server observation."""
         if destination is None:
             return None
         server = server or self._tmux_server_fact(destination.socket)
@@ -5620,15 +5632,15 @@ class Resolver:
             action, target = "split", panes[0]["pane"]
         else:
             action, target = "new-window", None
+        wanted_present = bool(wanted)
         return immutable({
             "destination": destination,
             "server": server,
             "action": action,
             "target_pane": target,
-            "wanted_present": bool(wanted),
-            "generation": (
-                server["socket_generation"], server["server"],
-                server["session_live"], server["panes"], action, target),
+            "wanted_present": wanted_present,
+            "generation": self._tmux_launch_generation(
+                server, action, target, wanted_present),
         })
 
     def revalidate_launch(self, launch):
@@ -5804,6 +5816,8 @@ class Resolver:
                     keep_team=False, table=None, census=None, terminal=None,
                     requested_socket=None, socket_reason=None):
         """Return one complete immutable launch answer, including destination."""
+        table = (self._process_table(refresh=True) if table is None
+                 else tuple(table))
         launch = self._identity(
             session_uuid=session_uuid, agent_id=agent_id, for_team=for_team,
             keep_team=keep_team, table=table, census=census, terminal=terminal)
@@ -6513,8 +6527,8 @@ class Resolver:
             seat = record["seat"]
             rows.append((
                 record["pid"], record["ppid"], record["proc_start"],
-                record.get("proc_state") or "", record["argv"],
-                record["agent_id"], record["session"], record["team"], seat,
+                record["argv"], record["agent_id"], record["session"],
+                record["team"], seat,
             ))
         return tuple(sorted(rows, key=lambda row: row[0]))
 
@@ -6525,9 +6539,8 @@ class Resolver:
             return None
         return (
             record["pid"], record.get("ppid"), record.get("proc_start") or "",
-            record.get("proc_state") or "", tuple(record.get("argv") or ()),
-            record.get("agent_id"), record.get("session"), record.get("team"),
-            record.get("seat"),
+            tuple(record.get("argv") or ()), record.get("agent_id"),
+            record.get("session"), record.get("team"), record.get("seat"),
         )
 
     def stop_plan(self, team=None, agent_id=None, agent_ids=(), session=None,
@@ -11787,21 +11800,23 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
         launched_at = ctx["transcript"]["path"].stat().st_mtime
     except OSError:
         launched_at = 0.0
-    # Validate placement before the roster claim and again immediately before
-    # tmux. Neither check may choose a different server, pane, or action.
+    # Validate every retained launch fact before the roster claim and again
+    # immediately before tmux. The report names exactly what changed.
     if not args.dry_run:
         checked = RESOLVER.revalidate_launch(ctx)
         if not checked["matches"]:
-            die("the selected tmux destination changed before the roster claim; "
-                "nothing was written. Run the command again")
+            die("the selected launch facts changed before the roster claim ("
+                + ", ".join(checked["changed"])
+                + "); nothing was written. Run the command again")
     claimed = reserve_membership(ctx, args)
     try:
         if not args.dry_run:
             checked = RESOLVER.revalidate_launch(ctx)
             if not checked["matches"]:
                 release_membership(claimed, args)
-                die("the selected tmux destination changed before launch; the roster "
-                    "claim was released. Run the command again")
+                die("the selected launch facts changed before launch ("
+                    + ", ".join(checked["changed"])
+                    + "); the roster claim was released. Run the command again")
             inherit_credentials(ctx)
         launched_seat, action = launch(
             ctx["launch_action"], cwd, command, args.dry_run, replace_pane)
@@ -13387,8 +13402,11 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix="", terminal=
     counts, since an agent already sitting in its pane is worth showing.
 
     `jobs` is (label, args) pairs; a None args is a member that was skipped.
-    `socket` pins the whole run to one server when the caller already knows it,
-    as a team does; otherwise the first agent to reach one decides.
+    `table` is the process snapshot selected before the first job. After a job
+    runs, the next job asks Resolver for a current snapshot that includes the
+    processes started earlier in this batch. `socket` pins the whole run to one
+    server when the caller already knows it, as a team does; otherwise the first
+    agent to reach one decides.
     """
     check_flag_scope(passthrough, sum(1 for _, a in jobs if a is not None))
     seen = [label for label, _a in jobs]
@@ -13425,6 +13443,10 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix="", terminal=
             # got far enough to exercise.
             refused = refused or exc
             outcome = Outcome("failed", None, False, None)
+        # A completed, failed, or refused job may have changed processes before
+        # returning. The next member selects from the current process table and
+        # then revalidates that selection immediately before its own writes.
+        table = None
         results.append((label, outcome.status))
         outcomes.append(outcome)
         socket = socket or outcome.socket
@@ -14178,6 +14200,218 @@ def _check_team_launch_actions_use_distinct_seats_and_commands(s):
           "; ".join(wrong + [f"outcomes {outcomes}, seats {len(set(seats))}, "
                              f"plans {only_one or len(plans)}, ran {spawning}"])
           if wrong else "")
+    return checked
+
+
+@unit(
+    ('team-batch-refreshes-member-runtime',
+     'each member in a team batch selects runtime after the preceding launch'),
+    ('launch-plan-refreshes-unsupplied-runtime',
+     'a launch without a retained process table reads the current table'),
+    ('tmux-launch-generation-ignores-scheduler-state',
+     'tmux launch revalidation ignores scheduler state but checks command inputs'),
+    ('process-generations-ignore-scheduler-state',
+     'process identity checks ignore scheduler state but retain identity facts'),
+)
+def _check_team_batch_revalidation(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    team = "session-corpus-alpha"
+    sessions = {
+        "batch-one": "11111111-1111-4111-8111-111111111111",
+        "batch-two": "22222222-2222-4222-8222-222222222222",
+    }
+    batch_code, batch_error, batch_entries = None, None, {}
+    fake = _FakeTmux(session_exists=False, sockets=[])
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "corpus"
+        shutil.copytree(Path(__file__).resolve().parent / "test" / "corpus", root)
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
+        eng._projects_dir, eng._teams_dir = root / "projects", root / "teams"
+        process_states = defaultdict(set)
+        process_state_reads = defaultdict(int)
+
+        def changing_proc_stat(pid):
+            process_state_reads[pid] += 1
+            state = "R" if process_state_reads[pid] % 2 else "S"
+            process_states[pid].add(state)
+            return state, 1, f"start-{pid}"
+
+        eng._proc_stat = changing_proc_stat
+        cfg = eng._roster_path(team)
+        roster = json.loads(cfg.read_text())
+        roster["members"].extend(
+            {"agentId": agent_id_of(name, team), "name": name}
+            for name in sessions)
+        cfg.write_text(json.dumps(roster))
+        project = eng._projects_dir / "corpus"
+        for name, session in sessions.items():
+            (project / f"{session}.jsonl").write_text(
+                fixture_line({
+                    "parentUuid": None, "type": "user", "uuid": session,
+                    "sessionId": session, "agentName": name,
+                    "teamName": team, "timestamp": "2026-01-01T00:00:00Z",
+                }) + "\n" + fixture_line({
+                    "type": "last-prompt", "leafUuid": session,
+                    "sessionId": session,
+                }) + "\n")
+
+        real_launch = globals()["launch"]
+
+        def observed(plan, cwd, command, dry, replace_pane=None):
+            seat, action = real_launch(
+                plan, cwd, command, dry, replace_pane)
+            if seat and not dry:
+                agent_id = command[command.index("--agent-id") + 1]
+                session = command[command.index("--resume") + 1]
+                pid = next(row["pid"] for row in fake.panes
+                           if row["pane"] == seat.pane)
+                fake.processes.append(
+                    (pid, 1, (FAKE_AGENT_BIN, "--resume", session,
+                              "--agent-id", agent_id)))
+                eng._transcript_path(session).touch()
+            return seat, action
+
+        batch_args = _Run(dry_run=False, no_attach=True, attach=False)
+        jobs = [
+            (name, _Run(
+                agent_id=agent_id_of(name, team), socket="claude-swarm-test",
+                socket_reason="team socket", no_attach=True, attach=False,
+                in_team=True))
+            for name in sessions
+        ]
+        try:
+            globals()["launch"] = observed
+            with fake.installed(eng), capturing("out"), capturing("err"):
+                batch_code = run_agents(
+                    batch_args, [], fake.process_rows(), jobs,
+                    socket="claude-swarm-test", prefix="  ")
+        except BaseException as exc:
+            batch_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            globals()["launch"] = real_launch
+        final_roster = json.loads(cfg.read_text())
+        batch_entries = {
+            member.get("name"): member
+            for member in final_roster.get("members", ())
+            if member.get("name") in sessions
+        }
+
+    seats = [entry.get("tmuxPaneId") for entry in batch_entries.values()]
+    scheduler_changed = any(states == {"R", "S"}
+                            for states in process_states.values())
+    batch_ok = (
+        batch_code == 0 and not batch_error and scheduler_changed
+        and len(fake.panes) == len(sessions)
+        and len(set(seats)) == len(sessions)
+        and all(entry.get("isActive") for entry in batch_entries.values())
+    )
+    check("team-batch-refreshes-member-runtime",
+          "each member in a team batch selects runtime after the preceding launch",
+          batch_ok,
+          batch_error or f"code={batch_code}, panes={fake.panes!r}, "
+          f"seats={seats!r}, states={dict(process_states)!r}")
+
+    refresh_reads = []
+    refresh_eng = s.corpus_engine()
+    refresh_world = _FakeTmux(session_exists=False, sockets=[])
+
+    def process_rows(refresh=False):
+        refresh_reads.append(refresh)
+        return ()
+
+    refresh_world.process_rows = process_rows
+    try:
+        with refresh_world.installed(refresh_eng):
+            refresh_eng.launch_plan(
+                agent_id="willow@session-corpus-alpha",
+                terminal=TerminalContext())
+    except BaseException as exc:
+        refresh_error = f"{type(exc).__name__}: {exc}"
+    else:
+        refresh_error = None
+    check("launch-plan-refreshes-unsupplied-runtime",
+          "a launch without a retained process table reads the current table",
+          bool(refresh_reads and refresh_reads[0] is True and not refresh_error),
+          refresh_error or repr(refresh_reads))
+
+    stable_server = {
+        "socket": "claude-swarm-test", "path": Path("/fixture/socket"),
+        "socket_generation": (1, 2, 3, 4), "alive": True,
+        "server": {"pid": 7000, "ppid": 1, "proc_start": "start",
+                   "argv": ("tmux",), "state": "R"},
+        "session_live": True,
+        "panes": ({
+            "session": TMUX_SESSION, "window": "@0", "pane": "%0", "pid": 7001,
+            "root": {"pid": 7001, "ppid": 7000, "proc_start": "pane-start",
+                     "argv": ("claude",), "state": "R"},
+        },),
+        "base_url": "", "clients": 0, "state": "live",
+    }
+    sleeping_server = {
+        **stable_server,
+        "server": {**stable_server["server"], "state": "S"},
+        "panes": ({
+            **stable_server["panes"][0],
+            "root": {**stable_server["panes"][0]["root"], "state": "S"},
+        },),
+    }
+    poisoned_server = {**sleeping_server, "base_url": POISON_URL}
+    other_target = {
+        **sleeping_server,
+        "panes": ({**sleeping_server["panes"][0], "pane": "%1"},),
+    }
+    destination = LaunchDestination("claude-swarm-test")
+    running = eng._tmux_launch_action(destination, server=immutable(stable_server))
+    sleeping = eng._tmux_launch_action(destination, server=immutable(sleeping_server))
+    poisoned = eng._tmux_launch_action(destination, server=immutable(poisoned_server))
+    moved = eng._tmux_launch_action(destination, server=immutable(other_target))
+    generation_ok = (
+        running["generation"] == sleeping["generation"]
+        and running["generation"] != poisoned["generation"]
+        and running["generation"] != moved["generation"]
+    )
+    check("tmux-launch-generation-ignores-scheduler-state",
+          "tmux launch revalidation ignores scheduler state but checks command inputs",
+          generation_ok,
+          f"stable={running['generation'] == sleeping['generation']}, "
+          f"poison={running['generation'] == poisoned['generation']}, "
+          f"target={running['generation'] == moved['generation']}")
+
+    process = immutable({
+        "pid": 8000, "ppid": 1, "proc_start": "process-start",
+        "proc_state": "R", "argv": ("claude", "--agent-id", "member@team"),
+        "agent_id": "member@team", "session": "session-id", "team": "team",
+        "seat": Seat("claude-swarm-test", "%0"),
+    })
+    sleeping_process = immutable({**process, "proc_state": "S"})
+    replaced_process = immutable({
+        **sleeping_process,
+        "argv": ("claude", "--agent-id", "other@team"),
+        "agent_id": "other@team",
+    })
+
+    def runtime_generation(record):
+        return eng._runtime_generation(
+            {"records": (record,)}, agent_ids=("member@team", "other@team"))
+
+    process_generation_ok = (
+        runtime_generation(process) == runtime_generation(sleeping_process)
+        and runtime_generation(process) != runtime_generation(replaced_process)
+        and eng._process_fact_signature(process)
+        == eng._process_fact_signature(sleeping_process)
+        and eng._process_fact_signature(process)
+        != eng._process_fact_signature(replaced_process)
+    )
+    check("process-generations-ignore-scheduler-state",
+          "process identity checks ignore scheduler state but retain identity facts",
+          process_generation_ok,
+          f"runtime stable={runtime_generation(process) == runtime_generation(sleeping_process)}, "
+          f"signature stable={eng._process_fact_signature(process) == eng._process_fact_signature(sleeping_process)}")
     return checked
 
 
@@ -18958,6 +19192,7 @@ class _FakeTmux:
         self.registry = [dict(row) for row in registry]
         self.env, self.ran, self.fail = {}, [], set()
         self.next_pane = 1 + max([int(p["pane"][1:]) for p in self.panes] or [-1])
+        self.next_pid = 1 + max([int(p["pid"]) for p in self.panes] or [4241])
         # Named sockets this fixture claims exist and answer. A directory that
         # is never read: the fixture answers both the listing and the liveness
         # probe, so nothing stats or connects to this path.
@@ -19056,9 +19291,15 @@ class _FakeTmux:
         if cmd in ("new-session", "split-window", "new-window"):
             pane = f"%{self.next_pane}"
             self.next_pane += 1
+            pid = self.next_pid
+            self.next_pid += 1
+            if cmd == "new-session":
+                name = socket.name if isinstance(socket, Path) else socket
+                if name not in self.sockets:
+                    self.sockets.append(name)
             self.sessions.add(TMUX_SESSION)
             self.panes.append({"session": TMUX_SESSION, "window": "@0",
-                               "pane": pane, "pid": 4242})
+                               "pane": pane, "pid": pid})
             return done(pane)
         return done()
 
@@ -19148,9 +19389,14 @@ def resume_run(agent_id, *, listed=True, server=None, table=(), registry=(),
             # fixture, so it takes the matcher's other branch, a versioned
             # path, and names itself a selftest. It still exercises the real
             # is_claude rather than dodging it.
+            pane = res.stdout.strip()
+            if not pane and args[0] == "respawn-pane":
+                pane = args[args.index("-t") + 1]
+            pid = next(row["pid"] for row in fake.panes
+                       if row["pane"] == pane)
             fake.processes.append(
-                (4242, 1, (FAKE_AGENT_BIN, "--resume", "x",
-                           "--agent-id", agent_id)))
+                (pid, 1, (FAKE_AGENT_BIN, "--resume", "x",
+                          "--agent-id", agent_id)))
             for jsonl in eng._projects_dir.rglob("*.jsonl"):
                 jsonl.touch()
         return res
