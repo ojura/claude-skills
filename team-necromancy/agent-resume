@@ -23256,6 +23256,8 @@ def _check_typed_side_classifies_alone(s):
      'stamp and spawn evidence declare copied-action ownership at the same strength'),
     ('launch-placement-declared-only-by-launch',
      'resume declares launch placement and doctor does not'),
+    ('no-lead-only-team-audits',
+     'a team run that skips its only lead completes its evidence audit'),
 )
 def _check_compute_declared_and_audited(s):
     checked = []
@@ -23412,6 +23414,39 @@ def _check_compute_declared_and_audited(s):
           placement_ok,
           ", ".join(f"{label}={needs[NEED.PLACEMENT].name}"
                     for label, needs in declarations))
+
+    team = "session-corpus-contradicted"
+    team_args, passthrough = build_parser().parse_known_args(
+        ["--no-lead", "--dry-run"])
+    no_lead_needs = verb_needs(team_args, team)
+    no_lead_engine = s.corpus_engine()
+    no_lead_engine._needs = no_lead_needs
+    real_engine = globals()["RESOLVER"]
+    no_lead_code, no_lead_error = None, None
+
+    def run_no_lead_team():
+        apply_selector(team, team_args)
+        return run_team(team_args, passthrough)
+
+    try:
+        globals()["RESOLVER"] = no_lead_engine
+        with capturing("out"), capturing("err"):
+            no_lead_code = audited(run_no_lead_team)
+    except BaseException as exc:
+        no_lead_error = f"{type(exc).__name__}: {exc}"
+    finally:
+        globals()["RESOLVER"] = real_engine
+    no_lead_audit = no_lead_engine.audit_answer()
+    target_conditional = all(
+        no_lead_needs[need] is DECLARED.MAYBE
+        for need in (NEED.TITLES, NEED.PLACEMENT))
+    no_lead_ok = (no_lead_code == 0 and not no_lead_error
+                  and no_lead_audit["result"] == "ok"
+                  and target_conditional)
+    check("no-lead-only-team-audits",
+          "a team run that skips its only lead completes its evidence audit",
+          no_lead_ok,
+          no_lead_error or repr(no_lead_audit))
     return checked
 
 
@@ -34795,29 +34830,32 @@ def verb_needs(args, selector):
         return Needs(hard={NEED.PROCS},
                      maybe={NEED.REGISTRY, NEED.STAMPS, NEED.SPAWNS,
                             NEED.TITLES, NEED.CONVERSION_CENSUS})
+    common_needs = {NEED.PROCS, NEED.REGISTRY, NEED.SEATS,
+                    NEED.SPAWNS, NEED.CONVERSION_CENSUS}
+    target_needs = {NEED.TITLES, NEED.PLACEMENT}
+
     # The input decides which resolution rungs can run. A UUID resolves from
     # the filename without the stamp index. Once identity is known, live-runtime
     # mapping for a promoted lead may enumerate known teams and read that index.
     # A bare name or team always uses stamps. An agent ID reaches them only when
     # no live process already states that identity.
     by_uuid = bool(args.resume) or bool(selector and UUID_RE.match(selector))
-    if args.agent_id or (selector and "@" in selector):
-        # An agent ID conditionally reaches stamps through runtime mapping.
-        return Needs(hard={NEED.PROCS, NEED.REGISTRY, NEED.SEATS,
-                           NEED.SPAWNS, NEED.TITLES, NEED.CONVERSION_CENSUS,
-                           NEED.PLACEMENT},
+    if (args.agent_id or (selector and "@" in selector)
+            or (by_uuid and not args.team)):
+        # Exact agent and session inputs always resolve one launch target. Their
+        # stamp lookup remains conditional on runtime mapping.
+        return Needs(hard=common_needs | target_needs,
                      maybe={NEED.STAMPS})
-    if by_uuid and not args.team:
-        # Exact lookup itself needs no stamps. Runtime mapping and rebind cleanup
-        # can read them after the transcript resolves, depending on identity and
-        # live process state.
-        return Needs(hard={NEED.PROCS, NEED.REGISTRY, NEED.SEATS,
-                           NEED.SPAWNS, NEED.TITLES, NEED.CONVERSION_CENSUS,
-                           NEED.PLACEMENT},
-                     maybe={NEED.STAMPS})
-    return Needs(hard={NEED.PROCS, NEED.REGISTRY, NEED.SEATS,
-                       NEED.SPAWNS, NEED.STAMPS, NEED.TITLES,
-                       NEED.CONVERSION_CENSUS, NEED.PLACEMENT})
+
+    # An explicit team or a bare selector can reach the team runner. --no-lead
+    # can leave a valid team run with only a skipped lead. The team plan still
+    # runs, while titles and launch placement require another selected member.
+    conditional_target_needs = (
+        target_needs if getattr(args, "no_lead", False) else set())
+    return Needs(
+        hard=common_needs | {NEED.STAMPS}
+        | (target_needs - conditional_target_needs),
+        maybe=conditional_target_needs)
 
 
 def audited(entry):
