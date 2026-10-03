@@ -86,6 +86,153 @@ def load(path):
     return objs
 
 
+GHOST_PREFIX = "pfgk-"
+CONTINUATION_PREAMBLE = "This session is being continued from a previous conversation"
+
+
+def edge(rec):
+    """The lineage link the walk follows: the logical parent, else the real parent. Only a
+    compaction boundary carries a logical parent, and a boundary's real parent is null."""
+    return rec.get("logicalParentUuid") or rec.get("parentUuid")
+
+
+def is_boundary(rec):
+    return rec.get("type") == "system" and rec.get("subtype") == "compact_boundary"
+
+
+def content_text(rec):
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
+                return b["text"]
+    return ""
+
+
+def is_origin(rec, belongs):
+    """A structural origin of the selected chain: a user or assistant turn, not meta, with no
+    link at all, that is neither a compaction summary nor a repair marker."""
+    return (belongs(rec) and rec.get("type") in ("user", "assistant") and not rec.get("isMeta")
+            and not edge(rec) and not rec.get("isCompactSummary")
+            and not str(rec.get("uuid", "")).startswith(GHOST_PREFIX))
+
+
+def walk_to_root(start, index, belongs):
+    """Walk from `start` along `edge`, cycle-guarded. Returns (path, reason), reason being
+    origin, preamble (the deepest root is a continuation summary), fork (a forkedFrom copy),
+    none, cycle or dangling: walkToRoot of ~/claude-patches/src/pfg-core.js."""
+    cur, seen, path = index.get(start), set(), []
+    while cur is not None:
+        if cur.get("uuid") in seen:
+            return path, "cycle"
+        seen.add(cur.get("uuid"))
+        path.append(cur)
+        if is_origin(cur, belongs):
+            if content_text(cur).startswith(CONTINUATION_PREAMBLE):
+                return path, "preamble"
+            if (cur.get("forkedFrom") or {}).get("sessionId"):
+                return path, "fork"
+            return path, "origin"
+        ref = edge(cur)
+        if not ref:
+            return path, "none"
+        nxt = index.get(ref)
+        if nxt is None:
+            return path, "dangling"
+        cur = nxt
+    return path, "none"
+
+
+def repair_preserved_tail_cycles(objs, belongs):
+    """Repair the one compaction cycle whose shape the compaction metadata describes in full,
+    as Patch K's step P does (~/claude-patches/src/d1e.js; the rule is the paragraph "An
+    in-file LPU target is not automatically a valid ancestor" in docs/invariant.md there).
+
+    A compaction can put its preserved window, the last records it keeps verbatim, under
+    the new compact summary while the boundary's logicalParentUuid still names that window's
+    tail:
+
+        boundary --lpu--> tail -> ... -> head -> summary -> boundary
+
+    The tail exists, but the walk from it returns to the boundary. The boundary's
+    compactMetadata.preservedMessages holds the window's complete order, so the repair
+    rebuilds that order and connects its head, through a marker record, to the nearest record
+    of the chain written before the boundary that is neither in the window nor a marker. It
+    repairs only that measured shape; any other cycle stays for the walk to report as a dead
+    end. The connection is "recorded" when the head's own record already names that record
+    as its parent (the compaction re-parented only the tail), "proven" when that record walks
+    to the chain's one origin that is not a fork copy, and otherwise an unproven seam joined
+    by write position alone. Mutates `objs`: inserts each marker before its boundary and
+    rewrites the window's parent links on every copy of each record.
+
+    The scan for that record and the walks see only `index`, the records `belongs` selects, so
+    a record of another chain written just before the boundary (a worker's sidechain record
+    in an older main file) is never taken for the window's parent."""
+    repairs = []
+    index = {o["uuid"]: o for o in objs if "uuid" in o and belongs(o)}
+    i = 0
+    while i < len(objs):
+        b = objs[i]
+        if not (is_boundary(b) and belongs(b) and b.get("parentUuid") is None
+                and b.get("logicalParentUuid")):
+            i += 1
+            continue
+        meta = b.get("compactMetadata") or {}
+        preserved = meta.get("preservedMessages") or {}
+        segment = meta.get("preservedSegment") or {}
+        uuids = preserved.get("uuids")
+        if not isinstance(uuids, list) or not uuids or any(u not in index for u in uuids):
+            i += 1
+            continue
+        head, tail = uuids[0], uuids[-1]
+        if b["logicalParentUuid"] != tail or segment.get("tailUuid") not in (None, tail):
+            i += 1
+            continue
+        lpath, reason = walk_to_root(tail, index, belongs)
+        if reason != "cycle" or not any(r.get("uuid") == b.get("uuid") for r in lpath):
+            i += 1
+            continue
+        window = set(uuids)
+        pred = next((objs[j]["uuid"] for j in range(i - 1, -1, -1)
+                     if objs[j].get("uuid") in index and objs[j]["uuid"] not in window
+                     and not objs[j]["uuid"].startswith(GHOST_PREFIX)), None)
+        if pred is None:
+            i += 1
+            continue
+        recorded = index[head].get("parentUuid") == pred
+        origins = [o for o in objs
+                   if is_origin(o, belongs) and not (o.get("forkedFrom") or {}).get("sessionId")]
+        ppath, preason = walk_to_root(pred, index, belongs)
+        proven = (len(origins) == 1 and preason == "origin"
+                  and ppath[-1].get("uuid") == origins[0].get("uuid")
+                  and not any((r.get("forkedFrom") or {}).get("sessionId") for r in ppath)
+                  and not any(str(r.get("uuid", "")).startswith(GHOST_PREFIX + "seam-")
+                              for r in ppath))
+        marker_uuid = "%s%s-%s" % (GHOST_PREFIX, "seamClean" if proven or recorded else "seam",
+                                   str(b.get("uuid"))[:8])
+        rep = {"boundary": b.get("uuid"), "ts": b.get("timestamp") or "", "tail": tail,
+               "count": len(uuids), "predecessor": pred, "recorded": recorded,
+               "proven": proven, "summary": preserved.get("anchorUuid"), "marker": marker_uuid}
+        marker = {"type": "system", "subtype": "preserved-tail-repair", "uuid": marker_uuid,
+                  "parentUuid": pred, "timestamp": b.get("timestamp"),
+                  "isSidechain": b.get("isSidechain"), "repair": rep}
+        if "agentId" in b:
+            marker["agentId"] = b["agentId"]
+        cursor = marker_uuid
+        for u in uuids:
+            for o in objs:
+                if o.get("uuid") == u:
+                    o["parentUuid"] = cursor
+            cursor = u
+        objs.insert(i, marker)
+        repairs.append(rep)
+        index = {o["uuid"]: o for o in objs if "uuid" in o and belongs(o)}
+        i += 2
+    return repairs
+
+
 def walk_path(objs, belongs):
     """Walk one active chain from its newest conversation entry to its local root.
 
@@ -93,7 +240,15 @@ def walk_path(objs, belongs):
     and attachments. The leaf and inferred joins use only user/assistant records. At each
     step `logicalParentUuid` takes precedence over `parentUuid`, so compacted chains remain
     walkable.
+
+    Before the walk, the preserved-tail compaction cycle is repaired
+    (repair_preserved_tail_cycles); each repair on the walked path is returned with the
+    breaks, kind "preserved-tail", at its marker. A parent that was never written is bridged
+    to the newest earlier conversation entry, an inferred join. A link back into the walked
+    path is any other cycle: the walk reports it and ends there, since a join by position
+    would be a guess.
     """
+    repairs = repair_preserved_tail_cycles(objs, belongs)
     by = {o["uuid"]: o for o in objs if "uuid" in o and belongs(o)}
     pos, convo = {}, []
     for i, o in enumerate(objs):
@@ -105,30 +260,72 @@ def walk_path(objs, belongs):
 
     path, breaks, seen = [], [], set()
     cur = leaf
-    while cur is not None and cur.get("uuid") not in seen:
+    while cur is not None:
         seen.add(cur.get("uuid"))
         path.append(cur)
-        nxt = cur.get("logicalParentUuid") or cur.get("parentUuid")
+        nxt = edge(cur)
         if not nxt:
+            break
+        here = pos.get(cur.get("uuid"), len(objs))
+        earlier = [o for i, o in convo if i < here and o.get("uuid") not in seen]
+        brk = {"at": cur.get("uuid"), "ts": cur.get("timestamp") or "", "missing": nxt,
+               "orphaned": len(earlier), "bridged": False, "to": None, "to_ts": ""}
+        if nxt in seen:
+            brk["why"] = "cycle"
+            breaks.append(brk)
             break
         if nxt in by:
             cur = by[nxt]
             continue
         # A killed process can leave a parent UUID that was never written. Rejoin only within
         # the selected chain and mark that inferred join in both the rendering and coverage.
-        here = pos.get(cur.get("uuid"), len(objs))
-        earlier = [o for i, o in convo if i < here and o.get("uuid") not in seen]
-        brk = {"at": cur.get("uuid"), "ts": cur.get("timestamp") or "", "missing": nxt,
-                "orphaned": len(earlier), "bridged": False, "to": None, "to_ts": ""}
+        brk["why"] = "missing"
         breaks.append(brk)
         if not earlier:
             break
         brk.update(bridged=True, to=earlier[-1].get("uuid"),
                    to_ts=earlier[-1].get("timestamp") or "")
         cur = earlier[-1]
+    on_path = {o.get("uuid") for o in path}
+    for rep in repairs:
+        if rep["marker"] in on_path:
+            breaks.append({"at": rep["marker"], "ts": rep["ts"], "why": "preserved-tail",
+                           "missing": rep["tail"], "orphaned": 0, "bridged": True,
+                           "to": rep["predecessor"], "to_ts": "", "repair": rep})
     path.reverse()
     breaks.reverse()
     return path, breaks
+
+
+def break_note(brk):
+    """The text of the record the rendering carries where the walk left the recorded chain."""
+    if brk["why"] == "preserved-tail":
+        rep = brk["repair"]
+        trust = ("recorded: the head's own record names it as its parent" if rep["recorded"] else
+                 "proven: that record walks to the chain's one origin" if rep["proven"] else
+                 "UNPROVEN: the head's record does not name it and it does not walk to one "
+                 "origin of the chain, so this join rests on its write position alone")
+        return ("COMPACTION CYCLE REPAIRED. Boundary %s named %s, the tail of its own preserved "
+                "window of %d records, as its logical parent, but the compaction had placed that "
+                "window under the new summary, so the chain returned to the boundary. The walk "
+                "restored the window's recorded order and connected its head to %s, the nearest "
+                "record written before the boundary outside the window (%s). The compaction "
+                "summary follows, then the preserved window, which the compaction kept verbatim."
+                % (rep["boundary"], rep["tail"], rep["count"], rep["predecessor"], trust))
+    if brk["why"] == "cycle":
+        return ("CHAIN CYCLE. This entry's parent %s is already on the walked path, so the walk "
+                "ends here. It is not the preserved-tail shape, the one cycle the compaction "
+                "metadata lets the walk repair." % brk["missing"])
+    if brk["bridged"]:
+        return ("CHAIN BREAK, BRIDGED. The record above is NOT this record's recorded "
+                "parent. This entry's parent %s exists in no file on disk (a killed "
+                "process left a last-prompt naming an entry it never wrote), so the walk "
+                "rejoined the newest preceding conversation entry. THIS JOIN IS INFERRED, "
+                "NOT RECORDED: the records either side may not be consecutive."
+                % brk["missing"])
+    return ("CHAIN BREAK. This entry's parent %s exists in no file on disk, and no "
+            "earlier conversation entry remains to rejoin, so the walk ends here."
+            % brk["missing"])
 
 
 def active_path(objs):
@@ -362,13 +559,17 @@ def main():
                 "# Each turn tagged `uuid=<id>`. Tool inputs clipped to %d chars; recover full input via\n"
                 "#   grep '\"uuid\":\"<id>\"' on the source jsonl -> parse message.content.\n" % a.cap
                 if a.mode == "enriched" else ""))
-        for o in path:
+        by_uuid = {o["uuid"]: o for o in objs if "uuid" in o}
+
+        def render(o):
+            """Emit one node of the chain, if it carries a user or assistant message."""
+            nonlocal turns
             msg = o.get("message")
             if not isinstance(msg, dict):
-                continue  # ai-title / file-history-snapshot / mode / etc.
+                return  # ai-title / file-history-snapshot / mode / etc.
             role = msg.get("role")
             if role not in ("user", "assistant"):
-                continue
+                return
             content = msg.get("content")
             items = []
             if isinstance(content, str):
@@ -400,25 +601,8 @@ def main():
                         items = non_text
                     else:
                         items = [("text", meta_stub(meta_text, o))] + non_text
-            # A break sits between this node and whatever the walk joined below it. Emit it
-            # before the skip test so it is never silently dropped along with an empty node.
-            brk = break_at.get(o.get("uuid"))
-            if brk:
-                if brk["bridged"]:
-                    note = ("CHAIN BREAK, BRIDGED. The record above is NOT this record's recorded "
-                            "parent. This entry's parent %s exists in no file on disk (a killed "
-                            "process left a last-prompt naming an entry it never wrote), so the walk "
-                            "rejoined the newest preceding conversation entry. THIS JOIN IS INFERRED, "
-                            "NOT RECORDED: the records either side may not be consecutive."
-                            % brk["missing"])
-                else:
-                    note = ("CHAIN BREAK. This entry's parent %s exists in no file on disk, and no "
-                            "earlier conversation entry remains to rejoin, so the walk ends here."
-                            % brk["missing"])
-                emit({"r": "break", "t": note},
-                     "!" * 70 + "\n[[" + note + "]]\n" + "!" * 70 + "\n\n")
             if not items:
-                continue
+                return
             turns += 1
             start, start_byte = line, nbytes
             texts = [p for k, p in items if k == "text"]
@@ -464,6 +648,26 @@ def main():
                     or "transcript (local sidechain)" in blob):
                 reingests.append((turns, start))
 
+        emitted = set()
+        for o in path:
+            # A break sits between this node and whatever the walk joined below it. Emit it
+            # before rendering, so a node that renders nothing (a compaction boundary, an
+            # attachment, a repair marker) never takes its note with it.
+            brk = break_at.get(o.get("uuid"))
+            if brk:
+                note = break_note(brk)
+                emit({"r": "break", "t": note},
+                     "!" * 70 + "\n[[" + note + "]]\n" + "!" * 70 + "\n\n")
+            emitted.add(o.get("uuid"))
+            render(o)
+            # A repaired compaction cycle leaves its summary off the walked path (nothing on
+            # the path names it any more). Emit it at the repair, where the compaction cut the
+            # chain, so its text is read and the interval map keeps this boundary.
+            summary = by_uuid.get((o.get("repair") or {}).get("summary") or "")
+            if summary is not None and summary.get("uuid") not in emitted:
+                emitted.add(summary.get("uuid"))
+                render(summary)
+
     print("scope=%s  mode=%s  turns=%d  tool_uses=%d  ->  %s"
           % (a.scope, a.mode, turns, sum(tools.values()), a.out))
     if tools:
@@ -485,7 +689,7 @@ def main():
         except Exception:
             return ts or "?"
 
-    on_path = {o.get("uuid") for o in path}
+    on_path = emitted
     if a.scope == "main":
         belongs = lambda o: not o.get("isSidechain")
     else:
@@ -509,10 +713,20 @@ def main():
         else:
             print("fork boundary: none (general-purpose worker local root)")
 
-    if breaks or unreached:
+    real = [s for s in breaks if s["why"] in ("missing", "cycle")]
+    repaired = [s["repair"] for s in breaks if s["why"] == "preserved-tail"]
+    unproven = [r for r in repaired if not (r["recorded"] or r["proven"])]
+    if real or unproven or unreached:
         print()
         print("COVERAGE: the walk did NOT cleanly reach the root")
-        for s in breaks:
+        for s in real:
+            if s["why"] == "cycle":
+                print("  STOPPED at %s: parent %s is already on the walked path (a cycle that is not"
+                      % (localtime(s["ts"]), s["missing"][:8]))
+                print("      the preserved-tail shape); %d earlier conversation entries in this file"
+                      % s["orphaned"])
+                print("      were never reached")
+                continue
             verb = "bridged" if s["bridged"] else "STOPPED"
             print("  %s at %s: parent %s exists in no file" % (verb, localtime(s["ts"]), s["missing"][:8]))
             if s["bridged"]:
@@ -531,14 +745,29 @@ def main():
             for o in unreached:
                 kind = "pseudocompaction" if o.get("logicalParentUuid") else "/compact"
                 print("      %s  %s  uuid=%s" % (localtime(o.get("timestamp") or ""), kind, str(o.get("uuid"))[:8]))
+        for r in unproven:
+            print("  UNPROVEN seam at %s: the repaired compaction cycle at boundary %s joins its"
+                  % (localtime(r["ts"]), r["boundary"][:8]))
+            print("      preserved window to %s by write position alone: the window's head does not"
+                  % r["predecessor"][:8])
+            print("      name it, and it does not walk to one origin of the chain")
         print("  walked %d of %d conversation entries in this file." % (convo_walked, convo_total))
+    if repaired:
+        print()
+        print("REPAIRED: %d compaction cycle%s, each a boundary naming the tail of its own preserved"
+              % (len(repaired), "" if len(repaired) == 1 else "s"))
+        print("  window; the window was put back in its recorded order before the summary:")
+        for r in repaired:
+            print("      %s  boundary %s: %d records joined to %s, %s"
+                  % (localtime(r["ts"]), r["boundary"][:8], r["count"], r["predecessor"][:8],
+                     "recorded" if r["recorded"] else "proven" if r["proven"] else "UNPROVEN"))
 
     last = line - 1
     print()
     print("READ-BACK INTERVALS (+ = contains a prior /reingest-transcript):")
     if not boundaries:
         mark = "+" if reingests else " "
-        if breaks:
+        if real:
             tail = "no compaction on the WALKED path, but the walk broke; see COVERAGE"
         elif a.scope == "sidechain":
             tail = ("whole local sidechain; inherited main history stops at fork-context-ref"
@@ -558,7 +787,7 @@ def main():
             mark = "+" if any(lo <= rl < hi for _, rl in reingests) else " "
             if i == 0:
                 span = "before %s" % localtime(bts[blines[0]])
-                if breaks:
+                if real or unproven:
                     span += "  (line 1 is NOT the start; see COVERAGE)"
             elif i == len(edges) - 2:
                 span = "%s -> now (already in your live context)" % localtime(bts[blines[-1]])
