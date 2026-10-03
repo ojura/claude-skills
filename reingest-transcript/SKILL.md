@@ -1,23 +1,31 @@
 ---
 name: reingest-transcript
-description: Reconstruct and re-read the full current-session conversation from its own Claude Code JSONL transcript (active path only), to recover detail that compaction flattened. Use when you need verbatim prior turns, exact strings/code you generated, decisions made, or the real action sequence rather than the lossy compacted summary. Produces a compact JSONL rendering you read back in slices.
+description: Reconstruct and re-read either the active main conversation or one worker's local sidechain from a Claude Code JSONL transcript. Use after compaction, or when a resumed fork needs its predecessor's exact local decisions, commands, findings, and checkpoints without reloading inherited main-session history.
 ---
 
 # Reingest transcript
 
-Rebuild the live conversation from the session's own JSONL and read it back, so detail the compaction summary dropped is recoverable verbatim.
+Rebuild either the lead's active conversation or a worker's local sidechain and read back the exact records that summaries or replacement forks omitted.
 
 ## When to use
-- After a compaction, when you need exact prior content (strings, code, decisions, the order things happened in) rather than the summary.
-- The compaction note "read the full transcript at: `<path>.jsonl`" points straight at the source file.
+- After a compaction, when you need exact prior content such as strings, code, decisions, or action order.
+- When a replacement or resumed fork needs the predecessor worker's local decisions and checkpoints without ingesting the inherited lead conversation again.
+- The compaction note "read the full transcript at: `<path>.jsonl`" points straight at a main-session source file. Worker transcripts live under `<session-id>/subagents/agent-<id>.jsonl`.
 
 ## Steps
 1. **Find the session JSONL.** It is the path in the compaction note, or:
    `~/.claude/projects/<slug>/<session-id>.jsonl`, where `<slug>` is the cwd with `/` and `.` turned into `-`. If unsure which file, the most recently modified `*.jsonl` in that project dir is the current session.
 2. **Generate the rendering** (the script sits beside this SKILL.md):
    ```
-   python3 ~/.claude/skills/reingest-transcript/extract.py <SESSION.jsonl> /tmp/turns.jsonl --mode text
+   # Lead conversation
+   python3 ~/.claude/skills/reingest-transcript/extract.py <SESSION.jsonl> /tmp/turns.jsonl --scope main --mode text
+
+   # One worker's local records only
+   python3 ~/.claude/skills/reingest-transcript/extract.py <agent-ID.jsonl> /tmp/sidechain.jsonl --scope sidechain --mode text
    ```
+   - `--scope main` (default) walks the active lead path and excludes worker records.
+   - `--scope sidechain` walks only one worker's local `isSidechain` path. It reports the matching `fork-context-ref` as the boundary and does not emit the inherited lead conversation. A general-purpose worker may have no reference; its parentless local entry is then the boundary.
+   - `--agent-id ID` selects the worker when a file contains more than one sidechain identity. A normal worker transcript contains one, so the script infers it.
    - `--mode text` (default-prefer): user + assistant prose only. Smallest. Use this unless you actually need the tool-call flow.
    - `--mode enriched`: also emits assistant tool calls (name + input, clipped via `--cap N`, default 300), and tags each record `u` so a clipped input is recoverable with `grep '"uuid":"<u>"' <SESSION.jsonl>`. Much larger, roughly double.
    - `--format jsonl` (default) or `--format md`. Prefer the default; md exists for reading by eye.
@@ -28,15 +36,18 @@ Rebuild the live conversation from the session's own JSONL and read it back, so 
 One JSON record per line, no banners:
 
 ```json
+{"r":"head","scope":"sidechain","agent":"a123...","fork":{"parentSessionId":"...","parentLastUuid":"..."}}
 {"i":12,"r":"user","t":"..."}
 {"i":13,"r":"team","msgs":[{"from":"cli-ux","idle":"available"}]}
 {"i":14,"r":"asst","t":"...","x":[{"n":"Bash","in":{"command":"..."}}]}
 ```
 
-`r` says where the turn came from, which the markdown format could not: **user** (the operator typed it), **team** (a teammate message), **task** (a task notification), **asst**, **meta** (a harness injection), **sys** (interrupt markers and other harness-inserted text). Teammate and task notifications are parsed into fields rather than left as raw tagged blobs, and their repeated harness boilerplate is dropped. A teammate record keeps any surrounding prose that is *not* that boilerplate, so nothing real is dropped quietly.
+The head record names the selected scope. In sidechain mode it also names the worker and, when present, the `fork-context-ref` boundary. `r` says where the turn came from, which the markdown format could not: **user** (the operator typed it), **team** (a teammate message), **task** (a task notification), **asst**, **meta** (a harness injection), **sys** (interrupt markers and other harness-inserted text). Teammate and task notifications are parsed into fields rather than left as raw tagged blobs, and their repeated harness boilerplate is dropped. A teammate record keeps any surrounding prose that is *not* that boilerplate, so nothing real is dropped quietly.
 
 ## What the script does
-Walks from the most-recent non-sidechain leaf towards the root, emitting **only the active path**: abandoned retry/interrupt branches and subagent sidechains are excluded (one real session had 22 leaves but a single live path). It prefers `logicalParentUuid` over `parentUuid`, which lets it **walk straight through every compaction boundary**: a `/compact` writes its summary against a synthetic boundary node whose `parentUuid` dead-ends, but that node stores the true pre-compaction tip in `logicalParentUuid`. Keeps `text` blocks (stripping `<system-reminder>...</system-reminder>`); enriched mode also keeps `tool_use`; `tool_result` and `thinking` are always dropped.
+For `--scope main`, the script walks from the most-recent non-sidechain leaf towards the root and emits only the active lead path. Abandoned retries and worker sidechains are excluded. For `--scope sidechain`, it selects one `agentId`, walks only that worker's `isSidechain` records, and stops at the local root. A matching `fork-context-ref` is reported in the header and on stdout, but the inherited main-session records named by it are not loaded or emitted.
+
+Both scopes prefer `logicalParentUuid` over `parentUuid`, which lets the walk continue through compaction boundaries. Subagents can compact independently of the lead; sidechain mode follows those worker-local boundaries in the same way. A `/compact` summary can have a parent that ends locally while its `logicalParentUuid` records the real pre-compaction tip. The renderer keeps `text` blocks after stripping `<system-reminder>...</system-reminder>`; enriched mode also keeps `tool_use`; `tool_result` and `thinking` are always dropped.
 
 **The walk does not always reach the root, and that is the failure mode to watch.** A killed process leaves a `last-prompt` naming an entry it never wrote, and the next boot parents its first entry onto that missing uuid. A strict walk stops dead there, mid-file, with most of the session still sitting in the same file unreached. The script therefore rejoins the newest conversation entry before the break and keeps going. That join is **inferred, not recorded**: it gets its own `{"r":"break"}` record at the exact spot, and is named in the COVERAGE report. Records either side of it may not be consecutive.
 
@@ -65,7 +76,9 @@ After running it: **kill and re-resume** the session. A live process keeps its o
 - **Read COVERAGE before trusting the intervals.** If it printed at all, the intervals describe less than the whole file, and "lines 1-N before `<ts>`" does not mean line 1 is the start of the conversation.
 - **Read the guidance, not the whole file.** Read the one-boundary-back slice the report points at (what the latest compaction flattened), and skip the lines it marks as already-in-context or as a prior reingest.
 - **A line is a whole message, so line count no longer predicts read size.** Use the per-interval token cost, not the line span.
-- **Prefer `--mode text`.** Enriched roughly doubles the record count (prose and tool calls are often separate nodes) and is token-heavy, so use it only when the action sequence matters.
+- **Prefer `--mode text`.** Enriched roughly doubles the record count because prose and tool calls are often separate nodes, so use it only when the action sequence matters.
+- **Sidechain mode does not compare workers.** Render the predecessor and replacement transcripts separately, then compare decisions, file paths, hashes, unfinished checks, rejected approaches, and pending messages. The replacement's inherited lead history is deliberately absent from its sidechain rendering.
+- A `fork-context-ref` has no UUID and is not linked through `parentUuid`; it is boundary metadata before the sidechain records. The script reports it instead of trying to walk through it.
 - The live JSONL keeps growing, so counts drift between runs.
 - **The harness does not mark teammate messages.** A task notification carries `origin.kind = "task-notification"` and prose you typed carries `origin.kind = "human"`, but a teammate message has no `origin` at all and is otherwise identical to typed prose: `type: user`, `userType: external`, no `isMeta`, plain string content. The `<teammate-message>` block in the body is the only thing that identifies it, which is why the script parses those blocks rather than trusting a field.
 - Don't count "user turns" by role alone: a node can carry a `tool_result` and a `text` block together, and `[Request interrupted by user]` / slash-command artifacts ride the user role. The `r` field settles this; classify by that rather than by role.

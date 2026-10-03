@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Reconstruct the active conversation path from a Claude Code session JSONL.
+"""Reconstruct an active main conversation or one worker's local sidechain.
 
-Walks `parentUuid` from the most-recent non-sidechain leaf towards the root, so only
-the live conversation is emitted: abandoned retry/interrupt branches and subagent
-sidechains are dropped. Where the chain is broken (an entry whose recorded parent
-was never written to disk) the walk rejoins the newest entry before the break and
-says so, in the output and in the report, rather than stopping without a word. Keeps
-user/assistant TEXT; `--mode enriched` also keeps assistant `tool_use` (name + input,
-clipped); `tool_result` and `thinking` are always excluded, and
-`<system-reminder>...</system-reminder>` blocks are stripped.
+`--scope main` walks `parentUuid` from the most-recent non-sidechain leaf towards the
+root, excluding abandoned retries and worker sidechains. `--scope sidechain` walks
+only one worker's `isSidechain` records to their local root. For a fork, the separate
+`fork-context-ref` record is reported as the boundary and inherited main-session
+history is not emitted. For a general-purpose worker without that record, the local
+parentless entry is the boundary.
+
+Where a chain is broken because a recorded parent was never written, the walk rejoins
+the newest eligible entry before the break and reports that inferred join instead of
+stopping without a word. Keeps user/assistant text; `--mode enriched` also keeps
+assistant `tool_use` blocks with clipped inputs. `tool_result` and `thinking` are
+always excluded, and `<system-reminder>...</system-reminder>` blocks are stripped.
 
 Output is JSONL by default, one record per line, no banners:
     {"i": 12, "r": "user", "t": "..."}
@@ -31,7 +35,8 @@ keep` restores emit-in-full. Compact-summary nodes are never stubbed; short one-
 meta (e.g. `[Image: ...]` placeholders) is kept as-is.
 
 Usage:
-    python3 extract.py <SESSION.jsonl> <OUT> [--mode text|enriched] [--format jsonl|md]
+    python3 extract.py <SESSION.jsonl> <OUT> [--scope main|sidechain] [--agent-id ID]
+                                             [--mode text|enriched] [--format jsonl|md]
                                              [--cap 300] [--meta stub|drop|keep]
 
 Read the COVERAGE report first if it prints: the walk did not reach the root and the
@@ -81,27 +86,20 @@ def load(path):
     return objs
 
 
-def active_path(objs):
-    """Leaf->root walk; returns (root-first nodes, breaks).
+def walk_path(objs, belongs):
+    """Walk one active chain from its newest conversation entry to its local root.
 
-    At each step prefer `logicalParentUuid` over `parentUuid`. A /compact writes its summary
-    against a synthetic boundary node whose `parentUuid` dead-ends; that node stores the real
-    pre-compaction tip in `logicalParentUuid`, so following it walks straight through every
-    compaction. Normal turns have no `logicalParentUuid` and fall back to `parentUuid`.
-
-    A walk can still end far short of the root. A killed process leaves a `last-prompt` naming
-    an entry it never wrote, and the next boot parents its first entry onto that missing
-    uuid, so a strict walk stops mid-file and orphans every earlier entry (and every earlier
-    compaction boundary) in the same file. Rather than stop, rejoin the newest conversation
-    entry preceding the break. That join is INFERRED, not recorded, so each one is returned
-    as a break record: `main()` marks it in the output and names it in the report.
+    `belongs` selects every record that may participate in the chain, including tool results
+    and attachments. The leaf and inferred joins use only user/assistant records. At each
+    step `logicalParentUuid` takes precedence over `parentUuid`, so compacted chains remain
+    walkable.
     """
-    by = {o["uuid"]: o for o in objs if "uuid" in o}
+    by = {o["uuid"]: o for o in objs if "uuid" in o and belongs(o)}
     pos, convo = {}, []
     for i, o in enumerate(objs):
-        if "uuid" in o:
+        if "uuid" in o and belongs(o):
             pos.setdefault(o["uuid"], i)
-            if o.get("type") in ("user", "assistant") and not o.get("isSidechain"):
+            if o.get("type") in ("user", "assistant"):
                 convo.append((i, o))
     leaf = convo[-1][1] if convo else None
 
@@ -112,24 +110,63 @@ def active_path(objs):
         path.append(cur)
         nxt = cur.get("logicalParentUuid") or cur.get("parentUuid")
         if not nxt:
-            break                                   # genuine root
+            break
         if nxt in by:
             cur = by[nxt]
             continue
-        # Dangling parent: the recorded ancestor is in no file. Stop, or infer a join.
+        # A killed process can leave a parent UUID that was never written. Rejoin only within
+        # the selected chain and mark that inferred join in both the rendering and coverage.
         here = pos.get(cur.get("uuid"), len(objs))
         earlier = [o for i, o in convo if i < here and o.get("uuid") not in seen]
         brk = {"at": cur.get("uuid"), "ts": cur.get("timestamp") or "", "missing": nxt,
                 "orphaned": len(earlier), "bridged": False, "to": None, "to_ts": ""}
         breaks.append(brk)
         if not earlier:
-            break                                   # nothing precedes it; the walk really is done
+            break
         brk.update(bridged=True, to=earlier[-1].get("uuid"),
-                    to_ts=earlier[-1].get("timestamp") or "")
+                   to_ts=earlier[-1].get("timestamp") or "")
         cur = earlier[-1]
     path.reverse()
     breaks.reverse()
     return path, breaks
+
+
+def active_path(objs):
+    """Return the root-first active main-session path and its inferred chain breaks."""
+    return walk_path(objs, lambda o: not o.get("isSidechain"))
+
+
+def sidechain_path(objs, requested_agent_id=None):
+    """Return one worker's local sidechain without loading its inherited main history.
+
+    Fork transcripts begin with a `fork-context-ref` record followed by local records whose
+    `isSidechain` field is true. The reference has no UUID and is not part of the parent chain;
+    it is returned as boundary metadata. General-purpose workers may have no reference, in
+    which case their local root is the first parentless sidechain record.
+    """
+    ids = []
+    for o in objs:
+        if (o.get("isSidechain") and o.get("type") in ("user", "assistant")
+                and isinstance(o.get("agentId"), str) and o["agentId"] not in ids):
+            ids.append(o["agentId"])
+    if requested_agent_id is not None:
+        if requested_agent_id not in ids:
+            raise ValueError("agent %s has no user/assistant sidechain records" % requested_agent_id)
+        agent_id = requested_agent_id
+    elif len(ids) == 1:
+        agent_id = ids[0]
+    elif not ids:
+        raise ValueError("the transcript has no user/assistant sidechain records")
+    else:
+        raise ValueError("the transcript contains multiple sidechain agents (%s); pass --agent-id"
+                         % ", ".join(ids))
+
+    belongs = lambda o: o.get("isSidechain") and o.get("agentId") == agent_id
+    path, breaks = walk_path(objs, belongs)
+    references = [o for o in objs
+                  if o.get("type") == "fork-context-ref" and o.get("agentId") == agent_id]
+    reference = references[-1] if references else None
+    return path, breaks, agent_id, reference, len(references)
 
 
 def clip(v, cap):
@@ -252,9 +289,13 @@ def source_of(node, text, team_msgs):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Reconstruct the active conversation path from a session JSONL.")
-    ap.add_argument("jsonl", help="path to the session .jsonl")
-    ap.add_argument("out", help="output markdown path")
+    ap = argparse.ArgumentParser(description="Reconstruct an active main or worker conversation path from a session JSONL.")
+    ap.add_argument("jsonl", help="path to the session or worker .jsonl")
+    ap.add_argument("out", help="output path")
+    ap.add_argument("--scope", choices=("main", "sidechain"), default="main",
+                    help="main = active lead conversation; sidechain = one worker's local records only")
+    ap.add_argument("--agent-id",
+                    help="sidechain agent id; inferred when the worker transcript contains exactly one")
     ap.add_argument("--mode", choices=("text", "enriched"), default="enriched",
                     help="text = prose only (small); enriched = prose + tool calls (large)")
     ap.add_argument("--cap", type=int, default=300, help="clip tool inputs to N chars (enriched mode)")
@@ -265,7 +306,19 @@ def main():
     a = ap.parse_args()
 
     objs = load(a.jsonl)
-    path, breaks = active_path(objs)
+    sidechain_agent = None
+    fork_reference = None
+    fork_reference_count = 0
+    if a.scope == "main":
+        if a.agent_id:
+            ap.error("--agent-id is valid only with --scope sidechain")
+        path, breaks = active_path(objs)
+    else:
+        try:
+            path, breaks, sidechain_agent, fork_reference, fork_reference_count = sidechain_path(
+                objs, a.agent_id)
+        except ValueError as error:
+            ap.error(str(error))
     break_at = {s["at"]: s for s in breaks}
     turns = 0
     tools = collections.Counter()
@@ -288,13 +341,24 @@ def main():
             else:
                 w(md_body)
 
-        head = {"r": "head", "mode": a.mode, "src": a.jsonl,
-                "note": "leaf->root active path; r=user|team|task|asst|meta|sys"}
+        scope_note = ("active main path"
+                      if a.scope == "main"
+                      else "local sidechain only; inherited main history omitted at fork-context-ref")
+        head = {"r": "head", "mode": a.mode, "scope": a.scope, "src": a.jsonl,
+                "note": "%s; r=user|team|task|asst|meta|sys" % scope_note}
+        if sidechain_agent:
+            head["agent"] = sidechain_agent
+        if fork_reference:
+            head["fork"] = {
+                "parentSessionId": fork_reference.get("parentSessionId"),
+                "parentLastUuid": fork_reference.get("parentLastUuid"),
+            }
         if a.mode == "enriched":
             head["tools"] = ("x[] holds tool calls, inputs clipped to %d chars; recover a full "
                              "input with grep '\"uuid\":\"<u>\"' on src" % a.cap)
-        emit(head, "# %s transcript (leaf->root active path)\n# Source: %s\n%s\n"
-             % (a.mode, a.jsonl,
+        title = "active main path" if a.scope == "main" else "local sidechain"
+        emit(head, "# %s transcript (%s)\n# Source: %s\n%s\n"
+             % (a.mode, title, a.jsonl,
                 "# Each turn tagged `uuid=<id>`. Tool inputs clipped to %d chars; recover full input via\n"
                 "#   grep '\"uuid\":\"<id>\"' on the source jsonl -> parse message.content.\n" % a.cap
                 if a.mode == "enriched" else ""))
@@ -394,10 +458,14 @@ def main():
             if o.get("isCompactSummary"):
                 boundaries.append((start, o.get("timestamp") or "", start_byte))
             blob = "\n".join(texts).lower()
-            if "/reingest-transcript" in blob or "transcript (leaf->root active path)" in blob:
+            if ("/reingest-transcript" in blob
+                    or "transcript (leaf->root active path)" in blob
+                    or "transcript (active main path)" in blob
+                    or "transcript (local sidechain)" in blob):
                 reingests.append((turns, start))
 
-    print("mode=%s  turns=%d  tool_uses=%d  ->  %s" % (a.mode, turns, sum(tools.values()), a.out))
+    print("scope=%s  mode=%s  turns=%d  tool_uses=%d  ->  %s"
+          % (a.scope, a.mode, turns, sum(tools.values()), a.out))
     if tools:
         print("tools:", ", ".join("%s=%d" % (k, v) for k, v in tools.most_common()))
 
@@ -418,12 +486,28 @@ def main():
             return ts or "?"
 
     on_path = {o.get("uuid") for o in path}
-    all_bounds = [o for o in objs if o.get("isCompactSummary")]
+    if a.scope == "main":
+        belongs = lambda o: not o.get("isSidechain")
+    else:
+        belongs = lambda o: o.get("isSidechain") and o.get("agentId") == sidechain_agent
+    all_bounds = [o for o in objs if o.get("isCompactSummary") and belongs(o)]
     unreached = [o for o in all_bounds if o.get("uuid") not in on_path]
     def is_convo(o):
-        return o.get("type") in ("user", "assistant") and "uuid" in o and not o.get("isSidechain")
+        return o.get("type") in ("user", "assistant") and "uuid" in o and belongs(o)
     convo_total = sum(1 for o in objs if is_convo(o))
     convo_walked = sum(1 for o in path if is_convo(o))
+
+    if a.scope == "sidechain":
+        print("sidechain agent=%s" % sidechain_agent)
+        if fork_reference:
+            print("fork boundary: parent session=%s  parent tail=%s"
+                  % (fork_reference.get("parentSessionId") or "?",
+                     fork_reference.get("parentLastUuid") or "?"))
+            if fork_reference_count > 1:
+                print("COVERAGE: %d fork-context-ref records match this agent; using the last one"
+                      % fork_reference_count)
+        else:
+            print("fork boundary: none (general-purpose worker local root)")
 
     if breaks or unreached:
         print()
@@ -454,8 +538,13 @@ def main():
     print("READ-BACK INTERVALS (+ = contains a prior /reingest-transcript):")
     if not boundaries:
         mark = "+" if reingests else " "
-        tail = "whole live conversation (no compaction on the active path)" if not breaks \
-            else "no compaction on the WALKED path, but the walk broke; see COVERAGE"
+        if breaks:
+            tail = "no compaction on the WALKED path, but the walk broke; see COVERAGE"
+        elif a.scope == "sidechain":
+            tail = ("whole local sidechain; inherited main history stops at fork-context-ref"
+                    if fork_reference else "whole local sidechain; no fork-context-ref in this worker")
+        else:
+            tail = "whole live conversation (no compaction on the active path)"
         print("  %s lines 1-%d  ~%dk tok  %s" % (mark, last, nbytes // 4000, tail))
     else:
         boundaries.sort()  # by line == chronological, since the output is root-first
