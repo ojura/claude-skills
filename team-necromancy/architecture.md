@@ -469,11 +469,15 @@ structured answers from Resolver.
 
 ### Public methods and private readers
 
-Resolver has exactly 34 public methods and no public instance attributes. Every
-public method returns one recursively immutable record for one command. The AST
-checks compare this method and caller table exactly, reject public aliases and
-component access, reject module calls to private Resolver methods, and require an
-empty `PUBLIC_RESOLVER_ATTRIBUTES` map.
+Resolver has exactly 35 public methods and no public instance attributes. Its
+answers use read-only records. The retained observation types and config
+constructors establish ownership of their nested values; a read-only outer
+mapping alone does not copy a caller's referenced objects. In particular, rebuild
+rejection retains the exact launch supplied by its caller. `refresh_transcript_evidence`
+is the one notification: transcript writers use it to discard cached evidence
+after a mutation attempt. The AST checks compare this method and caller table
+exactly, reject public aliases and component access, reject module calls to
+private Resolver methods, and require an empty `PUBLIC_RESOLVER_ATTRIBUTES` map.
 
 | Public method | Module caller or callers |
 |---|---|
@@ -494,6 +498,7 @@ empty `PUBLIC_RESOLVER_ATTRIBUTES` map.
 | `membership_plan` | `record_membership`, `release_membership`, `reserve_membership`, `restore_member` |
 | `promotion_plan` | `run_promote` |
 | `rebuild_plan` | `apply_rebuild_plan`, `rebuild_roster`, `rebuild_team` |
+| `refresh_transcript_evidence` | `apply_restamp`, `embed`, `materialize` |
 | `revalidate_cleanup` | `run_cleanup` |
 | `revalidate_cleanup_cut` | `remove_cleanup_action` |
 | `revalidate_conversion` | `embed`, `materialize` |
@@ -525,6 +530,186 @@ revalidation compares the current value with the recorded value. A writer does
 not use a later read to choose a different source, destination, or deletion. The
 root-stamp conversion fixture checks four cases through operation answers.
 
+### Complete roster observations
+
+`FileObservation` retains an immutable path, the existing file-generation tuple,
+and the descriptor's permission bits masked to `0o777`. `_file_observation`
+reads bytes and mode from the same open descriptor and compares its device,
+inode, size, and nanosecond modification time with the named path. A mode of `0`
+is retained; `None` means there was no physical mode to observe.
+`_file_generation` projects the generation for readers that still require a tuple.
+
+A physical generation is `(dev, ino, size, mtime_ns, raw_bytes)`. The reader also
+preserves `("absent",)` and the diagnostic
+`("changed-during-read", descriptor_signature, named_signature, raw)` result.
+The existing reader treats every `OSError` as absent, including permission
+failures. Census skips those records. An absent lookup therefore does not prove
+that no file exists. An unstable read refuses census selection instead of being
+parsed or treated as absent.
+
+`Resolver.RosterSnapshot` owns the complete roster interpretation. It retains a
+file observation, config data, and any parse problem. State, operative team name,
+raw bytes, mode, and activity time are derived properties. An empty parsed object
+is valid. A nonempty config `name` supplies the team name; otherwise the directory
+name does. `_rosters`, `_scan_teams`, `_boot_join`, and `census_answer` use that
+selected name even when it differs from the directory. Activity milliseconds are
+`mtime_ns // 1_000_000`; floating-point seconds can round a timestamp immediately
+below a millisecond boundary into the next millisecond.
+
+An explicit preview owns a path and config, with a generation containing that
+same owned config. It does not claim an on-disk write or physical permissions.
+Physical generation tuples retain their identity. Absent records, invalid parse
+records, and previews reject metadata that contradicts their construction.
+Snapshot consumers use attributes. Parsed config objects, individual membership
+records, and outer operation answers remain separate mappings.
+
+Snapshot construction copies config values through
+`immutable(json_value(data, strict=True))`. The supported tree is string-keyed
+mappings, lists or tuples, and built-in string, boolean, integer, float, and
+`None` values. NaN and infinities keep the parser's existing behavior. Unsupported
+leaves, non-string keys, dataclasses, sets, and cycles are rejected. Shared
+children that do not form cycles are allowed. Copying also detaches mapping-proxy
+backing dictionaries, so freezing only the outer object is insufficient.
+
+`_team_members` owns selection from a team name, the entire retained census, a
+normalized runtime snapshot, the retained durable-assignment index, and the
+enrichment setting. Census sequences become tuples of complete snapshots;
+process rows and their argv values become immutable tuples. Already immutable
+tuples and their records are retained. Cache reuse requires those retained input
+objects to be identical, not merely equal. Target-roster lookup follows the cache
+check, so repeated absent-team queries reuse their complete answer too.
+`_team_runtime` projects the member answer, and `_team_description` caches by
+member-answer identity. A change to another roster can change lead inference,
+which is why the selected team's generation alone cannot identify these inputs.
+
+`_update_census` inserts, replaces, or removes a record by its physical config
+path. It preserves unrelated order and identity and returns the original tuple
+for a no-op. Previews and accepted rebuild effects use this operation.
+`_complete_routed_launch` also uses it when a completed member or lead rebind
+retires a source team. Removing one path does not remove a second record that
+happens to declare the same team name. A later real `run_agents` job asks for a
+fresh census and process snapshot after either success or refusal. Dry jobs keep
+their selected preview census because it was never written.
+
+### Cache invalidation after mutations
+
+Each `Cache` declaration names the events that discard its stored value. One
+registry retains the descriptors, names, storage slots, empty-value factories,
+and event dependencies. `_invalidate` removes matching slots without mutating
+previously returned values, reading files, or exercising NEED declarations.
+Subsequent readers reconstruct evidence through their existing loaders.
+
+| Event | Caches discarded |
+|---|---|
+| Transcript | `_stamps`, `_carried`, `_carried_scope`, `_receipts`, `_spawns`, `_spawn_log`, `_by_agent`, `_by_team`, `_team_assignments`, `_transcript_facts`, `_transcript_snapshots`, `_copied_prefixes` |
+| Process | `_procs`, `_seat_table`, `_seats`, `_registry` |
+| Either | `_runtime_table`, `_runtime_snapshot`, `_team_member_answers`, `_team_descriptions` |
+| Neither | `_terminal` |
+
+The active `_process_table(refresh=True)` uses this registry. Transcript writers
+call `refresh_transcript_evidence`. Neither event resets configured directories,
+`_needs`, `_exercised`, the cache-free rewriter, or previously selected answers.
+This responds to this command's writes, not arbitrary external transcript edits.
+
+`apply_restamp` refreshes immediately after atomic replacement succeeds, before
+member or lead completion can refuse. Atomic writers capture and validate the
+observation and close the descriptor before `os.replace`; successful replacement
+returns immediately, with no intervening metadata read. A failure before
+installation preserves the earlier evidence.
+
+Every exclusive creation in `materialize` and `embed` refreshes in its own
+`finally`, including the embedded metadata creation. A write, flush, chmod,
+fsync, fstat, or close failure can leave readable bytes without returning a
+writer result. A failed attempt before creation may also invalidate unchanged
+evidence, without claiming that a write succeeded. Each successful source or
+side-metadata unlink refreshes again before any later operation can fail.
+Dry conversion and migration routes do not invoke these writes or notifications.
+
+### Selected roster writes and observed effects
+
+Resolver selects one roster write containing the path, original observation,
+owned config, serialized bytes, mode, and filesystem action. Rebuild and all
+membership operations share `_roster_write`. It obtains owned object config from
+`RosterSnapshot.preview` and serializes it once; writers do not serialize the
+roster again. The preview supplies owned data, not a claimed file observation.
+An observed mode, including zero, is preserved. Only a record without an
+observed mode selects the `0600` default. Inbox selections retain the original
+observation and a create, replace-empty, or keep action. Their path and generation
+come from that observation. Create and replace-empty also select intended bytes
+and mode; keep needs only the unchanged observation. The name is diagnostic
+metadata, not evidence that a write happened.
+
+`write_new_bytes`, `replace_json`, `replace_text`, `replace_bytes`, and
+`replace_retained_path` return `FileObservation`. Exclusive creation and atomic
+replacement share descriptor writing and observation capture. The returned mode
+comes from `fstat`, not the requested value. Forwarding helpers return the same
+observation, and retained-path replacement reports the installed inode.
+Conversion revalidation still accepts generation tuples: `materialize` and
+`embed` explicitly pass each writer observation's `.generation`. That projection
+does not add permission-aware conversion revalidation.
+
+Rebuild completion checks the `Applied` operation, launch and plan association,
+confirmation, dry-run state, durable action, written selection, path, bytes,
+config, physical observation, and mode. It validates operand types before value
+comparison. Operation and action names must be built-in strings with supported
+values. Both rollback operands must be `FileObservation` values; the retained
+selection must be physical and the reported observation must equal it. Every
+selected inbox needs exactly one associated effect with its action,
+before-observation, and correct result. Both inbox collections must be present,
+even when empty. Diagnostic names are optional; only string names are formatted.
+
+Completion checks these retained values without filesystem reads or another
+serialization. Create requires an absent before-observation, replace-empty a
+physical empty file, and keep a physical nonempty file whose reported result is
+equal to the original observation. Equal observations need not be the same Python
+object. The shared written-result comparison first requires a physical
+`FileObservation` and checks each intended operand's exact type against its
+observed counterpart. It then compares destination, bytes, and mode. A float or
+boolean cannot stand for integer permissions, nor a mutable buffer for bytes.
+The comparator does not interpret bytes as config data. Invalid JSON is legitimate
+in a backup of an unreadable roster.
+
+Both selected and reported config values pass through `RosterSnapshot` before
+their owned data is compared. Its expected type and value errors become
+objections. The selected config's identity association and the reported config's
+value comparison remain different checks. Supported list and tuple arrays are
+normalized by the existing constructor; completion adds no serialization or
+special equality rules for config leaves. The selected candidate is retained
+for publication after every effect passes.
+
+Incorrect or incomplete effects return exactly `launch`, `written_roster`, and
+`objections`, with the original launch object and no written roster. This also
+preserves an ordinary dictionary supplied as launch; it does not detach or deeply
+freeze that caller's graph. Successful output contains exactly `launch`,
+`written_roster`, `original_generation`, `replacement_generation`, and
+`objections`. The generation values come from the retained original and accepted
+file observation. Neither result copies raw plan fields or returns the `Applied`
+input, whose frozen outer dataclass does not establish ownership of its nested
+data. Executors and effect tests can retain that input separately.
+
+Only complete acceptance publishes the owned candidate as both the completed
+destination and the census entry. Creation inserts it into an empty census as
+well as an existing one. Previously retained snapshots remain unchanged.
+
+Rebuild revalidation compares the complete expected observations for its current
+phase. Backup creation, retaining the rollback inode, and installing the new
+config each update those expectations. After replacement, the rollback inode and
+the new config are separate observations. Before restoration or cleanup, both
+must still match, including permissions. An inbox failure restores the retained
+original inode, bytes, and mode, or removes a newly created config. The next check
+expects the restored config and absence of the rollback path that was renamed.
+
+Membership reserve, record, release, and restore use the same selected byte
+writer. Initial validation checks every selected roster before effects; each
+roster is checked again under its lock. A cross-team update retains separate
+source and destination modes. Successful backup history is passed to Resolver
+as an immutable set of config paths. The first backup in an invocation may
+replace an older invocation's `.bak-agent-resume`; later writes leave it alone.
+This differs from rebuild, which requires an absent invalid-roster backup path.
+There is no transaction-wide rollback across several membership writes: a late
+refusal may follow an inbox change or a completed write to the first roster.
+The existing lock publication procedure is unchanged.
+
 ### Operation behavior
 
 `DoctorRequest` is frozen. Its fields are `team`, `agent_id`, and `session_uuid`,
@@ -552,7 +737,7 @@ before a write.
 
 `apply_member_migration` is the only caller of
 `revalidate_member_redirect(plan)` and
-`complete_member_migration(plan, applied)`. The
+`complete_member_migration(applied)`. The
 `member-migration-completion-reuses-route-selection` API test verifies that
 completion preserves the explicit `--into-team` provenance selected by
 `member_redirect_plan`, preserves the selected identity, and reuses the selected
@@ -569,7 +754,7 @@ unstamped-lead API check refuses restamping before any mutation.
 and `complete_lead_migration` receive an `Applied` record, which is frozen and
 contains `operation` and `plan`. `run_one` is the only caller of
 `lead_migration_plan(request)`. `lead_rebind` is the only caller of
-`revalidate_lead_migration(plan)` and `complete_lead_migration(plan, applied)`.
+`revalidate_lead_migration(plan)` and `complete_lead_migration(applied)`.
 `_retarget_launch` and generic rebind helpers are private to Resolver plan and
 completion builders, with no module callers. API tests accept lead route selection,
 revalidation, exact caller ownership, the absence of generic or raw module calls,
@@ -632,19 +817,20 @@ behaviors.
 
 ### Generations, revalidation, and conversion
 
-A team-run plan is calculated from one immutable process snapshot and one roster
-census. It chooses the member order, former-member set, and destination from that
-pair and retains the selected roster generation. `revalidate_team_run` compares
-that generation before the run starts. If it changed, execution stops; the later
-roster is not used to choose a replacement member list. Launch observation records
-whether the selected launch appeared, survived, and wrote its transcript.
+A team-run plan retains its member answer's process snapshot, census, durable
+assignments, and selected complete roster. It chooses the member order,
+former-member set, and destination from that evidence. `revalidate_team_run`
+compares the selected roster observation, including permissions, before the run
+starts. A change stops execution rather than choosing another member list.
+Launch observation records whether the selected launch appeared, survived, and
+wrote its transcript.
 
-Every mutation follows the same order: select a plan, print or confirm it, check
-its recorded generations, then act. Roster writes compare the selected roster
-generation; transcript conversion compares the source generation and destination
-collision state; reaping and mailbox archiving compare the bytes at their final
-cut; process actions identify a PID with its kernel start time. A mismatch stops
-the action rather than choosing from later state.
+Mutations select a plan, print or confirm it, compare the recorded evidence,
+then act. Roster writes compare complete file observations; transcript conversion
+compares source generations and destination collision state; reaping and mailbox
+archiving compare the bytes immediately before removal; process actions identify
+a PID with its kernel start time. A mismatch stops the action rather than
+choosing from later state.
 
 AST checks list the permitted production callers of each public Resolver method.
 They reject a module-level call to a private Resolver reader or
@@ -669,9 +855,9 @@ Conversion receipts are versioned, tool-written evidence carried by the
 converted transcript. Resolver reads them to recover team membership, copied
 parent-record ownership, and the intentional identity assigned by promotion.
 The corpus census retains the main transcript paths it examined, so a path with
-no matching receipt is a known absence for that Resolver lifetime. A new path or
-one outside that census still receives direct receipt validation. Ordinary later
-stamps and roster observations do not silently replace the assigned identity. An
+no matching receipt is a known absence until transcript evidence is invalidated.
+A new path or one outside that census still receives direct receipt validation.
+Ordinary later stamps and roster observations do not silently replace the assigned identity. An
 explicit complete identity or an intentional move can replace it.
 
 Resolution produces one immutable target containing the exact session, canonical
@@ -738,7 +924,19 @@ Mutation scripts import `probe` and call `probe.expect(...)`. The function runs
 one clean suite and isolated mutants, then raises `ProbeFailure` if the clean run
 fails, a mutant crashes, no check bites, or the expected check does not bite.
 There is no probe command-line interface whose exit status can be separated from
-its report by redirection or a surrounding shell command.
+its report by redirection or a surrounding shell command. A positive operation
+fixture reports an unexpected refusal or missing result as a failed named check,
+including the exception type and message. It restores patched globals before
+later checks run; the runner still rejects an aborted unit.
+
+Cache dependency checks compare actual readers before and after transcript
+operations, with a cold Resolver as a control. The registry test establishes that
+invalidation follows declarations, not that every required dependency was
+declared. Assignment selection is tested separately with actual old and new
+assignment answers while the selecting Resolver's census, runtime, and enrichment stay
+fixed; this private-reader substitution does not claim that public refresh leaves
+the member cache intact. Dry-run checks retain directory entries as well as file
+bytes, so creating an empty directory counts as a change.
 
 Every remedy named in a refusal needs an implementation and a test because the
 refusal promises that the remedy preserves the user's data.
