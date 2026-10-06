@@ -10,29 +10,36 @@ parentless entry is the boundary.
 
 Where a chain is broken because a recorded parent was never written, the walk rejoins
 the newest eligible entry before the break and reports that inferred join instead of
-stopping without a word. Keeps user/assistant text; `--mode enriched` also keeps
-assistant `tool_use` blocks with clipped inputs. `tool_result` and `thinking` are
-always excluded, and `<system-reminder>...</system-reminder>` blocks are stripped.
+stopping without a word. Keeps user/assistant text, and the messages the harness
+delivers while a turn is running, which it writes as `attachment` records of type
+`queued_command` rather than as user messages; `--mode enriched` also keeps assistant
+`tool_use` blocks with clipped inputs. `tool_result` and `thinking` are always
+excluded, and `<system-reminder>...</system-reminder>` blocks are stripped.
 
 Output is JSONL by default, one record per line, no banners:
     {"i": 12, "r": "user", "t": "..."}
     {"i": 13, "r": "team", "msgs": [{"from": "cli-ux", "idle": "available"}]}
     {"i": 14, "r": "asst", "t": "...", "x": [{"n": "Bash", "in": {...}}]}
-`r` is where the turn came from: user (the operator typed it), team (a teammate
-message), task (a task notification), asst, meta (a harness injection), sys
-(interrupt markers and other harness-inserted text). Teammate and task blocks are
-parsed into fields, and their repeated harness boilerplate is dropped; a teammate
-record keeps any prose that is NOT that boilerplate, so nothing real is lost quietly.
-`--format md` gives banner-delimited prose instead.
+    {"i": 15, "r": "user", "t": "...", "queued": true}
+`r` is where the turn came from: user (the operator typed it), team (a message from
+another agent: a teammate, a peer session or subagent, or a fork's coordinator), task
+(a task notification), asst, meta (a harness injection), sys (interrupt markers and
+other harness-inserted text). `queued: true` marks a message that arrived while a turn
+was running. Agent messages and task blocks are parsed into fields, and their repeated
+harness boilerplate is dropped; a team record keeps any prose that is NOT that
+boilerplate, so nothing real is lost quietly. `--format md` gives banner-delimited
+prose instead.
 
-Harness-injected user nodes (`isMeta: true`), meaning skill content dumps,
-local-command caveats and session-name reminders, are stubbed to one line by default
-(`--meta stub`); they are text blocks, not tool_results, so block-type filtering
-alone would keep them in full (a single skill load can be thousands of lines). The
-stub names the first line, the line count, and the `sourceToolUseID` when the
-injection came from a Skill tool call. `--meta drop` removes them silently, `--meta
-keep` restores emit-in-full. Compact-summary nodes are never stubbed; short one-line
-meta (e.g. `[Image: ...]` placeholders) is kept as-is.
+Harness injections, meaning `isMeta: true` user nodes that no sender's origin claims
+(skill content dumps, local-command caveats and session-name reminders), are stubbed to
+one line by default (`--meta stub`); they are text blocks, not tool_results, so
+block-type filtering alone would keep them in full (a single skill load can be
+thousands of lines). A peer's message is `isMeta: true` too and is rendered in full as
+a team record, so the stub follows the classified source, not the flag. The stub names
+the first line, the line count, and the `sourceToolUseID` when the injection came from
+a Skill tool call. `--meta drop` removes them silently, `--meta keep` emits them in
+full. Compact-summary nodes are never stubbed; short one-line meta (e.g. `[Image: ...]`
+placeholders) is kept as-is.
 
 Usage:
     python3 extract.py <SESSION.jsonl> <OUT> [--scope main|sidechain] [--agent-id ID]
@@ -98,6 +105,30 @@ def edge(rec):
 
 def is_boundary(rec):
     return rec.get("type") == "system" and rec.get("subtype") == "compact_boundary"
+
+
+def is_queued(rec):
+    """A message delivered while a turn was running: the operator's, a peer's, the
+    coordinator's, or a task notification. The harness writes it as an attachment, not a
+    user message, and shows it to the model inside a system-reminder."""
+    att = rec.get("attachment")
+    return (rec.get("type") == "attachment" and isinstance(att, dict)
+            and att.get("type") == "queued_command")
+
+
+def turn_of(rec):
+    """The turn a record carries, as (role, content, origin, isMeta, commandMode), or None.
+    commandMode is None for a message record and the queued command's mode otherwise."""
+    msg = rec.get("message")
+    if isinstance(msg, dict):
+        if msg.get("role") not in ("user", "assistant"):
+            return None
+        return msg["role"], msg.get("content"), rec.get("origin"), bool(rec.get("isMeta")), None
+    if is_queued(rec):
+        att = rec["attachment"]
+        return ("user", att.get("prompt"), att.get("origin"), bool(att.get("isMeta")),
+                att.get("commandMode") or "prompt")
+    return None
 
 
 def content_text(rec):
@@ -237,8 +268,10 @@ def walk_path(objs, belongs):
     """Walk one active chain from its newest conversation entry to its local root.
 
     `belongs` selects every record that may participate in the chain, including tool results
-    and attachments. The leaf and inferred joins use only user/assistant records. At each
-    step `logicalParentUuid` takes precedence over `parentUuid`, so compacted chains remain
+    and attachments. The leaf and inferred joins use only records that carry a turn: user and
+    assistant records, and queued messages, so a message that arrived after the last answer
+    (the operator's last word to a worker that then died) is still the leaf. At each step
+    `logicalParentUuid` takes precedence over `parentUuid`, so compacted chains remain
     walkable.
 
     Before the walk, the preserved-tail compaction cycle is repaired
@@ -254,7 +287,7 @@ def walk_path(objs, belongs):
     for i, o in enumerate(objs):
         if "uuid" in o and belongs(o):
             pos.setdefault(o["uuid"], i)
-            if o.get("type") in ("user", "assistant"):
+            if o.get("type") in ("user", "assistant") or is_queued(o):
                 convo.append((i, o))
     leaf = convo[-1][1] if convo else None
 
@@ -402,31 +435,48 @@ def meta_stub(txt, node):
     return "[[meta injection stripped: %s (%d lines%s)]]" % (first, txt.count("\n") + 1, via)
 
 
-TEAM_RE = re.compile(r"<teammate-message\b([^>]*)>(.*?)</teammate-message>", re.S)
+MSG_RE = re.compile(
+    r"<(teammate-message|agent-message|cross-session-message)\b([^>]*)>(.*?)</\1>", re.S)
 ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
+WRAPPER_RE = re.compile(r"Another Claude session sent a message(?: while you were working)?:")
+CAUTION_RE = re.compile(
+    r"(?:This came from another Claude session|That \"other Claude session\" is an agent)"
+    r".*?permission laundering\.", re.S)
 TASK_RE = re.compile(r"<(task-id|status|summary|result|output-file|tool-use-id)>(.*?)</\1>", re.S)
 USAGE_RE = re.compile(r"<(subagent_tokens|tool_uses|duration_ms)>(.*?)</\1>", re.S)
 
 
-def parse_teammate(text):
-    """Structured records for each <teammate-message> block, or None if there are none.
+def parse_messages(text):
+    """Structured records for each agent message block, or (None, None) if there are none.
 
-    Each block is `<teammate-message teammate_id=... color=... summary=...>BODY</>`, and BODY
-    is either an agent's report or a JSON idle notification. Both get real fields. The prose
-    around the blocks is harness boilerplate ("Another Claude session sent a message:" plus
-    the permission-laundering paragraph), byte-identical on every one, so it is dropped; any
-    residue that is NOT that boilerplate is kept, so nothing real is thrown away silently.
+    Three wrappers carry another agent's words: `<teammate-message teammate_id=... color=...
+    summary=...>` from a team member, `<agent-message from=...>` from a subagent or teammate
+    of this session, and `<cross-session-message from=... from-name=... from-mode=...>` from
+    another session, whose `from` is its address and `from-name` its name. A teammate BODY is
+    either an agent's report or a JSON idle notification; both get real fields. The prose
+    around the blocks is harness boilerplate ("Another Claude session sent a message:" plus a
+    permission-laundering paragraph in one of two wordings), so it is dropped; any residue
+    that is NOT that boilerplate is kept, so nothing real is thrown away silently.
     """
-    blocks = TEAM_RE.findall(text)
+    blocks = MSG_RE.findall(text)
     if not blocks:
         return None, None
     msgs = []
-    for attrs, body in blocks:
+    for tag, attrs, body in blocks:
         at = dict(ATTR_RE.findall(attrs))
         body = body.strip()
-        m = {"from": at.get("teammate_id", "?")}
-        if at.get("summary"):
-            m["summary"] = at["summary"]
+        if tag == "teammate-message":
+            m = {"from": at.get("teammate_id", "?")}
+            if at.get("summary"):
+                m["summary"] = at["summary"]
+        elif at.get("from-name"):
+            m = {"from": at["from-name"]}
+            if at.get("from"):
+                m["addr"] = at["from"]
+        else:
+            m = {"from": at.get("from", "?")}
+        if at.get("from-mode"):
+            m["mode"] = at["from-mode"]
         try:
             payload = json.loads(body)
         except Exception:
@@ -440,9 +490,9 @@ def parse_teammate(text):
         elif body:
             m["t"] = body
         msgs.append(m)
-    residue = TEAM_RE.sub("", text)
-    residue = residue.replace("Another Claude session sent a message:", "")
-    residue = re.sub(r"This came from another Claude session.*?permission laundering\.", "", residue, flags=re.S)
+    residue = MSG_RE.sub("", text)
+    residue = WRAPPER_RE.sub("", residue)
+    residue = CAUTION_RE.sub("", residue)
     residue = residue.strip()
     return msgs, (residue or None)
 
@@ -461,28 +511,44 @@ def parse_task(text):
     return rec
 
 
-def source_of(node, text, team_msgs):
-    """Who a user-role node actually came from.
+def source_of(node, text, origin, is_meta, command_mode):
+    """Who a user-role turn came from: (source, msgs, residue).
 
-    The harness annotates task notifications (`origin.kind`) and prose the operator typed
-    (`origin.kind == "human"`, plus `promptSource`). It does NOT annotate teammate messages:
-    those carry `type: user`, `userType: external`, no `isMeta`, no `origin`, and a plain
-    string content, byte-identical in its marker fields to typed prose. So a teammate message
-    is identified by successfully parsing its blocks, not by matching a substring. Everything
-    left over (interrupt markers, harness-inserted text) is reported as `sys` rather than
-    being passed off as the operator talking.
+    `origin` is the record's `origin`, or `attachment.origin` for a queued message. Prose the
+    operator typed carries `origin.kind == "human"`, and stays theirs when it quotes an agent's
+    message block. A task notification carries `origin.kind == "task-notification"`; an older
+    queued one carries only `commandMode: "task-notification"`. A peer's message carries
+    `origin.kind == "peer"` and `isMeta: true` (so a stub keyed on isMeta alone would hide it),
+    with its words in an `<agent-message>` or `<cross-session-message>` block. A fork's
+    coordinator carries `origin.kind == "coordinator"` and no block. A teammate message carries
+    no `origin` and no `isMeta`, byte-identical in its marker fields to typed prose, so only
+    its parsed `<teammate-message>` blocks identify it. Blocks are never parsed in a
+    compaction summary or in a harness injection with no sender (a skill dump), since those
+    quote them. Everything left over (interrupt markers, harness-inserted text) is reported as
+    `sys`, and harness injections as `meta`, rather than being passed off as the operator.
     """
-    if team_msgs:
-        return "team"
-    origin = node.get("origin")
     kind = origin.get("kind") if isinstance(origin, dict) else None
-    if kind == "task-notification":
-        return "task"
     if kind == "human":
-        return "user"
-    if node.get("isMeta"):
-        return "meta"
-    return "sys"
+        return "user", None, None
+    if kind == "task-notification" or command_mode == "task-notification":
+        return "task", None, None
+    if kind in ("peer", "coordinator") or not (kind or is_meta or node.get("isCompactSummary")):
+        msgs, residue = parse_messages(text)
+        if msgs:
+            sender_task = origin.get("senderTaskId") if kind == "peer" else None
+            if sender_task and len(msgs) == 1 and msgs[0]["from"] != sender_task:
+                msgs[0]["agent"] = sender_task
+            return "team", msgs, residue
+        if kind in ("peer", "coordinator"):
+            sender = ("coordinator" if kind == "coordinator"
+                      else origin.get("name") or origin.get("from") or "?")
+            m = {"from": sender}
+            if text:
+                m["t"] = text
+            return "team", [m], None
+    if is_meta:
+        return "meta", None, None
+    return "sys", None, None
 
 
 def main():
@@ -562,15 +628,13 @@ def main():
         by_uuid = {o["uuid"]: o for o in objs if "uuid" in o}
 
         def render(o):
-            """Emit one node of the chain, if it carries a user or assistant message."""
+            """Emit one node of the chain, if it carries a user or assistant message or a
+            queued one."""
             nonlocal turns
-            msg = o.get("message")
-            if not isinstance(msg, dict):
-                return  # ai-title / file-history-snapshot / mode / etc.
-            role = msg.get("role")
-            if role not in ("user", "assistant"):
-                return
-            content = msg.get("content")
+            carried = turn_of(o)
+            if carried is None:
+                return  # ai-title / file-history-snapshot / mode / other attachments / etc.
+            role, content, origin, is_meta, command_mode = carried
             items = []
             if isinstance(content, str):
                 t = SR.sub("", content).strip()
@@ -588,28 +652,34 @@ def main():
                     elif bt == "tool_use" and role == "assistant" and a.mode == "enriched":
                         items.append(("tool", b))
                         tools[b.get("name", "?")] += 1
-            # Harness-injected meta (isMeta) rides ordinary text blocks; stub or drop it
-            # at the emission step only, so the walk and the compaction-boundary report
-            # below still see every node. Compact summaries are exempt (they anchor the
+            texts = [p for k, p in items if k == "text"]
+            body = "\n".join(texts)
+            if role == "assistant":
+                src, team, residue = "asst", None, None
+            else:
+                src, team, residue = source_of(o, body, origin, is_meta, command_mode)
+            # A harness injection (isMeta with no sender) rides ordinary text blocks; stub
+            # or drop it at the emission step only, so the walk and the compaction-boundary
+            # report below still see every node. The source decides, not isMeta alone: a
+            # peer's message is isMeta too. Compact summaries are exempt (they anchor the
             # read-back intervals), as are short one-liners like [Image: ...] placeholders,
             # which a stub would lengthen, not shorten.
-            if o.get("isMeta") and a.meta != "keep" and not o.get("isCompactSummary"):
-                meta_text = "\n".join(p for k, p in items if k == "text")
-                if meta_text and not ("\n" not in meta_text and len(meta_text) <= 120):
+            if src == "meta" and a.meta != "keep" and not o.get("isCompactSummary"):
+                if body and not ("\n" not in body and len(body) <= 120):
                     non_text = [it for it in items if it[0] != "text"]
                     if a.meta == "drop":
                         items = non_text
                     else:
-                        items = [("text", meta_stub(meta_text, o))] + non_text
+                        items = [("text", meta_stub(body, o))] + non_text
+                    texts = [p for k, p in items if k == "text"]
+                    body = "\n".join(texts)
             if not items:
                 return
             turns += 1
             start, start_byte = line, nbytes
-            texts = [p for k, p in items if k == "text"]
-            body = "\n".join(texts)
-            team, residue = (None, None) if role == "assistant" else parse_teammate(body)
-            src = "asst" if role == "assistant" else source_of(o, body, team)
             rec = {"i": turns, "r": src}
+            if command_mode is not None:
+                rec["queued"] = True
             lines = []
             if src == "team":
                 rec["msgs"] = team
@@ -637,8 +707,9 @@ def main():
                 lines += [render_tool(p, a.cap) for k, p in items if k == "tool"]
             if a.mode == "enriched":
                 rec["u"] = o.get("uuid")
-            emit(rec, "--- [%03d] %-4s uuid=%s\n%s\n\n"
-                 % (turns, src, o.get("uuid"), "\n".join(lines)))
+            emit(rec, "--- [%03d] %-4s%s uuid=%s\n%s\n\n"
+                 % (turns, src, " queued" if command_mode is not None else "", o.get("uuid"),
+                    "\n".join(lines)))
             if o.get("isCompactSummary"):
                 boundaries.append((start, o.get("timestamp") or "", start_byte))
             blob = "\n".join(texts).lower()
