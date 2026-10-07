@@ -1,13 +1,12 @@
 """Mutation probes for task 15 Resolver ownership and generation checks.
 
 Run this file as Python after the task-15 clean selftest passes. ``probe.expect``
-runs a clean suite and one isolated mutant for each tuple, and ``run`` below
-refuses two outcomes it would otherwise accept. This module has no probe
-command-line interface.
+runs a clean suite and one isolated mutant for each case, reads every report in
+full, and refuses a mutant whose failure set is not exactly the set its case
+names: the named check, plus any co-failure the case justifies with a reason.
+It also refuses a run during which the tool, its companion, the verifier or the
+test tree changed. This module has no probe command-line interface.
 """
-
-import hashlib
-from pathlib import Path
 
 import probe
 
@@ -60,112 +59,6 @@ PENDING_TEAM_MEMBERSHIP_ATTACH_CASES = ()
 # not yet registered fixtures for these planned verdicts. Each tuple is
 # (planned verdict, phase, old text, mutant text, status), never a probe case.
 PENDING_MEMBER_ROUTING_CASES = ()
-
-
-def watched_files():
-    """Every file whose contents decide what a run proved.
-
-    probe.py is watched with the rest: it chooses what each mutant runs against
-    and how a verdict is read, so a change to it during a run changes the proof
-    as surely as a change to the tool.
-    """
-    corpus = probe.TOOL.parent / "test"
-    return (probe.TOOL, probe.COMP, Path(probe.__file__).resolve(),
-            Path(__file__).resolve(),
-            *(item for item in corpus.rglob("*") if item.is_file()))
-
-
-def fingerprint(paths):
-    """Content hashes for files a run must not change underneath itself."""
-    prints = {}
-    for path in sorted(paths):
-        try:
-            prints[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError as exc:
-            prints[str(path)] = f"unreadable ({exc})"
-    return prints
-
-
-def declared_bites(cases):
-    """Split each case into a probe triple and the exact set it must fail.
-
-    A case is ``(check, old, new)``, or ``(check, old, new, co_failures)`` when
-    the mutation breaks a second rule by construction. Injecting a dead
-    ``RESOLVER`` call to defeat an ownership rule is the common one: the call
-    is also a caller edge the exact-caller map has not approved, so two checks
-    fail for one edit. Writing that second check down is what makes the overlap
-    reviewable. Anything undeclared is still a refusal.
-    """
-    triples, wanted, faults = [], [], []
-    for at, case in enumerate(cases, 1):
-        if not isinstance(case, (tuple, list)) or len(case) not in (3, 4):
-            faults.append(
-                f"case {at} is not (check, old, new) with optional co-failures")
-            continue
-        check, old, new = case[0], case[1], case[2]
-        declared = tuple(case[3]) if len(case) == 4 else ()
-        if len(set(declared)) != len(declared):
-            faults.append(f"case {at}: {check!r} names a co-failure twice")
-        if check in declared:
-            faults.append(
-                f"case {at}: {check!r} is the named check, not one of its "
-                "co-failures")
-        triples.append((check, old, new))
-        wanted.append(frozenset({check, *declared}))
-    return tuple(triples), tuple(wanted), faults
-
-
-def run(cases):
-    """Prove every case, and refuse three runs ``probe.expect`` would accept.
-
-    ``probe.expect`` already rejects a failing or incomplete clean suite, a
-    mutant that crashes or ends before every unit reports, and a mutation whose
-    named check does not newly fail. It accepts a mutant that fails its own
-    check alongside checks nobody predicted, it has no way to require a
-    structurally coupled second failure, and it never looks at the tool or
-    corpus again once the suites are running. All three are refused here. A
-    mutant must fail exactly the set its case names, so an unpredicted failure
-    means the edit broke something wider than the boundary under test and a
-    missing declared one means the coupling that justified the declaration is
-    gone; a changed input means the verdicts describe source that is no longer
-    on disk.
-    """
-    triples, wanted, faults = declared_bites(cases)
-    known = probe.known_checks(probe.TOOL, False)
-    for at, want in enumerate(wanted, 1):
-        unknown = sorted(item for item in want if item not in known)
-        if unknown:
-            faults.append(f"case {at}: names no check: {', '.join(unknown)}")
-    if faults:
-        raise probe.ProbeFailure(faults)
-
-    before = fingerprint(watched_files())
-    report, results = "", ()
-    try:
-        results = probe.expect(triples)
-    except probe.ProbeFailure as refusal:
-        faults, report = list(refusal.failures), refusal.report
-    for at, (result, want) in enumerate(zip(results, wanted), 1):
-        bit = set(result["bit"])
-        if bit != want:
-            said = []
-            if want - bit:
-                said.append("did not fail " + ", ".join(sorted(want - bit)))
-            if bit - want:
-                said.append("also failed " + ", ".join(sorted(bit - want)))
-            faults.append(
-                f"case {at}: {result['check']!r} " + "; ".join(said)
-                + "; a case fails exactly the checks it names")
-    changed = sorted(name for name, digest in fingerprint(watched_files()).items()
-                     if before.get(name) != digest)
-    if changed:
-        faults.append(
-            "the tool or its corpus changed while the suites ran ("
-            + ", ".join(changed) + "), so no verdict here describes what is "
-            "on disk now")
-    if faults:
-        raise probe.ProbeFailure(faults, report=report)
-    return results
 
 
 CASES = [
@@ -642,4 +535,4 @@ CASES = [
 ]
 
 
-run(CASES)
+probe.expect(CASES)
