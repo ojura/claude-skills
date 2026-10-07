@@ -6,10 +6,12 @@ mutants run with at most four suites active at once.
 
     import probe
 
+    retained = probe.retained_expectation(mapping_path, live=True, jobs=2,
+                                          adjudications=approved_path)
     probe.expect([
         ("check-id", "old text", "new text"),
         ("other-id", "old text", "new text", {"second-id": "why it fails too"}),
-    ], live=True, jobs=2, expected=retained_mapping)
+    ], live=True, jobs=2, expected=retained, certify=True)
 
 A case succeeds only when its mutant fails exactly the checks it names: the
 named check and each co-failure, with the reason the caller wrote down for it.
@@ -25,14 +27,18 @@ stdout and stderr of every refused run. Success is an ordinary return, so
 redirected output cannot be mistaken for it.
 
 ``retained_expectation`` reads that mapping for one selection from the frozen
-expected-mapping-v1 file the reviewer keeps, with the file's hash and the
-source it was frozen for, and ``expect`` writes both into its report so a
-verification record says which expectation judged it.
+expected-mapping-v1 file the reviewer keeps, with the file's hash, the source
+it was frozen for and the approved adjudications it rests on, and ``expect``
+writes all of them into its report so a verification record says which
+expectation judged it.
 
-Without ``expected`` the verifier has no independent population. The clean
-listing stands in for it, which checks that the listing, the clean run and the
-mutants agree with each other and nothing more. That mode does not certify a
-change; the unit's retained expectation does.
+Certification is asked for, not inferred: ``expect(..., certify=True)`` runs
+only with such a retained expectation, adjudications included, and its result
+says it certified. Every other call is a development run. Without ``expected``
+the clean listing stands in for the population, which checks that the listing,
+the clean run and the mutants agree with each other and nothing more; a bare
+mapping has no recorded origin. Both still judge every run strictly, and both
+return a result that says it certifies nothing.
 """
 
 import collections
@@ -128,7 +134,9 @@ class Expectation:
     selection is read-only or live-jobs-N. mapping is {id: description}. path
     and sha256 identify the file it was read from, and source is what that
     file says it was frozen for, so a report can say whether the tested tool
-    is that source or a candidate that differs from it.
+    is that source or a candidate that differs from it. adjudications and
+    adjudications_sha256 identify the approved record of the decisions the
+    frozen rows carry, when one was named.
     """
 
     selection: str
@@ -136,6 +144,23 @@ class Expectation:
     path: object = None
     sha256: str = ""
     source: dict = dataclasses.field(default_factory=dict)
+    adjudications: object = None
+    adjudications_sha256: str = ""
+
+
+class Results(tuple):
+    """What expect returns: one result dictionary per case, in case order.
+
+    certified says whether the call asked for certification and had what it
+    needs, and report is the record expect printed, so a caller that keeps
+    the result keeps the provenance with it.
+    """
+
+    def __new__(cls, results, certified, report):
+        made = super().__new__(cls, results)
+        made.certified = certified
+        made.report = report
+        return made
 
 
 ReportText = collections.namedtuple("ReportText", "rows summary problems complete stray")
@@ -505,6 +530,20 @@ def fingerprints(paths):
     return prints
 
 
+def tree_digest(prints, root):
+    """(file count, sha256) for the fingerprinted files under root.
+
+    Each file adds its path relative to root and its own sha256, in path
+    order, so editing, adding, removing or renaming a file changes the digest.
+    """
+    entries = sorted((str(item.relative_to(root)), digest)
+                     for item, digest in prints.items() if root in item.parents)
+    hasher = hashlib.sha256()
+    for name, digest in entries:
+        hasher.update(f"{name}\0{digest}\n".encode())
+    return len(entries), hasher.hexdigest()
+
+
 def raw_output(outcome):
     """The refused run as the reader needs it: command, status, both streams."""
     run = outcome.run
@@ -551,45 +590,83 @@ def mutation_target(old, paths=None):
     return next(path for path, count in counts.items() if count == 1), None
 
 
-def retained_expectation(path, *, live=False, jobs=1):
+def _json_record(path, what):
+    """(bytes, parsed object) of a JSON file, or a refusal naming it as what."""
+    path = Path(path)
+    data = path.read_bytes()
+    try:
+        return data, json.loads(data)
+    except ValueError as exc:
+        raise ProbeFailure([f"{what} {path} is not JSON: {exc}"])
+
+
+def retained_expectation(path, *, live=False, jobs=1, adjudications=None):
     """Read the expected mapping for one selection from a frozen expected-mapping-v1 file.
 
     The file is the reviewer's record: a schema name, the modes it covers, the
     source it was frozen for, and rows that each carry an id, a description,
     emitted_in with the selections a clean run reports the row in and
     not_emitted_in with the ones that withhold it. The mapping for a selection
-    is every row emitted in it. A selection the file does not cover, a row
-    that is both emitted and withheld, or an id named twice is refused, since
-    an expectation that is unsure of its own rows decides nothing. Nothing
-    here reads the tested tool.
+    is every row emitted in it. A file that does not name the source it was
+    frozen for by sha256, a selection it does not cover, a row that is not an
+    object or is both emitted and withheld, and an id named twice are all
+    refused, since an expectation that is unsure of its own rows or origin
+    decides nothing.
+
+    adjudications names the approved record of the decisions the rows carry.
+    It must name this mapping by sha256 under frozen_mapping, so a record
+    about another mapping cannot stand behind this one. Nothing here reads the
+    tested tool.
     """
     path = Path(path)
-    data = path.read_bytes()
-    try:
-        record = json.loads(data)
-    except ValueError as exc:
-        raise ProbeFailure([f"{path} is not JSON: {exc}"])
+    data, record = _json_record(path, "expected mapping")
     if not isinstance(record, dict) or record.get("schema") != "expected-mapping-v1":
         raise ProbeFailure([f"{path} does not carry schema expected-mapping-v1"])
+    digest = hashlib.sha256(data).hexdigest()
+    source = record.get("frozen_for_source")
+    if not (isinstance(source, dict) and isinstance(source.get("sha256"), str)
+            and source["sha256"]):
+        raise ProbeFailure([f"{path} does not name the source it was frozen for "
+                            "(frozen_for_source with its sha256)"])
     selection = selection_name(live, jobs)
-    modes = record.get("modes") or {}
-    if selection not in modes:
+    modes = record.get("modes")
+    if not isinstance(modes, dict) or selection not in modes:
         raise ProbeFailure([f"{path} has no selection {selection}; it has: "
-                            + ", ".join(sorted(modes))])
+                            + ", ".join(sorted(modes if isinstance(modes, dict) else ()))])
+    rows = record.get("rows")
+    if not isinstance(rows, list):
+        raise ProbeFailure([f"{path}: rows is not a list"])
     pairs, failures = [], []
-    for at, row in enumerate(record.get("rows") or (), 1):
-        emitted = selection in (row.get("emitted_in") or {})
-        withheld = selection in (row.get("not_emitted_in") or {})
-        if emitted and withheld:
+    for at, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            failures.append(f"row {at} is not an object")
+            continue
+        placed = {}
+        for key in ("emitted_in", "not_emitted_in"):
+            where = row.get(key, {})
+            if not isinstance(where, (dict, list)):
+                failures.append(f"row {at} ({row.get('id')!r}): {key} is neither an "
+                                "object nor a list")
+            placed[key] = selection in where if isinstance(where, (dict, list)) else False
+        if placed["emitted_in"] and placed["not_emitted_in"]:
             failures.append(f"row {at} ({row.get('id')!r}) is both emitted and "
                             f"withheld in {selection}")
-        elif emitted:
+        elif placed["emitted_in"]:
             pairs.append((row.get("id"), row.get("description")))
     if failures:
         raise ProbeFailure(failures)
-    return Expectation(selection, _normalize_expected(pairs), path,
-                       hashlib.sha256(data).hexdigest(),
-                       dict(record.get("frozen_for_source") or {}))
+    mapping = _normalize_expected(pairs)
+    adjudications_digest = ""
+    if adjudications is not None:
+        adjudications = Path(adjudications)
+        adjudicated, decided = _json_record(adjudications, "adjudications")
+        named = (decided.get("frozen_mapping") or {}) if isinstance(decided, dict) else {}
+        if not isinstance(named, dict) or named.get("sha256") != digest:
+            raise ProbeFailure([f"adjudications {adjudications} do not name this mapping "
+                                f"by its sha256 {digest} under frozen_mapping"])
+        adjudications_digest = hashlib.sha256(adjudicated).hexdigest()
+    return Expectation(selection, mapping, path, digest, dict(source),
+                       adjudications, adjudications_digest)
 
 
 def _normalize_expected(expected):
@@ -670,8 +747,33 @@ def _refusal(outcomes, lines, stream):
                          for reason in outcome.reasons], report=report, outcomes=refused)
 
 
+def certification_gaps(expected):
+    """Why expected cannot back a certifying run; empty when it can.
+
+    A certifying run rests on a retained expectation read from its frozen
+    file, with the file's hash, the source it names and the approved
+    adjudications behind it, because those are what a later reader checks the
+    record against.
+    """
+    if expected is None:
+        return ["no expectation was supplied, so the listing would stand in for "
+                "the population"]
+    if not isinstance(expected, Expectation):
+        return ["the expectation is a bare mapping with no recorded origin; read it "
+                "with retained_expectation"]
+    gaps = []
+    if not (expected.path and expected.sha256):
+        gaps.append("the expectation names no file and hash it was read from")
+    if not expected.source.get("sha256"):
+        gaps.append("the expectation names no source it was frozen for")
+    if not (expected.adjudications and expected.adjudications_sha256):
+        gaps.append("the expectation names no approved adjudications; pass them to "
+                    "retained_expectation")
+    return gaps
+
+
 def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
-           filtering=False, stream=None):
+           filtering=False, certify=False, stream=None):
     """Run expected mutations and raise unless every case is proved.
 
     ``cases`` holds ``(check_id, old_text, new_text)`` triples, each with an
@@ -685,19 +787,34 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
     ``filtering`` every run also happens with --failed, and that report must
     be the failures of the unfiltered one and nothing else.
 
-    The successful return is a tuple with one result dictionary per case:
-    the check, the mutated file, the ids that failed and the co-failures, with
-    the judged outcome. ``ProbeFailure`` carries ``failures``, the printed
-    ``report`` and the refused ``outcomes`` with their raw output.
+    ``certify`` asks for a certifying run. It is refused before anything runs
+    unless ``expected`` came from ``retained_expectation`` with its source and
+    approved adjudications, and its record names all of them. Without it the
+    run judges just as strictly and its result says it certified nothing.
+
+    The successful return is a Results tuple with one result dictionary per
+    case: the check, the mutated file, the ids that failed and the
+    co-failures, with the judged outcome; its ``certified`` and ``report``
+    say whether the run certified and what it recorded. ``ProbeFailure``
+    carries ``failures``, the printed ``report`` and the refused ``outcomes``
+    with their raw output.
     """
     cases = _normalize_cases(cases)
+    if certify:
+        gaps = certification_gaps(expected)
+        if gaps:
+            raise ProbeFailure([f"a certifying run needs a retained expectation: {gap}"
+                                for gap in gaps])
     tool = Path(TOOL if tool is None else tool)
     comp = tool.parent / f"_{tool.name}"
     stream = sys.stdout if stream is None else stream
     selection = selection_name(live, jobs)
     watched = fingerprints(watched_files(tool, comp))
     tool_digest = watched[tool]
+    count, digest = tree_digest(watched, tool.parent / "test")
     lines = [f"tool: {tool} sha256 {tool_digest}",
+             f"companion: {comp} sha256 {watched[comp]}",
+             f"test tree: {tool.parent / 'test'} {count} file(s), digest {digest}",
              f"verifier: {VERIFIER} sha256 {watched[VERIFIER]}",
              f"selection: {selection}"]
     if isinstance(expected, Expectation):
@@ -707,16 +824,24 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
         lines.append(f"expectation: {expected.path} sha256 {expected.sha256}")
         frozen_for = expected.source.get("sha256")
         if frozen_for:
-            lines.append(f"expectation frozen for source sha256 {frozen_for}: the tool "
+            named = ", ".join(f"{key} {expected.source[key]}"
+                              for key in ("commit", "path_in_repo") if expected.source.get(key))
+            lines.append(f"expectation frozen for source sha256 {frozen_for}"
+                         + (f" ({named})" if named else "") + ": the tool "
                          + ("is that source" if frozen_for == tool_digest
                             else "differs from it"))
+        if expected.adjudications:
+            lines.append(f"adjudications: {expected.adjudications} sha256 "
+                         f"{expected.adjudications_sha256}")
         expected = expected.mapping
     elif expected is not None:
         expected = _normalize_expected(expected)
-        lines.append(f"expectation: a supplied mapping of {len(expected)} check(s)")
+        lines.append(f"expectation: a supplied mapping of {len(expected)} check(s), "
+                     "with no recorded origin")
     else:
-        lines.append("expectation: none supplied, so the listing is the population "
-                     "and nothing here certifies the tool")
+        lines.append("expectation: none supplied, so the listing is the population")
+    lines.insert(0, "certifying: yes" if certify else
+                 "certifying: no; this run certifies nothing about the tool")
 
     listed = judge_listing(
         run_suite(suite_argv(tool, live=live, jobs=jobs, listing=True), timeout), expected)
@@ -765,17 +890,28 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
 
     # The report names the bytes it judged. A file that changed while the
     # suites ran, the tool itself or a corpus file a unit wrote into, makes
-    # every verdict above describe something no longer on disk.
+    # every verdict above describe something no longer on disk. The runs are
+    # discarded unjudged, and their raw output is kept for whoever has to find
+    # out which of them wrote.
     after = fingerprints(watched_files(tool, comp))
     changed = sorted(str(item) for item in set(watched) | set(after)
                      if watched.get(item) != after.get(item))
     if changed:
         lines.append("changed while the suites ran: " + ", ".join(changed))
-        report = "\n".join(lines)
+        discarded = []
+        for label, (full, filtered) in zip(
+                ["clean", *(f"case {at}" for at in range(1, len(prepared) + 1))], runs):
+            for name, run in ((label, full), (f"{label} --failed", filtered)):
+                if run is not None:
+                    discarded.append(Outcome(name, run, (), frozenset(),
+                                             ("discarded: the inputs changed while it ran",)))
+        report = "\n".join([*lines, "", *(line for outcome in discarded
+                                          for line in raw_output(outcome))])
         print(report, file=stream)
         raise ProbeFailure(["the tool, its companion, the verifier or the test tree "
                             f"changed while the suites ran ({', '.join(changed)}); no "
-                            "verdict here describes what is on disk now"], report=report)
+                            "verdict here describes what is on disk now"],
+                           report=report, outcomes=discarded)
 
     clean = judge_report(runs[0][0], population, "clean")
     outcomes = [listed, clean]
@@ -812,12 +948,14 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
             "bit": tuple(sorted(outcome.failed)),
             "co_failures": dict(co_failures),
             "outcome": outcome,
+            "certified": certify,
         })
 
     if any(outcome.reasons for outcome in outcomes):
         raise _refusal(outcomes, lines, stream)
-    print("\n".join(lines), file=stream)
-    return tuple(results)
+    report = "\n".join(lines)
+    print(report, file=stream)
+    return Results(results, certify, report)
 
 
 # What probe's own tests say about the stand-in runner. KNOBS is the block of
@@ -1102,12 +1240,32 @@ def selftest():
           only(outcome.reasons, "omits beta, which the full report failed",
                "summary says 1 failed but 0 known row(s) were readable"),
           repr(outcome.reasons))
-    outcome = judge_filtering(full, record(filtered, returncode=1), expected)
     outcome = judge_filtering(
         full, record("beta  the second check  (scripted)\nchecks: 2 ok,\n", returncode=1),
         expected)
     check("failed-only-malformed-summary",
           only(outcome.reasons, "malformed summary: 'checks: 2 ok,'"), repr(outcome.reasons))
+    outcome = judge_filtering(
+        full, record("beta  the second check  (scripted)\n" * 2 + "checks: 2 ok, 1 failed\n",
+                     returncode=1), expected)
+    check("failed-only-repeated-row",
+          only(outcome.reasons, "lists beta 2 times",
+               "summary says 1 failed but 2 known row(s) were readable"),
+          repr(outcome.reasons))
+    outcome = judge_filtering(
+        full, record("beta  the second check  (scripted)\n", returncode=1), expected)
+    check("failed-only-missing-summary",
+          only(outcome.reasons, "no summary line; the run is incomplete"),
+          repr(outcome.reasons))
+    stopped = Run(("python3", "agent-resume", "--selftest", "--failed"), None,
+                  "beta  the second check  (scripted)\n", "", 1.0)
+    outcome = judge_filtering(full, stopped, expected)
+    check("failed-only-timeout-judged-alone",
+          only(outcome.reasons, "did not finish within 1s; its process group was stopped"),
+          repr(outcome.reasons))
+    outcome = judge_filtering(full, record(filtered, returncode=-9), expected)
+    check("failed-only-signal-judged-alone",
+          only(outcome.reasons, "was ended by SIGKILL (returncode -9)"), repr(outcome.reasons))
 
     # Cases and expectations that cannot be judged.
     try:
@@ -1123,6 +1281,10 @@ def selftest():
         ("co-failure-naming-the-check-refused", ("a", "old", "new", {"a": "why"}),
          "'a' is the named check, not one of its co-failures"),
         ("case-of-wrong-length-refused", ("a", "old"), "is not a (check, old, new) triple"),
+        ("case-with-empty-value-refused", ("a", "", "new"),
+         "case 1 contains an empty or non-string value"),
+        ("case-replacing-text-with-itself-refused", ("a", "same", "same"),
+         "case 1 replaces text with itself"),
     ):
         try:
             _normalize_cases([case])
@@ -1138,6 +1300,8 @@ def selftest():
         ("expectation-repeating-an-id-refused", [("a", "x"), ("a", "y")], "names 'a' twice"),
         ("expectation-with-empty-value-refused", {"a": ""}, "empty or non-string value"),
         ("empty-expectation-refused", {}, "names no check"),
+        ("expectation-entry-not-a-pair-refused", [("a", "x", "y")],
+         "expected entry 1 is not an (id, description) pair"),
     ):
         try:
             _normalize_expected(given)
@@ -1149,16 +1313,28 @@ def selftest():
           == {"a": "x", "b": "y"})
 
     # The frozen expected-mapping-v1 file, read per selection.
-    def frozen(rows, modes=("read-only", "live-jobs-1"), schema="expected-mapping-v1"):
-        return json.dumps({
+    def frozen(entries, modes=("read-only", "live-jobs-1"), schema="expected-mapping-v1",
+               source=None, **replaced):
+        """A mapping file's bytes; a replaced key takes the given value, ... drops it."""
+        record = {
             "schema": schema,
-            "frozen_for_source": {"sha256": "f" * 64},
+            "frozen_for_source": {"sha256": "f" * 64} if source is None else source,
             "modes": {mode: {} for mode in modes},
             "rows": [{"id": cid, "description": description,
                       "emitted_in": {mode: "MECHANISM" for mode in emitted},
                       "not_emitted_in": {mode: "WITHHELD" for mode in withheld}}
-                     for cid, description, emitted, withheld in rows],
-        }).encode()
+                     for cid, description, emitted, withheld in entries],
+        }
+        record.update(replaced)
+        return json.dumps({key: value for key, value in record.items()
+                           if value is not ...}).encode()
+
+    def adjudicating(mapping_path, digest=None):
+        """An approved-adjudications record naming the mapping at mapping_path."""
+        digest = digest or hashlib.sha256(mapping_path.read_bytes()).hexdigest()
+        where = mapping_path.with_name("adjudications-approved.json")
+        where.write_text(json.dumps({"frozen_mapping": {"sha256": digest}, "entries": []}))
+        return where
 
     with tempfile.TemporaryDirectory() as td:
         record_path = Path(td) / "expected-mapping-v1.json"
@@ -1173,8 +1349,26 @@ def selftest():
               and live_one.mapping == {**read_only.mapping, "live-only": "a live check"}
               and (read_only.selection, live_one.selection) == ("read-only", "live-jobs-1")
               and read_only.sha256 == hashlib.sha256(record_path.read_bytes()).hexdigest()
-              and read_only.path == record_path and read_only.source == {"sha256": "f" * 64},
+              and read_only.path == record_path and read_only.source == {"sha256": "f" * 64}
+              and read_only.adjudications is None,
               repr((read_only, live_one)))
+        approved = adjudicating(record_path)
+        backed = retained_expectation(record_path, adjudications=approved)
+        check("retained-expectation-records-adjudications",
+              backed.adjudications == approved
+              and backed.adjudications_sha256 == hashlib.sha256(approved.read_bytes()).hexdigest()
+              and backed.mapping == read_only.mapping, repr(backed))
+        adjudicating(record_path, digest="0" * 64)
+        try:
+            retained_expectation(record_path, adjudications=approved)
+        except ProbeFailure as exc:
+            check("retained-expectation-adjudications-for-another-mapping-refused",
+                  "do not name this mapping by its sha256" in str(exc), str(exc))
+        else:
+            check("retained-expectation-adjudications-for-another-mapping-refused", False,
+                  "did not raise")
+        no_description = {"id": "delta", "emitted_in": {"read-only": "MECHANISM"},
+                          "not_emitted_in": {}}
         for name, text, options, phrase in (
             ("retained-expectation-unknown-selection-refused", frozen(rows),
              {"live": True, "jobs": 3}, "has no selection live-jobs-3; it has: live-jobs-1, "
@@ -1188,6 +1382,22 @@ def selftest():
              frozen((*rows, ("alpha", "again", ("read-only",), ()))), {},
              "names 'alpha' twice"),
             ("retained-expectation-not-json-refused", b"{", {}, "is not JSON"),
+            ("retained-expectation-without-source-refused", frozen(rows, source=...), {},
+             "does not name the source it was frozen for"),
+            ("retained-expectation-source-without-sha256-refused",
+             frozen(rows, source={"commit": "abc"}), {},
+             "does not name the source it was frozen for"),
+            ("retained-expectation-rows-not-a-list-refused", frozen(rows, rows={}), {},
+             "rows is not a list"),
+            ("retained-expectation-row-not-an-object-refused", frozen(rows, rows=["alpha"]), {},
+             "row 1 is not an object"),
+            ("retained-expectation-placement-not-a-collection-refused",
+             frozen(rows, rows=[{"id": "alpha", "description": "the first check",
+                                 "emitted_in": "read-only"}]), {},
+             "row 1 ('alpha'): emitted_in is neither an object nor a list"),
+            ("retained-expectation-row-without-description-refused",
+             frozen(rows, rows=[no_description]), {},
+             "expected entry 1 has an empty or non-string value"),
         ):
             record_path.write_bytes(text)
             try:
@@ -1372,24 +1582,84 @@ def selftest():
                                        "(agent-resume: 0, _agent-resume: 0)",),
                   repr(exc and exc.failures))
 
+            synthetic_rows = [(cid, description, ("live-jobs-3",), ())
+                              for cid, description in SYNTHETIC_EXPECTED.items()]
             record_path = room / "expected-mapping-v1.json"
-            record_path.write_bytes(frozen(
-                [(cid, description, ("live-jobs-3",), ())
-                 for cid, description in SYNTHETIC_EXPECTED.items()],
-                modes=("live-jobs-3",)))
+            record_path.write_bytes(frozen(synthetic_rows, modes=("live-jobs-3",)))
             retained = retained_expectation(record_path, live=True, jobs=3)
             stream = io.StringIO()
             results = expect([("target-check", knobs(), bite)], live=True, jobs=3, tool=tool,
                              expected=retained, timeout=20.0, stream=stream)
             tool_digest = hashlib.sha256(tool.read_bytes()).hexdigest()
+            printed = stream.getvalue()
             check("expect-records-the-expectation-and-tool-identity",
                   results[0]["bit"] == ("target-check",)
-                  and f"expectation: {record_path} sha256 {retained.sha256}" in stream.getvalue()
-                  and f"tool: {tool} sha256 {tool_digest}" in stream.getvalue()
-                  and "selection: live-jobs-3" in stream.getvalue()
-                  and f"frozen for source sha256 {'f' * 64}: the tool differs from it"
-                  in stream.getvalue(),
-                  stream.getvalue())
+                  and f"expectation: {record_path} sha256 {retained.sha256}" in printed
+                  and f"tool: {tool} sha256 {tool_digest}" in printed
+                  and (f"companion: {room / '_agent-resume'} sha256 "
+                       f"{hashlib.sha256(b'').hexdigest()}") in printed
+                  and (f"test tree: {room / 'test'} 0 file(s), digest "
+                       f"{hashlib.sha256().hexdigest()}") in printed
+                  and "selection: live-jobs-3" in printed
+                  and f"frozen for source sha256 {'f' * 64}: the tool differs from it" in printed,
+                  printed)
+            check("uncertified-run-says-so",
+                  results.certified is False and results[0]["certified"] is False
+                  and results.report == printed.rstrip("\n")
+                  and printed.startswith("certifying: no; this run certifies nothing"),
+                  printed)
+            stream = io.StringIO()
+            results = expect([("target-check", knobs(), bite)], live=True, jobs=3, tool=tool,
+                             timeout=20.0, stream=stream)
+            check("run-without-expectation-says-the-listing-stood-in",
+                  results.certified is False
+                  and "expectation: none supplied, so the listing is the population"
+                  in stream.getvalue(), stream.getvalue())
+
+            # Certification: refused before anything runs unless the expectation
+            # carries its file, its source and its approved adjudications.
+            commands_before = log.read_text()
+            for name, given, gap in (
+                ("certify-without-expectation-refused", None,
+                 "no expectation was supplied, so the listing would stand in for the "
+                 "population"),
+                ("certify-with-bare-mapping-refused", SYNTHETIC_EXPECTED,
+                 "the expectation is a bare mapping with no recorded origin; read it with "
+                 "retained_expectation"),
+                ("certify-without-adjudications-refused", retained,
+                 "the expectation names no approved adjudications; pass them to "
+                 "retained_expectation"),
+            ):
+                try:
+                    expect([("target-check", knobs(), bite)], live=True, jobs=3, tool=tool,
+                           expected=given, timeout=20.0, certify=True, stream=io.StringIO())
+                except ProbeFailure as exc:
+                    check(name, exc.failures == (f"a certifying run needs a retained "
+                                                 f"expectation: {gap}",)
+                          and log.read_text() == commands_before, repr(exc.failures))
+                else:
+                    check(name, False, "expect returned")
+            source_path = room / "expected-mapping-source.json"
+            source_path.write_bytes(frozen(
+                synthetic_rows, modes=("live-jobs-3",),
+                source={"commit": "c0ffee", "path_in_repo": "team-necromancy/agent-resume",
+                        "sha256": tool_digest}))
+            approved = adjudicating(source_path)
+            certifying = retained_expectation(source_path, live=True, jobs=3,
+                                              adjudications=approved)
+            stream = io.StringIO()
+            results = expect([("target-check", knobs(), bite)], live=True, jobs=3, tool=tool,
+                             expected=certifying, timeout=20.0, certify=True, stream=stream)
+            printed = stream.getvalue()
+            check("certifying-run-records-its-provenance",
+                  results.certified is True and results[0]["certified"] is True
+                  and printed.startswith("certifying: yes\n")
+                  and f"expectation: {source_path} sha256 {certifying.sha256}" in printed
+                  and (f"expectation frozen for source sha256 {tool_digest} (commit c0ffee, "
+                       "path_in_repo team-necromancy/agent-resume): the tool is that source")
+                  in printed
+                  and f"adjudications: {approved} sha256 {certifying.adjudications_sha256}"
+                  in printed, printed)
             try:
                 expect([("target-check", knobs(), bite)], live=True, jobs=2, tool=tool,
                        expected=retained, timeout=20.0, stream=io.StringIO())
@@ -1414,6 +1684,13 @@ def selftest():
                                        "verdict here describes what is on disk now",)
                   and f"changed while the suites ran: {leak}" in exc.report,
                   repr(exc and exc.failures))
+            check("changed-inputs-keep-the-discarded-output", exc is not None
+                  and [outcome.label for outcome in exc.outcomes] == ["clean", "case 1"]
+                  and all(outcome.reasons == ("discarded: the inputs changed while it ran",)
+                          for outcome in exc.outcomes)
+                  and "--- clean: " in exc.report and "--- case 1: " in exc.report
+                  and "FAIL  target-check" in exc.report,
+                  exc.report[-800:] if exc else "expect returned")
             leak.unlink(missing_ok=True)
             tool.write_text(runner_text)
         finally:
