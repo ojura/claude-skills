@@ -328,24 +328,35 @@ runtime's `runs_as`, the lead process rungs, lead corroboration, retirement
 objections, and a parent's team for promotion. Lines and spawn payloads the
 process wrote after it started decide, and only that answer is exact; the
 process must be the only live holder of its transcript for its lines to be its
-own. Spawns written by earlier processes on the same transcript say nothing
-about the current one. Without such lines the mount rule is applied to whether
-each candidate config could have loaded when the process started: yes when the
-config parses now and its bytes or its `createdAt` predate the start, no when
-its `createdAt` is later than the start by more than `TEAM_MINT_WINDOW_MS`, and
-unknown otherwise, including a config absent or unparsable now, which may have
-loaded and been removed since. A process with neither an argv nor a loading
+own. Those lines are read backward from the end of the transcript, stopping at
+the first record written before the process started, so a long conversation
+costs only what was written since; the window root, which takes a walk of the
+whole transcript, is read only when the mount rule is needed. Spawns written by
+earlier processes on the same transcript say nothing about the current one.
+Without such lines the mount rule is applied to whether each candidate config
+could have loaded when the process started: yes when the config parses now and
+its bytes or its `createdAt` predate the start, no when its `createdAt` is later
+than the start by more than `TEAM_MINT_WINDOW_MS`, and unknown otherwise,
+including a config absent or unparsable now, which may have loaded and been
+removed since. A config created after the start is a new one, and an earlier
+config of the team may have been there at the mount: when this tool's reap
+receipt for the team shows it retired the team after the process started, the
+answer is unknown rather than no. A process with neither an argv nor a loading
 stamped team takes the implicit team whose creation pairs uniquely with its
-boot. These answers are inferred. When the evidence does not decide, the
-answer names no team and lists the teams still open. The start time is the
-kernel's, read from `/proc/<pid>/stat` and `/proc/uptime`, with the session
-registry's `startedAt` as the fallback.
+boot. These answers are inferred. When the evidence does not decide, the answer
+names no team and lists the teams still open. The start time is the kernel's,
+read from `/proc/<pid>/stat` and `/proc/uptime`, with the session registry's
+`startedAt` as the fallback.
 
 A launch that has not started yet is a different question. `restore_answer`
 says whether its window root's team loads in the census the launch was planned
 with, so that team takes over from argv. Launch answers do not store it:
-`enforce_restore` asks at the action boundary, after any rebuild or retirement
-earlier in the run, and `run_one` asks when it reports the launch.
+`enforce_restore` asks at the action boundary and `run_one` asks when it
+reports the launch. In a team run that census holds every change the run makes
+to its teams, because the run makes them all before its first member, a
+rebuild or one retirement, and no member's step creates, rebuilds or retires a
+team (`in_team_run`). A launch that moved is not asked: the retirement or
+restamp it went through decides what it comes back as.
 
 ## Implicit-team cleanup
 
@@ -783,19 +794,54 @@ names the destination and its selected lead session, whether a person must
 confirm (an inferred destination), and the retirement: reap the source team when
 nothing that sends or reads as it is left, restamp each moving member's own
 conversation under `--force`, or blocked. `run_team` carries out the team-wide
-part once in `apply_team_redirect`: one question, at most one reap, or one
-decline, and no roster rebuild for a team its members leave. Each member's plan
-receives the decision and the run's answer to it in `MemberRedirectRequest.team`
-and `team_answer` and carries it out without deciding again. A restamp touches
-one transcript, so a live process holding that transcript is its only conflict.
+part once in `apply_team_redirect`, in the order a single member's move keeps:
+the one question, then every stop (`settle_stops`), then at most one reap, or
+instead one decline. Each running member a move restarts is asked about in
+turn before any process is ended; a declined stop, or one nothing here can ask
+about without `--yes`, refuses the whole move with nothing stopped, retired or
+started. The processes are then ended, the plan is revalidated with them gone,
+and only then is the team retired. Each member's plan receives the decision and
+the run's answer to it in `MemberRedirectRequest.team` and `team_answer`, skips
+the stops the run settled, and carries the rest out without deciding again. The
+decision is the only authority over which team directories exist while the run
+lasts: `run_team` rebuilds a missing roster before the first member only when
+the members stay, and no member's step creates, rebuilds or retires a team, so
+no roster is rebuilt for a team the members leave. A restamp touches one
+transcript, so a live process holding that transcript is its only conflict. A
+reap counts each moving member's other holders as ended, since the run ends
+them first. A moving member held by this run's own process or one of its
+ancestors cannot be ended, so the decision refuses the move before anything
+changes, with `--force` or without. A running member whose live processes all
+operate as the destination has already moved, whatever roster still lists it:
+the decision marks it `arrived`, and its step reports it running there and
+registers it in the destination's roster, without starting, stopping or
+rebuilding anything.
 
-The destination a member would follow its live lead to comes from one private
-answer, `_lead_destination`, for `--into-team live`, the automatic decision and
-the doctor's remedies. A destination with no selected lead session refuses an
-explicit or live move with `--keep-team` and `--into-team <name>` named; for the
-automatic move it blocks, so `decline_unreachable` asks before starting the
-member where its lead does not read its mail. The doctor offers `--into-team
-live` only when that answer has no objection, and always names `--keep-team`.
+Whether a member can be moved onto a team comes from one private answer,
+`_destination_answer`: the team needs a valid roster and a selected lead session
+to be the moved member's parent. Its `refusal` says why not, and its
+objections refuse a move asked for with `--into-team`, saying to drop that flag
+and pass `--keep-team` to stay, or to name a team that has a lead session. An
+explicit `--into-team <name>` asks it about the named team, and
+`_lead_destination` about the team the live lead runs as, for `--into-team
+live` and the automatic decision; for the automatic move a missing lead session
+blocks, so `decline_unreachable` asks before starting the member where its lead
+does not read its mail.
+
+A report offers a move only as the planner would make it. `_move_offer` asks
+`_team_redirect` for the command it would offer, as given and then with
+`--with-mail`, and offers the first under which the decision moves someone,
+with those flags. The doctor's remedies for a team whose lead runs elsewhere
+come from `_team_moves`: the team run with `--all`, which starts the stopped
+members on the lead's team, and the run with `--into-team live --all`, which
+restarts the running ones too, each judged on the members `team_run_plan`
+would start. So the doctor names `--with-mail` when only waiting mail keeps the
+team from being retired, offers no automatic move when the lead is not known
+exactly or running members stay behind, offers stopping the processes that run
+as the team when they alone stand in the way, and always names `--keep-team`.
+A lead move's crew report asks `_crew_move` the same about moving the crew onto
+the lead's destination, in the world the lead move leaves: the processes it
+ends gone, and the source roster gone when it retires that team.
 
 A member redirect's revalidation compares the facts its plan used: the
 destination roster observation, the parent transcript's identity (device and

@@ -2262,7 +2262,7 @@ class Resolver:
         # runs_as is the lead's operating_team answer. A member's argv names the
         # team it sends to, which is worn_team; the team it reads from is not
         # asked here, because nothing consumes it for a member.
-        runs_as, runs_as_exact, runs_as_basis = None, False, None
+        runs_as, runs_as_exact, runs_as_basis, runs_as_open = None, False, None, ()
         worn = team if pairs else None
         if name == "team-lead" and team:
             lead_process = self._lead_process(
@@ -2281,6 +2281,7 @@ class Resolver:
                 operating = self._operating_team(lead_pid, snapshot, census)
                 runs_as, runs_as_exact = operating["team"], operating["exact"]
                 runs_as_basis = operating["basis"]
+                runs_as_open = () if runs_as else operating["possible"]
                 worn = operating["argv_team"]
 
         ordered = sorted(pairs.items())
@@ -2323,6 +2324,7 @@ class Resolver:
             "runs_as": runs_as,
             "runs_as_exact": runs_as_exact,
             "runs_as_basis": runs_as_basis,
+            "runs_as_open": runs_as_open,
             "worn_team": worn,
         })
 
@@ -3377,6 +3379,58 @@ class Resolver:
         former = tuple(name for name in sorted(population) if name not in listed)
         return tuple(members), former
 
+    def _team_jobs(self, team, runtime, all_members=False):
+        """The members a run of `team` starts, the lead last, and who it leaves out.
+
+        Returns (ordered members, former names, live names): the selection
+        team_run_plan launches, which the doctor and a lead move's crew report
+        ask the planner about too.
+        """
+        roster = runtime["roster"]
+        lead_id = roster.get("leadAgentId")
+        live = frozenset(
+            name for name, facts in runtime["runtimes"].items() if facts["external"])
+        selected, former = self._select_team_jobs(
+            tuple(roster.get("members", ())), runtime["population"], live, lead_id,
+            all_members, team)
+        ordered = tuple(sorted(
+            selected, key=lambda member: 1 if member.get("agentId") == lead_id else 0))
+        return ordered, former, live
+
+    def _team_movers(self, runtime, members, table, census):
+        """`members` other than the lead as team_redirect reads them (mover rows).
+
+        Each row says where the member's conversation is, whether it is running
+        and which processes hold it: ones a move ends (`holders`) and this
+        process or its ancestors, which no move can end (`ours`).
+        """
+        snapshot = runtime["snapshot"]
+        lead_id = runtime["roster"].get("leadAgentId")
+        movers = []
+        for member in members:
+            name = member.get("name")
+            if member.get("agentId") == lead_id or name == "team-lead":
+                continue
+            record = runtime["member_records"].get(name)
+            member_runtime = (record["runtime"] if record else
+                              self._agent_runtime(member.get("agentId"), table,
+                                                  census=census))
+            resolution = record["resolution"] if record else None
+            path = resolution.path if resolution else None
+            held = (((snapshot.get("transcripts") or {}).get(path.stem) or {}).get(
+                "processes", ()) if path else ())
+            running = {row["pid"]: row["ours"]
+                       for row in tuple(held) + tuple(member_runtime["records"])}
+            movers.append(immutable({
+                "agent_id": member.get("agentId"),
+                "path": path,
+                "running": bool(member_runtime["external"] or held),
+                "holders": tuple(sorted(pid for pid, ours in running.items()
+                                        if not ours)),
+                "ours": tuple(sorted(pid for pid, ours in running.items() if ours)),
+            }))
+        return tuple(movers)
+
     def team_run_plan(self, team, table=None, all_members=False,
                       requested_socket=None, census=None, preview_roster=None,
                       redirect=None):
@@ -3401,12 +3455,7 @@ class Resolver:
         roster = runtime["roster"]
         members = tuple(roster.get("members", ()))
         lead_id = roster.get("leadAgentId")
-        live = frozenset(
-            name for name, facts in runtime["runtimes"].items() if facts["external"])
-        selected, former = self._select_team_jobs(
-            members, runtime["population"], live, lead_id, all_members, team)
-        ordered = tuple(sorted(
-            selected, key=lambda member: 1 if member.get("agentId") == lead_id else 0))
+        ordered, former, live = self._team_jobs(team, runtime, all_members)
 
         warnings = []
         if requested_socket:
@@ -3454,30 +3503,9 @@ class Resolver:
             for member in ordered)
         selection = None
         if redirect is not None:
-            snapshot = runtime["snapshot"]
-            movers = []
-            for member in ordered:
-                name = member.get("name")
-                if member.get("agentId") == lead_id or name == "team-lead":
-                    continue
-                record = runtime["member_records"].get(name)
-                member_runtime = (record["runtime"] if record else
-                                  self._agent_runtime(member.get("agentId"), table,
-                                                      census=census))
-                resolution = record["resolution"] if record else None
-                path = resolution.path if resolution else None
-                held = (((snapshot.get("transcripts") or {}).get(path.stem) or {}).get(
-                    "processes", ()) if path else ())
-                movers.append(immutable({
-                    "agent_id": member.get("agentId"),
-                    "path": path,
-                    "running": bool(member_runtime["external"] or held),
-                    "holders": tuple(sorted(
-                        {row["pid"] for row in held}
-                        | {row["pid"] for row in member_runtime["records"]})),
-                }))
             selection = self._team_redirect(
-                team, redirect, runtime["lead"], tuple(movers), table, census)
+                team, redirect, runtime["lead"],
+                self._team_movers(runtime, ordered, table, census), table, census)
         return types.MappingProxyType({
             "team": team,
             "table": table,
@@ -3505,19 +3533,31 @@ class Resolver:
             "redirect": selection,
         })
 
-    def revalidate_team_run(self, plan):
-        """Compare selected roster and process facts without choosing new jobs."""
+    def revalidate_team_run(self, plan, cleared=()):
+        """Compare selected roster and process facts without choosing new jobs.
+
+        `cleared` are the pids the run ended to move its members: each must be
+        gone, and every other process is compared as selected.
+        """
         current = self._roster_snapshot(plan["team"])
         table = self._process_table(refresh=True)
         snapshot = self._runtime(table)
         process_generation = self._runtime_generation(
             snapshot, agent_ids=plan["process_agents"],
-            sessions=plan["process_sessions"], teams=(plan["team"],))
+            sessions=plan["process_sessions"], teams=(plan["team"],),
+            exclude_pids=cleared)
+        selected_generation = (self._runtime_generation(
+            plan["snapshot"], agent_ids=plan["process_agents"],
+            sessions=plan["process_sessions"], teams=(plan["team"],),
+            exclude_pids=cleared) if cleared else plan["process_generation"])
         changed = []
         if current.observation != plan["roster_snapshot"].observation:
             changed.append(f"roster {plan['team']}")
-        if process_generation != plan["process_generation"]:
+        if process_generation != selected_generation:
             changed.append(f"runtime {plan['team']}")
+        for pid in cleared:
+            if pid in snapshot["by_pid"]:
+                changed.append(f"stopped pid {pid} remains")
         current_placement = (self._tmux_launch_action(plan["destination"])
                              if plan["destination"] else None)
         current_generation = (current_placement["generation"]
@@ -3847,16 +3887,9 @@ class Resolver:
         return tuple(found)
 
     def _derive_transcript_snapshot(self, lines, include_mail):
-        """Derive requested immutable facts from complete JSONL lines.
-
-        `last_stamp` is the newest record carrying a team stamp, as
-        (timestamp, agentName, teamName). A process stamps every line it writes
-        with the team it operates as, so a stamp written after a process started
-        is that process's own statement of its team.
-        """
+        """Derive requested immutable facts from complete JSONL lines."""
         records, leaves, duplicate_uuids = {}, [], set()
         sends, wrappers, newest = [], [], 0
-        last_stamp = None
         for raw_line in lines:
             line = raw_line.strip()
             if not line:
@@ -3890,13 +3923,6 @@ class Resolver:
                 if isinstance(leaf, str) and leaf and leaf not in leaves:
                     leaves.append(leaf)
                 continue
-            if "teamName" in rec:
-                written = _identity_stamp(rec)
-                written_at = iso_ms(rec.get("timestamp"))
-                if (written.get("teamName") and written_at
-                        and (last_stamp is None or written_at >= last_stamp[0])):
-                    last_stamp = (written_at, written.get("agentName"),
-                                  written["teamName"])
             uuid = _record_uuid(rec) if "uuid" in rec else None
             if uuid:
                 parent = rec.get("parentUuid")
@@ -3925,7 +3951,6 @@ class Resolver:
                 cursor = parent
         return types.MappingProxyType({
             "start": start,
-            "last_stamp": last_stamp,
             "uuids": frozenset(records),
             "duplicate_uuids": frozenset(duplicate_uuids),
             "mail_complete": include_mail,
@@ -3979,10 +4004,51 @@ class Resolver:
         fact = self._transcript_snapshot(path)
         return fact["start"] if fact else None
 
-    def _last_stamp(self, path):
-        """(timestamp, agentName, teamName) of the newest stamped record, or None."""
-        fact = self._transcript_snapshot(path)
-        return fact["last_stamp"] if fact else None
+    @staticmethod
+    def _last_stamp(path, since_ms):
+        """(timestamp, agentName, teamName) of the last stamped record written at
+        or after `since_ms`, or None.
+
+        A process stamps every line it writes with the team it operates as, so
+        a stamp written after it started is its own statement of that team. A
+        transcript is only appended to, so it is read backward from the end and
+        the read stops at the first record written before `since_ms`: what a
+        process wrote since it started is all that is read, however long the
+        conversation behind it.
+        """
+        try:
+            size = path.stat().st_size
+            handle = path.open("rb")
+        except OSError:
+            return None
+        carry, at = b"", size
+        with handle:
+            while at or carry:
+                if at:
+                    take = min(INDEX_CHUNK, at)
+                    at -= take
+                    handle.seek(at)
+                    lines = (handle.read(take) + carry).split(b"\n")
+                    carry = lines.pop(0) if at else b""
+                else:
+                    lines, carry = [carry], b""
+                for raw in reversed(lines):
+                    if b'"timestamp"' not in raw:
+                        continue
+                    try:
+                        record = json.loads(raw)
+                    except ValueError:
+                        continue
+                    written_at = (iso_ms(record.get("timestamp"))
+                                  if isinstance(record, dict) else None)
+                    if not written_at:
+                        continue
+                    if written_at < since_ms:
+                        return None
+                    stamp = _identity_stamp(record)
+                    if stamp.get("teamName"):
+                        return written_at, stamp.get("agentName"), stamp["teamName"]
+        return None
 
     @staticmethod
     def _mount_rule(stamped, argv_team, judge):
@@ -4025,6 +4091,15 @@ class Resolver:
         return (("yes", f"{team}'s config parses") if state == "valid"
                 else ("no", f"{team}'s config is {state}"))
 
+    def _retired_at(self, team):
+        """When this tool last retired `team`, from its reap receipt, or None."""
+        try:
+            receipt = json.loads((RECEIPTS_DIR / f"{team}.json").read_text())
+        except (OSError, ValueError):
+            return None
+        at = receipt.get("at") if isinstance(receipt, dict) else None
+        return at if type(at) is int else None
+
     def _loaded_at_start(self, team, start_ms, census=None):
         """("yes" | "no" | "unknown", why) for whether `team` loaded at a mount.
 
@@ -4032,9 +4107,14 @@ class Resolver:
         config could have loaded then when it parses now and either its bytes
         were written before the start or its createdAt is earlier. A createdAt
         later than the start by more than TEAM_MINT_WINDOW_MS, the bound this
-        module also gives a boot's own team work, appeared after the mount. An
-        absent or unparsable config may have loaded and gone since, so it, an
-        unknown start, and a creation inside that window decide nothing.
+        module also gives a boot's own team work, is a config that appeared
+        after the mount; whether an earlier config of the team was there at
+        the mount is another question. This tool's reap receipt says when it
+        last retired the team: after the start means the team existed while
+        the process ran and the config there now is a new one, so the mount
+        stays unknown. An absent or unparsable config may have loaded and gone
+        since, so it, an unknown start, and a creation inside that window
+        decide nothing.
         """
         roster = self._roster_snapshot(team, census)
         if roster.state != "valid":
@@ -4049,6 +4129,11 @@ class Resolver:
         if type(created) is int and created <= start_ms:
             return "yes", f"{team} was created before the process started"
         if type(created) is int and created > start_ms + TEAM_MINT_WINDOW_MS:
+            retired = self._retired_at(team)
+            if retired and retired > start_ms:
+                return "unknown", (f"{team} was created again after this tool retired it "
+                                   "while the process ran, so the config the process "
+                                   "could have mounted is not the one there now")
             return "no", f"{team} was created after the process started"
         return "unknown", f"{team} appeared too close to the process start to tell"
 
@@ -4135,15 +4220,12 @@ class Resolver:
         session = (record or {}).get("session")
         path = self._transcript_path(session) if session else None
         start_ms = self._process_start_ms(record) if record else None
-        window = self._window_start(path) if path else None
-        stamped = window[1] if window else None
 
         def answer(team, exact, rule, basis, possible=()):
             return immutable({
                 "pid": pid, "team": team, "exact": exact, "rule": rule,
                 "basis": basis, "possible": (team,) if team else tuple(possible),
-                "argv_team": argv_team, "stamped_team": stamped,
-                "session": session, "start": start_ms,
+                "argv_team": argv_team, "session": session, "start": start_ms,
             })
 
         found = None
@@ -4154,8 +4236,8 @@ class Resolver:
         sole = all(row["pid"] == pid for row in holders)
         if found is None and path and start_ms and sole:
             written = []
-            last = self._last_stamp(path)
-            if last and last[0] >= start_ms:
+            last = self._last_stamp(path, start_ms)
+            if last:
                 written.append((last[0], last[2],
                                 f"the lines it wrote since it started are stamped {last[2]}"))
             for stamp, payload in self._log(session):
@@ -4166,8 +4248,11 @@ class Resolver:
                 _at, team, basis = max(written, key=lambda item: item[0])
                 found = answer(team, True, "written", basis)
         if found is None:
+            # The window root is read only now, when the process's own lines
+            # have not decided: finding it walks the whole transcript.
+            window = self._window_start(path) if path else None
             team, rule, possible, why = self._mount_rule(
-                stamped, argv_team,
+                window[1] if window else None, argv_team,
                 lambda candidate: self._loaded_at_start(candidate, start_ms, census))
             if rule != "plain":
                 found = answer(team, False, rule, why, possible)
@@ -4390,42 +4475,119 @@ class Resolver:
             return ("absent",)
         return (stat.st_dev, stat.st_ino)
 
-    @staticmethod
-    def _no_lead_session(team, source):
-        """The refusal for a destination whose lead session cannot be selected."""
-        return (f"team {team} has no selected lead session; pass --keep-team to "
-                f"stay on {source}, or --into-team <name>")
+    def _destination_answer(self, team, source, table=None, census=None):
+        """Whether a member of `source` can be moved onto `team`.
+
+        A moved member needs the team's roster and a selected lead session for
+        its parent. Every decision that moves members asks here, explicit, live
+        and automatic, and so does every report that offers a move, since it
+        offers what that decision would do. `refusal` is why the move cannot be
+        made, or None; `objections` refuse a move asked for with --into-team,
+        so their way out says to drop that flag to stay where the member is.
+        """
+        roster = self._roster_snapshot(team, census)
+        parent = (self._lead_session_for(team, table=table, census=census)
+                  if roster.state == "valid" else None)
+        refusal = (f"no team config at {roster.path}" if roster.state != "valid"
+                   else None if parent else f"team {team} has no selected lead session")
+        objections = (() if refusal is None else (refusal,) if roster.state != "valid"
+                      else (f"{refusal}; drop --into-team and pass --keep-team to stay "
+                            f"on {source}, or pass --into-team a team that has one",))
+        return immutable({"team": team, "roster": roster, "parent": parent,
+                          "refusal": refusal, "objections": objections})
 
     def _lead_destination(self, source, lead, table=None, census=None):
         """The team a member of `source` would follow its live lead onto.
 
-        One answer for the three readers that need it: `--into-team live`, the
-        automatic redirect, and the doctor's remedies, so the doctor offers the
-        move only where the planner would make it. `objections` are what refuse
-        `--into-team live`; none means the lead's team has a valid roster and a
-        selected lead session for the moved member's parent.
+        The lead's operating team, judged by destination_answer once the lead
+        is known to be live and its team known. `objections` are what refuse
+        `--into-team live`.
         """
         team = lead["runs_as"]
-        roster = self._roster_snapshot(team, census) if team else None
-        parent = (self._lead_session_for(team, table=table, census=census)
-                  if roster is not None and roster.state == "valid" else None)
-        objections = []
+        target = (self._destination_answer(team, source, table, census)
+                  if team and lead["pid"] and lead["alive"] else None)
         if not (lead["pid"] and lead["alive"]):
-            objections.append(
-                f"no live lead for team {source}; pass --into-team <name> explicitly")
+            refusal = f"no live lead for team {source}"
         elif not team:
-            objections.append(
-                f"cannot tell which team pid {lead['pid']} runs as; pass --into-team "
-                "<name> explicitly")
-        elif roster.state != "valid":
-            objections.append(f"no team config at {roster.path}")
-        elif not parent:
-            objections.append(self._no_lead_session(team, source))
+            refusal = f"cannot tell which team pid {lead['pid']} runs as"
+        else:
+            refusal = target["refusal"]
+        objections = (target["objections"] if target else
+                      (f"{refusal}; pass --into-team <name> explicitly",))
         return immutable({
             "team": team, "exact": bool(team and lead["runs_as_exact"]),
-            "how": lead["how"], "roster": roster, "parent": parent,
-            "objections": tuple(objections),
+            "how": lead["how"], "roster": target["roster"] if target else None,
+            "parent": target["parent"] if target else None,
+            "refusal": refusal, "objections": objections,
         })
+
+    def _move_offer(self, source, kind, lead, movers, table, census, destination=None,
+                    single=False, ended=()):
+        """The planner's decision for one move a report offers, under the fewest flags.
+
+        The move is decided as given, then with --with-mail, which archives the
+        mail that retiring `source` would otherwise drop, and, for a move of one
+        member (`single`), with --force, which rewrites that conversation
+        instead of retiring the team. `flags` are the first under which the
+        decision moves at least one member; None means no flag does, and
+        `plain`, the decision as given, and `last`, the one under the most
+        flags, say why. `ended` are processes an earlier step ends first.
+        """
+        trials = ((), ("--with-mail",)) + ((("--force",),) if single else ())
+        plain = None
+        for flags in trials:
+            decision = self._team_redirect(source, MemberRedirectRequest(
+                kind=kind, destination=destination,
+                archive_mail="--with-mail" in flags, force="--force" in flags),
+                lead, movers, table, census, ended=ended)
+            plain = plain or decision
+            if decision["action"] == "redirect" and decision["moving"]:
+                return immutable({"flags": flags, "decision": decision,
+                                  "plain": plain, "last": decision})
+        return immutable({"flags": None, "decision": None, "plain": plain,
+                          "last": decision})
+
+    def _team_moves(self, team, lead, table, census, runtime=None):
+        """What the planner does with the two moves a report offers a team.
+
+        `automatic` is the run of the team with --all, which starts its
+        stopped members on the team their lead runs as, and `live` the run
+        with --into-team live --all, which restarts the running ones too:
+        each the decision team_run_plan makes for that command now
+        (move_offer), so the doctor offers a move only as the planner would
+        make it. --all, because a run without it starts only the members that
+        are running while any are, and the members left behind are the ones
+        whose mail nobody reads. `runtime` is the team's, from a member answer
+        with its transcripts resolved, as team_run_plan reads it.
+        """
+        if runtime is None:
+            runtime = self._team_runtime(team, table, census=census, member_answer=(
+                self._team_members(team, table, census, enrich=True)))
+        ordered, _former, _live = self._team_jobs(team, runtime, all_members=True)
+        movers = self._team_movers(runtime, ordered, table, census)
+        return immutable({kind: self._move_offer(team, kind, lead, movers, table, census)
+                          for kind in ("automatic", "live")})
+
+    def _crew_move(self, source, dest, rebind, ended, table, census):
+        """What the planner would do with the crew a lead move leaves on `source`.
+
+        The move is the run of SOURCE with --into-team DEST --all, decided
+        (move_offer) for the world the lead move leaves: the processes it ends
+        are gone, and when it retires `source`, that roster with them. The crew
+        report offers it only as the planner would make it, and says why not
+        otherwise.
+        """
+        after = (self._update_census(census, self._roster_in(rebind["reap"]["path"]))
+                 if rebind and rebind["action"] == "reap" else census)
+        runtime = self._team_runtime(source, table, census=after, member_answer=(
+            self._team_members(source, table, after, enrich=True)))
+        ordered, _former, _live = self._team_jobs(source, runtime, all_members=True)
+        offer = self._move_offer(
+            source, "explicit", runtime["lead"],
+            self._team_movers(runtime, ordered, table, after), table, after,
+            destination=dest, ended=ended)
+        return immutable({**offer, "refusal": (None if offer["flags"] is not None
+                                               else self._move_refusal(source, offer))})
 
     @staticmethod
     def _launch_mover(launch):
@@ -4439,10 +4601,11 @@ class Resolver:
             "path": launch["transcript"]["path"],
             "running": bool(held or (owner and owner["alive"])
                             or runtime.get("external")),
-            "holders": tuple(row["pid"] for row in held),
+            "holders": tuple(row["pid"] for row in holders["others"]),
+            "ours": tuple(row["pid"] for row in holders["ours"]),
         })
 
-    def _team_redirect(self, source, request, lead, movers, table, census):
+    def _team_redirect(self, source, request, lead, movers, table, census, ended=()):
         """The one redirect decision for the members a run launches from `source`.
 
         Made before any member launches: where they go, whether the team their
@@ -4450,7 +4613,12 @@ class Resolver:
         once for the run. member_redirect_plan carries it out for each member, so
         no member's step decides the team's fate again. `movers` are the members
         the run would launch (launch_mover rows). An automatic move leaves a
-        running member where it is; an explicit or live one restarts it.
+        running member where it is; an explicit or live one restarts it. A
+        running member whose live processes all operate as the destination has
+        already moved, whatever roster still lists it: it is `arrived`, and the
+        run neither starts, stops nor counts it as staying. `ended` are
+        processes an earlier step ends before this decision is carried out, as
+        a lead move does before its crew moves.
         """
         kind = request.kind
         objections, reason, confirmation, action = [], None, "accepted", None
@@ -4460,8 +4628,33 @@ class Resolver:
         if follow:
             reason = lead["how"]
         proposed = destination
-        moving = tuple(row for row in movers
-                       if kind != "automatic" or not row["running"])
+        snapshot = self._runtime(table)
+
+        def operates_as(row):
+            """The one team every live process of this member operates as, or None."""
+            teams = {team for pid in row["holders"] + row["ours"]
+                     for team in self._operating_team(pid, snapshot, census)["possible"]}
+            return next(iter(teams)) if len(teams) == 1 else None
+
+        arrived = tuple(row for row in movers
+                        if row["running"] and destination and destination != source
+                        and operates_as(row) == destination)
+        moving = tuple(row for row in movers if row not in arrived
+                       and (kind != "automatic" or not row["running"]))
+        everyone_arrived = bool(arrived) and len(arrived) == len(movers)
+        # A running member that moves is restarted, so its process is ended
+        # before the team is retired (settle_stops); this process is one no
+        # move can end, so a member held by it refuses the move outright.
+        stops = tuple(immutable({"agent_id": row["agent_id"],
+                                 "process": snapshot["by_pid"][pid]})
+                      for row in moving for pid in row["holders"]
+                      if pid in snapshot["by_pid"])
+        for row in moving:
+            for pid in row["ours"]:
+                objections.append(
+                    f"you are running {row['agent_id']}'s conversation yourself (pid "
+                    f"{pid}); nothing can replace a process from inside it. Exit it "
+                    "first, or have the lead run this")
         if kind == "automatic":
             if request.keep_team or not source:
                 action = "stay"
@@ -4473,30 +4666,36 @@ class Resolver:
             elif destination == source:
                 action = "stay"
             elif not moving:
-                action, reason = "stay", "the member is already running"
+                action, reason = "stay", (f"it already runs as {destination}"
+                                          if everyone_arrived else
+                                          "the member is already running")
             elif follow["roster"].state != "valid":
                 action, reason = "stay", "the lead's team has no destination roster"
             elif not follow["parent"]:
                 # Blocked rather than a quiet stay: starting a member where its
                 # lead does not read mail is the question decline_unreachable asks.
-                action, reason = "blocked", self._no_lead_session(destination, source)
+                action, reason = "blocked", (f"{follow['refusal']}; pass --keep-team to "
+                                             f"stay on {source}, or --into-team <name>")
             elif not follow["exact"]:
                 confirmation = "pending"
-        elif kind == "live":
-            if destination != source:
-                objections.extend(follow["objections"])
+        # Why the destination refuses the move, when its objection is one of
+        # them, so a report can say so without the flag advice in the objection.
+        refusal = None
+        if kind == "live" and destination != source and not everyone_arrived:
+            objections.extend(follow["objections"])
+            refusal = follow["refusal"]
+        if kind != "automatic" and everyone_arrived:
+            action, reason = "stay", f"it already runs as {destination}"
         if action == "stay" or (action is None and destination == source):
             action, destination = "stay", source
-        destination_roster = (self._roster_snapshot(destination, census)
-                              if destination else None)
-        parent = (follow["parent"] if follow and destination == follow["team"] else
-                  self._lead_session_for(destination, table=table, census=census)
+        target = (follow if follow and destination == follow["team"] else
+                  self._destination_answer(destination, source, table, census)
                   if destination else None)
+        destination_roster = target["roster"] if target else None
+        parent = target["parent"] if target else None
         if kind == "explicit" and destination != source:
-            if destination_roster.state != "valid":
-                objections.append(f"no team config at {destination_roster.path}")
-            elif not parent:
-                objections.append(self._no_lead_session(destination, source))
+            objections.extend(target["objections"])
+            refusal = target["refusal"]
         stamped, rebind = None, None
         if action is None and not objections:
             restoring = {}
@@ -4510,10 +4709,13 @@ class Resolver:
                     "would each need retiring; move one team's members at a time")
             elif restoring:
                 stamped = next(iter(restoring))
+                # A process this run is itself cannot be ended to move it, so
+                # it stays among the objections to retiring its team.
                 rebind = self._rebind_plan(
                     stamped, destination, None, table, census=census,
                     force=request.force, archive_mail=request.archive_mail,
-                    cleared_pids=tuple(pid for row in moving for pid in row["holders"]))
+                    cleared_pids=tuple(pid for row in moving for pid in row["holders"])
+                    + tuple(ended))
         if objections or (rebind and rebind["action"] == "blocked"):
             action = "blocked"
         census_after = (self._update_census(census, self._roster_in(rebind["reap"]["path"]))
@@ -4531,11 +4733,15 @@ class Resolver:
             "lead": lead,
             "movers": tuple(movers),
             "moving": moving,
+            "stops": stops,
+            "arrived": arrived,
+            "arrived_team": proposed if arrived else None,
             "stamped": stamped,
             "rebind": rebind,
             "census": census,
             "census_after": census_after,
             "objections": tuple(objections),
+            "refusal": refusal,
         })
 
     def member_redirect_plan(self, launch, request):
@@ -4575,6 +4781,13 @@ class Resolver:
             elif action == "redirect" and request.kind == "automatic" and mover["running"]:
                 action, destination = "stay", source
                 reason = "the member is already running"
+        arrived = (team["arrived_team"] if any(row["agent_id"] == mover["agent_id"]
+                                               for row in team["arrived"]) else None)
+        if arrived:
+            # Already running as the team its lead runs as: the decision leaves
+            # it there, so this member is neither started nor kept on the source.
+            action, destination, confirmation = "stay", source, "accepted"
+            reason = f"it already runs as {arrived}"
         destination_roster = (self._roster_snapshot(destination, census)
                               if destination else None)
         if (destination and destination != source and action != "blocked"
@@ -4613,9 +4826,21 @@ class Resolver:
                     else "explicit --into-team"),
             route=route, census=census)
                       if destination and destination != source else launch)
-        holder_processes = tuple(
-            launch["process"]["holders"]["others"]
-            + launch["process"]["holders"]["ours"])
+        # The identity it already runs under, for the report and the roster
+        # that lists it there; nothing is launched with it.
+        arrived_launch = (self._retarget_launch(
+            launch, team=arrived,
+            parent=self._destination_answer(arrived, source, table, census)["parent"],
+            source="already running there", route={"arrived": arrived}, census=census)
+                          if arrived else None)
+        holders = launch["process"]["holders"]
+        if request.team is not None and team["stops"]:
+            # The run ended these before its first member (settle_stops), so
+            # this member's step neither asks about them nor ends them again.
+            settled = {stop["process"]["pid"] for stop in team["stops"]}
+            holders = immutable({**holders, "others": tuple(
+                row for row in holders["others"] if row["pid"] not in settled)})
+        holder_processes = tuple(holders["others"] + holders["ours"])
         action = ("blocked" if objections or action == "blocked" else
                   "stay" if destination == source else
                   "blocked" if rebind and rebind["action"] == "blocked" else
@@ -4633,6 +4858,8 @@ class Resolver:
             "declined_launch": self._set_effective_identity(
                 launch, route={"stale_team_warned": True}),
             "declined": declined,
+            "arrived": arrived,
+            "arrived_launch": arrived_launch,
             "redirected_launch": redirected,
             "kind": request.kind,
             "source": source,
@@ -4648,7 +4875,7 @@ class Resolver:
             "parent_identity": parent_identity,
             "lead": lead,
             "lead_generation": lead_generation,
-            "holders": launch["process"]["holders"],
+            "holders": holders,
             "holder_processes": holder_processes,
             "mailbox_generation": (rebind or {}).get("mailbox_generation"),
             "rebind": rebind,
@@ -5023,6 +5250,10 @@ class Resolver:
                 cleared_pids=tuple(
                     row["pid"] for row in
                     launch["process"]["lead_holders"]["others"]))
+        # What moving the crew left on the source would take once this lead
+        # runs as the destination: the planner's decision, as the doctor asks it.
+        crew_move = (self._crew_move(source, dest, rebind, holder_pids, table, census)
+                     if taking_over and source else None)
         actions = []
         if taking_over:
             if launch["process"]["lead_holders"]["others"]:
@@ -5047,6 +5278,7 @@ class Resolver:
             "taking_over": taking_over,
             "runtime": runtime,
             "crew": tuple(crew),
+            "crew_move": crew_move,
             "inbox": inbox,
             "rebind": rebind,
             "holders": launch["process"]["lead_holders"],
@@ -5817,6 +6049,7 @@ class Resolver:
                 "lead_moving": None,
                 "member_moving": None,
                 "stale_team_warned": False,
+                "arrived": None,
             }),
             "receipt": immutable(receipt) if receipt else None,
             # A lead found from spawn records may have no roster entry yet.
@@ -7452,13 +7685,61 @@ class Resolver:
                 return restored["team"], "the parent's restored identity"
         return None, "no live identity, teammate spawn, or restored identity names its team"
 
+    @staticmethod
+    def _move_remedies(team, lead_team, moves):
+        """The moves a report offers a team whose lead runs as `lead_team`.
+
+        Only those team_moves found the planner would make, each with the flags
+        the planner needs. When the live move is not made because live
+        processes keep the team from being retired, stopping them is offered.
+        """
+        remedies = []
+        archived = f", and archives the mail waiting on {team} into the receipt"
+        automatic, live = moves["automatic"], moves["live"]
+        if automatic["flags"] is not None:
+            remedies.append((
+                " ".join((f"{TOOL} {team} --all",) + automatic["flags"]),
+                f"starts its stopped members on {lead_team}, where their lead reads"
+                + (", after asking" if automatic["decision"]["confirmation"] == "pending"
+                   else "")
+                + (archived if "--with-mail" in automatic["flags"] else "")))
+        if live["flags"] is not None:
+            remedies.append((
+                " ".join((f"{TOOL} {team} --into-team live --all",) + live["flags"]),
+                f"restarts its members onto {lead_team}, asking before it ends each "
+                "running one" + (archived if "--with-mail" in live["flags"] else "")))
+        else:
+            blockers = (live["last"]["rebind"] or {}).get("blockers") or ()
+            pids = [row["pid"] for row in blockers if row["pid"] is not None]
+            if pids and len(pids) == len(blockers):
+                remedies.append((
+                    f"stop pid {', '.join(map(str, pids))}",
+                    f"{'it runs' if len(pids) == 1 else 'they run'} as {team}, which "
+                    f"the move retires; after that {TOOL} {team} --into-team live --all "
+                    "moves its members"))
+        return tuple(remedies)
+
+    @staticmethod
+    def _move_refusal(team, offer):
+        """Why a move a report could offer is not made, from its last decision."""
+        decision = offer["last"]
+        rebind = decision["rebind"]
+        if decision["refusal"] or decision["objections"]:
+            return ("moving them is refused: "
+                    + (decision["refusal"] or decision["objections"][0]))
+        if rebind and rebind["action"] == "blocked":
+            return (f"moving them needs {team} retired, which waits on "
+                    + "; ".join(row["said"] for row in rebind["blockers"][:3]))
+        return f"moving them is not made: {decision['reason']}"
+
     def _team_delivery_facts(self, team, lead, addressed_roster, census=None,
-                             table=None):
+                             table=None, moves=None):
         """Interpret lead and polling evidence once for every member of a team.
 
-        When the lead runs as another team, the remedies are the planner's:
-        `--into-team live` only where lead_destination says that move would be
-        made, and --keep-team, which starts the member where it is.
+        When the lead runs as another team, the remedies are the planner's: the
+        moves team_moves finds it would make, each with the flags it needs, and
+        --keep-team, which starts the member where it is. `moves` is that
+        answer when the caller already has it.
         """
         pid, alive, exact_lead = lead["pid"], lead["alive"], lead["exact"]
         lead_team, exact_team = lead["runs_as"], lead["runs_as_exact"]
@@ -7494,20 +7775,18 @@ class Resolver:
             common_remedies = (("resume the lead", "starts a process"),)
         elif lead_team and lead_team != team:
             follow = self._lead_destination(team, lead, table, census)
-            refused = follow["objections"][0].partition(";")[0] if follow["objections"] else ""
+            refused, offered = follow["refusal"], ()
+            if not refused:
+                moves = moves or self._team_moves(team, lead, table, census)
+                offered = self._move_remedies(team, lead_team, moves)
+                if not any(what.startswith(TOOL) for what, _cost in offered):
+                    refused = self._move_refusal(team, moves["live"])
             common_reachable = (
                 False, f"its lead is live but runs as {lead_team}, so mail sent "
                 f"to {team} remains unpolled" + (f", and {refused}" if refused else ""))
-            common_remedies = ()
-            if not refused:
-                common_remedies += (("--into-team live",
-                                     "restarts this member, losing its in-flight turn"),)
-                if not exact_team:
-                    common_remedies += (("ask before redirecting",
-                                         "needs a terminal to ask at"),)
-            common_remedies += (("--keep-team",
-                                 f"starts it on {team}, where its lead does not "
-                                 "read its mail"),)
+            common_remedies = offered + (("--keep-team",
+                                          f"starts it on {team}, where its lead does not "
+                                          "read its mail"),)
         elif lead_team is None:
             common_reachable = (
                 False, "its lead is live and structural team resolution returned "
@@ -7596,11 +7875,12 @@ class Resolver:
         return types.MappingProxyType(shared)
 
     @staticmethod
-    def _team_conclusion(team, members, inbox, shared, follow=None):
+    def _team_conclusion(team, members, inbox, shared, follow=None, moves=None):
         """One structured doctor verdict from canonical member records.
 
         `follow` is lead_destination's answer when the live lead runs as
-        another team, so the remedies offered are the moves the planner makes.
+        another team, and `moves` team_moves' when that answer has no
+        objection, so the remedies offered are the moves the planner makes.
         """
         lead_id = agent_id_of("team-lead", team)
         lead_member = next(member for member in members
@@ -7662,13 +7942,7 @@ class Resolver:
                 remedies.append((
                     f"{TOOL} {team}", "rebuilds the roster and places its members"))
             elif not follow["objections"]:
-                remedies.append((
-                    f"{TOOL} {team}",
-                    f"starts its stopped members on {lead_team}, where their lead reads"
-                    + ("" if follow["exact"] else ", after asking")))
-                remedies.append((
-                    "--into-team live on each member",
-                    f"restarts them onto {lead_team}"))
+                remedies.extend(Resolver._move_remedies(team, lead_team, moves))
             if follow is not None:
                 remedies.append((
                     f"{TOOL} {team} --keep-team",
@@ -7787,8 +8061,14 @@ class Resolver:
             member_answer=description["member_answer"])
         roster = runtime["roster"]
         order = self._doctor_member_ids(team, runtime, requested)
+        lead = runtime["lead"]
+        follow = (self._lead_destination(team, lead, table, census)
+                  if lead["pid"] and lead["alive"] and lead["runs_as"]
+                  and lead["runs_as"] != team else None)
+        moves = (self._team_moves(team, lead, table, census, runtime)
+                 if follow and not follow["objections"] else None)
         delivery = (self._team_delivery_facts(
-            team, runtime["lead"], roster, census=census, table=table)
+            team, lead, roster, census=census, table=table, moves=moves)
                     if deep else None)
         ledger = (self._mail_ledger(
             team, table=table, census=census, description=description,
@@ -7853,11 +8133,7 @@ class Resolver:
         members = tuple(members)
         shared = (self._shared_doctor_facts(members) if deep
                   else types.MappingProxyType({"remedies": ()}))
-        lead = runtime["lead"]
-        follow = (self._lead_destination(team, lead, table, census)
-                  if lead["pid"] and lead["alive"] and lead["runs_as"]
-                  and lead["runs_as"] != team else None)
-        conclusion = self._team_conclusion(team, members, inbox, shared, follow)
+        conclusion = self._team_conclusion(team, members, inbox, shared, follow, moves)
         return types.MappingProxyType({
             "team": team,
             "deep": deep,
@@ -11885,36 +12161,34 @@ def redirect_blockers(plan):
     return tuple(f"- {said}" for said in (plan["objections"] or (plan["reason"],)))
 
 
-def kill_holder(process, where, args, indent="  "):
-    """End the selected process generation holding this conversation.
-    True when it is gone.
-
-    One spelling for both paths. A member migrating to another team and a lead
-    moving to one do the same thing to the same obstacle: identity is frozen in
-    argv at exec, so a move is kill and restart, and two processes must never
-    append to one transcript. Written twice, the two would drift, and the one
-    that drifted would be the one nobody was watching.
+def agree_to_end(said, args):
+    """Whether ending the process `said` describes is agreed to.
 
     Ending a conversation cannot be undone, so it is asked for the way --stop
-    asks: y/N, --yes skips the question, and nothing to ask at stops the run
-    rather than killing something nobody was told about. A dry run prints the
-    line and asks nothing, because nothing happens.
+    asks: y/N, and --yes or a dry run agrees without a question, because a
+    dry run ends nothing. Returns None when nothing here can ask, so the
+    caller refuses rather than ending something nobody was told about.
+    """
+    if args.dry_run or getattr(args, "yes", False):
+        return True
+    if not sys.stdin.isatty():
+        return None
+    try:
+        answer = input(f"kill {said}? [y/N] ").strip().lower()
+    except EOFError:
+        answer = ""
+    return answer.startswith("y")
+
+
+def end_holder(process, said, args, indent="  "):
+    """End one agreed process generation; True when it is gone.
+
+    Two processes appending to one transcript is the state a move prevents,
+    so a kill that did not work is said out loud rather than reported as a
+    clean move.
     """
     pid = process["pid"]
-    target = immutable({"process": process, "label": process.get("agent_id") or "holder"})
-    said = f"pid {pid}, which holds this transcript{where}"
-    # Asked before the line that says it is happening, so the tense on screen is
-    # never ahead of the act.
-    if not (args.dry_run or getattr(args, "yes", False)):
-        if not sys.stdin.isatty():
-            die(f"this move has to end {said}, and nothing here can ask; "
-                "pass --yes, or stop it yourself first")
-        try:
-            answer = input(f"kill {said}? [y/N] ").strip().lower()
-        except EOFError:
-            answer = ""
-        if not answer.startswith("y"):
-            die(f"left alone; stop pid {pid} yourself, or pass --yes")
+    # Said only once agreed, so the tense on screen is never ahead of the act.
     step(args.dry_run, f"would kill {said}", f"killing {said}", indent=indent)
     if args.dry_run:
         # Every answer below this point comes from a table this run did not
@@ -11922,15 +12196,78 @@ def kill_holder(process, where, args, indent="  "):
         print(fill(f"{indent}a dry run ends nothing, so what follows is measured "
                    f"with pid {pid} still running"))
         return False
-    gone, why = stopped(target)
+    gone, why = stopped(immutable({
+        "process": process, "label": process.get("agent_id") or "holder"}))
     if not gone:
-        # Two processes appending to one transcript is the state this prevents,
-        # so a kill that did not work has to be said out loud rather than
-        # reported as a clean move.
         warn(f"pid {pid} did not die ({why}); "
              "it is still appending to this transcript")
         return False
     return True
+
+
+def kill_holder(process, where, args, indent="  "):
+    """End the selected process generation holding this conversation.
+    True when it is gone.
+
+    One spelling for every path. A member migrating to another team, a lead
+    moving to one and a team run moving its members (settle_stops) do the
+    same thing to the same obstacle: identity is frozen in argv at exec, so a
+    move is kill and restart, and two processes must never append to one
+    transcript. Written twice, the copies would drift, and the one that
+    drifted would be the one nobody was watching.
+    """
+    pid = process["pid"]
+    said = f"pid {pid}, which holds this transcript{where}"
+    agreed = agree_to_end(said, args)
+    if agreed is None:
+        die(f"this move has to end {said}, and nothing here can ask; "
+            "pass --yes, or stop it yourself first")
+    if not agreed:
+        die(f"left alone; stop pid {pid} yourself, or pass --yes")
+    return end_holder(process, said, args, indent=indent)
+
+
+def settle_stops(selection, args, prefix=""):
+    """End every running member a team move restarts, before anything else.
+
+    The order a single member's move keeps (apply_member_migration): every
+    stop is agreed to first and every process is ended before the team is
+    retired, so a stop that is declined, or that nothing here can ask about,
+    refuses the whole move while nothing has changed yet. Returns the pids
+    ended, none in a dry run.
+    """
+    stops = selection["stops"]
+    if not stops:
+        return ()
+
+    def where(process):
+        seat = process.get("seat")
+        return f" in pane {seat.pane} on {seat.socket}" if seat else ""
+
+    said = [(stop, f"pid {stop['process']['pid']}, which holds {stop['agent_id']}'s "
+                   f"conversation{where(stop['process'])}")
+            for stop in stops]
+    answers = [(stop, agree_to_end(text, args)) for stop, text in said]
+
+    def named(agreed):
+        return some_of([f"pid {stop['process']['pid']} ({stop['agent_id']})"
+                        for stop, answer in answers if answer is agreed])
+
+    if any(answer is None for _stop, answer in answers):
+        die(f"this move has to end {named(None)}, and nothing here can ask; nothing "
+            "was stopped, retired or started. Pass --yes, or stop them yourself first")
+    if not all(answer for _stop, answer in answers):
+        die(f"left alone: {named(False)}; nothing was stopped, retired or started. "
+            "Stop them yourself, or pass --yes")
+    ended = []
+    for stop, text in said:
+        if end_holder(stop["process"], text, args, indent=prefix):
+            ended.append(stop["process"]["pid"])
+        elif not args.dry_run:
+            die(f"{stop['agent_id']} is still running, so {selection['source']} was "
+                "not retired and no member was started"
+                + (f"; already ended: pid {', '.join(map(str, ended))}" if ended else ""))
+    return tuple(ended)
 
 
 def auto_redirect(ctx, args, prefix=""):
@@ -11947,6 +12284,8 @@ def auto_redirect(ctx, args, prefix=""):
     if plan["objections"]:
         die("; ".join(plan["objections"]))
     if plan["action"] == "stay":
+        if plan["arrived"]:
+            return plan["arrived_launch"]
         if plan["declined"]:
             return plan["declined_launch"]
         if plan["reason"] == "the member is already running":
@@ -12162,9 +12501,18 @@ def lead_crew_lines(migration, prefix=""):
         elif count:
             lines.append(f"mail     {count} waiting for {name} on {source}, "
                          f"oldest {said_when(oldest)}; delivery remains on the source team")
-    if said:
-        lines.append(f"remedy   --into-team live on each member moves it onto {dest} "
-                     "once this lead is running as it, one restart each")
+    move = migration["crew_move"]
+    if said and move is not None:
+        # The planner's decision for moving the crew, so this offers the move
+        # only as it would be made, with the flags it needs.
+        if move["flags"] is not None:
+            lines.append(f"remedy   {' '.join((TOOL, source, '--into-team', dest, '--all') + move['flags'])}"
+                         f" moves them onto {dest} once this lead runs as it, asking "
+                         "before it ends each running one")
+        else:
+            lines.append(f"note     {move['refusal']}")
+        lines.append(f"remedy   --keep-team on each member starts it on {source}, "
+                     "where this lead will not read its mail")
     return tuple(fill(f"{prefix}{line}") for line in lines)
 
 
@@ -12218,6 +12566,16 @@ def lead_rebind(migration, args, prefix=""):
     return completed["launch"]
 
 
+def in_team_run(args):
+    """Whether this step belongs to a team run, which carries the run's decision.
+
+    That decision is the only authority over which team directories exist
+    while the run lasts: run_team rebuilds before the first step or retires
+    once, and no step rebuilds or creates a team itself.
+    """
+    return getattr(args, "team_selection", None) is not None
+
+
 def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
     """Resume one agent. Returns Outcome(status, socket, is_lead), status being
     'noop' | 'launched' | 'manual' | 'failed'.
@@ -12251,10 +12609,13 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
         member_redirect = RESOLVER.member_redirect_plan(ctx, request)
         if member_redirect["objections"]:
             die("; ".join(member_redirect["objections"]))
-        if request.kind == "live":
-            print(f"rebind   {member_redirect['reason']}, now running as team "
-                  f"{member_redirect['destination']}")
-        ctx = member_redirect["redirected_launch"]
+        if member_redirect["arrived"]:
+            ctx = member_redirect["arrived_launch"]
+        else:
+            if request.kind == "live":
+                print(f"rebind   {member_redirect['reason']}, now running as team "
+                      f"{member_redirect['destination']}")
+            ctx = member_redirect["redirected_launch"]
         agent_id = ctx["identity"]["agentId"]
 
     note_cwd(ctx)
@@ -12317,8 +12678,10 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
         if not args.dry_run and not shutil.which(command[0]):
             die(f"cannot exec {command[0]}: not found or not executable")
         # Flag-bound lead startup reads the destination roster. Reconstruct that
-        # roster before exec, using the explicit destination after migration.
-        ctx, _rebuilt = rebuild_team(ctx, args.dry_run, assume_yes=args.yes)
+        # roster before exec, using the explicit destination after migration;
+        # in a team run the run already did, before its first step.
+        if not in_team_run(args):
+            ctx, _rebuilt = rebuild_team(ctx, args.dry_run, assume_yes=args.yes)
         # Members launch before the lead. The foreground process then becomes the
         # interactive lead from the resolved cwd so --resume finds its transcript.
         if sys.stdout.isatty() and not args.dry_run:
@@ -12340,12 +12703,25 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
         return Outcome("manual", None, True, None)
 
     if not args.to_team:
-        # The redirect is decided before any roster is rebuilt: a member that
-        # follows its lead elsewhere leaves its source team as it is, so a
-        # rebuild here would only make the stamps restore it there again.
         ctx = auto_redirect(ctx, args, prefix)
-        if not ctx["route"]["member_moving"]:
-            ctx, _rebuilt = rebuild_team(ctx, args.dry_run, assume_yes=args.yes)
+    if ctx["route"]["arrived"]:
+        # The run's decision found it already running as the team its lead
+        # runs as: nothing is started, and it is registered where it runs.
+        records = (ctx["process"]["runtime"] or {}).get("records", ())
+        seat = next((row["seat"] for row in records if row["seat"]), None)
+        pids = ", ".join(str(row["pid"]) for row in records)
+        return noop_outcome(
+            ctx, args, prefix, socket=seat.socket if seat else None,
+            pane=seat.pane if seat else None, report=True,
+            why=f"{ctx['identity']['agentName']} already runs as {ctx['identity']['agentId']}"
+                + (f" (pid {pids})" if pids else "") + ", where its lead reads")
+    # The redirect is decided before any roster is rebuilt: a member that
+    # follows its lead elsewhere leaves its source team as it is, so a rebuild
+    # here would only make the stamps restore it there again. A team run
+    # decided which team directories exist before its first step, so no step
+    # of it rebuilds one.
+    if not (args.to_team or ctx["route"]["member_moving"] or in_team_run(args)):
+        ctx, _rebuilt = rebuild_team(ctx, args.dry_run, assume_yes=args.yes)
 
     agent_id = ctx["identity"]["agentId"]
     if args.explain:
@@ -12982,14 +13358,16 @@ def diagnose_team(state):
     lead_title = title_value((lead_transcript or {}).get("title"))
     if lead_title:
         lines.append(f"title    {clip(lead_title, REPORT_TRANSCRIPT_TITLE)}")
+    # An unknown answer has no grade; it names the teams the evidence left open.
+    open_teams = lead.get("runs_as_open") or ()
+    unknown = ("runs as  (unknown"
+               + (f"; {some_of(open_teams)} still open" if open_teams else "") + ")")
     if "lead_team" in shared:
         said_team, said_grade = shared["lead_team"]
-        lines.append(f"runs as  {said_team}  [{said_grade}]" if said_team
-                     else "runs as  (unknown)")
+        lines.append(f"runs as  {said_team}  [{said_grade}]" if said_team else unknown)
     elif pid and alive:
         grade = "exact" if exact_team else f"inferred: {lead['runs_as_basis']}"
-        lines.append(f"runs as  {lead_team}  [{grade}]" if lead_team
-                     else "runs as  (unknown)")
+        lines.append(f"runs as  {lead_team}  [{grade}]" if lead_team else unknown)
     if "polls" in shared:
         said = {True: "yes", False: "no", None: "unknowable"}[shared["polls"][0]]
         lines.append(f"polls    {said}  ({shared['polls'][1]})")
@@ -14268,15 +14646,17 @@ def team_redirect_request(args):
         keep_team=bool(args.keep_team) and not to_team)
 
 
-def apply_team_redirect(selection, args, prefix=""):
+def apply_team_redirect(plan, args, prefix=""):
     """Carry out a team run's one redirect decision before its first member.
 
-    The run asks its one question here and retires the source team here at
-    most once, so no member's step decides either again. Returns the answer
-    each member's step is given: follow, stay, or declined.
+    The run asks its one question here, ends the running members it moves
+    (settle_stops) and only then retires the source team, at most once, so no
+    member's step decides any of it again. Returns the answer each member's
+    step is given (follow, stay, or declined) and the pids it ended.
     """
+    selection = plan["redirect"]
     if selection["action"] == "stay":
-        return "follow"
+        return "follow", ()
     if selection["action"] == "blocked":
         if selection["kind"] != "automatic":
             if selection["rebind"] and selection["rebind"]["action"] == "blocked":
@@ -14286,13 +14666,21 @@ def apply_team_redirect(selection, args, prefix=""):
              f"{selection['proposed_destination']}:\n"
              + "\n".join(redirect_blockers(selection)))
         decline_unreachable(selection, args, prefix)
-        return "declined"
+        return "declined", ()
     if not confirm_redirect(selection, prefix):
-        return "stay"
+        return "stay", ()
+    ended = settle_stops(selection, args, prefix)
+    if ended:
+        checked = RESOLVER.revalidate_team_run(plan, cleared=ended)
+        if not checked["matches"]:
+            die("the team changed while its members were stopped ("
+                + ", ".join(checked["changed"]) + "); "
+                f"{selection['source']} was not retired and no member was started. "
+                "Run the command again")
     rebind = selection["rebind"]
     if rebind and rebind["action"] == "reap":
         rebind_reap(rebind, args, prefix, members=redirect_subject(selection))
-    return "follow"
+    return "follow", ended
 
 
 def run_team(args, passthrough):
@@ -14310,7 +14698,7 @@ def run_team(args, passthrough):
                 + "); nothing was launched or written. Run the command again")
     # Decided once, before any member: where the members go, whether their
     # team is retired, and the run's one question about it.
-    answer = apply_team_redirect(selection, args)
+    answer, ended = apply_team_redirect(plan, args)
     following = answer == "follow" and selection["action"] == "redirect"
     # A team whose members follow their lead elsewhere is not rebuilt: its
     # roster would only make their stamps restore them onto it again.
@@ -14362,7 +14750,9 @@ def run_team(args, passthrough):
         one.team_selection, one.team_answer = selection, answer
         one.in_team = True
         jobs.append((name, one))
-    return run_agents(args, passthrough, plan["table"], jobs,
+    # Processes the run ended are gone from the table the plan was made with,
+    # so the first member is selected from the current one.
+    return run_agents(args, passthrough, None if ended else plan["table"], jobs,
                       socket=socket, prefix="  ")
 
 
@@ -14536,7 +14926,7 @@ def fixture_target(session, path=None, title=None, identity=None, cwd=None,
         "records": (), "external": (), "lineage": (), "evidence": {},
         "seat_state": "stopped", "seats": (),
         "runs_as": None, "runs_as_exact": False, "runs_as_basis": None,
-        "worn_team": None,
+        "runs_as_open": (), "worn_team": None,
         "how": None, "detail": None, "exact": False,
     })
     empty_holders = immutable({
@@ -14560,7 +14950,7 @@ def fixture_target(session, path=None, title=None, identity=None, cwd=None,
     route_values = {
         "to_team": None, "to_lead": None, "automatic": False,
         "lead_moving": None, "member_moving": None,
-        "stale_team_warned": False,
+        "stale_team_warned": False, "arrived": None,
     }
     route_values.update(route or {})
     roster_values = {
@@ -14598,8 +14988,7 @@ def fixture_operating(pid, team, exact=True, argv_team=None):
         "pid": pid, "team": team, "exact": exact,
         "rule": "written" if exact else "stamped" if team else "unknown",
         "basis": "test fixture", "possible": (team,) if team else (),
-        "argv_team": argv_team, "stamped_team": None, "session": None,
-        "start": None})
+        "argv_team": argv_team, "session": None, "start": None})
 
 
 def mutable_nodes(value, path="answer", seen=None):
@@ -14661,7 +15050,7 @@ PUBLIC_RESOLVER_QUESTIONS = {
     "revalidate_reap": ("archive_inbox", "reap_team"),
     "revalidate_rebuild": ("apply_rebuild_plan",),
     "revalidate_stop": ("stopped",),
-    "revalidate_team_run": ("run_team",),
+    "revalidate_team_run": ("apply_team_redirect", "run_team"),
     "selector_answer": ("apply_selector",),
     "sides_answer": ("run_sides",),
     "socket_control_answer": ("run_poison",),
@@ -16188,8 +16577,7 @@ def _check_runtime_reuses_supplied_snapshot(s):
         minted_with.append((pid, given)), immutable({
             "pid": pid, "team": "session-chosen", "exact": True,
             "rule": "written", "basis": "fixture", "possible": ("session-chosen",),
-            "argv_team": None, "stamped_team": None, "session": chosen_session,
-            "start": None}))[1]
+            "argv_team": None, "session": chosen_session, "start": None}))[1]
     answer = coherent._agent_runtime(
         "team-lead@session-chosen", chosen_table,
         parent_session=chosen_session,
@@ -18130,7 +18518,8 @@ def _check_membership_inbox_and_operation_ownership(s):
     ('member-redirect-retains-selected-semantic-branch',
      'a typed member redirect retains its selected route and exact public callers'),
     ('member-redirect-explicit-revalidates-destination-parent',
-     'an explicit redirect refuses changed selected destination or lead transcript facts'),
+     'an explicit redirect refuses a changed destination roster or a replaced lead '
+     'transcript, and accepts a lead transcript that only grew'),
     ('member-redirect-auto-consumes-one-selected-route',
      'automatic redirect applies the one route the Resolver selected'),
     ('member-redirect-auto-does-not-reselect-after-rebind',
@@ -18498,7 +18887,8 @@ def _check_member_redirect_operation(s):
           "a typed member redirect retains its selected route and exact public callers",
           semantic_branch, details.get("semantic", details.get("error", "")))
     check("member-redirect-explicit-revalidates-destination-parent",
-          "an explicit redirect refuses changed selected destination or lead transcript facts",
+          "an explicit redirect refuses a changed destination roster or a replaced lead "
+          "transcript, and accepts a lead transcript that only grew",
           explicit_revalidation, details.get("explicit", details.get("error", "")))
     check("member-redirect-auto-consumes-one-selected-route",
           "automatic redirect applies the one route the Resolver selected",
@@ -20422,6 +20812,14 @@ class _FakeTmux:
     def process_rows(self, refresh=False):
         return list(self.processes)
 
+    def process_env(self, pid, names):
+        """This world's processes carry no environment.
+
+        A fixture's pid can be a number some real process on the machine holds,
+        and the engine's own reader would then read that process's environment.
+        """
+        return {}
+
     def process_started(self, record):
         """When one of this world's processes started, in epoch ms, or None."""
         pid = (record or {}).get("pid")
@@ -20447,7 +20845,8 @@ class _FakeTmux:
     # cannot fall behind it: adding an input here and forgetting to put it
     # back is exactly the leak this pair exists to prevent.
     ENGINE_INPUTS = ("_process_table", "_session_registry",
-                     "_swarm_sockets", "_socket_alive", "_process_start_ms")
+                     "_swarm_sockets", "_socket_alive", "_process_start_ms",
+                     "_proc_env")
 
     def attach(self, engine):
         """Give a Resolver this fixture's process, session and socket inputs.
@@ -20463,6 +20862,7 @@ class _FakeTmux:
         engine._swarm_sockets = self.socket_paths
         engine._socket_alive = self.socket_is_alive
         engine._process_start_ms = self.process_started
+        engine._proc_env = self.process_env
         if self.attached_at is None:
             self.attached_at = int(time.time() * 1000)
         return engine
@@ -22266,7 +22666,7 @@ def _check_session_row_is_a_uuid_not_a_path(s):
     return checked
 
 
-@unit(('lead-rebind-crew-report', 'a lead move names the crew it leaves behind'), ('lead-rebind-guards', "a live-membered team still blocks a lead's reap"), ('lead-rebind-kill-gate', 'a lead move ends the holder only after it is agreed to'), ('lead-address-spelling-moves-nothing', 'a team named inside an agent id addresses a lead without moving it'), ('lead-routing-one-operation', 'lead routing uses one complete operation instead of generic rebind helpers'))
+@unit(('lead-rebind-crew-report', 'a lead move names the crew it leaves behind'), ('lead-rebind-guards', "a live-membered team still blocks a lead's reap"), ('lead-rebind-kill-gate', 'a lead move ends the holder only after it is agreed to'), ('lead-address-spelling-moves-nothing', 'a team named inside an agent id addresses a lead without moving it'), ('lead-routing-one-operation', 'lead routing uses one complete operation instead of generic rebind helpers'), ('lead-move-crew-remedies-match-the-planner', "a lead move's crew report offers moving the crew only as the planner would make that move, with the flags it needs, and names --keep-team"))
 def _check_lead_rebind_crew_report(s):
     checked = []
 
@@ -22296,14 +22696,39 @@ def _check_lead_rebind_crew_report(s):
             json.dumps([{"id": "m1", "from": "team-lead", "text": "still there?",
                          "timestamp": "2026-04-02T00:00:00Z"}]))
 
+    def planner_offer(seen):
+        """team_run_plan's decision for moving the crew, in the world the lead
+        move left: the flags under which it moves someone, or None."""
+        def look(_root):
+            RESOLVER.refresh_transcript_evidence()
+            for archive in (False, True):
+                chosen = RESOLVER.team_run_plan(
+                    "session-corpus-alpha", all_members=True,
+                    redirect=MemberRedirectRequest(
+                        kind="explicit", destination="session-corpus-crew",
+                        archive_mail=archive))["redirect"]
+                if chosen["action"] == "redirect" and chosen["moving"]:
+                    seen.append(("--with-mail",) if archive else ())
+                    return
+            seen.append(None)
+        return look
+
+    def report_offer(said):
+        """The flags the crew report names for moving the crew, or None."""
+        found = re.search(rf"remedy {re.escape(TOOL)} session-corpus-alpha --into-team "
+                          r"session-corpus-crew --all((?: --[a-z-]+)*) moves them",
+                          " ".join(without_wrap_arrows(said).split()))
+        return tuple(found.group(1).split()) if found else None
+
     real_receipts = RECEIPTS_DIR
     lead_receipts = Path(tempfile.mkdtemp())
     globals()["RECEIPTS_DIR"] = lead_receipts
     real_stdin, real_input = sys.stdin, globals().get("input")
     try:
+        base_seen = []
         moved, _entry, _srv, moved_said = resume_run(
             "team-lead@session-corpus-alpha", to_team="session-corpus-crew",
-            prepare=stamped_stranger)
+            prepare=stamped_stranger, inspect=planner_offer(base_seen))
         # Everyone the engine says session-corpus-alpha has, plus the member
         # this run planted into the copy. The lead is the one that moves, so it
         # is the one name that must not be listed as staying.
@@ -22318,10 +22743,43 @@ def _check_lead_rebind_crew_report(s):
             missing.append("the lead itself is listed as staying behind")
         if "1 waiting for drift" not in told:
             missing.append("the mail waiting on the old team is not named")
-        if "--into-team live on each member" not in told:
-            missing.append("the way to move one is not named")
+        if "--keep-team on each member" not in told:
+            missing.append("the way to keep one where it is is not named")
         check("lead-rebind-crew-report", "a lead move names the crew it leaves behind",
               not missing, ", ".join(missing[:3]))
+
+        # The corpus crew team names no lead session, so a member moved onto it
+        # would have no parent, and the planner refuses that move. With a lead
+        # session recorded the move can be made, and the report offers it.
+        def crew_led(root):
+            stamped_stranger(root)
+            cfg = root / "teams" / "session-corpus-crew" / "config.json"
+            data = json.loads(cfg.read_text())
+            data["leadSessionId"] = LEAD_STAMPED
+            cfg.write_text(json.dumps(data))
+
+        led_seen = []
+        led, _entry, _srv, led_said = resume_run(
+            "team-lead@session-corpus-alpha", to_team="session-corpus-crew",
+            prepare=crew_led, inspect=planner_offer(led_seen))
+        led_told = " ".join(led_said.split())
+        crew_remedies = {
+            "without a lead session neither the report nor the planner moves them": (
+                base_seen == [None] and report_offer(moved_said) is None
+                and "moving them is refused: team session-corpus-crew has no selected "
+                    "lead session" in " ".join(without_wrap_arrows(moved_said).split())),
+            "with one the report names the flags the planner needs": led == "manual"
+                and led_seen == [report_offer(led_said)] and led_seen != [None],
+            "and --keep-team is named either way": "--keep-team on each member" in told
+                and "--keep-team on each member" in led_told,
+        }
+        check("lead-move-crew-remedies-match-the-planner",
+              "a lead move's crew report offers moving the crew only as the planner would "
+              "make that move, with the flags it needs, and names --keep-team",
+              all(crew_remedies.values()),
+              ", ".join(sorted(k for k, ok in crew_remedies.items() if not ok))
+              + f"; planner {base_seen} then {led_seen}, report {report_offer(moved_said)} "
+                f"then {report_offer(led_said)}")
 
         # The guards, unchanged, reached through the lead path: one live member
         # of the team the stamps name, and the reap it would need refuses.
@@ -22616,11 +23074,20 @@ def operating_conversation(f, start, session, name=None, root_team=None, later=(
     ('operating-team-unknown-names-what-is-open',
      'evidence that cannot decide leaves the team unknown and names the teams still open'),
     ('config-loads-when-it-parses',
-     'a team config loads only when it parses as a JSON object'),
+     'a team config loads only when it parses as a JSON object, and one that does not '
+     'parse now leaves an earlier mount unknown'),
     ('reap-objection-judged-at-the-process-start',
-     'a team rebuilt after a process started is not a team that process operates as'),
+     'a team rebuilt after a process started draws no retirement objection from it, '
+     'while a team it operates as does'),
     ('earlier-spawns-name-a-lead-not-its-team',
      "a conversation's spawns from an earlier life find its lead and say nothing about the team it runs as"),
+    ('recreated-team-mount-stays-unknown',
+     'a team this tool retired while a process ran and that was created again leaves '
+     "that process's mount unknown, so retiring it again still counts the process, "
+     'while one retired before the process started did not load'),
+    ('operating-team-parses-a-transcript-only-for-the-mount-rule',
+     'a process whose own lines since it started decide its team is answered without '
+     'walking its transcript, which only the mount rule needs'),
 )
 def _check_operating_team_answer(s):
     checked = []
@@ -22638,8 +23105,20 @@ def _check_operating_team_answer(s):
                               ("FIRST", before), ("SECOND", before), ("EARLY", before),
                               ("LATE", long_after), ("LATEARGV", long_after),
                               ("CLOSE", close_after), ("REBUILT", long_after),
-                              ("DEST", before), ("KEPT", before)):
+                              ("DEST", before), ("KEPT", before),
+                              ("RECREATED", long_after), ("RETIREDFIRST", long_after)):
             f.config(team, {"name": team, "createdAt": created, "members": []})
+        f.config("OPENLEAD", {"name": "OPENLEAD", "createdAt": before,
+                              "leadAgentId": "team-lead@OPENLEAD",
+                              "members": [{"name": "team-lead",
+                                           "agentId": "team-lead@OPENLEAD"}]})
+        # This tool's reap receipts: RECREATED was retired half a minute after
+        # the processes started, RETIREDFIRST half a minute before.
+        RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
+        for team, retired in (("RECREATED", start + 30_000), ("RETIREDFIRST", start - 30_000)):
+            (RECEIPTS_DIR / f"{team}.json").write_text(json.dumps({
+                "kind": "rebind-reap", "team": team, "at": retired,
+                "config": json.dumps({"name": team, "createdAt": before}), "mail": {}}))
         f.config("BROKEN", b"{not json")
         f.config("ARRAY", b"[]\n")
         f.config("OLDTEAM", {"name": "OLDTEAM", "createdAt": before, "leadSessionId": "",
@@ -22665,21 +23144,26 @@ def _check_operating_team_answer(s):
         operating_conversation(f, start, "rebuilt-stamp", "mate", "REBUILT")
         operating_conversation(f, start, "kept-stamp", "mate", "KEPT")
         operating_conversation(f, start, "old-lead", spawns=(("OLDTEAM", -3_600_000),))
+        operating_conversation(f, start, "open-lead", "team-lead", "CLOSE")
+        operating_conversation(f, start, "recreated-stamp", "mate", "RECREATED")
         f.fake.processes[:] = [
-            member(9101, "own-lines", "ARGV"),
-            member(9102, "early-lines", "ARGV"),
-            (9103, 1, (FAKE_AGENT_BIN, "--resume", "lead-spawns")),
-            member(9104, "late-stamp", "ARGV"),
-            member(9105, None, "LATEARGV"),
-            member(9106, "early-stamp", "ARGV"),
-            member(9107, "close-stamp", "ARGV"),
-            member(9108, None, "ARGV"),
-            member(9109, "rebuilt-stamp", "DEST"),
-            member(9110, "kept-stamp", "DEST"),
-            (9111, 1, (FAKE_AGENT_BIN, "--resume", "old-lead")),
+            member(4309101, "own-lines", "ARGV"),
+            member(4309102, "early-lines", "ARGV"),
+            (4309103, 1, (FAKE_AGENT_BIN, "--resume", "lead-spawns")),
+            member(4309104, "late-stamp", "ARGV"),
+            member(4309105, None, "LATEARGV"),
+            member(4309106, "early-stamp", "ARGV"),
+            member(4309107, "close-stamp", "ARGV"),
+            member(4309108, None, "ARGV"),
+            member(4309109, "rebuilt-stamp", "DEST"),
+            member(4309110, "kept-stamp", "DEST"),
+            (4309111, 1, (FAKE_AGENT_BIN, "--resume", "old-lead")),
+            (4309112, 1, (FAKE_AGENT_BIN, "--resume", "open-lead",
+                          "--agent-id", "team-lead@OPENLEAD")),
+            member(4309113, "recreated-stamp", "DEST"),
         ]
         f.fake.started.update({pid: start for pid, _p, _a in f.fake.processes})
-        f.fake.started[9108] = None
+        f.fake.started[4309108] = None
         table = tuple(f.fake.processes)
         census = eng._roster_census()
         snapshot = eng._runtime(table)
@@ -22688,22 +23172,29 @@ def _check_operating_team_answer(s):
             answer = eng._operating_team(pid, snapshot, census)
             return answer["team"], answer["exact"], answer["rule"], answer["possible"]
 
-        own = {9101: said(9101), 9102: said(9102), 9103: said(9103)}
+        own = {4309101: said(4309101), 4309102: said(4309102), 4309103: said(4309103)}
         check('operating-team-own-lines-decide',
-              own[9101][:3] == ("NEW", True, "written")
-              and own[9102][:3] == ("OLD", False, "stamped")
-              and own[9103][:3] == ("SECOND", True, "written"), repr(own))
+              own[4309101][:3] == ("NEW", True, "written")
+              and own[4309102][:3] == ("OLD", False, "stamped")
+              and own[4309103][:3] == ("SECOND", True, "written"), repr(own))
 
-        mounted = {9104: said(9104), 9105: said(9105), 9106: said(9106)}
+        mounted = {4309104: said(4309104), 4309105: said(4309105), 4309106: said(4309106)}
         check('operating-team-follows-the-mount-rule',
-              mounted[9104][:3] == ("ARGV", False, "argv")
-              and mounted[9105] == (None, False, "none", ())
-              and mounted[9106][:3] == ("EARLY", False, "stamped"), repr(mounted))
+              mounted[4309104][:3] == ("ARGV", False, "argv")
+              and mounted[4309105] == (None, False, "none", ())
+              and mounted[4309106][:3] == ("EARLY", False, "stamped"), repr(mounted))
 
-        unknown = {9107: said(9107), 9108: said(9108)}
+        unknown = {4309107: said(4309107), 4309108: said(4309108)}
+        # The doctor names the open teams of a lead whose answer is unknown.
+        with capturing("err"):
+            _verdict, lead_lines, _remedies = diagnose_team(
+                eng._team_diagnosis("OPENLEAD", table=table, census=census))
+        runs_line = next((line for line in lead_lines if line.startswith("runs as")), "")
         check('operating-team-unknown-names-what-is-open',
-              unknown[9107] == (None, False, "unknown", ("CLOSE", "ARGV"))
-              and unknown[9108] == (None, False, "unknown", ("ARGV",)), repr(unknown))
+              unknown[4309107] == (None, False, "unknown", ("CLOSE", "ARGV"))
+              and unknown[4309108] == (None, False, "unknown", ("ARGV",))
+              and runs_line == "runs as  (unknown; CLOSE, OPENLEAD still open)",
+              f"{unknown!r}, doctor said {runs_line!r}")
 
         loads = {
             "broken": eng._restore_fact(broken, census)["state"],
@@ -22717,15 +23208,42 @@ def _check_operating_team_answer(s):
 
         rebuilt = [row["pid"] for row in eng._reap_objections("REBUILT", table, census=census)]
         kept = [row for row in eng._reap_objections("KEPT", table, census=census)
-                if row["pid"] == 9110]
+                if row["pid"] == 4309110]
         check('reap-objection-judged-at-the-process-start',
-              9109 not in rebuilt and len(kept) == 1
-              and "pid 9110 operates as it" in kept[0]["said"],
+              4309109 not in rebuilt and len(kept) == 1
+              and "pid 4309110 operates as it" in kept[0]["said"],
               f"rebuilt objectors {rebuilt}, kept {[row['said'] for row in kept]}")
+
+        mounts = {team: eng._loaded_at_start(team, start, census)[0]
+                  for team in ("RECREATED", "RETIREDFIRST", "REBUILT")}
+        recreated = [row for row in eng._reap_objections("RECREATED", table, census=census)
+                     if row["pid"] == 4309113]
+        check('recreated-team-mount-stays-unknown',
+              mounts == {"RECREATED": "unknown", "RETIREDFIRST": "no", "REBUILT": "no"}
+              and len(recreated) == 1 and "may operate as it" in recreated[0]["said"],
+              f"mounts {mounts}, objections {[row['said'] for row in recreated]}")
+
+        # Asked again under a census of its own, so nothing is answered from
+        # the cache: own lines need no walk of the transcript, the mount rule does.
+        walked, real_snapshot = [], eng._transcript_snapshot
+        eng._transcript_snapshot = lambda path, *rest, **kw: (
+            walked.append(path.stem), real_snapshot(path, *rest, **kw))[1]
+        try:
+            fresh = tuple(list(census))
+            by_lines = eng._operating_team(4309101, snapshot, fresh)["rule"]
+            walked_for_lines = list(walked)
+            by_mount = eng._operating_team(4309102, snapshot, fresh)["rule"]
+        finally:
+            eng._transcript_snapshot = real_snapshot
+        check('operating-team-parses-a-transcript-only-for-the-mount-rule',
+              by_lines == "written" and not walked_for_lines
+              and by_mount == "stamped" and "early-lines" in walked,
+              f"own lines {by_lines} walked {walked_for_lines}, mount {by_mount} "
+              f"walked {walked}")
 
         lead = eng._agent_runtime("team-lead@OLDTEAM", table, census=census)
         check('earlier-spawns-name-a-lead-not-its-team',
-              lead["pid"] == 9111
+              lead["pid"] == 4309111
               and "whose conversation spawned into team OLDTEAM" in (lead["how"] or "")
               and lead["runs_as"] != "OLDTEAM" and lead["runs_as_exact"] is False,
               f"pid {lead['pid']}, how {lead['how']!r}, runs as {lead['runs_as']!r} "
@@ -22733,12 +23251,110 @@ def _check_operating_team_answer(s):
     return checked
 
 
+def doctor_against_planner(eng, source, census, table):
+    """The doctor's move offers for `source` beside the planner's decisions.
+
+    The doctor offers the run of SOURCE with --all and the run with
+    --into-team live --all, each with whatever flags it names, in its team
+    conclusion and in the remedies every member shares. team_run_plan is asked
+    for each of those commands without and with --with-mail, and the planner's
+    offer is the first under which it moves someone. `agree` says the doctor
+    names exactly those flags, or no command, in both places, and --keep-team.
+    """
+    prefixes = {"automatic": f"{TOOL} {source} --all",
+                "live": f"{TOOL} {source} --into-team live --all"}
+
+    def flags_in(remedies, kind):
+        for what, _cost in remedies:
+            rest = what[len(prefixes[kind]):] if what.startswith(prefixes[kind]) else None
+            if rest is not None and "--into-team" not in rest:
+                return tuple(rest.split())
+        return None
+
+    lead = eng._agent_runtime(agent_id_of("team-lead", source), table, census=census)
+    delivery = eng._team_delivery_facts(
+        source, lead, eng._roster_snapshot(source, census).data, census=census, table=table)
+    conclusion = eng._team_diagnosis(source, table=table, census=census)["conclusion"]
+    planner, reasons = [], []
+    for kind in ("automatic", "live"):
+        offer = None
+        for archive in (False, True):
+            chosen = eng.team_run_plan(source, table, all_members=True, census=census,
+                                       redirect=MemberRedirectRequest(
+                                           kind=kind, archive_mail=archive))["redirect"]
+            if not archive:
+                reasons.append(chosen["reason"])
+            if chosen["action"] == "redirect" and chosen["moving"]:
+                offer = ("--with-mail",) if archive else ()
+                break
+        planner.append(offer)
+    doctor = tuple(flags_in(conclusion["remedies"], kind) for kind in ("automatic", "live"))
+    member = tuple(flags_in(delivery["common_remedies"], kind)
+                   for kind in ("automatic", "live"))
+    keep = (any(what == f"{TOOL} {source} --keep-team" for what, _c in conclusion["remedies"])
+            and any(what == "--keep-team" for what, _c in delivery["common_remedies"]))
+    return {"planner": tuple(planner), "doctor": doctor, "member": member, "keep": keep,
+            "reasons": tuple(reasons), "agree": doctor == member == tuple(planner) and keep}
+
+
+def doctor_cases(start):
+    """The doctor against the planner where the lead runs as DSTTEAM by a spawn.
+
+    One synthetic world per case. The lead spawned into DSTTEAM after it
+    started, so it runs there exactly, and DSTTEAM's roster names its
+    conversation; SRCTEAM keeps mover, stopped. Returns {case: (what
+    doctor_against_planner saw, the planner offers the case should have)}.
+    """
+    source, dest = "SRCTEAM", "DSTTEAM"
+    lead_conv = "1ead7777-0000-4000-8000-000000000007"
+    lead_pid, runner_pid = 4309801, 4309802
+    cases = {
+        # A running member wears SRCTEAM: the automatic run leaves it there,
+        # so it keeps the team from being retired, and the live run moves it.
+        "a member runs on the team": (True, True, (None, ())),
+        # SRCTEAM's roster does not name the lead's conversation and nothing
+        # corroborates its old spawn, so the automatic run stays put.
+        "the lead is known only by an uncorroborated claim": (False, False, (None, ())),
+        "nothing is in the way": (False, True, ((), ())),
+    }
+    seen = {}
+    for case, (running, named, expected) in cases.items():
+        with _roster_test_fixture() as f:
+            eng = f.engine
+            names = ("team-lead", "mover") + (("runner",) if running else ())
+            f.config(source, {"name": source, "createdAt": start - 7_200_000,
+                              "leadAgentId": agent_id_of("team-lead", source),
+                              "leadSessionId": lead_conv if named else "",
+                              "members": [{"name": name, "agentId": agent_id_of(name, source)}
+                                          for name in names]})
+            f.config(dest, {"name": dest, "createdAt": start - 7_200_000,
+                            "leadAgentId": agent_id_of("team-lead", dest),
+                            "leadSessionId": lead_conv,
+                            "members": [{"name": "team-lead",
+                                         "agentId": agent_id_of("team-lead", dest)}]})
+            operating_conversation(f, start, lead_conv,
+                                   spawns=((source, -3_600_000), (dest, 5_000)))
+            for name in names[1:]:
+                operating_conversation(f, start, f"{name}-conv", name, source)
+            f.fake.processes[:] = [(lead_pid, 1, (FAKE_AGENT_BIN, "--resume", lead_conv))]
+            if running:
+                f.fake.processes.append(
+                    (runner_pid, 1, (FAKE_AGENT_BIN, "--resume", "runner-conv",
+                                     "--agent-id", agent_id_of("runner", source))))
+            f.fake.started.update({pid: start for pid, _ppid, _argv in f.fake.processes})
+            eng._pid_alive = lambda _pid, procstart=None: True
+            seen[case] = (doctor_against_planner(eng, source, eng._roster_census(),
+                                                 tuple(f.fake.processes)), expected)
+    return seen
+
+
 @unit(
     ('redirect-refusal-names-the-way-out',
      'a move onto a team with no selected lead session names --keep-team and --into-team'),
     ('automatic-redirect-asks-before-an-unread-start',
-     "an automatic move its destination's lead session cannot carry asks before "
-     "starting the member where its mail goes unread"),
+     "an automatic move its destination's lead session cannot carry asks [y/N] before "
+     "starting the member where its mail goes unread, refuses naming --keep-team when "
+     "nothing can ask, and stays with --keep-team"),
     ('doctor-remedies-match-the-planner',
      'the doctor offers --into-team live only where the planner would move the member, '
      'and names --keep-team'),
@@ -22773,9 +23389,9 @@ def _check_redirect_decision(s):
                         "members": [{"name": "team-lead", "agentId": f"team-lead@{dest}"}]})
         operating_conversation(f, start, lead_conv, spawns=((source, -3_600_000),))
         mover_path = operating_conversation(f, start, "mover-conv", "mover", source)
-        f.fake.processes[:] = [(9201, 1, (FAKE_AGENT_BIN, "--resume", lead_conv))]
-        f.fake.started[9201] = start
-        f.fake.registry = [{"pid": 9201, "sessionId": lead_conv, "startedAt": start + 400,
+        f.fake.processes[:] = [(4309201, 1, (FAKE_AGENT_BIN, "--resume", lead_conv))]
+        f.fake.started[4309201] = start
+        f.fake.registry = [{"pid": 4309201, "sessionId": lead_conv, "startedAt": start + 400,
                             "updatedAt": start + 400, "procStart": "1"}]
         eng._pid_alive = lambda _pid, procstart=None: True
         table = tuple(f.fake.processes)
@@ -22785,12 +23401,15 @@ def _check_redirect_decision(s):
         lead = launch["process"]["lead"]
         way_out = (f"team {dest} has no selected lead session; pass --keep-team to "
                    f"stay on {source}, or --into-team <name>")
+        # A move asked for with --into-team stays only once that flag is gone.
+        dropped = (f"team {dest} has no selected lead session; drop --into-team and pass "
+                   f"--keep-team to stay on {source}, or pass --into-team a team that has one")
 
         explicit = eng.member_redirect_plan(
             launch, MemberRedirectRequest(kind="explicit", destination=dest))
         live = eng.member_redirect_plan(launch, MemberRedirectRequest(kind="live"))
         check('redirect-refusal-names-the-way-out',
-              way_out in explicit["objections"] and way_out in live["objections"]
+              dropped in explicit["objections"] and dropped in live["objections"]
               and lead["runs_as"] == dest,
               f"explicit {explicit['objections']}, live {live['objections']}, "
               f"lead runs as {lead['runs_as']!r}")
@@ -22835,36 +23454,31 @@ def _check_redirect_decision(s):
               f"action {automatic['action']}, reason {automatic['reason']!r}, "
               f"outcomes {outcomes}, asked {asked}")
 
-        def remedies():
-            delivery = eng._team_delivery_facts(
-                source, lead, eng._roster_snapshot(source, census).data,
-                census=census, table=table)
-            diagnosis = eng._team_diagnosis(source, table=table, census=census)
-            return ([what for what, _cost in delivery["common_remedies"]],
-                    (delivery["common_reachable"] or (None, ""))[1],
-                    diagnosis["conclusion"]["verdict"],
-                    [what for what, _cost in diagnosis["conclusion"]["remedies"]])
-
-        unsupported = remedies()
+        unsupported = doctor_against_planner(eng, source, census, table)
         # A transcript whose session id opens with the team's eight hex is the
-        # lead session the planner selects for it, so the move becomes possible.
+        # lead session the planner selects for it, so the move becomes
+        # possible, and the mail waiting for mover is what retiring needs.
         operating_conversation(f, start, "d57d57d5-1111-4111-8111-111111111111")
         eng.refresh_transcript_evidence()
-        supported = remedies()
-        check('doctor-remedies-match-the-planner',
-              unsupported[0] == ["--keep-team"]
-              and "has no selected lead session" in unsupported[1]
-              and unsupported[2] == "SEVERED"
-              and "--into-team live on each member" not in unsupported[3]
-              and f"{TOOL} {source} --keep-team" in unsupported[3]
-              and supported[0] == ["--into-team live", "ask before redirecting",
-                                   "--keep-team"]
-              and "--into-team live on each member" in supported[3]
-              and f"{TOOL} {source} --keep-team" in supported[3],
-              f"without a lead session {unsupported}, with one {supported}")
+        mailed = doctor_against_planner(eng, source, eng._roster_census(), table)
+        others = doctor_cases(start)
+        met = {
+            "the destination has no lead session": (unsupported, (None, None)),
+            "mail is waiting": (mailed, (("--with-mail",), ("--with-mail",))),
+            **others,
+        }
+        # The uncorroborated lead is the case where only the automatic run's
+        # own condition, an exactly known lead, keeps it from moving anyone.
+        inexact = met["the lead is known only by an uncorroborated claim"][0]
+        wrong = sorted(case for case, (seen, expected) in met.items()
+                       if not seen["agree"] or seen["planner"] != expected)
+        if inexact["reasons"][0] != "the source lead is not known exactly":
+            wrong.append("the lead is known only by an uncorroborated claim")
+        check('doctor-remedies-match-the-planner', not wrong,
+              "; ".join(f"{case}: {met[case][0]}" for case in wrong))
 
-        wearer = (9202, 1, (FAKE_AGENT_BIN, "--agent-id", f"other@{source}"))
-        holder = (9203, 1, (FAKE_AGENT_BIN, "--resume", "mover-conv"))
+        wearer = (4309202, 1, (FAKE_AGENT_BIN, "--agent-id", f"other@{source}"))
+        holder = (4309203, 1, (FAKE_AGENT_BIN, "--resume", "mover-conv"))
         f.fake.processes[:] = [*table, wearer]
         free = eng._rebind_plan(source, dest, mover_path, tuple(f.fake.processes),
                                 census=census, force=True)
@@ -22875,10 +23489,284 @@ def _check_redirect_decision(s):
               free["action"] == "restamp" and free["restamp"]["proved"]
               and {"wears", "mail"} <= {kind for row in free["rows"] for kind in row["kinds"]}
               and held["action"] == "blocked"
-              and [row["pid"] for row in held["blockers"]] == [9203],
+              and [row["pid"] for row in held["blockers"]] == [4309203],
               f"free {free['action']} over {[row['said'] for row in free['rows']]}, "
               f"held {held['action']} by {[row['said'] for row in held['blockers']]}")
     return checked
+
+
+def team_move_run(start, held_here=False, extra=(), reply="y", terminal=True):
+    """Run `--team OLDCREW --into-team NEWCREW` for real against a synthetic world.
+
+    runner is running in a process a move must end, and sitter and keeper are
+    stopped, unless `held_here` puts keeper's conversation in this very
+    process, which no move can end. `reply` answers every question and
+    `terminal` says whether there is one to ask at. Returns what happened:
+    the exit, the questions, the plans made, the pids ended, the output, what
+    each conversation comes back as, OLDCREW's roster state and the names
+    NEWCREW's roster lists.
+    """
+    old, new = "OLDCREW", "NEWCREW"
+    lead_conv = "1ead5555-0000-4000-8000-000000000005"
+    runner_pid = 4309401
+    with _roster_test_fixture() as f:
+        eng = f.engine
+        f.config(old, {"name": old, "createdAt": start - 7_200_000,
+                       "leadAgentId": agent_id_of("team-lead", old),
+                       "members": [{"name": name, "agentId": agent_id_of(name, old)}
+                                   for name in ("team-lead", "runner", "sitter", "keeper")]})
+        f.config(new, {"name": new, "createdAt": start - 7_200_000,
+                       "leadAgentId": agent_id_of("team-lead", new), "leadSessionId": lead_conv,
+                       "members": [{"name": "team-lead",
+                                    "agentId": agent_id_of("team-lead", new)}]})
+        operating_conversation(f, start, lead_conv)
+        paths = {name: operating_conversation(f, start, f"{name}-conv", name, old)
+                 for name in ("runner", "sitter", "keeper")}
+        f.fake.processes[:] = [
+            (runner_pid, 1, (FAKE_AGENT_BIN, "--resume", "runner-conv",
+                             "--agent-id", agent_id_of("runner", old)))]
+        if held_here:
+            f.fake.processes.append(
+                (os.getpid(), os.getppid(), (FAKE_AGENT_BIN, "--resume", "keeper-conv",
+                                             "--agent-id", agent_id_of("keeper", old))))
+        f.fake.started[runner_pid] = start
+        f.fake.next_pid = 4309500
+        ended, prompts, plans, out = [], [], [], io.StringIO()
+
+        def end_it(target):
+            """Stop a process of the synthetic world; nothing real is signalled."""
+            pid = target["process"]["pid"]
+            ended.append(pid)
+            f.fake.processes[:] = [row for row in f.fake.processes if row[0] != pid]
+            return True, ""
+
+        def watched(socket, *args):
+            """A spawn that works starts its agent and writes its transcript."""
+            res = f.fake(socket, *args)
+            if (args and args[0] in ("split-window", "new-window", "new-session")
+                    and res.returncode == 0):
+                pane = res.stdout.strip()
+                pid = next(row["pid"] for row in f.fake.panes if row["pane"] == pane)
+                worn = re.search(r"--agent-id (\S+)", " ".join(args))
+                f.fake.processes.append((pid, 1, (FAKE_AGENT_BIN, "--resume", "x",
+                                                  "--agent-id", worn.group(1).strip("'"))))
+                for jsonl in eng._projects_dir.rglob("*.jsonl"):
+                    jsonl.touch()
+            return res
+
+        real_stopped, real_stdin = globals()["stopped"], sys.stdin
+        real_input, real_plan = globals().get("input"), eng.team_run_plan
+
+        def observed(*args, **kwargs):
+            plans.append(real_plan(*args, **kwargs))
+            return plans[-1]
+
+        try:
+            globals()["stopped"] = end_it
+            sys.stdin = types.SimpleNamespace(isatty=lambda: terminal)
+            globals()["input"] = lambda prompt="": (prompts.append(prompt), reply)[1]
+            eng.team_run_plan = observed
+            with f.fake.installed(eng, through=watched):
+                try:
+                    with capturing("out", into=out), capturing("err", into=out):
+                        code = run_team(build_parser().parse_args(
+                            ["--team", old, "--into-team", new, "--no-lead", "--all",
+                             "--no-attach", *extra]), [])
+                except Refusal:
+                    code = "refused"
+            eng.refresh_transcript_evidence()
+            census = eng._roster_census()
+            restored = {name: fact["team"] if fact["state"] == "restored" else None
+                        for name, path in paths.items()
+                        for fact in (eng._restore_fact(path, census),)}
+            old_state = eng._roster_snapshot(old, census).state
+            new_roster = eng._roster_snapshot(new, census).data
+        finally:
+            globals()["stopped"], sys.stdin = real_stopped, real_stdin
+            eng.team_run_plan = real_plan
+            if real_input is not None:
+                globals()["input"] = real_input
+            else:
+                globals().pop("input", None)
+    return types.SimpleNamespace(
+        code=code, prompts=prompts, plans=len(plans), ended=ended, runner=runner_pid,
+        told=" ".join(without_wrap_arrows(out.getvalue()).split()),
+        restored=restored, old_state=old_state,
+        new_names={member.get("name") for member in new_roster.get("members", ())})
+
+
+def explicit_move(start):
+    """`--team OLDCREW --into-team NEWCREW` decides once and moves every member.
+
+    With runner running and sitter and keeper stopped, the run asks one
+    question, runner's kill, and moves all three to NEWCREW without rebuilding
+    OLDCREW. With keeper's conversation held by this process, which no move
+    can end, the decision refuses the whole move before anything changes,
+    with --force or without. Returns (ok, detail) for the check.
+    """
+    old = "OLDCREW"
+    faults = []
+    moved = team_move_run(start)
+    if not (moved.code == 0 and moved.plans == 1 and len(moved.prompts) == 1
+            and f"kill pid {moved.runner}" in moved.prompts[0] and moved.ended == [moved.runner]
+            and all(f"{name} launched" in moved.told for name in ("runner", "sitter", "keeper"))
+            and "rebuil" not in moved.told and moved.old_state == "absent"
+            and moved.restored == {"runner": None, "sitter": None, "keeper": None}
+            and {"runner", "sitter", "keeper"} <= moved.new_names):
+        faults.append(f"moving: code {moved.code}, plans {moved.plans}, prompts {moved.prompts}, "
+                      f"ended {moved.ended}, OLDCREW {moved.old_state}, come back as "
+                      f"{moved.restored}, NEWCREW lists {sorted(moved.new_names)}, "
+                      f"said {moved.told[-700:]}")
+    for label, extra in (("held here", ()), ("held here with --force", ("--force",))):
+        held = team_move_run(start, held_here=True, extra=extra)
+        if not (held.code == "refused" and held.plans == 1 and not held.prompts
+                and not held.ended and "launched" not in held.told
+                and f"you are running {agent_id_of('keeper', old)}'s conversation yourself"
+                in held.told
+                and held.old_state == "valid" and held.new_names == {"team-lead"}
+                and set(held.restored.values()) == {old}):
+            faults.append(f"{label}: code {held.code}, plans {held.plans}, prompts "
+                          f"{held.prompts}, ended {held.ended}, OLDCREW {held.old_state}, "
+                          f"NEWCREW lists {sorted(held.new_names)}, said {held.told[-500:]}")
+    return not faults, "; ".join(faults)
+
+
+def stops_settled_first(start):
+    """A team move ends its running members first and retires its team last.
+
+    runner's process is ended before OLDCREW is retired. Answering N to its
+    kill question, or running with nothing to ask at and no --yes, refuses the
+    whole move with nothing ended, retired or started. Returns (ok, detail).
+    """
+    old = "OLDCREW"
+    faults = []
+    moved = team_move_run(start)
+    killed, reaped = moved.told.find("killing pid"), moved.told.find(f"reaped {old} ")
+    if not (moved.code == 0 and moved.ended == [moved.runner] and -1 < killed < reaped):
+        faults.append(f"agreed: code {moved.code}, ended {moved.ended}, killing at {killed}, "
+                      f"reaped at {reaped}, said {moved.told[-500:]}")
+    for label, run, said in (
+            ("declined", team_move_run(start, reply="n"), "left alone"),
+            ("no terminal", team_move_run(start, terminal=False), "nothing here can ask")):
+        if not (run.code == "refused" and not run.ended and said in run.told
+                and "nothing was stopped, retired or started" in run.told
+                and "--yes" in run.told and "launched" not in run.told
+                and run.old_state == "valid" and run.new_names == {"team-lead"}):
+            faults.append(f"{label}: code {run.code}, prompts {run.prompts}, ended {run.ended}, "
+                          f"OLDCREW {run.old_state}, NEWCREW lists {sorted(run.new_names)}, "
+                          f"said {run.told[-500:]}")
+    return not faults, "; ".join(faults)
+
+
+def retired_team_stays_retired(start):
+    """Run the team verb on OLDHOME with --all, for real, in a synthetic world.
+
+    m was moved to NEWHOME earlier with --force, which rewrote its window
+    root and left OLDHOME in place: it runs with argv m@NEWHOME and writes
+    lines stamped NEWHOME, and OLDHOME's roster still lists it between a and b.
+    x was moved the same way to a third team, OTHER, and runs there. The lead
+    runs as NEWHOME by a spawn it made after it started. The run retires
+    OLDHOME once and starts a and b on NEWHOME; the steps of m and x, which
+    both stay where they run, must leave OLDHOME retired, or b, started after
+    them, comes back as OLDHOME. Returns (ok, detail) for the check.
+    """
+    old, new, other = "OLDHOME", "NEWHOME", "OTHER"
+    lead_conv = "1ead6666-0000-4000-8000-000000000006"
+    lead_pid, m_pid, x_pid = 4309601, 4309602, 4309603
+    with _roster_test_fixture() as f:
+        eng = f.engine
+        f.config(old, {"name": old, "createdAt": start - 7_200_000,
+                       "leadAgentId": agent_id_of("team-lead", old), "leadSessionId": lead_conv,
+                       "members": [{"name": name, "agentId": agent_id_of(name, old)}
+                                   for name in ("team-lead", "a", "m", "x", "b")]})
+        f.config(other, {"name": other, "createdAt": start - 7_200_000,
+                         "members": [{"name": "x", "agentId": agent_id_of("x", other)}]})
+        f.config(new, {"name": new, "createdAt": start - 7_200_000,
+                       "leadAgentId": agent_id_of("team-lead", new), "leadSessionId": lead_conv,
+                       "members": [{"name": name, "agentId": agent_id_of(name, new)}
+                                   for name in ("team-lead", "m")]})
+        operating_conversation(f, start, lead_conv,
+                               spawns=((old, -3_600_000), (new, 5_000)))
+        paths = {name: operating_conversation(f, start, f"{name}-conv", name, old)
+                 for name in ("a", "b")}
+        # The restamp rewrote the window root; the lines after it written
+        # before the move still say OLDHOME, and the ones since say NEWHOME.
+        paths["m"] = operating_conversation(f, start, "m-conv", "m", new,
+                                            later=((old, -1_200_000), (new, 10_000)))
+        paths["x"] = operating_conversation(f, start, "x-conv", "x", other,
+                                            later=((old, -1_200_000), (other, 10_000)))
+        f.fake.processes[:] = [
+            (lead_pid, 1, (FAKE_AGENT_BIN, "--resume", lead_conv)),
+            (m_pid, 1, (FAKE_AGENT_BIN, "--resume", "m-conv",
+                        "--agent-id", agent_id_of("m", new))),
+            (x_pid, 1, (FAKE_AGENT_BIN, "--resume", "x-conv",
+                        "--agent-id", agent_id_of("x", other)))]
+        f.fake.started.update({lead_pid: start, m_pid: start, x_pid: start})
+        f.fake.registry = [{"pid": lead_pid, "sessionId": lead_conv, "startedAt": start + 400,
+                            "updatedAt": start + 400, "procStart": "1"}]
+        f.fake.next_pid = 4309700
+        eng._pid_alive = lambda _pid, procstart=None: True
+
+        def watched(socket, *args):
+            """A spawn that works starts its agent and writes its transcript."""
+            res = f.fake(socket, *args)
+            if (args and args[0] in ("split-window", "new-window", "new-session")
+                    and res.returncode == 0):
+                pane = res.stdout.strip()
+                pid = next(row["pid"] for row in f.fake.panes if row["pane"] == pane)
+                worn = re.search(r"--agent-id (\S+)", " ".join(args))
+                f.fake.processes.append((pid, 1, (FAKE_AGENT_BIN, "--resume", "x",
+                                                  "--agent-id", worn.group(1).strip("'"))))
+                for jsonl in eng._projects_dir.rglob("*.jsonl"):
+                    jsonl.touch()
+            return res
+
+        prompts, out = [], io.StringIO()
+        real_stdin, real_input = sys.stdin, globals().get("input")
+        try:
+            sys.stdin = types.SimpleNamespace(isatty=lambda: True)
+            globals()["input"] = lambda prompt="": (prompts.append(prompt), "y")[1]
+            with f.fake.installed(eng, through=watched):
+                try:
+                    with capturing("out", into=out), capturing("err", into=out):
+                        code = run_team(build_parser().parse_args(
+                            ["--team", old, "--no-lead", "--all", "--no-attach"]), [])
+                except Refusal as exc:
+                    code = f"refused: {exc}"
+            eng.refresh_transcript_evidence()
+            census = eng._roster_census()
+            # What each conversation comes back as when it next starts: its
+            # stamped team when that team loads, and its argv team otherwise.
+            restored = {name: fact["team"] if fact["state"] == "restored" else None
+                        for name, path in paths.items()
+                        for fact in (eng._restore_fact(path, census),)}
+            old_state = eng._roster_snapshot(old, census).state
+        finally:
+            sys.stdin = real_stdin
+            if real_input is not None:
+                globals()["input"] = real_input
+            else:
+                globals().pop("input", None)
+        launched = [row for row in f.fake.processes if row[0] >= 4309700]
+    told = " ".join(without_wrap_arrows(out.getvalue()).split())
+    worn = sorted(argv[-1] for _pid, _ppid, argv in launched)
+    facts = {
+        "the run ends cleanly": code == 0,
+        "it asks nothing": not prompts,
+        "it retires OLDHOME once": told.count(f"reaped {old} (roster archived") == 1,
+        "no step rebuilds it": "rebuild" not in told and old_state == "absent",
+        "m is left running where it is": f"m already runs as {agent_id_of('m', new)}" in told
+            and m_pid in {row[0] for row in f.fake.processes},
+        "x is left running where it is": "x noop" in told
+            and x_pid in {row[0] for row in f.fake.processes},
+        "a and b start on NEWHOME": worn == [agent_id_of("a", new), agent_id_of("b", new)],
+        "a and b come back as their argv team, not OLDHOME": restored.get("a") is None
+            and restored.get("b") is None and restored.get("m") == new
+            and restored.get("x") == other,
+    }
+    wrong = sorted(fact for fact, ok in facts.items() if not ok)
+    return not wrong, (", ".join(wrong) + f"; code {code}, prompts {prompts}, started {worn}, "
+                       f"come back as {restored}, OLDHOME {old_state}, said {told[-900:]}")
 
 
 @unit(
@@ -22890,6 +23778,18 @@ def _check_redirect_decision(s):
     ('member-follows-its-lead-without-rebuilding-its-team',
      'a member that follows its lead elsewhere moves before its own team would be '
      'rebuilt, so that team is neither rebuilt nor retired'),
+    ('team-move-into-team-decides-once',
+     '--team with --into-team decides once, asks once, moves every member to the '
+     'named team and rebuilds no roster for the old one, and a member no move can '
+     'end refuses the whole move before anything changes'),
+    ('team-move-settles-stops-before-retiring',
+     'a team move ends its running members before it retires their team, and a '
+     'declined stop, or one nothing here can ask about, refuses the whole move '
+     'with nothing changed'),
+    ('team-run-rebuilds-no-team-it-retires',
+     "a team run that retires its team rebuilds it in no member's step and leaves a "
+     'member already running as the destination where it is, so every member it '
+     'starts comes back as the destination'),
 )
 def _check_team_run_decides_once(s):
     checked = []
@@ -22900,18 +23800,35 @@ def _check_team_run_decides_once(s):
     start = int(time.time() * 1000) - 3_600_000
 
     def team_run(f, team, reply="y"):
-        """Run the team verb as a dry run; returns (code, output, prompts, plans)."""
-        eng, plans, prompts = f.engine, [], []
-        real_plan = eng.team_run_plan
+        """Run the team verb as a dry run.
+
+        Returns (code, output, prompts, plans, events): `events` lists, in the
+        order they happened, the run's decision ("decide"), each question
+        ("ask"), each retirement ("retire") and each member's launch step
+        ("member").
+        """
+        eng, plans, prompts, events = f.engine, [], [], []
+        real_plan, real_reap, real_step = eng.team_run_plan, rebind_reap, run_one
 
         def observed(*args, **kwargs):
+            events.append("decide")
             plans.append(real_plan(*args, **kwargs))
             return plans[-1]
+
+        def retiring(*args, **kwargs):
+            events.append("retire")
+            return real_reap(*args, **kwargs)
+
+        def member_step(*args, **kwargs):
+            events.append("member")
+            return real_step(*args, **kwargs)
 
         eng.team_run_plan = observed
         real_stdin, real_input = sys.stdin, globals().get("input")
         sys.stdin = types.SimpleNamespace(isatty=lambda: True)
-        globals()["input"] = lambda prompt="": (prompts.append(prompt), reply)[1]
+        globals()["input"] = lambda prompt="": (
+            events.append("ask"), prompts.append(prompt), reply)[2]
+        globals().update(rebind_reap=retiring, run_one=member_step)
         said, code = io.StringIO(), None
         try:
             with capturing("out", into=said), capturing("err", into=said):
@@ -22921,11 +23838,19 @@ def _check_team_run_decides_once(s):
             code = f"refused: {exc}"
         finally:
             sys.stdin = real_stdin
+            globals().update(rebind_reap=real_reap, run_one=real_step)
             if real_input is not None:
                 globals()["input"] = real_input
             else:
                 globals().pop("input", None)
-        return code, " ".join(without_wrap_arrows(said.getvalue()).split()), prompts, plans
+        return (code, " ".join(without_wrap_arrows(said.getvalue()).split()), prompts,
+                plans, events)
+
+    def decided_first(events):
+        """The decision, its question and any retirement came before any member."""
+        first = events.index("member") if "member" in events else len(events)
+        return ("decide" in events[:first]
+                and all(kind == "member" for kind in events[first:]))
 
     # The lead's boot pairs with session-1ead2222, the fresh team its
     # conversation named at boot, so where the crew goes is inferred and asked.
@@ -22941,20 +23866,22 @@ def _check_team_run_decides_once(s):
         operating_conversation(f, start, lead_conv, spawns=((source, -3_600_000),))
         for name in ("m1", "m2"):
             operating_conversation(f, start, f"{name}-conv", name, source)
-        f.fake.processes[:] = [(9301, 1, (FAKE_AGENT_BIN, "--resume", lead_conv))]
-        f.fake.started[9301] = start
-        f.fake.registry = [{"pid": 9301, "sessionId": lead_conv, "startedAt": start + 400,
+        f.fake.processes[:] = [(4309301, 1, (FAKE_AGENT_BIN, "--resume", lead_conv))]
+        f.fake.started[4309301] = start
+        f.fake.registry = [{"pid": 4309301, "sessionId": lead_conv, "startedAt": start + 400,
                             "updatedAt": start + 400, "procStart": "1"}]
         f.engine._pid_alive = lambda _pid, procstart=None: True
-        code, told, prompts, plans = team_run(f, source)
+        code, told, prompts, plans, events = team_run(f, source)
         decision = plans[0]["redirect"] if plans else None
     asked_once = (
         code == 0 and len(plans) == 1 and decision["action"] == "redirect"
         and decision["confirmation"] == "pending"
         and len(prompts) == 1 and "[Y/n]" in prompts[0]
         and told.count(f"would reap {source}") == 1
-        and told.count("launched") >= 2 and "refused" not in told)
-    detail = f"code {code}, plans {len(plans)}, prompts {prompts}, said {told[-700:]}"
+        and told.count("launched") >= 2 and "refused" not in told
+        and decided_first(events) and events.count("retire") == 1)
+    detail = (f"code {code}, plans {len(plans)}, prompts {prompts}, in order {events}, "
+              f"said {told[-700:]}")
 
     # A running member still wears the crew's team, so it cannot be retired:
     # the run asks once whether to start the stopped one where its lead does
@@ -22974,19 +23901,20 @@ def _check_team_run_decides_once(s):
         for name in ("m5", "m6"):
             operating_conversation(f, start, f"{name}-conv", name, source)
         f.fake.processes[:] = [
-            (9303, 1, (FAKE_AGENT_BIN, "--resume", lead_conv)),
-            (9304, 1, (FAKE_AGENT_BIN, "--resume", "m5-conv",
+            (4309303, 1, (FAKE_AGENT_BIN, "--resume", lead_conv)),
+            (4309304, 1, (FAKE_AGENT_BIN, "--resume", "m5-conv",
                        "--agent-id", f"m5@{source}"))]
-        f.fake.started.update({9303: start, 9304: start})
-        code, told, prompts, plans = team_run(f, source)
+        f.fake.started.update({4309303: start, 4309304: start})
+        code, told, prompts, plans, events = team_run(f, source)
         decision = plans[0]["redirect"] if plans else None
     declined_once = (
         code == 0 and len(plans) == 1 and decision["action"] == "blocked"
         and len(prompts) == 1 and "[y/N]" in prompts[0]
-        and "would reap" not in told and "m6 launched" in told)
+        and "would reap" not in told and "m6 launched" in told
+        and decided_first(events) and "retire" not in events)
     check('team-run-decides-redirect-once', asked_once and declined_once,
           f"{detail}; blocked: code {code}, plans {len(plans)}, prompts {prompts}, "
-          f"said {told[-700:]}")
+          f"in order {events}, said {told[-700:]}")
 
     # The crew's team has no roster left, and its lead now runs as DESTTEAM by
     # a spawn it made after it started; the members follow without a rebuild.
@@ -23000,9 +23928,9 @@ def _check_team_run_decides_once(s):
                                spawns=((source, -3_600_000), (dest, 5_000)))
         for name in ("m3", "m4"):
             operating_conversation(f, start, f"{name}-conv", name, source)
-        f.fake.processes[:] = [(9302, 1, (FAKE_AGENT_BIN, "--resume", lead_conv))]
-        f.fake.started[9302] = start
-        code, told, prompts, plans = team_run(f, source)
+        f.fake.processes[:] = [(4309302, 1, (FAKE_AGENT_BIN, "--resume", lead_conv))]
+        f.fake.started[4309302] = start
+        code, told, prompts, plans, _events = team_run(f, source)
         decision = plans[0]["redirect"] if plans else None
         rebuilt = f.engine._roster_snapshot(source).state
         # One of its members resumed on its own: the move is decided before
@@ -23020,12 +23948,29 @@ def _check_team_run_decides_once(s):
           single == "launched" and "would rebuild" not in alone_said
           and "would reap" not in alone_said and f"--team-name {dest}" in alone_said,
           f"status {single}, said {alone_said[-700:]}")
+    check('team-move-into-team-decides-once', *explicit_move(start))
+    check('team-move-settles-stops-before-retiring', *stops_settled_first(start))
+    check('team-run-rebuilds-no-team-it-retires', *retired_team_stays_retired(start))
     check('team-run-leaves-a-team-it-moves-from-unrebuilt',
           code == 0 and len(plans) == 1 and decision["action"] == "redirect"
           and decision["destination"] == dest and not prompts
           and "rebuilding" not in told and "would reap" not in told
           and rebuilt == "absent" and told.count("launched") >= 2,
           f"code {code}, plans {len(plans)}, prompts {prompts}, said {told[-900:]}")
+    return checked
+
+
+@unit(('synthetic-world-reads-no-environment',
+       'a process of the synthetic world has no environment, so a fixture pid '
+       'that names a real process reads nothing from it'))
+def _check_synthetic_world_reads_no_environment(s):
+    checked = []
+    with _roster_test_fixture() as f:
+        # This process is certainly running and has a PATH, so the engine's
+        # own reader would find one; the synthetic world answers instead.
+        read = f.engine._proc_env(os.getpid(), ("PATH",))
+    checked.append(_check_verdict('synthetic-world-reads-no-environment', read == {},
+                                  f"read {sorted(read)}"))
     return checked
 
 
@@ -23696,7 +24641,9 @@ def _check_blockers_listed_with_remedy(s):
     return checked
 
 
-@unit(('refusal-names-a-pid-once', 'a refusal names each process once, with all it objects'))
+@unit(('refusal-names-a-pid-once', 'a refusal names each process once, with all it objects'),
+      ('wearing-process-not-asked-its-team',
+       'a process that wears the team is not also asked which team it operates as'))
 def _check_refusal_names_a_pid_once(s):
     checked = []
 
@@ -23726,8 +24673,8 @@ def _check_refusal_names_a_pid_once(s):
         return immutable({
             "pid": pid, "team": team, "exact": False, "rule": "stamped",
             "basis": "its window start names session-doubled", "possible":
-            (team,) if team else (), "argv_team": None, "stamped_team": team,
-            "session": "OTHER", "start": None})
+            (team,) if team else (), "argv_team": None, "session": "OTHER",
+            "start": None})
 
     RESOLVER._operating_team = operating
     RESOLVER._inbox_state = lambda team: {}
@@ -23754,12 +24701,15 @@ def _check_refusal_names_a_pid_once(s):
         "our own process says it is this process": any(
             r["said"].endswith("; that pid is this process") and "4243" in r["said"]
             for r in doubled),
-        # Wearing the team already objects, so what it reads is not asked.
-        "a wearing process is not asked what it reads": 4242 not in asked and 4250 not in asked,
     }
     wrong = sorted(k for k, ok in once.items() if not ok)
     check("refusal-names-a-pid-once", "a refusal names each process once, with all it objects",
           not wrong, ", ".join(wrong))
+    # Wearing the team already objects, so which team it operates as is not
+    # asked of it; the process that wears nothing is the one asked.
+    check("wearing-process-not-asked-its-team",
+          "a process that wears the team is not also asked which team it operates as",
+          4242 not in asked and 4250 not in asked and 4243 in asked, f"asked {asked}")
     return checked
 
 
@@ -28605,21 +29555,29 @@ def _check_holder_kill_one_site(s):
                 return True
         return False
 
-    # stopped() sends the signal and waits; kill_holder is the one route a
-    # migration and a lead move take to it, and abort_agents is --stop, the
-    # verb whose whole job is ending processes, which asks its own question of
-    # a list before it ends anything. Everything else reaches a process through
-    # one of those two.
+    # stopped() sends the signal and waits; end_holder is the one route a
+    # move takes to it, through kill_holder for a migration and a lead move and
+    # through settle_stops for a team run, and abort_agents is --stop, the verb
+    # whose whole job is ending processes, which asks its own question of a
+    # list before it ends anything. Everything else reaches a process through
+    # one of those.
     killers = {n for n, node in funcs.items() if ends_a_process(node)}
     reached = callers_of("kill_holder") - s.suite_fns
+    ended_by = callers_of("end_holder") - s.suite_fns
+    settled_by = callers_of("settle_stops") - s.suite_fns
     asked_to_stop = callers_of("stopped") - s.suite_fns
     sites = []
     if killers != {"stopped"}:
         sites.append("a process is ended in " + (", ".join(sorted(killers)) or "nowhere"))
-    if asked_to_stop != {"abort_agents", "kill_holder"}:
+    if asked_to_stop != {"abort_agents", "end_holder"}:
         sites.append("stopped is asked by " + (", ".join(sorted(asked_to_stop)) or "nobody"))
+    if ended_by != {"kill_holder", "settle_stops"}:
+        sites.append("end_holder is asked by " + (", ".join(sorted(ended_by)) or "nobody"))
     if reached != {"apply_member_migration", "clear_lead_holder"}:
         sites.append("reached from " + (", ".join(sorted(reached)) or "nowhere"))
+    if settled_by != {"apply_team_redirect"}:
+        sites.append("a team run's stops are settled from "
+                     + (", ".join(sorted(settled_by)) or "nowhere"))
     run_calls = {part.func.id for part in ast.walk(run_one)
                  if isinstance(part, ast.Call) and isinstance(part.func, ast.Name)}
     lead_calls = {part.func.id for part in ast.walk(lead_rebind)
@@ -28816,9 +29774,11 @@ def _check_sidechain_not_evidence(s):
         nested_hits = engine._stamped_candidates("spoof", "session-spoof")
         structured_fallback = ([path for path, _fields, _ts in spaced_hits] == [mid]
                                and not nested_hits)
+    # _last_stamp reads a process's own lines backward from the end of its
+    # transcript, and takes their stamps through the same rule.
     stamp_owners = s.callers_of("_identity_stamp")
     if stamp_owners != {"_stamps_in", "_scan_transcript",
-                        "_derive_transcript_snapshot"}:
+                        "_derive_transcript_snapshot", "_last_stamp"}:
         leaks.append(f"identity stamp owners {sorted(stamp_owners)}")
     assigned_names = {
         target.id for node in s.ast.walk(s.tree) if isinstance(node, s.ast.Assign)
@@ -35276,18 +36236,24 @@ def _check_confirmation_taxonomy(s):
 
     # Ending a conversation is its own decision. Whatever settled the move it
     # happens inside must not also settle this, so the only things that skip it
-    # are the ones the operator typed on this run.
-    killer = s.funcs.get("kill_holder")
-    bypass = ast.unparse(killer) if killer else ""
-    guard = next((ast.unparse(part) for part in ast.walk(killer or ast.Module(body=[], type_ignores=[]))
+    # are the ones the operator typed on this run. agree_to_end is the kill's
+    # question, asked by both routes that end a process for a move.
+    asker = s.funcs.get("agree_to_end")
+    asked = ast.unparse(asker) if asker else ""
+    guard = next((ast.unparse(part.test) for part in ast.walk(
+                      asker or ast.Module(body=[], type_ignores=[]))
                   if isinstance(part, ast.If)
-                  and "input(" in ast.unparse(part)), "")
+                  and any(isinstance(line, ast.Return) and isinstance(line.value, ast.Constant)
+                          and line.value.value is True for line in part.body)), "")
+    askers = s.callers_of("agree_to_end") - s.suite_fns
     independent = {
-        "the kill has a question of its own": "input(" in bypass,
+        "the kill has a question of its own": "input(" in asked,
         "skipped only by what this run was told":
             bool(guard) and "dry_run" in guard and "yes" in guard,
         "and never by the surrounding decision":
             "confirmation" not in guard and "confirmed" not in guard,
+        "and every move that ends a process asks it":
+            askers == {"kill_holder", "settle_stops"},
     }
     faults = sorted(name for name, ok in independent.items() if not ok)
     check("confirmation-nested-kill-decides-on-its-own",
