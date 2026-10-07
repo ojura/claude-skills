@@ -1042,6 +1042,19 @@ def _normalize_cases(cases):
     return tuple(normalized)
 
 
+def case_set_digest(cases):
+    """The sha256 of a run's cases, so its report names the mutation set it judged.
+
+    Each case is (check, old, new, co-failures) as _normalize_cases froze it, in
+    the order given, written as JSON with the co-failures in id order. Two runs
+    rest on the same set exactly when their reports name the same digest.
+    """
+    written = json.dumps([[check, old, new, dict(sorted(co_failures.items()))]
+                          for check, old, new, co_failures in cases],
+                         ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(written.encode()).hexdigest()
+
+
 def _refusal(outcomes, lines, stream):
     """Print the report with the raw output of every refused run, then the exception."""
     refused = [outcome for outcome in outcomes if outcome.reasons]
@@ -1311,7 +1324,8 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
              f"verifier: {VERIFIER} sha256 {watched[VERIFIER]}",
              f"interpreter: {sys.executable} (Python {platform.python_version()})",
              f"timeout: {timeout:g}s for each run",
-             f"selection: {selection}"]
+             f"selection: {selection}",
+             f"cases: {len(cases)}, sha256 {case_set_digest(cases)}"]
     if checked_verifier is not None:
         lines.append(f"verifier selftest: {checked_verifier}")
     if isinstance(expected, Expectation):
@@ -1827,6 +1841,17 @@ def _selftest_checks(verifier):
     check("failed-only-signal-judged-alone",
           only(outcome.reasons, "was ended by SIGKILL (returncode -9)"), repr(outcome.reasons))
 
+    # The digest a report names for its cases: the same cases give the same
+    # digest, and a change to any part of a case, or another case, gives another.
+    one = ("a-check", "old text", "new text", {"b-check": "why"})
+    digests = [case_set_digest(_normalize_cases(cases)) for cases in (
+        [one], [("a-check", "old text", "newer text", {"b-check": "why"})],
+        [("a-check", "old text", "new text", {"b-check": "why not"})],
+        [("a-check", "old text", "new text")], [one, one])]
+    check("case-set-digest-names-the-exact-cases",
+          digests[0] == case_set_digest(_normalize_cases([one])) and len(set(digests)) == 5,
+          repr(digests))
+
     # Cases and expectations that cannot be judged.
     try:
         _normalize_cases([])
@@ -2219,6 +2244,8 @@ def _selftest_checks(verifier):
                   and (f"test tree: {room / 'test'} 0 file(s), digest "
                        f"{hashlib.sha256().hexdigest()}") in printed
                   and "selection: live-jobs-3" in printed
+                  and f"cases: 1, sha256 {case_set_digest([('target-check', knobs(), bite, {})])}"
+                  in printed
                   and f"frozen for source sha256 {'f' * 64}: the tool differs from it" in printed,
                   printed)
             check("uncertified-run-says-so",
