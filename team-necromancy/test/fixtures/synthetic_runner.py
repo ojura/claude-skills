@@ -23,7 +23,9 @@ OWNED_DRIVER starts a driver in a session of its own whose terminal child
 ignores the hangup its pty sends, as the real suite's completion drive does,
 and writes the driver down where the suite writes the groups it owns: in the
 file the verifier names ("direct") or in a worker's file that one names
-("nested"). Ending the runner's group reaches neither process.
+("nested"). Ending the runner's group reaches neither process. RECORD_LINES
+are lines written as they are into that same file, for a test that names a
+process of its own there.
 
 With PROBE_SYNTHETIC_LOG set, every invocation appends its arguments to that
 file as one JSON line, which is how a test sees what the verifier asked. With
@@ -59,6 +61,7 @@ SIGNAL = None
 FILTER_LIES = False
 WRITE_BESIDE = None
 OWNED_DRIVER = None
+RECORD_LINES = []
 
 # The driver OWNED_DRIVER starts. Its child is a terminal's: pty.fork puts it in
 # a session of its own, and it ignores the hangup the pty sends when the driver
@@ -82,6 +85,12 @@ def started_at(pid):
     return text[text.rindex(")") + 2:].split()[19]
 
 
+def owned_groups_record():
+    """The file the verifier named for the groups this run owns, or None."""
+    name = os.path.basename(os.path.realpath(__file__))
+    return os.environ.get(f"{name.upper().replace('-', '_')}_SELFTEST_OWNED_GROUPS")
+
+
 def start_owned_driver(where):
     """Start the driver and write it down as the suite would, directly or in a worker's file."""
     driver = subprocess.Popen([sys.executable, "-c", DRIVER], stdin=subprocess.DEVNULL,
@@ -89,8 +98,7 @@ def start_owned_driver(where):
                               text=True, start_new_session=True)
     leader, child = (int(word) for word in driver.stdout.readline().split())
     entry = f"{leader} {started_at(leader)}\n"
-    name = os.path.basename(os.path.realpath(__file__))
-    record = os.environ.get(f"{name.upper().replace('-', '_')}_SELFTEST_OWNED_GROUPS")
+    record = owned_groups_record()
     if record and where == "nested":
         worker = record + ".worker"
         with open(worker, "a") as owned:
@@ -132,6 +140,9 @@ def main(argv):
         return 0
     if OWNED_DRIVER:
         start_owned_driver(OWNED_DRIVER)
+    if RECORD_LINES and owned_groups_record():
+        with open(owned_groups_record(), "a") as owned:
+            owned.write("".join(f"{line}\n" for line in RECORD_LINES))
     if SLEEP:
         time.sleep(SLEEP)
     verdicts = [(cid, description, cid not in FAILING,

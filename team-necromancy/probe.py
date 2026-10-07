@@ -53,6 +53,7 @@ import contextlib
 import dataclasses
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -98,9 +99,33 @@ VERIFIER = Path(__file__).resolve()
 # or when the code that ran was not compiled from them.
 _VERIFIER_BYTES = VERIFIER.read_bytes()
 VERIFIER_LOADED = hashlib.sha256(_VERIFIER_BYTES).hexdigest()
-VERIFIER_FROM_SOURCE = sys._getframe().f_code == compile(
-    _VERIFIER_BYTES, str(VERIFIER), "exec", dont_inherit=True)
-del _VERIFIER_BYTES
+_VERIFIER_CODE = compile(_VERIFIER_BYTES, str(VERIFIER), "exec", dont_inherit=True)
+VERIFIER_FROM_SOURCE = sys._getframe().f_code == _VERIFIER_CODE
+# The code of every function the module defines at its top level, as its bytes
+# compile it. A function replaced in the module after the import runs code that
+# was never hashed, which certification_gaps finds by comparing against these.
+# A def compiles to optimized code under its own name; a class body, a lambda
+# and a generator expression are not defs.
+VERIFIER_FUNCTIONS = {code.co_name: code for code in _VERIFIER_CODE.co_consts
+                      if isinstance(code, types.CodeType) and code.co_name.isidentifier()
+                      and code.co_flags & inspect.CO_OPTIMIZED}
+del _VERIFIER_BYTES, _VERIFIER_CODE
+
+
+def replaced_functions():
+    """Names in this module whose function is not the one the verifier's bytes define.
+
+    A name defined by a def at the top level that now holds another function,
+    or no function at all, is named; so is a top-level name holding a function
+    that the bytes define under another name.
+    """
+    module = sys.modules[__name__]
+    replaced = []
+    for name, code in VERIFIER_FUNCTIONS.items():
+        held = getattr(module, name, None)
+        if not (isinstance(held, types.FunctionType) and held.__code__ == code):
+            replaced.append(name)
+    return sorted(replaced)
 
 
 class ProbeFailure(AssertionError):
@@ -128,6 +153,9 @@ class Run:
     stdout: str
     stderr: str
     timeout: float = SUITE_TIMEOUT_S
+    # Processes the suite recorded and was still running when it exited by
+    # itself, which the verifier then ended; a certifying run is refused for any.
+    left_running: tuple = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -238,15 +266,16 @@ def end_group(child, grace=None):
 def owned_groups_variable(tool):
     """The environment variable naming the file a suite writes its own-session groups to.
 
-    The tool names it from its own file name, as agent-resume's OWNED_GROUPS
-    does, and a private copy or a mutant keeps the tool's name, so every suite
-    the verifier runs reads the variable named here.
+    The tool names it from the resolved name of its own file, as agent-resume's
+    OWNED_GROUPS does, so the name is taken from the resolved path here too: a
+    private copy or a mutant keeps the tool's name, and a tool reached through
+    a symlink names the variable after the file it is.
     """
-    return f"{Path(tool).name.upper().replace('-', '_')}_SELFTEST_OWNED_GROUPS"
+    return f"{Path(tool).resolve().name.upper().replace('-', '_')}_SELFTEST_OWNED_GROUPS"
 
 
 def _proc_identity(pid):
-    """(parent pid, start time) from /proc/<pid>/stat, or None for no live process.
+    """(parent pid, process group, start time) from /proc/<pid>/stat, or None for none.
 
     The start time is the kernel's, field 22, as the tool writes it beside a
     pid, so a pid the kernel has handed to another process does not match. A
@@ -255,86 +284,154 @@ def _proc_identity(pid):
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
         rest = stat[stat.rindex(")") + 2:].split()
-        state, parent, started = rest[0], int(rest[1]), rest[19]
+        state, parent, group, started = rest[0], int(rest[1]), int(rest[2]), rest[19]
     except (OSError, ValueError, IndexError):
         return None
-    return None if state in ("Z", "X") else (parent, started)
+    return None if state in ("Z", "X") else (parent, group, started)
 
 
-def _descendants(leader):
-    """Every live process under leader, by parentage, with its start time.
+def _started(pid):
+    """The kernel's start time of pid as a string, or None for no live process."""
+    identity = _proc_identity(pid)
+    return identity[2] if identity else None
+
+
+def _read_text(path):
+    """The stripped text of path, or "" when it cannot be read."""
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return ""
+
+
+def never_signalled(pid):
+    """Why the verifier must never signal pid, or None.
+
+    pid 1, the verifier itself, every process it descends from, and any systemd
+    process: the user's service manager adopts every orphan, so a recorded pid
+    that is really its own would otherwise be signalled, and that manager ends
+    the whole desktop session on SIGTERM. These hold whatever a record says
+    and whenever the process started.
+    """
+    if pid == 1:
+        return "pid 1"
+    if pid == os.getpid():
+        return "the verifier itself"
+    ancestor, walked = os.getppid(), 0
+    while ancestor > 1 and walked < 4096:
+        if pid == ancestor:
+            return "an ancestor of the verifier"
+        identity = _proc_identity(ancestor)
+        ancestor, walked = (identity[0] if identity else 0), walked + 1
+    if _read_text(f"/proc/{pid}/comm") == "systemd":
+        return "a systemd process"
+    return None
+
+
+def _family(leader):
+    """Every live process in leader's process group or under it, with its start time.
 
     Read while the leader still runs: a terminal child sits in a session of its
-    own, so the group signal misses it, and once the leader ends its children
+    own, so a group signal misses it, and once the leader ends its children
     are handed to another parent and cannot be told from anyone else's.
     """
-    children = {}
+    table = {}
     for entry in Path("/proc").iterdir():
         if entry.name.isdigit() and (identity := _proc_identity(int(entry.name))):
-            children.setdefault(identity[0], []).append((int(entry.name), identity[1]))
-    found, frontier = {}, [leader]
+            table[int(entry.name)] = identity
+    found = {pid: identity[2] for pid, identity in table.items() if identity[1] == leader}
+    children = {}
+    for pid, identity in table.items():
+        children.setdefault(identity[0], []).append(pid)
+    frontier = [leader, *found]
     while frontier:
-        for pid, started in children.get(frontier.pop(), ()):
+        for pid in children.get(frontier.pop(), ()):
             if pid not in found:
-                found[pid] = started
+                found[pid] = table[pid][2]
                 frontier.append(pid)
     return found
 
 
-def end_recorded_groups(record, grace=3.0, seen=None):
-    """End every process group a suite wrote down in record; returns the pids left running.
+def end_recorded_groups(record, suite_started, grace=3.0, seen=None):
+    """End what a suite wrote down in record; returns (ended, left running, refused).
 
-    A suite writes "<pid> <start time>" for each process it starts in a session
-    of its own, which ending the suite's group does not reach, and "record
-    <path>" for the file a worker of its writes its own groups to. Each group is
-    ended with its leader's descendants, read while the leader runs, and only
-    while each process's start time is the one written down, so a pid reused
-    since is left alone. The groups written in a file are ended before the
-    files it names are read, because a worker's group carries the groups that
-    worker started while it still runs.
+    A suite writes "<pid> <start time>" for each process group it starts in a
+    session of its own, which ending the suite's group does not reach, and
+    "record <path>" for the file a worker of its writes its own groups to.
+    Anything in the suite's environment can write to record, a mutant or a
+    fixture included, so no line is trusted beyond what this checks: a leader
+    is signalled only while its start time is the one written down, and every
+    process signalled, the leader and each process in its group or under it,
+    must have started after the suite, in a later clock tick than
+    suite_started, and must not be one never_signalled names. Each process is signalled by itself, never
+    through its group, so nothing older is reached that way. A file is read at
+    most once, and its groups are ended before the files it names are read,
+    because a worker's own group carries what that worker started while it
+    still runs. Refused lines and processes are returned as sentences.
     """
     seen = set() if seen is None else seen
     record = Path(record)
     if record in seen:
-        return []
+        return [], [], []
     seen.add(record)
     try:
         lines = record.read_text().splitlines()
     except OSError:
-        return []
-    left, nested = [], []
+        return [], [], []
+    ended, left, refused, nested = [], [], [], []
+    bound = int(suite_started)
+
+    def why_not(pid, started):
+        """Why pid is not to be signalled, or None."""
+        guard = never_signalled(pid)
+        if guard:
+            return guard
+        # Start times count clock ticks, so a process that started in the
+        # suite's own tick cannot be shown to be younger than it.
+        if not started.isdigit() or int(started) <= bound:
+            return "it did not start after the suite"
+        return None
+
     for line in lines:
         first, _, rest = line.partition(" ")
         if first == "record" and rest:
             nested.append(rest)
             continue
-        if not first.isdigit():
+        if not (first.isdigit() and rest):
+            refused.append(f"{record}: {line!r} is not a recorded group")
             continue
         leader = int(first)
-        identity = _proc_identity(leader)
-        if not rest or identity is None or identity[1] != rest:
+        if _started(leader) != rest:
             continue
-        family = {leader: rest, **_descendants(leader)}
+        reason = why_not(leader, rest)
+        if reason:
+            refused.append(f"{record}: pid {leader}, {reason}")
+            continue
+        family = {leader: rest, **_family(leader)}
+        for member, started in list(family.items()):
+            reason = why_not(member, started)
+            if reason:
+                refused.append(f"{record}: pid {member} under pid {leader}, {reason}")
+                del family[member]
         for number in (signal.SIGTERM, signal.SIGKILL):
-            with contextlib.suppress(OSError):
-                os.killpg(leader, number)
             for member, started in family.items():
-                if (_proc_identity(member) or (None, None))[1] == started:
+                if _started(member) == started:
                     with contextlib.suppress(OSError):
                         os.kill(member, number)
             deadline = time.monotonic() + grace
             while time.monotonic() < deadline and any(
-                    (_proc_identity(member) or (None, None))[1] == started
-                    for member, started in family.items()):
+                    _started(member) == started for member, started in family.items()):
                 time.sleep(0.05)
             running = [member for member, started in family.items()
-                       if (_proc_identity(member) or (None, None))[1] == started]
+                       if _started(member) == started]
             if not running:
                 break
+        ended += [member for member in family if member not in running]
         left += running
     for path in nested:
-        left += end_recorded_groups(path, grace, seen)
-    return sorted(left)
+        more = end_recorded_groups(path, suite_started, grace, seen)
+        ended, left, refused = ended + more[0], left + more[1], refused + more[2]
+    return sorted(ended), sorted(left), refused
 
 
 def run_suite(argv, timeout=None):
@@ -347,10 +444,11 @@ def run_suite(argv, timeout=None):
 
     The suite is told, through the variable owned_groups_variable names, a
     private file to write down the process groups it starts in sessions of
-    their own. When the suite did not end by itself, because the bound was
-    reached or a signal ended it, its own cleanup may not have run, so every
-    group written there is ended too, and any process still running after
-    that is named at the end of the run's stderr.
+    their own. After every run, whatever is written there and still running is
+    ended under end_recorded_groups' rules, bounded by the suite's own start
+    time, read as it starts. A suite that exited by itself and left any of it
+    running comes back with those processes in left_running; whatever was
+    ended, left running or refused is named at the end of the run's stderr.
     """
     timeout = SUITE_TIMEOUT_S if timeout is None else timeout
     with tempfile.TemporaryDirectory(prefix="probe-groups-") as owned:
@@ -358,24 +456,35 @@ def run_suite(argv, timeout=None):
         env = {**os.environ, owned_groups_variable(argv[1]): str(record)}
         with subprocess.Popen(list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True, start_new_session=True, env=env) as child:
+            # The bound for everything the record may name. A suite whose
+            # start cannot be read is bounded by now, which is later still.
+            suite_started = _started(child.pid) or str(1 << 62)
             try:
                 out, err = child.communicate(timeout=timeout)
                 returncode = child.returncode
-                left = end_recorded_groups(record) if returncode < 0 else []
+                said = end_recorded_groups(record, suite_started)
             except subprocess.TimeoutExpired:
                 end_group(child)
                 # Before the rest is read: a process the suite recorded can
                 # hold its pipes open, and the read would wait for it.
-                left = end_recorded_groups(record)
+                said = end_recorded_groups(record, suite_started)
                 try:
                     out, err = child.communicate(timeout=SUITE_GRACE_S)
                 except subprocess.TimeoutExpired:
                     out, err = "", ""
                 returncode = None
+        ended, left, refused = said
+        notes = [f"probe: refused to signal {sentence}" for sentence in refused]
+        if ended:
+            notes.append("probe: ended processes the suite recorded and left running: "
+                         + ", ".join(map(str, ended)))
         if left:
-            err += (f"\nprobe: still running after the suite and the groups it recorded "
-                    f"were ended: {', '.join(map(str, left))}\n")
-        return Run(tuple(argv), returncode, out, err, timeout)
+            notes.append("probe: still running after the suite and the groups it recorded "
+                         f"were ended: {', '.join(map(str, left))}")
+        if notes:
+            err += "\n" + "\n".join(notes) + "\n"
+        left_running = tuple(ended + left) if returncode is not None and returncode >= 0 else ()
+        return Run(tuple(argv), returncode, out, err, timeout, left_running)
 
 
 def read_listing(stdout):
@@ -1090,6 +1199,11 @@ def certification_gaps(expected, live, jobs, tool_digest, verifier_digest):
                     f"{again.selection}")
     if again.source != expected.source:
         gaps.append(f"the frozen source in use is not the one {expected.path} names")
+    # Asked last, so the inputs are read and judged whatever it finds.
+    replaced = replaced_functions()
+    if replaced:
+        gaps.append(f"functions replaced in the verifier after it was imported would run "
+                    f"code its bytes do not hold: {', '.join(replaced)}")
     return gaps + undecided(decided) + misplaced(decided, record)
 
 
@@ -1328,6 +1442,18 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
     clean = judge_report(runs[0][0], population, "clean")
     outcomes = [listed, clean]
     lines.append(f"clean: {said(clean)}")
+    # A certified run is one that cleaned up after itself: a suite that exited
+    # with processes it recorded still running would leave them on the machine
+    # had the verifier not ended them.
+    left = sorted({pid for run in runs[0] if run is not None for pid in run.left_running})
+    if certify and left:
+        lines.append("clean: the suite exited with processes it recorded still running, "
+                     f"which the verifier ended: {', '.join(map(str, left))}")
+        report = "\n".join(lines)
+        print(report, file=stream)
+        raise ProbeFailure(["the clean suite exited with processes it recorded still running "
+                            f"({', '.join(map(str, left))}); a certified run ends what it "
+                            "started"], report=report, outcomes=tuple(outcomes))
     if clean.stray:
         lines.append(f"clean: {len(clean.stray)} line(s) of output before the first row")
     if runs[0][1] is not None:
@@ -1375,10 +1501,11 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
 # literals in SYNTHETIC_RUNNER, in file order; a test mutation rewrites the
 # whole block, so any combination of knobs is one contiguous replacement.
 KNOBS = ("FAILING", "SUMMARY", "EXIT", "DROP", "EXTRA", "DUPLICATE", "DESCRIBE",
-         "SLEEP", "SIGNAL", "FILTER_LIES", "WRITE_BESIDE", "OWNED_DRIVER")
+         "SLEEP", "SIGNAL", "FILTER_LIES", "WRITE_BESIDE", "OWNED_DRIVER", "RECORD_LINES")
 KNOB_DEFAULTS = {"FAILING": [], "SUMMARY": "exact", "EXIT": None, "DROP": [], "EXTRA": [],
                  "DUPLICATE": [], "DESCRIBE": {}, "SLEEP": 0, "SIGNAL": None,
-                 "FILTER_LIES": False, "WRITE_BESIDE": None, "OWNED_DRIVER": None}
+                 "FILTER_LIES": False, "WRITE_BESIDE": None, "OWNED_DRIVER": None,
+                 "RECORD_LINES": []}
 SYNTHETIC_EXPECTED = {
     "target-check": "the check a case names",
     "other-check": "a check a case may justify as a co-failure",
@@ -2338,7 +2465,9 @@ def _selftest_checks(verifier):
             finally:
                 globals()["_json_record"] = real_record
             check("certification-reads-each-input-once",
-                  once == [] and reads == {source_path: 1, approved: 1}, repr((once, reads)))
+                  once == ["functions replaced in the verifier after it was imported would "
+                           "run code its bytes do not hold: _json_record"]
+                  and reads == {source_path: 1, approved: 1}, repr((once, reads)))
 
             # A certifying run names its timeout.
             commands_before = log.read_text()
@@ -2446,26 +2575,75 @@ def _selftest_checks(verifier):
                   verifier_selftest(lambda: print("a first line\nprobe checks: 3 ok, 0 failed"))
                   == "probe checks: 3 ok, 0 failed")
 
+            # Certification refuses a verifier with functions replaced after its
+            # import, so what a certifying run does differently is shown on a
+            # copy of this verifier with its text changed, certifying in an
+            # interpreter of its own where nothing is replaced. The copy's
+            # selftest says one fixed line, since the real one cannot run
+            # inside itself.
+            quick_selftest = (
+                '    return _selftest_checks(lambda: print("running; this certifying run is one '
+                'of its own "\n                                          "checks"))\n',
+                '    print("probe checks: 9 ok, 0 failed")\n    return 9\n')
+
+            def certified_by_a_copy(name, edits, case, extra_env=None):
+                """Certify case on a copy of this verifier changed by edits, in another interpreter."""
+                text = Path(__file__).read_text()
+                missing = [old[:60] for old, _new in edits if text.count(old) != 1]
+                if missing:
+                    return {"error": f"edits that do not apply once: {missing}"}
+                for old, new in edits:
+                    text = text.replace(old, new)
+                here = room / name
+                here.mkdir()
+                (here / "probe.py").write_text(text)
+                script = (
+                    "import io, json, os, sys\n"
+                    "given = json.loads(os.environ['PROBE_COPY_CALL'])\n"
+                    "sys.path.insert(0, given['copy'])\n"
+                    "import probe\n"
+                    "expected = probe.retained_expectation(given['mapping'], live=True, jobs=3, "
+                    "adjudications=given['adjudications'])\n"
+                    "stream = io.StringIO()\n"
+                    "try:\n"
+                    "    results = probe.expect([tuple(given['case'])], live=True, "
+                    "jobs=3, tool=probe.Path(given['tool']), expected=expected, timeout=20.0, "
+                    "certify=True, stream=stream)\n"
+                    "    said = {'certified': results.certified, 'first': results[0]['certified'],"
+                    " 'printed': stream.getvalue() or results.report}\n"
+                    "except probe.ProbeFailure as exc:\n"
+                    "    said = {'failures': list(exc.failures), "
+                    "'printed': stream.getvalue() or exc.report}\n"
+                    "print(json.dumps(said))\n")
+                call = {"copy": str(here), "case": list(case), "tool": str(tool),
+                        "mapping": str(source_path), "adjudications": str(approved)}
+                done = subprocess.run(
+                    [sys.executable, "-B", "-c", script], capture_output=True, text=True,
+                    timeout=180, env={**os.environ, **(extra_env or {}),
+                                      "PROBE_COPY_CALL": json.dumps(call)})
+                try:
+                    return json.loads(done.stdout.strip().splitlines()[-1])
+                except (ValueError, IndexError):
+                    return {"error": f"exit {done.returncode}: {done.stderr[-800:]}"}
+
             # A private copy that is not what it was copied from is refused
             # before any run.
-            real_copy = globals()["_private_copy"]
-
-            def altering(source_tool, source_comp, copy_room):
-                made = real_copy(source_tool, source_comp, copy_room)
-                with open(made[1], "ab") as companion_copy:
-                    companion_copy.write(b"#")
-                return made
-
             commands_before = log.read_text()
-            globals()["_private_copy"] = altering
-            try:
-                refused("certify-refused-when-the-private-copy-differs",
-                        lambda: expect([("target-check", knobs(), bite)], live=True, jobs=3,
-                                       tool=tool, expected=certifying, timeout=20.0,
-                                       certify=True, stream=io.StringIO(), verifier=verifier),
-                        "is not the tool, companion and test tree it was copied from")
-            finally:
-                globals()["_private_copy"] = real_copy
+            differing = certified_by_a_copy(
+                "verifier-differing-copy",
+                [quick_selftest,
+                 ('    shutil.copytree(tool.parent / "test", room / "test")\n'
+                  '    return copied_tool, copied_comp, _copy_files(room, copied_tool, '
+                  'copied_comp)\n',
+                  '    shutil.copytree(tool.parent / "test", room / "test")\n'
+                  '    with open(copied_comp, "ab") as companion_copy:\n'
+                  '        companion_copy.write(b"#")\n'
+                  '    return copied_tool, copied_comp, _copy_files(room, copied_tool, '
+                  'copied_comp)\n')],
+                ("target-check", knobs(), bite))
+            check("certify-refused-when-the-private-copy-differs",
+                  any("is not the tool, companion and test tree it was copied from" in failure
+                      for failure in differing.get("failures", ())), repr(differing)[:1500])
             check("certify-refused-for-a-differing-copy-runs-nothing",
                   log.read_text() == commands_before, log.read_text()[len(commands_before):])
 
@@ -2496,25 +2674,16 @@ def _selftest_checks(verifier):
                        "certifying run is one of its own checks\n") in stream.getvalue(),
                   stream.getvalue()[:600])
 
-            # The certifying path itself: selftest stands in for itself only by
-            # being replaced, so the run goes through verifier_selftest's own
-            # path, and every run of it, the listing too, uses the private copy.
-            stream = io.StringIO()
+            # The certifying path itself, on a copy whose selftest says one fixed
+            # line: every run of it, the listing too, uses the private copy, and
+            # the record names what the run rests on.
             paths_log = room / "paths.log"
-            os.environ["PROBE_SYNTHETIC_PATHS"] = str(paths_log)
-            globals()["selftest"] = lambda: print("probe checks: 9 ok, 0 failed")
-            try:
-                results = expect([("target-check", knobs(), knobs(FAILING=["target-check",
-                                                                            "other-check"]),
-                                   {"other-check": "the scripted failure names both"})],
-                                 live=True, jobs=3, tool=tool, expected=certifying, timeout=20.0,
-                                 certify=True, stream=stream)
-            except ProbeFailure as exc:
-                results = Results([{"certified": None}], None, "; ".join(exc.failures))
-            finally:
-                globals()["selftest"] = real_selftest
-                os.environ.pop("PROBE_SYNTHETIC_PATHS", None)
-            printed = stream.getvalue() or results.report
+            said = certified_by_a_copy(
+                "verifier-certifying", [quick_selftest],
+                ("target-check", knobs(), knobs(FAILING=["target-check", "other-check"]),
+                 {"other-check": "the scripted failure names both"}),
+                extra_env={"PROBE_SYNTHETIC_PATHS": str(paths_log)})
+            printed = said.get("printed") or said.get("error", "")
             ran_from = collections.Counter(
                 paths_log.read_text().splitlines() if paths_log.exists() else ())
             copy_line = next((line for line in printed.splitlines()
@@ -2528,7 +2697,7 @@ def _selftest_checks(verifier):
                   and ran_from[str(Path(copy_room) / tool.name)] == 3
                   and ran_from[str(tool)] == 0, repr((copy_line, ran_from)))
             check("certifying-run-records-its-provenance",
-                  results.certified is True and results[0]["certified"] is True
+                  said.get("certified") is True and said.get("first") is True
                   and printed.startswith("certifying: yes\n")
                   and f"expectation: {source_path} sha256 {certifying.sha256}" in printed
                   and (f"expectation frozen for source sha256 {tool_digest} (commit c0ffee, "
@@ -2543,6 +2712,56 @@ def _selftest_checks(verifier):
                   and "--failed checked for: clean\n" in printed
                   and "co-failure other-check: the scripted failure names both" in printed,
                   printed)
+
+            # X4: a function replaced after the import is named, and certification refused.
+            real_listing = globals()["judge_listing"]
+            globals()["judge_listing"] = lambda run, expected: real_listing(run, expected)
+            try:
+                gaps = certification_gaps(certifying, True, 3, tool_digest, VERIFIER_LOADED)
+            finally:
+                globals()["judge_listing"] = real_listing
+            check("certify-refused-when-a-function-was-replaced",
+                  gaps == ["functions replaced in the verifier after it was imported would run "
+                           "code its bytes do not hold: judge_listing"]
+                  and certification_gaps(certifying, True, 3, tool_digest, VERIFIER_LOADED)
+                  == [], repr(gaps))
+
+            # X2: a suite that exits with a driver it recorded still running is
+            # not certified; the verifier ends what it left.
+            leaving_room = room / "leaving"
+            (leaving_room / "test").mkdir(parents=True)
+            leaving_tool = leaving_room / "agent-resume"
+            leaving_tool.write_text(runner_text.replace(knobs(), knobs(OWNED_DRIVER="direct")))
+            leaving_tool.chmod(0o755)
+            (leaving_room / "_agent-resume").write_text("")
+            leaving_digest = hashlib.sha256(leaving_tool.read_bytes()).hexdigest()
+            leaving_path, leaving_approved = frozen_beside(
+                "expected-mapping-leaving", source={**source, "sha256": leaving_digest})
+            witness = room / "leaving-groups"
+            os.environ["PROBE_SYNTHETIC_GROUPS"] = str(witness)
+            try:
+                expect([("target-check", knobs(OWNED_DRIVER="direct"),
+                         knobs(OWNED_DRIVER="direct", FAILING=["target-check"]))],
+                       live=True, jobs=3, tool=leaving_tool,
+                       expected=retained_expectation(leaving_path, live=True, jobs=3,
+                                                     adjudications=leaving_approved),
+                       timeout=20.0, certify=True, stream=io.StringIO(), verifier=verifier)
+                left_refusal = None
+            except ProbeFailure as exc:
+                left_refusal = exc.failures
+            finally:
+                os.environ.pop("PROBE_SYNTHETIC_GROUPS", None)
+            named = ([tuple(line.split()) for line in witness.read_text().splitlines()]
+                     if witness.exists() else [])
+            still = [int(pid) for pid, born in named
+                     if (_proc_identity(int(pid)) or (None, None, None))[2] == born]
+            for pid in still:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+            check("certify-refused-when-the-suite-left-recorded-processes",
+                  bool(left_refusal) and "exited with processes it recorded still running"
+                  in left_refusal[0] and bool(named) and not still,
+                  repr((left_refusal, named, still)))
             try:
                 expect([("target-check", knobs(), bite)], live=True, jobs=2, tool=tool,
                        expected=retained, timeout=20.0, stream=io.StringIO())
@@ -2640,8 +2859,7 @@ def _selftest_checks(verifier):
                 os.environ.pop("PROBE_SYNTHETIC_GROUPS", None)
             named = ([tuple(line.split()) for line in witness.read_text().splitlines()]
                      if witness.exists() else [])
-            alive = [int(pid) for pid, started in named
-                     if (_proc_identity(int(pid)) or (None, None))[1] == started]
+            alive = [int(pid) for pid, started in named if _started(int(pid)) == started]
             for pid in alive:
                 with contextlib.suppress(OSError):
                     os.kill(pid, signal.SIGKILL)
@@ -2666,17 +2884,132 @@ def _selftest_checks(verifier):
         try:
             record = Path(td) / "stranger-groups"
             record.write_text(f"{stranger.pid} 1\n")
-            left = end_recorded_groups(record, grace=0.5)
+            said = end_recorded_groups(record, _started(stranger.pid) or "0", grace=0.5)
             # A signal takes effect when the process next runs, so the
             # stranger is asked about a second later rather than at once.
             with contextlib.suppress(subprocess.TimeoutExpired):
                 stranger.wait(timeout=1.0)
             check("recorded-pid-with-another-start-time-left-alone",
-                  stranger.poll() is None and left == [],
-                  f"returncode {stranger.poll()}, left {left}")
+                  stranger.poll() is None and said == ([], [], []),
+                  f"returncode {stranger.poll()}, said {said}")
         finally:
             stranger.kill()
             stranger.wait()
+
+        # X1: a process that started before the suite is never signalled,
+        # whatever a record says. The only process recorded here is this
+        # test's own sleeper, started before the suite.
+        older = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        try:
+            older_line = f"{older.pid} {_started(older.pid)}"
+            # Some clock ticks apart, so the sleeper is older than the suite
+            # and not only in the same tick.
+            time.sleep(0.1)
+            run, named, alive = recorded_driver_run("older", 3.0, RECORD_LINES=[older_line],
+                                                    SLEEP=30)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                older.wait(timeout=1.0)
+            check("recorded-process-older-than-the-suite-left-alone",
+                  run.returncode is None and older.poll() is None
+                  and "refused to signal" in run.stderr
+                  and f"pid {older.pid}, it did not start after the suite" in run.stderr,
+                  f"returncode {run.returncode}, older {older.poll()}, stderr "
+                  f"{run.stderr[-400:]!r}")
+        finally:
+            older.kill()
+            older.wait()
+
+        # The guards that hold whatever a record says: read, never signalled.
+        sleeper = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        # A process of this test's own named systemd, which no other guard
+        # covers: the machine's own managers are pid 1 or this run's ancestors.
+        named_systemd = Path(td) / "systemd"
+        named_systemd.symlink_to(shutil.which("sleep"))
+        imitation = subprocess.Popen([str(named_systemd), "30"], start_new_session=True)
+        # Named only once it has executed; until then it is a copy of this process.
+        deadline = time.monotonic() + 10
+        while (_read_text(f"/proc/{imitation.pid}/comm") != "systemd"
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+        try:
+            managers = [int(entry.name) for entry in Path("/proc").iterdir()
+                        if entry.name.isdigit() and _read_text(entry / "comm") == "systemd"]
+            guarded = {
+                "pid 1": never_signalled(1) == "pid 1",
+                "the verifier": never_signalled(os.getpid()) == "the verifier itself",
+                "its parent": never_signalled(os.getppid()) == "an ancestor of the verifier",
+                # Asked of each one still named systemd when it is asked: other
+                # runs' processes come and go between the scan and the question.
+                "every systemd process": all(
+                    never_signalled(pid) or _read_text(f"/proc/{pid}/comm") != "systemd"
+                    for pid in managers),
+                "a process named systemd": never_signalled(imitation.pid) == "a systemd process",
+                "not a process this test started": never_signalled(sleeper.pid) is None,
+            }
+        finally:
+            for started in (sleeper, imitation):
+                started.kill()
+                started.wait()
+        wrong = sorted(name for name, ok in guarded.items() if not ok)
+        check("never-signalled-guards-the-verifier-its-ancestors-and-the-manager",
+              not wrong, ", ".join(wrong) + f"; {len(managers)} systemd process(es)")
+
+        # X2: a suite that exits by itself with a recorded driver still
+        # running has it ended, and says so.
+        run, named, alive = recorded_driver_run("exited", 20.0, OWNED_DRIVER="direct")
+        check("suite-exiting-with-recorded-processes-running-has-them-ended",
+              run.returncode == 0 and len(named) == 2 and not alive
+              and sorted(run.left_running) == sorted(int(pid) for pid, _born in named)
+              and "ended processes the suite recorded and left running" in run.stderr,
+              f"returncode {run.returncode}, left_running {run.left_running}, named {named}, "
+              f"alive {alive}, stderr {run.stderr[-300:]!r}")
+        run, named, alive = recorded_driver_run("clean", 20.0)
+        check("self-exiting-suite-that-recorded-nothing-has-nothing-ended",
+              run.returncode == 0 and run.left_running == () and "probe:" not in run.stderr,
+              f"returncode {run.returncode}, left_running {run.left_running}, "
+              f"stderr {run.stderr[-300:]!r}")
+
+        # X3: what a record file can be other than a list of live groups.
+        missing = Path(td) / "no-such-record"
+        malformed = Path(td) / "malformed-record"
+        malformed.write_text("not a group\n12\n")
+        first, second = Path(td) / "record-a", Path(td) / "record-b"
+        first.write_text(f"record {second}\n")
+        second.write_text(f"record {first}\n")
+        try:
+            missing_said = end_recorded_groups(missing, "0")
+        except OSError as exc:
+            missing_said = f"raised {exc!r}"
+        check("missing-record-file-ends-nothing", missing_said == ([], [], []),
+              repr(missing_said))
+        malformed_said = end_recorded_groups(malformed, "0")
+        check("malformed-record-lines-are-refused-and-named",
+              malformed_said[:2] == ([], []) and len(malformed_said[2]) == 2
+              and all("is not a recorded group" in sentence for sentence in malformed_said[2]),
+              repr(malformed_said))
+        try:
+            cycled = end_recorded_groups(first, "0")
+        except RecursionError:
+            cycled = "the two files kept naming each other"
+        check("record-files-are-read-once", cycled == ([], [], []), repr(cycled))
+        real_ending = globals()["end_recorded_groups"]
+        globals()["end_recorded_groups"] = lambda record, started, *rest: ([], [4242], [])
+        try:
+            run, _named, _alive = recorded_driver_run("leftover", 20.0)
+        finally:
+            globals()["end_recorded_groups"] = real_ending
+        check("processes-left-running-are-named-on-stderr",
+              "still running after the suite and the groups it recorded were ended: 4242"
+              in run.stderr, repr(run.stderr[-300:]))
+
+        # X5: the variable is named after the file the tool is, as the tool names it.
+        named_file = Path(td) / "agent-resume"
+        named_file.write_text("")
+        other_name = Path(td) / "other-name"
+        other_name.symlink_to(named_file)
+        check("owned-groups-variable-is-named-from-the-resolved-tool",
+              owned_groups_variable(other_name) == "AGENT_RESUME_SELFTEST_OWNED_GROUPS",
+              owned_groups_variable(other_name))
     if was_groups is not None:
         os.environ["PROBE_SYNTHETIC_GROUPS"] = was_groups
 
