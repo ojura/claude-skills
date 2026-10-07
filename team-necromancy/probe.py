@@ -11,7 +11,7 @@ mutants run with at most four suites active at once.
     probe.expect([
         ("check-id", "old text", "new text"),
         ("other-id", "old text", "new text", {"second-id": "why it fails too"}),
-    ], live=True, jobs=2, expected=retained, certify=True)
+    ], live=True, jobs=2, expected=retained, timeout=600, certify=True)
 
 A case succeeds only when its mutant fails exactly the checks it names: the
 named check and each co-failure, with the reason the caller wrote down for it.
@@ -33,11 +33,13 @@ writes all of them into its report so a verification record says which
 expectation judged it.
 
 Certification is asked for, not inferred: ``expect(..., certify=True)`` runs
-only with such a retained expectation, adjudications included, that still
-reads the same from its files, whose adjudications are all decided and whose
-frozen source is the tool under test, and only after the verifier's own
-selftest passes; its result says it certified. Every other call is a
-development run. Without ``expected`` the clean listing stands in for the
+only with a timeout of its own and such a retained expectation, adjudications
+included, that still reads the same from its files, whose adjudications are all
+decided and name rows of the mapping in selections that emit them, and whose
+frozen source is the tool under test; only while the verifier on disk is the
+one this process loaded, and only after the verifier's own selftest passes. Its
+clean suite runs from a private copy of the tool tree, and its result says it
+certified. Every other call is a development run. Without ``expected`` the clean listing stands in for the
 population, which checks that the listing, the clean run and the mutants agree
 with each other and nothing more; a bare mapping has no recorded origin. Both
 still judge every run strictly, and both return a result that says it
@@ -82,6 +84,11 @@ FAILED_SUMMARY = re.compile(r"checks: (\d+) ok, (\d+) failed")
 # The stand-in suite probe's own tests run against, beside the corpus.
 SYNTHETIC_RUNNER = TOOL.parent / "test" / "fixtures" / "synthetic_runner.py"
 VERIFIER = Path(__file__).resolve()
+# The sha256 of the bytes this process loaded as the verifier, read once as the
+# module is imported. A certifying run names the verifier in its record, and a
+# reader checks the file on disk, so certification is refused when that file is
+# no longer these bytes.
+VERIFIER_LOADED = hashlib.sha256(VERIFIER.read_bytes()).hexdigest()
 
 
 class ProbeFailure(AssertionError):
@@ -628,6 +635,23 @@ def retained_expectation(path, *, live=False, jobs=1, adjudications=None):
     """
     path = Path(path)
     data, record = _json_record(path, "expected mapping")
+    if adjudications is None:
+        return _expectation_from(path, data, record, live, jobs)
+    adjudications = Path(adjudications)
+    return _expectation_from(path, data, record, live, jobs, adjudications,
+                             *_json_record(adjudications, "adjudications"))
+
+
+def _expectation_from(path, data, record, live, jobs, adjudications=None, adjudicated=b"",
+                      decided=None):
+    """The Expectation a mapping file's bytes give for one selection, or a refusal.
+
+    data and record are the mapping file's bytes and what they parse to;
+    adjudicated and decided the same for the adjudications record, when one
+    is named. Nothing is read here, so what is judged is exactly what the
+    caller read and hashed: retained_expectation reads each file once, and
+    certification reads each once again and judges those bytes.
+    """
     if not isinstance(record, dict) or record.get("schema") != "expected-mapping-v1":
         raise ProbeFailure([f"{path} does not carry schema expected-mapping-v1"])
     digest = hashlib.sha256(data).hexdigest()
@@ -675,8 +699,6 @@ def retained_expectation(path, *, live=False, jobs=1, adjudications=None):
     mapping = types.MappingProxyType(_normalize_expected(pairs))
     adjudications_digest = ""
     if adjudications is not None:
-        adjudications = Path(adjudications)
-        adjudicated, decided = _json_record(adjudications, "adjudications")
         named = (decided.get("frozen_mapping") or {}) if isinstance(decided, dict) else {}
         if not isinstance(named, dict) or named.get("sha256") != digest:
             raise ProbeFailure([f"adjudications {adjudications} do not name this mapping "
@@ -780,15 +802,50 @@ def undecided(record):
         return ["the adjudications record holds no entries list"]
     gaps = []
     for at, entry in enumerate(entries, 1):
-        decision = entry.get("decision") if isinstance(entry, dict) else None
-        if not (isinstance(decision, str) and decision.startswith(("approved", "refused"))):
-            named = entry.get("id") if isinstance(entry, dict) else None
-            gaps.append(f"adjudication entry {at}" + (f" ({named!r})" if named else "")
-                        + f" is not decided: its decision is {decision!r}")
+        if not isinstance(entry, dict):
+            gaps.append(f"adjudication entry {at} is not an object")
+            continue
+        named = f"adjudication entry {at}" + (f" ({entry['id']!r})" if entry.get("id") else "")
+        decision = entry.get("decision")
+        if "decision" not in entry:
+            gaps.append(f"{named} has no decision")
+        elif not (isinstance(decision, str) and decision.strip()):
+            gaps.append(f"{named} has an empty decision: {decision!r}")
+        elif not decision.startswith(("approved", "refused")):
+            gaps.append(f"{named} is not decided: its decision is {decision!r}")
     return gaps
 
 
-def certification_gaps(expected, live, jobs, tool_digest):
+def misplaced(record, mapping):
+    """The adjudication entries that name no row of the mapping in a selection emitting it, as sentences.
+
+    record is the approved-adjudications record and mapping the frozen
+    mapping file it names, both as parsed. An entry decides about one row in
+    one selection, so its id must be a row of the mapping and its mode a
+    selection of the mapping in which that row is emitted, a key of the row's
+    emitted_in. An entry that is not an object is undecided's to name.
+    """
+    rows = {row.get("id"): row for row in (mapping.get("rows") or [])
+            if isinstance(row, dict)} if isinstance(mapping, dict) else {}
+    modes = (mapping.get("modes") or {}) if isinstance(mapping, dict) else {}
+    gaps = []
+    for at, entry in enumerate((record.get("entries") or []) if isinstance(record, dict) else [], 1):
+        if not isinstance(entry, dict):
+            continue
+        cid, mode = entry.get("id"), entry.get("mode")
+        emitted = rows.get(cid, {}).get("emitted_in")
+        if cid not in rows:
+            gaps.append(f"adjudication entry {at} names {cid!r}, which is no row of the mapping")
+        elif not isinstance(modes, (dict, list)) or mode not in modes:
+            gaps.append(f"adjudication entry {at} ({cid!r}) names the mode {mode!r}, which is "
+                        "no selection of the mapping")
+        elif not isinstance(emitted, (dict, list)) or mode not in emitted:
+            gaps.append(f"adjudication entry {at} ({cid!r}) names the mode {mode!r}, in which "
+                        "that row is not emitted")
+    return gaps
+
+
+def certification_gaps(expected, live, jobs, tool_digest, verifier_digest):
     """Why expected cannot back a certifying run of this tool; empty when it can.
 
     A certifying run rests on a retained expectation read from its frozen
@@ -796,10 +853,14 @@ def certification_gaps(expected, live, jobs, tool_digest):
     commit and path, and the approved adjudications behind it, because those
     are what a later reader checks the record against. The fields an
     Expectation carries are only what it says of itself, so the file and the
-    adjudications record are read again here and must give the same bytes,
-    the same mapping and the same source, and every adjudication must be
-    decided. The plan accepts one exact executable, so the tool must be the
-    source the mapping was frozen for; a changed tool needs its own mapping.
+    adjudications record are each read once more here, hashed, and judged
+    from those same bytes: they must give the same mapping and the same
+    source, every adjudication must be decided, and every entry must name a
+    row of the mapping in a selection that emits it. The plan accepts one
+    exact executable, so the tool must be the source the mapping was frozen
+    for; a changed tool needs its own mapping. verifier_digest is the sha256
+    of the verifier file as the run found it on disk, which must be the
+    VERIFIER_LOADED this process runs.
     """
     if expected is None:
         return ["no expectation was supplied, so the listing would stand in for "
@@ -808,6 +869,10 @@ def certification_gaps(expected, live, jobs, tool_digest):
         return ["the expectation is a bare mapping with no recorded origin; read it "
                 "with retained_expectation"]
     gaps = []
+    if verifier_digest != VERIFIER_LOADED:
+        gaps.append(f"the verifier {VERIFIER} on disk has sha256 {verifier_digest}, not the "
+                    f"{VERIFIER_LOADED} this process loaded, so the record would name a "
+                    "verifier that did not judge the run")
     if not (expected.path and expected.sha256):
         gaps.append("the expectation names no file and hash it was read from")
     gaps += [f"the expectation's frozen source names no {key}"
@@ -822,20 +887,27 @@ def certification_gaps(expected, live, jobs, tool_digest):
         gaps.append(f"the tool's sha256 {tool_digest} is not {expected.source['sha256']}, "
                     "the source the expectation was frozen for; a changed tool needs its "
                     "own frozen mapping")
-    # The bytes first: a file that changed since it was read is named as changed,
-    # before anything read from it is compared.
+    # One read of each file. The bytes come first: a file that changed since
+    # it was read is named as changed, before anything read from it is
+    # compared, and what is compared is what those bytes parse to.
     try:
-        for path, recorded in ((expected.path, expected.sha256),
-                               (expected.adjudications, expected.adjudications_sha256)):
-            current = hashlib.sha256(_json_record(path, "a certified input")[0]).hexdigest()
-            if current != recorded:
-                gaps.append(f"{path} now has sha256 {current}, not the {recorded} the "
-                            "expectation was read with")
-        if gaps:
-            return gaps
-        again = retained_expectation(expected.path, live=live, jobs=jobs,
-                                     adjudications=expected.adjudications)
-        _bytes, decided = _json_record(expected.adjudications, "adjudications")
+        data, record = _json_record(expected.path, "a certified input")
+        adjudicated, decided = _json_record(expected.adjudications, "a certified input")
+    except ProbeFailure as exc:
+        return gaps + [f"the expectation no longer reads from its files: {failure}"
+                       for failure in exc.failures]
+    for path, read, recorded in ((expected.path, data, expected.sha256),
+                                 (expected.adjudications, adjudicated,
+                                  expected.adjudications_sha256)):
+        current = hashlib.sha256(read).hexdigest()
+        if current != recorded:
+            gaps.append(f"{path} now has sha256 {current}, not the {recorded} the "
+                        "expectation was read with")
+    if gaps:
+        return gaps
+    try:
+        again = _expectation_from(expected.path, data, record, live, jobs,
+                                  expected.adjudications, adjudicated, decided)
     except ProbeFailure as exc:
         return gaps + [f"the expectation no longer reads from its files: {failure}"
                        for failure in exc.failures]
@@ -844,35 +916,31 @@ def certification_gaps(expected, live, jobs, tool_digest):
                     f"{again.selection}")
     if again.source != expected.source:
         gaps.append(f"the frozen source in use is not the one {expected.path} names")
-    return gaps + undecided(decided)
+    return gaps + undecided(decided) + misplaced(decided, record)
 
 
-# Whether the verifier's own selftest is running, so a certifying expect it
-# calls among its own checks does not start it again.
-_SELFTEST = {"running": False}
-
-
-def verifier_selftest():
+def verifier_selftest(run=None):
     """The verifier's own selftest, run before a certifying run, as its summary line.
 
     Section 5A has the verifier tested before its conclusions are used as
-    acceptance, so certification runs it first and refuses when it fails. Its
-    output is taken into a buffer; the summary line goes into the record.
+    acceptance, so certification runs it first and refuses when it fails. run
+    is the selftest to run: selftest itself, or a stand-in a caller hands in,
+    as the verifier's own tests do. Its output is taken into a buffer; its
+    last line goes into the record.
     """
-    if _SELFTEST["running"]:
-        return "running; this certifying run is one of its own checks"
     said = io.StringIO()
     try:
         with contextlib.redirect_stdout(said):
-            selftest()
+            (selftest if run is None else run)()
     except ProbeFailure as exc:
         raise ProbeFailure([f"the verifier's own selftest failed: {failure}"
                             for failure in exc.failures])
-    return said.getvalue().strip().splitlines()[-1]
+    lines = said.getvalue().strip().splitlines()
+    return lines[-1] if lines else "it printed nothing"
 
 
 def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
-           filtering=False, certify=False, stream=None):
+           filtering=False, certify=False, stream=None, verifier=None):
     """Run expected mutations and raise unless every case is proved.
 
     ``cases`` holds ``(check_id, old_text, new_text)`` triples, each with an
@@ -887,15 +955,21 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
     be the failures of the unfiltered one and nothing else.
 
     ``certify`` asks for a certifying run. It is refused before any suite runs
-    unless ``expected`` came from ``retained_expectation`` with its source and
-    approved adjudications, reads again from its files as it was read, every
-    adjudication is decided, the tool is the source the mapping was frozen for
-    and the verifier's own selftest passes. A certifying run always checks the
-    clean run's --failed report too, and its record names the inputs with
-    their hashes, the interpreter, the timeout, the selftest's result, the runs
-    whose --failed output was checked and every co-failure's reason. Without
-    it the run judges just as strictly and its result says it certified
-    nothing.
+    unless it names its timeout, ``expected`` came from
+    ``retained_expectation`` with its source and approved adjudications, reads
+    again from its files as it was read, every adjudication is decided and
+    names a row of the mapping in a selection that emits it, the tool is the
+    source the mapping was frozen for, the verifier on disk is the one this
+    process loaded and the verifier's own selftest passes. ``verifier`` is
+    that selftest: selftest itself when it is None, or a stand-in the caller
+    supplies, which the record names as one; the verifier's own tests supply
+    one, since a selftest that started itself would not end. A certifying run
+    runs the clean suite from a private copy of the tool, its companion and
+    its test tree, with the same hashes, and checks the clean run's --failed
+    report too. Its record names the inputs and the copy with their hashes,
+    the interpreter, the timeout, the selftest's result, the runs whose
+    --failed output was checked and every co-failure's reason. Without it the
+    run judges just as strictly and its result says it certified nothing.
 
     The successful return is a Results tuple with one result dictionary per
     case: the check, the mutated file, the ids that failed and the
@@ -912,6 +986,11 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
             raise ProbeFailure([f"the {what} {needed} is not a file; every suite run needs "
                                 "the tool and its companion side by side"])
     stream = sys.stdout if stream is None else stream
+    # The default bound is for development runs; a certifying record states
+    # the bound its caller chose for the runs it certifies.
+    if certify and timeout is None:
+        raise ProbeFailure(["a certifying run names its timeout: pass timeout, since the "
+                            "default is for development runs"])
     timeout = SUITE_TIMEOUT_S if timeout is None else timeout
     selection = selection_name(live, jobs)
     watched = fingerprints(watched_files(tool, comp))
@@ -921,11 +1000,13 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
                             f"this run is {selection}"])
     checked_verifier = None
     if certify:
-        gaps = certification_gaps(expected, live, jobs, tool_digest)
+        gaps = certification_gaps(expected, live, jobs, tool_digest, watched[VERIFIER])
         if gaps:
             raise ProbeFailure([f"a certifying run needs a retained expectation: {gap}"
                                 for gap in gaps])
-        checked_verifier = verifier_selftest()
+        checked_verifier = verifier_selftest(verifier)
+        if verifier is not None:
+            checked_verifier = f"a stand-in the caller supplied said: {checked_verifier}"
     count, digest = tree_digest(watched, tool.parent / "test")
     lines = [f"tool: {tool} sha256 {tool_digest}",
              f"companion: {comp} sha256 {watched[comp]}",
@@ -995,6 +1076,26 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
         return full, filtered
 
     with tempfile.TemporaryDirectory() as scratch:
+        # A certifying run's clean suite runs from a copy nothing else touches,
+        # hashed after copying, so the record names the bytes that ran.
+        clean_tool = tool
+        if certify:
+            room = Path(scratch) / "clean"
+            room.mkdir()
+            clean_tool, clean_comp = room / tool.name, room / comp.name
+            shutil.copy2(tool, clean_tool)
+            shutil.copy2(comp, clean_comp)
+            shutil.copytree(tool.parent / "test", room / "test")
+            copied = fingerprints([clean_tool, clean_comp, *sorted(
+                item for item in (room / "test").rglob("*") if item.is_file())])
+            copied_count, copied_digest = tree_digest(copied, room / "test")
+            if (copied[clean_tool], copied[clean_comp], copied_digest) != (
+                    tool_digest, watched[comp], digest):
+                raise ProbeFailure([f"the private copy {room} is not the tool, companion and "
+                                    "test tree it was copied from"])
+            lines.append(f"clean run from a private copy: {room}: tool sha256 "
+                         f"{copied[clean_tool]}, companion sha256 {copied[clean_comp]}, "
+                         f"test tree {copied_count} file(s), digest {copied_digest}")
         copies = []
         for at, (_check, old, new, _co_failures, target) in enumerate(prepared, 1):
             room = Path(scratch) / f"case-{at}"
@@ -1005,8 +1106,8 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
             (room / target.name).write_text(target.read_text().replace(old, new, 1))
             shutil.copytree(tool.parent / "test", room / "test")
             copies.append(copy)
-        runs = batch([(tool, filtering or certify), *((copy, filtering) for copy in copies)],
-                     run_one)
+        runs = batch([(clean_tool, filtering or certify),
+                      *((copy, filtering) for copy in copies)], run_one)
     labels = ["clean", *(f"case {at}" for at in range(1, len(prepared) + 1))]
     lines.append("--failed checked for: " + (", ".join(
         label for label, (_full, filtered) in zip(labels, runs) if filtered is not None)
@@ -1111,18 +1212,16 @@ def selftest():
     shown to come from exactly the input it is about. The processes are copies
     of the stand-in runner in a private room, so the whole path from command
     to refusal is exercised on real exits, a real signal and a real timeout.
-    While it runs, a certifying expect among its checks records that it is one
-    of them instead of starting the selftest again.
+    A certifying expect among its checks is handed a stand-in for this
+    selftest, which says it is one of these checks, since one that started
+    the selftest again would not end.
     """
-    _SELFTEST["running"] = True
-    try:
-        return _selftest_checks()
-    finally:
-        _SELFTEST["running"] = False
+    return _selftest_checks(lambda: print("running; this certifying run is one of its own "
+                                          "checks"))
 
 
-def _selftest_checks():
-    """The checks selftest runs; see selftest."""
+def _selftest_checks(verifier):
+    """The checks selftest runs; see selftest. verifier is the stand-in for certifying runs."""
     checks = []
 
     def check(name, ok, detail=""):
@@ -1568,6 +1667,24 @@ def _selftest_checks():
             refused(name, lambda options=options: retained_expectation(record_path, **options),
                     phrase)
 
+    # Each way an adjudication entry can lack a decision is named its own way,
+    # and a refusal is a decision.
+    for name, entries, wanted in (
+        ("undecided-accepts-a-refused-decision",
+         [{"id": "x", "decision": "refused: not a row of this mapping"}], []),
+        ("undecided-names-an-empty-decision", [{"id": "x", "decision": ""}],
+         ["adjudication entry 1 ('x') has an empty decision: ''"]),
+        ("undecided-names-a-missing-decision", [{"id": "x"}],
+         ["adjudication entry 1 ('x') has no decision"]),
+        ("undecided-names-an-entry-that-is-not-an-object", ["x"],
+         ["adjudication entry 1 is not an object"]),
+    ):
+        try:
+            got = undecided({"entries": entries})
+        except Exception as exc:
+            got = f"raised {type(exc).__name__}: {exc}"
+        check(name, got == wanted, repr(got))
+
     # The digest of a test tree follows every file's name and bytes.
     with tempfile.TemporaryDirectory() as td:
         tree = Path(td) / "test"
@@ -1824,6 +1941,13 @@ def _selftest_checks():
                       log.read_text()[len(commands_before):])
             finally:
                 (room / "companion-aside").rename(companion)
+            # A tool that is not there could not run whatever expect did, so what
+            # tells the refusal apart is that it names the tool.
+            absent_tool = room / "no-tool-here"
+            refused("missing-tool-refused-before-any-run",
+                    lambda: expect([("target-check", knobs(), bite)], live=True, jobs=3,
+                                   tool=absent_tool, timeout=20.0, stream=io.StringIO()),
+                    f"the tool {absent_tool} is not a file")
 
             # Certification: refused before any suite runs unless the expectation
             # is read from its frozen file with its source and decided
@@ -1846,7 +1970,25 @@ def _selftest_checks():
                 "expected-mapping-other-tool", source={**source, "sha256": "f" * 64})
             pending_path, pending_approved = frozen_beside(
                 "expected-mapping-pending",
-                entries=[{"id": "target-check", "decision": "pending review"}])
+                entries=[{"id": "target-check", "mode": "live-jobs-3",
+                          "decision": "pending review"}])
+            # The entry rule: an id that is no row, a mode that is no selection,
+            # and a mode in which the row is withheld. The last needs a mapping
+            # with a second selection that withholds a row.
+            stray_path, stray_approved = frozen_beside(
+                "expected-mapping-entry-no-row",
+                entries=[{"id": "no-such-check", "mode": "live-jobs-3", "decision": "approved"}])
+            unmoded_path, unmoded_approved = frozen_beside(
+                "expected-mapping-entry-no-selection",
+                entries=[{"id": "target-check", "mode": "live-jobs-9", "decision": "approved"}])
+            withheld_path = room / "expected-mapping-entry-withheld.json"
+            withheld_path.write_bytes(frozen(
+                [(cid, description, ("live-jobs-3",) if cid == "target-check"
+                  else ("live-jobs-3", "read-only"), ("read-only",) if cid == "target-check"
+                  else ()) for cid, description in SYNTHETIC_EXPECTED.items()],
+                modes=("live-jobs-3", "read-only"), source=source))
+            withheld_approved = adjudicating(withheld_path, entries=[
+                {"id": "target-check", "mode": "read-only", "decision": "approved"}])
             bare_path, _bare = frozen_beside("expected-mapping-no-entries")
             bare_approved = adjudicating(bare_path, record={"frozen_mapping": {
                 "sha256": hashlib.sha256(bare_path.read_bytes()).hexdigest()}})
@@ -1911,11 +2053,28 @@ def _selftest_checks():
                 ("certify-adjudications-without-entries-refused",
                  retained_expectation(bare_path, live=True, jobs=3, adjudications=bare_approved),
                  ["the adjudications record holds no entries list"]),
+                ("certify-with-a-replaced-source-refused",
+                 dataclasses.replace(certifying, source={**source, "commit": "beefcafe"}),
+                 [f"the frozen source in use is not the one {source_path} names"]),
+                ("certify-entry-naming-no-row-refused",
+                 retained_expectation(stray_path, live=True, jobs=3, adjudications=stray_approved),
+                 ["adjudication entry 1 names 'no-such-check', which is no row of the mapping"]),
+                ("certify-entry-naming-no-selection-refused",
+                 retained_expectation(unmoded_path, live=True, jobs=3,
+                                      adjudications=unmoded_approved),
+                 ["adjudication entry 1 ('target-check') names the mode 'live-jobs-9', which is "
+                  "no selection of the mapping"]),
+                ("certify-entry-in-a-mode-withholding-its-row-refused",
+                 retained_expectation(withheld_path, live=True, jobs=3,
+                                      adjudications=withheld_approved),
+                 ["adjudication entry 1 ('target-check') names the mode 'read-only', in which "
+                  "that row is not emitted"]),
             ):
                 commands_before = log.read_text()
                 try:
                     expect([("target-check", knobs(), bite)], live=True, jobs=3, tool=tool,
-                           expected=given, timeout=20.0, certify=True, stream=io.StringIO())
+                           expected=given, timeout=20.0, certify=True, stream=io.StringIO(),
+                           verifier=verifier)
                 except ProbeFailure as exc:
                     check(name, exc.failures == tuple(wanted + gap for gap in gaps)
                           and log.read_text() == commands_before, repr(exc.failures))
@@ -1924,8 +2083,17 @@ def _selftest_checks():
                 else:
                     check(name, False, "expect returned")
 
-            # The form of mapping v1's approved record, field for field, certifies.
-            v1_path, v1_approved = frozen_beside("expected-mapping-v1-form", record={})
+            # The form of mapping v1's approved record, field for field, certifies,
+            # against a mapping that has the rows and modes its entries name.
+            v1_path = room / "expected-mapping-v1-form.json"
+            v1_rows = [(cid, description, ("live-jobs-1", "live-jobs-2", "live-jobs-3",
+                                           "live-jobs-4"), ())
+                       for cid, description in SYNTHETIC_EXPECTED.items()]
+            v1_rows.append(("read-only-tier-runs-no-tmux", "the read-only tier runs no tmux",
+                            ("live-jobs-1", "live-jobs-2", "live-jobs-4"), ("live-jobs-3",)))
+            v1_path.write_bytes(frozen(v1_rows, modes=("live-jobs-1", "live-jobs-2", "live-jobs-3",
+                                                       "live-jobs-4"), source=source))
+            v1_approved = adjudicating(v1_path, record={})
             v1_approved.write_text(json.dumps({
                 "recorded_at_zagreb": "2026-10-07T03:32:05+02:00", "recorded_by": "a reviewer",
                 "decided_by": "the lead",
@@ -1946,37 +2114,97 @@ def _selftest_checks():
                 "consequence": "the listing changes", "note": "a note"}))
             v1_form = retained_expectation(v1_path, live=True, jobs=3, adjudications=v1_approved)
             check("certify-accepts-the-v1-adjudications-form",
-                  certification_gaps(v1_form, True, 3, tool_digest) == [],
-                  repr(certification_gaps(v1_form, True, 3, tool_digest)))
+                  certification_gaps(v1_form, True, 3, tool_digest, VERIFIER_LOADED) == [],
+                  repr(certification_gaps(v1_form, True, 3, tool_digest, VERIFIER_LOADED)))
+
+            # Each input is read once and judged as read.
+            reads = collections.Counter()
+            real_record = globals()["_json_record"]
+
+            def counting(path, what):
+                reads[Path(path)] += 1
+                return real_record(path, what)
+
+            globals()["_json_record"] = counting
+            try:
+                once = certification_gaps(certifying, True, 3, tool_digest, VERIFIER_LOADED)
+            finally:
+                globals()["_json_record"] = real_record
+            check("certification-reads-each-input-once",
+                  once == [] and reads == {source_path: 1, approved: 1}, repr((once, reads)))
+
+            # A certifying run names its timeout.
+            commands_before = log.read_text()
+            refused("certify-without-a-timeout-refused",
+                    lambda: expect([("target-check", knobs(), bite)], live=True, jobs=3, tool=tool,
+                                   expected=certifying, certify=True, stream=io.StringIO(),
+                                   verifier=verifier),
+                    "a certifying run names its timeout")
+            check("certify-without-a-timeout-runs-nothing", log.read_text() == commands_before,
+                  log.read_text()[len(commands_before):])
+
+            # The verifier on disk is the one this process loaded.
+            loaded = globals()["VERIFIER_LOADED"]
+            globals()["VERIFIER_LOADED"] = "0" * 64
+            try:
+                refused("certify-refused-when-the-verifier-changed-on-disk",
+                        lambda: expect([("target-check", knobs(), bite)], live=True, jobs=3,
+                                       tool=tool, expected=certifying, timeout=20.0,
+                                       certify=True, stream=io.StringIO(), verifier=verifier),
+                        f"the verifier {VERIFIER} on disk has sha256 {loaded}, not the "
+                        f"{'0' * 64} this process loaded")
+            finally:
+                globals()["VERIFIER_LOADED"] = loaded
+
+            # verifier_selftest on stand-ins: a failing one refuses, a passing one
+            # gives its last line.
+            def failing_stand_in():
+                raise ProbeFailure(["a stand-in check"])
+
+            refused("verifier-selftest-refuses-a-failing-selftest",
+                    lambda: verifier_selftest(failing_stand_in),
+                    "the verifier's own selftest failed: a stand-in check")
+            check("verifier-selftest-gives-the-summary-line",
+                  verifier_selftest(lambda: print("a first line\nprobe checks: 3 ok, 0 failed"))
+                  == "probe checks: 3 ok, 0 failed")
 
             # A failing verifier selftest refuses certification before any suite runs.
-            real_selftest = globals()["verifier_selftest"]
-
-            def failing_selftest():
-                raise ProbeFailure(["the verifier's own selftest failed: a check"])
-
             commands_before = log.read_text()
-            globals()["verifier_selftest"] = failing_selftest
             try:
                 expect([("target-check", knobs(), bite)], live=True, jobs=3, tool=tool,
-                       expected=certifying, timeout=20.0, certify=True, stream=io.StringIO())
+                       expected=certifying, timeout=20.0, certify=True, stream=io.StringIO(),
+                       verifier=failing_stand_in)
             except ProbeFailure as exc:
                 check("certify-refused-when-the-verifier-selftest-fails",
-                      exc.failures == ("the verifier's own selftest failed: a check",)
+                      exc.failures == ("the verifier's own selftest failed: a stand-in check",)
                       and log.read_text() == commands_before, repr(exc.failures))
             else:
                 check("certify-refused-when-the-verifier-selftest-fails", False,
                       "expect returned")
-            finally:
-                globals()["verifier_selftest"] = real_selftest
 
             stream = io.StringIO()
-            results = expect([("target-check", knobs(), knobs(FAILING=["target-check",
-                                                                        "other-check"]),
-                               {"other-check": "the scripted failure names both"})],
-                             live=True, jobs=3, tool=tool, expected=certifying, timeout=20.0,
-                             certify=True, stream=stream)
+            paths_log = room / "paths.log"
+            os.environ["PROBE_SYNTHETIC_PATHS"] = str(paths_log)
+            try:
+                results = expect([("target-check", knobs(), knobs(FAILING=["target-check",
+                                                                            "other-check"]),
+                                   {"other-check": "the scripted failure names both"})],
+                                 live=True, jobs=3, tool=tool, expected=certifying, timeout=20.0,
+                                 certify=True, stream=stream, verifier=verifier)
+            finally:
+                os.environ.pop("PROBE_SYNTHETIC_PATHS", None)
             printed = stream.getvalue()
+            ran_from = collections.Counter(paths_log.read_text().splitlines())
+            copy_line = next((line for line in printed.splitlines()
+                              if line.startswith("clean run from a private copy: ")), "")
+            copy_room = copy_line[len("clean run from a private copy: "):].split(":")[0]
+            check("certified-clean-run-uses-a-private-copy",
+                  copy_line.endswith(f": tool sha256 {tool_digest}, companion sha256 "
+                                     f"{hashlib.sha256(b'').hexdigest()}, test tree 0 file(s), "
+                                     f"digest {hashlib.sha256().hexdigest()}")
+                  and copy_room and Path(copy_room) != room
+                  and ran_from[str(Path(copy_room) / tool.name)] == 2
+                  and ran_from[str(tool)] == 1, repr((copy_line, ran_from)))
             check("certifying-run-records-its-provenance",
                   results.certified is True and results[0]["certified"] is True
                   and printed.startswith("certifying: yes\n")
@@ -1986,8 +2214,8 @@ def _selftest_checks():
                   in printed
                   and f"adjudications: {approved} sha256 {certifying.adjudications_sha256}"
                   in printed
-                  and "verifier selftest: running; this certifying run is one of its own checks"
-                  in printed
+                  and ("verifier selftest: a stand-in the caller supplied said: running; this "
+                       "certifying run is one of its own checks") in printed
                   and f"interpreter: {sys.executable} (Python {platform.python_version()})"
                   in printed
                   and "timeout: 20s for each run" in printed

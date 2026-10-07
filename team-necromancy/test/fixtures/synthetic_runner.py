@@ -20,7 +20,9 @@ passed. WRITE_BESIDE names a path under this file's directory that every
 invocation writes to, as a unit leaking into the corpus beside the tool would.
 
 With PROBE_SYNTHETIC_LOG set, every invocation appends its arguments to that
-file as one JSON line, which is how a test sees what the verifier asked.
+file as one JSON line, which is how a test sees what the verifier asked. With
+PROBE_SYNTHETIC_PATHS set, every invocation appends the path it ran from, which
+is how a test sees which copy the verifier ran.
 """
 
 import json
@@ -54,6 +56,10 @@ def main(argv):
     if log:
         with open(log, "a") as record:
             record.write(json.dumps(argv) + "\n")
+    paths = os.environ.get("PROBE_SYNTHETIC_PATHS")
+    if paths:
+        with open(paths, "a") as record:
+            record.write(os.path.abspath(__file__) + "\n")
     if WRITE_BESIDE:
         beside = os.path.join(os.path.dirname(os.path.abspath(__file__)), WRITE_BESIDE)
         os.makedirs(os.path.dirname(beside), exist_ok=True)
