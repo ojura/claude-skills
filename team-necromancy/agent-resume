@@ -1116,19 +1116,25 @@ def read_one_key():
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
-def confirm_attach(targets, socket):
+def confirm_attach(started, socket):
     """Ask before opening the swarm. Returns True to attach.
 
     The run has just printed what it did, and attaching replaces that with a
     tmux client, so the summary is unreadable the moment it succeeds. Stopping
     here is what makes the output worth printing.
+
+    `started` is the panes this run created. Ctrl-X stops the processes in
+    them and nothing else: an agent that was already running when the run
+    began, the lead included, was not started here.
     """
     if not sys.stdin.isatty():
         # Downstream terminal checks decide attachment for a noninteractive run.
         return True
     # Several swarm servers can coexist, so the prompt names the target socket.
+    offer = (f", Ctrl-X to stop the {len(started)} agent(s) this run started"
+             if started else "")
     print(f"Press any key to attach to {socket} ({TMUX_SESSION}), "
-          f"Ctrl-C to skip attaching, Ctrl-X to abort the running process(es)")
+          f"Ctrl-C to skip attaching{offer}")
     key = read_one_key()
     if key is None:
         return True
@@ -1137,7 +1143,10 @@ def confirm_attach(targets, socket):
         return False
     if key == "\x18":          # Ctrl-X
         print()
-        plan = RESOLVER.stop_plan(agent_ids=tuple(targets))
+        if not started:
+            print("this run started nothing, so Ctrl-X has nothing to stop")
+            return False
+        plan = RESOLVER.stop_plan(seats=tuple(started))
         if plan["objection"]:
             warn(plan["objection"])
         else:
@@ -2035,86 +2044,103 @@ class Resolver:
                 )
         return process()
 
+    @staticmethod
+    def _lead_claim(kind, why, basis=None, **facts):
+        """Build the one record of how a lead transcript was chosen for a team.
+
+        `kind` names the rung that chose it and `why` says so in words. `basis`
+        is what `lead_corroboration` found tying that transcript to the team, or
+        None when nothing did. Every rung that chooses a lead for a team returns
+        this record as its evidence: the live lead process, roster
+        `leadSessionId` and the spawn-payload claims in resolve_transcript, and
+        the durable assignment team_members uses for a listed lead. A reader
+        never has to know which of them answered. A session uuid names a
+        transcript, not a team, so that rung carries none.
+        """
+        return {"kind": kind, "why": why, "basis": basis, **facts}
+
+    @classmethod
+    def _judged_lead_claim(cls, kind, chosen_by, basis):
+        """The claim for a transcript `chosen_by` picked, once `basis` is known.
+
+        The rungs that pick a transcript and then ask lead_corroboration about
+        it all report the answer in this one phrase.
+        """
+        return cls._lead_claim(
+            kind, f"{chosen_by}, corroborated by {basis}" if basis
+            else f"{chosen_by}, uncorroborated", basis)
+
+    def _lead_corroboration(self, team, path, table=None, census=None):
+        """Name the evidence besides spawn payloads that this transcript leads team.
+
+        The evidence is a live process running as the team, roster
+        `leadSessionId`, member names shared by roster and spawn records, live
+        spawned members, or the implicit team-name prefix. Returns the first that
+        holds, or None. Choosing among claimants and deciding what a rebuilt
+        roster may record both ask here, so the two cannot disagree.
+
+        A populated leadSessionId counts as evidence. Reconstructed rosters leave
+        it empty for an uncorroborated lead, so spawn records never corroborate
+        themselves through a roster derived from those records.
+        """
+        rosters = [e for e in self._roster_entries(team=team, census=census)
+                   if e.get("leadSessionId")]
+        if path.stem in {e.get("session") for e in self._runtime(table)["live_sessions"]
+                         if e.get("team") == team}:
+            return f"live process running as {team}"
+        if path.stem in {e.get("leadSessionId") for e in rosters}:
+            return "roster leadSessionId"
+        spawned = {payload["name"] for payload
+                   in self._members_spawned_into(path.stem, team)}
+        if spawned & {e["member"].get("name") for e in rosters}:
+            return "member names"
+        # Live members spawned by this claimant provide current process
+        # evidence. Fork siblings share child history, so this distinguishes
+        # different payload sets while leaving copied histories tied. A member
+        # whose process is this command's own ancestor counts like any other;
+        # dropping it would leave a claimant uncorroborated exactly when the
+        # asker is its own child.
+        if any(self._agent_runtime(agent_id_of(name, team), table,
+                                   census=census)["records"]
+               for name in spawned):
+            return "live members it spawned"
+        if self._session_names_team(path.stem, team):
+            return "team-name block"
+        return None
+
     def _lead_transcript_for(self, team, table=None, census=None):
         """Return the transcript and evidence claim for a team's lead.
 
         Forked history and quoted spawn payloads can create several claimants.
-        Corroboration uses a live team process, roster `leadSessionId`, member names
-        shared by roster and spawn records, live spawned members, or the implicit
-        team-name prefix. One corroborated claimant wins. A sole claimant remains
-        usable for dead-team recovery and is marked uncorroborated. Multiple
-        unresolved claimants produce an ambiguity result.
+        `lead_corroboration` judges each one. One corroborated claimant wins. A
+        sole claimant remains usable for dead-team recovery and is marked
+        uncorroborated. Multiple unresolved claimants produce an ambiguity result.
         """
-        def claim(kind, why, corroborated=False, **facts):
-            return {"kind": kind, "why": why, "corroborated": corroborated,
-                    **facts}
-
         hits = self._led_teams().get(team) or []
         if not hits:
-            return None, claim("none", f"no transcript records spawning into {team}")
+            return None, self._lead_claim(
+                "none", f"no transcript records spawning into {team}")
 
-        # A populated leadSessionId provides roster corroboration. Reconstructed
-        # rosters leave it empty for uncorroborated leads, preventing spawn records
-        # from corroborating themselves through a roster derived from those records.
-        rosters = [e for e in self._roster_entries(team=team, census=census)
-                   if e.get("leadSessionId")]
-        roster_members = {e["member"].get("name") for e in rosters}
-        roster_leads = {e.get("leadSessionId") for e in rosters}
-        live_here = {e.get("session") for e in self._runtime(table)["live_sessions"]
-                     if e.get("team") == team}
-
-        def any_child_running(names):
-            """Is any of these members of this team running right now?
-
-            Both halves: a member whose process is this command's own ancestor
-            is running as plainly as any other, and dropping it would leave a
-            claimant uncorroborated exactly when the asker is its own child.
-            """
-            for name in names:
-                if self._agent_runtime(
-                        agent_id_of(name, team), table, census=census)["records"]:
-                    return True
-            return False
-
-        def corroboration(path):
-            if path.stem in live_here:
-                return f"live process running as {team}"
-            if path.stem in roster_leads:
-                return "roster leadSessionId"
-            spawned = {payload.get("name") for payload in self._members_spawned_into(path.stem, team)}
-            if roster_members and spawned & roster_members:
-                return "member names"
-            # Live members spawned by this claimant provide current process
-            # evidence. Fork siblings share child history, so this distinguishes
-            # different payload sets while leaving copied histories tied.
-            if spawned and any_child_running(name for name in spawned if name):
-                return "live members it spawned"
-            if self._session_names_team(path.stem, team):
-                return "team-name block"
-            return None
-
-        backed = [(path, why) for _, path in hits if (why := corroboration(path))]
+        backed = [(path, basis) for _, path in hits
+                  if (basis := self._lead_corroboration(team, path, table, census))]
         if len(backed) == 1:
-            return backed[0][0], claim(
-                "corroborated",
-                f"spawn payloads naming {team}, corroborated by {backed[0][1]}",
-                True, basis=backed[0][1],
-            )
+            return backed[0][0], self._judged_lead_claim(
+                "corroborated", f"spawn payloads naming {team}", backed[0][1])
         if len(hits) == 1:
             # The answer says it is uncorroborated; it does not warn about it.
             # Reports ask this question too, and a listing that said "resuming"
             # would describe an act nobody asked for. Whoever resumes says so,
             # from this provenance.
-            return hits[0][1], claim(
-                "sole", f"sole payload claimant for {team}, uncorroborated")
+            return hits[0][1], self._judged_lead_claim(
+                "sole", f"sole payload claimant for {team}", None)
         listed = ", ".join(path.stem[:8] for _, path in hits)
         if len(backed) > 1:
-            return None, claim(
+            return None, self._lead_claim(
                 "ambiguous-corroborated",
                 f"{len(backed)} transcripts claim {team} with corroboration "
                 f"({listed}); name one with --resume",
             )
-        return None, claim(
+        return None, self._lead_claim(
             "ambiguous",
             f"{len(hits)} transcripts claim {team}; corroboration is empty "
             f"({listed}); name one with --resume",
@@ -2910,10 +2936,17 @@ class Resolver:
                         None,
                     )
                     fields, last = ({}, 0) if quick else self._scan_transcript(path)
+                    via = proof["how"] if proof else "live process runtime"
+                    # The process outranks the claimants, but the evidence that
+                    # it holds this team's lead transcript can be the same spawn
+                    # payloads they rest on, so it is judged the same way.
+                    claim = (self._judged_lead_claim(
+                        "live-runtime", via,
+                        self._lead_corroboration(team, path, table, census))
+                             if is_lead else None)
                     return self._resolution(
-                        path, fields, last, strength=EXACT,
-                        via=proof["how"] if proof else "live process runtime",
-                        runtime=runtime,
+                        path, fields, last, strength=EXACT, via=via,
+                        runtime=runtime, evidence=claim,
                     )
 
         if lead_session or is_lead:
@@ -2922,12 +2955,13 @@ class Resolver:
                 fields, last = ({}, 0) if quick else self._scan_transcript(path)
                 return self._resolution(
                     path, fields, last, via="roster leadSessionId", strength=EXACT,
-                    evidence={"kind": "roster-lead", "corroborated": True},
+                    evidence=self._lead_claim(
+                        "roster-lead", "roster leadSessionId",
+                        "roster leadSessionId"),
                 )
             path, claim = (self._lead_transcript_for(
                 team, table=table, census=census) if team else
-                           (None, {"kind": "none", "why": "no team was named",
-                                   "corroborated": False}))
+                           (None, self._lead_claim("none", "no team was named")))
             if path:
                 fields, last = ({}, 0) if quick else self._scan_transcript(path)
                 return self._resolution(
@@ -3188,7 +3222,12 @@ class Resolver:
                 elif assignment is not None:
                     resolution = self._resolution(
                         path=assignment["path"], via=assignment["source"],
-                        strength=EXACT)
+                        strength=EXACT,
+                        evidence=self._judged_lead_claim(
+                            "assignment", assignment["source"],
+                            self._lead_corroboration(
+                                team, assignment["path"], table, census))
+                        if name == "team-lead" else None)
                 else:
                     resolution = self._resolve_transcript(
                         team=team, name=name, is_lead=name == "team-lead",
@@ -5974,8 +6013,10 @@ class Resolver:
         if want_name and stamped_name != want_name:
             # Name mismatch always remains an objection because Claude Code stamps
             # the launch name onto every later line. Corroboration is included so
-            # the refusal can name the appropriate remedy.
-            corroborated = bool(res.evidence.get("corroborated"))
+            # the refusal can name the appropriate remedy. Corroboration is the
+            # basis of the lead claim, so an answer with no claim, or a claim
+            # with no basis, is not corroborated.
+            corroborated = res.evidence.get("basis") is not None
             objections.append(("name_mismatch", stamped_name, want_name,
                                f"{res.via}|corroborated" if corroborated else res.via))
 
@@ -6683,7 +6724,7 @@ class Resolver:
             record.get("session"), record.get("team"), record.get("seat"),
         )
 
-    def stop_plan(self, team=None, agent_id=None, agent_ids=(), session=None,
+    def stop_plan(self, team=None, agent_id=None, seats=(), session=None,
                   table=None):
         """Return the exact processes selected by one stop request."""
         table = self._retained_table(self._process_table() if table is None else table)
@@ -6728,16 +6769,24 @@ class Resolver:
                         if not listed else
                         f"nothing running for {team}: none of its {len(listed)} listed "
                         f"member(s) is running ({some_of(listed)})")
-        elif agent_ids:
-            selected_ids = tuple(dict.fromkeys(item for item in agent_ids if item))
-            selection = immutable({"kind": "agents", "value": selected_ids})
-            for selected_id in selected_ids:
-                colour = agent_colour(
-                    selected_id, spawn=self._spawn_payload(selected_id))
-                for record in self._agent_runtime(selected_id, table)["external"]:
-                    add(record, selected_id, colour)
+        elif seats:
+            # `seats` are the panes one run created. Every process in them
+            # descends from a launch that run made, so this stops what the run
+            # started and nothing else. An agent id would also select a copy
+            # that was already running in some other pane, and the lead's id
+            # selects the lead wherever it runs.
+            selected_seats = tuple(dict.fromkeys(seat for seat in seats if seat))
+            selection = immutable({"kind": "seats", "value": selected_seats})
+            for seat in selected_seats:
+                for record in snapshot["by_seat"].get(seat, ()):
+                    if not record["is_claude"] or record["ours"]:
+                        continue
+                    colour = agent_colour(
+                        record["agent_id"],
+                        spawn=self._spawn_payload(record["agent_id"]))
+                    add(record, record["agent_id"] or f"pane {seat.pane}", colour)
             if not targets:
-                objection = "the selected agent ids have zero live processes"
+                objection = "nothing this run started is still running"
         elif agent_id:
             selection = immutable({"kind": "agent", "value": agent_id})
             colour = agent_colour(
@@ -8403,9 +8452,16 @@ class Resolver:
             "replacement_generation": observed.generation, "objections": (),
         })
 
-    def rebuild_plan(self, launch=None, evidence=None, applied=None, now_ms=None,
+    def rebuild_plan(self, launch=None, applied=None, now_ms=None,
                      team=None, table=None, census=None):
-        """Return one complete missing-roster reconstruction answer."""
+        """Return one complete missing-roster reconstruction answer.
+
+        The rebuilt roster records a lead session only when
+        `lead_corroboration` ties that transcript to the team by something
+        besides its spawn payloads. Every path that rebuilds a roster asks
+        here, so the same transcript is recorded or left out whichever command
+        made the roster.
+        """
         if launch is None:
             census = self._roster_census() if census is None else self._retained_census(census)
             table = self._retained_table(self._process_table() if table is None else table)
@@ -8422,16 +8478,14 @@ class Resolver:
                         f"no roster for {team} and none can be rebuilt: "
                         f"{resolution.reason}",),
                 })
-            claim = resolution.evidence
             launch = self.launch_plan(
                 session_uuid=path.stem, for_team=team,
                 table=table, census=census)
-            planned = self.rebuild_plan(
-                launch, evidence=claim, now_ms=now_ms)
+            planned = self.rebuild_plan(launch, now_ms=now_ms)
             return types.MappingProxyType({
                 **planned,
                 "lead_resolution": resolution,
-                "lead_claim": immutable(claim),
+                "lead_claim": resolution.evidence,
                 "lead_path": path,
                 "selected_roster": selected,
             })
@@ -8472,8 +8526,7 @@ class Resolver:
                     if payload.get(key):
                         member[key] = payload[key]
                 members.append(member)
-            lead_session = ("" if evidence and not evidence["corroborated"]
-                            else launch["session"])
+            lead_session = launch["session"]
             note = "lead + " + (
                 ", ".join(member["name"] for member in members[1:])
                 or "no members recovered")
@@ -8497,6 +8550,11 @@ class Resolver:
             }, member]
             lead_session = lead_sid
             note = f"lead + {name}"
+        lead_path = self._transcript_path(lead_session) if lead_session else None
+        if not (lead_path and self._lead_corroboration(
+                team, lead_path, launch["process"]["table"],
+                launch["roster"]["census"])):
+            lead_session = ""
         config = immutable({
             "name": team, "createdAt": now_ms,
             "leadAgentId": agent_id_of("team-lead", team),
@@ -10586,14 +10644,17 @@ def enforce_identity(target, objections, allow_team_change, force):
             message = (f"{target['transcript']['path'].name} is stamped agentName={stamped!r}, not {wanted!r} "
                        f"(matched by {why})")
             if corroborated:
-                # The roster and the payloads agree on the identity being asked for,
-                # so the stamp is the odd one out. Two shapes produce that and the
-                # remedy is the same, but the diagnosis is not: a launch that carried
-                # the wrong name, or a session that was a teammate first and was
-                # later resumed into leading a team. The second has an honest past,
-                # so naming only the first would accuse it of damage it does not
-                # have. Both are stated and neither is assumed.
-                message += (f"; the roster and the spawn payloads both say {wanted!r}, so the "
+                # Corroborated evidence agrees on the identity being asked for, so
+                # the stamp is the odd one out. The match above names that
+                # evidence; it can be the roster, the spawn payloads or a live
+                # process, so this sentence names none of them. Two histories
+                # produce the disagreement and the remedy is the same, but the
+                # diagnosis is not: a launch that carried the wrong name, or a
+                # session that was a teammate first and was later resumed into
+                # leading a team. The second has an honest past, so naming only
+                # the first would accuse it of damage it does not have. Both are
+                # stated and neither is assumed.
+                message += (f"; that evidence is corroborated and says {wanted!r}, so the "
                             f"stamp is either a launch that carried the wrong name or this "
                             f"session's earlier life as a teammate")
             if not force:
@@ -11018,11 +11079,10 @@ def apply_rebuild_plan(plan, dry, assume_yes=False):
     return completed["launch"], completed["written_roster"].data
 
 
-def rebuild_team(ctx, dry, evidence=None, assume_yes=False):
+def rebuild_team(ctx, dry, assume_yes=False):
     """Build and apply the reconstruction answer for one launch."""
     return apply_rebuild_plan(
-        RESOLVER.rebuild_plan(ctx, evidence=evidence), dry,
-        assume_yes=assume_yes)
+        RESOLVER.rebuild_plan(ctx), dry, assume_yes=assume_yes)
 
 
 # Roster writes wait for proper-lockfile's 10-second stale interval. Claude Code
@@ -12054,7 +12114,10 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
     # answer it at the end rather than leaving "not yet" as the last word.
     unwritten = ((ctx["identity"]["agentId"] or ctx["session"][:8],
                   ctx["transcript"]["path"], launched_at) if alive and not wrote else None)
-    return Outcome("launched" if alive else "failed", socket, False, unwritten)
+    # Kept for a launch that looked dead too: it may only have been slow, and
+    # whatever comes up in that pane later is still this run's process.
+    return Outcome("launched" if alive else "failed", socket, False, unwritten,
+                   started_in=launched_seat)
 
 
 def render_transcript_row(stem, fact=None, note=None, completion=False, limit=None,
@@ -13578,10 +13641,16 @@ def run_poison(args):
     return 0
 
 
-class Outcome(collections.namedtuple("Outcome", "status socket is_lead pending_write")):
+class Outcome(collections.namedtuple(
+        "Outcome", "status socket is_lead pending_write started_in",
+        defaults=(None,))):
     """What one agent's run produced: how it went, where it landed, and whether
     it was the lead. The role comes from resolution rather than from the entry
-    point, so a single resume and a team resume answer it the same way."""
+    point, so a single resume and a team resume answer it the same way.
+
+    `started_in` is the pane this run created for the agent's new process. It
+    is None when the run started no process there: a noop, a refusal, a dry
+    run, or a lead whose command was handed to the terminal."""
 
 
 def report_transcript_writes(pending, args, grace=LAUNCH_WRITE_S):
@@ -13696,9 +13765,8 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix="", terminal=
             is_tty=sys.stdout.isatty())
         if decision["alive"]:
             print()
-            targets = [a.agent_id for _, a in jobs
-                       if a is not None and getattr(a, "agent_id", None)]
-            if decision["action"] != "attach" or confirm_attach(targets, socket):
+            started = tuple(o.started_in for o in outcomes if o.started_in)
+            if decision["action"] != "attach" or confirm_attach(started, socket):
                 maybe_attach(decision)
     if refused:
         # Last, so everything the run did manage has already been reported.
@@ -13715,13 +13783,13 @@ def rebuild_roster(team, args, passthrough, table, selected=None, census=None):
         team=team, table=table, census=census)
     if plan["objections"]:
         die("; ".join(plan["objections"]))
-    claim = plan["lead_claim"]
     path = plan["lead_path"]
-    if not claim["corroborated"]:
-        warn(f"resuming the only transcript claiming {team}; nothing corroborates it. "
-             "If that is the wrong conversation, name the right one with --resume")
+    if not plan["config"].get("leadSessionId"):
+        warn(f"nothing corroborates {path.stem[:8]} as the lead of {team}, so the "
+             "rebuilt roster leaves leadSessionId empty. If that is the wrong "
+             "conversation, name the right one with --resume")
     print(f"team     {team} has no roster; rebuilding from {path.stem[:8]} "
-          f"({claim['why']})")
+          f"({plan['lead_claim']['why']})")
     enforce_ctx(plan["launch"], args)
     _launch, config = apply_rebuild_plan(
         plan, args.dry_run, assume_yes=args.yes)
@@ -14458,7 +14526,10 @@ def _check_team_launch_actions_use_distinct_seats_and_commands(s):
 
 
 @unit(('team-rebuild-preview-reaches-member-launches',
-       'a missing or invalid roster can be rebuilt and used by a read-only team run'))
+       'a missing or invalid roster can be rebuilt and used by a read-only team run'),
+      ('team-rebuild-lead-session-follows-corroboration',
+       'a rebuilt roster names the lead session only when evidence corroborates it, '
+       'and warns otherwise'))
 def _check_team_rebuild_preview(s):
     team = "session-preview-rebuild"
     sessions = {
@@ -14466,8 +14537,34 @@ def _check_team_rebuild_preview(s):
         "alpha": "44444444-4444-4444-8444-444444444444",
         "beta": "55555555-5555-4555-8555-555555555555",
     }
-    faults = []
-    for state, raw in (("absent", None), ("invalid", b'{"name":')):
+    # A stopped lead leaves its spawn records as the only claim on the team,
+    # and nothing corroborates a sole claimant. A lead resumed without
+    # --agent-id is found through the spawn records in the transcript it
+    # holds. That process outranks the claim, but those spawn records are
+    # still all that ties its transcript to the team, so nothing corroborates
+    # it either. A lead resumed with --agent-id states in its own argv that it
+    # runs as the team's lead, which corroborates the transcript it holds.
+    lead_pid = os.getpid() + 1000000
+    lead_id = agent_id_of("team-lead", team)
+    lead_argv = (FAKE_AGENT_BIN, "--resume", sessions["team-lead"])
+    leads = {
+        "stopped": ((), "", f"sole payload claimant for {team}, uncorroborated"),
+        "running plain": (
+            ((lead_pid, 1, lead_argv),), "",
+            f"pid {lead_pid}, which spawned into team {team}, uncorroborated"),
+        "running flag-bound": (
+            ((lead_pid, 1, lead_argv + ("--agent-id", lead_id)),),
+            sessions["team-lead"],
+            f"live pid {lead_pid} running as {lead_id}, corroborated by "
+            f"live process running as {team}"),
+    }
+    faults, claims = [], []
+    arms = [(state, raw, lead)
+            for state, raw in (("absent", None), ("invalid", b'{"name":'))
+            for lead in leads]
+    for state, raw, lead in arms:
+        arm = f"{state}, lead {lead}"
+        processes, wanted, evidence = leads[lead]
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             eng = Resolver(needs=Needs(maybe=set(NEED)))
@@ -14509,7 +14606,8 @@ def _check_team_rebuild_preview(s):
                 return plan
 
             eng.team_run_plan = observed
-            fake = _FakeTmux(session_exists=False, sockets=[])
+            fake = _FakeTmux(session_exists=False, sockets=[],
+                             processes=list(processes))
             code, error = None, None
             said = io.StringIO()
             try:
@@ -14532,12 +14630,155 @@ def _check_team_rebuild_preview(s):
                 and all(agent_id_of(member, team) in said.getvalue()
                         for member in ("alpha", "beta")))
             if not passed:
-                faults.append(f"{state}: code={code}, error={error}, "
+                faults.append(f"{arm}: code={code}, error={error}, "
                               f"plans={len(plans)}, files unchanged={before == after}, "
+                              f"output={said.getvalue()}")
+                claims.append(f"{arm}: the run did not finish, so its lead claim "
+                              "was not checked")
+                continue
+            told = " ".join(without_wrap_arrows(said.getvalue()).split())
+            written = preview.data.get("leadSessionId")
+            reported = f"rebuilding from {sessions['team-lead'][:8]} ({evidence})" in told
+            warned = "nothing corroborates" in told
+            if written != wanted or not reported or warned == bool(wanted):
+                claims.append(f"{arm}: leadSessionId={written!r}, wanted {wanted!r}; "
+                              f"reported {evidence!r}: {reported}; warned: {warned}; "
                               f"output={said.getvalue()}")
     return [("team-rebuild-preview-reaches-member-launches",
              "a missing or invalid roster can be rebuilt and used by a read-only team run",
-             not faults, "\n".join(faults))]
+             not faults, "\n".join(faults)),
+            ("team-rebuild-lead-session-follows-corroboration",
+             "a rebuilt roster names the lead session only when evidence corroborates it, "
+             "and warns otherwise",
+             not claims, "\n".join(claims))]
+
+
+def _spawning_lead(f, team, lead, members, stamped=False):
+    """Write a lead transcript that spawned `members` into team, and theirs.
+
+    `members` maps each name to its session, and each member transcript
+    carries its agent and team stamps. The lead carries none unless `stamped`
+    asks for them: a lead started without --agent-id writes no stamps.
+    """
+    stamps = {"agentName": "team-lead", "teamName": team} if stamped else {}
+    f.transcript(lead, stamps.get("agentName"), stamps.get("teamName"), tuple({
+        "type": "user", "uuid": f"spawn-{name}", "parentUuid": f"{lead}-root",
+        "isSidechain": False, "sessionId": lead, **stamps,
+        "timestamp": "2026-01-01T00:00:01Z",
+        "message": {"role": "user", "content": []},
+        "toolUseResult": {"status": "teammate_spawned", "name": name,
+                          "team_name": team, "agent_id": agent_id_of(name, team)},
+    } for name in members))
+    for name, session in members.items():
+        f.transcript(session, name, team)
+
+
+@unit(('every-lead-rung-carries-a-claim',
+       'every way of choosing a team lead records how it chose and what '
+       'corroborates the choice, in one claim'))
+def _check_every_lead_rung_carries_a_claim(s):
+    lead = "33333333-3333-4333-8333-333333333333"
+    alpha = "44444444-4444-4444-8444-444444444444"
+    members = {"alpha": alpha, "beta": "55555555-5555-4555-8555-555555555555"}
+    # A leadSessionId with no transcript, as a lead resumed without
+    # --agent-id leaves in the roster it creates.
+    boot = "99999999-9999-4999-8999-999999999999"
+    plain, minted = "session-preview-rebuild", "session-33333333"
+    lead_pid = os.getpid() + 1000000
+    resumed = (FAKE_AGENT_BIN, "--resume", lead)
+    flag_bound = resumed + ("--agent-id", agent_id_of("team-lead", plain))
+    member_argv = (FAKE_AGENT_BIN, "--resume", alpha,
+                   "--agent-id", agent_id_of("alpha", plain))
+    # Each arm: team, roster leadSessionId (None writes no roster), whether
+    # the lead transcript is stamped, live processes, and the claim it must
+    # produce.
+    arms = {
+        "roster leadSessionId": (
+            plain, lead, False, (),
+            ("roster-lead", "roster leadSessionId", "roster leadSessionId")),
+        "sole payload claimant": (
+            plain, None, False, (),
+            ("sole", f"sole payload claimant for {plain}, uncorroborated", None)),
+        "team-name block": (
+            minted, None, False, (),
+            ("corroborated", f"spawn payloads naming {minted}, corroborated by "
+             "team-name block", "team-name block")),
+        "member names": (
+            plain, boot, False, (),
+            ("corroborated", f"spawn payloads naming {plain}, corroborated by "
+             "member names", "member names")),
+        "live member": (
+            plain, None, False, ((lead_pid + 1, 1, member_argv),),
+            ("corroborated", f"spawn payloads naming {plain}, corroborated by "
+             "live members it spawned", "live members it spawned")),
+        "plain live lead": (
+            plain, None, False, ((lead_pid, 1, resumed),),
+            ("live-runtime", f"pid {lead_pid}, which spawned into team {plain}, "
+             "uncorroborated", None)),
+        "flag-bound live lead": (
+            plain, None, False, ((lead_pid, 1, flag_bound),),
+            ("live-runtime", f"live pid {lead_pid} running as "
+             f"{agent_id_of('team-lead', plain)}, corroborated by live process "
+             f"running as {plain}", f"live process running as {plain}")),
+        "listed lead with an empty leadSessionId": (
+            plain, "", True, (),
+            ("assignment", "transcript identity, uncorroborated", None)),
+    }
+    faults = []
+    for arm, (team, roster_lead, stamped, processes, wanted) in arms.items():
+        with _roster_test_fixture() as f:
+            _spawning_lead(f, team, lead, members, stamped=stamped)
+            if roster_lead is not None:
+                f.config(team, {
+                    "name": team, "leadAgentId": agent_id_of("team-lead", team),
+                    "leadSessionId": roster_lead, "createdAt": 1,
+                    "members": [{"agentId": agent_id_of(name, team), "name": name}
+                                for name in ("team-lead", *members)]})
+            f.fake.processes[:] = processes
+            with capturing("err"):
+                found = f.engine._team_description(
+                    team, table=tuple(processes),
+                    census=f.engine._roster_census())["lead_resolution"]
+            claim = dict(found.evidence or {})
+            kind, why, basis = wanted
+            if (not found or found.path.stem != lead
+                    or claim != {"kind": kind, "why": why, "basis": basis}):
+                faults.append(f"{arm}: chose {found.path and found.path.stem!r} "
+                              f"({found.reason}), claim {claim}")
+    return [_check_verdict('every-lead-rung-carries-a-claim', not faults,
+                           "\n".join(faults))]
+
+
+@unit(('single-agent-rebuild-follows-corroboration',
+       'a roster rebuilt for one agent launched by id names the lead session '
+       'only when evidence corroborates it'))
+def _check_single_agent_rebuild_follows_corroboration(s):
+    lead = "33333333-3333-4333-8333-333333333333"
+    members = {"alpha": "44444444-4444-4444-8444-444444444444"}
+    faults = []
+    # A team name that is not session-<eight hex> says nothing about its
+    # lead. A minted name carries the first eight hex of its lead's session.
+    for team, wanted in (("session-preview-rebuild", ""), ("session-33333333", lead)):
+        for name in ("team-lead", "alpha"):
+            with _roster_test_fixture() as f:
+                _spawning_lead(f, team, lead, members)
+                plan, error = None, None
+                try:
+                    with capturing("err"):
+                        launch = f.engine.launch_plan(
+                            agent_id=agent_id_of(name, team), table=(),
+                            terminal=TerminalContext())
+                        plan = f.engine.rebuild_plan(launch, now_ms=5000)
+                except Refusal as exc:
+                    error = exc
+                written = ((plan or {}).get("config") or {}).get("leadSessionId")
+                if error or plan["action"] != "create" or written != wanted:
+                    faults.append(
+                        f"{agent_id_of(name, team)}: "
+                        f"action {(plan or {}).get('action')!r}, leadSessionId "
+                        f"{written!r}, wanted {wanted!r}, refused: {error}")
+    return [_check_verdict('single-agent-rebuild-follows-corroboration',
+                           not faults, "\n".join(faults))]
 
 
 @unit(
@@ -19771,7 +20012,7 @@ class _Run:
 
 def resume_run(agent_id, *, listed=True, server=None, table=(), registry=(),
                watch=None, prepare=None, inspect=None, observe_launch_action=None,
-               **flags):
+               observe_outcome=None, **flags):
     """Run the real resume path against a writable copy of the corpus.
 
     Only the world outside the process is faked: one tmux server and the
@@ -19784,6 +20025,8 @@ def resume_run(agent_id, *, listed=True, server=None, table=(), registry=(),
     `inspect` is handed the same copy once the run is over and before it is
     deleted, for the results that live in the tree rather than in the
     return value: another team's roster, an inbox, a restamped transcript.
+    `observe_outcome` is handed the Outcome run_one returned, for what the run
+    recorded about its launch rather than how the launch went.
 
     Returns (outcome, roster entry afterwards, the fake server, printed
     output), or ("refused", ...) when the run died on a refusal.
@@ -19883,6 +20126,8 @@ def resume_run(agent_id, *, listed=True, server=None, table=(), registry=(),
                 out = run_one(_Run(agent_id=agent_id, socket="claude-swarm-test",
                                    **flags), [], fake.process_rows())
                 status = out.status
+                if observe_outcome:
+                    observe_outcome(out)
             except Refusal:
                 status = "refused"
         if inspect:
@@ -19902,16 +20147,19 @@ def resume_run(agent_id, *, listed=True, server=None, table=(), registry=(),
         shutil.rmtree(base, ignore_errors=True)
 
 
-@unit(('resume-places-a-member-in-a-pane', 'a member resume reaches tmux and records the pane it got'))
+@unit(('resume-places-a-member-in-a-pane', 'a member resume reaches tmux and records the pane it got'),
+      ('launch-outcome-names-the-pane-it-started',
+       'a launch reports the pane it started, which is what Ctrl-X may stop'))
 def _check_resume_places_a_member_in_a_pane(s):
     checked = []
 
     def check(cid, name, ok, detail=""):
         checked.append((cid, name, ok, detail))
 
-    seen_at_spawn = []
+    seen_at_spawn, outcomes = [], []
     started, started_entry, started_srv, started_said = resume_run(
-        "willow@session-corpus-alpha", listed=False, watch=seen_at_spawn.append)
+        "willow@session-corpus-alpha", listed=False, watch=seen_at_spawn.append,
+        observe_outcome=outcomes.append)
     at_spawn = seen_at_spawn[0] if seen_at_spawn else None
 
     check("resume-places-a-member-in-a-pane",
@@ -19921,6 +20169,13 @@ def _check_resume_places_a_member_in_a_pane(s):
           and any(a[0] == "split-window" or a[0] == "new-window" or a[0] == "new-session"
                   for a in started_srv.ran),
           f"{started}, entry {started_entry}, ran {[a[0] for a in started_srv.ran]}")
+    outcome = outcomes[0] if outcomes else None
+    check("launch-outcome-names-the-pane-it-started",
+          "a launch reports the pane it started, which is what Ctrl-X may stop",
+          outcome is not None
+          and outcome.started_in == Seat("claude-swarm-test", "%0")
+          and any(pane["pane"] == "%0" for pane in started_srv.panes),
+          f"outcome {outcome}, panes {[pane['pane'] for pane in started_srv.panes]}")
 
     s.at_spawn = at_spawn
     s.started_said = started_said
@@ -25783,6 +26038,43 @@ def _check_contradicted_stamp_refused(s):
     return checked
 
 
+@unit(('mismatch-calls-evidence-corroborated-from-its-basis',
+       'a refused name mismatch calls its evidence corroborated exactly when the '
+       'lead claim has a basis'))
+def _check_mismatch_calls_evidence_corroborated_from_its_basis(s):
+    # The corpus lead of this team is stamped with another name. Its roster
+    # names it as the lead, which corroborates the spawn payloads; without the
+    # roster those payloads are all that claims it.
+    team = "session-corpus-contradicted"
+    faults = []
+    with tempfile.TemporaryDirectory() as empty:
+        for rostered in (True, False):
+            eng = s.corpus_engine()
+            if not rostered:
+                eng._teams_dir = Path(empty)
+            with capturing("err"):
+                found = eng._resolve_transcript(
+                    team=team, name="team-lead", is_lead=True, table=())
+            raised = [objection for objection in eng._objections(found, "team-lead", team)
+                      if objection[0] == "name_mismatch"] if found else []
+            spoken = ""
+            if raised:
+                with capturing("err") as said:
+                    try:
+                        enforce_identity(
+                            fixture_target(found.path.stem, found.path, objections=raised),
+                            raised, allow_team_change=False, force=False)
+                    except Refusal:
+                        pass
+                spoken = said.getvalue()
+            basis = (found.evidence or {}).get("basis") if found else None
+            corroborated = "that evidence is corroborated" in spoken
+            if not raised or (basis is not None) != rostered or corroborated != rostered:
+                faults.append(f"rostered={rostered}: basis {basis!r}, refusal {spoken!r}")
+    return [_check_verdict('mismatch-calls-evidence-corroborated-from-its-basis',
+                           not faults, "; ".join(faults))]
+
+
 @unit(('reaper-spares-retained-mail', 'the reaper spares a team with retained mail'))
 def _check_reaper_spares_resurrectable(s):
     checked = []
@@ -26582,6 +26874,7 @@ def _check_attach_prompt_keys(s):
         stop_plan=lambda **kwargs: stop_requests.append(kwargs) or selected_stop)
     globals()["abort_agents"] = (
         lambda plan, assume_yes=False: aborted.append((plan, assume_yes)) or 0)
+    started = (Seat("sock", "%3"),)
     keys = {}
     try:
         # confirm_attach asks whether anyone can answer before it asks anything,
@@ -26590,20 +26883,32 @@ def _check_attach_prompt_keys(s):
         for name, key, want_attach, want_abort in (
                 ("a plain key attaches", "\r", True, False),
                 ("Ctrl-C skips", "\x03", False, False),
-                ("Ctrl-X aborts", "\x18", False, True)):
+                ("Ctrl-X stops what the run started", "\x18", False, True)):
             globals()["read_one_key"] = (lambda k: (lambda: k))(key)
             aborted.clear()
             stop_requests.clear()
-            with capturing("out"):
-                got = confirm_attach([], "sock")
+            with capturing("out") as out:
+                got = confirm_attach(started, "sock")
             keys[name] = (
                 got == want_attach and bool(aborted) == want_abort
+                and "Ctrl-X to stop the 1 agent(s) this run started" in out.getvalue()
                 and (not want_abort or (
-                    stop_requests == [{"agent_ids": ()}]
+                    stop_requests == [{"seats": started}]
                     and aborted == [(selected_stop, True)])))
+        # A run that only found its agents already running started nothing, so
+        # the prompt offers no Ctrl-X and the key stops nothing.
+        globals()["read_one_key"] = lambda: "\x18"
+        aborted.clear()
+        stop_requests.clear()
+        with capturing("out") as out:
+            got = confirm_attach((), "sock")
+        keys["Ctrl-X stops nothing when the run started nothing"] = (
+            got is False and not aborted and not stop_requests
+            and "Ctrl-X" not in out.getvalue().splitlines()[0])
         sys.stdin = types.SimpleNamespace(isatty=lambda: False)
         with capturing("out") as out:
-            keys["no terminal does not prompt"] = confirm_attach([], "sock") and not out.getvalue()
+            keys["no terminal does not prompt"] = (
+                confirm_attach(started, "sock") and not out.getvalue())
     finally:
         globals()["read_one_key"], globals()["abort_agents"] = real_key, real_abort
         globals()["RESOLVER"] = real_resolver
@@ -26612,6 +26917,112 @@ def _check_attach_prompt_keys(s):
     check("attach-prompt-keys", "the attach prompt does what each key says", not wrong, ", ".join(wrong))
 
     s.name = name
+    return checked
+
+
+@unit(('stop-plan-selects-the-panes-a-run-started',
+       'stopping what a run started selects the processes in its panes and '
+       'nothing that was already running'))
+def _check_stop_plan_selects_the_panes_a_run_started(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    socket, team = "claude-swarm-stop-check", "session-stop-check"
+    launched, nested, helper, member, copy, lead = (
+        os.getpid() + 1000000 + offset for offset in range(6))
+    processes = [
+        # This run started %1. The agent there ran a claude of its own, and an
+        # MCP helper that is not a claude at all.
+        (launched, 1, (FAKE_AGENT_BIN, "--resume", "s1", "--agent-id", f"m1@{team}")),
+        (nested, launched, (FAKE_AGENT_BIN, "-p", "summarise this")),
+        (helper, launched, ("/usr/bin/node", "mcp-server.js")),
+        # Already running before the run: a member in %2, a copy wearing the
+        # launched member's id in %3, and the lead in a terminal of its own.
+        (member, 1, (FAKE_AGENT_BIN, "--resume", "s2", "--agent-id", f"m2@{team}")),
+        (copy, 1, (FAKE_AGENT_BIN, "--resume", "s1", "--agent-id", f"m1@{team}")),
+        (lead, 1, (FAKE_AGENT_BIN, "--resume", "s0")),
+    ]
+    panes = [{"session": TMUX_SESSION, "window": "@0", "pane": pane, "pid": pid}
+             for pane, pid in (("%1", launched), ("%2", member), ("%3", copy))]
+    fake = _FakeTmux(panes=panes, processes=processes, sockets=[socket])
+    root = Path(tempfile.mkdtemp())
+    try:
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
+        eng._projects_dir, eng._teams_dir = root / "projects", root / "teams"
+        eng._projects_dir.mkdir()
+        eng._teams_dir.mkdir()
+        with fake.installed(eng):
+            plan = eng.stop_plan(seats=(Seat(socket, "%1"),))
+            closed = eng.stop_plan(seats=(Seat(socket, "%9"),))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    selected = sorted(target["process"]["pid"] for target in plan["targets"])
+    check("stop-plan-selects-the-panes-a-run-started",
+          "stopping what a run started selects the processes in its panes and "
+          "nothing that was already running",
+          selected == [launched, nested] and plan["objection"] is None
+          and not closed["targets"]
+          and closed["objection"] == "nothing this run started is still running",
+          f"selected {selected} of launched {launched}, nested {nested}, "
+          f"helper {helper}, member {member}, copy {copy}, lead {lead}; "
+          f"objection {plan['objection']!r}; a closed pane gave "
+          f"{len(closed['targets'])} target(s), objection {closed['objection']!r}")
+    return checked
+
+
+@unit(('ctrl-x-covers-only-what-the-run-started',
+       'the attach prompt is handed the panes this run started and no agent '
+       'it found running'))
+def _check_ctrl_x_covers_only_what_the_run_started(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    fresh, slow = Seat("sock", "%4"), Seat("sock", "%5")
+    # The lead and one member were already running, so both noop. One member
+    # launched, one launched but looked dead, and one was refused before it
+    # reached tmux.
+    outcomes = {
+        "team-lead": Outcome("noop", "sock", True, None),
+        "running": Outcome("noop", "sock", False, None),
+        "fresh": Outcome("launched", "sock", False, None, started_in=fresh),
+        "slow": Outcome("failed", "sock", False, None, started_in=slow),
+    }
+
+    def stub(sub_args, *_args, **_kwargs):
+        if sub_args.job == "refused":
+            raise Refusal("refused for this check")
+        return outcomes[sub_args.job]
+
+    real_one, real_confirm = globals()["run_one"], globals()["confirm_attach"]
+    real_attach, real_decision = globals()["maybe_attach"], RESOLVER.attach_decision
+    handed, refused = [], None
+    try:
+        globals()["run_one"] = stub
+        globals()["confirm_attach"] = (
+            lambda started, socket: handed.append((started, socket)) and False)
+        globals()["maybe_attach"] = lambda decision: None
+        RESOLVER.attach_decision = lambda socket, *_args, **_kwargs: immutable({
+            "socket": socket, "alive": True, "action": "attach"})
+        jobs = [(job, _Run(job=job)) for job in
+                ("team-lead", "running", "fresh", "slow", "refused")]
+        with capturing("out"), capturing("err"):
+            try:
+                run_agents(_Run(), [], (), jobs, "sock")
+            except Refusal as exc:
+                refused = exc
+    finally:
+        globals()["run_one"], globals()["confirm_attach"] = real_one, real_confirm
+        globals()["maybe_attach"] = real_attach
+        RESOLVER.attach_decision = real_decision
+    check("ctrl-x-covers-only-what-the-run-started",
+          "the attach prompt is handed the panes this run started and no agent "
+          "it found running",
+          handed == [((fresh, slow), "sock")] and refused is not None,
+          f"handed {handed}, refused {refused!r}")
     return checked
 
 
@@ -31219,8 +31630,8 @@ def _check_claimant_corroborated_by_children(s):
     wrong = sorted(t for t, ok in live_kids.items() if not ok)
     # And the upgrade must reach the write: only a corroborated claim lets the
     # forge record a real leadSessionId.
-    launders = sorted(t for t, ok in live_kids.items() if ok and not
-                      eng._lead_transcript_for(t)[1]["corroborated"])
+    launders = sorted(t for t, ok in live_kids.items() if ok and
+                      eng._lead_transcript_for(t)[1]["basis"] is None)
     check("claimant-corroborated-by-children", "a claimant is corroborated only by children that are running",
           bool(live_kids) and not wrong and not launders,
           ", ".join(wrong + launders) or f"{len(live_kids)} team(s) upgraded")
@@ -36638,7 +37049,7 @@ def _check_asking_is_not_resuming(s):
         uncorroborated = []
         for candidate in eng._known_teams():
             path, claim = eng._lead_transcript_for(candidate)
-            if path and not claim["corroborated"]:
+            if path and claim["basis"] is None:
                 uncorroborated.append(candidate)
         completion = eng.completion_answer("teams")
         described = {team for team in uncorroborated
@@ -36651,7 +37062,7 @@ def _check_asking_is_not_resuming(s):
         quiet.append("completion omitted " + ", ".join(sorted(set(uncorroborated) - described)))
     if said.getvalue().strip():
         quiet.append(f"describing one warned: {said.getvalue().strip().splitlines()[0][:60]}")
-    if "nothing corroborates it" not in acts:
+    if "nothing corroborates" not in acts:
         quiet.append("the run that rebuilds no longer says the claim is uncorroborated")
     check("asking-is-not-resuming", "describing a team warns about nothing; rebuilding it does",
           not quiet, "; ".join(quiet))
