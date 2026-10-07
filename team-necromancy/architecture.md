@@ -308,6 +308,45 @@ fields control two behaviors:
   2.1.220 and 2.1.226. Every exec and pane launch therefore carries `TEAM_ENV`
   inline, independent of the invoking shell's environment.
 
+### The team a live process operates as
+
+Claude Code 2.1.292 decides a process's team context once, when it mounts.
+`computeInitialTeamContext` takes the argv team when that team's config loads,
+and `initializeTeammateContextFromSession` then adopts the team stamped on the
+window root of the resumed transcript when that config loads, keeping the argv
+context otherwise. A config loads when it parses as a JSON object
+(`readTeamFileAsync`); an absent or unparsable file does not. The inbox poller
+reads from that operating team. `SendMessage` and the idle-notification hook
+use the argv team. So a teammate reads from its operating team and sends to
+its argv team, and a redirect is consistent only when the argv team equals the
+team the first message's stamps (the window root's) will load, or the stamped
+team cannot load at that moment. Lines the process writes are stamped with its
+operating team, and a lead's spawn payloads name it.
+
+Resolver answers this once, in `_operating_team`, for every reader: the lead
+runtime's `runs_as`, the lead process rungs, lead corroboration, retirement
+objections, and a parent's team for promotion. Lines and spawn payloads the
+process wrote after it started decide, and only that answer is exact; the
+process must be the only live holder of its transcript for its lines to be its
+own. Spawns written by earlier processes on the same transcript say nothing
+about the current one. Without such lines the mount rule is applied to whether
+each candidate config could have loaded when the process started: yes when the
+config parses now and its bytes or its `createdAt` predate the start, no when
+its `createdAt` is later than the start by more than `TEAM_MINT_WINDOW_MS`, and
+unknown otherwise, including a config absent or unparsable now, which may have
+loaded and been removed since. A process with neither an argv nor a loading
+stamped team takes the implicit team whose creation pairs uniquely with its
+boot. These answers are inferred. When the evidence does not decide, the
+answer names no team and lists the teams still open. The start time is the
+kernel's, read from `/proc/<pid>/stat` and `/proc/uptime`, with the session
+registry's `startedAt` as the fallback.
+
+A launch that has not started yet is a different question. `restore_answer`
+says whether its window root's team loads in the census the launch was planned
+with, so that team takes over from argv. Launch answers do not store it:
+`enforce_restore` asks at the action boundary, after any rebuild or retirement
+earlier in the run, and `run_one` asks when it reports the launch.
+
 ## Implicit-team cleanup
 
 A leader names its lazily created team `session-<internal-live-session-id>`.
@@ -414,18 +453,22 @@ implicit team-directory name currently carry that value.
 
 Resolver ranks available evidence as follows:
 
-1. `--team-name` in a flag-bound process identifies the team exactly.
-2. A spawn payload from the current process life identifies the lead exactly;
-   process start time distinguishes it from payloads written by earlier lives.
-3. A team's `leadSessionId` identifies a fresh lead exactly because the fresh
-   internal ID equals its transcript filename.
+1. `--agent-id` and `--team-name` in a flag-bound process identify exactly the
+   team it sends to and the identity it was launched with. The team it reads
+   from is the operating answer above.
+2. Lines and spawn payloads a process wrote after it started identify the team
+   it operates as exactly; process start time distinguishes them from records
+   written by earlier lives of the same transcript.
+3. A team's `leadSessionId` identifies a fresh lead's conversation exactly
+   because the fresh internal ID equals its transcript filename.
 4. A unique, bidirectional match between team `createdAt` and process
-   `startedAt` corroborates a resumed lead.
+   `startedAt` infers the implicit team a plain process minted at boot.
 
 Timing needs bidirectional uniqueness because several processes can start in one
 team's interval and one process can fit several team intervals. It also covers
 only eager team creation: a team created at first spawn may appear minutes after
-boot. `agent-resume` therefore asks before applying a timing-based rebind.
+boot. `agent-resume` therefore asks before applying a redirect whose
+destination is inferred.
 
 The `SessionStart` hook carries the transcript ID, which associates a process
 with its resumed transcript. Team inference needs the internal ID used in the
@@ -433,11 +476,11 @@ implicit team name. In the measured corpus, one of eight resumed hook IDs mapped
 to an implicit team name, and four of 23 team directories used IDs unique to a
 process life.
 
-Resolver returns an exact result for durable identity, a corroborated result for
-a unique timing match, and an unknown result for the remaining cases. A
-corroborated result is offered with confirmation and defaults to yes. A durable
-internal-session record would turn late-created teams into exact results as
-well.
+Resolver returns an exact result for durable identity and for a process's own
+lines, an inferred result for the mount rule and a unique timing match, and an
+unknown result for the remaining cases. An inferred redirect destination is
+offered with confirmation and defaults to yes. A durable internal-session
+record would turn late-created teams into exact results as well.
 
 ## Adopt
 
@@ -469,7 +512,7 @@ structured answers from Resolver.
 
 ### Public methods and private readers
 
-Resolver has exactly 35 public methods and no public instance attributes. Its
+Resolver has exactly 36 public methods and no public instance attributes. Its
 answers use read-only records. The retained observation types and config
 constructors establish ownership of their nested values; a read-only outer
 mapping alone does not copy a caller's referenced objects. In particular, rebuild
@@ -499,6 +542,7 @@ private Resolver methods, and require an empty `PUBLIC_RESOLVER_ATTRIBUTES` map.
 | `promotion_plan` | `run_promote` |
 | `rebuild_plan` | `apply_rebuild_plan`, `rebuild_roster`, `rebuild_team` |
 | `refresh_transcript_evidence` | `apply_restamp`, `embed`, `materialize` |
+| `restore_answer` | `enforce_restore`, `run_one` |
 | `revalidate_cleanup` | `run_cleanup` |
 | `revalidate_cleanup_cut` | `remove_cleanup_action` |
 | `revalidate_conversion` | `embed`, `materialize` |
@@ -603,8 +647,8 @@ Subsequent readers reconstruct evidence through their existing loaders.
 |---|---|
 | Transcript | `_stamps`, `_carried`, `_carried_scope`, `_receipts`, `_spawns`, `_spawn_log`, `_by_agent`, `_by_team`, `_team_assignments`, `_transcript_facts`, `_transcript_snapshots`, `_copied_prefixes` |
 | Process | `_procs`, `_seat_table`, `_seats`, `_registry` |
-| Either | `_runtime_table`, `_runtime_snapshot`, `_team_member_answers`, `_team_descriptions` |
-| Neither | `_terminal` |
+| Either | `_runtime_table`, `_runtime_snapshot`, `_team_member_answers`, `_team_descriptions`, `_operating_answers` |
+| Neither | `_terminal`, `_boot_time` |
 
 The active `_process_table(refresh=True)` uses this registry. Transcript writers
 call `refresh_transcript_evidence`. Neither event resets configured directories,
@@ -729,11 +773,35 @@ live lead team. The automatic branch runs only when the required live-lead facts
 are available. `member_redirect_plan(request)` chooses the source and
 destination teams, target identity and parent, confirmation, warnings, objections,
 and any rebind before any write. `auto_redirect` and `run_one` are its only
-callers. Its retained-generation check compares the exact parent transcript
-generation and exact destination-lead runtime generation, and retains the exact
-redirected-launch object. It does not establish a separate roster generation in
-that subcase. A separate explicit-route check refuses destination-roster drift
-before a write.
+callers.
+
+Where members go and whether the team their stamps restore them as is retired
+is one decision per run, made before any member launches by the private
+`_team_redirect`. A team run makes it in `team_run_plan` for every member it
+starts; a run of one member makes it inside `member_redirect_plan`. The decision
+names the destination and its selected lead session, whether a person must
+confirm (an inferred destination), and the retirement: reap the source team when
+nothing that sends or reads as it is left, restamp each moving member's own
+conversation under `--force`, or blocked. `run_team` carries out the team-wide
+part once in `apply_team_redirect`: one question, at most one reap, or one
+decline, and no roster rebuild for a team its members leave. Each member's plan
+receives the decision and the run's answer to it in `MemberRedirectRequest.team`
+and `team_answer` and carries it out without deciding again. A restamp touches
+one transcript, so a live process holding that transcript is its only conflict.
+
+The destination a member would follow its live lead to comes from one private
+answer, `_lead_destination`, for `--into-team live`, the automatic decision and
+the doctor's remedies. A destination with no selected lead session refuses an
+explicit or live move with `--keep-team` and `--into-team <name>` named; for the
+automatic move it blocks, so `decline_unreachable` asks before starting the
+member where its lead does not read its mail. The doctor offers `--into-team
+live` only when that answer has no objection, and always names `--keep-team`.
+
+A member redirect's revalidation compares the facts its plan used: the
+destination roster observation, the parent transcript's identity (device and
+inode, which appending leaves unchanged, since a working lead writes to it all
+the time), the destination lead's runtime generation, the selected holders, the
+rebind, and the redirected-launch object and placement.
 
 `apply_member_migration` is the only caller of
 `revalidate_member_redirect(plan)` and
@@ -750,7 +818,10 @@ destination with expected bytes and reuses the selected object and provenance. T
 unstamped-lead API check refuses restamping before any mutation.
 
 `LeadMigrationRequest` is frozen and contains `destination`, `force`, and
-`archive_mail`. It requires a nonempty destination. `complete_member_migration`
+`archive_mail`. It requires a nonempty destination, and `run_one` asks for a lead
+migration only when `--into-team` names one: a team named inside an agent id
+says which lead this is, and when the stamps disagree `enforce_identity` refuses
+and names `--into-team` as the move. `complete_member_migration`
 and `complete_lead_migration` receive an `Applied` record, which is frozen and
 contains `operation` and `plan`. `run_one` is the only caller of
 `lead_migration_plan(request)`. `lead_rebind` is the only caller of
@@ -783,7 +854,7 @@ transcript move. A writer may make the final check required by that plan, but it
 does not choose a new identity, parent, destination, or member set.
 
 `selector_answer` selects a conversation without selecting a tmux destination.
-`launch_plan` adds identity, settings, cwd, restore state, provenance, the roster
+`launch_plan` adds identity, settings, cwd, provenance, the roster
 record to write, terminal context, lead and member runtime facts, `CrewPlacement`,
 `LaunchDestination`, and `RosterPaneReference`. `_retarget_launch` rebuilds those
 coupled facts after an identity or route change. It does not retain a roster,
@@ -819,8 +890,9 @@ behaviors.
 
 A team-run plan retains its member answer's process snapshot, census, durable
 assignments, and selected complete roster. It chooses the member order,
-former-member set, and destination from that evidence. `revalidate_team_run`
-compares the selected roster observation, including permissions, before the run
+former-member set, destination, and the run's redirect decision from that
+evidence. `revalidate_team_run` compares the selected roster observation,
+including permissions, and the redirect destination's roster before the run
 starts. A change stops execution rather than choosing another member list.
 Launch observation records whether the selected launch appeared, survived, and
 wrote its transcript.
@@ -947,9 +1019,10 @@ records from `doctor_answer`; summary and dossier title rows therefore retain th
 same transcript fact by object identity. The canonical transcript fact carries
 path, optional title, and activity time together; there is no separate title
 lookup. A full transcript snapshot is keyed by device, inode, size, and
-nanosecond modification time. It derives the restored window root and, when
-requested, compact mail evidence from one stable read; restored-identity and mail
-questions reuse that answer until any key field changes. Runtime reads produce
+nanosecond modification time. It derives the restored window root, the newest
+team stamp and, when requested, compact mail evidence from one stable read;
+window-start, operating-team and mail questions reuse that answer until any key
+field changes. Runtime reads produce
 one immutable snapshot whose PID records are the exact objects referenced by its
 process, agent, transcript, pane, and session indexes. A question that receives
 a process table carries that snapshot through every helper instead of reading the
