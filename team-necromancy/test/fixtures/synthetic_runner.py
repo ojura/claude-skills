@@ -19,15 +19,24 @@ report is printed. FILTER_LIES makes the failed-only report name a check that
 passed. WRITE_BESIDE names a path under this file's directory that every
 invocation writes to, as a unit leaking into the corpus beside the tool would.
 
+OWNED_DRIVER starts a driver in a session of its own whose terminal child
+ignores the hangup its pty sends, as the real suite's completion drive does,
+and writes the driver down where the suite writes the groups it owns: in the
+file the verifier names ("direct") or in a worker's file that one names
+("nested"). Ending the runner's group reaches neither process.
+
 With PROBE_SYNTHETIC_LOG set, every invocation appends its arguments to that
 file as one JSON line, which is how a test sees what the verifier asked. With
 PROBE_SYNTHETIC_PATHS set, every invocation appends the path it ran from, which
-is how a test sees which copy the verifier ran.
+is how a test sees which copy the verifier ran. With PROBE_SYNTHETIC_GROUPS
+set, OWNED_DRIVER appends the pid and start time of the driver and of its
+terminal child, which is how a test sees whether both were ended.
 """
 
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 
@@ -49,6 +58,53 @@ SLEEP = 0
 SIGNAL = None
 FILTER_LIES = False
 WRITE_BESIDE = None
+OWNED_DRIVER = None
+
+# The driver OWNED_DRIVER starts. Its child is a terminal's: pty.fork puts it in
+# a session of its own, and it ignores the hangup the pty sends when the driver
+# ends, so only an owner that ends it by identity ends it.
+DRIVER = r"""
+import os, pty, signal, time
+child, _terminal = pty.fork()
+if child == 0:
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    time.sleep(600)
+    os._exit(0)
+print(os.getpid(), child, flush=True)
+time.sleep(600)
+"""
+
+
+def started_at(pid):
+    """The kernel's start time for pid, field 22 of its stat, as the suite writes it."""
+    with open(f"/proc/{pid}/stat") as stat:
+        text = stat.read()
+    return text[text.rindex(")") + 2:].split()[19]
+
+
+def start_owned_driver(where):
+    """Start the driver and write it down as the suite would, directly or in a worker's file."""
+    driver = subprocess.Popen([sys.executable, "-c", DRIVER], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              text=True, start_new_session=True)
+    leader, child = (int(word) for word in driver.stdout.readline().split())
+    entry = f"{leader} {started_at(leader)}\n"
+    name = os.path.basename(os.path.realpath(__file__))
+    record = os.environ.get(f"{name.upper().replace('-', '_')}_SELFTEST_OWNED_GROUPS")
+    if record and where == "nested":
+        worker = record + ".worker"
+        with open(worker, "a") as owned:
+            owned.write(entry)
+        with open(record, "a") as owned:
+            owned.write(f"record {worker}\n")
+    elif record:
+        with open(record, "a") as owned:
+            owned.write(entry)
+    witness = os.environ.get("PROBE_SYNTHETIC_GROUPS")
+    if witness:
+        with open(witness, "a") as named:
+            for pid in (leader, child):
+                named.write(f"{pid} {started_at(pid)}\n")
 
 
 def main(argv):
@@ -74,6 +130,8 @@ def main(argv):
         for cid, description in rows:
             print(f"{cid:<{width}}  {description}")
         return 0
+    if OWNED_DRIVER:
+        start_owned_driver(OWNED_DRIVER)
     if SLEEP:
         time.sleep(SLEEP)
     verdicts = [(cid, description, cid not in FAILING,

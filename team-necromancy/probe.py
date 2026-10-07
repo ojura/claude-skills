@@ -35,15 +35,16 @@ expectation judged it.
 Certification is asked for, not inferred: ``expect(..., certify=True)`` runs
 only with a timeout of its own and such a retained expectation, adjudications
 included, that still reads the same from its files, whose adjudications are all
-decided and name rows of the mapping in selections that emit them, and whose
-frozen source is the tool under test; only while the verifier on disk is the
-one this process loaded, and only after the verifier's own selftest passes. Its
-clean suite runs from a private copy of the tool tree, and its result says it
-certified. Every other call is a development run. Without ``expected`` the clean listing stands in for the
-population, which checks that the listing, the clean run and the mutants agree
-with each other and nothing more; a bare mapping has no recorded origin. Both
-still judge every run strictly, and both return a result that says it
-certifies nothing.
+decided and point where their decisions can, and whose frozen source is the
+tool under test; only while the verifier on disk is the one this process loaded
+and the code running was compiled from it, and only after the verifier's own
+selftest passes. Its listing and clean suite run from a private copy of the
+tool tree, hashed before and after the runs, and its result says it certified.
+Every other call is a development run. Without ``expected`` the clean listing
+stands in for the population, which checks that the listing, the clean run and
+the mutants agree with each other and nothing more; a bare mapping has no
+recorded origin. Both still judge every run strictly, and both return a result
+that says it certifies nothing.
 """
 
 import collections
@@ -51,10 +52,12 @@ import concurrent.futures
 import contextlib
 import dataclasses
 import hashlib
+import importlib.util
 import io
 import json
 import os
 import platform
+import py_compile
 import re
 import shlex
 import shutil
@@ -63,6 +66,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 from collections.abc import Mapping
 from pathlib import Path
@@ -84,11 +88,19 @@ FAILED_SUMMARY = re.compile(r"checks: (\d+) ok, (\d+) failed")
 # The stand-in suite probe's own tests run against, beside the corpus.
 SYNTHETIC_RUNNER = TOOL.parent / "test" / "fixtures" / "synthetic_runner.py"
 VERIFIER = Path(__file__).resolve()
-# The sha256 of the bytes this process loaded as the verifier, read once as the
-# module is imported. A certifying run names the verifier in its record, and a
-# reader checks the file on disk, so certification is refused when that file is
-# no longer these bytes.
-VERIFIER_LOADED = hashlib.sha256(VERIFIER.read_bytes()).hexdigest()
+# The sha256 of the verifier's bytes, read once as the module is imported, and
+# whether the code this process runs is what those bytes compile to. A cached
+# .pyc whose recorded size and modification time match the source runs in its
+# place without being read against it, so the module's own code object is
+# compared with the bytes compiled as the import system compiles them. A
+# certifying run names the verifier in its record and a reader checks the file
+# on disk, so certification is refused when that file is no longer these bytes
+# or when the code that ran was not compiled from them.
+_VERIFIER_BYTES = VERIFIER.read_bytes()
+VERIFIER_LOADED = hashlib.sha256(_VERIFIER_BYTES).hexdigest()
+VERIFIER_FROM_SOURCE = sys._getframe().f_code == compile(
+    _VERIFIER_BYTES, str(VERIFIER), "exec", dont_inherit=True)
+del _VERIFIER_BYTES
 
 
 class ProbeFailure(AssertionError):
@@ -163,9 +175,10 @@ class Expectation:
 class Results(tuple):
     """What expect returns: one result dictionary per case, in case order.
 
-    certified says whether the call asked for certification and had what it
-    needs, and report is the record expect printed, so a caller that keeps
-    the result keeps the provenance with it.
+    certified says whether the call asked for certification, had what it
+    needs and ran the verifier's own selftest rather than a stand-in, and
+    report is the record expect printed, so a caller that keeps the result
+    keeps the provenance with it.
     """
 
     def __new__(cls, results, certified, report):
@@ -222,6 +235,108 @@ def end_group(child, grace=None):
             return
 
 
+def owned_groups_variable(tool):
+    """The environment variable naming the file a suite writes its own-session groups to.
+
+    The tool names it from its own file name, as agent-resume's OWNED_GROUPS
+    does, and a private copy or a mutant keeps the tool's name, so every suite
+    the verifier runs reads the variable named here.
+    """
+    return f"{Path(tool).name.upper().replace('-', '_')}_SELFTEST_OWNED_GROUPS"
+
+
+def _proc_identity(pid):
+    """(parent pid, start time) from /proc/<pid>/stat, or None for no live process.
+
+    The start time is the kernel's, field 22, as the tool writes it beside a
+    pid, so a pid the kernel has handed to another process does not match. A
+    zombie has ended and is not a process to stop.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        rest = stat[stat.rindex(")") + 2:].split()
+        state, parent, started = rest[0], int(rest[1]), rest[19]
+    except (OSError, ValueError, IndexError):
+        return None
+    return None if state in ("Z", "X") else (parent, started)
+
+
+def _descendants(leader):
+    """Every live process under leader, by parentage, with its start time.
+
+    Read while the leader still runs: a terminal child sits in a session of its
+    own, so the group signal misses it, and once the leader ends its children
+    are handed to another parent and cannot be told from anyone else's.
+    """
+    children = {}
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit() and (identity := _proc_identity(int(entry.name))):
+            children.setdefault(identity[0], []).append((int(entry.name), identity[1]))
+    found, frontier = {}, [leader]
+    while frontier:
+        for pid, started in children.get(frontier.pop(), ()):
+            if pid not in found:
+                found[pid] = started
+                frontier.append(pid)
+    return found
+
+
+def end_recorded_groups(record, grace=3.0, seen=None):
+    """End every process group a suite wrote down in record; returns the pids left running.
+
+    A suite writes "<pid> <start time>" for each process it starts in a session
+    of its own, which ending the suite's group does not reach, and "record
+    <path>" for the file a worker of its writes its own groups to. Each group is
+    ended with its leader's descendants, read while the leader runs, and only
+    while each process's start time is the one written down, so a pid reused
+    since is left alone. The groups written in a file are ended before the
+    files it names are read, because a worker's group carries the groups that
+    worker started while it still runs.
+    """
+    seen = set() if seen is None else seen
+    record = Path(record)
+    if record in seen:
+        return []
+    seen.add(record)
+    try:
+        lines = record.read_text().splitlines()
+    except OSError:
+        return []
+    left, nested = [], []
+    for line in lines:
+        first, _, rest = line.partition(" ")
+        if first == "record" and rest:
+            nested.append(rest)
+            continue
+        if not first.isdigit():
+            continue
+        leader = int(first)
+        identity = _proc_identity(leader)
+        if not rest or identity is None or identity[1] != rest:
+            continue
+        family = {leader: rest, **_descendants(leader)}
+        for number in (signal.SIGTERM, signal.SIGKILL):
+            with contextlib.suppress(OSError):
+                os.killpg(leader, number)
+            for member, started in family.items():
+                if (_proc_identity(member) or (None, None))[1] == started:
+                    with contextlib.suppress(OSError):
+                        os.kill(member, number)
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline and any(
+                    (_proc_identity(member) or (None, None))[1] == started
+                    for member, started in family.items()):
+                time.sleep(0.05)
+            running = [member for member, started in family.items()
+                       if (_proc_identity(member) or (None, None))[1] == started]
+            if not running:
+                break
+        left += running
+    for path in nested:
+        left += end_recorded_groups(path, grace, seen)
+    return sorted(left)
+
+
 def run_suite(argv, timeout=None):
     """Run one bounded suite in its own group and return its Run.
 
@@ -229,20 +344,38 @@ def run_suite(argv, timeout=None):
     above is what decides it and a caller can lower it without editing this.
     A run that reaches the bound is stopped with its group and comes back with
     returncode None and whatever it had printed.
+
+    The suite is told, through the variable owned_groups_variable names, a
+    private file to write down the process groups it starts in sessions of
+    their own. When the suite did not end by itself, because the bound was
+    reached or a signal ended it, its own cleanup may not have run, so every
+    group written there is ended too, and any process still running after
+    that is named at the end of the run's stderr.
     """
     timeout = SUITE_TIMEOUT_S if timeout is None else timeout
-    with subprocess.Popen(list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, start_new_session=True) as child:
-        try:
-            out, err = child.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            end_group(child)
+    with tempfile.TemporaryDirectory(prefix="probe-groups-") as owned:
+        record = Path(owned) / "owned-groups"
+        env = {**os.environ, owned_groups_variable(argv[1]): str(record)}
+        with subprocess.Popen(list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, start_new_session=True, env=env) as child:
             try:
-                out, err = child.communicate(timeout=SUITE_GRACE_S)
+                out, err = child.communicate(timeout=timeout)
+                returncode = child.returncode
+                left = end_recorded_groups(record) if returncode < 0 else []
             except subprocess.TimeoutExpired:
-                out, err = "", ""
-            return Run(tuple(argv), None, out, err, timeout)
-        return Run(tuple(argv), child.returncode, out, err, timeout)
+                end_group(child)
+                # Before the rest is read: a process the suite recorded can
+                # hold its pipes open, and the read would wait for it.
+                left = end_recorded_groups(record)
+                try:
+                    out, err = child.communicate(timeout=SUITE_GRACE_S)
+                except subprocess.TimeoutExpired:
+                    out, err = "", ""
+                returncode = None
+        if left:
+            err += (f"\nprobe: still running after the suite and the groups it recorded "
+                    f"were ended: {', '.join(map(str, left))}\n")
+        return Run(tuple(argv), returncode, out, err, timeout)
 
 
 def read_listing(stdout):
@@ -556,6 +689,27 @@ def tree_digest(prints, root):
     return len(entries), hasher.hexdigest()
 
 
+def _private_copy(tool, comp, room):
+    """Copy the tool, its companion and its test tree into room; return the copies' paths.
+
+    The paths are the copied tool, the copied companion and every file of the
+    copied test tree, which certification hashes before the runs and again
+    after them.
+    """
+    room.mkdir()
+    copied_tool, copied_comp = room / tool.name, room / comp.name
+    shutil.copy2(tool, copied_tool)
+    shutil.copy2(comp, copied_comp)
+    shutil.copytree(tool.parent / "test", room / "test")
+    return copied_tool, copied_comp, _copy_files(room, copied_tool, copied_comp)
+
+
+def _copy_files(room, copied_tool, copied_comp):
+    """Every file a private copy holds that a run could read: tool, companion, test tree."""
+    return [copied_tool, copied_comp,
+            *sorted(item for item in (room / "test").rglob("*") if item.is_file())]
+
+
 def raw_output(outcome):
     """The refused run as the reader needs it: command, status, both streams."""
     run = outcome.run
@@ -817,31 +971,47 @@ def undecided(record):
 
 
 def misplaced(record, mapping):
-    """The adjudication entries that name no row of the mapping in a selection emitting it, as sentences.
+    """The adjudication entries that point where their decision cannot, as sentences.
 
     record is the approved-adjudications record and mapping the frozen
-    mapping file it names, both as parsed. An entry decides about one row in
-    one selection, so its id must be a row of the mapping and its mode a
-    selection of the mapping in which that row is emitted, a key of the row's
-    emitted_in. An entry that is not an object is undecided's to name.
+    mapping file it names, both as parsed. An approved entry decides that a
+    row belongs to a selection, so its id must be a row of the mapping and its
+    mode a selection in which that row is emitted, a key of the row's
+    emitted_in. A refused entry decides that a row does not, so its id must be
+    no row of the mapping, or a row its mode, a selection of the mapping,
+    withholds. An entry that is not an object or carries no decision is
+    undecided's to name.
     """
     rows = {row.get("id"): row for row in (mapping.get("rows") or [])
             if isinstance(row, dict)} if isinstance(mapping, dict) else {}
     modes = (mapping.get("modes") or {}) if isinstance(mapping, dict) else {}
     gaps = []
-    for at, entry in enumerate((record.get("entries") or []) if isinstance(record, dict) else [], 1):
-        if not isinstance(entry, dict):
+    entries = (record.get("entries") or []) if isinstance(record, dict) else []
+    for at, entry in enumerate(entries, 1):
+        decision = entry.get("decision") if isinstance(entry, dict) else None
+        if not isinstance(decision, str):
             continue
         cid, mode = entry.get("id"), entry.get("mode")
         emitted = rows.get(cid, {}).get("emitted_in")
-        if cid not in rows:
-            gaps.append(f"adjudication entry {at} names {cid!r}, which is no row of the mapping")
-        elif not isinstance(modes, (dict, list)) or mode not in modes:
-            gaps.append(f"adjudication entry {at} ({cid!r}) names the mode {mode!r}, which is "
-                        "no selection of the mapping")
-        elif not isinstance(emitted, (dict, list)) or mode not in emitted:
-            gaps.append(f"adjudication entry {at} ({cid!r}) names the mode {mode!r}, in which "
-                        "that row is not emitted")
+        selection = isinstance(modes, (dict, list)) and mode in modes
+        in_mode = isinstance(emitted, (dict, list)) and mode in emitted
+        if decision.startswith("approved"):
+            if cid not in rows:
+                gaps.append(f"adjudication entry {at} names {cid!r}, which is no row of the "
+                            "mapping")
+            elif not selection:
+                gaps.append(f"adjudication entry {at} ({cid!r}) names the mode {mode!r}, which is "
+                            "no selection of the mapping")
+            elif not in_mode:
+                gaps.append(f"adjudication entry {at} ({cid!r}) names the mode {mode!r}, in which "
+                            "that row is not emitted")
+        elif decision.startswith("refused") and cid in rows:
+            if not selection:
+                gaps.append(f"adjudication entry {at} ({cid!r}) is refused for the mode {mode!r}, "
+                            "which is no selection of the mapping")
+            elif in_mode:
+                gaps.append(f"adjudication entry {at} ({cid!r}) is refused, but the mapping still "
+                            f"emits that row in {mode!r}")
     return gaps
 
 
@@ -873,6 +1043,10 @@ def certification_gaps(expected, live, jobs, tool_digest, verifier_digest):
         gaps.append(f"the verifier {VERIFIER} on disk has sha256 {verifier_digest}, not the "
                     f"{VERIFIER_LOADED} this process loaded, so the record would name a "
                     "verifier that did not judge the run")
+    if not VERIFIER_FROM_SOURCE:
+        gaps.append(f"the code this process runs is not what {VERIFIER} compiles to: cached "
+                    "bytecode ran in its place; remove the verifier's .pyc from __pycache__ "
+                    "and import it again")
     if not (expected.path and expected.sha256):
         gaps.append("the expectation names no file and hash it was read from")
     gaps += [f"the expectation's frozen source names no {key}"
@@ -936,7 +1110,9 @@ def verifier_selftest(run=None):
         raise ProbeFailure([f"the verifier's own selftest failed: {failure}"
                             for failure in exc.failures])
     lines = said.getvalue().strip().splitlines()
-    return lines[-1] if lines else "it printed nothing"
+    if not lines:
+        raise ProbeFailure(["the verifier's own selftest printed nothing, so nothing says it ran"])
+    return lines[-1]
 
 
 def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
@@ -958,18 +1134,22 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
     unless it names its timeout, ``expected`` came from
     ``retained_expectation`` with its source and approved adjudications, reads
     again from its files as it was read, every adjudication is decided and
-    names a row of the mapping in a selection that emits it, the tool is the
-    source the mapping was frozen for, the verifier on disk is the one this
-    process loaded and the verifier's own selftest passes. ``verifier`` is
-    that selftest: selftest itself when it is None, or a stand-in the caller
-    supplies, which the record names as one; the verifier's own tests supply
-    one, since a selftest that started itself would not end. A certifying run
-    runs the clean suite from a private copy of the tool, its companion and
-    its test tree, with the same hashes, and checks the clean run's --failed
-    report too. Its record names the inputs and the copy with their hashes,
-    the interpreter, the timeout, the selftest's result, the runs whose
-    --failed output was checked and every co-failure's reason. Without it the
-    run judges just as strictly and its result says it certified nothing.
+    points where its decision can (misplaced), the tool is the source the
+    mapping was frozen for, the verifier on disk is the one this process
+    loaded, the code running was compiled from it, and the verifier's own
+    selftest passes. ``verifier`` is that selftest: selftest itself when it is
+    None, or a stand-in the caller supplies. The verifier's own tests supply
+    one, since a selftest that started itself would not end; a run given one
+    judges as a certifying run does, its result says it certified nothing, and
+    its record says why. A certifying run runs its listing and its clean suite
+    from a private copy of the tool, its companion and its test tree, hashed
+    after copying, where it must equal the originals, and again after the
+    runs, where any change is refused as a change to the originals is; and it
+    checks the clean run's --failed report too. Its record names the inputs
+    and the copy with their hashes, the interpreter, the timeout, the
+    selftest's result, the runs whose --failed output was checked and every
+    co-failure's reason. Without it the run judges just as strictly and its
+    result says it certified nothing.
 
     The successful return is a Results tuple with one result dictionary per
     case: the check, the mutated file, the ids that failed and the
@@ -1007,6 +1187,9 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
         checked_verifier = verifier_selftest(verifier)
         if verifier is not None:
             checked_verifier = f"a stand-in the caller supplied said: {checked_verifier}"
+    # A run that did not run the verifier's own selftest certifies nothing,
+    # though it judges everything else a certifying run judges.
+    certified = certify and verifier is None
     count, digest = tree_digest(watched, tool.parent / "test")
     lines = [f"tool: {tool} sha256 {tool_digest}",
              f"companion: {comp} sha256 {watched[comp]}",
@@ -1037,34 +1220,10 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
                      "with no recorded origin")
     else:
         lines.append("expectation: none supplied, so the listing is the population")
-    lines.insert(0, "certifying: yes" if certify else
+    lines.insert(0, "certifying: yes" if certified else
+                 "certifying: no; the verifier's own selftest was a stand-in the caller "
+                 "supplied, so this run certifies nothing" if certify else
                  "certifying: no; this run certifies nothing about the tool")
-
-    listed = judge_listing(
-        run_suite(suite_argv(tool, live=live, jobs=jobs, listing=True), timeout), expected)
-    population = expected if expected is not None else dict(listed.rows)
-    lines.append(f"listing: {len(listed.rows)} check(s)")
-    if listed.reasons:
-        raise _refusal([listed], lines, stream)
-
-    failures = []
-    for at, (check, _old, _new, co_failures) in enumerate(cases, 1):
-        for cid in (check, *co_failures):
-            if cid not in population:
-                failures.append(f"case {at}: {cid!r} names no expected check")
-    if failures:
-        examples = ", ".join(sorted(population)[:5])
-        raise ProbeFailure([*failures, f"expected checks include: {examples}"])
-
-    prepared = []
-    for at, (check, old, new, co_failures) in enumerate(cases, 1):
-        target, reason = mutation_target(old, (tool, comp))
-        if reason:
-            failures.append(f"case {at}: {reason}")
-        else:
-            prepared.append((check, old, new, co_failures, target))
-    if failures:
-        raise ProbeFailure(failures)
 
     # A certifying run checks the clean run's --failed report whatever filtering
     # says, because the plan has --failed tested against the same run.
@@ -1076,26 +1235,51 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
         return full, filtered
 
     with tempfile.TemporaryDirectory() as scratch:
-        # A certifying run's clean suite runs from a copy nothing else touches,
-        # hashed after copying, so the record names the bytes that ran.
-        clean_tool = tool
+        # A certifying run's listing and clean suite run from a copy nothing
+        # else touches, hashed after copying and again after the runs, so the
+        # record names the bytes that ran and a run that wrote into its own
+        # copy is refused as one that wrote into the original would be.
+        clean_tool, copied, copy_changed = tool, {}, []
         if certify:
             room = Path(scratch) / "clean"
-            room.mkdir()
-            clean_tool, clean_comp = room / tool.name, room / comp.name
-            shutil.copy2(tool, clean_tool)
-            shutil.copy2(comp, clean_comp)
-            shutil.copytree(tool.parent / "test", room / "test")
-            copied = fingerprints([clean_tool, clean_comp, *sorted(
-                item for item in (room / "test").rglob("*") if item.is_file())])
+            clean_tool, clean_comp, files = _private_copy(tool, comp, room)
+            copied = fingerprints(files)
             copied_count, copied_digest = tree_digest(copied, room / "test")
-            if (copied[clean_tool], copied[clean_comp], copied_digest) != (
+            if (copied.get(clean_tool), copied.get(clean_comp), copied_digest) != (
                     tool_digest, watched[comp], digest):
                 raise ProbeFailure([f"the private copy {room} is not the tool, companion and "
                                     "test tree it was copied from"])
             lines.append(f"clean run from a private copy: {room}: tool sha256 "
                          f"{copied[clean_tool]}, companion sha256 {copied[clean_comp]}, "
                          f"test tree {copied_count} file(s), digest {copied_digest}")
+
+        listed = judge_listing(
+            run_suite(suite_argv(clean_tool, live=live, jobs=jobs, listing=True), timeout),
+            expected)
+        population = expected if expected is not None else dict(listed.rows)
+        lines.append(f"listing: {len(listed.rows)} check(s)")
+        if listed.reasons:
+            raise _refusal([listed], lines, stream)
+
+        failures = []
+        for at, (check, _old, _new, co_failures) in enumerate(cases, 1):
+            for cid in (check, *co_failures):
+                if cid not in population:
+                    failures.append(f"case {at}: {cid!r} names no expected check")
+        if failures:
+            examples = ", ".join(sorted(population)[:5])
+            raise ProbeFailure([*failures, f"expected checks include: {examples}"])
+
+        prepared = []
+        for at, (check, old, new, co_failures) in enumerate(cases, 1):
+            target, reason = mutation_target(old, (tool, comp))
+            if reason:
+                failures.append(f"case {at}: {reason}")
+            else:
+                prepared.append((check, old, new, co_failures, target))
+        if failures:
+            raise ProbeFailure(failures)
+
         copies = []
         for at, (_check, old, new, _co_failures, target) in enumerate(prepared, 1):
             room = Path(scratch) / f"case-{at}"
@@ -1108,6 +1292,10 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
             copies.append(copy)
         runs = batch([(clean_tool, filtering or certify),
                       *((copy, filtering) for copy in copies)], run_one)
+        if certify:
+            again = fingerprints(_copy_files(clean_tool.parent, clean_tool, clean_comp))
+            copy_changed = sorted(str(item) for item in set(copied) | set(again)
+                                  if copied.get(item) != again.get(item))
     labels = ["clean", *(f"case {at}" for at in range(1, len(prepared) + 1))]
     lines.append("--failed checked for: " + (", ".join(
         label for label, (_full, filtered) in zip(labels, runs) if filtered is not None)
@@ -1120,7 +1308,7 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
     # out which of them wrote.
     after = fingerprints(watched_files(tool, comp))
     changed = sorted(str(item) for item in set(watched) | set(after)
-                     if watched.get(item) != after.get(item))
+                     if watched.get(item) != after.get(item)) + copy_changed
     if changed:
         lines.append("changed while the suites ran: " + ", ".join(changed))
         discarded = []
@@ -1173,24 +1361,24 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
             "bit": tuple(sorted(outcome.failed)),
             "co_failures": dict(co_failures),
             "outcome": outcome,
-            "certified": certify,
+            "certified": certified,
         })
 
     if any(outcome.reasons for outcome in outcomes):
         raise _refusal(outcomes, lines, stream)
     report = "\n".join(lines)
     print(report, file=stream)
-    return Results(results, certify, report)
+    return Results(results, certified, report)
 
 
 # What probe's own tests say about the stand-in runner. KNOBS is the block of
 # literals in SYNTHETIC_RUNNER, in file order; a test mutation rewrites the
 # whole block, so any combination of knobs is one contiguous replacement.
 KNOBS = ("FAILING", "SUMMARY", "EXIT", "DROP", "EXTRA", "DUPLICATE", "DESCRIBE",
-         "SLEEP", "SIGNAL", "FILTER_LIES", "WRITE_BESIDE")
+         "SLEEP", "SIGNAL", "FILTER_LIES", "WRITE_BESIDE", "OWNED_DRIVER")
 KNOB_DEFAULTS = {"FAILING": [], "SUMMARY": "exact", "EXIT": None, "DROP": [], "EXTRA": [],
                  "DUPLICATE": [], "DESCRIBE": {}, "SLEEP": 0, "SIGNAL": None,
-                 "FILTER_LIES": False, "WRITE_BESIDE": None}
+                 "FILTER_LIES": False, "WRITE_BESIDE": None, "OWNED_DRIVER": None}
 SYNTHETIC_EXPECTED = {
     "target-check": "the check a case names",
     "other-check": "a check a case may justify as a co-failure",
@@ -1989,6 +2177,15 @@ def _selftest_checks(verifier):
                 modes=("live-jobs-3", "read-only"), source=source))
             withheld_approved = adjudicating(withheld_path, entries=[
                 {"id": "target-check", "mode": "read-only", "decision": "approved"}])
+            # A refused entry decides that a row is not in a selection.
+            refused_emitted_path, refused_emitted_approved = frozen_beside(
+                "expected-mapping-refused-but-emitted",
+                entries=[{"id": "target-check", "mode": "live-jobs-3",
+                          "decision": "refused: not a row of this selection"}])
+            refused_unmoded_path, refused_unmoded_approved = frozen_beside(
+                "expected-mapping-refused-no-selection",
+                entries=[{"id": "target-check", "mode": "live-jobs-9",
+                          "decision": "refused: not a row of this selection"}])
             bare_path, _bare = frozen_beside("expected-mapping-no-entries")
             bare_approved = adjudicating(bare_path, record={"frozen_mapping": {
                 "sha256": hashlib.sha256(bare_path.read_bytes()).hexdigest()}})
@@ -2064,6 +2261,16 @@ def _selftest_checks(verifier):
                                       adjudications=unmoded_approved),
                  ["adjudication entry 1 ('target-check') names the mode 'live-jobs-9', which is "
                   "no selection of the mapping"]),
+                ("certify-refused-entry-for-a-row-still-emitted-refused",
+                 retained_expectation(refused_emitted_path, live=True, jobs=3,
+                                      adjudications=refused_emitted_approved),
+                 ["adjudication entry 1 ('target-check') is refused, but the mapping still emits "
+                  "that row in 'live-jobs-3'"]),
+                ("certify-refused-entry-for-no-selection-refused",
+                 retained_expectation(refused_unmoded_path, live=True, jobs=3,
+                                      adjudications=refused_unmoded_approved),
+                 ["adjudication entry 1 ('target-check') is refused for the mode 'live-jobs-9', "
+                  "which is no selection of the mapping"]),
                 ("certify-entry-in-a-mode-withholding-its-row-refused",
                  retained_expectation(withheld_path, live=True, jobs=3,
                                       adjudications=withheld_approved),
@@ -2156,10 +2363,81 @@ def _selftest_checks(verifier):
             finally:
                 globals()["VERIFIER_LOADED"] = loaded
 
-            # verifier_selftest on stand-ins: a failing one refuses, a passing one
-            # gives its last line.
+            # A refused entry for a row its mode withholds, or for an id that is
+            # no row, is a decision the mapping carries.
+            for name, cid, mode in (
+                ("certify-accepts-a-refused-entry-for-a-withheld-row", "target-check",
+                 "read-only"),
+                ("certify-accepts-a-refused-entry-for-an-id-that-is-no-row", "no-such-check",
+                 "read-only"),
+            ):
+                adjudicating(withheld_path, entries=[
+                    {"id": cid, "mode": mode, "decision": "refused: not in this selection"}])
+                gaps = certification_gaps(
+                    retained_expectation(withheld_path, live=True, jobs=3,
+                                         adjudications=withheld_approved),
+                    True, 3, tool_digest, VERIFIER_LOADED)
+                check(name, gaps == [], repr(gaps))
+
+            # Cached bytecode that is not what the verifier's bytes compile to.
+            commands_before = log.read_text()
+            from_source = globals()["VERIFIER_FROM_SOURCE"]
+            globals()["VERIFIER_FROM_SOURCE"] = False
+            try:
+                refused("certify-refused-when-the-code-was-not-compiled-from-the-verifier",
+                        lambda: expect([("target-check", knobs(), bite)], live=True, jobs=3,
+                                       tool=tool, expected=certifying, timeout=20.0,
+                                       certify=True, stream=io.StringIO(), verifier=verifier),
+                        f"the code this process runs is not what {VERIFIER} compiles to")
+            finally:
+                globals()["VERIFIER_FROM_SOURCE"] = from_source
+            check("certify-refused-for-bytecode-runs-nothing", log.read_text() == commands_before,
+                  log.read_text()[len(commands_before):])
+            stale = room / "stale"
+            stale.mkdir()
+            source_text = VERIFIER.read_text()
+            (stale / "probe.py").write_text(source_text)
+            (stale / "test" / "fixtures").mkdir(parents=True)
+            importer = (f"import sys; sys.path.insert(0, {str(stale)!r}); import probe; "
+                        "print(probe.VERIFIER_FROM_SOURCE)")
+
+            def loaded_from_source():
+                said = subprocess.run([sys.executable, "-B", "-c", importer],
+                                      capture_output=True, text=True, timeout=60)
+                return said.stdout.strip() or said.stderr.strip()[-300:]
+
+            fresh = loaded_from_source()
+            py_compile.compile(str(stale / "probe.py"), cfile=importlib.util.cache_from_source(
+                str(stale / "probe.py")), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+            kept = (stale / "probe.py").stat()
+            first_line = source_text.splitlines()[0]
+            changed_text = source_text.replace(first_line, first_line[:-1] + "!", 1)
+            (stale / "probe.py").write_text(changed_text)
+            os.utime(stale / "probe.py", ns=(kept.st_atime_ns, kept.st_mtime_ns))
+            behind = loaded_from_source()
+            check("verifier-knows-when-cached-bytecode-ran",
+                  fresh == "True" and behind == "False"
+                  and len(changed_text.encode()) == kept.st_size, repr((fresh, behind)))
+
+            # verifier_selftest on stand-ins: a failing one refuses, a silent one
+            # refuses, a passing one gives its last line; given none, it runs
+            # selftest.
             def failing_stand_in():
                 raise ProbeFailure(["a stand-in check"])
+
+            refused("verifier-selftest-refuses-a-selftest-that-prints-nothing",
+                    lambda: verifier_selftest(lambda: None),
+                    "the verifier's own selftest printed nothing")
+            real_selftest = globals()["selftest"]
+            globals()["selftest"] = lambda: print("probe checks: 9 ok, 0 failed")
+            try:
+                ran = verifier_selftest()
+            except ProbeFailure as exc:
+                ran = f"refused: {exc.failures}"
+            finally:
+                globals()["selftest"] = real_selftest
+            check("verifier-selftest-runs-selftest-when-given-none",
+                  ran == "probe checks: 9 ok, 0 failed", repr(ran))
 
             refused("verifier-selftest-refuses-a-failing-selftest",
                     lambda: verifier_selftest(failing_stand_in),
@@ -2167,6 +2445,29 @@ def _selftest_checks(verifier):
             check("verifier-selftest-gives-the-summary-line",
                   verifier_selftest(lambda: print("a first line\nprobe checks: 3 ok, 0 failed"))
                   == "probe checks: 3 ok, 0 failed")
+
+            # A private copy that is not what it was copied from is refused
+            # before any run.
+            real_copy = globals()["_private_copy"]
+
+            def altering(source_tool, source_comp, copy_room):
+                made = real_copy(source_tool, source_comp, copy_room)
+                with open(made[1], "ab") as companion_copy:
+                    companion_copy.write(b"#")
+                return made
+
+            commands_before = log.read_text()
+            globals()["_private_copy"] = altering
+            try:
+                refused("certify-refused-when-the-private-copy-differs",
+                        lambda: expect([("target-check", knobs(), bite)], live=True, jobs=3,
+                                       tool=tool, expected=certifying, timeout=20.0,
+                                       certify=True, stream=io.StringIO(), verifier=verifier),
+                        "is not the tool, companion and test tree it was copied from")
+            finally:
+                globals()["_private_copy"] = real_copy
+            check("certify-refused-for-a-differing-copy-runs-nothing",
+                  log.read_text() == commands_before, log.read_text()[len(commands_before):])
 
             # A failing verifier selftest refuses certification before any suite runs.
             commands_before = log.read_text()
@@ -2183,18 +2484,39 @@ def _selftest_checks(verifier):
                       "expect returned")
 
             stream = io.StringIO()
+            standing_in = expect([("target-check", knobs(), bite)], live=True, jobs=3, tool=tool,
+                                 expected=certifying, timeout=20.0, certify=True, stream=stream,
+                                 verifier=verifier)
+            check("certify-with-a-stand-in-certifies-nothing",
+                  standing_in.certified is False and standing_in[0]["certified"] is False
+                  and stream.getvalue().startswith(
+                      "certifying: no; the verifier's own selftest was a stand-in the caller "
+                      "supplied, so this run certifies nothing\n")
+                  and ("verifier selftest: a stand-in the caller supplied said: running; this "
+                       "certifying run is one of its own checks\n") in stream.getvalue(),
+                  stream.getvalue()[:600])
+
+            # The certifying path itself: selftest stands in for itself only by
+            # being replaced, so the run goes through verifier_selftest's own
+            # path, and every run of it, the listing too, uses the private copy.
+            stream = io.StringIO()
             paths_log = room / "paths.log"
             os.environ["PROBE_SYNTHETIC_PATHS"] = str(paths_log)
+            globals()["selftest"] = lambda: print("probe checks: 9 ok, 0 failed")
             try:
                 results = expect([("target-check", knobs(), knobs(FAILING=["target-check",
                                                                             "other-check"]),
                                    {"other-check": "the scripted failure names both"})],
                                  live=True, jobs=3, tool=tool, expected=certifying, timeout=20.0,
-                                 certify=True, stream=stream, verifier=verifier)
+                                 certify=True, stream=stream)
+            except ProbeFailure as exc:
+                results = Results([{"certified": None}], None, "; ".join(exc.failures))
             finally:
+                globals()["selftest"] = real_selftest
                 os.environ.pop("PROBE_SYNTHETIC_PATHS", None)
-            printed = stream.getvalue()
-            ran_from = collections.Counter(paths_log.read_text().splitlines())
+            printed = stream.getvalue() or results.report
+            ran_from = collections.Counter(
+                paths_log.read_text().splitlines() if paths_log.exists() else ())
             copy_line = next((line for line in printed.splitlines()
                               if line.startswith("clean run from a private copy: ")), "")
             copy_room = copy_line[len("clean run from a private copy: "):].split(":")[0]
@@ -2203,8 +2525,8 @@ def _selftest_checks(verifier):
                                      f"{hashlib.sha256(b'').hexdigest()}, test tree 0 file(s), "
                                      f"digest {hashlib.sha256().hexdigest()}")
                   and copy_room and Path(copy_room) != room
-                  and ran_from[str(Path(copy_room) / tool.name)] == 2
-                  and ran_from[str(tool)] == 1, repr((copy_line, ran_from)))
+                  and ran_from[str(Path(copy_room) / tool.name)] == 3
+                  and ran_from[str(tool)] == 0, repr((copy_line, ran_from)))
             check("certifying-run-records-its-provenance",
                   results.certified is True and results[0]["certified"] is True
                   and printed.startswith("certifying: yes\n")
@@ -2214,8 +2536,7 @@ def _selftest_checks(verifier):
                   in printed
                   and f"adjudications: {approved} sha256 {certifying.adjudications_sha256}"
                   in printed
-                  and ("verifier selftest: a stand-in the caller supplied said: running; this "
-                       "certifying run is one of its own checks") in printed
+                  and "verifier selftest: probe checks: 9 ok, 0 failed\n" in printed
                   and f"interpreter: {sys.executable} (Python {platform.python_version()})"
                   in printed
                   and "timeout: 20s for each run" in printed
@@ -2232,6 +2553,31 @@ def _selftest_checks(verifier):
             else:
                 check("expect-refuses-an-expectation-for-another-selection", False,
                       "expect returned")
+
+            # A certifying run whose suite writes into its own copy of the test
+            # tree is refused as a run writing into the original is, and the
+            # original is not where it wrote.
+            leaking = knobs(WRITE_BESIDE="test/leak")
+            tool.write_text(runner_text.replace(knobs(), leaking))
+            leak_digest = hashlib.sha256(tool.read_bytes()).hexdigest()
+            leak_path, leak_approved = frozen_beside(
+                "expected-mapping-leaking", source={**source, "sha256": leak_digest})
+            try:
+                expect([("target-check", leaking,
+                         knobs(WRITE_BESIDE="test/leak", FAILING=["target-check"]))],
+                       live=True, jobs=3, tool=tool, timeout=20.0, certify=True,
+                       expected=retained_expectation(leak_path, live=True, jobs=3,
+                                                     adjudications=leak_approved),
+                       stream=io.StringIO(), verifier=verifier)
+                wrote = "expect returned"
+            except ProbeFailure as exc:
+                wrote = exc.failures
+            check("certify-run-writing-into-its-copy-refused",
+                  isinstance(wrote, tuple) and len(wrote) == 1
+                  and "changed while the suites ran" in wrote[0]
+                  and "/clean/test/leak" in wrote[0]
+                  and not (room / "test" / "leak").exists(), repr(wrote))
+            tool.write_text(runner_text)
 
             # A runner that writes into the test tree beside itself, as a unit
             # leaking into the corpus would, changes what the report describes.
@@ -2270,6 +2616,69 @@ def _selftest_checks(verifier):
                 os.environ.pop("PROBE_SYNTHETIC_LOG", None)
             else:
                 os.environ["PROBE_SYNTHETIC_LOG"] = was_log
+
+    # A suite that does not end by itself leaves the groups it started in
+    # sessions of their own to the verifier. The stand-in's driver and its
+    # terminal child stand for the real suite's completion drive.
+    was_groups = os.environ.pop("PROBE_SYNTHETIC_GROUPS", None)
+    with tempfile.TemporaryDirectory() as td:
+
+        def recorded_driver_run(label, timeout, **values):
+            """Run the stand-in with an owned driver; returns the run, the named
+            processes and the ones still running, which are then ended here so a
+            failing rule leaves nothing behind."""
+            here = Path(td) / label
+            here.mkdir()
+            copy = here / "agent-resume"
+            copy.write_text(runner_text.replace(knobs(), knobs(**values)))
+            copy.chmod(0o755)
+            witness = here / "groups"
+            os.environ["PROBE_SYNTHETIC_GROUPS"] = str(witness)
+            try:
+                run = run_suite(suite_argv(copy, live=True), timeout=timeout)
+            finally:
+                os.environ.pop("PROBE_SYNTHETIC_GROUPS", None)
+            named = ([tuple(line.split()) for line in witness.read_text().splitlines()]
+                     if witness.exists() else [])
+            alive = [int(pid) for pid, started in named
+                     if (_proc_identity(int(pid)) or (None, None))[1] == started]
+            for pid in alive:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+            return run, named, alive
+
+        run, named, alive = recorded_driver_run("direct", 3.0, OWNED_DRIVER="direct", SLEEP=30)
+        check("stopped-suite-ends-its-recorded-groups",
+              run.returncode is None and len(named) == 2 and not alive,
+              f"returncode {run.returncode}, named {named}, still running {alive}")
+        run, named, alive = recorded_driver_run("nested", 3.0, OWNED_DRIVER="nested", SLEEP=30)
+        check("stopped-suite-ends-the-groups-its-workers-recorded",
+              run.returncode is None and len(named) == 2 and not alive,
+              f"returncode {run.returncode}, named {named}, still running {alive}")
+        run, named, alive = recorded_driver_run("signalled", 20.0, OWNED_DRIVER="direct",
+                                                SIGNAL="SIGKILL")
+        check("signalled-suite-has-its-recorded-groups-ended",
+              run.returncode == -signal.SIGKILL and len(named) == 2 and not alive,
+              f"returncode {run.returncode}, named {named}, still running {alive}")
+
+        # A pid written beside another start time is somebody else's process.
+        stranger = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        try:
+            record = Path(td) / "stranger-groups"
+            record.write_text(f"{stranger.pid} 1\n")
+            left = end_recorded_groups(record, grace=0.5)
+            # A signal takes effect when the process next runs, so the
+            # stranger is asked about a second later rather than at once.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                stranger.wait(timeout=1.0)
+            check("recorded-pid-with-another-start-time-left-alone",
+                  stranger.poll() is None and left == [],
+                  f"returncode {stranger.poll()}, left {left}")
+        finally:
+            stranger.kill()
+            stranger.wait()
+    if was_groups is not None:
+        os.environ["PROBE_SYNTHETIC_GROUPS"] = was_groups
 
     failed = [(name, detail) for name, ok, detail in checks if not ok]
     print(f"probe checks: {len(checks) - len(failed)} ok, {len(failed)} failed")
