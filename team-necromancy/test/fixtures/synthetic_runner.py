@@ -19,20 +19,25 @@ report is printed. FILTER_LIES makes the failed-only report name a check that
 passed. WRITE_BESIDE names a path under this file's directory that every
 invocation writes to, as a unit leaking into the corpus beside the tool would.
 
-OWNED_DRIVER starts a driver in a session of its own whose terminal child
-ignores the hangup its pty sends, as the real suite's completion drive does,
-and writes the driver down where the suite writes the groups it owns: in the
-file the verifier names ("direct") or in a worker's file that one names
-("nested"). Ending the runner's group reaches neither process. RECORD_LINES
-are lines written as they are into that same file, for a test that names a
-process of its own there.
+The last three start processes that outlive their part of the run, as the
+real suite's fixtures can. OWNED_DRIVER starts a driver in a session of its
+own whose terminal child ignores the hangup its pty sends, as the real suite's
+completion drive does; with "stays" the driver keeps running, and with "exits"
+it ends at once, so its terminal child is handed to whichever process adopts
+orphans. STUBBORN starts a process that ignores SIGTERM and answers it by
+starting another process, so a cleanup that read the process table once and
+never again misses the newer one. NAMED_SYSTEMD starts a process that calls
+itself systemd, which no cleanup may signal.
 
 With PROBE_SYNTHETIC_LOG set, every invocation appends its arguments to that
 file as one JSON line, which is how a test sees what the verifier asked. With
 PROBE_SYNTHETIC_PATHS set, every invocation appends the path it ran from, which
-is how a test sees which copy the verifier ran. With PROBE_SYNTHETIC_GROUPS
-set, OWNED_DRIVER appends the pid and start time of the driver and of its
-terminal child, which is how a test sees whether both were ended.
+is how a test sees which copy the verifier ran. With PROBE_SYNTHETIC_ENVIRON
+set, every invocation appends its TMPDIR, TMUX_TMPDIR and XDG_CACHE_HOME as one
+JSON line, which is how a test sees what the suite was given. With
+PROBE_SYNTHETIC_STARTED
+set, every process the last three knobs start is appended there as its pid and
+start time, which is how a test sees whether each was ended.
 """
 
 import json
@@ -61,58 +66,99 @@ SIGNAL = None
 FILTER_LIES = False
 WRITE_BESIDE = None
 OWNED_DRIVER = None
-RECORD_LINES = []
+STUBBORN = False
+NAMED_SYSTEMD = False
 
 # The driver OWNED_DRIVER starts. Its child is a terminal's: pty.fork puts it in
 # a session of its own, and it ignores the hangup the pty sends when the driver
-# ends, so only an owner that ends it by identity ends it.
+# ends, so only an owner that ends it by identity ends it. The child says ready
+# on the terminal once it ignores the hangup, and the driver waits for that
+# before it says who its child is, so a driver that ends at once cannot take
+# the child with it. Given "exits", the driver then ends.
 DRIVER = r"""
-import os, pty, signal, time
-child, _terminal = pty.fork()
+import os, pty, signal, sys, time
+child, terminal = pty.fork()
 if child == 0:
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    os.write(1, b"ready\n")
     time.sleep(600)
     os._exit(0)
+said = b""
+while b"ready" not in said:
+    said += os.read(terminal, 64)
 print(os.getpid(), child, flush=True)
+if sys.argv[1] == "exits":
+    os._exit(0)
+time.sleep(600)
+"""
+
+# The process STUBBORN starts. SIGTERM does not end it: it starts a sleeper in
+# a session of its own instead, writes it down where the test reads, and
+# carries on until SIGKILL.
+STUBBORN_PROCESS = r"""
+import os, signal, subprocess, sys, time
+witness = sys.argv[1]
+def answer(_number, _frame):
+    sleeper = subprocess.Popen(["sleep", "600"], start_new_session=True)
+    with open(f"/proc/{sleeper.pid}/stat") as stat:
+        text = stat.read()
+    if witness:
+        with open(witness, "a") as started:
+            started.write(f"{sleeper.pid} {text[text.rindex(')') + 2:].split()[19]}\n")
+signal.signal(signal.SIGTERM, answer)
+print("ready", flush=True)
+while True:
+    time.sleep(600)
+"""
+
+# The process NAMED_SYSTEMD starts: prctl(PR_SET_NAME) gives it the command
+# name systemd, the name the service manager that adopts orphans goes by.
+NAMED_SYSTEMD_PROCESS = r"""
+import ctypes, time
+ctypes.CDLL(None).prctl(15, b"systemd", 0, 0, 0)
+print("named", flush=True)
 time.sleep(600)
 """
 
 
 def started_at(pid):
-    """The kernel's start time for pid, field 22 of its stat, as the suite writes it."""
+    """The kernel's start time for pid, field 22 of its stat."""
     with open(f"/proc/{pid}/stat") as stat:
         text = stat.read()
     return text[text.rindex(")") + 2:].split()[19]
 
 
-def owned_groups_record():
-    """The file the verifier named for the groups this run owns, or None."""
-    name = os.path.basename(os.path.realpath(__file__))
-    return os.environ.get(f"{name.upper().replace('-', '_')}_SELFTEST_OWNED_GROUPS")
-
-
-def start_owned_driver(where):
-    """Start the driver and write it down as the suite would, directly or in a worker's file."""
-    driver = subprocess.Popen([sys.executable, "-c", DRIVER], stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              text=True, start_new_session=True)
-    leader, child = (int(word) for word in driver.stdout.readline().split())
-    entry = f"{leader} {started_at(leader)}\n"
-    record = owned_groups_record()
-    if record and where == "nested":
-        worker = record + ".worker"
-        with open(worker, "a") as owned:
-            owned.write(entry)
-        with open(record, "a") as owned:
-            owned.write(f"record {worker}\n")
-    elif record:
-        with open(record, "a") as owned:
-            owned.write(entry)
-    witness = os.environ.get("PROBE_SYNTHETIC_GROUPS")
+def witnessed(*pids):
+    """Append pid and start time of each process to PROBE_SYNTHETIC_STARTED, when it is set."""
+    witness = os.environ.get("PROBE_SYNTHETIC_STARTED")
     if witness:
-        with open(witness, "a") as named:
-            for pid in (leader, child):
-                named.write(f"{pid} {started_at(pid)}\n")
+        with open(witness, "a") as started:
+            for pid in pids:
+                started.write(f"{pid} {started_at(pid)}\n")
+
+
+def start(code, *args, own_session=True):
+    """Start code under this interpreter; returns the process and the first line it printed."""
+    process = subprocess.Popen([sys.executable, "-c", code, *args], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               text=True, start_new_session=own_session)
+    return process, process.stdout.readline().split()
+
+
+def start_owned_driver(how):
+    """Start the driver and its terminal child; with "exits" the driver ends straight after."""
+    driver, said = start(DRIVER, how)
+    leader, child = (int(word) for word in said)
+    if how == "exits":
+        # The driver ends by itself; what is left to end is its terminal child,
+        # which has to outlive it for a cleanup to be what ends it.
+        born = started_at(child)
+        witnessed(child)
+        driver.wait()
+        if not os.path.exists(f"/proc/{child}") or started_at(child) != born:
+            raise SystemExit("the driver's terminal child ended with the driver")
+    else:
+        witnessed(leader, child)
 
 
 def main(argv):
@@ -120,6 +166,11 @@ def main(argv):
     if log:
         with open(log, "a") as record:
             record.write(json.dumps(argv) + "\n")
+    environ = os.environ.get("PROBE_SYNTHETIC_ENVIRON")
+    if environ:
+        with open(environ, "a") as record:
+            record.write(json.dumps({name: os.environ.get(name) for name in
+                                     ("TMPDIR", "TMUX_TMPDIR", "XDG_CACHE_HOME")}) + "\n")
     paths = os.environ.get("PROBE_SYNTHETIC_PATHS")
     if paths:
         with open(paths, "a") as record:
@@ -140,9 +191,12 @@ def main(argv):
         return 0
     if OWNED_DRIVER:
         start_owned_driver(OWNED_DRIVER)
-    if RECORD_LINES and owned_groups_record():
-        with open(owned_groups_record(), "a") as owned:
-            owned.write("".join(f"{line}\n" for line in RECORD_LINES))
+    if STUBBORN:
+        stubborn, _ready = start(STUBBORN_PROCESS, os.environ.get("PROBE_SYNTHETIC_STARTED", ""))
+        witnessed(stubborn.pid)
+    if NAMED_SYSTEMD:
+        named, _said = start(NAMED_SYSTEMD_PROCESS)
+        witnessed(named.pid)
     if SLEEP:
         time.sleep(SLEEP)
     verdicts = [(cid, description, cid not in FAILING,
