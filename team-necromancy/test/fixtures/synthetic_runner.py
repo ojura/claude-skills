@@ -19,7 +19,7 @@ report is printed. FILTER_LIES makes the failed-only report name a check that
 passed. WRITE_BESIDE names a path under this file's directory that every
 invocation writes to, as a unit leaking into the corpus beside the tool would.
 
-The last three start processes that outlive their part of the run, as the
+The next four start processes that outlive their part of the run, as the
 real suite's fixtures can. OWNED_DRIVER starts a driver in a session of its
 own whose terminal child ignores the hangup its pty sends, as the real suite's
 completion drive does; with "stays" the driver keeps running, and with "exits"
@@ -27,17 +27,23 @@ it ends at once, so its terminal child is handed to whichever process adopts
 orphans. STUBBORN starts a process that ignores SIGTERM and answers it by
 starting another process, so a cleanup that read the process table once and
 never again misses the newer one. NAMED_SYSTEMD starts a process that calls
-itself systemd, which no cleanup may signal.
+itself systemd, which no cleanup may signal. LISTING_LEAVES makes a --list run
+start a driver that stays, as OWNED_DRIVER="stays" does for a report.
+LOCKED_TMPDIR names a directory: a run whose TMPDIR is inside it makes a
+directory in that TMPDIR, puts a file in it and takes away its write
+permission, so removing the TMPDIR leaves both; a run given any other TMPDIR
+does nothing.
 
 With PROBE_SYNTHETIC_LOG set, every invocation appends its arguments to that
 file as one JSON line, which is how a test sees what the verifier asked. With
 PROBE_SYNTHETIC_PATHS set, every invocation appends the path it ran from, which
 is how a test sees which copy the verifier ran. With PROBE_SYNTHETIC_ENVIRON
-set, every invocation appends its TMPDIR, TMUX_TMPDIR and XDG_CACHE_HOME as one
-JSON line, which is how a test sees what the suite was given. With
-PROBE_SYNTHETIC_STARTED
-set, every process the last three knobs start is appended there as its pid and
-start time, which is how a test sees whether each was ended.
+set, every invocation appends its TMPDIR, TMUX_TMPDIR and XDG_CACHE_HOME and
+the command line of the process that started it, its supervisor, as one JSON
+line, which is how a test sees what the suite was given and which verifier file
+its supervisor loaded. With PROBE_SYNTHETIC_STARTED set, every process those
+four knobs start is appended there as its pid and start time, which is how a
+test sees whether each was ended.
 """
 
 import json
@@ -68,6 +74,8 @@ WRITE_BESIDE = None
 OWNED_DRIVER = None
 STUBBORN = False
 NAMED_SYSTEMD = False
+LISTING_LEAVES = False
+LOCKED_TMPDIR = None
 
 # The driver OWNED_DRIVER starts. Its child is a terminal's: pty.fork puts it in
 # a session of its own, and it ignores the hangup the pty sends when the driver
@@ -168,9 +176,12 @@ def main(argv):
             record.write(json.dumps(argv) + "\n")
     environ = os.environ.get("PROBE_SYNTHETIC_ENVIRON")
     if environ:
+        given = {name: os.environ.get(name) for name in ("TMPDIR", "TMUX_TMPDIR", "XDG_CACHE_HOME")}
+        with open(f"/proc/{os.getppid()}/cmdline", "rb") as parent:
+            given["supervisor"] = [part.decode(errors="replace")
+                                   for part in parent.read().split(b"\0") if part]
         with open(environ, "a") as record:
-            record.write(json.dumps({name: os.environ.get(name) for name in
-                                     ("TMPDIR", "TMUX_TMPDIR", "XDG_CACHE_HOME")}) + "\n")
+            record.write(json.dumps(given) + "\n")
     paths = os.environ.get("PROBE_SYNTHETIC_PATHS")
     if paths:
         with open(paths, "a") as record:
@@ -182,9 +193,17 @@ def main(argv):
             record.write("written during the run\n")
     if "--selftest" not in argv:
         return 2
+    if LOCKED_TMPDIR and os.environ.get("TMPDIR", "").startswith(LOCKED_TMPDIR + os.sep):
+        locked = os.path.join(os.environ["TMPDIR"], "locked")
+        os.mkdir(locked)
+        with open(os.path.join(locked, "kept"), "w") as kept:
+            kept.write("kept\n")
+        os.chmod(locked, 0o500)
     rows = [(cid, DESCRIBE.get(cid, description))
             for cid, description in CATALOG if cid not in DROP]
     if "--list" in argv:
+        if LISTING_LEAVES:
+            start_owned_driver("stays")
         width = max(len(cid) for cid, _description in rows)
         for cid, description in rows:
             print(f"{cid:<{width}}  {description}")

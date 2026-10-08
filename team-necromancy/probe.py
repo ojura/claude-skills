@@ -3,8 +3,10 @@
 Import this module from a mutation script and call ``expect``. The clean suite is
 run once, every mutation receives its own copy of the tool and corpus, and the
 mutants run with at most four suites active at once. Every suite runs under a
-supervisor of its own, an interpreter that loads this file and calls
-supervise, which ends whatever the suite leaves running and nothing outside it.
+supervisor of its own, an interpreter that loads this file, or a certifying
+run's private copy of it, and calls supervise, which starts the suite only when
+the bytes it loaded have the digest its run names, and ends whatever the suite
+leaves running and nothing outside it.
 
     import probe
 
@@ -41,7 +43,8 @@ decided and point where their decisions can, and whose frozen source is the
 tool under test; only while the verifier on disk is the one this process loaded
 and the code running was compiled from it, and only after the verifier's own
 selftest passes. Its listing and clean suite run from a private copy of the
-tool tree, hashed before and after the runs, and its result says it certified.
+tool tree, and its supervisors from a private copy of the verifier, each hashed
+before and after the runs, and its result says it certified.
 Every other call is a development run. Without ``expected`` the clean listing
 stands in for the population, which checks that the listing, the clean run and
 the mutants agree with each other and nothing more; a bare mapping has no
@@ -121,15 +124,39 @@ def replaced_functions():
 
     A name defined by a def at the top level that now holds another function,
     or no function at all, is named; so is a top-level name holding a function
-    that the bytes define under another name.
+    that the bytes define under another name, and one whose function had its
+    code, its defaults or its keyword defaults changed in place since the
+    import, as VERIFIER_DEFAULTS holds them.
     """
     module = sys.modules[__name__]
     replaced = []
     for name, code in VERIFIER_FUNCTIONS.items():
         held = getattr(module, name, None)
-        if not (isinstance(held, types.FunctionType) and held.__code__ == code):
+        if not (isinstance(held, types.FunctionType) and held.__code__ == code
+                and _function_state(held)[1:] == VERIFIER_DEFAULTS.get(name)):
             replaced.append(name)
     return sorted(replaced)
+
+
+def _function_state(function):
+    """What a function runs: its code, its defaults and a copy of its keyword defaults."""
+    return (function.__code__, function.__defaults__, dict(function.__kwdefaults__ or {}))
+
+
+def _method_state(value):
+    """The _function_state of every function a class attribute runs, in a fixed order.
+
+    A function is its own; a staticmethod or classmethod runs the function it
+    wraps, and a property its getter, setter and deleter.
+    """
+    if isinstance(value, (staticmethod, classmethod)):
+        functions = [value.__func__]
+    elif isinstance(value, property):
+        functions = [part for part in (value.fget, value.fset, value.fdel) if part is not None]
+    else:
+        functions = [value]
+    return tuple(_function_state(function) for function in functions
+                 if isinstance(function, types.FunctionType))
 
 
 def _constant_form(value):
@@ -167,41 +194,52 @@ def _class_methods(cls):
 # given and takes its timeout as an argument. The snapshots are what the
 # others are compared against.
 NOT_CONSTANTS = ("TOOL", "COMP", "SUITE_TIMEOUT_S", "VERIFIER_FUNCTIONS", "VERIFIER_CLASSES",
-                 "VERIFIER_CONSTANTS", "NOT_CONSTANTS")
+                 "VERIFIER_CONSTANTS", "VERIFIER_DEFAULTS", "NOT_CONSTANTS")
 
 
 def _module_snapshot():
-    """The module's classes and constants as they stand: (classes, constants).
+    """The module's classes, constants and function defaults as they stand.
 
-    classes maps each class this module defines to the class and its methods;
-    constants maps each name written in capitals that is not in NOT_CONSTANTS
-    and holds no class, function or module to the digest of its value.
+    Returns (classes, constants, defaults). classes maps each class this
+    module defines to the class, its methods and each method's
+    _method_state; constants maps each name written in capitals that is not
+    in NOT_CONSTANTS and holds no class, function or module to the digest of
+    its value; defaults maps each function VERIFIER_FUNCTIONS names to its
+    defaults and keyword defaults.
     """
     module = sys.modules[__name__]
-    classes = {name: (value, _class_methods(value)) for name, value in vars(module).items()
-               if isinstance(value, type) and value.__module__ == __name__}
+    classes = {}
+    for name, value in vars(module).items():
+        if isinstance(value, type) and value.__module__ == __name__:
+            methods = _class_methods(value)
+            classes[name] = (value, methods, {method: _method_state(held)
+                                              for method, held in methods.items()})
     constants = {name: _constant_digest(value) for name, value in vars(module).items()
                  if re.fullmatch(r"[A-Z][A-Z0-9_]*", name) and name not in NOT_CONSTANTS
                  and not isinstance(value, (type, types.FunctionType, types.ModuleType))}
-    return classes, constants
+    defaults = {name: _function_state(vars(module)[name])[1:] for name in VERIFIER_FUNCTIONS
+                if isinstance(vars(module).get(name), types.FunctionType)}
+    return classes, constants, defaults
 
 
 def replaced_classes():
     """Classes, and methods of classes, that are no longer the ones the import made, as names.
 
     A class name bound to another object is named, and so is a method, one a
-    decorator generated included, that was rebound, added or removed since:
-    its code is then not code the import made of the verifier's bytes.
+    decorator generated included, that was rebound, added or removed since,
+    or whose code, defaults or keyword defaults were changed in place: its
+    code is then not code the import made of the verifier's bytes.
     """
     module = sys.modules[__name__]
     replaced = []
-    for name, (cls, methods) in VERIFIER_CLASSES.items():
+    for name, (cls, methods, states) in VERIFIER_CLASSES.items():
         if vars(module).get(name) is not cls:
             replaced.append(name)
             continue
         now = _class_methods(cls)
         replaced += [f"{name}.{method}" for method in sorted(set(methods) | set(now))
-                     if now.get(method) is not methods.get(method)]
+                     if now.get(method) is not methods.get(method)
+                     or _method_state(now[method]) != states[method]]
     return sorted(replaced)
 
 
@@ -226,10 +264,10 @@ class ProbeFailure(AssertionError):
 class Run:
     """One suite process as the verifier saw it.
 
-    returncode is None when the process ran out of time and its supervisor
-    ended it, negative when a signal ended it, and the exit status otherwise.
-    stdout and stderr are kept whole whatever happened, so a refusal can show
-    what the process said.
+    returncode is None when the process never started, which unstarted then
+    says why, or ran out of time and its supervisor ended it; negative when a
+    signal ended it, and the exit status otherwise. stdout and stderr are kept
+    whole whatever happened, so a refusal can show what the process said.
     """
 
     argv: tuple
@@ -243,6 +281,16 @@ class Run:
     # SUITE_DIRECTORIES as the suite was given them, (name, value) pairs with
     # None for a variable it was not given.
     environment: tuple = ()
+    # Why the suite was never started, as its supervisor said or as its
+    # supervisor's silence shows; empty for a suite that started.
+    unstarted: str = ""
+    # The directory made for the suite, when it is still there after its
+    # removal; empty when none was made or it is gone.
+    directory_left: str = ""
+    # Every environment variable the suite was given, (name, value) pairs in
+    # name order. The Run's repr leaves it out, so a test that prints a Run
+    # writes down none of the values a record does not show.
+    environ: tuple = dataclasses.field(default=(), repr=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -370,10 +418,14 @@ def _started(pid):
 
 
 def _read_text(path):
-    """The stripped text of path, or "" when it cannot be read."""
+    """The stripped text of path, or "" when it cannot be read or is not UTF-8.
+
+    A process may give itself a command name in any bytes, so a scan of
+    other processes' comm files meets names that do not decode.
+    """
     try:
         return Path(path).read_text().strip()
-    except OSError:
+    except (OSError, ValueError):
         return ""
 
 
@@ -536,10 +588,13 @@ def end_descendants(root, bound, grace=None, rounds=None, reap=None):
 def supervise(argv):
     """Run a suite as this process's child and end what it leaves; run_suite's supervisor.
 
-    run_suite starts an interpreter that loads this file and calls this, so
-    the module stays an API with no command line of its own. argv is the
-    status descriptor, the control descriptor, "--" and the
-    suite's command. This process makes itself the subreaper of everything
+    run_suite starts an interpreter that loads a verifier file and calls
+    this, so the module stays an API with no command line of its own. argv is
+    the status descriptor, the control descriptor, the sha256 the bytes this
+    module was loaded from must have, "--" and the suite's command. A run
+    names the one verifier its supervisors run, so this module starts nothing
+    when the bytes it was loaded from have another digest or the code it runs
+    was not compiled from them. It makes itself the subreaper of everything
     under it, so a process the suite leaves behind, whichever of its parents
     ended first, stays a descendant of this one and of nothing outside the
     suite. It writes "started <pid>" once the suite runs and "exited
@@ -549,10 +604,12 @@ def supervise(argv):
     own death looks like from here, or for SIGTERM, and ends every process
     under it under end_descendants' rules, the suite too when it still runs,
     bounded by its own start time. It writes a "refused", "ended" or "left"
-    line for each process that concerns, then "done", and returns 0. Without
-    the subreaper it starts nothing, says why, and returns 125.
+    line for each process that concerns, then "done", and returns 0. When it
+    starts nothing, because of the bytes it was loaded from, a subreaper it
+    could not become or a command that cannot be started, it writes
+    "unstarted" and why, then "done", and returns 125.
     """
-    status_fd, control_fd, separator, *command = argv
+    status_fd, control_fd, expected, separator, *command = argv
     if separator != "--" or not command:
         return 2
     control = int(control_fd)
@@ -565,16 +622,29 @@ def supervise(argv):
         with contextlib.suppress(OSError):
             status.write(line + "\n")
 
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
-        tell(f"refused to start the suite: this process could not become a subreaper "
-             f"(errno {ctypes.get_errno()})")
+    def unstarted(why):
+        """Start nothing, and say why."""
+        tell(f"unstarted {why}")
         tell("done")
         return 125
+
+    if VERIFIER_LOADED != expected:
+        return unstarted(f"the verifier it loaded, {VERIFIER}, has sha256 {VERIFIER_LOADED}, "
+                         f"not the {expected} its run names")
+    if not VERIFIER_FROM_SOURCE:
+        return unstarted(f"the code it runs was not compiled from the verifier it loaded, "
+                         f"{VERIFIER}")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        return unstarted(f"this process could not become a subreaper "
+                         f"(errno {ctypes.get_errno()})")
     bound = _started(os.getpid())
     asked = []
     signal.signal(signal.SIGTERM, lambda _number, _frame: asked.append("SIGTERM"))
-    suite = os.posix_spawnp(command[0], command, dict(os.environ))
+    try:
+        suite = os.posix_spawnp(command[0], command, dict(os.environ))
+    except OSError as exc:
+        return unstarted(f"its command could not be started: {exc}")
     tell(f"started {suite}")
     exited = []
 
@@ -614,13 +684,17 @@ def supervise(argv):
     return 0
 
 
-def run_suite(argv, timeout=None, owned_under=None):
+def run_suite(argv, timeout=None, owned_under=None, supervisor_source=None):
     """Run one bounded suite under a supervisor of its own and return its Run.
 
     With owned_under the suite gets a directory of its own under it for each
     of SUITE_DIRECTORIES, made before it starts and removed once its
     supervisor is done; without, it gets the caller's. Either way its Run
-    carries the values the suite was given. Everything else is _supervised_run.
+    carries the values the suite was given. A directory still there after
+    its removal is named in the Run's stderr and directory_left.
+    supervisor_source is the verifier file the supervisor loads and the
+    sha256 its bytes must have; without it, this file and the bytes this
+    process loaded. Everything else is _supervised_run.
     """
     timeout = SUITE_TIMEOUT_S if timeout is None else timeout
     env = dict(os.environ)
@@ -631,13 +705,19 @@ def run_suite(argv, timeout=None, owned_under=None):
             for name, short in zip(SUITE_DIRECTORIES, "tmc"):
                 (home / short).mkdir()
                 env[name] = str(home / short)
-        return _supervised_run(argv, timeout, env)
+        run = _supervised_run(argv, timeout, env, supervisor_source)
     finally:
         if home is not None:
             shutil.rmtree(home, ignore_errors=True)
+    if home is not None and home.exists():
+        run = dataclasses.replace(
+            run, directory_left=str(home),
+            stderr=run.stderr + f"\nprobe: the suite's directory {home} is still there after "
+                                "its removal\n")
+    return run
 
 
-def _supervised_run(argv, timeout, env):
+def _supervised_run(argv, timeout, env, supervisor_source=None):
     """Run one bounded suite, with env, under a supervisor of its own and return its Run.
 
     The bound is read here rather than bound as a default, so the one constant
@@ -650,21 +730,28 @@ def _supervised_run(argv, timeout, env):
     suite's own process ends, or at the bound, the supervisor is asked to end
     everything still under it, the suite too when it still runs. A run that
     reached the bound comes back with returncode None and whatever it had
-    printed. A suite that exited by itself and left processes running comes
+    printed, and one that was never started with returncode None and why in
+    unstarted. A suite that exited by itself and left processes running comes
     back with them in left_running. Whatever was ended, left running or
     refused is named at the end of the run's stderr.
+
+    supervisor_source names the verifier file the supervisor loads and the
+    sha256 the bytes it loads must have; without it, this file and the bytes
+    this process loaded. A supervisor that loaded other bytes starts nothing.
     """
+    source, digest = supervisor_source or (VERIFIER, VERIFIER_LOADED)
     status_read, status_write = os.pipe()
     control_read, control_write = os.pipe()
-    # The supervisor is this same file, loaded by path and handed its
-    # arguments in the code it runs. -B, so loading it writes no bytecode
-    # beside the verifier, whose bytes a certifying run names.
+    # The supervisor is a verifier file loaded by path and handed its
+    # arguments, the digest its bytes must have among them, in the code it
+    # runs. -B, so loading it writes no bytecode beside the file, whose bytes
+    # a certifying run names.
     bootstrap = ("import importlib.util, sys\n"
-                 f"spec = importlib.util.spec_from_file_location('probe', {str(VERIFIER)!r})\n"
+                 f"spec = importlib.util.spec_from_file_location('probe', {str(source)!r})\n"
                  "probe = sys.modules['probe'] = importlib.util.module_from_spec(spec)\n"
                  "spec.loader.exec_module(probe)\n"
                  "raise SystemExit(probe.supervise("
-                 f"{[str(status_write), str(control_read), '--', *argv]!r}))\n")
+                 f"{[str(status_write), str(control_read), digest, '--', *argv]!r}))\n")
     try:
         supervisor = subprocess.Popen(
             [sys.executable, "-I", "-B", "-c", bootstrap],
@@ -715,7 +802,7 @@ def _supervised_run(argv, timeout, env):
                      "and was killed, so processes under it may still run")
     for reader in readers:
         reader.join(timeout=SUITE_GRACE_S)
-    returncode, ended, left, refused = None, [], [], []
+    returncode, ended, left, refused, unstarted = None, [], [], [], ""
     for line in list(said):
         kind, _, rest = line.partition(" ")
         if kind == "exited" and not timed_out:
@@ -726,10 +813,14 @@ def _supervised_run(argv, timeout, env):
             (ended if kind == "ended" else left).append((int(pid), name))
         elif kind == "refused":
             refused.append(rest)
-    notes += [f"probe: refused to signal {sentence}" for sentence in refused
-              if sentence.startswith("pid ")]
-    notes += [f"probe: the supervisor {sentence}" for sentence in refused
-              if not sentence.startswith("pid ")]
+        elif kind == "unstarted":
+            unstarted = rest
+    if not unstarted and not any(line.startswith("started ") for line in said):
+        unstarted = (f"its supervisor exited {supervisor.returncode} before it started the "
+                     "suite, without saying why; its stderr is the run's")
+    if unstarted:
+        notes.append(f"probe: the supervisor did not start the suite: {unstarted}")
+    notes += [f"probe: refused to signal {sentence}" for sentence in refused]
     if ended:
         notes.append(("probe: the suite reached its bound; ended it and the processes under "
                       "it: " if timed_out else "probe: ended processes the suite left running: ")
@@ -745,12 +836,77 @@ def _supervised_run(argv, timeout, env):
     left_running = (tuple(pid for pid, _name in ended + left)
                     if returncode is not None and returncode >= 0 else ())
     return Run(tuple(argv), returncode, "".join(out), err, timeout, left_running,
-               tuple((name, env.get(name)) for name in SUITE_DIRECTORIES))
+               tuple((name, env.get(name)) for name in SUITE_DIRECTORIES),
+               unstarted=unstarted, environ=tuple(sorted(env.items())))
 
 
 def said_directories(environment):
     """SUITE_DIRECTORIES as a Run carries them, for a record."""
     return ", ".join(f"{name} {value or 'unset'}" for name, value in environment)
+
+
+# The variables whose values a record shows, by exact name, as the lead's list
+# of 8 October 2026 (environment-values-2026-10-08.txt) gives them: process
+# and terminal; LANG, LANGUAGE and glibc's thirteen LC_ names; tmux and the
+# suite directories; CLAUDE_CONFIG_DIR; the XDG base directories and session;
+# and the 29 PYTHON names that Python 3.12.3's python3 --help-env lists. A
+# record names every other variable without its value, its length or a digest
+# of it. A rule on names would show a value held under any name it matches
+# (ssh can be set to pass LC_ names), a digest of a short secret can be
+# reversed by trying candidates, and records are copied into review packages.
+SHOWN_VALUES = frozenset("""
+    PATH HOME USER LOGNAME SHELL TERM COLUMNS LINES TZ ZDOTDIR NO_COLOR FORCE_COLOR
+    LANG LANGUAGE LC_ALL LC_CTYPE LC_NUMERIC LC_TIME LC_COLLATE LC_MONETARY LC_MESSAGES
+    LC_PAPER LC_NAME LC_ADDRESS LC_TELEPHONE LC_MEASUREMENT LC_IDENTIFICATION
+    TMUX TMUX_PANE TMUX_TMPDIR TMPDIR
+    CLAUDE_CONFIG_DIR
+    XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME XDG_CACHE_HOME XDG_RUNTIME_DIR
+    XDG_DATA_DIRS XDG_CONFIG_DIRS XDG_SESSION_TYPE XDG_SESSION_CLASS XDG_SESSION_DESKTOP
+    XDG_CURRENT_DESKTOP XDG_SESSION_ID XDG_SEAT XDG_VTNR XDG_MENU_PREFIX
+    PYTHONBREAKPOINT PYTHONCASEOK PYTHONCOERCECLOCALE PYTHONDEBUG PYTHONDEVMODE
+    PYTHONDONTWRITEBYTECODE PYTHONFAULTHANDLER PYTHONHASHSEED PYTHONHOME PYTHONINSPECT
+    PYTHONINTMAXSTRDIGITS PYTHONIOENCODING PYTHONMALLOC PYTHONNODEBUGRANGES PYTHONNOUSERSITE
+    PYTHONOPTIMIZE PYTHONPATH PYTHONPERFSUPPORT PYTHONPLATLIBDIR PYTHONPROFILEIMPORTTIME
+    PYTHONPYCACHEPREFIX PYTHONSAFEPATH PYTHONSTARTUP PYTHONTRACEMALLOC PYTHONUNBUFFERED
+    PYTHONUTF8 PYTHONVERBOSE PYTHONWARNDEFAULTENCODING PYTHONWARNINGS
+""".split())
+
+
+def said_environments(runs):
+    """Record lines naming the whole environment each of runs was given.
+
+    runs are (name, Run) pairs. Every variable the first run was given apart
+    from SUITE_DIRECTORIES is named, with its value when SHOWN_VALUES holds
+    its name and alone otherwise, and every run's own three are named after
+    it. Every other run's environment is compared here with the first's,
+    every value included whether a record shows it or not, and each variable
+    that differs is named without its values.
+    """
+    first_name, first = runs[0]
+    shared = {name: value for name, value in first.environ if name not in SUITE_DIRECTORIES}
+    shown, unshown = [], []
+    for name in sorted(shared):
+        (shown if name in SHOWN_VALUES else unshown).append(name)
+    lines = [f"suite environment of the {first_name}, apart from its "
+             f"{', '.join(SUITE_DIRECTORIES[:-1])} and {SUITE_DIRECTORIES[-1]}, values shown "
+             "for the variables on the verifier's list: "
+             + ("; ".join(f"{name}={shared[name]!r}" for name in shown) or "none"),
+             f"suite environment of the {first_name}, variables not on that list, named "
+             "without their values: " + (", ".join(unshown) or "none")]
+    lines += [f"suite directories of the {name}: {said_directories(run.environment)}"
+              for name, run in runs]
+    differing = []
+    for name, run in runs[1:]:
+        given = {key: value for key, value in run.environ if key not in SUITE_DIRECTORIES}
+        if given != shared:
+            names = sorted(key for key in set(given) | set(shared)
+                           if given.get(key) != shared.get(key))
+            differing.append(f"{name} ({', '.join(names)})")
+    compared = "every value compared, shown or not"
+    lines.append(f"suite environment: every other suite was given the {first_name}'s, {compared}"
+                 if not differing else f"suite environment differs from the {first_name}'s, "
+                 f"{compared}, for: " + "; ".join(differing))
+    return lines
 
 
 def read_listing(stdout):
@@ -899,9 +1055,12 @@ def signal_name(number):
 
 
 def unfinished(run):
-    """Why a run did not finish: ran out of time, or a signal ended it."""
+    """Why a run did not finish: it never started, ran out of time, or a signal ended it."""
+    if run.unstarted:
+        return [f"never started: {run.unstarted}"]
     if run.returncode is None:
-        return [f"did not finish within {run.timeout:g}s; its process group was stopped"]
+        return [f"did not finish within {run.timeout:g}s; its supervisor then ended it and the "
+                "processes under it one pidfd at a time, signalling no group"]
     if run.returncode < 0:
         return [f"was ended by {signal_name(-run.returncode)} (returncode {run.returncode})"]
     return []
@@ -1482,12 +1641,14 @@ def certification_gaps(expected, live, jobs, tool_digest, verifier_digest):
     # Asked last, so the inputs are read and judged whatever it finds.
     replaced = replaced_functions()
     if replaced:
-        gaps.append(f"functions replaced in the verifier after it was imported would run "
-                    f"code its bytes do not hold: {', '.join(replaced)}")
+        gaps.append(f"functions replaced or changed in place in the verifier after it was "
+                    f"imported would run code or defaults its bytes do not hold: "
+                    f"{', '.join(replaced)}")
     classes = replaced_classes()
     if classes:
-        gaps.append("classes or their methods replaced in the verifier after it was imported "
-                    f"would run code the import did not make: {', '.join(classes)}")
+        gaps.append("classes or their methods replaced or changed in place in the verifier "
+                    "after it was imported would run code the import did not make: "
+                    f"{', '.join(classes)}")
     constants = changed_constants()
     if constants:
         gaps.append("constants changed in the verifier after it was imported: "
@@ -1547,15 +1708,22 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
     from a private copy of the tool, its companion and its test tree, hashed
     after copying, where it must equal the originals, and again after the
     runs, where any change is refused as a change to the originals is; and it
-    checks the clean run's --failed report too. Its record names the inputs
-    and the copy with their hashes, the interpreter, the timeout, the
-    selftest's result, the runs whose --failed output was checked and every
-    co-failure's reason. Every suite a certifying run starts gets a TMPDIR,
-    TMUX_TMPDIR and XDG_CACHE_HOME of its own, made for it under
-    ``suite_parent``, /tmp unless the caller names another, and the record
-    names the clean run's; a development run passes the caller's on and
-    records them. Without it the run judges just as strictly and its result
-    says it certified nothing.
+    checks the clean run's --failed report too. It also copies the verifier
+    once, and every suite's supervisor loads that copy and starts nothing
+    unless the bytes it loaded have the copy's digest. Its record names the
+    inputs and the copies with their hashes, the interpreter, the timeout,
+    the selftest's result, the runs whose --failed output was checked, every
+    co-failure's reason and every variable every suite was given, with its
+    value only when SHOWN_VALUES names it. The listing, the clean run or its
+    --failed run exiting with processes still running under it refuses the
+    run, naming each process.
+    Every suite a certifying run starts gets a TMPDIR, TMUX_TMPDIR and
+    XDG_CACHE_HOME of its own, made for it under ``suite_parent``, /tmp unless
+    the caller names another and removed once its supervisor is done; the
+    record names the clean run's and any that was still there after its
+    removal. A development run passes the caller's on and records them.
+    Without it the run judges just as strictly and its result says it
+    certified nothing.
 
     The successful return is a Results tuple with one result dictionary per
     case: the check, the mutated file, the ids that failed and the
@@ -1607,7 +1775,8 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
              f"cases: {len(cases)}, sha256 {case_set_digest(cases)}"]
     owned_under = (Path("/tmp") if suite_parent is None else Path(suite_parent)) if certify else None
     lines.append(f"suite directories: {', '.join(SUITE_DIRECTORIES)} made for each suite "
-                 f"under {owned_under} and removed after it" if certify else
+                 f"under {owned_under}, each removed once its suite's supervisor is done"
+                 if certify else
                  "suite directories: the caller's, " + said_directories(
                      (name, os.environ.get(name)) for name in SUITE_DIRECTORIES))
     if checked_verifier is not None:
@@ -1641,9 +1810,10 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
     # says, because the plan has --failed tested against the same run.
     def run_one(entry):
         path, filtered_too = entry
-        full = run_suite(suite_argv(path, live=live, jobs=jobs), timeout, owned_under)
+        full = run_suite(suite_argv(path, live=live, jobs=jobs), timeout, owned_under,
+                         supervisor_source)
         filtered = (run_suite(suite_argv(path, live=live, jobs=jobs, failed=True), timeout,
-                              owned_under) if filtered_too else None)
+                              owned_under, supervisor_source) if filtered_too else None)
         return full, filtered
 
     with tempfile.TemporaryDirectory() as scratch:
@@ -1651,7 +1821,7 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
         # else touches, hashed after copying and again after the runs, so the
         # record names the bytes that ran and a run that wrote into its own
         # copy is refused as one that wrote into the original would be.
-        clean_tool, copied, copy_changed = tool, {}, []
+        clean_tool, copied, copy_changed, supervisor_source = tool, {}, [], None
         if certify:
             room = Path(scratch) / "clean"
             clean_tool, clean_comp, files = _private_copy(tool, comp, room)
@@ -1664,10 +1834,23 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
             lines.append(f"clean run from a private copy: {room}: tool sha256 "
                          f"{copied[clean_tool]}, companion sha256 {copied[clean_comp]}, "
                          f"test tree {copied_count} file(s), digest {copied_digest}")
+            # The supervisors run the verifier too, so they load a copy of it
+            # nothing else touches, and each checks the bytes it loaded.
+            verifier_copy = Path(scratch) / "verifier" / VERIFIER.name
+            verifier_copy.parent.mkdir()
+            shutil.copy2(VERIFIER, verifier_copy)
+            copied[verifier_copy] = fingerprints([verifier_copy])[verifier_copy]
+            if copied[verifier_copy] != VERIFIER_LOADED:
+                raise ProbeFailure([f"the private copy {verifier_copy} is not the verifier this "
+                                    "process loaded"])
+            supervisor_source = (verifier_copy, copied[verifier_copy])
+            lines.append(f"verifier copy for the supervisors: {verifier_copy} sha256 "
+                         f"{copied[verifier_copy]}; each supervisor starts nothing unless the "
+                         "bytes it loaded have this digest")
 
         listed = judge_listing(
             run_suite(suite_argv(clean_tool, live=live, jobs=jobs, listing=True), timeout,
-                      owned_under),
+                      owned_under, supervisor_source),
             expected)
         population = expected if expected is not None else dict(listed.rows)
         lines.append(f"listing: {len(listed.rows)} check(s)")
@@ -1706,13 +1889,23 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
         runs = batch([(clean_tool, filtering or certify),
                       *((copy, filtering) for copy in copies)], run_one)
         if certify:
-            again = fingerprints(_copy_files(clean_tool.parent, clean_tool, clean_comp))
+            again = fingerprints([*_copy_files(clean_tool.parent, clean_tool, clean_comp),
+                                  verifier_copy])
             copy_changed = sorted(str(item) for item in set(copied) | set(again)
                                   if copied.get(item) != again.get(item))
     labels = ["clean", *(f"case {at}" for at in range(1, len(prepared) + 1))]
     lines.append("--failed checked for: " + (", ".join(
         label for label, (_full, filtered) in zip(labels, runs) if filtered is not None)
         or "no run"))
+    every_run = [("listing", listed.run)] + [
+        (name, run) for label, (full, filtered) in zip(labels, runs)
+        for name, run in ((label, full), (f"{label} --failed", filtered)) if run is not None]
+    if certify:
+        still_there = [run.directory_left for _name, run in every_run if run.directory_left]
+        lines.append(f"suite directories: all {len(every_run)} removed after their suites"
+                     if not still_there else "suite directories still there after their "
+                     "suites: " + ", ".join(still_there))
+        lines.extend(said_environments(every_run))
 
     # The report names the bytes it judged. A file that changed while the
     # suites ran, the tool itself or a corpus file a unit wrote into, makes
@@ -1743,18 +1936,23 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
     lines.append(f"clean: {said(clean)}")
     if certify:
         lines.append(f"clean: suite directories {said_directories(runs[0][0].environment)}")
-    # A certified run is one that cleaned up after itself: a suite that exited
-    # with processes still running under it would have left them on the
-    # machine had its supervisor not ended them.
-    left = sorted({pid for run in runs[0] if run is not None for pid in run.left_running})
-    if certify and left:
-        lines.append("clean: the suite exited with processes still running under it, which "
-                     f"its supervisor ended or could not: {', '.join(map(str, left))}")
+    # A certified run is one that cleaned up after itself: a listing or clean
+    # suite that exited with processes still running under it would have left
+    # them on the machine had its supervisor not ended them.
+    leaving = [(name, sorted({pid for run in group if run is not None
+                              for pid in run.left_running}))
+               for name, group in (("listing", (listed.run,)), ("clean suite", runs[0]))]
+    leaving = [(name, left) for name, left in leaving if left]
+    if certify and leaving:
+        for name, left in leaving:
+            lines.append(f"{name}: exited with processes still running under it, which its "
+                         f"supervisor ended or could not: {', '.join(map(str, left))}")
         report = "\n".join(lines)
         print(report, file=stream)
-        raise ProbeFailure(["the clean suite exited with processes still running under it "
+        raise ProbeFailure([f"the {name} exited with processes still running under it "
                             f"({', '.join(map(str, left))}); a certified run ends what it "
-                            "started"], report=report, outcomes=tuple(outcomes))
+                            "started" for name, left in leaving],
+                           report=report, outcomes=tuple(outcomes))
     if clean.stray:
         lines.append(f"clean: {len(clean.stray)} line(s) of output before the first row")
     if runs[0][1] is not None:
@@ -1803,11 +2001,12 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
 # whole block, so any combination of knobs is one contiguous replacement.
 KNOBS = ("FAILING", "SUMMARY", "EXIT", "DROP", "EXTRA", "DUPLICATE", "DESCRIBE",
          "SLEEP", "SIGNAL", "FILTER_LIES", "WRITE_BESIDE", "OWNED_DRIVER", "STUBBORN",
-         "NAMED_SYSTEMD")
+         "NAMED_SYSTEMD", "LISTING_LEAVES", "LOCKED_TMPDIR")
 KNOB_DEFAULTS = {"FAILING": [], "SUMMARY": "exact", "EXIT": None, "DROP": [], "EXTRA": [],
                  "DUPLICATE": [], "DESCRIBE": {}, "SLEEP": 0, "SIGNAL": None,
                  "FILTER_LIES": False, "WRITE_BESIDE": None, "OWNED_DRIVER": None,
-                 "STUBBORN": False, "NAMED_SYSTEMD": False}
+                 "STUBBORN": False, "NAMED_SYSTEMD": False, "LISTING_LEAVES": False,
+                 "LOCKED_TMPDIR": None}
 SYNTHETIC_EXPECTED = {
     "target-check": "the check a case names",
     "other-check": "a check a case may justify as a co-failure",
@@ -2027,8 +2226,19 @@ def _selftest_checks(verifier):
                   table(passing[:1], summary=False), "", 1.0)
     outcome = judge_report(partial, expected, "case 1", "beta")
     check("timeout-refused-alone",
-          only(outcome.reasons, "did not finish within 1s; its process group was stopped",
+          only(outcome.reasons, "did not finish within 1s; its supervisor then ended it and "
+               "the processes under it one pidfd at a time, signalling no group",
                "missing expected check(s): beta, every-unit-reported"),
+          repr(outcome.reasons))
+    # A run whose supervisor started nothing is judged for that, and is not
+    # read as one that reached its bound.
+    never = Run(("python3", "agent-resume", "--selftest", "--jobs", "1"), None, "", "", 1.0,
+                unstarted="its command could not be started: no such file")
+    outcome = judge_report(never, expected, "case 1", "beta")
+    check("never-started-refused-alone",
+          only(outcome.reasons, "never started: its command could not be started: no such file",
+               "missing expected check(s): ")
+          and not any("did not finish" in reason for reason in outcome.reasons),
           repr(outcome.reasons))
     outcome = judge_report(record(table(passing), returncode=-15), expected, "case 1", "beta")
     check("signal-refused-alone",
@@ -2127,7 +2337,8 @@ def _selftest_checks(verifier):
                   "beta  the second check  (scripted)\n", "", 1.0)
     outcome = judge_filtering(full, stopped, expected)
     check("failed-only-timeout-judged-alone",
-          only(outcome.reasons, "did not finish within 1s; its process group was stopped"),
+          only(outcome.reasons, "did not finish within 1s; its supervisor then ended it and "
+               "the processes under it one pidfd at a time, signalling no group"),
           repr(outcome.reasons))
     outcome = judge_filtering(full, record(filtered, returncode=-9), expected)
     check("failed-only-signal-judged-alone",
@@ -2472,7 +2683,8 @@ def _selftest_checks(verifier):
                     (1, "synthetic-declaration-and-check-removed-together",
                      ("missing expected check(s): third-check",)),
                     (2, "synthetic-timeout-refused",
-                     ("did not finish within 1.5s; its process group was stopped",
+                     ("did not finish within 1.5s; its supervisor then ended it and the "
+                      "processes under it one pidfd at a time, signalling no group",
                       "missing expected check(s): every-unit-reported, other-check, "
                       "target-check, third-check")),
                     (3, "synthetic-signal-refused", ("was ended by SIGTERM (returncode -15)",)),
@@ -2791,8 +3003,9 @@ def _selftest_checks(verifier):
             finally:
                 globals()["_json_record"] = real_record
             check("certification-reads-each-input-once",
-                  once == ["functions replaced in the verifier after it was imported would "
-                           "run code its bytes do not hold: _json_record"]
+                  once == ["functions replaced or changed in place in the verifier after it "
+                           "was imported would run code or defaults its bytes do not hold: "
+                           "_json_record"]
                   and reads == {source_path: 1, approved: 1}, repr((once, reads)))
 
             # A certifying run names its timeout.
@@ -3047,25 +3260,37 @@ def _selftest_checks(verifier):
             finally:
                 globals()["judge_listing"] = real_listing
             check("certify-refused-when-a-function-was-replaced",
-                  gaps == ["functions replaced in the verifier after it was imported would run "
-                           "code its bytes do not hold: judge_listing"]
+                  gaps == ["functions replaced or changed in place in the verifier after it "
+                           "was imported would run code or defaults its bytes do not hold: "
+                           "judge_listing"]
                   and certification_gaps(certifying, True, 3, tool_digest, VERIFIER_LOADED)
                   == [], repr(gaps))
 
-            # Y4: a method replaced after the import is named, and so is a
-            # constant whose value changed, in place or rebound.
+            # Y4: a method rebound after the import is named, whether to other
+            # code or to a new function made of the same code, defaults and
+            # closure, which only its identity tells apart from the one the
+            # import made. So is a constant whose value is changed in place,
+            # ENDED_CHECKS emptied here; a rebound one is compared by the same
+            # digest.
             made = vars(Results)["__new__"]
-            Results.__new__ = staticmethod(lambda cls, results, certified, report:
-                                           tuple.__new__(cls, results))
-            try:
-                method_gaps = certification_gaps(certifying, True, 3, tool_digest,
-                                                 VERIFIER_LOADED)
-            finally:
-                Results.__new__ = made
+            same = made.__func__
+            rebindings = (staticmethod(lambda cls, results, certified, report:
+                                       tuple.__new__(cls, results)),
+                          staticmethod(types.FunctionType(same.__code__, same.__globals__,
+                                                          same.__name__, same.__defaults__,
+                                                          same.__closure__)))
+            method_gaps = []
+            for rebinding in rebindings:
+                Results.__new__ = rebinding
+                try:
+                    method_gaps.append(certification_gaps(certifying, True, 3, tool_digest,
+                                                          VERIFIER_LOADED))
+                finally:
+                    Results.__new__ = made
             check("certify-refused-when-a-method-was-replaced",
-                  method_gaps == ["classes or their methods replaced in the verifier after it "
-                                  "was imported would run code the import did not make: "
-                                  "Results.__new__"]
+                  method_gaps == [["classes or their methods replaced or changed in place in "
+                                   "the verifier after it was imported would run code the "
+                                   "import did not make: Results.__new__"]] * 2
                   and certification_gaps(certifying, True, 3, tool_digest, VERIFIER_LOADED)
                   == [], repr(method_gaps))
             ended_checks = set(ENDED_CHECKS)
@@ -3080,6 +3305,69 @@ def _selftest_checks(verifier):
                                     "ENDED_CHECKS"]
                   and certification_gaps(certifying, True, 3, tool_digest, VERIFIER_LOADED)
                   == [], repr(constant_gaps))
+
+            # Y4, in place: each change below leaves every name holding the
+            # object the import made and changes what that object runs: a
+            # function's code, its defaults and its keyword defaults, and a
+            # method's code and its defaults. Each is named alone, and nothing
+            # is once it is put back.
+            class _StandIn(AssertionError):
+                def __init__(self, failures, report="", outcomes=()):
+                    super().__init__("a stand-in")
+
+            functions_changed = ("functions replaced or changed in place in the verifier after "
+                                 "it was imported would run code or defaults its bytes do not "
+                                 "hold: ")
+            methods_changed = ("classes or their methods replaced or changed in place in the "
+                               "verifier after it was imported would run code the import did "
+                               "not make: ")
+            # Named through the module: inside this function some of these
+            # names are locals.
+            said_function, suite_function = globals()["said"], globals()["run_suite"]
+            expect_function = globals()["expect"]
+            jobs_default = expect_function.__kwdefaults__["jobs"]
+
+            def kwdefault(value):
+                expect_function.__kwdefaults__["jobs"] = value
+
+            in_place = {
+                "a function's code": (
+                    lambda: setattr(said_function, "__code__", signal_name.__code__),
+                    lambda kept: setattr(said_function, "__code__", kept),
+                    lambda: said_function.__code__, functions_changed + "said"),
+                "a function's defaults": (
+                    lambda: setattr(suite_function, "__defaults__", (1.0, None, None)),
+                    lambda kept: setattr(suite_function, "__defaults__", kept),
+                    lambda: suite_function.__defaults__, functions_changed + "run_suite"),
+                "a function's keyword default, its dictionary kept": (
+                    lambda: kwdefault(9), kwdefault, lambda: jobs_default,
+                    functions_changed + "expect"),
+                "a method's code": (
+                    lambda: setattr(ProbeFailure.__init__, "__code__",
+                                    _StandIn.__init__.__code__),
+                    lambda kept: setattr(ProbeFailure.__init__, "__code__", kept),
+                    lambda: ProbeFailure.__init__.__code__,
+                    methods_changed + "ProbeFailure.__init__"),
+                "a method's defaults": (
+                    lambda: setattr(ProbeFailure.__init__, "__defaults__", ("a report", ())),
+                    lambda kept: setattr(ProbeFailure.__init__, "__defaults__", kept),
+                    lambda: ProbeFailure.__init__.__defaults__,
+                    methods_changed + "ProbeFailure.__init__"),
+            }
+            unnamed = []
+            for change, (make, put_back, keep, named) in in_place.items():
+                kept = keep()
+                make()
+                try:
+                    found = certification_gaps(certifying, True, 3, tool_digest, VERIFIER_LOADED)
+                finally:
+                    put_back(kept)
+                if found != [named]:
+                    unnamed.append(f"{change}: {found}")
+            check("certify-refused-when-code-or-defaults-changed-in-place",
+                  not unnamed and certification_gaps(certifying, True, 3, tool_digest,
+                                                     VERIFIER_LOADED) == [],
+                  "; ".join(unnamed))
 
             # X2: a clean suite that exits with a driver still running is not
             # certified. The stand-in starts the driver as its own child and then
@@ -3146,18 +3434,43 @@ def _selftest_checks(verifier):
                   and "ended processes the suite left running" in reported.stderr
                   and not still,
                   repr((refused, reported.left_running if reported else None, named, still)))
+            # The listing runs under a supervisor of its own too, and what it
+            # leaves refuses a certifying run as the clean suite's does: here
+            # only the listing leaves a driver, and the refusal names it and
+            # its terminal child.
+            _results, listing_refusal, named, still = leaving(
+                "listing-leaving", knobs(LISTING_LEAVES=True), knobs(FAILING=["target-check"]))
+            listed_pids = (listing_refusal[0].partition("(")[2].partition(")")[0]
+                           if listing_refusal else "")
+            check("certify-refused-when-the-listing-left-processes",
+                  len(listing_refusal) == 1
+                  and listing_refusal[0].startswith(
+                      "the listing exited with processes still running under it (")
+                  and bool(named) and not still
+                  and {int(pid) for pid in listed_pids.split(", ") if pid.isdigit()}
+                  == {int(pid) for pid, _born in named},
+                  repr((listing_refusal, named, still)))
 
             # A certifying run gives every suite a TMPDIR, TMUX_TMPDIR and
             # XDG_CACHE_HOME of its own under the parent it is given, removes
-            # them after it, and names the clean run's in its record. A
-            # development run hands its suites the caller's and records them.
+            # them after it, and names the clean run's in its record, with the
+            # whole environment every suite was given. Its supervisors load a
+            # copy of the verifier. A development run hands its suites the
+            # caller's directories and records them, and its supervisors load
+            # the verifier itself. Two variables of this test's own show which
+            # values a record writes down: ZDOTDIR is on SHOWN_VALUES, and
+            # LC_PROBE_SELFTEST is not, though it begins with LC_ as thirteen
+            # listed names do, so a rule on names that let it through fails here.
             environ_log = room / "environ-log"
             owned_parent = room / "suites"
             owned_parent.mkdir()
             callers = {name: room / f"callers-{name.lower()}" for name in SUITE_DIRECTORIES}
-            was = {name: os.environ.get(name) for name in callers}
+            own = {"ZDOTDIR": "probe-selftest-shown", "LC_PROBE_SELFTEST": "probe-selftest-unlisted"}
+            was = {name: os.environ.get(name) for name in [*callers, *own]}
             certified_record, developed_record = io.StringIO(), io.StringIO()
             os.environ["PROBE_SYNTHETIC_ENVIRON"] = str(environ_log)
+            os.environ.update(own)
+            given_names = set(os.environ) - set(SUITE_DIRECTORIES)
             try:
                 expect([("target-check", knobs(), bite)], live=True, jobs=3, tool=tool,
                        expected=certifying, timeout=20.0, certify=True,
@@ -3191,9 +3504,12 @@ def _selftest_checks(verifier):
                     len({next(iter(home)) for home in homes if home}) == len(given),
                 "each directory was removed after its suite":
                     sorted(entry.name for entry in owned_parent.iterdir()) == [],
-                "the record says where they were made":
+                "the record says where they were made and that each is removed":
                     f"suite directories: TMPDIR, TMUX_TMPDIR, XDG_CACHE_HOME made for each suite "
-                    f"under {owned_parent} and removed after it" in printed,
+                    f"under {owned_parent}, each removed once its suite's supervisor is done"
+                    in printed,
+                "the record says each was removed":
+                    f"suite directories: all {len(given)} removed after their suites" in printed,
                 "the record names the clean run's three":
                     len(clean_named) == 1 and any(
                         clean_named[0] == "clean: suite directories " + ", ".join(
@@ -3205,11 +3521,112 @@ def _selftest_checks(verifier):
                   ", ".join(wrong) + (f"; given {given}" if wrong else ""))
             developed = developed_record.getvalue()
             check("development-run-hands-its-suites-the-callers-directories",
-                  bool(handed) and all(values == {name: str(path) for name, path in callers.items()}
+                  bool(handed) and all({name: values.get(name) for name in SUITE_DIRECTORIES}
+                                       == {name: str(path) for name, path in callers.items()}
                                        for values in handed)
                   and "suite directories: the caller's, " + ", ".join(
                       f"{name} {callers[name]}" for name in SUITE_DIRECTORIES) in developed,
                   f"handed {handed}")
+            copy_line = next((line for line in printed.splitlines()
+                              if line.startswith("verifier copy for the supervisors: ")), "")
+            verifier_copy = copy_line[len("verifier copy for the supervisors: "):].split(" ")[0]
+            loaded = {
+                "the record names the copy and this process's digest":
+                    bool(verifier_copy) and verifier_copy != str(VERIFIER)
+                    and f" sha256 {VERIFIER_LOADED}; " in copy_line,
+                "every certifying supervisor loaded the copy, and was told its digest":
+                    bool(given) and all(
+                        any(repr(verifier_copy) in part and repr(VERIFIER_LOADED) in part
+                            for part in values.get("supervisor", ())) for values in given),
+                "every development supervisor loaded the verifier itself":
+                    bool(handed) and all(
+                        any(repr(str(VERIFIER)) in part for part in values.get("supervisor", ()))
+                        for values in handed),
+            }
+            wrong = sorted(claim for claim, ok in loaded.items() if not ok)
+            check("certify-supervisors-load-a-private-copy-of-the-verifier", not wrong,
+                  ", ".join(wrong) + (f"; {copy_line!r}" if wrong else ""))
+            lines = printed.splitlines()
+
+            def items(start, separator):
+                found = next((line for line in lines if line.startswith(start)), "")
+                return [] if found.endswith(": none") else found.split(": ", 1)[-1].split(separator)
+
+            shown_items = items("suite environment of the listing, apart ", "; ")
+            unshown_items = items("suite environment of the listing, variables ", ", ")
+            unlisted = own["LC_PROBE_SELFTEST"]
+            # The comparison on three made-up runs, the second of which was
+            # given another value for a variable that is not on the list.
+            compared = globals()["said_environments"]([
+                (label, Run(("suite",), 0, "", "", environ=(("LC_PROBE_SELFTEST", value),
+                                                            ("PATH", "/bin"))))
+                for label, value in (("listing", "first-value"), ("clean", "second-value"),
+                                     ("case 1", "first-value"))])[-1]
+            environment = {
+                "the record shows a listed variable's value":
+                    "ZDOTDIR='probe-selftest-shown'" in shown_items,
+                "and the caller's PATH with its value":
+                    f"PATH={os.environ.get('PATH', '')!r}" in shown_items,
+                "and names an unlisted one with nothing after the name":
+                    "LC_PROBE_SELFTEST" in unshown_items,
+                "and writes down neither its value nor a digest of it":
+                    unlisted not in printed and "LC_PROBE_SELFTEST=" not in printed
+                    and hashlib.sha256(unlisted.encode()).hexdigest()[:16] not in printed,
+                "and names every variable the suites were given":
+                    {item.split("=", 1)[0] for item in shown_items} | set(unshown_items)
+                    == given_names,
+                "every other suite was given the same, its own directories apart":
+                    "suite environment: every other suite was given the listing's, every value "
+                    "compared, shown or not" in lines,
+                "every suite's own directories are named":
+                    sum(line.startswith("suite directories of the ") for line in lines) == len(given),
+                "a variable given another value in one run is named for that run alone, "
+                "without either value":
+                    compared == "suite environment differs from the listing's, every value "
+                                "compared, shown or not, for: clean (LC_PROBE_SELFTEST)",
+            }
+            wrong = sorted(claim for claim, ok in environment.items() if not ok)
+            check("certify-record-names-the-whole-suite-environment", not wrong, ", ".join(wrong))
+            # A suite directory that cannot be removed is named in the record:
+            # here every clean run's TMPDIR holds a directory without write
+            # permission, so each of their directories stays, and the test
+            # removes them after.
+            locked_parent = room / "locked-suites"
+            locked_parent.mkdir()
+            locked_room = room / "locked"
+            (locked_room / "test").mkdir(parents=True)
+            locked_tool = locked_room / "agent-resume"
+            locked_knobs = knobs(LOCKED_TMPDIR=str(locked_parent))
+            locked_tool.write_text(runner_text.replace(knobs(), locked_knobs))
+            locked_tool.chmod(0o755)
+            (locked_room / "_agent-resume").write_text("")
+            locked_path, locked_approved = frozen_beside(
+                "expected-mapping-locked",
+                source={**source, "sha256": hashlib.sha256(locked_tool.read_bytes()).hexdigest()})
+            locked_record = io.StringIO()
+            try:
+                expect([("target-check", locked_knobs, knobs(FAILING=["target-check"]))],
+                       live=True, jobs=3, tool=locked_tool,
+                       expected=retained_expectation(locked_path, live=True, jobs=3,
+                                                     adjudications=locked_approved),
+                       timeout=20.0, certify=True, stream=locked_record, verifier=verifier,
+                       suite_parent=locked_parent)
+                locked_failure = None
+            except ProbeFailure as exc:
+                locked_failure = exc.failures
+            kept = sorted(str(home) for home in locked_parent.iterdir())
+            for home in kept:
+                with contextlib.suppress(OSError):
+                    os.chmod(Path(home) / "t" / "locked", 0o700)
+                shutil.rmtree(home, ignore_errors=True)
+            still_there = next((line for line in locked_record.getvalue().splitlines()
+                                if line.startswith("suite directories still there after their "
+                                                   "suites: ")), "")
+            check("certify-record-names-a-suite-directory-left-behind",
+                  locked_failure is None and bool(kept)
+                  and sorted(still_there.split(": ", 1)[-1].split(", ")) == kept
+                  and not any(locked_parent.iterdir()),
+                  repr((locked_failure, kept, still_there)))
             try:
                 expect([("target-check", knobs(), bite)], live=True, jobs=2, tool=tool,
                        expected=retained, timeout=20.0, stream=io.StringIO())
@@ -3338,6 +3755,107 @@ def _selftest_checks(verifier):
               run.returncode is None and len(named) == 2 and not alive,
               f"returncode {run.returncode}, named {named}, still running {alive}")
 
+        # A supervisor starts nothing unless the bytes it loaded have the digest
+        # its run names. The copy here differs from this file by one comment
+        # line: named with this file's digest it starts nothing, which the
+        # stand-in's own log shows, and named with its own it runs the suite.
+        other = Path(td) / "other" / VERIFIER.name
+        other.parent.mkdir()
+        other.write_bytes(VERIFIER.read_bytes() + b"# one more line\n")
+        other_digest = hashlib.sha256(other.read_bytes()).hexdigest()
+        here = Path(td) / "unstarted"
+        here.mkdir()
+        copy = here / "agent-resume"
+        copy.write_text(runner_text)
+        copy.chmod(0o755)
+        log = here / "log"
+        was_log = os.environ.get("PROBE_SYNTHETIC_LOG")
+        os.environ["PROBE_SYNTHETIC_LOG"] = str(log)
+        try:
+            refused_run = run_suite(suite_argv(copy, live=True), timeout=20.0,
+                                    supervisor_source=(other, VERIFIER_LOADED))
+            ran_before = log.read_text() if log.exists() else ""
+            started_run = run_suite(suite_argv(copy, live=True), timeout=20.0,
+                                    supervisor_source=(other, other_digest))
+        finally:
+            if was_log is None:
+                os.environ.pop("PROBE_SYNTHETIC_LOG", None)
+            else:
+                os.environ["PROBE_SYNTHETIC_LOG"] = was_log
+        mismatch = (f"the verifier it loaded, {other}, has sha256 {other_digest}, not the "
+                    f"{VERIFIER_LOADED} its run names")
+        check("supervisor-starts-nothing-from-other-bytes",
+              refused_run.unstarted == mismatch and refused_run.returncode is None
+              and ran_before == "" and unfinished(refused_run) == [f"never started: {mismatch}"]
+              and f"probe: the supervisor did not start the suite: {mismatch}" in refused_run.stderr
+              and started_run.returncode == 0 and not started_run.unstarted,
+              f"refused {refused_run.unstarted!r}, ran before {ran_before!r}, started "
+              f"{started_run.returncode} {started_run.unstarted!r}")
+        # A supervisor whose code came from a cached .pyc rather than from the
+        # bytes it read starts nothing, though those bytes have the digest its
+        # run names. The .pyc is compiled from the file with one constant
+        # changed and carries the file's size and modification time, which is
+        # all the import compares, so the import runs it.
+        stale = Path(td) / "stale" / VERIFIER.name
+        stale.parent.mkdir()
+        original = VERIFIER.read_bytes()
+        stale.write_bytes(original.replace(b"CLEANUP_ROUNDS = 20\n", b"CLEANUP_ROUNDS = 21\n", 1))
+        py_compile.compile(str(stale), cfile=importlib.util.cache_from_source(str(stale)),
+                           doraise=True)
+        compiled_at = stale.stat().st_mtime_ns
+        stale.write_bytes(original)
+        os.utime(stale, ns=(compiled_at, compiled_at))
+        log.unlink(missing_ok=True)
+        os.environ["PROBE_SYNTHETIC_LOG"] = str(log)
+        try:
+            stale_run = run_suite(suite_argv(copy, live=True), timeout=20.0,
+                                  supervisor_source=(stale, VERIFIER_LOADED))
+        finally:
+            if was_log is None:
+                os.environ.pop("PROBE_SYNTHETIC_LOG", None)
+            else:
+                os.environ["PROBE_SYNTHETIC_LOG"] = was_log
+        not_compiled = f"the code it runs was not compiled from the verifier it loaded, {stale}"
+        check("supervisor-starts-nothing-from-stale-bytecode",
+              stale_run.unstarted == not_compiled and not log.exists()
+              and unfinished(stale_run) == [f"never started: {not_compiled}"],
+              f"{stale_run.unstarted!r}, ran {log.read_text() if log.exists() else ''!r}")
+        # A command that cannot be started is a suite that never started, not
+        # one that reached its bound.
+        missing = Path(td) / "no-such-tool"
+        unstartable = run_suite([str(missing), "--selftest"], timeout=20.0)
+        check("unstartable-suite-is-reported-as-never-started",
+              unstartable.returncode is None
+              and unstartable.unstarted.startswith("its command could not be started: ")
+              and str(missing) in unstartable.unstarted
+              and unfinished(unstartable) == [f"never started: {unstartable.unstarted}"]
+              and "probe: the supervisor did not start the suite: its command could not be "
+                  "started: " in unstartable.stderr,
+              f"{unstartable.unstarted!r}, {unfinished(unstartable)}")
+        # A suite directory that cannot be removed is named, in the run's
+        # stderr and its Run, and is then removed here.
+        locked_parent = Path(td) / "locked-suites"
+        locked_parent.mkdir()
+        here = Path(td) / "locked"
+        here.mkdir()
+        copy = here / "agent-resume"
+        copy.write_text(runner_text.replace(knobs(), knobs(LOCKED_TMPDIR=str(locked_parent))))
+        copy.chmod(0o755)
+        locked_run = run_suite(suite_argv(copy, live=True), timeout=20.0,
+                               owned_under=locked_parent)
+        kept = sorted(locked_parent.iterdir())
+        for home in kept:
+            with contextlib.suppress(OSError):
+                os.chmod(home / "t" / "locked", 0o700)
+            shutil.rmtree(home, ignore_errors=True)
+        check("suite-directory-left-behind-is-named",
+              locked_run.returncode == 0 and len(kept) == 1
+              and locked_run.directory_left == str(kept[0])
+              and f"probe: the suite's directory {kept[0]} is still there after its removal"
+                  in locked_run.stderr and not any(locked_parent.iterdir()),
+              f"returncode {locked_run.returncode}, kept {kept}, named "
+              f"{locked_run.directory_left!r}")
+
         # A process outside the suite is never signalled, though it started
         # after the suite and so passes the start-time rule: what a supervisor
         # ends is what is under it. The outsider is this test's own child.
@@ -3462,10 +3980,12 @@ def _selftest_checks(verifier):
                 "pid 1": never_signalled(1) == "pid 1",
                 "this process": never_signalled(os.getpid()) == "this process",
                 "its parent": never_signalled(os.getppid()) == "an ancestor of this process",
-                # Asked of each one still named systemd when it is asked: other
-                # runs' processes come and go between the scan and the question.
+                # Asked of each one still a running process named systemd when
+                # it is asked: other runs' processes, other selftests' stand-ins
+                # among them, start, end and wait as zombies between the scan
+                # and the question.
                 "every systemd process": all(
-                    never_signalled(pid) or _read_text(f"/proc/{pid}/comm") != "systemd"
+                    never_signalled(pid) or (_proc_identity(pid) or ("",) * 4)[3] != "systemd"
                     for pid in managers),
                 "a process named systemd": never_signalled(imitation.pid) == "a systemd process",
                 "not a process this test started": never_signalled(sleeper.pid) is None,
@@ -3496,7 +4016,7 @@ def _selftest_checks(verifier):
     return len(checks)
 
 
-# The classes and constants as the import left them, taken last so that every
-# definition above is in it; replaced_classes and changed_constants compare
-# against these.
-VERIFIER_CLASSES, VERIFIER_CONSTANTS = _module_snapshot()
+# The classes, constants and function defaults as the import left them, taken
+# last so that every definition above is in it; replaced_classes,
+# changed_constants and replaced_functions compare against these.
+VERIFIER_CLASSES, VERIFIER_CONSTANTS, VERIFIER_DEFAULTS = _module_snapshot()
