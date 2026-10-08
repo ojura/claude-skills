@@ -3,10 +3,10 @@
 Import this module from a mutation script and call ``expect``. The clean suite is
 run once, every mutation receives its own copy of the tool and corpus, and the
 mutants run with at most four suites active at once. Every suite runs under a
-supervisor of its own, an interpreter that loads this file, or a certifying
-run's private copy of it, and calls supervise, which starts the suite only when
-the bytes it loaded have the digest its run names, and ends whatever the suite
-leaves running and nothing outside it.
+supervisor of its own: an interpreter that reads this file, or a certifying
+run's private copy of it, starts nothing unless those bytes have the digest its
+run names, runs those same bytes as the module and calls its supervise, which
+ends whatever the suite leaves running and nothing outside it.
 
     import probe
 
@@ -265,8 +265,10 @@ class Run:
     """One suite process as the verifier saw it.
 
     returncode is None when the process never started, which unstarted then
-    says why, or ran out of time and its supervisor ended it; negative when a
-    signal ended it, and the exit status otherwise. stdout and stderr are kept
+    says why, when its supervisor ended before saying how it ended, which
+    supervisor_ended then says how, or when it ran out of time and its
+    supervisor ended it; negative when a signal ended it, and the exit status
+    otherwise. stdout and stderr are kept
     whole whatever happened, so a refusal can show what the process said.
     """
 
@@ -284,8 +286,12 @@ class Run:
     # Why the suite was never started, as its supervisor said or as its
     # supervisor's silence shows; empty for a suite that started.
     unstarted: str = ""
-    # The directory made for the suite, when it is still there after its
-    # removal; empty when none was made or it is gone.
+    # How the supervisor ended when it ended after starting the suite and
+    # before saying how the suite's own process ended, with no bound reached,
+    # such as "exited 9"; empty otherwise.
+    supervisor_ended: str = ""
+    # The directory made for the suite, when it could not be removed; empty
+    # when none was made or it was removed.
     directory_left: str = ""
     # Every environment variable the suite was given, (name, value) pairs in
     # name order. The Run's repr leaves it out, so a test that prints a Run
@@ -398,17 +404,31 @@ def _proc_identity(pid):
 
     The start time is the kernel's, field 22, so a pid the kernel has handed
     to another process does not match. The command name is the stat's own,
-    which a process can set for itself. A zombie has ended and is not a
-    process to stop, so it reads as none.
+    which a process can set for itself to any bytes but NUL. So the stat is
+    read as bytes and its fields are taken after the last ")", which ends the
+    name, and the name is kept as _name_text writes it: a name that is not
+    UTF-8 then neither hides its process nor the processes under it. A zombie
+    has ended and is not a process to stop, so it reads as none.
     """
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-        name = stat[stat.index("(") + 1:stat.rindex(")")]
-        rest = stat[stat.rindex(")") + 2:].split()
-        state, parent, group, started = rest[0], int(rest[1]), int(rest[2]), rest[19]
+        with open(f"/proc/{pid}/stat", "rb") as stat_file:
+            stat = stat_file.read()
+        name = stat[stat.index(b"(") + 1:stat.rindex(b")")]
+        rest = stat[stat.rindex(b")") + 2:].split()
+        state, parent, group, started = rest[0], int(rest[1]), int(rest[2]), rest[19].decode()
     except (OSError, ValueError, IndexError):
         return None
-    return None if state in ("Z", "X") else (parent, group, started, name)
+    return None if state in (b"Z", b"X") else (parent, group, started, _name_text(name))
+
+
+def _name_text(name):
+    """A command name's bytes as text: printable ASCII as it is, any other byte or \\ as \\xNN.
+
+    It cannot fail on any bytes, and a name written into a supervisor's
+    report line can neither end that line nor pass for another name.
+    """
+    return "".join(chr(byte) if 0x20 <= byte < 0x7f and byte != 0x5c else f"\\x{byte:02x}"
+                   for byte in name)
 
 
 def _started(pid):
@@ -588,13 +608,11 @@ def end_descendants(root, bound, grace=None, rounds=None, reap=None):
 def supervise(argv):
     """Run a suite as this process's child and end what it leaves; run_suite's supervisor.
 
-    run_suite starts an interpreter that loads a verifier file and calls
-    this, so the module stays an API with no command line of its own. argv is
-    the status descriptor, the control descriptor, the sha256 the bytes this
-    module was loaded from must have, "--" and the suite's command. A run
-    names the one verifier its supervisors run, so this module starts nothing
-    when the bytes it was loaded from have another digest or the code it runs
-    was not compiled from them. It makes itself the subreaper of everything
+    run_suite starts an interpreter that reads a verifier file, checks the
+    digest of its bytes and runs them as this module, then calls this, so the
+    module stays an API with no command line of its own. argv is the status
+    descriptor, the control descriptor, "--" and the suite's command. It
+    makes itself the subreaper of everything
     under it, so a process the suite leaves behind, whichever of its parents
     ended first, stays a descendant of this one and of nothing outside the
     suite. It writes "started <pid>" once the suite runs and "exited
@@ -605,11 +623,12 @@ def supervise(argv):
     under it under end_descendants' rules, the suite too when it still runs,
     bounded by its own start time. It writes a "refused", "ended" or "left"
     line for each process that concerns, then "done", and returns 0. When it
-    starts nothing, because of the bytes it was loaded from, a subreaper it
-    could not become or a command that cannot be started, it writes
-    "unstarted" and why, then "done", and returns 125.
+    starts nothing, because of a subreaper it could not become or a command
+    that cannot be started, it writes "unstarted" and why, then "done", and
+    returns 125, as the interpreter that runs it does, before it, for bytes
+    with another digest.
     """
-    status_fd, control_fd, expected, separator, *command = argv
+    status_fd, control_fd, separator, *command = argv
     if separator != "--" or not command:
         return 2
     control = int(control_fd)
@@ -628,12 +647,6 @@ def supervise(argv):
         tell("done")
         return 125
 
-    if VERIFIER_LOADED != expected:
-        return unstarted(f"the verifier it loaded, {VERIFIER}, has sha256 {VERIFIER_LOADED}, "
-                         f"not the {expected} its run names")
-    if not VERIFIER_FROM_SOURCE:
-        return unstarted(f"the code it runs was not compiled from the verifier it loaded, "
-                         f"{VERIFIER}")
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
         return unstarted(f"this process could not become a subreaper "
@@ -690,8 +703,8 @@ def run_suite(argv, timeout=None, owned_under=None, supervisor_source=None):
     With owned_under the suite gets a directory of its own under it for each
     of SUITE_DIRECTORIES, made before it starts and removed once its
     supervisor is done; without, it gets the caller's. Either way its Run
-    carries the values the suite was given. A directory still there after
-    its removal is named in the Run's stderr and directory_left.
+    carries the values the suite was given. A directory that could not be
+    removed is named in the Run's stderr and directory_left.
     supervisor_source is the verifier file the supervisor loads and the
     sha256 its bytes must have; without it, this file and the bytes this
     process loaded. Everything else is _supervised_run.
@@ -712,8 +725,8 @@ def run_suite(argv, timeout=None, owned_under=None, supervisor_source=None):
     if home is not None and home.exists():
         run = dataclasses.replace(
             run, directory_left=str(home),
-            stderr=run.stderr + f"\nprobe: the suite's directory {home} is still there after "
-                                "its removal\n")
+            stderr=run.stderr + f"\nprobe: the suite's directory {home} could not be "
+                                "removed\n")
     return run
 
 
@@ -723,9 +736,12 @@ def _supervised_run(argv, timeout, env, supervisor_source=None):
     The bound is read here rather than bound as a default, so the one constant
     above is what decides it and a caller can lower it without editing this.
 
-    The suite runs as the child of an interpreter that loads this file and
-    calls supervise, in a session of its own. supervise makes itself the subreaper of everything
-    under it, so whatever the suite starts stays under it however the
+    The suite runs as the child of a supervisor, an interpreter of its own in
+    a session of its own that reads a verifier file once, starts nothing
+    unless those bytes have the digest the run names, and runs those same
+    bytes as the module whose supervise it calls. supervise makes itself the
+    subreaper of everything under it, so whatever the suite starts stays
+    under it however the
     processes in between end, and nothing outside the suite ever is. When the
     suite's own process ends, or at the bound, the supervisor is asked to end
     everything still under it, the suite too when it still runs. A run that
@@ -735,27 +751,44 @@ def _supervised_run(argv, timeout, env, supervisor_source=None):
     back with them in left_running. Whatever was ended, left running or
     refused is named at the end of the run's stderr.
 
-    supervisor_source names the verifier file the supervisor loads and the
-    sha256 the bytes it loads must have; without it, this file and the bytes
-    this process loaded. A supervisor that loaded other bytes starts nothing.
+    supervisor_source names the verifier file the supervisor reads and the
+    sha256 its bytes must have; without it, this file and the bytes this
+    process loaded. A supervisor that read other bytes starts nothing.
     """
     source, digest = supervisor_source or (VERIFIER, VERIFIER_LOADED)
     status_read, status_write = os.pipe()
     control_read, control_write = os.pipe()
-    # The supervisor is a verifier file loaded by path and handed its
-    # arguments, the digest its bytes must have among them, in the code it
-    # runs. -B, so loading it writes no bytecode beside the file, whose bytes
-    # a certifying run names.
-    bootstrap = ("import importlib.util, sys\n"
-                 f"spec = importlib.util.spec_from_file_location('probe', {str(source)!r})\n"
-                 "probe = sys.modules['probe'] = importlib.util.module_from_spec(spec)\n"
-                 "spec.loader.exec_module(probe)\n"
-                 "raise SystemExit(probe.supervise("
-                 f"{[str(status_write), str(control_read), digest, '--', *argv]!r}))\n")
+    # The supervisor's interpreter reads the verifier file once and compares
+    # the sha256 of those bytes with the digest the run names, before any of
+    # them runs. It then compiles and runs those same bytes as the module, so
+    # nothing is imported from the file after the check: no check inside the
+    # module, which a changed copy could leave out or answer falsely, decides
+    # whether the suite starts, and no cached bytecode runs in place of the
+    # bytes. -B, so the interpreter writes no bytecode either.
+    bootstrap = (
+        "import hashlib, os, sys, types\n"
+        f"source, expected, status = {str(source)!r}, {digest!r}, {status_write}\n"
+        "with open(source, 'rb') as verifier:\n"
+        "    loaded = verifier.read()\n"
+        "digest = hashlib.sha256(loaded).hexdigest()\n"
+        "if digest != expected:\n"
+        "    os.write(status, ('unstarted the verifier it loaded, ' + source + ', has sha256 '\n"
+        "                      + digest + ', not the ' + expected + ' its run names\\n'\n"
+        "                      'done\\n').encode())\n"
+        "    raise SystemExit(125)\n"
+        "probe = sys.modules['probe'] = types.ModuleType('probe')\n"
+        "probe.__file__ = source\n"
+        "exec(compile(loaded, source, 'exec', dont_inherit=True), probe.__dict__)\n"
+        "raise SystemExit(probe.supervise("
+        f"{[str(status_write), str(control_read), '--', *argv]!r}))\n")
+    # The suite's output is decoded as UTF-8 with any other byte kept as
+    # \xNN, so a byte that is not UTF-8 neither stops the reading of its rows
+    # nor goes missing from the raw output a refused run keeps.
     try:
         supervisor = subprocess.Popen(
             [sys.executable, "-I", "-B", "-c", bootstrap],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            encoding="utf-8", errors="backslashreplace", env=env,
             start_new_session=True, pass_fds=(status_write, control_read))
     except BaseException:
         os.close(status_read)
@@ -815,11 +848,21 @@ def _supervised_run(argv, timeout, env, supervisor_source=None):
             refused.append(rest)
         elif kind == "unstarted":
             unstarted = rest
-    if not unstarted and not any(line.startswith("started ") for line in said):
+    started = any(line.startswith("started ") for line in said)
+    if not unstarted and not started:
         unstarted = (f"its supervisor exited {supervisor.returncode} before it started the "
-                     "suite, without saying why; its stderr is the run's")
+                     "suite, without saying why; its stderr is in the run's stderr")
     if unstarted:
         notes.append(f"probe: the supervisor did not start the suite: {unstarted}")
+    # A supervisor that ended after starting the suite, before saying how the
+    # suite's own process ended and before any bound, ended nothing under it.
+    supervisor_ended = ""
+    if started and returncode is None and not timed_out:
+        code = supervisor.returncode
+        supervisor_ended = (f"was ended by {signal_name(-code)}" if code is not None and code < 0
+                            else f"exited {code}")
+        notes.append(f"probe: the suite's supervisor {supervisor_ended} before saying how the "
+                     "suite ended, so processes under it may still run")
     notes += [f"probe: refused to signal {sentence}" for sentence in refused]
     if ended:
         notes.append(("probe: the suite reached its bound; ended it and the processes under "
@@ -837,7 +880,8 @@ def _supervised_run(argv, timeout, env, supervisor_source=None):
                     if returncode is not None and returncode >= 0 else ())
     return Run(tuple(argv), returncode, "".join(out), err, timeout, left_running,
                tuple((name, env.get(name)) for name in SUITE_DIRECTORIES),
-               unstarted=unstarted, environ=tuple(sorted(env.items())))
+               unstarted=unstarted, supervisor_ended=supervisor_ended,
+               environ=tuple(sorted(env.items())))
 
 
 def said_directories(environment):
@@ -872,6 +916,17 @@ SHOWN_VALUES = frozenset("""
 """.split())
 
 
+def said_removal(runs):
+    """The record line saying whether the directories made for runs were removed.
+
+    runs are (name, Run) pairs, each Run naming a directory that could not be
+    removed in its directory_left.
+    """
+    still_there = [run.directory_left for _name, run in runs if run.directory_left]
+    return [f"suite directories: all {len(runs)} removed after their suites" if not still_there
+            else "suite directories still there after their suites: " + ", ".join(still_there)]
+
+
 def said_environments(runs):
     """Record lines naming the whole environment each of runs was given.
 
@@ -880,7 +935,8 @@ def said_environments(runs):
     its name and alone otherwise, and every run's own three are named after
     it. Every other run's environment is compared here with the first's,
     every value included whether a record shows it or not, and each variable
-    that differs is named without its values.
+    that differs is named without its values; with one run, the record says
+    that nothing was compared.
     """
     first_name, first = runs[0]
     shared = {name: value for name, value in first.environ if name not in SUITE_DIRECTORIES}
@@ -903,9 +959,13 @@ def said_environments(runs):
                            if given.get(key) != shared.get(key))
             differing.append(f"{name} ({', '.join(names)})")
     compared = "every value compared, shown or not"
-    lines.append(f"suite environment: every other suite was given the {first_name}'s, {compared}"
-                 if not differing else f"suite environment differs from the {first_name}'s, "
-                 f"{compared}, for: " + "; ".join(differing))
+    if len(runs) == 1:
+        lines.append(f"suite environment: no other suite ran, so nothing was compared with the "
+                     f"{first_name}'s")
+    else:
+        lines.append(f"suite environment: every other suite was given the {first_name}'s, "
+                     f"{compared}" if not differing else f"suite environment differs from the "
+                     f"{first_name}'s, {compared}, for: " + "; ".join(differing))
     return lines
 
 
@@ -1055,12 +1115,16 @@ def signal_name(number):
 
 
 def unfinished(run):
-    """Why a run did not finish: it never started, ran out of time, or a signal ended it."""
+    """Why a run did not finish: it never started, its supervisor ended first, it ran out of
+    time, or a signal ended it."""
     if run.unstarted:
         return [f"never started: {run.unstarted}"]
+    if run.supervisor_ended:
+        return [f"its supervisor {run.supervisor_ended} before saying how the suite ended, and "
+                "no bound was reached"]
     if run.returncode is None:
-        return [f"did not finish within {run.timeout:g}s; its supervisor then ended it and the "
-                "processes under it one pidfd at a time, signalling no group"]
+        return [f"did not finish within {run.timeout:g}s; its supervisor was then asked to end "
+                "it and the processes under it one pidfd at a time, signalling no group"]
     if run.returncode < 0:
         return [f"was ended by {signal_name(-run.returncode)} (returncode {run.returncode})"]
     return []
@@ -1244,10 +1308,26 @@ def _copy_files(room, copied_tool, copied_comp):
             *sorted(item for item in (room / "test").rglob("*") if item.is_file())]
 
 
+def cut_short(run):
+    """What ended a run before its suite's own exit was seen, in a few words, or None.
+
+    A suite that never started, one whose supervisor ended while it ran and
+    one that reached its bound each say so with its reason; for a suite whose
+    exit was seen this is None and the exit status says the rest.
+    """
+    if run.unstarted:
+        return f"never started: {run.unstarted}"
+    if run.supervisor_ended:
+        return f"its supervisor {run.supervisor_ended} before the suite's end was seen"
+    if run.returncode is None:
+        return f"timed out after {run.timeout:g}s"
+    return None
+
+
 def raw_output(outcome):
     """The refused run as the reader needs it: command, status, both streams."""
     run = outcome.run
-    status = "timed out" if run.returncode is None else f"exit {run.returncode}"
+    status = cut_short(run) or f"exit {run.returncode}"
     lines = [f"--- {outcome.label}: {shlex.join(run.argv)} ({status})"]
     for name, text in (("stdout", run.stdout), ("stderr", run.stderr)):
         lines.append(f"{name}:" if text else f"{name}: (empty)")
@@ -1257,8 +1337,9 @@ def raw_output(outcome):
 
 def said(outcome):
     """One line for what a run came to."""
-    if outcome.run.returncode is None:
-        return f"timed out after {outcome.run.timeout:g}s"
+    short = cut_short(outcome.run)
+    if short:
+        return short
     if outcome.summary is not None:
         return f"{outcome.summary[0]}/{outcome.summary[1]} checks passed"
     return f"exit {outcome.run.returncode}, no summary"
@@ -1720,8 +1801,8 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
     Every suite a certifying run starts gets a TMPDIR, TMUX_TMPDIR and
     XDG_CACHE_HOME of its own, made for it under ``suite_parent``, /tmp unless
     the caller names another and removed once its supervisor is done; the
-    record names the clean run's and any that was still there after its
-    removal. A development run passes the caller's on and records them.
+    record names the clean run's and any that could not be removed. A
+    development run passes the caller's on and records them.
     Without it the run judges just as strictly and its result says it
     certified nothing.
 
@@ -1855,6 +1936,11 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
         population = expected if expected is not None else dict(listed.rows)
         lines.append(f"listing: {len(listed.rows)} check(s)")
         if listed.reasons:
+            # Refused here, the record still says what became of the
+            # listing's directories and what environment it was given.
+            if certify:
+                lines.extend(said_removal([("listing", listed.run)]))
+                lines.extend(said_environments([("listing", listed.run)]))
             raise _refusal([listed], lines, stream)
 
         failures = []
@@ -1901,10 +1987,7 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
         (name, run) for label, (full, filtered) in zip(labels, runs)
         for name, run in ((label, full), (f"{label} --failed", filtered)) if run is not None]
     if certify:
-        still_there = [run.directory_left for _name, run in every_run if run.directory_left]
-        lines.append(f"suite directories: all {len(every_run)} removed after their suites"
-                     if not still_there else "suite directories still there after their "
-                     "suites: " + ", ".join(still_there))
+        lines.extend(said_removal(every_run))
         lines.extend(said_environments(every_run))
 
     # The report names the bytes it judged. A file that changed while the
@@ -2000,13 +2083,13 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
 # literals in SYNTHETIC_RUNNER, in file order; a test mutation rewrites the
 # whole block, so any combination of knobs is one contiguous replacement.
 KNOBS = ("FAILING", "SUMMARY", "EXIT", "DROP", "EXTRA", "DUPLICATE", "DESCRIBE",
-         "SLEEP", "SIGNAL", "FILTER_LIES", "WRITE_BESIDE", "OWNED_DRIVER", "STUBBORN",
-         "NAMED_SYSTEMD", "LISTING_LEAVES", "LOCKED_TMPDIR")
+         "SLEEP", "SIGNAL", "FILTER_LIES", "WRITE_BESIDE", "BYTES_NOT_UTF8", "OWNED_DRIVER",
+         "STUBBORN", "NAMED_SYSTEMD", "NAME_NOT_UTF8", "LISTING_LEAVES", "LOCKED_TMPDIR")
 KNOB_DEFAULTS = {"FAILING": [], "SUMMARY": "exact", "EXIT": None, "DROP": [], "EXTRA": [],
                  "DUPLICATE": [], "DESCRIBE": {}, "SLEEP": 0, "SIGNAL": None,
-                 "FILTER_LIES": False, "WRITE_BESIDE": None, "OWNED_DRIVER": None,
-                 "STUBBORN": False, "NAMED_SYSTEMD": False, "LISTING_LEAVES": False,
-                 "LOCKED_TMPDIR": None}
+                 "FILTER_LIES": False, "WRITE_BESIDE": None, "BYTES_NOT_UTF8": False,
+                 "OWNED_DRIVER": None, "STUBBORN": False, "NAMED_SYSTEMD": False,
+                 "NAME_NOT_UTF8": False, "LISTING_LEAVES": False, "LOCKED_TMPDIR": None}
 SYNTHETIC_EXPECTED = {
     "target-check": "the check a case names",
     "other-check": "a check a case may justify as a co-failure",
@@ -2046,6 +2129,15 @@ def _selftest_checks(verifier):
 
     def check(name, ok, detail=""):
         checks.append((name, bool(ok), detail))
+
+    def without_environment_lines(record):
+        """A record's text without its lines on the suites' directories and environment.
+
+        A failure detail that quotes a certifying record quotes it so, since
+        a mutant's record can hold any value of the environment it was given.
+        """
+        return "\n".join(line for line in record.split("\n") if not line.startswith(
+            ("suite environment", "suite directories of the ")))
 
     def refused(name, call, phrase):
         """call must raise a ProbeFailure carrying phrase; anything else fails name."""
@@ -2224,22 +2316,55 @@ def _selftest_checks(verifier):
     # A run that did not finish is judged for that alone.
     partial = Run(("python3", "agent-resume", "--selftest", "--jobs", "1"), None,
                   table(passing[:1], summary=False), "", 1.0)
-    outcome = judge_report(partial, expected, "case 1", "beta")
+    outcome = partial_outcome = judge_report(partial, expected, "case 1", "beta")
     check("timeout-refused-alone",
-          only(outcome.reasons, "did not finish within 1s; its supervisor then ended it and "
-               "the processes under it one pidfd at a time, signalling no group",
+          only(outcome.reasons, "did not finish within 1s; its supervisor was then asked to end "
+               "it and the processes under it one pidfd at a time, signalling no group",
                "missing expected check(s): beta, every-unit-reported"),
           repr(outcome.reasons))
     # A run whose supervisor started nothing is judged for that, and is not
     # read as one that reached its bound.
     never = Run(("python3", "agent-resume", "--selftest", "--jobs", "1"), None, "", "", 1.0,
                 unstarted="its command could not be started: no such file")
-    outcome = judge_report(never, expected, "case 1", "beta")
+    outcome = never_outcome = judge_report(never, expected, "case 1", "beta")
     check("never-started-refused-alone",
           only(outcome.reasons, "never started: its command could not be started: no such file",
                "missing expected check(s): ")
           and not any("did not finish" in reason for reason in outcome.reasons),
           repr(outcome.reasons))
+    # A run whose supervisor ended after starting it, before saying how it
+    # ended, is judged for that alone: no bound was reached.
+    lost = Run(("python3", "agent-resume", "--selftest", "--jobs", "1"), None, "", "", 1.0,
+               supervisor_ended="was ended by SIGKILL")
+    lost_outcome = judge_report(lost, expected, "case 1", "beta")
+    check("supervisor-ended-first-refused-alone",
+          only(lost_outcome.reasons, "its supervisor was ended by SIGKILL before saying how the "
+               "suite ended, and no bound was reached", "missing expected check(s): ")
+          and not any("did not finish" in reason for reason in lost_outcome.reasons),
+          repr(lost_outcome.reasons))
+    # A record and a refused run's output say what cut a run short: it never
+    # started, its supervisor ended first, or it reached its bound. said is
+    # named through the module: inside this function it is also a local.
+    said_function = globals()["said"]
+    cut = {
+        "a run that never started is said with its reason":
+            said_function(never_outcome)
+            == "never started: its command could not be started: no such file",
+        "and its raw output's status line says the same":
+            raw_output(never_outcome)[0].endswith(
+                "(never started: its command could not be started: no such file)"),
+        "a run whose supervisor ended first is said so":
+            said_function(lost_outcome)
+            == "its supervisor was ended by SIGKILL before the suite's end was seen",
+        "and so does its raw output's status line":
+            raw_output(lost_outcome)[0].endswith(
+                "(its supervisor was ended by SIGKILL before the suite's end was seen)"),
+        "a run that reached its bound is said to have timed out":
+            said_function(partial_outcome) == "timed out after 1s"
+            and raw_output(partial_outcome)[0].endswith("(timed out after 1s)"),
+    }
+    wrong = sorted(claim for claim, ok in cut.items() if not ok)
+    check("runs-cut-short-are-said-for-what-cut-them-short", not wrong, ", ".join(wrong))
     outcome = judge_report(record(table(passing), returncode=-15), expected, "case 1", "beta")
     check("signal-refused-alone",
           only(outcome.reasons, "was ended by SIGTERM (returncode -15)"),
@@ -2337,8 +2462,8 @@ def _selftest_checks(verifier):
                   "beta  the second check  (scripted)\n", "", 1.0)
     outcome = judge_filtering(full, stopped, expected)
     check("failed-only-timeout-judged-alone",
-          only(outcome.reasons, "did not finish within 1s; its supervisor then ended it and "
-               "the processes under it one pidfd at a time, signalling no group"),
+          only(outcome.reasons, "did not finish within 1s; its supervisor was then asked to end "
+               "it and the processes under it one pidfd at a time, signalling no group"),
           repr(outcome.reasons))
     outcome = judge_filtering(full, record(filtered, returncode=-9), expected)
     check("failed-only-signal-judged-alone",
@@ -2616,6 +2741,10 @@ def _selftest_checks(verifier):
         (room / "test").mkdir()
         log = room / "argv.log"
         os.environ["PROBE_SYNTHETIC_LOG"] = str(log)
+        # Every certifying run here makes its suites' directories in the room,
+        # so one this test runs under a broken rule leaves nothing in /tmp.
+        suites = room / "certified-suites"
+        suites.mkdir()
 
         def probe(cases, **options):
             options.setdefault("expected", SYNTHETIC_EXPECTED)
@@ -2683,8 +2812,8 @@ def _selftest_checks(verifier):
                     (1, "synthetic-declaration-and-check-removed-together",
                      ("missing expected check(s): third-check",)),
                     (2, "synthetic-timeout-refused",
-                     ("did not finish within 1.5s; its supervisor then ended it and the "
-                      "processes under it one pidfd at a time, signalling no group",
+                     ("did not finish within 1.5s; its supervisor was then asked to end it and "
+                      "the processes under it one pidfd at a time, signalling no group",
                       "missing expected check(s): every-unit-reported, other-check, "
                       "target-check, third-check")),
                     (3, "synthetic-signal-refused", ("was ended by SIGTERM (returncode -15)",)),
@@ -2946,7 +3075,7 @@ def _selftest_checks(verifier):
                 try:
                     expect([("target-check", knobs(), bite)], live=True, jobs=3, tool=tool,
                            expected=given, timeout=20.0, certify=True, stream=io.StringIO(),
-                           verifier=verifier)
+                           verifier=verifier, suite_parent=suites)
                 except ProbeFailure as exc:
                     check(name, exc.failures == tuple(wanted + gap for gap in gaps)
                           and log.read_text() == commands_before, repr(exc.failures))
@@ -3013,7 +3142,7 @@ def _selftest_checks(verifier):
             refused("certify-without-a-timeout-refused",
                     lambda: expect([("target-check", knobs(), bite)], live=True, jobs=3, tool=tool,
                                    expected=certifying, certify=True, stream=io.StringIO(),
-                                   verifier=verifier),
+                                   verifier=verifier, suite_parent=suites),
                     "a certifying run names its timeout")
             check("certify-without-a-timeout-runs-nothing", log.read_text() == commands_before,
                   log.read_text()[len(commands_before):])
@@ -3025,7 +3154,8 @@ def _selftest_checks(verifier):
                 refused("certify-refused-when-the-verifier-changed-on-disk",
                         lambda: expect([("target-check", knobs(), bite)], live=True, jobs=3,
                                        tool=tool, expected=certifying, timeout=20.0,
-                                       certify=True, stream=io.StringIO(), verifier=verifier),
+                                       certify=True, stream=io.StringIO(), verifier=verifier,
+                                       suite_parent=suites),
                         f"the verifier {VERIFIER} on disk has sha256 {loaded}, not the "
                         f"{'0' * 64} this process loaded")
             finally:
@@ -3055,7 +3185,8 @@ def _selftest_checks(verifier):
                 refused("certify-refused-when-the-code-was-not-compiled-from-the-verifier",
                         lambda: expect([("target-check", knobs(), bite)], live=True, jobs=3,
                                        tool=tool, expected=certifying, timeout=20.0,
-                                       certify=True, stream=io.StringIO(), verifier=verifier),
+                                       certify=True, stream=io.StringIO(), verifier=verifier,
+                                       suite_parent=suites),
                         f"the code this process runs is not what {VERIFIER} compiles to")
             finally:
                 globals()["VERIFIER_FROM_SOURCE"] = from_source
@@ -3147,7 +3278,7 @@ def _selftest_checks(verifier):
                     "try:\n"
                     "    results = probe.expect([tuple(given['case'])], live=True, "
                     "jobs=3, tool=probe.Path(given['tool']), expected=expected, timeout=20.0, "
-                    "certify=True, stream=stream)\n"
+                    "certify=True, stream=stream, suite_parent=given['suites'])\n"
                     "    said = {'certified': results.certified, 'first': results[0]['certified'],"
                     " 'printed': stream.getvalue() or results.report}\n"
                     "except probe.ProbeFailure as exc:\n"
@@ -3155,7 +3286,8 @@ def _selftest_checks(verifier):
                     "'printed': stream.getvalue() or exc.report}\n"
                     "print(json.dumps(said))\n")
                 call = {"copy": str(here), "case": list(case), "tool": str(tool),
-                        "mapping": str(source_path), "adjudications": str(approved)}
+                        "mapping": str(source_path), "adjudications": str(approved),
+                        "suites": str(suites)}
                 done = subprocess.run(
                     [sys.executable, "-B", "-c", script], capture_output=True, text=True,
                     timeout=180, env={**os.environ, **(extra_env or {}),
@@ -3182,7 +3314,8 @@ def _selftest_checks(verifier):
                 ("target-check", knobs(), bite))
             check("certify-refused-when-the-private-copy-differs",
                   any("is not the tool, companion and test tree it was copied from" in failure
-                      for failure in differing.get("failures", ())), repr(differing)[:1500])
+                      for failure in differing.get("failures", ())),
+                  repr({key: value for key, value in differing.items() if key != "printed"})[:1500])
             check("certify-refused-for-a-differing-copy-runs-nothing",
                   log.read_text() == commands_before, log.read_text()[len(commands_before):])
 
@@ -3191,7 +3324,7 @@ def _selftest_checks(verifier):
             try:
                 expect([("target-check", knobs(), bite)], live=True, jobs=3, tool=tool,
                        expected=certifying, timeout=20.0, certify=True, stream=io.StringIO(),
-                       verifier=failing_stand_in)
+                       verifier=failing_stand_in, suite_parent=suites)
             except ProbeFailure as exc:
                 check("certify-refused-when-the-verifier-selftest-fails",
                       exc.failures == ("the verifier's own selftest failed: a stand-in check",)
@@ -3203,7 +3336,7 @@ def _selftest_checks(verifier):
             stream = io.StringIO()
             standing_in = expect([("target-check", knobs(), bite)], live=True, jobs=3, tool=tool,
                                  expected=certifying, timeout=20.0, certify=True, stream=stream,
-                                 verifier=verifier)
+                                 verifier=verifier, suite_parent=suites)
             check("certify-with-a-stand-in-certifies-nothing",
                   standing_in.certified is False and standing_in[0]["certified"] is False
                   and stream.getvalue().startswith(
@@ -3211,7 +3344,7 @@ def _selftest_checks(verifier):
                       "supplied, so this run certifies nothing\n")
                   and ("verifier selftest: a stand-in the caller supplied said: running; this "
                        "certifying run is one of its own checks\n") in stream.getvalue(),
-                  stream.getvalue()[:600])
+                  without_environment_lines(stream.getvalue())[:600])
 
             # The certifying path itself, on a copy whose selftest says one fixed
             # line: every run of it, the listing too, uses the private copy, and
@@ -3235,22 +3368,36 @@ def _selftest_checks(verifier):
                   and copy_room and Path(copy_room) != room
                   and ran_from[str(Path(copy_room) / tool.name)] == 3
                   and ran_from[str(tool)] == 0, repr((copy_line, ran_from)))
-            check("certifying-run-records-its-provenance",
-                  said.get("certified") is True and said.get("first") is True
-                  and printed.startswith("certifying: yes\n")
-                  and f"expectation: {source_path} sha256 {certifying.sha256}" in printed
-                  and (f"expectation frozen for source sha256 {tool_digest} (commit c0ffee, "
-                       "path_in_repo team-necromancy/agent-resume): the tool is that source")
-                  in printed
-                  and f"adjudications: {approved} sha256 {certifying.adjudications_sha256}"
-                  in printed
-                  and "verifier selftest: probe checks: 9 ok, 0 failed\n" in printed
-                  and f"interpreter: {sys.executable} (Python {platform.python_version()})"
-                  in printed
-                  and "timeout: 20s for each run" in printed
-                  and "--failed checked for: clean\n" in printed
-                  and "co-failure other-check: the scripted failure names both" in printed,
-                  printed)
+            # A claim that fails is named, and the record is not printed: it
+            # holds environment lines, which a mutant may have written whole.
+            provenance = {
+                "the run and its case certified":
+                    said.get("certified") is True and said.get("first") is True,
+                "the record begins by saying it certifies":
+                    printed.startswith("certifying: yes\n"),
+                "it names the expectation and its digest":
+                    f"expectation: {source_path} sha256 {certifying.sha256}" in printed,
+                "and the source the expectation was frozen for":
+                    (f"expectation frozen for source sha256 {tool_digest} (commit c0ffee, "
+                     "path_in_repo team-necromancy/agent-resume): the tool is that source")
+                    in printed,
+                "and the adjudications and their digest":
+                    f"adjudications: {approved} sha256 {certifying.adjudications_sha256}"
+                    in printed,
+                "and what the verifier's own selftest said":
+                    "verifier selftest: probe checks: 9 ok, 0 failed\n" in printed,
+                "and the interpreter":
+                    f"interpreter: {sys.executable} (Python {platform.python_version()})"
+                    in printed,
+                "and the timeout": "timeout: 20s for each run" in printed,
+                "and the runs whose --failed report was checked":
+                    "--failed checked for: clean\n" in printed,
+                "and each co-failure's reason":
+                    "co-failure other-check: the scripted failure names both" in printed,
+            }
+            wrong = sorted(claim for claim, ok in provenance.items() if not ok)
+            check("certifying-run-records-its-provenance", not wrong,
+                  ", ".join(wrong) + (f"; {said['error'][:300]}" if said.get("error") else ""))
 
             # X4: a function replaced after the import is named, and certification refused.
             real_listing = globals()["judge_listing"]
@@ -3400,7 +3547,7 @@ def _selftest_checks(verifier):
                                          leaving_path, live=True, jobs=3,
                                          adjudications=leaving_approved),
                                      timeout=20.0, certify=True, stream=io.StringIO(),
-                                     verifier=verifier)
+                                     verifier=verifier, suite_parent=suites)
                 except ProbeFailure as exc:
                     failures = exc.failures
                 finally:
@@ -3461,6 +3608,9 @@ def _selftest_checks(verifier):
             # values a record writes down: ZDOTDIR is on SHOWN_VALUES, and
             # LC_PROBE_SELFTEST is not, though it begins with LC_ as thirteen
             # listed names do, so a rule on names that let it through fails here.
+            # The unlisted name may stand only in the line that names such
+            # variables, so a length or another digest written beside it on a
+            # line of its own fails here too.
             environ_log = room / "environ-log"
             owned_parent = room / "suites"
             owned_parent.mkdir()
@@ -3569,9 +3719,12 @@ def _selftest_checks(verifier):
                     f"PATH={os.environ.get('PATH', '')!r}" in shown_items,
                 "and names an unlisted one with nothing after the name":
                     "LC_PROBE_SELFTEST" in unshown_items,
-                "and writes down neither its value nor a digest of it":
+                "and writes down neither its value, its length nor a digest of it":
                     unlisted not in printed and "LC_PROBE_SELFTEST=" not in printed
-                    and hashlib.sha256(unlisted.encode()).hexdigest()[:16] not in printed,
+                    and hashlib.sha256(unlisted.encode()).hexdigest()[:16] not in printed
+                    and [line for line in lines if "LC_PROBE_SELFTEST" in line]
+                    == [line for line in lines if line.startswith(
+                        "suite environment of the listing, variables ")],
                 "and names every variable the suites were given":
                     {item.split("=", 1)[0] for item in shown_items} | set(unshown_items)
                     == given_names,
@@ -3587,6 +3740,52 @@ def _selftest_checks(verifier):
             }
             wrong = sorted(claim for claim, ok in environment.items() if not ok)
             check("certify-record-names-the-whole-suite-environment", not wrong, ", ".join(wrong))
+            # A certifying run refused at its listing still names what became of
+            # the listing's directories and the environment it was given, and
+            # says that no other suite ran to compare it with. This tool's
+            # listing describes other-check otherwise than the expectation.
+            renamed = knobs(DESCRIBE={"other-check": "renamed"})
+            refused_room = room / "listing-refused"
+            (refused_room / "test").mkdir(parents=True)
+            refused_tool = refused_room / "agent-resume"
+            refused_tool.write_text(runner_text.replace(knobs(), renamed))
+            refused_tool.chmod(0o755)
+            (refused_room / "_agent-resume").write_text("")
+            refused_path, refused_approved = frozen_beside(
+                "expected-mapping-listing-refused",
+                source={**source, "sha256": hashlib.sha256(refused_tool.read_bytes()).hexdigest()})
+            refused_record = io.StringIO()
+            try:
+                expect([("target-check", renamed,
+                         knobs(DESCRIBE={"other-check": "renamed"}, FAILING=["target-check"]))],
+                       live=True, jobs=3, tool=refused_tool,
+                       expected=retained_expectation(refused_path, live=True, jobs=3,
+                                                     adjudications=refused_approved),
+                       timeout=20.0, certify=True, stream=refused_record, verifier=verifier,
+                       suite_parent=suites)
+                refusal = ()
+            except ProbeFailure as exc:
+                refusal = exc.failures
+            refused_lines = refused_record.getvalue().splitlines()
+            at_listing = {
+                "the run is refused at its listing":
+                    bool(refusal) and all(failure.startswith("listing: ") for failure in refusal),
+                "its record says the listing's directories were removed":
+                    "suite directories: all 1 removed after their suites" in refused_lines,
+                "and names the listing's environment":
+                    any(line.startswith("suite environment of the listing, apart ")
+                        for line in refused_lines)
+                    and any(line.startswith("suite environment of the listing, variables ")
+                            for line in refused_lines)
+                    and any(line.startswith("suite directories of the listing: ")
+                            for line in refused_lines),
+                "and says that nothing was compared with it":
+                    "suite environment: no other suite ran, so nothing was compared with the "
+                    "listing's" in refused_lines,
+            }
+            wrong = sorted(claim for claim, ok in at_listing.items() if not ok)
+            check("certify-refused-at-its-listing-names-its-directories-and-environment",
+                  not wrong, ", ".join(wrong))
             # A suite directory that cannot be removed is named in the record:
             # here every clean run's TMPDIR holds a directory without write
             # permission, so each of their directories stays, and the test
@@ -3652,7 +3851,7 @@ def _selftest_checks(verifier):
                        live=True, jobs=3, tool=tool, timeout=20.0, certify=True,
                        expected=retained_expectation(leak_path, live=True, jobs=3,
                                                      adjudications=leak_approved),
-                       stream=io.StringIO(), verifier=verifier)
+                       stream=io.StringIO(), verifier=verifier, suite_parent=suites)
                 wrote = "expect returned"
             except ProbeFailure as exc:
                 wrote = exc.failures
@@ -3708,6 +3907,20 @@ def _selftest_checks(verifier):
     was_started = os.environ.pop("PROBE_SYNTHETIC_STARTED", None)
     with tempfile.TemporaryDirectory() as td:
 
+        def start_time(pid):
+            """pid's start time as this test reads it, apart from _proc_identity, or None.
+
+            A mutation of the module's reader then cannot hide from the test
+            what the supervisor missed, nor keep it from being ended here.
+            """
+            try:
+                with open(f"/proc/{pid}/stat", "rb") as stat_file:
+                    stat = stat_file.read()
+            except OSError:
+                return None
+            fields = stat[stat.rindex(b")") + 2:].split()
+            return None if fields[0] in (b"Z", b"X") else fields[19].decode()
+
         def supervised_run(label, timeout, **values):
             """Run the stand-in through run_suite; returns the run, the processes it
             started and the ones still running, which are then ended here so a
@@ -3727,7 +3940,7 @@ def _selftest_checks(verifier):
             # sleeper it starts as it is asked to stop.
             named = ([tuple(line.split()) for line in witness.read_text().splitlines()]
                      if witness.exists() else [])
-            alive = [int(pid) for pid, started in named if _started(int(pid)) == started]
+            alive = [int(pid) for pid, started in named if start_time(int(pid)) == started]
             for pid in alive:
                 with contextlib.suppress(OSError):
                     os.kill(pid, signal.SIGKILL)
@@ -3755,10 +3968,11 @@ def _selftest_checks(verifier):
               run.returncode is None and len(named) == 2 and not alive,
               f"returncode {run.returncode}, named {named}, still running {alive}")
 
-        # A supervisor starts nothing unless the bytes it loaded have the digest
+        # A supervisor starts nothing unless the bytes it read have the digest
         # its run names. The copy here differs from this file by one comment
-        # line: named with this file's digest it starts nothing, which the
-        # stand-in's own log shows, and named with its own it runs the suite.
+        # line, and its module checks no digest of its own: named with this
+        # file's digest it starts nothing, which the stand-in's own log shows,
+        # and named with its own it runs the suite.
         other = Path(td) / "other" / VERIFIER.name
         other.parent.mkdir()
         other.write_bytes(VERIFIER.read_bytes() + b"# one more line\n")
@@ -3791,17 +4005,47 @@ def _selftest_checks(verifier):
               and started_run.returncode == 0 and not started_run.unstarted,
               f"refused {refused_run.unstarted!r}, ran before {ran_before!r}, started "
               f"{started_run.returncode} {started_run.unstarted!r}")
-        # A supervisor whose code came from a cached .pyc rather than from the
-        # bytes it read starts nothing, though those bytes have the digest its
-        # run names. The .pyc is compiled from the file with one constant
-        # changed and carries the file's size and modification time, which is
-        # all the import compares, so the import runs it.
+        # The check is made on the bytes that then run, so a copy whose module
+        # vouches for itself, here by naming the run's digest as its own,
+        # starts nothing either.
+        original = VERIFIER.read_bytes()
+        vouching = Path(td) / "vouching" / VERIFIER.name
+        vouching.parent.mkdir()
+        vouching.write_bytes(original.replace(
+            b"VERIFIER_LOADED = hashlib.sha256(_VERIFIER_BYTES).hexdigest()\n",
+            f"VERIFIER_LOADED = {VERIFIER_LOADED!r}\n".encode(), 1))
+        vouching_digest = hashlib.sha256(vouching.read_bytes()).hexdigest()
+        log.unlink(missing_ok=True)
+        os.environ["PROBE_SYNTHETIC_LOG"] = str(log)
+        try:
+            vouching_run = run_suite(suite_argv(copy, live=True), timeout=20.0,
+                                     supervisor_source=(vouching, VERIFIER_LOADED))
+        finally:
+            if was_log is None:
+                os.environ.pop("PROBE_SYNTHETIC_LOG", None)
+            else:
+                os.environ["PROBE_SYNTHETIC_LOG"] = was_log
+        vouched = (f"the verifier it loaded, {vouching}, has sha256 {vouching_digest}, not the "
+                   f"{VERIFIER_LOADED} its run names")
+        check("supervisor-starts-nothing-from-a-copy-that-vouches-for-itself",
+              vouching_digest != VERIFIER_LOADED and vouching_run.unstarted == vouched
+              and vouching_run.returncode is None and not log.exists(),
+              f"{vouching_run.unstarted!r}, ran {log.read_text() if log.exists() else ''!r}")
+        # A supervisor runs the bytes it read, compiled as it read them, and no
+        # cached bytecode. Beside the copy here sits a .pyc compiled from a
+        # variant of the same size whose supervise starts nothing, carrying
+        # the copy's size and modification time, which is all an import of the
+        # file would compare. It is written by its own name with a timestamp,
+        # so neither SOURCE_DATE_EPOCH nor PYTHONPYCACHEPREFIX changes it.
         stale = Path(td) / "stale" / VERIFIER.name
         stale.parent.mkdir()
-        original = VERIFIER.read_bytes()
-        stale.write_bytes(original.replace(b"CLEANUP_ROUNDS = 20\n", b"CLEANUP_ROUNDS = 21\n", 1))
-        py_compile.compile(str(stale), cfile=importlib.util.cache_from_source(str(stale)),
-                           doraise=True)
+        statement = b"    libc = ctypes.CDLL(None, use_errno=True)\n"
+        early = b'    return unstarted("cached bytecode ran")'
+        variant = original.replace(statement, early.ljust(len(statement) - 1) + b"\n", 1)
+        stale.write_bytes(variant)
+        cached = stale.parent / "__pycache__" / f"{stale.stem}.{sys.implementation.cache_tag}.pyc"
+        py_compile.compile(str(stale), cfile=str(cached), doraise=True,
+                           invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
         compiled_at = stale.stat().st_mtime_ns
         stale.write_bytes(original)
         os.utime(stale, ns=(compiled_at, compiled_at))
@@ -3815,11 +4059,11 @@ def _selftest_checks(verifier):
                 os.environ.pop("PROBE_SYNTHETIC_LOG", None)
             else:
                 os.environ["PROBE_SYNTHETIC_LOG"] = was_log
-        not_compiled = f"the code it runs was not compiled from the verifier it loaded, {stale}"
-        check("supervisor-starts-nothing-from-stale-bytecode",
-              stale_run.unstarted == not_compiled and not log.exists()
-              and unfinished(stale_run) == [f"never started: {not_compiled}"],
-              f"{stale_run.unstarted!r}, ran {log.read_text() if log.exists() else ''!r}")
+        check("supervisor-runs-the-bytes-it-read-not-cached-bytecode",
+              len(variant) == len(original) and variant != original and cached.exists()
+              and stale_run.returncode == 0 and not stale_run.unstarted and log.exists(),
+              f"returncode {stale_run.returncode}, {stale_run.unstarted!r}, ran "
+              f"{log.read_text() if log.exists() else ''!r}")
         # A command that cannot be started is a suite that never started, not
         # one that reached its bound.
         missing = Path(td) / "no-such-tool"
@@ -3832,6 +4076,79 @@ def _selftest_checks(verifier):
               and "probe: the supervisor did not start the suite: its command could not be "
                   "started: " in unstartable.stderr,
               f"{unstartable.unstarted!r}, {unfinished(unstartable)}")
+        # A supervisor that exits before saying anything leaves a suite that
+        # never started, with the exit status as the only reason there is.
+        # This copy exits 7 as it is loaded.
+        silent = Path(td) / "silent" / VERIFIER.name
+        silent.parent.mkdir()
+        silent.write_bytes(b"raise SystemExit(7)\n" + original)
+        log.unlink(missing_ok=True)
+        os.environ["PROBE_SYNTHETIC_LOG"] = str(log)
+        try:
+            silent_run = run_suite(suite_argv(copy, live=True), timeout=20.0, supervisor_source=(
+                silent, hashlib.sha256(silent.read_bytes()).hexdigest()))
+        finally:
+            if was_log is None:
+                os.environ.pop("PROBE_SYNTHETIC_LOG", None)
+            else:
+                os.environ["PROBE_SYNTHETIC_LOG"] = was_log
+        unsaid = ("its supervisor exited 7 before it started the suite, without saying why; "
+                  "its stderr is in the run's stderr")
+        check("supervisor-that-exits-without-a-word-is-named",
+              silent_run.unstarted == unsaid and silent_run.returncode is None
+              and not silent_run.supervisor_ended and not log.exists()
+              and unfinished(silent_run) == [f"never started: {unsaid}"]
+              and f"probe: the supervisor did not start the suite: {unsaid}" in silent_run.stderr,
+              f"{silent_run.unstarted!r}, {silent_run.supervisor_ended!r}, ran "
+              f"{log.read_text() if log.exists() else ''!r}")
+        # A supervisor that ends after starting its suite, before saying how
+        # the suite ended, leaves a run of its own kind, not one that reached
+        # its bound, since none was reached. This copy ends its supervisor as
+        # soon as it has said the suite started; the stand-in exits by itself.
+        abrupt = Path(td) / "abrupt" / VERIFIER.name
+        abrupt.parent.mkdir()
+        said_started = b'    tell(f"started {suite}")\n'
+        abrupt.write_bytes(original.replace(said_started, said_started + b"    os._exit(9)\n", 1))
+        abrupt_run = run_suite(suite_argv(copy, live=True), timeout=20.0, supervisor_source=(
+            abrupt, hashlib.sha256(abrupt.read_bytes()).hexdigest()))
+        check("supervisor-that-ends-before-its-suite-is-named",
+              abrupt_run.supervisor_ended == "exited 9" and abrupt_run.returncode is None
+              and not abrupt_run.unstarted
+              and unfinished(abrupt_run) == ["its supervisor exited 9 before saying how the suite "
+                                             "ended, and no bound was reached"]
+              and "probe: the suite's supervisor exited 9 before saying how the suite ended, so "
+                  "processes under it may still run" in abrupt_run.stderr,
+              f"{abrupt_run.supervisor_ended!r}, returncode {abrupt_run.returncode}, "
+              f"{unfinished(abrupt_run)}, stderr {abrupt_run.stderr[-300:]!r}")
+        # A suite's output is read whatever bytes it holds. This stand-in puts a
+        # byte that is not UTF-8 in its failing row's detail and on stderr:
+        # every row and the summary after them are still read, and the raw
+        # output a refused run would keep holds the byte, written as \xff.
+        undecodable = Path(td) / "undecodable"
+        undecodable.mkdir()
+        raw_copy = undecodable / "agent-resume"
+        raw_copy.write_text(runner_text.replace(
+            knobs(), knobs(BYTES_NOT_UTF8=True, FAILING=["target-check"])))
+        raw_copy.chmod(0o755)
+        raw_run = run_suite(suite_argv(raw_copy, live=True), timeout=20.0)
+        raw_outcome = judge_report(raw_run, SYNTHETIC_EXPECTED, "case 1", "target-check")
+        raw_dump = "\n".join(raw_output(raw_outcome))
+        kept = {
+            "every row is read, in order":
+                [row[0] for row in raw_outcome.rows] == list(SYNTHETIC_EXPECTED),
+            "and the summary after them": raw_outcome.summary == (3, 4),
+            "and the run is judged on them, with nothing refused": not raw_outcome.reasons,
+            "the failing row's detail holds the byte, written as \\xff":
+                ("target-check", SYNTHETIC_EXPECTED["target-check"], False,
+                 "scripted failure \\xff") in raw_outcome.rows,
+            "and the raw output holds it from stdout and from stderr":
+                "(scripted failure \\xff)" in raw_dump
+                and "a byte that is not UTF-8: \\xff" in raw_dump,
+        }
+        wrong = sorted(claim for claim, ok in kept.items() if not ok)
+        check("output-that-is-not-utf8-is-read-and-kept", not wrong,
+              ", ".join(wrong) + f"; returncode {raw_run.returncode}, rows "
+              f"{[row[0] for row in raw_outcome.rows]}, reasons {raw_outcome.reasons}")
         # A suite directory that cannot be removed is named, in the run's
         # stderr and its Run, and is then removed here.
         locked_parent = Path(td) / "locked-suites"
@@ -3851,7 +4168,7 @@ def _selftest_checks(verifier):
         check("suite-directory-left-behind-is-named",
               locked_run.returncode == 0 and len(kept) == 1
               and locked_run.directory_left == str(kept[0])
-              and f"probe: the suite's directory {kept[0]} is still there after its removal"
+              and f"probe: the suite's directory {kept[0]} could not be removed"
                   in locked_run.stderr and not any(locked_parent.iterdir()),
               f"returncode {locked_run.returncode}, kept {kept}, named "
               f"{locked_run.directory_left!r}")
@@ -3906,6 +4223,18 @@ def _selftest_checks(verifier):
               and f"still running after the suite and everything under it were ended: {pid} "
                   "(systemd)" in run.stderr
               and run.left_running == (int(pid),),
+              f"returncode {run.returncode}, named {named}, alive {alive}, left_running "
+              f"{run.left_running}, stderr {run.stderr[-400:]!r}")
+        # A process may name itself in bytes that are not UTF-8. The suite
+        # leaves one, with a sleeping child of its own, and exits: the
+        # supervisor sees both, ends both and names the first with its bytes
+        # written out, and the run carries both as left, as X2 counts them.
+        run, named, alive = supervised_run("name-not-utf8", 20.0, NAME_NOT_UTF8=True)
+        pid = named[0][0] if named else "?"
+        check("process-whose-name-is-not-utf8-is-ended",
+              run.returncode == 0 and len(named) == 2 and not alive
+              and sorted(run.left_running) == sorted(int(left) for left, _born in named)
+              and f"{pid} (\\xffleft\\xfe)" in run.stderr,
               f"returncode {run.returncode}, named {named}, alive {alive}, left_running "
               f"{run.left_running}, stderr {run.stderr[-400:]!r}")
 

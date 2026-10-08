@@ -18,8 +18,10 @@ seconds before answering. SIGNAL ends the process with that signal once the
 report is printed. FILTER_LIES makes the failed-only report name a check that
 passed. WRITE_BESIDE names a path under this file's directory that every
 invocation writes to, as a unit leaking into the corpus beside the tool would.
+BYTES_NOT_UTF8 puts a byte that is not UTF-8, 0xff, in each failing row's
+detail and on stderr, as a tool that prints a path in any bytes would.
 
-The next four start processes that outlive their part of the run, as the
+The next five start processes that outlive their part of the run, as the
 real suite's fixtures can. OWNED_DRIVER starts a driver in a session of its
 own whose terminal child ignores the hangup its pty sends, as the real suite's
 completion drive does; with "stays" the driver keeps running, and with "exits"
@@ -27,8 +29,10 @@ it ends at once, so its terminal child is handed to whichever process adopts
 orphans. STUBBORN starts a process that ignores SIGTERM and answers it by
 starting another process, so a cleanup that read the process table once and
 never again misses the newer one. NAMED_SYSTEMD starts a process that calls
-itself systemd, which no cleanup may signal. LISTING_LEAVES makes a --list run
-start a driver that stays, as OWNED_DRIVER="stays" does for a report.
+itself systemd, which no cleanup may signal. NAME_NOT_UTF8 starts a process
+whose command name is bytes that are not UTF-8, with a sleeping child, so a
+cleanup that decodes names loses both. LISTING_LEAVES makes a --list run start
+a driver that stays, as OWNED_DRIVER="stays" does for a report.
 LOCKED_TMPDIR names a directory: a run whose TMPDIR is inside it makes a
 directory in that TMPDIR, puts a file in it and takes away its write
 permission, so removing the TMPDIR leaves both; a run given any other TMPDIR
@@ -42,7 +46,7 @@ set, every invocation appends its TMPDIR, TMUX_TMPDIR and XDG_CACHE_HOME and
 the command line of the process that started it, its supervisor, as one JSON
 line, which is how a test sees what the suite was given and which verifier file
 its supervisor loaded. With PROBE_SYNTHETIC_STARTED set, every process those
-four knobs start is appended there as its pid and start time, which is how a
+five knobs start is appended there as its pid and start time, which is how a
 test sees whether each was ended.
 """
 
@@ -71,9 +75,11 @@ SLEEP = 0
 SIGNAL = None
 FILTER_LIES = False
 WRITE_BESIDE = None
+BYTES_NOT_UTF8 = False
 OWNED_DRIVER = None
 STUBBORN = False
 NAMED_SYSTEMD = False
+NAME_NOT_UTF8 = False
 LISTING_LEAVES = False
 LOCKED_TMPDIR = None
 
@@ -108,11 +114,11 @@ import os, signal, subprocess, sys, time
 witness = sys.argv[1]
 def answer(_number, _frame):
     sleeper = subprocess.Popen(["sleep", "600"], start_new_session=True)
-    with open(f"/proc/{sleeper.pid}/stat") as stat:
-        text = stat.read()
+    with open(f"/proc/{sleeper.pid}/stat", "rb") as stat:
+        raw = stat.read()
     if witness:
         with open(witness, "a") as started:
-            started.write(f"{sleeper.pid} {text[text.rindex(')') + 2:].split()[19]}\n")
+            started.write(f"{sleeper.pid} {raw[raw.rindex(b')') + 2:].split()[19].decode()}\n")
 signal.signal(signal.SIGTERM, answer)
 print("ready", flush=True)
 while True:
@@ -128,12 +134,25 @@ print("named", flush=True)
 time.sleep(600)
 """
 
+# The process NAME_NOT_UTF8 starts: it names itself \xff, left, \xfe, which
+# is not UTF-8, then starts a sleeping child and says who that is.
+NAME_NOT_UTF8_PROCESS = r"""
+import ctypes, subprocess, time
+ctypes.CDLL(None).prctl(15, b"\xffleft\xfe", 0, 0, 0)
+child = subprocess.Popen(["sleep", "600"])
+print("named", child.pid, flush=True)
+time.sleep(600)
+"""
+
 
 def started_at(pid):
-    """The kernel's start time for pid, field 22 of its stat."""
-    with open(f"/proc/{pid}/stat") as stat:
-        text = stat.read()
-    return text[text.rindex(")") + 2:].split()[19]
+    """The kernel's start time for pid, field 22 of its stat.
+
+    Read as bytes, since the command name before the fields can be any bytes.
+    """
+    with open(f"/proc/{pid}/stat", "rb") as stat:
+        raw = stat.read()
+    return raw[raw.rindex(b")") + 2:].split()[19].decode()
 
 
 def witnessed(*pids):
@@ -193,6 +212,11 @@ def main(argv):
             record.write("written during the run\n")
     if "--selftest" not in argv:
         return 2
+    if BYTES_NOT_UTF8:
+        # A lone surrogate written under surrogateescape is the byte itself.
+        for stream in (sys.stdout, sys.stderr):
+            stream.reconfigure(errors="surrogateescape")
+        print("a byte that is not UTF-8: \udcff", file=sys.stderr, flush=True)
     if LOCKED_TMPDIR and os.environ.get("TMPDIR", "").startswith(LOCKED_TMPDIR + os.sep):
         locked = os.path.join(os.environ["TMPDIR"], "locked")
         os.mkdir(locked)
@@ -216,10 +240,14 @@ def main(argv):
     if NAMED_SYSTEMD:
         named, _said = start(NAMED_SYSTEMD_PROCESS)
         witnessed(named.pid)
+    if NAME_NOT_UTF8:
+        not_utf8, said = start(NAME_NOT_UTF8_PROCESS)
+        witnessed(not_utf8.pid, int(said[1]))
     if SLEEP:
         time.sleep(SLEEP)
     verdicts = [(cid, description, cid not in FAILING,
-                 "scripted failure" if cid in FAILING else "")
+                 ("scripted failure \udcff" if BYTES_NOT_UTF8 else "scripted failure")
+                 if cid in FAILING else "")
                 for cid, description in rows]
     verdicts += [(cid, description, True, "") for cid, description in EXTRA]
     verdicts += [row for row in verdicts if row[0] in DUPLICATE]
