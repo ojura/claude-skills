@@ -5,9 +5,12 @@ probe.selftest copies this file into a private room under the tool's name and
 runs probe.expect against it, so the verifier's rules are exercised on real
 processes without running the real suite. The clean copy lists CATALOG,
 reports every check as passing and exits 0. Each knob in the block below
-changes one thing a verifier must notice, and a test mutation rewrites the
-block: probe.knobs() renders it from the same defaults, so the block's text
-here must stay exactly as that function writes it.
+changes one thing a verifier must notice. The block is the only place the
+knobs are written: probe.knob_block() reads their names and defaults from
+it, and a test mutation rewrites it with probe.knobs(). So each knob stays a
+line of its own, NAME = value as repr writes the value, the knob lines
+follow each other, and no other top-level assignment of a literal to a name
+in capitals fits on one line.
 
 FAILING names the checks reported as failed. SUMMARY is exact, missing,
 malformed or short. EXIT replaces the exit status. DROP leaves checks out of
@@ -23,18 +26,18 @@ detail and on stderr, as a tool that prints a path in any bytes would.
 
 The next five start processes that outlive their part of the run, as the
 real suite's fixtures can. OWNED_DRIVER starts a driver in a session of its
-own whose terminal child ignores the hangup its pty sends, as the real suite's
-completion drive does; with "stays" the driver keeps running, and with "exits"
-it ends at once, so its terminal child is handed to whichever process adopts
-orphans. STUBBORN starts a process that ignores SIGTERM and answers it by
-starting another process, so a cleanup that read the process table once and
-never again misses the newer one. NAMED_SYSTEMD starts a process that calls
-itself systemd, which no cleanup may signal. NAME_NOT_UTF8 starts a process
-whose command name is bytes that are not UTF-8, with a sleeping child, so a
-cleanup that decodes names loses both. LISTING_LEAVES makes a --list run start
-a driver that stays, as OWNED_DRIVER="stays" does for a report.
-LOCKED_TMPDIR names a directory: a run whose TMPDIR is inside it makes a
-directory in that TMPDIR, puts a file in it and takes away its write
+own with a terminal child that ignores the hangup its pty sends, as the real
+suite's completion drive does; with "stays" the driver keeps running, and with
+"exits" it ends at once, so its terminal child is handed to whichever process
+adopts orphans. STUBBORN starts a process that ignores SIGTERM and answers it
+by starting another process, so a cleanup that read the process table once
+and never again misses the newer one. NAMED_SYSTEMD starts a process that
+calls itself systemd, which no cleanup may signal. NAME_NOT_UTF8 starts a
+process that gives itself a command name in bytes that are not UTF-8, with a
+sleeping child, so a cleanup that decodes names loses both. LISTING_LEAVES
+makes a --list run start a driver that stays, as OWNED_DRIVER="stays" does
+for a report. LOCKED_TMPDIR names a directory: a run given a TMPDIR inside it
+makes a directory in that TMPDIR, puts a file in it and takes away its write
 permission, so removing the TMPDIR leaves both; a run given any other TMPDIR
 does nothing.
 
@@ -106,19 +109,41 @@ if sys.argv[1] == "exits":
 time.sleep(600)
 """
 
-# The process STUBBORN starts. SIGTERM does not end it: it starts a sleeper in
-# a session of its own instead, writes it down where the test reads, and
-# carries on until SIGKILL.
-STUBBORN_PROCESS = r"""
-import os, signal, subprocess, sys, time
-witness = sys.argv[1]
-def answer(_number, _frame):
-    sleeper = subprocess.Popen(["sleep", "600"], start_new_session=True)
-    with open(f"/proc/{sleeper.pid}/stat", "rb") as stat:
+# The code that reads a process's start time and records a process the runner
+# started in the witness file the test reads, the one PROBE_SYNTHETIC_STARTED
+# names, kept as source text: the runner executes it below, and
+# STUBBORN_PROCESS, which runs as a program of its own, begins with it.
+WITNESS = r'''
+import os
+
+
+def started_at(pid):
+    """The kernel's start time for pid, field 22 of its stat.
+
+    Read as bytes, since the command name before the fields can be any bytes.
+    """
+    with open(f"/proc/{pid}/stat", "rb") as stat:
         raw = stat.read()
+    return raw[raw.rindex(b")") + 2:].split()[19].decode()
+
+
+def witnessed(*pids):
+    """Append pid and start time of each process to PROBE_SYNTHETIC_STARTED, when it is set."""
+    witness = os.environ.get("PROBE_SYNTHETIC_STARTED")
     if witness:
         with open(witness, "a") as started:
-            started.write(f"{sleeper.pid} {raw[raw.rindex(b')') + 2:].split()[19].decode()}\n")
+            for pid in pids:
+                started.write(f"{pid} {started_at(pid)}\n")
+'''
+
+# The process STUBBORN starts. SIGTERM does not end it: it starts a sleeper in
+# a session of its own instead, records the sleeper in the witness file, and
+# carries on until SIGKILL.
+STUBBORN_PROCESS = WITNESS + r"""
+import signal, subprocess, time
+def answer(_number, _frame):
+    sleeper = subprocess.Popen(["sleep", "600"], start_new_session=True)
+    witnessed(sleeper.pid)
 signal.signal(signal.SIGTERM, answer)
 print("ready", flush=True)
 while True:
@@ -145,23 +170,14 @@ time.sleep(600)
 """
 
 
-def started_at(pid):
-    """The kernel's start time for pid, field 22 of its stat.
-
-    Read as bytes, since the command name before the fields can be any bytes.
-    """
-    with open(f"/proc/{pid}/stat", "rb") as stat:
-        raw = stat.read()
-    return raw[raw.rindex(b")") + 2:].split()[19].decode()
+def _witness_functions():
+    """started_at and witnessed, as WITNESS defines them."""
+    namespace = {}
+    exec(WITNESS, namespace)
+    return namespace["started_at"], namespace["witnessed"]
 
 
-def witnessed(*pids):
-    """Append pid and start time of each process to PROBE_SYNTHETIC_STARTED, when it is set."""
-    witness = os.environ.get("PROBE_SYNTHETIC_STARTED")
-    if witness:
-        with open(witness, "a") as started:
-            for pid in pids:
-                started.write(f"{pid} {started_at(pid)}\n")
+started_at, witnessed = _witness_functions()
 
 
 def start(code, *args, own_session=True):
@@ -235,7 +251,7 @@ def main(argv):
     if OWNED_DRIVER:
         start_owned_driver(OWNED_DRIVER)
     if STUBBORN:
-        stubborn, _ready = start(STUBBORN_PROCESS, os.environ.get("PROBE_SYNTHETIC_STARTED", ""))
+        stubborn, _ready = start(STUBBORN_PROCESS)
         witnessed(stubborn.pid)
     if NAMED_SYSTEMD:
         named, _said = start(NAMED_SYSTEMD_PROCESS)
