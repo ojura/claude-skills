@@ -15084,11 +15084,12 @@ def deepest_socket_root(base, live, jobs, share=None, units=None):
     makes its socket root there. A unit declared with rooms=True makes one more
     level below the process it runs in: a read-only run runs the read-only
     units, and a live run that does not split and each share run the live
-    ones, a split run's shares a level below the run. units is UNITS unless
-    given, so the fault fixture's copy, which runs units of its own and none
-    of these, counts no level for them. Asking the budget of this path once,
-    before anything is made, refuses a TMPDIR the run cannot use instead of
-    failing at the depth that first runs out of bytes.
+    ones, and a split run's shares make theirs a level below the run. units
+    is UNITS unless given, so the fault fixture's copy, which runs units of
+    its own and none of these, counts no level for them. Checking this path
+    against the byte budget once, before anything is made, refuses a TMPDIR
+    the run cannot use instead of failing at the depth that first runs out of
+    bytes.
     """
     makes_rooms = any(entry[0] in ROOM_MAKING_UNITS and bool(entry[3]) == bool(live)
                       for entry in (UNITS if units is None else units))
@@ -15303,16 +15304,37 @@ def adopt_orphans(adopting=True):
     return bool(was.value)
 
 
+def wait_for_command_line(pid, bound=10.0):
+    """Wait until pid's command line is set, up to bound seconds; returns whether it is.
+
+    Popen returns once the child's exec has begun, and until the exec has set
+    the child's arguments its command line reads empty, so a process table
+    taken then leaves the child out. Read from /proc itself rather than through
+    the engine's reader, so the wait tells the run's fence nothing: a check
+    that asks the fence about the process next finds it as it would have
+    without the wait. A wait that reaches its bound only lets the caller go on
+    as it would have before it waited, so no check loses an arm to it.
+    """
+    deadline = time.monotonic() + bound
+    while True:
+        with contextlib.suppress(OSError):
+            if Path(f"/proc/{pid}/cmdline").read_bytes():
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
 def orphan_adopted(bound=10):
     """Make an orphan on purpose and say whether this process adopted it.
 
-    Returns (adopted, its pid, whether it ended). A child that starts a
-    sleeper and exits at once, setsid --fork with this process's setting left
-    as it is, so the sleeper's parent has exited before it is asked about and
-    the kernel has given it to the nearest process that adopts orphans. The
-    sleeper says its pid in a file, as start_stray's does, and waits for end of
-    file on a line whose write end only this process holds. Whether its parent
-    is this process is read off this process's own children files
+    Returns (adopted, its pid, whether it ended). setsid --fork starts a child
+    that starts the sleeper and exits at once, with this process's setting
+    left as it is, so the sleeper's parent has exited before anyone asks about
+    it and the kernel has given it to the nearest process that adopts orphans.
+    The sleeper says its pid in a file, as start_stray's does, and waits for
+    end of file on a line whose write end only this process holds. Whether its
+    parent is this process is read off this process's own children files
     (_ProcessFence.children), which reads nothing outside the run. Then that
     line is closed and the sleeper ends by itself wherever it went, with no
     signal sent, and its end is waited for, up to bound seconds, on a life line
@@ -15726,13 +15748,16 @@ class _ProcessFence:
     reads once the tool run has exited.
 
     Popen tells the fence about every process it starts, so a child that
-    exited before anyone asked about it is still one the run knows. The
+    exited before anyone asked about it is still one the run knows. What a
+    fence learns it also writes, under its token, to a file beside the record
+    (known_record), and a fence that meets a pid it has not learned reads what
+    the run's other fences wrote there first: the selftest process and every
+    tool run of its units keep one record of known pids between them. The
     processes under the root are found by walking /proc/<pid>/task/*/children
-    down from it, which reads only those processes. A walk reads those files
+    down from it, which reads only those processes. A pass reads those files
     one after another, so a process whose parent exits meanwhile can move to a
-    subreaper inside the run between two of them and be in neither; admit and
-    identity walk again before they count a pid a process holds as outside the
-    run (_found_by). The same walk and a
+    subreaper inside the run between two of them and be in neither; the walk
+    passes again when a pass may have done that (_walk_down). The same walk and a
     reader of one process's stat file are how the selftest ends what it
     started, in end_processes and the functions that use it.
     """
@@ -15744,6 +15769,7 @@ class _ProcessFence:
         self.token = token or os.urandom(6).hex()
         self.record = record
         self.known = {}
+        self.known_read = 0
         self.unit, self.machine = unit, machine
         self.named, self.refused, self.unwritten, self.entered = {}, [], [], []
 
@@ -15766,7 +15792,56 @@ class _ProcessFence:
 
     def spawned(self, pid):
         """Popen started this process here: the run knows it, with its start time now."""
-        self.known.setdefault(pid, self._start_of(pid))
+        if pid not in self.known:
+            self.learn(pid, self._start_of(pid))
+
+    def known_record(self):
+        """The file every fence of this run keeps the pids it learned in, beside the record."""
+        return f"{self.record}.known" if self.record else None
+
+    def learn(self, pid, started):
+        """The run knows pid from now on with this start time, unless it already did.
+
+        Written to known_record as well, so the run's other fences, the
+        selftest process's and those of the tool runs its units start, find it
+        there (catch_up).
+        """
+        if pid in self.known:
+            return
+        self.known[pid] = started
+        shared = self.known_record()
+        if shared:
+            with contextlib.suppress(OSError):
+                with open(shared, "a") as out:
+                    out.write(json.dumps({"fence": self.token, "pid": pid,
+                                          "start": started}) + "\n")
+
+    def catch_up(self):
+        """Take in what the run's other fences learned since this one last read known_record.
+
+        A pid keeps the first start time this fence learned for it, its own or
+        another fence's. Only whole lines are read, so a line another fence is
+        still writing is read next time.
+        """
+        shared = self.known_record()
+        if not shared:
+            return
+        try:
+            with open(shared, "rb") as source:
+                source.seek(self.known_read)
+                added = source.read()
+        except OSError:
+            return
+        complete = added[:added.rfind(b"\n") + 1]
+        self.known_read += len(complete)
+        for line in complete.splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            number = _whole_pid(row.get("pid")) if isinstance(row, dict) else None
+            if number is not None and row.get("fence") == self.token:
+                self.known.setdefault(number, row.get("start"))
 
     def sees_registry(self):
         """Whether the session registry is read: only by a unit declared to read the machine."""
@@ -15798,29 +15873,32 @@ class _ProcessFence:
     def admit(self, pid, reader):
         """Whether reader may read pid; a refusal is written down by note.
 
-        A pid from PID_CEILING up is admitted, and so, in a declared unit, is a
-        pid a real listing or registry named while its start time is the one
-        read then. A pid the run knows, because Popen started it here or a walk
-        found it under the root, is admitted while its start time is the one
-        read when the run first learned of it, or once no process holds its
-        number, and refused while another process holds it. One under the root
-        now is admitted, and the walk that finds it is how the run learns it.
-        The pid's start time is read only for a named or known pid, the two
-        rules that compare it, so a pid outside the run that neither rule
-        covers is refused without anything of it being read.
+        A pid from PID_CEILING up is admitted. Every other pid the run admits,
+        whether a declared unit's listing or registry named it, Popen started
+        it or a walk found it, is under one rule: it is read while its start
+        time is the one recorded when the run learned of it, or once no process
+        holds its number, and refused while another process holds it. A pid
+        this fence has not learned is looked up in what the run's other fences
+        learned (catch_up) before it counts as unknown. One under the root now
+        is admitted, and the walk that finds it is how the run learns it. The
+        pid's start time is read only for a named or known pid, the two cases
+        that compare it, so a pid outside the run that neither covers is
+        refused without anything of it being read.
         """
         number = _whole_pid(pid)
         if number is not None:
             if number >= PID_CEILING:
                 return True
             named = self.machine and number in self.named
+            if not named and number not in self.known:
+                self.catch_up()
             if named or number in self.known:
                 now = self._start_of(number)
                 if named and now in (None, self.named[number]):
                     return True
                 if number in self.known and now in (None, self.known[number]):
                     return True
-            if self._found_by(number, self._tree):
+            if number in self._tree():
                 return True
         self.note(reader, pid)
         return False
@@ -15831,8 +15909,9 @@ class _ProcessFence:
         Each record line holds the fence's token, the root, the process that
         was refused, the unit (None outside any unit), the reader, and the pid,
         or the repr of a value that is no pid. A line the record cannot take is
-        kept here for the row in the root's own process, and written to the
-        diagnostic stream in a tool run, which has no row of its own.
+        kept here for the row in the root's own process. A tool run has no row
+        of its own, so there it ends the run through die, which names the line
+        on stderr and exits nonzero, for the unit that started the run to see.
         """
         number = _whole_pid(pid)
         shown = number if number is not None else repr(pid)
@@ -15848,8 +15927,8 @@ class _ProcessFence:
             if os.getpid() == self.root:
                 self.unwritten.append(line)
             else:
-                write_diagnostic(f"{TOOL} selftest: a refused read the record could not "
-                                 f"take ({unwritable}): {line}")
+                die(f"selftest: a refused read the record could not take ({unwritable}): "
+                    f"{line}")
 
     def refusals_in_run(self):
         """Every refusal under this fence, as (unit, reader, pid, process), in the order written.
@@ -15884,68 +15963,93 @@ class _ProcessFence:
         tree = {self.root} | self._walk_down(self.root)
         for pid in tree:
             if pid not in self.known:
-                self.known[pid] = self._start_of(pid)
+                self.learn(pid, self._start_of(pid))
         return tree
 
     # How the selftest ends what it started, and checks that it did. These
     # readers do not ask admit; what they can reach is limited by how they
     # find it instead. run_processes reads the children files of this process
-    # and of every process found under it, and the stat file of each process
-    # found that way. identity reads one pid's stat file only when that pid is
-    # this process or the same walk finds it under this process now, in one of
-    # up to three walks for a pid a process holds (_found_by).
+    # and of every process found under it, each of them once more after the
+    # pass that read it (_walk_down), and the stat file of each process found
+    # that way. identity reads one pid's stat file only when that pid is this
+    # process or the same walk finds it under this process now.
     # ancestors reads the stat files up the chain of parents from this
     # process's own parent, for never_signalled never to signal one of them.
-    # Any other pid reads as no running process and is not read, and a refused
-    # pid that a process holds is written down by note as the reader "cleanup
-    # stat", the way admit writes its refusals, so the tier's row names it and
-    # an audit counts it. A process that left the run's tree and still runs is
-    # told apart from one that has gone that way, rather than passing for
-    # gone.
+    # Any other pid reads as no running process and is not read. A refused pid
+    # that a process holds, and a value that is no pid, are written down by
+    # note as the reader "cleanup stat", the way admit writes its refusals, so
+    # the tier's row names them and an audit counts them. A process that left
+    # the run's tree and still runs holds its pid, so it is written down as
+    # refused, where one that has ended is not, and it does not pass for
+    # ended.
+
+    @classmethod
+    def children(cls, pid):
+        """The pids whose parent is pid now, by its threads' children files."""
+        return set().union(*cls._task_children(pid).values())
 
     @staticmethod
-    def children(pid):
-        """The pids whose parent is pid now, by its threads' children files."""
-        found = set()
+    def _task_children(pid):
+        """Each thread of pid, as its /proc task directory, with the pids its children file lists now.
+
+        None at all when pid had gone before its threads could be listed.
+        """
+        listed = {}
         try:
             tasks = list(Path(f"/proc/{pid}/task").iterdir())
         except OSError:
-            return found
+            return listed
         for task in tasks:
             try:
-                found.update(map(int, (task / "children").read_text().split()))
+                listed[task] = set(map(int, (task / "children").read_text().split()))
             except OSError:
                 continue
-        return found
+        return listed
+
+    @classmethod
+    def _walk_once(cls, root):
+        """One pass down from root: (every pid it found, root left out; each task whose children file it read)."""
+        found, frontier, read = set(), [root], []
+        while frontier:
+            for task, listed in cls._task_children(frontier.pop()).items():
+                read.append(task)
+                for child in listed:
+                    if child not in found:
+                        found.add(child)
+                        frontier.append(child)
+        return found, read
+
+    @staticmethod
+    def _gained(read, found):
+        """Whether a children file in read lists a pid now that is not in found."""
+        for task in read:
+            try:
+                listed = set(map(int, (task / "children").read_text().split()))
+            except OSError:
+                continue
+            if listed - found:
+                return True
+        return False
 
     @classmethod
     def _walk_down(cls, root):
-        """Every pid under root now, root left out, by its threads' children files."""
-        found, frontier = set(), [root]
-        while frontier:
-            for child in cls.children(frontier.pop()):
-                if child not in found:
-                    found.add(child)
-                    frontier.append(child)
-        return found
+        """Every pid under root now, root left out, by its threads' children files.
 
-    @classmethod
-    def _found_by(cls, pid, walk):
-        """Whether walk, a walk down a tree that returns the pids it found, finds pid.
-
-        A walk reads one children file after another, so a process whose
-        parent exits while the walk is between two of them is handed to a
-        subreaper inside the run and can be in neither file. A pid that a
-        process holds and a walk did not find is looked for again, in up to
-        three walks in all, before it counts as outside the tree; one that no
-        process holds is not looked for again.
+        A pass reads one children file after another, so a process whose
+        parent exits while the pass is between two of them is handed to a
+        subreaper inside the run and can be in neither file: the subreaper,
+        which is root or under it, had its file read before the process got
+        there. Once there, the process stays in that file, so after each pass
+        the walk reads every children file the pass read once more. One that
+        lists a pid the pass did not find means a process moved, or started,
+        while the pass ran, and the walk passes again, up to four passes.
+        run_processes, identity and admit, through _tree, all walk this way.
         """
-        for _attempt in range(3):
-            if pid in walk():
-                return True
-            if cls._held(pid)[0] is False:
-                return False
-        return False
+        for _pass in range(4):
+            found, read = cls._walk_once(root)
+            if not cls._gained(read, found):
+                return found
+        return found
 
     @staticmethod
     def _start_of(pid):
@@ -16008,13 +16112,16 @@ class _ProcessFence:
     @classmethod
     def identity(cls, pid):
         """pid's identity as _stat reads it when pid is this process or runs under it now, else None."""
-        try:
-            number = int(pid)
-        except (TypeError, ValueError):
-            return None  # names no process, so there is nothing to read
-        if number == os.getpid() or cls._found_by(number, lambda: cls._walk_down(os.getpid())):
-            return cls._stat(number)
+        number = _whole_pid(pid)
         fence = PROCESS_FENCE
+        if number is None:
+            # Names no process, so there is nothing to read; written down as
+            # admit writes a value that is no pid.
+            if fence is not None:
+                fence.note("cleanup stat", pid)
+            return None
+        if number == os.getpid() or number in cls._walk_down(os.getpid()):
+            return cls._stat(number)
         if fence is not None:
             held, unknown = cls._held(number)
             if held:
@@ -16137,9 +16244,8 @@ def refusal_lines(refused, root):
 def register_procs_row(register, live, fence):
     """The tier's verdict on the reads its fence refused: its units', their tool runs' and its own."""
     said = refusal_lines(fence.refusals_in_run(), fence.root)
-    shown = said[:4] + ([f"and {len(said) - 4} more"] if len(said) > 4 else [])
     register(*TIER_PROCS[live], not said,
-             f"{len(said)} refused read(s): " + "; ".join(shown) if said else "")
+             f"{len(said)} refused read(s): " + "; ".join(said) if said else "")
 
 
 def declared_unit_rows(unit_name, ids, produced):
@@ -16520,6 +16626,7 @@ def _suite_functions():
     """Classify registered units and designated helpers when a context is built."""
     return ({run.__name__ for _n, _i, run, _l in UNITS}
             | {"_suite_context", "_live_context", "run_selftest", "live_checks", "unit", "resume_run",
+               "wait_for_command_line",
                "_roster_test_fixture", "_rebuild_test_plan", "_restamp_test_plan", "_roster_cold_engine",
                "_retained_transcript_answers", "_conversion_test_plan"})
 
@@ -17610,8 +17717,11 @@ def _check_abort_refusal_spares(s):
     real_stdin = sys.stdin
 
     def abort_with(stdin):
-        """(plan, whether it planned only that target, killed, spared, prompts asked, what it
-        printed) for one owned target."""
+        """abort_agents on one owned target, with stdin as given and every question answered no.
+
+        Returns (plan, whether it planned only that target, killed, spared,
+        prompts asked, what it printed).
+        """
         # The prompt goes to input(), not to stdout, so a stand-in that dropped
         # it would leave nothing anywhere saying the question was ever put.
         # Keeping it is what tells a refusal apart from a run that skipped the
@@ -17672,6 +17782,15 @@ def _check_abort_refusal_spares(s):
     return checked
 
 
+# Not declared to read the machine. A declaration stays where a mutation fails
+# one of the unit's arms declared and not undeclared, and a mutation counts for
+# an arm only where it produces what the arm looks for in every run. The
+# commands this unit types meet a pid that is gone by the time it is read only
+# when some process on the machine ends between a table's listing and its read,
+# which happens by chance, so a gone-pid mutation that fails it declared counts
+# for nothing here. process-reads-are-fenced reads a pid no process holds on
+# purpose, in both worlds, and fails every time either gone-pid branch of
+# _proc_stat or _cmdline goes.
 @unit(('smoke-typed-commands', 'the commands a person types end in a message, not a traceback'),
       live=True)
 def _check_smoke_typed_commands(s):
@@ -17824,7 +17943,7 @@ def _check_stop_preview_ends_nothing(s):
         victim = sp.Popen([FAKE_AGENT_BIN, "-c", '__import__("time").sleep(60)',
                            "--agent-id", ident], executable=sys.executable)
         try:
-            time.sleep(0.3)          # let it reach the process table
+            wait_for_command_line(victim.pid)
             run = sp.run([sys.executable, str(Path(__file__).resolve()),
                           "--agent-id", ident, "--stop", *flags],
                          capture_output=True, text=True, timeout=300,
@@ -17939,15 +18058,20 @@ def _check_process_table_width_independent(s):
                        stdin=sp.PIPE)
     reader = Resolver(needs=Needs(maybe=set(NEED)))
     try:
-        time.sleep(0.3)          # let both reach the process table
+        wait_for_command_line(padded.pid)
+        wait_for_command_line(churner.pid)
         before = identities()
         narrow = engine_at("100")
         churner.stdin.write(b"\n")
         churner.stdin.flush()
+        # Until its exec, the churner's command line is the one it started
+        # with, whose code names "churned-by-exec" too; after it, that is its
+        # last argument.
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             with contextlib.suppress(OSError):
-                if b"churned-by-exec" in Path(f"/proc/{churner.pid}/cmdline").read_bytes():
+                argv = Path(f"/proc/{churner.pid}/cmdline").read_bytes().split(b"\0")
+                if argv[-2:] == [b"churned-by-exec", b""]:
                     break
             time.sleep(0.05)
         wide = engine_at("1000")
@@ -18329,7 +18453,8 @@ def stop_fixture(count):
     engine._teams_dir = base / "corpus" / "teams"
     real_table = engine._process_table
     try:
-        time.sleep(0.4)          # let them reach the process table
+        for started in victims + near:
+            wait_for_command_line(started.pid)
         with _FakeTmux(sockets=[]).installed(engine):
             engine._process_table = real_table
             yield engine, ident, victims, near
@@ -18543,6 +18668,9 @@ def _check_smoke_counts_only_what_it_started(s):
     # which a SIGTERM to this run also reaches. Under the verifier the suite's
     # supervisor adopted it, and ends it should this run be killed first.
     try:
+        # Until the decoy's exec has set its command line, a table leaves the
+        # decoy out, so the table is read once it is set.
+        wait_for_command_line(decoy.pid)
         table = RESOLVER._process_table(refresh=True)
         rows = {pid: cmd for pid, _ppid, cmd in table}
         # The tier's own question, not a copy of it: a narrowing removed from
@@ -18576,170 +18704,6 @@ def _check_smoke_counts_only_what_it_started(s):
     wrong = sorted(k for k, ok in told.items() if not ok)
     check("smoke-counts-only-what-it-started",
           "the smoke tier counts processes it started, not the machine's",
-          not wrong, ", ".join(wrong))
-    return checked
-
-
-def live_tree(prefix):
-    """A config tree of this run's own, and the pieces that fill it.
-
-    Every destructive fixture wants the same three things: a directory the real
-    CLI will treat as its config, teams inside it, and transcripts the roster
-    can point at. Returned as one namespace so a unit says what it is building
-    rather than repeating the mkdir.
-
-    The claude it launches is written here too. A destructive fixture that let
-    the real binary start would put a live agent on the machine and wait
-    45 seconds for it to say something; this one records that it started, which
-    is the same evidence, and then waits where the fixture can end it.
-    """
-    home = Path(tempfile.mkdtemp(prefix=f"{TOOL}-{prefix}-"))
-    cfg = home / "claude"
-    projects = cfg / "projects" / prefix
-    projects.mkdir(parents=True)
-    binary = home / "claude-bin"
-    binary.write_text(
-        "#!/usr/bin/env python3\n"
-        "import os, sys, time\n"
-        "from pathlib import Path\n"
-        "argv = sys.argv\n"
-        "session = argv[argv.index('--resume') + 1] if '--resume' in argv else ''\n"
-        "cfg = os.environ.get('CLAUDE_CONFIG_DIR', '')\n"
-        "if session and cfg:\n"
-        "    for path in (Path(cfg) / 'projects').rglob(session + '.jsonl'):\n"
-        "        with path.open('a') as handle:\n"
-        "            handle.write('{\"type\":\"assistant\",\"uuid\":\"fixture-live\",'\n"
-        "                         '\"sessionId\":\"' + session + '\"}\\n')\n"
-        "time.sleep(90)\n")
-    binary.chmod(0o755)
-
-    def engine():
-        """A Resolver that answers about this tree, for reading it back.
-
-        A fixture asserts on rosters and transcripts through the engine that
-        owns reading them, rather than parsing the files a second way.
-        """
-        eng = Resolver(needs=Needs(maybe=set(NEED)))
-        eng._teams_dir, eng._projects_dir = cfg / "teams", cfg / "projects"
-        return eng
-
-    def roster(team, lead_session, members):
-        # Where a team keeps its roster and its mailboxes is the engine's
-        # answer, so the fixture asks rather than spelling the names again.
-        directory = cfg / "teams" / team
-        RESOLVER._inboxes_in(directory).mkdir(parents=True)
-        RESOLVER._roster_in(directory).write_text(json.dumps({
-            "name": team, "leadAgentId": agent_id_of("team-lead", team),
-            "leadSessionId": lead_session, "members": members, "createdAt": 1,
-        }))
-        return directory
-
-    def transcript(session, root_uuid, name, team):
-        path = projects / f"{session}.jsonl"
-        path.write_text(
-            json.dumps({"parentUuid": None, "type": "user", "uuid": root_uuid,
-                        "sessionId": session, "agentName": name,
-                        "teamName": team,
-                        "timestamp": "2026-01-01T00:00:00Z"}) + "\n"
-            + json.dumps({"type": "last-prompt", "leafUuid": root_uuid,
-                          "sessionId": session}) + "\n")
-        return path
-
-    return types.SimpleNamespace(
-        home=home, cfg=cfg, projects=projects, binary=binary,
-        env=dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), NO_COLOR="1"),
-        roster=roster, transcript=transcript, engine=engine)
-
-
-def fixture_uuid(tag, at):
-    """A distinct uuid per fixture record, owned by this run.
-
-    Written from the pid so two runs never name the same session, and from a
-    tag so one run's sessions stay apart from each other.
-    """
-    return f"{tag * 8:.8}-{at:04d}-4000-8000-{os.getpid():012d}"
-
-
-def named_claude(argv, binary):
-    """The argv a fixture runs, with this tree's recording claude named in it.
-
-    Every invocation carries it, whether or not the verb looks like one that
-    launches. Sorting verbs into launching and not is what went wrong the
-    first time: --no-launch reads as though it settles the question and in
-    fact only ever applied to --promote, so a resume carrying it would have
-    started the real binary with the exemption's blessing. The parser takes
-    --claude-bin beside every verb, so there is nothing to be gained by
-    leaving it off any of them.
-
-    The flag and the argument after it are read as a pair. The path merely
-    appearing somewhere in argv is a different claim and not the one that
-    matters: it could be a team name, a session, or any other value, and none
-    of those tell the tool which binary to run.
-    """
-    for at, part in enumerate(argv):
-        if part != "--claude-bin":
-            continue
-        named = argv[at + 1] if at + 1 < len(argv) else None
-        if named != binary:
-            raise AssertionError(
-                f"a fixture named --claude-bin {named}, not its own {binary}")
-        return list(argv)
-    return [*argv, "--claude-bin", binary]
-
-
-def cli(argv, tree, timeout=300):
-    """Run the production CLI as a person would, against a fixture's tree.
-
-    Without this tree's claude named, the real one starts: a live agent on the
-    machine, in a tmux server named after the fixture, both still running long
-    after the fixture's directory is gone. That is measured, not hypothetical.
-    It happened once while these units were being written and the pair had to
-    be found and killed by hand afterwards.
-    """
-    return subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()),
-         *named_claude(argv, str(tree.binary))],
-        capture_output=True, text=True, env=tree.env,
-        stdin=subprocess.DEVNULL, timeout=timeout)
-
-
-@unit(('live-fixture-names-its-own-claude',
-       'a fixture invocation carries its own claude, however the argv is spelled'))
-def _check_live_fixture_names_its_own_claude(s):
-    checked = []
-
-    def check(cid, name, ok, detail=""):
-        checked.append((cid, name, ok, detail))
-
-    mine, other = "/tmp/fixture-tree/claude-bin", "/usr/local/bin/claude"
-
-    def refused(argv):
-        try:
-            named_claude(argv, mine)
-        except AssertionError:
-            return True
-        return False
-
-    pair = ["--claude-bin", mine]
-    told = {
-        # The exemption that was there before: --no-launch only ever applied
-        # to --promote, so a resume carrying it still reaches a launch.
-        "a resume carrying --no-launch is still given one":
-            named_claude(["--agent-id", "a@b", "--no-launch"], mine)[-2:] == pair,
-        "a verb that cannot launch is given one anyway":
-            named_claude(["--doctor", "crew"], mine)[-2:] == pair,
-        # The path as some other flag's value says nothing about what runs.
-        "the path in an unrelated argument does not stand in for the flag":
-            named_claude(["--team", mine], mine)[-2:] == pair,
-        "an argv that already names it is left alone":
-            named_claude(pair, mine) == pair,
-        "another binary is refused": refused(["--claude-bin", other]),
-        "a trailing flag with nothing after it is refused":
-            refused(["--agent-id", "a@b", "--claude-bin"]),
-    }
-    wrong = sorted(k for k, ok in told.items() if not ok)
-    check("live-fixture-names-its-own-claude",
-          "a fixture invocation carries its own claude, however the argv is spelled",
           not wrong, ", ".join(wrong))
     return checked
 
@@ -19255,8 +19219,9 @@ def _check_live_workers_share_one_removable_tempdir(s):
 
         def __init__(self, argv, **kwargs):
             self.args, self.env, self.returncode = argv, kwargs.get("env", {}), 0
-            # No process, so nothing to record as a group or end as one.
-            self.pid = None
+            # No process: a pid from PID_CEILING up, which no process can hold,
+            # so the cleanup finds nothing to record as a group or end as one.
+            self.pid = PID_CEILING + 743001
 
         def communicate(self, timeout=None):
             return "", ""
@@ -19353,8 +19318,7 @@ def _check_run_refuses_a_tmpdir_too_long_for_its_sockets(s):
     ast = s.ast
 
     def makers(tree):
-        """The registered units whose code calls run_shares, or builds an argv list holding
-        --jobs, by the syntax tree."""
+        """The registered units whose code, read as a syntax tree, calls run_shares or builds an argv list holding --jobs."""
         registered = {name for name, _ids, _run, _live in UNITS}
         return {node.name for node in tree.body
                 if isinstance(node, ast.FunctionDef) and node.name in registered
@@ -19513,6 +19477,7 @@ loader = importlib.machinery.SourceFileLoader("worker_fixture", tool)
 module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
 module.__file__ = tool
 loader.exec_module(module)
+module.adopt_inherited_fence()
 made = tempfile.mkdtemp(prefix="s")
 child_file = os.path.join(made, "child")
 process = subprocess.Popen([sys.executable, "-c", driver, child_file], start_new_session=True,
@@ -19578,6 +19543,7 @@ loader = importlib.machinery.SourceFileLoader("dying_worker_run_fixture", tool)
 module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
 module.__file__ = tool
 loader.exec_module(module)
+module.adopt_inherited_fence()
 module.adopt_orphans()
 worker_told = told + ".worker-0"
 seen = {}
@@ -19608,10 +19574,11 @@ os.rename(told + ".tmp", told)
 """
 
 # A run of its own with one process under it that its finish must refuse: the
-# program named by its third argument, a sleep reached through a name of
-# systemd, whose pid goes to the file named by its fourth. It waits for the
-# file named by its second argument and then finishes as run_selftest does,
-# printing what finish_run ended, left and refused.
+# program named by its third argument, a link named systemd to sleep, so the
+# process it starts is named systemd. Its pid goes to the file named by its
+# fourth argument. It waits for the file named by its second argument and then
+# finishes as run_selftest does, printing what finish_run ended, left and
+# refused.
 RUN_FINISH_FIXTURE = r"""
 import importlib.machinery, importlib.util, os, subprocess, sys, time
 tool, go, named, told = sys.argv[1:5]
@@ -19619,6 +19586,7 @@ loader = importlib.machinery.SourceFileLoader("run_finish_fixture", tool)
 module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
 module.__file__ = tool
 loader.exec_module(module)
+module.adopt_inherited_fence()
 module.adopt_orphans()
 imitation = subprocess.Popen([named, "300"], start_new_session=True, stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -19631,6 +19599,132 @@ while not os.path.exists(go) and time.monotonic() < deadline:
 print(module.finish_run())
 """
 
+# A parent the walk fixture starts: it starts a sleeper, says the sleeper's
+# pid, and waits to be ended, which leaves the sleeper running.
+MID_WALK_PARENT = r"""
+import subprocess, sys, time
+child = subprocess.Popen(["sleep", "30"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+print(child.pid, flush=True)
+time.sleep(300)
+"""
+
+# A subreaper between the walk fixture and MID_WALK_PARENT: it makes itself the
+# subreaper of what is under it, starts the parent, says the parent's pid and
+# the sleeper's, and waits to be ended. It reaps nothing, so the parent stays a
+# zombie under it once ended.
+MID_WALK_REAPER = r"""
+import ctypes, subprocess, sys, time
+ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)          # PR_SET_CHILD_SUBREAPER
+parent = subprocess.Popen([sys.executable, "-c", sys.argv[1]], stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, text=True)
+print(parent.pid, parent.stdout.readline().strip(), flush=True)
+time.sleep(300)
+"""
+
+# A run of its own in which one reader walks while a parent exits in the middle
+# of the walk. It loads the tool as a module, becomes the subreaper of what is
+# under it and installs a fence of its own entered as an undeclared unit. It
+# starts MID_WALK_PARENT, under MID_WALK_REAPER when its third argument is
+# nested, and puts a stand-in for _ProcessFence._task_children in place that
+# lets the walk's first read of the parent go on only once the parent has been
+# sent SIGTERM and has ended: reaped by this process with reap, left a zombie of
+# this process's with zombie, left a zombie of the reaper's with nested. By
+# then the pass has read the file of the process the sleeper is handed to, this
+# process or the reaper, and the sleeper is in neither file that pass read. The
+# reader, its second argument, is end_processes picking the sleeper, identity,
+# the fence's admit, asked whether the stat reader may read the sleeper, or the
+# engine's table, which this fence narrows as it narrows an undeclared unit's.
+# What it found goes as JSON to the file named by its fourth argument, and it
+# ends the sleeper, the parent and the reaper.
+MID_WALK_FIXTURE = r"""
+import contextlib, importlib.machinery, importlib.util, json, os, signal, subprocess, sys
+tool, reader, ends, told = sys.argv[1:5]
+loader = importlib.machinery.SourceFileLoader("mid_walk_fixture", tool)
+module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+module.__file__ = tool
+loader.exec_module(module)
+module.adopt_orphans()
+fence = module.install_process_fence(module._ProcessFence(None))
+fence.enter("undeclared", False)
+Fence = module._ProcessFence
+kept = vars(Fence)["_task_children"]
+if ends == "nested":
+    holder = subprocess.Popen([sys.executable, "-c", module.MID_WALK_REAPER,
+                               module.MID_WALK_PARENT], stdout=subprocess.PIPE, text=True)
+    said = holder.stdout.readline().split()
+    parent_pid, sleeper = (int(said[0]), int(said[1])) if len(said) == 2 else (0, 0)
+else:
+    holder = subprocess.Popen([sys.executable, "-c", module.MID_WALK_PARENT],
+                              stdout=subprocess.PIPE, text=True)
+    said = holder.stdout.readline().strip()
+    parent_pid, sleeper = holder.pid, int(said) if said.isdigit() else 0
+module.wait_for_command_line(sleeper)
+started = Fence.start_time(sleeper) if sleeper else ""
+fired = []
+
+
+def parent_exits_first(pid):
+    if pid == parent_pid and not fired:
+        fired.append(pid)
+        fd = os.pidfd_open(pid)
+        signal.pidfd_send_signal(fd, signal.SIGTERM)
+        module.ready_to_read(fd, 10.0)
+        os.close(fd)
+        if ends == "reap":
+            holder.wait(timeout=10)
+    return kept.__func__(pid)
+
+
+Fence._task_children = staticmethod(parent_exits_first)
+try:
+    if reader == "end_processes":
+        ended, left, refused = module.end_processes(
+            lambda processes: {sleeper: processes[sleeper]} if sleeper in processes else {},
+            grace=2.0)
+        found = {"ended": ended, "left": left, "refused": refused}
+    elif reader == "identity":
+        read = Fence.identity(sleeper)
+        found = {"read": read is not None and read[2] == started}
+    elif reader == "table":
+        table = module.Resolver(needs=module.Needs(maybe=set(module.NEED)))._process_table(
+            refresh=True)
+        found = {"read": sleeper in {pid for pid, _ppid, _argv in table}}
+    else:
+        found = {"read": fence.admit(sleeper, "stat")}
+finally:
+    Fence._task_children = kept
+found.update(sleeper=sleeper, fired=bool(fired),
+             refusals=[list(row) for row in fence.leave()])
+fd = module._pidfd_for(sleeper, started) if sleeper and started else None
+if fd is not None:
+    with contextlib.suppress(OSError):
+        signal.pidfd_send_signal(fd, signal.SIGKILL)
+    module.ready_to_read(fd, 5.0)
+    os.close(fd)
+if ends == "nested" and parent_pid:
+    # Under the reaper, the parent ended only if a walk read its file; the
+    # reaper reaps nothing, so the number is still the parent's until the
+    # reaper goes. Left running, the parent would hold this run's stderr,
+    # which it inherited through the reaper, until it ended by itself.
+    with contextlib.suppress(OSError):
+        parent_fd = os.pidfd_open(parent_pid)
+        try:
+            signal.pidfd_send_signal(parent_fd, signal.SIGKILL)
+            module.ready_to_read(parent_fd, 5.0)
+        finally:
+            os.close(parent_fd)
+with contextlib.suppress(OSError):
+    holder.kill()
+holder.wait(timeout=10)
+holder.stdout.close()
+with contextlib.suppress(ChildProcessError):
+    os.waitpid(sleeper, os.WNOHANG)
+with open(told + ".tmp", "w") as out:
+    json.dump(found, out)
+os.rename(told + ".tmp", told)
+"""
+
 # A run of its own with one process of each kind the suite starts in a session
 # of its own, each started through the function its fixture uses: a copy run
 # with a child of its own, as the fault fixture's copies, the copy without a
@@ -19640,9 +19734,9 @@ print(module.finish_run())
 # subreaper of what is under it and makes SIGTERM raise, as run_selftest does,
 # writes "<kind> <pid>" for each to the file named by its second argument, with
 # whether it adopts after making the stray and after a raise inside the block
-# that stops it adopting, and waits. Terminated ends the wait: the stray is ended by the pid and life line
-# the run kept, as the smoke check ends it, finish_run ends the rest, and the
-# run exits 143.
+# that stops it adopting, and waits. Terminated ends the wait: the stray is
+# ended by the pid and life line the run kept, as the smoke check ends it,
+# finish_run ends the rest, and the run exits 143.
 OWN_SESSION_RUN_FIXTURE = r"""
 import importlib.machinery, importlib.util, os, sys, time
 tool, told = sys.argv[1:3]
@@ -19650,6 +19744,7 @@ loader = importlib.machinery.SourceFileLoader("own_session_run_fixture", tool)
 module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
 module.__file__ = tool
 loader.exec_module(module)
+module.adopt_inherited_fence()
 module.adopt_orphans()
 restore = module.raise_on_sigterm()
 copy_said = told + ".copy-child"
@@ -19719,6 +19814,7 @@ loader = importlib.machinery.SourceFileLoader("terminated_fixture", tool)
 module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
 module.__file__ = tool
 loader.exec_module(module)
+module.adopt_inherited_fence()
 module.adopt_orphans()
 restore = module.raise_on_sigterm()
 child_file = told + ".child"
@@ -19733,6 +19829,7 @@ stubborn = subprocess.Popen(
      "module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))\n"
      "module.__file__ = tool\n"
      "loader.exec_module(module)\n"
+     "module.adopt_inherited_fence()\n"
      "def answer(_number, _frame):\n"
      "    late = subprocess.Popen(['sleep', '300'], start_new_session=True,\n"
      "                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
@@ -19786,8 +19883,9 @@ finally:
        "a copy run and its child, a wrapper and its agent, and a stray outside the run's "
        "lineage, each started in a session of its own as the suite starts them, are gone once "
        "their run is sent SIGTERM, the stray ended by the pid and life line the run kept; "
-       "and the run adopts again after making the stray and after a raise inside the block "
-       "that stops it adopting"),
+       "the run exits 143 and names on its diagnostic stream what it ended; and it adopts "
+       "again after making the stray and after a raise inside the block that stops it "
+       "adopting"),
       live=True, rooms=True)
 def _check_shares_cleanup_owner(s):
     """run_shares, owned_group and collected ending what they own, on processes started here.
@@ -20257,8 +20355,9 @@ def _check_shares_cleanup_owner(s):
               "a copy run and its child, a wrapper and its agent, and a stray outside the run's "
               "lineage, each started in a session of its own as the suite starts them, are gone "
               "once their run is sent SIGTERM, the stray ended by the pid and life line the run "
-              "kept; and the run adopts again after making the stray and after a raise inside "
-              "the block that stops it adopting",
+              "kept; the run exits 143 and names on its diagnostic stream what it ended; and it "
+              "adopts again after making the stray and after a raise inside the block that "
+              "stops it adopting",
               not wrong, ", ".join(wrong) + (f"; kinds {kinds}, before {before}, under the run "
                                              f"{placed}, after {after}, exit {own_run.returncode},"
                                              f" stderr {own_err.strip()[-300:]!r}"
@@ -20279,27 +20378,27 @@ def _check_shares_cleanup_owner(s):
        "the selftest's own process readers read the stat files only of the processes under "
        "its run, and of its ancestors for the guard; any other pid reads as no running "
        "process and its stat file is not read, one a process holds is written down as "
-       "refused and one pidfd_open cannot judge is written down with the error; and end_stray "
-       "ends the stray it asked about and says so"), live=True)
+       "refused, as is a value that is not a whole number, and one pidfd_open cannot judge is "
+       "written down with the error; and end_stray ends the stray it asked about and says "
+       "so"), live=True)
 def _check_cleanup_reads_only_its_run(s):
     """_ProcessFence's own readers, asked about pids inside and outside this run.
 
-    A sleeper this check starts is under the run and is read, and so it is
-    when the first walk identity makes for it misses it, through a stand-in
-    for _ProcessFence._walk_down, as a walk can while a process's parent exits
-    and the process moves to a subreaper inside the run. pid 1, this
+    A sleeper this check starts is under the run and is read. pid 1, this
     run's parent and a stray start_stray puts outside the run's lineage are
     running and are not read: each reads as no running process and is written
     down as refused. A pid no process can hold reads the same and is not
     written down, since nothing holds it. A pid pidfd_open cannot judge, as a
     stand-in for it makes one here, is written down with the error and read
-    neither as held nor as gone. The parent is still found by the guard's walk
-    up from this run. Every pid whose stat file is read while the questions
-    are put is recorded, through a stand-in for _ProcessFence._stat put in its
-    place as the lineage stand-in in _check_shares_cleanup_owner is, and each
-    one must be this run, a process under it or an ancestor. The refusals go
-    to a fence of this check's own, entered as an undeclared unit, so they are
-    read here instead of reaching the tier's refusal row.
+    neither as held nor as gone. A value that is no pid, such as a path, True
+    or 3.7, reads as nothing and is written down as admit writes one. The
+    parent is still found by the guard's walk up from this run. Every pid
+    whose stat file is read while the questions are put is recorded, through
+    a stand-in for _ProcessFence._stat put in its place as the lineage
+    stand-in in _check_shares_cleanup_owner is, and each one must be this
+    run, a process under it or an ancestor. The refusals go to a fence of
+    this check's own, entered as an undeclared unit, so they are read here
+    instead of reaching the tier's refusal row.
     """
     import errno
     checked = []
@@ -20336,23 +20435,8 @@ def _check_cleanup_reads_only_its_run(s):
             unjudged = _ProcessFence.identity(1)
         finally:
             os.pidfd_open = real_open
-        kept_walk, walks = vars(_ProcessFence)["_walk_down"], []
-
-        def missing_first(cls, root):
-            found = kept_walk.__func__(cls, root)
-            walks.append(root)
-            return found - {sleeper.pid} if len(walks) == 1 else found
-
-        before_moving = len(fence.refused)
-        _ProcessFence._walk_down = classmethod(missing_first)
-        try:
-            moving = _ProcessFence.identity(sleeper.pid)
-        finally:
-            _ProcessFence._walk_down = kept_walk
         read = {
             "a process this run started is read": _ProcessFence.identity(sleeper.pid) is not None,
-            "and so it is when one walk misses it while it moves inside the run, unrefused":
-                moving is not None and len(walks) >= 2 and len(fence.refused) == before_moving,
             "and so is this run": _ProcessFence.identity(os.getpid()) is not None,
             "and the sleeper is among the processes found under this run":
                 sleeper.pid in _ProcessFence.run_processes(),
@@ -20362,6 +20446,10 @@ def _check_cleanup_reads_only_its_run(s):
         refused = sorted(pid for _unit, reader, pid in fence.refused if reader == "cleanup stat")
         named = [(reader, pid) for _unit, reader, pid in fence.refused
                  if reader != "cleanup stat"]
+        before = len(fence.refused)
+        no_pids = ("1/task/1", True, 3.7)
+        no_pid_answers = [_ProcessFence.identity(value) for value in no_pids]
+        no_pid_refused = [(reader, pid) for _unit, reader, pid in fence.refused[before:]]
         fence.leave()
         # Taken while the sleeper still runs, so it counts as under the run.
         readable = {os.getpid(), *_ProcessFence._walk_down(os.getpid()),
@@ -20384,6 +20472,9 @@ def _check_cleanup_reads_only_its_run(s):
             unjudged is None,
         "and is written down with the error, apart from the refusals":
             named == [("cleanup stat, of a pid pidfd_open could not judge (EMFILE)", 1)],
+        "a value that is not a whole number reads as nothing and is written down as such":
+            no_pid_answers == [None] * len(no_pids)
+            and no_pid_refused == [("cleanup stat", repr(value)) for value in no_pids],
         "no stat file is read but this run's, those under it and its ancestors'":
             bool(stat_read) and set(stat_read) <= readable,
         "end_stray ends the stray and says so": ended is True,
@@ -20393,8 +20484,9 @@ def _check_cleanup_reads_only_its_run(s):
           "the selftest's own process readers read the stat files only of the processes under "
           "its run, and of its ancestors for the guard; any other pid reads as no running "
           "process and its stat file is not read, one a process holds is written down as "
-          "refused and one pidfd_open cannot judge is written down with the error; and "
-          "end_stray ends the stray it asked about and says so",
+          "refused, as is a value that is not a whole number, and one pidfd_open cannot judge "
+          "is written down with the error; and end_stray ends the stray it asked about and "
+          "says so",
           not wrong, ", ".join(wrong) + (f"; asked {held}, refused {refused}, named {named}, "
                                          f"read {sorted(set(stat_read) - readable)}"
                                          if wrong else ""))
@@ -22612,10 +22704,10 @@ def _check_roster_read_one_place(s):
        "a /proc reader refuses a pid outside its unit's processes, and a value that is not "
        "a whole number, without reading it, answers it as gone and writes the refusal down, "
        "in a unit or outside one, and the fence reads nothing of a refused pid but the start "
-       "time its rules compare; it reads the run's own processes, a pid the run learned "
-       "while its start time is the one learned or once no process holds it, in that unit or "
-       "a later one, and in a unit declared to read the machine a pid the real table or "
-       "registry named while that pid's start time holds"),
+       "time its rules compare; it reads the run's own processes, a pid the run learned in "
+       "this process or in a tool run of its units, in that unit or a later one, and a pid a "
+       "declared unit's real table or registry named, each while its start time is the one "
+       "recorded when the run learned of it or once no process holds its number"),
       ('undeclared-units-see-no-processes',
        "a unit not declared to read the machine sees the processes under the selftest "
        "process that runs it and no others, and no session registry, through RESOLVER and "
@@ -22626,7 +22718,7 @@ def _check_roster_read_one_place(s):
        "it ends, a raise included, and puts back the fence's unit and the variable a tool "
        "run inherits"))
 def _check_process_reads_are_fenced(s):
-    """The process fence, its readers and the unit runner's edges.
+    """The process fence, its readers, and what ran_unit does as a unit starts and in its finally.
 
     Every refusal here is provoked on purpose, so each is provoked under a
     fence of this check's own, writing to a record of this check's own: the
@@ -22648,12 +22740,8 @@ def _check_process_reads_are_fenced(s):
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     wrapper, wrapper_started = None, ""
     try:
-        # Popen returns once the child's exec has begun, and until the exec has
-        # set its arguments its command line reads empty and a table leaves it
-        # out, so the tables below are taken once it is set.
-        deadline = time.monotonic() + 10
-        while not RESOLVER._cmdline(child.pid) and time.monotonic() < deadline:
-            time.sleep(0.01)
+        # The tables below are taken once the child's command line is set.
+        wait_for_command_line(child.pid)
         # The world the run gives this unit, through RESOLVER and an engine
         # made here, each still holding the six process inputs it was built with.
         made = Resolver(needs=Needs(maybe=set(NEED)))
@@ -22668,12 +22756,16 @@ def _check_process_reads_are_fenced(s):
                 {os.getpid(), child.pid} <= pids)
             seen[f"{name}'s table lists nothing outside this run"] = pids <= before | after
 
-        # A registry with one session in it, which this unit does not see and a
-        # declared unit, under a fence of this check's own, does.
+        # A registry with two sessions in it, which this unit does not see and a
+        # declared unit, under a fence of this check's own, does: this run's,
+        # and its parent's, a running process outside the run that only the
+        # registry names to the fence.
         sessions = room / "sessions"
         sessions.mkdir()
         (sessions / "fence-check.json").write_text(json.dumps(
             {"pid": os.getpid(), "sessionId": "fence-check"}))
+        (sessions / "fence-check-outside.json").write_text(json.dumps(
+            {"pid": os.getppid(), "sessionId": "fence-check-outside"}))
         was_sessions = globals()["SESSIONS_DIR"]
         globals()["SESSIONS_DIR"] = sessions
         try:
@@ -22684,12 +22776,16 @@ def _check_process_reads_are_fenced(s):
             fence.enter("declared", True)
             declared = Resolver(needs=Needs(maybe=set(NEED)))
             shown = declared._runtime(((os.getpid(), os.getppid(), ("python3",)),))["registry"]
-            fence.leave()
+            outside = declared._proc_stat(os.getppid())
+            registry_refused = fence.leave()
         finally:
             globals()["SESSIONS_DIR"] = was_sessions
             globals()["PROCESS_FENCE"] = runner
         seen["RESOLVER and the engine see no session registry, where a declared unit reads it"] = (
-            hidden == ((), ()) and [entry["pid"] for entry in shown] == [os.getpid()])
+            hidden == ((), ())
+            and sorted(entry["pid"] for entry in shown) == sorted([os.getpid(), os.getppid()]))
+        told["a declared unit reads a running pid outside the run that only the registry "
+             "named"] = outside[0] is not None and not registry_refused
 
         listed = [1, os.getppid(), os.getpid(), child.pid]
         fence = fence_of_own()
@@ -22717,7 +22813,7 @@ def _check_process_reads_are_fenced(s):
         seen["and its start time reader reads no process at all"] = (
             type(start_ms) is int and len(refused) == 3)
 
-        # The narrowing on a tree whose shape is known: a fence rooted at a
+        # The narrowing on a tree whose processes are known: a fence rooted at a
         # wrapper this check started sees the wrapper and the process under it,
         # and neither this process, its parent nor the sibling sleeper.
         wrapper = start_wrapped([FAKE_AGENT_BIN, "-c", '__import__("time").sleep(30)'])
@@ -22854,6 +22950,32 @@ def _check_process_reads_are_fenced(s):
         told["a grandchild the run learned in one unit reads as gone in the next once its "
              "parent reaped it, unrefused"] = (
             learned and reaped and later == (None, None, None) and not asked_after)
+        # A tool run of this fence's unit asks about a process this fence
+        # learned, and which has gone since, through the run's record of known
+        # pids: the tool run never saw it, and reads it as gone, unrefused.
+        fence.enter("hands down", False)
+        gone = subprocess.Popen(["true"], stdin=subprocess.DEVNULL)
+        gone.wait()
+        asking = subprocess.run(
+            [sys.executable, "-c",
+             "import importlib.machinery, importlib.util, sys\n"
+             "loader = importlib.machinery.SourceFileLoader('known_record_child', sys.argv[1])\n"
+             "tool = importlib.util.module_from_spec(importlib.util.spec_from_loader("
+             "loader.name, loader))\n"
+             "tool.__file__ = sys.argv[1]\n"
+             "loader.exec_module(tool)\n"
+             "fence = tool.adopt_inherited_fence()\n"
+             "read = tool.Resolver(needs=tool.Needs(maybe=set(tool.NEED)))._proc_stat("
+             "int(sys.argv[2]))\n"
+             "print(read == (None, None, None), len(fence.refused))\n",
+             str(Path(__file__).resolve()), str(gone.pid)],
+            capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+            env=dict(os.environ, **{FENCE_UNIT_VAR: fence.handed_down(),
+                                    FENCE_RECORD_VAR: fence.record}))
+        everything += fence.leave()
+        told["a tool run reads a pid this process learned and that has gone since as gone, "
+             "unrefused, from the run's record of known pids"] = (
+            asking.returncode == 0 and asking.stdout.split() == ["True", "0"])
         fence.enter("declared", True)
         fence.name([stranger])
         told["a unit declared to read the machine reads a pid a real listing named"] = (
@@ -22888,27 +23010,8 @@ def _check_process_reads_are_fenced(s):
             f"unit undeclared: stat of pid {stranger}" in lines
             and f"outside any unit: stat of pid {stranger}" in lines
             and [row[:3] for row in rows] == [(*TIER_PROCS[False], False)]
-            and rows[0][3].startswith(f"{len(written)} refused read(s): {lines[0]}; "))
+            and rows[0][3] == f"{len(written)} refused read(s): " + "; ".join(lines))
         globals()["PROCESS_FENCE"] = runner
-
-        # A process one walk misses while it moves inside the run: the first
-        # walk a new fence makes hides the sleeper this check started, as a
-        # walk between two children files can while a process's parent exits.
-        fence = fence_of_own()
-        real_tree, walks = fence._tree, []
-
-        def missing_first():
-            walks.append(len(walks))
-            tree = real_tree()
-            return tree - {child.pid} if len(walks) == 1 else tree
-
-        fence._tree = missing_first
-        fence.enter("undeclared", False)
-        moved = Resolver(needs=Needs(maybe=set(NEED)))._proc_stat(child.pid)
-        refused_moving = fence.leave()
-        globals()["PROCESS_FENCE"] = runner
-        told["a process one walk misses while it moves inside the run is read after the next "
-             "walk, unrefused"] = moved[0] is not None and not refused_moving and len(walks) >= 2
 
         # A fence made the way a run makes its own, from the record variable an
         # audit sets, writes its refusals to the file the variable names.
@@ -22933,8 +23036,9 @@ def _check_process_reads_are_fenced(s):
             and [(row.get("unit"), row.get("reader"), row.get("pid")) for row in lines]
             == [("variable", "stat", stranger)])
 
-        # The runner's edges, driven on a stand-in unit that raises Terminated,
-        # which ran_unit lets through, so only a finally can still clean up.
+        # What ran_unit does as a unit starts and in its finally, driven on a
+        # stand-in unit that raises Terminated, which ran_unit lets through, so
+        # only a finally can still clean up.
         fence = fence_of_own()
         handed = os.environ.get(FENCE_UNIT_VAR)
         left = ((stranger, 0, ("a table left by something else",)),)
@@ -22978,6 +23082,85 @@ def _check_process_reads_are_fenced(s):
             verdict('unit-runner-drops-process-caches', edges)]
 
 
+@unit(('fence-faults-are-named',
+       "a tool run whose unit variable does not parse ends before anything else runs, naming "
+       "the variable on stderr; a refusal its record cannot take reaches the tier's row in "
+       "the selftest process, and in a tool run ends the run, named on stderr"))
+def _check_fence_faults_are_named(s):
+    """adopt_inherited_fence on a value that does not parse, and note on a record it cannot write.
+
+    The record is a file in a directory that does not exist. The refusals are
+    provoked under a fence of this check's own, as the fence check provokes
+    its own, so the run's fence and its record see none of them. One tool run
+    is this tool as a person runs it; the other is a short program that loads
+    this file, installs its fence as main does first and reads pid 1, which is
+    outside every run.
+    """
+    room = Path(tempfile.mkdtemp(prefix=own("faults")))
+    runner, unwritable = PROCESS_FENCE, str(room / "missing" / "record.jsonl")
+    told = {}
+    try:
+        # main installs the fence before it reads its arguments, so a run asked
+        # only for --help ends there too.
+        malformed = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--help"],
+            capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+            env=dict(os.environ, **{FENCE_UNIT_VAR: "not a fence"}))
+        told["a tool run whose unit variable does not parse exits nonzero"] = (
+            malformed.returncode != 0)
+        told["naming the variable on stderr"] = FENCE_UNIT_VAR in malformed.stderr
+        told["and runs nothing after it"] = not malformed.stdout.strip()
+
+        # In the selftest process the line waits for the tier's row.
+        fence = _ProcessFence(unwritable)
+        globals()["PROCESS_FENCE"] = fence
+        fence.enter("faults", False)
+        Resolver(needs=Needs(maybe=set(NEED)))._proc_stat(1)
+        handed = fence.handed_down()
+        fence.leave()
+        globals()["PROCESS_FENCE"] = runner
+        rows, register = check_rows()
+        register_procs_row(register, False, fence)
+        told["a refusal the record cannot take is kept in the selftest process"] = (
+            len(fence.unwritten) == 1)
+        told["and the tier's row fails, naming it"] = (
+            [row[:3] for row in rows] == [(*TIER_PROCS[False], False)]
+            and "unit faults: stat of pid 1" in rows[0][3])
+
+        # A tool run of that unit has no row of its own, so the run ends.
+        reading = subprocess.run(
+            [sys.executable, "-c",
+             "import importlib.machinery, importlib.util, sys\n"
+             "loader = importlib.machinery.SourceFileLoader('fence_faults', sys.argv[1])\n"
+             "tool = importlib.util.module_from_spec(importlib.util.spec_from_loader("
+             "loader.name, loader))\n"
+             "tool.__file__ = sys.argv[1]\n"
+             "loader.exec_module(tool)\n"
+             "tool.adopt_inherited_fence()\n"
+             "def reads():\n"
+             "    tool.Resolver(needs=tool.Needs(maybe=set(tool.NEED)))._proc_stat(1)\n"
+             "    print('went on', flush=True)\n"
+             "    return 0\n"
+             "sys.exit(tool.answered(reads))\n",
+             str(Path(__file__).resolve())],
+            capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+            env=dict(os.environ, **{FENCE_UNIT_VAR: handed, FENCE_RECORD_VAR: unwritable}))
+        # warn wraps the message for a terminal, each continuation starting
+        # with WRAP_ARROW, and never splits a token, so it is read with the
+        # markers and the line breaks taken out.
+        said = " ".join(reading.stderr.replace(WRAP_ARROW, " ").split())
+        told["a tool run whose record cannot take a refusal exits nonzero"] = (
+            reading.returncode != 0)
+        told["naming the refusal on stderr"] = (
+            '"unit": "faults", "reader": "stat", "pid": 1}' in said)
+        told["and reads nothing after it"] = "went on" not in reading.stdout
+    finally:
+        globals()["PROCESS_FENCE"] = runner
+        shutil.rmtree(room, ignore_errors=True)
+    wrong = sorted(claim for claim, ok in told.items() if not ok)
+    return [_check_verdict('fence-faults-are-named', not wrong, ", ".join(wrong))]
+
+
 @unit(('tool-runs-inherit-their-unit-fence',
        "a tool run a unit starts reads processes by that unit's rule, rooted at the selftest "
        "process that runs the unit, and none once that root's start time is another; a "
@@ -23018,7 +23201,7 @@ def _check_tool_runs_inherit_their_unit_fence(s):
                        "--agent-id", ident], executable=sys.executable, stdin=sp.DEVNULL)
     stray, life = start_stray(room / "stray-pid", "--agent-id", ident, program=FAKE_AGENT_BIN)
     try:
-        time.sleep(0.3)          # let the victim reach the process table
+        wait_for_command_line(victim.pid)
 
         def preview(**given):
             run = sp.run([sys.executable, tool, "--agent-id", ident, "--stop", "--dry-run"],
@@ -23277,14 +23460,16 @@ def _check_ending_names_what_it_cannot_open(s):
 
 @unit(('stray-ends-when-its-making-raises',
        "a stray start_stray is making when an exception reaches it, once the stray has said "
-       "its pid, is ended before the exception leaves start_stray"))
+       "its pid, has exited within half a second of the exception leaving start_stray"))
 def _check_stray_ends_when_its_making_raises(s):
     """start_stray with a stand-in for time.sleep that raises once the stray has said its pid.
 
     The stand-in waits for the pid in the told file, opens a pidfd for it, and
-    raises Terminated, as SIGTERM would there. start_stray must end the stray
-    by that pid before the raise leaves it: the pidfd turns ready when the
-    stray exits, whichever process above this run reaps it.
+    raises Terminated, as SIGTERM would there. start_stray ends the stray by
+    that pid, through end_stray, which returns once the stray's life line has
+    closed, and the line closes as the stray exits. The pidfd turns ready when
+    the exit has finished, whichever process above this run reaps the stray,
+    a moment after the line closes, so the arm allows half a second for it.
     """
     checked = []
 
@@ -23318,7 +23503,7 @@ def _check_stray_ends_when_its_making_raises(s):
             raised = True
         finally:
             time.sleep = real_sleep
-        ended = "fd" in held and ready_to_read(held["fd"], 5.0)
+        ended = "fd" in held and ready_to_read(held["fd"], 0.5)
     finally:
         if "fd" in held:
             if not ready_to_read(held["fd"]):
@@ -23330,13 +23515,80 @@ def _check_stray_ends_when_its_making_raises(s):
     told = {
         "the exception left start_stray": raised,
         "the stray had said its pid": bool(held.get("pid")),
-        "and had ended before start_stray let the exception go": ended,
+        "and had exited within half a second of start_stray letting the exception go": ended,
     }
     wrong = sorted(claim for claim, ok in told.items() if not ok)
     check("stray-ends-when-its-making-raises",
           "a stray start_stray is making when an exception reaches it, once the stray has said "
-          "its pid, is ended before the exception leaves start_stray",
+          "its pid, has exited within half a second of the exception leaving start_stray",
           not wrong, ", ".join(wrong) + (f"; {held}" if wrong else ""))
+    return checked
+
+
+@unit(('walks-find-a-process-whose-parent-exits-mid-walk',
+       "a process whose parent exits while a walk reads the run's children files is found by "
+       "the walk all the same, also when it is handed to a subreaper below the run: "
+       "end_processes ends it rather than naming it as left, identity reads it and admit "
+       "lets it be read, unrefused, and an undeclared table lists it"))
+def _check_walks_find_a_process_whose_parent_exits_mid_walk(s):
+    """Each reader that walks, while a real parent exits in the middle of its walk.
+
+    Each reader runs in a run of its own, MID_WALK_FIXTURE: end_processes,
+    which reads through run_processes, with the parent left a zombie; identity
+    with it reaped; admit, which reads through _tree, with it left a zombie;
+    the engine's table, narrowed through the same _tree as an undeclared
+    unit's, with it reaped; and identity again with a subreaper between the
+    run and the parent, so the sleeper is handed to that subreaper and not to
+    the run. The fixture ends what it started; a sleeper of one that is still
+    running after is ended here.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    room = Path(tempfile.mkdtemp(prefix=own("mw")))
+    tool = str(Path(__file__).resolve())
+    said, told = {}, {}
+    try:
+        for label, reader, parent_ends in (
+                ("end_processes", "end_processes", "zombie"), ("identity", "identity", "reap"),
+                ("admit", "admit", "zombie"), ("table", "table", "reap"),
+                ("identity below a subreaper", "identity", "nested")):
+            answer = room / f"{reader}-{parent_ends}"
+            run = subprocess.run([sys.executable, "-B", "-c", MID_WALK_FIXTURE, tool, reader,
+                                  parent_ends, str(answer)],
+                                 stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                 timeout=120)
+            try:
+                said[label] = json.loads(answer.read_text())
+            except (OSError, ValueError):
+                said[label] = {"exit": run.returncode, "stderr": run.stderr.strip()[-300:]}
+        ending = said["end_processes"]
+        told["end_processes ends it rather than naming it as left"] = (
+            ending.get("fired") is True and ending.get("ended") == [ending.get("sleeper")]
+            and ending.get("left") == [] and ending.get("refused") == []
+            and ending.get("refusals") == [])
+        for label, claim in (("identity", "identity reads it, unrefused"),
+                             ("admit", "admit lets it be read, unrefused"),
+                             ("identity below a subreaper",
+                              "identity reads it when it is handed to a subreaper below the run, "
+                              "unrefused")):
+            told[claim] = (said[label].get("fired") is True and said[label].get("read") is True
+                           and said[label].get("refusals") == [])
+        told["an undeclared table lists it"] = (
+            said["table"].get("fired") is True and said["table"].get("read") is True)
+    finally:
+        end_left_behind([str(found.get("sleeper")) for found in said.values()
+                         if found.get("sleeper")])
+        shutil.rmtree(room, ignore_errors=True)
+    wrong = sorted(claim for claim, ok in told.items() if not ok)
+    check("walks-find-a-process-whose-parent-exits-mid-walk",
+          "a process whose parent exits while a walk reads the run's children files is found by "
+          "the walk all the same, also when it is handed to a subreaper below the run: "
+          "end_processes ends it rather than naming it as left, identity reads it and admit "
+          "lets it be read, unrefused, and an undeclared table lists it",
+          not wrong, ", ".join(wrong) + (f"; {said}" if wrong else ""))
     return checked
 
 
@@ -33633,7 +33885,7 @@ def _check_population_contains_roster(s):
     eng._projects_dir, eng._teams_dir = base / "projects", base / "teams"
     real_table = eng._process_table
     try:
-        time.sleep(0.3)          # let it reach the process table
+        wait_for_command_line(running.pid)
         with _FakeTmux(sockets=[]).installed(eng):
             eng._process_table = real_table
             crew_runtime = eng._team_runtime(crew)
@@ -44049,13 +44301,13 @@ def _check_shares_fold_into_one_run(s):
     def check(cid, name, ok, detail=""):
         checked.append((cid, name, ok, detail))
 
-    # What a share states about its own run, written out here rather than read
-    # from SHARE_SUMMARY_ROWS, so a row left out of that list shows up as the
-    # collision it would be: the declaration and ended rows tier_rows registers,
-    # and the mid-run, tmux and uniqueness rows run_selftest adds.
-    own_rows = (UNIT_DECLARED[True], UNIT_ENDED[True], RUNNER_CHECKS[0], TIER_TMUX[True],
-                TIER_CLAUDE[True], TIER_PROCS[True], TIER_ADOPTS[True], TIER_LEFT[True],
-                IDS_UNIQUE[True])
+    # What a share states about its own run: the mid-run row, and the live
+    # member of every tier row but the catalog one, which only the run that
+    # merged the shares states, a share having no catalog of its own. Taken
+    # from TIER_ROWS rather than from SHARE_SUMMARY_ROWS, so a tier row left
+    # out of that list shows up as the collision it would be.
+    own_rows = (RUNNER_CHECKS[0], *(pair[True] for pair in TIER_ROWS
+                                    if pair is not CATALOG_REPORTED))
 
     def summary(**failing):
         rows = {cid: (cid, said, True, "") for cid, said in own_rows}
@@ -44738,14 +44990,14 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=N
     # this record, set by that call for its length; the subreaper setting reads
     # the same in both where the kernel offers none.
     outermost = SELFTEST_IN_PROGRESS["call"] is None
-    if outermost:
-        SELFTEST_IN_PROGRESS["call"] = object()
     was_fence, was_handed = PROCESS_FENCE, os.environ.get(FENCE_UNIT_VAR)
     was_record = os.environ.get(FENCE_RECORD_VAR)
     was_tmpdir, was_path = os.environ.get("TMUX_TMPDIR"), os.environ.get("PATH")
     probe_socket = Resolver._socket_alive
     record_room = sockets = canary = adopted = None
     try:
+        if outermost:
+            SELFTEST_IN_PROGRESS["call"] = object()
         # This run's fence, rooted at this process whatever a unit that
         # started it handed down, so the units it runs read the processes
         # under it (_ProcessFence). Its refusals go to the record an audit
@@ -44867,8 +45119,8 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=N
                      f"the decoy was not armed: claude resolved to {claude_resolved}, "
                      f"a deliberate call recorded {claude_control}")
 
-        def register_adoption_row(register, tier):
-            """The tier's verdict on adoption, from an orphan made before its first unit and one made now."""
+        def adoption_said():
+            """What is wrong with this run's adoption, as sentences, from an orphan made before its first unit and one made now."""
             said = []
             for when, (taken, pid, ended) in (("before the first unit", adopted_before),
                                               ("after the last unit", orphan_adopted())):
@@ -44880,12 +45132,20 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=N
                                 "its line was closed")
             if outermost and adopted is None:
                 said.insert(0, "adopt_orphans could not make this process a subreaper")
+            return said
+
+        def register_adoption_row(register, tier):
+            """The tier's verdict on adoption, from adoption_said."""
+            said = adoption_said()
             register(*TIER_ADOPTS[tier], not said, "; ".join(said))
 
         def left_running():
-            """What this run's units left running, as sentences: finish_run's result for the
-            outermost call, and for a nested call what appeared under this process after it
-            began and still runs, which the outermost call ends."""
+            """What this run's units left running, as sentences.
+
+            finish_run's result for the outermost call; for a nested call, what
+            appeared under this process after it began and still runs, which the
+            outermost call ends.
+            """
             if outermost:
                 ended, left, refused = finish_run(diagnostics)
                 return ([f"ended {', '.join(map(str, ended))}"] if ended else []) \
@@ -44903,9 +45163,11 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=N
 
         def settle():
             """What the merging run of a split live tier found about itself, by summary row id."""
+            adoption = adoption_said()
             left = left_running()
             refused = refusal_lines(fence.refusals_in_run(), fence.root)
-            return {TIER_LEFT[True][0]: [f"the merging run: {line}" for line in left],
+            return {TIER_ADOPTS[True][0]: [f"the merging run: {line}" for line in adoption],
+                    TIER_LEFT[True][0]: [f"the merging run: {line}" for line in left],
                     TIER_PROCS[True][0]: [f"the merging run: {line}" for line in refused]}
 
         # What runs under this process as a nested call begins: it names only
