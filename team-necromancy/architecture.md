@@ -1038,6 +1038,23 @@ the source separately. An edit between those reads can make the executed code
 and the assertions describe different files. Accept a passing run only when the
 tree remained unchanged.
 
+While the selftest runs a unit, Resolver's `/proc` readers (`_proc_stat`,
+`_cmdline` and `_proc_env`, and through them `_pid_alive`, `_proc_start` and the
+tmux server fact) ask the run's process fence before reading. The fence admits
+the run's own process, the processes under it, and a process the run started
+that has since exited. A unit declared with `machine=True` reads the real
+machine on purpose and may also read every pid a real `/proc` listing named
+during the run. Any other pid is refused, answered as a process that does not
+exist, and ends the run as a raising unit does, with `every-unit-reported`
+naming the reader and pid. A unit that is not declared sees no processes at
+all: for its length RESOLVER answers from an empty synthetic world's process
+table, session registry and process readers, and every engine made in the unit
+gets the same, while sockets stay the engine's own. Fixtures number the
+processes they invent from `PID_CEILING` (1 << 22) up, which no process can
+hold. `proc_reader_audit.py` runs the tiers with the fence recording refusals
+instead of stopping and lists every unit that read a process its run did not
+start.
+
 Mutation scripts import `probe` and call `probe.expect(...)`. The function runs
 one clean suite and isolated mutants, then raises `ProbeFailure` if the clean run
 fails, a mutant crashes, no check bites, or the expected check does not bite.

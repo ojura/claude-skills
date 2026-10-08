@@ -145,6 +145,18 @@ TMUX_WINDOW = "swarm-view"
 SWARM_COLS, SWARM_ROWS = 220, 50
 SOCKET_PREFIX = "claude-swarm-"
 
+# No process on Linux can hold a pid at or above this. It is PID_MAX_LIMIT, the
+# largest value pid_max can take on a 64-bit kernel, so a pid numbered from here
+# up names nothing that runs. The selftest numbers the processes it invents from
+# here, which keeps a fixture's pid from naming a process on the machine.
+PID_CEILING = 1 << 22
+
+# Which processes the engine's /proc readers may read while the selftest runs
+# units. None outside the selftest, where every reader reads what it is asked;
+# while units run it is this process's _ProcessFence, which ran_unit installs
+# and consults.
+PROCESS_FENCE = None
+
 # isAgentSwarmsEnabled activates the --agent-id, --agent-name, and --team-name
 # triple in 2.1.220 and 2.1.226. Harness teammate spawns embed these variables in
 # each command because explicit pane commands run directly. Every pane and exec
@@ -1769,6 +1781,10 @@ class Resolver:
         self._teams_dir = TEAMS_DIR   # overridable so a test resolver can read a synthetic tree
         self._projects_dir = PROJECTS_DIR  # same, for the transcript tree
         self._rewriter = TranscriptRewriter()
+        # While the selftest runs a unit, the fence decides what processes an
+        # engine made there can see; outside the selftest it is None.
+        if PROCESS_FENCE is not None:
+            PROCESS_FENCE.engine_made(self)
 
     def _exercise(self, need):
         """Record one declared compute happening, or refuse an undeclared one."""
@@ -2407,6 +2423,8 @@ class Resolver:
         `pid_alive` and `state_note`. Field 2 can contain spaces and parentheses,
         so parsing starts after the final closing parenthesis.
         """
+        if not self._may_read(pid, "stat"):
+            return None, None, None
         try:
             stat = Path(f"/proc/{pid}/stat").read_text()
         except (OSError, ValueError):
@@ -2458,6 +2476,8 @@ class Resolver:
         with rather than what anyone since has set. Nothing outside can read
         it and stay honest: /proc/<pid>/environ is the only source.
         """
+        if not self._may_read(pid, "environ"):
+            return {}
         try:
             raw = Path(f"/proc/{pid}/environ").read_bytes()
         except OSError:
@@ -2487,12 +2507,25 @@ class Resolver:
 
     def _cmdline(self, pid):
         """One process's exact argv tuple from NUL-delimited procfs bytes."""
+        if not self._may_read(pid, "cmdline"):
+            return ()
         try:
             raw = Path(f"/proc/{pid}/cmdline").read_bytes()
         except OSError:
             return ()
         return tuple(item.decode("utf-8", "replace")
                      for item in raw.split(b"\0") if item)
+
+    @staticmethod
+    def _may_read(pid, reader):
+        """Whether `reader` may read this pid's /proc entry.
+
+        Outside the selftest, always. While its units run, the fence decides,
+        and a pid it refuses is answered as a process that does not exist,
+        without reading anything.
+        """
+        fence = PROCESS_FENCE
+        return fence is None or fence.admit(pid, reader)
 
     def _process_table(self, refresh=False):
         """Return one PID-sorted snapshot of process parentage and full argv.
@@ -2509,10 +2542,11 @@ class Resolver:
         if self._procs is not None and not refresh:
             return self._procs
         rows = []
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
-            pid = int(entry.name)
+        listed = [int(entry.name) for entry in Path("/proc").iterdir()
+                  if entry.name.isdigit()]
+        if PROCESS_FENCE is not None:
+            PROCESS_FENCE.saw_listed(listed)
+        for pid in listed:
             argv = self._cmdline(pid)
             if not argv:
                 continue
@@ -14766,6 +14800,9 @@ def set_tmux_target(session, window):
 # suite contains is a lookup rather than something a run discovers.
 UNITS = []
 
+# The units declared with machine=True, by function name.
+MACHINE_UNITS = set()
+
 # Checks the runner performs itself, because their subject is the run rather
 # than anything a unit can reach.
 RUNNER_CHECKS = (("live-checks-say-nothing-mid-run",
@@ -14807,6 +14844,20 @@ TIER_TMUX = {
 def ran_unit(run, s):
     """One unit's rows, and what ended the run when the unit did not report.
 
+    The engine's /proc readers ask this process's fence while the unit runs. A
+    unit that had one of them refused, because it named a process this run did
+    not start, ends the run here like a unit that raised, with the reader and
+    pid it named, whether or not the unit noticed the empty answer it got.
+    Under an audit, which names a record file in the fence variable, the
+    refusals go to that file instead and the run goes on, so one run lists
+    every unit that does it.
+
+    A unit not declared to read the machine sees no processes at all: for its
+    length RESOLVER answers from an empty synthetic world's process table,
+    session registry and process readers, put back here after the unit, and
+    every engine the unit makes gets the same through the fence's engine_made.
+    Sockets stay the engine's own.
+
     Returns (rows, None) from a unit that reported, and ([], what ended it)
     from one that exited or raised. The tier stops there rather than running
     what is left: a unit patches RESOLVER, tmux, sys.stdin and globals and
@@ -14824,23 +14875,184 @@ def ran_unit(run, s):
     discarded. SystemExit is still caught beside it, for a unit ended by
     something that is not a refusal at all.
     """
+    fence = _process_fence()
+    machine = run.__name__ in MACHINE_UNITS
+    fence.enter(run.__name__, machine)
+    engine = globals()["RESOLVER"]
+    kept = {name: vars(engine).get(name) for name in _FakeTmux.PROCESS_INPUTS}
+    if not machine:
+        _FakeTmux().attach_processes(engine)
     try:
-        return run(s), None
+        produced, stopped = run(s), None
     except KeyboardInterrupt:
         raise
     except Refusal as refused:
-        return [], f"refused: {refused.said}"
+        produced, stopped = [], f"refused: {refused.said}"
     except SystemExit as exc:
-        return [], f"SystemExit: {exc.code}"
+        produced, stopped = [], f"SystemExit: {exc.code}"
     except BaseException as exc:
         traceback.print_exc()
-        return [], f"{type(exc).__name__}: {exc}"
+        produced, stopped = [], f"{type(exc).__name__}: {exc}"
+    finally:
+        reads = fence.leave()
+        for name, value in kept.items():
+            if value is None:
+                vars(engine).pop(name, None)
+            else:
+                setattr(engine, name, value)
+    if reads and fence.record is None:
+        named = "; ".join(f"{reader} of pid {pid}" for _unit, reader, pid in reads[:4])
+        more = f" and {len(reads) - 4} more" if len(reads) > 4 else ""
+        return [], f"read processes this run did not start: {named}{more}"
+    return produced, stopped
 
 
-def unit(*ids, live=False):
-    """Register one unit of the suite under the ids it produces."""
+# The variable an audit sets to the file it wants the refusals in. Derived from
+# the tool's name so a copy under another name keeps its own.
+FENCE_RECORD_VAR = f"{TOOL.upper().replace('-', '_')}_SELFTEST_FENCE"
+
+
+class _ProcessFence:
+    """Which processes a selftest unit may read through the engine's /proc readers.
+
+    A fixture can name any pid, and a real process may hold that number: the
+    engine would then read a stranger's command line, state or environment,
+    and what a check concluded would depend on what happened to run on the
+    machine. So while a unit runs, each reader asks here first. A unit may read
+    this run's own process, any process this run started while it is still
+    under it, and one this run started that has since gone, where the read
+    finds nothing. A unit declared with machine=True reads the real machine on
+    purpose and may also read every pid a real /proc listing named during the
+    run, in that unit or an earlier one, since an engine keeps the table it
+    read and a later unit may use it. Any other pid is refused, written down
+    against the unit, and answered as a process that does not exist.
+
+    Popen tells the fence about every process it starts, so a child that
+    exited before anyone asked about it still counts as this run's. The
+    processes under this run are found by walking /proc/<pid>/task/*/children
+    down from it, which reads only this run's own processes.
+    """
+
+    def __init__(self, record=None):
+        self.root = os.getpid()
+        self.record = record
+        self.started = set()
+        self.unit, self.machine = None, False
+        self.listed, self.refused, self.under = set(), [], set()
+
+    def enter(self, name, machine):
+        """Begin one unit: its refusals and the processes under it start empty."""
+        self.unit, self.machine = name, machine
+        self.refused, self.under = [], set()
+
+    def leave(self):
+        """End the unit; return its refusals, and write them for an audit."""
+        refused = self.refused
+        if refused and self.record:
+            with open(self.record, "a") as out:
+                for unit, reader, pid in refused:
+                    out.write(json.dumps({"runner": self.root, "unit": unit,
+                                          "reader": reader, "pid": pid}) + "\n")
+        self.unit, self.machine = None, False
+        self.refused, self.under = [], set()
+        return refused
+
+    def spawned(self, pid):
+        """Popen started this process for this run."""
+        self.started.add(pid)
+
+    def engine_made(self, engine):
+        """An engine made inside a unit that does not read the machine sees no
+        processes: an empty synthetic world's process inputs, its sockets its
+        own. A unit that wants processes installs a world over it."""
+        if self.unit is not None and not self.machine:
+            _FakeTmux().attach_processes(engine)
+
+    def saw_listed(self, pids):
+        """A real /proc listing named these pids; a declared unit may read them."""
+        self.listed.update(pids)
+
+    def admit(self, pid, reader):
+        """Whether reader may read pid; a refusal is written down against the unit."""
+        try:
+            number = int(pid)
+        except (TypeError, ValueError):
+            return True  # names no process, so reading it finds nothing
+        if number == self.root:
+            return True
+        if self.machine and number in self.listed:
+            return True
+        if number in self.under or number in self._under():
+            return True
+        if number in self.started and not self._exists(number):
+            return True
+        if self.unit is not None:
+            self.refused.append((self.unit, reader, number))
+        return False
+
+    def _under(self):
+        """Every process under this run now, by its children files."""
+        found, frontier = set(), [self.root]
+        while frontier:
+            parent = frontier.pop()
+            try:
+                tasks = list(Path(f"/proc/{parent}/task").iterdir())
+            except OSError:
+                continue
+            for task in tasks:
+                try:
+                    children = (task / "children").read_text().split()
+                except OSError:
+                    continue
+                for child in map(int, children):
+                    if child not in found:
+                        found.add(child)
+                        frontier.append(child)
+        self.under = found
+        return found
+
+    @staticmethod
+    def _exists(pid):
+        """Whether any process holds pid, by signal 0, which reads nothing."""
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+
+def _process_fence():
+    """This process's fence, installed the first time one of its units runs.
+
+    Popen is told to report what it starts from then on. A selftest process
+    runs units and nothing else, so neither is put back.
+    """
+    global PROCESS_FENCE
+    if PROCESS_FENCE is None:
+        fence = _ProcessFence(os.environ.get(FENCE_RECORD_VAR) or None)
+        started = subprocess.Popen.__init__
+
+        def reporting(popen, *args, **kwargs):
+            started(popen, *args, **kwargs)
+            fence.spawned(popen.pid)
+
+        subprocess.Popen.__init__ = reporting
+        PROCESS_FENCE = fence
+    return PROCESS_FENCE
+
+
+def unit(*ids, live=False, machine=False):
+    """Register one unit of the suite under the ids it produces.
+
+    machine=True declares a unit that reads the real machine's processes on
+    purpose; the fence lets it read what the real process table lists.
+    """
     def take(run):
         UNITS.append((run.__name__, ids, run, live))
+        if machine:
+            MACHINE_UNITS.add(run.__name__)
         return run
     return take
 
@@ -15444,7 +15656,7 @@ def _check_team_rebuild_preview(s):
     # still all that ties its transcript to the team, so nothing corroborates
     # it either. A lead resumed with --agent-id states in its own argv that it
     # runs as the team's lead, which corroborates the transcript it holds.
-    lead_pid = os.getpid() + 1000000
+    lead_pid = PID_CEILING + 1000000
     lead_id = agent_id_of("team-lead", team)
     lead_argv = (FAKE_AGENT_BIN, "--resume", sessions["team-lead"])
     leads = {
@@ -15584,7 +15796,7 @@ def _check_every_lead_rung_carries_a_claim(s):
     # --agent-id leaves in the roster it creates.
     boot = "99999999-9999-4999-8999-999999999999"
     plain, minted = "session-preview-rebuild", "session-33333333"
-    lead_pid = os.getpid() + 1000000
+    lead_pid = PID_CEILING + 1000000
     resumed = (FAKE_AGENT_BIN, "--resume", lead)
     flag_bound = resumed + ("--agent-id", agent_id_of("team-lead", plain))
     member_argv = (FAKE_AGENT_BIN, "--resume", alpha,
@@ -15821,12 +16033,12 @@ def _check_team_batch_revalidation(s):
     stable_server = {
         "socket": "claude-swarm-test", "path": Path("/fixture/socket"),
         "socket_generation": (1, 2, 3, 4), "alive": True,
-        "server": {"pid": 7000, "ppid": 1, "proc_start": "start",
+        "server": {"pid": PID_CEILING + 7000, "ppid": 1, "proc_start": "start",
                    "argv": ("tmux",), "state": "R"},
         "session_live": True,
         "panes": ({
-            "session": TMUX_SESSION, "window": "@0", "pane": "%0", "pid": 7001,
-            "root": {"pid": 7001, "ppid": 7000, "proc_start": "pane-start",
+            "session": TMUX_SESSION, "window": "@0", "pane": "%0", "pid": PID_CEILING + 7001,
+            "root": {"pid": PID_CEILING + 7001, "ppid": PID_CEILING + 7000, "proc_start": "pane-start",
                      "argv": ("claude",), "state": "R"},
         },),
         "base_url": "", "clients": 0, "state": "live",
@@ -15862,7 +16074,7 @@ def _check_team_batch_revalidation(s):
           f"target={running['generation'] == moved['generation']}")
 
     process = immutable({
-        "pid": 8000, "ppid": 1, "proc_start": "process-start",
+        "pid": PID_CEILING + 8000, "ppid": 1, "proc_start": "process-start",
         "proc_state": "R", "argv": ("claude", "--agent-id", "member@team"),
         "agent_id": "member@team", "session": "session-id", "team": "team",
         "seat": Seat("claude-swarm-test", "%0"),
@@ -15894,7 +16106,7 @@ def _check_team_batch_revalidation(s):
     return checked
 
 
-@unit(('abort-stops-listed', 'an abort stops what it listed'), ('abort-listing-describes', 'the abort listing says what each process is doing'), live=True)
+@unit(('abort-stops-listed', 'an abort stops what it listed'), ('abort-listing-describes', 'the abort listing says what each process is doing'), live=True, machine=True)
 def _check_abort_stops_listed(s):
     checked = []
 
@@ -15938,7 +16150,7 @@ def _check_abort_stops_listed(s):
     return checked
 
 
-@unit(('abort-refusal-spares', 'answering no leaves the process alone'), live=True)
+@unit(('abort-refusal-spares', 'answering no leaves the process alone'), live=True, machine=True)
 def _check_abort_refusal_spares(s):
     checked = []
 
@@ -15980,7 +16192,8 @@ def _check_abort_refusal_spares(s):
     return checked
 
 
-@unit(('smoke-typed-commands', 'the commands a person types end in a message, not a traceback'), live=True)
+@unit(('smoke-typed-commands', 'the commands a person types end in a message, not a traceback'),
+      live=True, machine=True)
 def _check_smoke_typed_commands(s):
     checked = []
 
@@ -16144,7 +16357,7 @@ def _check_stop_preview_ends_nothing(s):
     return checked
 
 
-@unit(('process-table-width-independent', 'the process table is the same at a narrow and a wide terminal'), ('liveness-width-independent', 'an agent that is running is seen as running at either terminal width'), live=True)
+@unit(('process-table-width-independent', 'the process table is the same at a narrow and a wide terminal'), ('liveness-width-independent', 'an agent that is running is seen as running at either terminal width'), live=True, machine=True)
 def _check_process_table_width_independent(s):
     checked = []
 
@@ -16378,7 +16591,8 @@ def _check_poison_preview_changes_nothing(s):
     return checked
 
 
-@unit(('help-is-inert', 'asking for the flags beside a verb does that verb no work'), live=True)
+@unit(('help-is-inert', 'asking for the flags beside a verb does that verb no work'), live=True,
+      machine=True)
 def _check_help_is_inert(s):
     """--help answers a question about the command line, so it must act like
     --dry-run acts: say something and change nothing.
@@ -16563,7 +16777,7 @@ def _check_runtime_reuses_supplied_snapshot(s):
     def check(cid, name, ok, detail=""):
         checked.append((cid, name, ok, detail))
 
-    chosen_pid, default_pid = 741001, 741002
+    chosen_pid, default_pid = PID_CEILING + 741001, PID_CEILING + 741002
     chosen_session = "88888888-8888-4888-8888-888888888888"
     chosen_table = ((chosen_pid, 1, (FAKE_AGENT_BIN, "--resume", chosen_session)),)
     default_table = ((default_pid, 1, (FAKE_AGENT_BIN, "--resume", chosen_session)),)
@@ -16699,7 +16913,8 @@ def _check_shares_cover_the_tier_once(s):
 
 
 @unit(("smoke-counts-only-what-it-started",
-       "the smoke tier counts processes it started, not the machine's"), live=True)
+       "the smoke tier counts processes it started, not the machine's"), live=True,
+      machine=True)
 def _check_smoke_counts_only_what_it_started(s):
     checked = []
 
@@ -17003,15 +17218,15 @@ def _check_doctor_reports_a_connected_team(s):
         # Both wearing the team, as rows rather than processes: what doctor
         # reads is the process table, and spawning two real sleeps to be read
         # there costs two processes and proves nothing more.
-        running = ((717171, 1, (FAKE_AGENT_BIN, "--resume", lead_session,
+        running = ((PID_CEILING + 717171, 1, (FAKE_AGENT_BIN, "--resume", lead_session,
                                 "--agent-id", f"team-lead@{team}")),
-                   (717172, 1, (FAKE_AGENT_BIN, "--resume", watcher_session,
+                   (PID_CEILING + 717172, 1, (FAKE_AGENT_BIN, "--resume", watcher_session,
                                 "--agent-id", f"watcher@{team}")))
         eng = Resolver(needs=Needs(maybe=set(NEED)))
         eng._projects_dir, eng._teams_dir = base / "projects", teams
         fake = _FakeTmux(processes=running, sockets=[f"{SOCKET_PREFIX}{team}"],
                          panes=[{"session": TMUX_SESSION, "window": "0",
-                                 "pane": "%0", "pid": 717171}])
+                                 "pane": "%0", "pid": PID_CEILING + 717171}])
         with fake.installed(eng), capturing("out") as out, capturing("err"):
             code = run_doctor(types.SimpleNamespace(
                 team=team, agent_id=None, all_members=True, resume=None))
@@ -17600,7 +17815,11 @@ def _suite_context():
         corpus = Path(__file__).resolve().parent / "test" / "corpus"
         eng._projects_dir = corpus / "projects"
         eng._teams_dir = corpus / "teams"
-        return eng
+        # The corpus holds conversations and rosters and nothing that runs: no
+        # process, session registry or socket. An empty synthetic world is that
+        # answer, so the engine reads none of the machine's. A unit that wants
+        # processes installs its own world over this one.
+        return _FakeTmux().attach(eng)
 
     source = Path(__file__).resolve().read_text()
     tree = ast.parse(source)
@@ -18616,7 +18835,7 @@ def _check_member_redirect_operation(s):
             lead_argv += ("--resume", source_lead_session)
         if not plain_lead:
             lead_argv += ("--agent-id", source_lead)
-        table = ((424242, 1, lead_argv),)
+        table = ((PID_CEILING + 424242, 1, lead_argv),)
         eng._process_table = lambda refresh=False: table
         launch = eng.launch_plan(
             agent_id=mover, table=table, terminal=TerminalContext())
@@ -18726,7 +18945,7 @@ def _check_member_redirect_operation(s):
 
             unknown = fixture(root, "unknown-team", automatic=True, plain_lead=True)
             unknown_lead = unknown.launch["process"]["lead"]
-            known_process = (unknown_lead["pid"] == 424242
+            known_process = (unknown_lead["pid"] == PID_CEILING + 424242
                              and unknown_lead["alive"] and unknown_lead["exact"]
                              and unknown_lead["runs_as"] is None)
             unknown_result, unknown_error = None, None
@@ -18987,7 +19206,7 @@ def _check_lead_migration_operation(s):
                 "alive": False, "server": None, "session_live": False,
                 "panes": (), "base_url": "", "clients": 0, "state": "no server",
             })
-            table = ((525252, 1, (FAKE_AGENT_BIN, "--resume", source_session,
+            table = ((PID_CEILING + 525252, 1, (FAKE_AGENT_BIN, "--resume", source_session,
                                   "--agent-id", lead_id)),)
             eng._process_table = lambda refresh=False: table
             launch = eng.launch_plan(
@@ -19066,9 +19285,9 @@ def _check_lead_migration_operation(s):
                 .replace(b"tail\"}", b"tail\xff\"}") + b"\n")
             roster(plain, plain_session)
             plain_table = (
-                (626262, 1, (FAKE_AGENT_BIN, "--resume", plain_session,
+                (PID_CEILING + 626262, 1, (FAKE_AGENT_BIN, "--resume", plain_session,
                              "--agent-id", plain_id)),
-                (626263, 1, (FAKE_AGENT_BIN, "--agent-id",
+                (PID_CEILING + 626263, 1, (FAKE_AGENT_BIN, "--agent-id",
                              agent_id_of("observer", plain))),
             )
             eng._process_table = lambda refresh=False: plain_table
@@ -19176,7 +19395,7 @@ def _check_roster_read_one_place(s):
     # commands, so the bans on asking those questions outside the engine would
     # otherwise read it as a second place that asks them.
     suite_fns = s.suite_fns
-    suite_classes = s.suite_classes = {"_FakeTmux"}
+    suite_classes = s.suite_classes = {"_FakeTmux", "_ProcessFence"}
     selftest_lines = set()
     for n in ast.walk(tree):
         if isinstance(n, ast.FunctionDef) and n.name in suite_fns:
@@ -19210,8 +19429,128 @@ def _check_roster_read_one_place(s):
     return checked
 
 
+@unit(('process-reads-are-fenced',
+       "a /proc reader refuses a pid this run did not start and answers it as gone, "
+       "and reads this run's own processes, and in a unit declared to read the machine "
+       "the pids the real table listed"),
+      ('undeclared-units-see-no-processes',
+       "a unit not declared to read the machine sees no processes or session registry "
+       "through RESOLVER or any engine it makes, their sockets stay their own, and "
+       "RESOLVER gets its inputs back when the unit ends; a declared unit is left as it is"))
+def _check_process_reads_are_fenced(s):
+    # This unit is not declared to read the machine, so the runner has given
+    # RESOLVER a world with no processes for its length, and an engine made here
+    # gets one too. Their socket inputs stay the engine's own.
+    made = Resolver(needs=Needs(maybe=set(NEED)))
+    blind = {}
+    for name, engine in (("RESOLVER", RESOLVER), ("an engine made in the unit", made)):
+        world = getattr(engine._process_table, "world", None)
+        blind[f"{name} sees no processes"] = (
+            world is not None and not world.process_rows()
+            and getattr(engine._proc_stat, "world_reader", False)
+            and getattr(engine._cmdline, "world_reader", False))
+        blind[f"{name} sees no session registry"] = (
+            world is not None and getattr(engine._session_registry, "__self__", None) is world
+            and not world.session_rows())
+        blind[f"{name} keeps its own sockets"] = all(
+            getattr(getattr(engine, attr), "__func__", None) is getattr(Resolver, attr)
+            for attr in ("_swarm_sockets", "_socket_alive"))
+
+    # The runner's swap itself, driven on two stand-in units under a fence of
+    # this check's own: the undeclared one gets a fresh world and RESOLVER has
+    # its inputs back after it; the declared one is left with what RESOLVER had.
+    def before_and_after():
+        return {name: vars(RESOLVER).get(name) for name in _FakeTmux.PROCESS_INPUTS}
+
+    seen = {}
+
+    def undeclared_stand_in(_s):
+        seen["undeclared"] = getattr(RESOLVER._process_table, "world", None)
+        return []
+
+    def declared_stand_in(_s):
+        seen["declared"] = getattr(RESOLVER._process_table, "world", None)
+        return []
+
+    outer = getattr(RESOLVER._process_table, "world", None)
+    runner = PROCESS_FENCE
+    globals()["PROCESS_FENCE"] = _ProcessFence()
+    MACHINE_UNITS.add(declared_stand_in.__name__)
+    try:
+        before = before_and_after()
+        ran_unit(undeclared_stand_in, s)
+        blind["an undeclared unit runs in a world of its own"] = (
+            seen.get("undeclared") is not None and seen["undeclared"] is not outer)
+        blind["and RESOLVER has its inputs back after it"] = all(
+            value is before[name] for name, value in before_and_after().items())
+        ran_unit(declared_stand_in, s)
+        blind["a declared unit is left with what RESOLVER had"] = (
+            seen.get("declared") is outer
+            and all(value is before[name] for name, value in before_and_after().items()))
+    finally:
+        MACHINE_UNITS.discard(declared_stand_in.__name__)
+        globals()["PROCESS_FENCE"] = runner
+    unseen = sorted(k for k, ok in blind.items() if not ok)
+    # A pid at or above PID_CEILING names nothing that runs, so a reader that
+    # failed to refuse it still reads nothing; pid 1 is running and never this
+    # run's, and is read here only through stat, which holds no secret.
+    invented, stranger = PID_CEILING + 7, 1
+    runner = PROCESS_FENCE
+    fence = _ProcessFence()
+    child = subprocess.Popen(["sleep", "30"])
+    told = {}
+    globals()["PROCESS_FENCE"] = fence
+    try:
+        # Made under this check's own fence before it enters a unit, so the
+        # engine keeps its own readers, which are what this checks. An engine
+        # made inside an undeclared unit gets a world with no processes.
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
+        fence.enter("unit", False)
+        answers = (eng._proc_stat(invented), eng._cmdline(invented),
+                   eng._proc_env(invented, ("PATH",)))
+        told["each reader refuses a pid nothing started"] = (
+            sorted(reader for _unit, reader, pid in fence.refused if pid == invented)
+            == ["cmdline", "environ", "stat"])
+        told["and answers it as a process that does not exist"] = (
+            answers == ((None, None, None), (), {}))
+        before = len(fence.refused)
+        eng._pid_alive(stranger)
+        eng._proc_start(stranger)
+        told["a running process this run did not start is refused through stat"] = (
+            [(reader, pid) for _unit, reader, pid in fence.refused[before:]]
+            == [("stat", stranger), ("stat", stranger)])
+        before = len(fence.refused)
+        told["this run's own process is read"] = eng._proc_stat(os.getpid())[0] is not None
+        told["and so is a process it started"] = (
+            eng._proc_stat(child.pid)[0] is not None
+            and "sleep" in eng._cmdline(child.pid))
+        fence.spawned(child.pid)
+        child.kill()
+        child.wait()
+        told["one it started that has gone reads as gone"] = (
+            eng._proc_stat(child.pid) == (None, None, None))
+        told["and none of those was refused"] = len(fence.refused) == before
+        fence.leave()
+        fence.enter("declared", True)
+        fence.saw_listed([stranger])
+        told["a unit declared to read the machine reads what the real table listed"] = (
+            eng._proc_stat(stranger)[0] is not None and not fence.refused)
+        eng._proc_stat(invented)
+        told["but not a pid the table did not list"] = (
+            [(reader, pid) for _unit, reader, pid in fence.refused] == [("stat", invented)])
+        fence.leave()
+    finally:
+        globals()["PROCESS_FENCE"] = runner
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+    wrong = sorted(k for k, ok in told.items() if not ok)
+    return [_check_verdict('process-reads-are-fenced', not wrong, ", ".join(wrong)),
+            _check_verdict('undeclared-units-see-no-processes', not unseen, ", ".join(unseen))]
+
+
 @unit(('synthetic-tmux-allowlist-is-exact',
-       'the suite-support allowlist names exactly the one fixture'),
+       'the suite-support allowlist names exactly the one fixture and the process fence'),
       ('synthetic-tmux-defined-once',
        'the synthetic tmux fixture is defined once'),
       ('synthetic-tmux-no-second-fixture',
@@ -19238,8 +19577,8 @@ def _check_synthetic_tmux_is_one_fixture(s):
     # exemption and the policy are separate statements, and this one has to be
     # edited on purpose, with this name in the diff.
     check("synthetic-tmux-allowlist-is-exact",
-          "the suite-support allowlist names exactly the one fixture",
-          s.suite_classes == {"_FakeTmux"}, repr(sorted(s.suite_classes)))
+          "the suite-support allowlist names exactly the one fixture and the process fence",
+          s.suite_classes == {"_FakeTmux", "_ProcessFence"}, repr(sorted(s.suite_classes)))
 
     fixtures = [n for n in ast.walk(tree)
                 if isinstance(n, ast.ClassDef) and n.name == "_FakeTmux"]
@@ -19341,7 +19680,7 @@ def _check_synthetic_tmux_is_one_fixture(s):
         try:
             with probe.installed(eng):
                 swapped = (globals()["tmux"] is probe and globals()["RESOLVER"] is eng
-                           and eng._process_table == probe.process_rows
+                           and getattr(eng._process_table, "world", None) is probe
                            and eng._session_registry == probe.session_rows)
                 raise ZeroDivisionError("a unit failing part-way through its fixture")
         except ZeroDivisionError:
@@ -20779,6 +21118,14 @@ def _check_claim_precedes_spawn_and_is_given_back(s):
     return checked
 
 
+def _invented_pid(pid):
+    """Whether pid is one the selftest invented: numbered at or above PID_CEILING."""
+    try:
+        return int(pid) >= PID_CEILING
+    except (TypeError, ValueError):
+        return False
+
+
 class _FakeTmux:
     """A tmux server kept in a dict, answering the command surface the tool
     uses. It also owns the process table and session registry associated
@@ -20802,7 +21149,7 @@ class _FakeTmux:
         self.attached_at = None
         self.env, self.ran, self.fail = {}, [], set()
         self.next_pane = 1 + max([int(p["pane"][1:]) for p in self.panes] or [-1])
-        self.next_pid = 1 + max([int(p["pid"]) for p in self.panes] or [4241])
+        self.next_pid = 1 + max([int(p["pid"]) for p in self.panes] or [PID_CEILING + 4241])
         # Named sockets this fixture claims exist and answer. A directory that
         # is never read: the fixture answers both the listing and the liveness
         # probe, so nothing stats or connects to this path.
@@ -20811,6 +21158,31 @@ class _FakeTmux:
 
     def process_rows(self, refresh=False):
         return list(self.processes)
+
+    @staticmethod
+    def _world_reader(answer, real):
+        """answer bound to the engine's own reader, marked as this world's."""
+        def reader(pid):
+            return answer(pid, real=real)
+        reader.world_reader = True
+        return reader
+
+    def proc_stat(self, pid, real=None):
+        """A pid this world invented runs nowhere, so it has no state or start.
+
+        Invented pids are numbered from PID_CEILING up. A lower pid is a real
+        process, the suite's own or one it started, and is read for real,
+        through the engine's own reader and its fence.
+        """
+        if _invented_pid(pid):
+            return None, None, None
+        return real(pid)
+
+    def cmdline(self, pid, real=None):
+        """An invented pid has no command line; a real one is read for real."""
+        if _invented_pid(pid):
+            return ()
+        return real(pid)
 
     def process_env(self, pid, names):
         """This world's processes carry no environment.
@@ -20841,12 +21213,48 @@ class _FakeTmux:
         name = socket.name if isinstance(socket, Path) else socket
         return name in self.sockets
 
+    # What attach_processes replaces on the engine: the process table, the
+    # session registry and the readers that answer for one process.
+    PROCESS_INPUTS = ("_process_table", "_session_registry", "_process_start_ms",
+                      "_proc_env", "_proc_stat", "_cmdline")
+
     # What attach replaces on the engine, named once so the restore below
     # cannot fall behind it: adding an input here and forgetting to put it
     # back is exactly the leak this pair exists to prevent.
-    ENGINE_INPUTS = ("_process_table", "_session_registry",
-                     "_swarm_sockets", "_socket_alive", "_process_start_ms",
-                     "_proc_env")
+    ENGINE_INPUTS = PROCESS_INPUTS + ("_swarm_sockets", "_socket_alive")
+
+    def attach_processes(self, engine):
+        """Give a Resolver this world's processes, session registry and process
+        readers, and leave its sockets as they are.
+
+        The runner gives every engine a unit makes this way, and RESOLVER for
+        the length of the unit, unless the unit is declared to read the
+        machine (see _ProcessFence.engine_made and ran_unit).
+        """
+        # The engine's own table counts reading it as computing PROCS, and a
+        # verb's evidence audit holds it to what it declared; the world's table
+        # is read in its place, so it counts the same.
+        def process_table(refresh=False):
+            engine._exercise(NEED.PROCS)
+            return self.process_rows(refresh)
+        process_table.world = self
+        engine._process_table = process_table
+        engine._session_registry = self.session_rows
+        engine._process_start_ms = self.process_started
+        engine._proc_env = self.process_env
+        # A unit that put its own reader on the engine keeps it; otherwise the
+        # world answers, reading through the engine's class for a real pid. A
+        # restore by installed() leaves the class's own reader on the instance,
+        # and an earlier attach leaves a world's; neither is a unit's.
+        for name, answer in (("_proc_stat", self.proc_stat), ("_cmdline", self.cmdline)):
+            current = vars(engine).get(name)
+            own = getattr(type(engine), name)
+            if (current is None or getattr(current, "__func__", None) is own
+                    or getattr(current, "world_reader", False)):
+                setattr(engine, name, self._world_reader(answer, own.__get__(engine)))
+        if self.attached_at is None:
+            self.attached_at = int(time.time() * 1000)
+        return engine
 
     def attach(self, engine):
         """Give a Resolver this fixture's process, session and socket inputs.
@@ -20857,14 +21265,9 @@ class _FakeTmux:
         depend on what happened to be running on the box. An empty set is an
         answer: this world has no sockets.
         """
-        engine._process_table = self.process_rows
-        engine._session_registry = self.session_rows
+        self.attach_processes(engine)
         engine._swarm_sockets = self.socket_paths
         engine._socket_alive = self.socket_is_alive
-        engine._process_start_ms = self.process_started
-        engine._proc_env = self.process_env
-        if self.attached_at is None:
-            self.attached_at = int(time.time() * 1000)
         return engine
 
     @contextlib.contextmanager
@@ -21230,7 +21633,7 @@ def _check_member_redirect_through_cli(s):
     # something real to set aside. A row is all it takes: the guard reads the
     # process table, and spawning a process to be read there costs a process
     # and proves nothing this does not.
-    wearing_source = ((909090, 1,
+    wearing_source = ((PID_CEILING + 909090, 1,
                        (FAKE_AGENT_BIN, "--agent-id", f"team-lead@{source}")),)
 
     status, _entry, _fake, said = resume_run(
@@ -21334,7 +21737,7 @@ def _check_lead_migration_takes_the_lead(s):
     # A second process wearing the source team and holding nothing. --force may
     # set a wearer aside; it may never set aside one holding a stamped
     # transcript, which is why this row carries no --resume.
-    wearing_source = ((919191, 1,
+    wearing_source = ((PID_CEILING + 919191, 1,
                        (FAKE_AGENT_BIN, "--agent-id", f"observer@{source}")),)
 
     status, _entry, _fake, said = resume_run(
@@ -21582,7 +21985,7 @@ def _check_synthetic_sockets_do_not_couple_engines(s):
 
 
 @unit(('seat-finds-wrapped-agent',
-       'the seat resolver finds an agent wrapped inside the pane root process'))
+       'the seat resolver finds an agent wrapped inside the pane root process'), machine=True)
 def _check_seat_finds_wrapped_agent(s):
     checked = []
 
@@ -21997,10 +22400,10 @@ def _check_promoted_member_resolves_by_its_receipt(s):
             "table": (), "records": (), "by_pid": {}, "by_agent": {},
             "by_transcript": {}, "by_session": {}, "by_seat": {}, "registry": (),
             "best_by_session": {}, "transcripts": {}, "live_sessions": [{
-                "pid": 4242, "alive": True, "session": None, "team": None,
+                "pid": PID_CEILING + 4242, "alive": True, "session": None, "team": None,
                 "agent_id": None, "started": 0}]}
         runtime_eng._lead_process = lambda snapshot, parent, team, census=None: {
-            "pid": 4242, "alive": True, "how": "fixture live lead",
+            "pid": PID_CEILING + 4242, "alive": True, "how": "fixture live lead",
             "detail": "fixture live lead", "exact": True, "kind": "registry",
         }
         runtime_eng._boot_join = lambda snapshot, census=None: []
@@ -22783,7 +23186,7 @@ def _check_lead_rebind_crew_report(s):
 
         # The guards, unchanged, reached through the lead path: one live member
         # of the team the stamps name, and the reap it would need refuses.
-        alive_member = [(4242, 1,
+        alive_member = [(PID_CEILING + 4242, 1,
                          (FAKE_AGENT_BIN, "--agent-id", "willow@session-corpus-alpha"))]
         try:
             blocked, _e, _s, blocked_said = resume_run(
@@ -22797,7 +23200,7 @@ def _check_lead_rebind_crew_report(s):
         held = []
         if blocked != "refused":
             held.append(f"a live-membered team did not block the move ({blocked})")
-        for owed in ("pid 4242 runs as it", "--force instead rewrites"):
+        for owed in (f"pid {PID_CEILING + 4242} runs as it", "--force instead rewrites"):
             if owed not in told:
                 held.append(f"the refusal does not say {owed!r}")
         if (lead_receipts / "session-corpus-alpha.json").exists():
@@ -22958,14 +23361,14 @@ def _check_member_rebind_preview_launches(s):
 
         # Blocked, and the run stops where it always did: a live process runs
         # under the source-team identity, and --force was not requested.
-        source_process = [(4242, 1,
+        source_process = [(PID_CEILING + 4242, 1,
                            (FAKE_AGENT_BIN, "--agent-id", "echo@session-corpus-alpha"))]
         for tense, over in (("preview", {"dry_run": True}), ("run", {})):
             stopped, _e, _s, stopped_said = member_move(table=source_process, **over)
             blocked_told = " ".join(stopped_said.split())
             if stopped != "refused":
                 previews.append(f"a blocked {tense} was not refused ({stopped})")
-            if "pid 4242 runs as it" not in blocked_told:
+            if f"pid {PID_CEILING + 4242} runs as it" not in blocked_told:
                 previews.append(f"a blocked {tense} does not name the running process")
             if retired.exists():
                 previews.append(f"a blocked {tense} retired the team anyway")
@@ -24598,10 +25001,12 @@ def _check_blockers_listed_with_remedy(s):
     RESOLVER._reap_objections = lambda team, table, archive_mail=False, census=None: (
         [_row(f"{n} unread for member{n}, oldest 2026-08-06 15:33:30", "mail")
          for n in range(1, 7)]
-        + [_row("pid 4242 runs as it (someone@somewhere)", "wears", pid=4242),
-           _row("pid 4244 operates as it (fixture)", "operates", pid=4244)])
+        + [_row(f"pid {PID_CEILING + 4242} runs as it (someone@somewhere)", "wears",
+                pid=PID_CEILING + 4242),
+           _row(f"pid {PID_CEILING + 4244} operates as it (fixture)", "operates",
+                pid=PID_CEILING + 4244)])
     # A live process holding the conversation a forced rewrite would change.
-    holding = ((4246, 1, (FAKE_AGENT_BIN, "--resume", "transcript")),)
+    holding = ((PID_CEILING + 4246, 1, (FAKE_AGENT_BIN, "--resume", "transcript")),)
     try:
         plan = RESOLVER._rebind_plan(
             "session-blocked", "destination", Path("/nowhere/transcript.jsonl"),
@@ -24628,7 +25033,7 @@ def _check_blockers_listed_with_remedy(s):
         # it cannot do that under a live writer.
         "a holder of the conversation is asked to be stopped": forced_plan["action"] == "blocked"
             and len(forced_headings) == 1 and "stop it first" in forced_headings[0]
-            and any("4246" in each for each in forced_bullets) and all(forced_opened),
+            and any(str(PID_CEILING + 4246) in each for each in forced_bullets) and all(forced_opened),
         "a bounded list says what it dropped": any("and 2 more" in each for each in bullets),
         "nothing else rode along": len(blocked) == len(bullets) + len(headings)
             and len(forced) == len(forced_bullets) + len(forced_headings)
@@ -24652,24 +25057,25 @@ def _check_refusal_names_a_pid_once(s):
 
     real_runtime, real_operating = RESOLVER._runtime, RESOLVER._operating_team
     real_inboxes2 = RESOLVER._inbox_state
-    r4242 = {"pid": 4242, "alive": True, "ours": False,
-             "team": "session-doubled", "agent_id": "audit@session-doubled",
-             "session": "SEEN"}
-    r4250 = {"pid": 4250, "alive": True, "ours": False,
-             "team": "session-doubled", "agent_id": "other@session-doubled",
-             "session": "ELSE"}
-    r4243 = {"pid": 4243, "alive": True, "ours": True,
+    audit, other, own = PID_CEILING + 4242, PID_CEILING + 4250, PID_CEILING + 4243
+    r_audit = {"pid": audit, "alive": True, "ours": False,
+               "team": "session-doubled", "agent_id": "audit@session-doubled",
+               "session": "SEEN"}
+    r_other = {"pid": other, "alive": True, "ours": False,
+               "team": "session-doubled", "agent_id": "other@session-doubled",
+               "session": "ELSE"}
+    r_own = {"pid": own, "alive": True, "ours": True,
              "team": None, "agent_id": None, "session": "OTHER"}
     RESOLVER._runtime = lambda table=None: {
         "table": (), "records": (), "by_pid": {}, "by_agent": {},
         "by_transcript": {}, "by_session": {}, "by_seat": {}, "registry": (),
-        "best_by_session": {}, "live_sessions": [r4242, r4250, r4243],
+        "best_by_session": {}, "live_sessions": [r_audit, r_other, r_own],
         "transcripts": {}}
     asked = []
 
     def operating(pid, snapshot, census=None):
         asked.append(pid)
-        team = "session-doubled" if pid == 4243 else None
+        team = "session-doubled" if pid == own else None
         return immutable({
             "pid": pid, "team": team, "exact": False, "rule": "stamped",
             "basis": "its window start names session-doubled", "possible":
@@ -24689,17 +25095,17 @@ def _check_refusal_names_a_pid_once(s):
         RESOLVER._inbox_state = real_inboxes2
     printed = [each for each in with_dupes if each.startswith("- ")]
     once = {
-        "one row per process": sorted(r["pid"] for r in doubled) == [4242, 4243, 4250],
+        "one row per process": sorted(r["pid"] for r in doubled) == sorted((audit, other, own)),
         "a process operating as it says how that is known": any(
-            "pid 4243 operates as it (its window start names session-doubled)" in r["said"]
+            f"pid {own} operates as it (its window start names session-doubled)" in r["said"]
             for r in doubled),
         "a pid is bulleted once": all(
-            sum(f"pid {pid}" in each for each in printed) == 1 for pid in (4242, 4243, 4250)),
+            sum(f"pid {pid}" in each for each in printed) == 1 for pid in (audit, own, other)),
         "no bullet is left over": len(printed) == 3,
         "the process clause survives the merge": any(
-            "pid 4242 runs as it (audit@session-doubled)" in r["said"] for r in doubled),
+            f"pid {audit} runs as it (audit@session-doubled)" in r["said"] for r in doubled),
         "our own process says it is this process": any(
-            r["said"].endswith("; that pid is this process") and "4243" in r["said"]
+            r["said"].endswith("; that pid is this process") and str(own) in r["said"]
             for r in doubled),
     }
     wrong = sorted(k for k, ok in once.items() if not ok)
@@ -24709,7 +25115,7 @@ def _check_refusal_names_a_pid_once(s):
     # asked of it; the process that wears nothing is the one asked.
     check("wearing-process-not-asked-its-team",
           "a process that wears the team is not also asked which team it operates as",
-          4242 not in asked and 4250 not in asked and 4243 in asked, f"asked {asked}")
+          audit not in asked and other not in asked and own in asked, f"asked {asked}")
     return checked
 
 
@@ -24997,9 +25403,9 @@ def _check_doctor_shared_fact_once(s):
     beta_session = "deadbeef-dead-4bee-8bee-deadbeef0003"
     lead_pid = os.getpid()
     fake = _FakeTmux(processes=[
-        (8822, 1,
+        (PID_CEILING + 8822, 1,
          (FAKE_AGENT_BIN, "--resume", alpha_session, "--agent-id", f"alpha@{probe_team}")),
-        (8833, 1,
+        (PID_CEILING + 8833, 1,
          (FAKE_AGENT_BIN, "--resume", beta_session, "--agent-id", f"beta@{probe_team}")),
     ])
     fake.attach(eng)
@@ -25024,7 +25430,7 @@ def _check_doctor_shared_fact_once(s):
             fake.registry = [{"pid": lead_pid, "sessionId": lead_session,
                               "updatedAt": 2, "startedAt": 1}]
             fake.processes = [
-                (8822, 1,
+                (PID_CEILING + 8822, 1,
                  (FAKE_AGENT_BIN, "--resume", alpha_session,
                   "--agent-id", f"alpha@{probe_team}")),
             ]
@@ -25109,7 +25515,7 @@ def _check_doctor_shared_fact_once(s):
         for member in doctor_live["members"]
     }
     expected_members = {
-        (8822, agent_id_of("alpha", probe_team), "Alpha work"),
+        (PID_CEILING + 8822, agent_id_of("alpha", probe_team), "Alpha work"),
         (None, agent_id_of("beta", probe_team), "(no title)"),
         (None, agent_id_of("gamma", probe_team), "(no title)"),
         (lead_pid, agent_id_of("team-lead", probe_team), "Lead work"),
@@ -25123,7 +25529,7 @@ def _check_doctor_shared_fact_once(s):
     member_ok = (expected_members <= member_facts
                  and all(rendered in lines_live for rendered in rendered_members)
                  and rendered_by_agent[agent_id_of("alpha", probe_team)].startswith(
-                     f"  {8822:<8} {agent_id_of('alpha', probe_team)}")
+                     f"  {PID_CEILING + 8822:<8} {agent_id_of('alpha', probe_team)}")
                  and rendered_by_agent[agent_id_of("team-lead", probe_team)].startswith(
                      f"  {lead_pid:<8} {agent_id_of('team-lead', probe_team)}")
                  and rendered_by_agent[agent_id_of("beta", probe_team)].startswith(
@@ -25144,7 +25550,7 @@ def _check_doctor_shared_fact_once(s):
           f"dossier={dossier_src.count('render_doctor_identity(')}, "
           f"identity={identity_src.count('render_identity_labeled_row(')}")
     rendered = render_agent_rows([
-        (8822, "a@team", "A title whose continuation has enough words to wrap " * 3, ""),
+        (PID_CEILING + 8822, "a@team", "A title whose continuation has enough words to wrap " * 3, ""),
         (None, "much-longer-name@team", "Short title", ""),
     ], width=72)
     first_lines = [row.splitlines()[0] for row in rendered]
@@ -25238,7 +25644,7 @@ def _check_runtime_provenance_is_structured(s):
             else:
                 os.environ["COLUMNS"] = real_columns
 
-        argv_pid = plain_pid + 1000000
+        argv_pid = PID_CEILING + 1000000
         argv_fake = _FakeTmux(processes=[(
             argv_pid, 1,
             (FAKE_AGENT_BIN, "--resume", session, "--agent-id", agent_id),
@@ -25531,7 +25937,7 @@ def _check_doctor_canonical_members(s):
             not wrong, ", ".join(wrong))
 
         live = engine()
-        live_pid = os.getpid() + 1000000
+        live_pid = PID_CEILING + 1000000
         live_row = (
             live_pid, 1,
             (FAKE_AGENT_BIN, "--resume", lead_session, "--agent-id", lead),
@@ -26569,11 +26975,11 @@ def _check_title_skips_the_harness(s):
             return (eng._transcript_fact(path=path) or {}).get("title")
 
         runtime = eng._runtime([(
-            4242, 1,
+            PID_CEILING + 4242, 1,
             (FAKE_AGENT_BIN, "--resume", chosen.stem, "--agent-id", "title@fixture"),
         )])
         resolution = eng._resolve_transcript(session_uuid=chosen.stem)
-        runtime_fact = runtime["by_pid"][4242]["transcript"]
+        runtime_fact = runtime["by_pid"][PID_CEILING + 4242]["transcript"]
         wrapped_title = title(wrapped)
         chosen_title = title(chosen)
         nested_title = title(nested)
@@ -26701,7 +27107,7 @@ def _check_noop_says_live_location(s):
         force = False
     with capturing("err"):
         member = {"agentId": "m@t", "agentName": "m", "teamName": "t"}
-        owner = {"pid": 777, "updated": "x", "alive": True,
+        owner = {"pid": PID_CEILING + 777, "updated": "x", "alive": True,
                  "session": "seat-uuid"}
         unseated = already_running(
             fixture_target(
@@ -26709,10 +27115,10 @@ def _check_noop_says_live_location(s):
                 process={
                     "snapshot": immutable({
                         "best_by_session": {"seat-uuid": owner},
-                        "by_pid": {777: {"pid": 777, "seat": None}},
+                        "by_pid": {PID_CEILING + 777: {"pid": PID_CEILING + 777, "seat": None}},
                     }),
                     "runtime": immutable({
-                        "records": (immutable({"pid": 777, "seat": None}),),
+                        "records": (immutable({"pid": PID_CEILING + 777, "seat": None}),),
                         "external": (), "lineage": (), "seats": (),
                         "seat_state": "outside tmux",
                     }),
@@ -26724,10 +27130,10 @@ def _check_noop_says_live_location(s):
                 process={
                     "snapshot": immutable({
                         "best_by_session": {"seat-uuid": owner},
-                        "by_pid": {777: {"pid": 777, "seat": Seat("sock-z", "%9")}},
+                        "by_pid": {PID_CEILING + 777: {"pid": PID_CEILING + 777, "seat": Seat("sock-z", "%9")}},
                     }),
                     "runtime": immutable({
-                        "records": (immutable({"pid": 777,
+                        "records": (immutable({"pid": PID_CEILING + 777,
                                                "seat": Seat("sock-z", "%9")}),),
                         "external": (), "lineage": (),
                         "seats": (Seat("sock-z", "%9"),),
@@ -26814,7 +27220,7 @@ def _check_stop_resolves_selector_shapes(s):
         (0, target["label"], "", "") for target in plan["targets"])
     RESOLVER._runtime = lambda table=None: immutable({
         "transcripts": {"abcd-1234": {"others": ({
-            "pid": 3, "ppid": 1, "proc_start": "3", "proc_state": "S",
+            "pid": PID_CEILING + 3, "ppid": 1, "proc_start": "3", "proc_state": "S",
             "argv": (), "agent_id": None, "session": "abcd-1234", "team": None,
             "seat": None, "ours": False,
         },)}},
@@ -26822,7 +27228,7 @@ def _check_stop_resolves_selector_shapes(s):
 
     def selected_runtime(agent_id, *_args, **_kwargs):
         name, team = name_and_team(agent_id)
-        pid = 1 if name == "team-lead" else 2
+        pid = PID_CEILING + (1 if name == "team-lead" else 2)
         return immutable({"external": ({
             "pid": pid, "ppid": 1, "proc_start": str(pid), "proc_state": "S",
             "argv": (), "agent_id": agent_id, "session": "abcd-1234", "team": team,
@@ -28377,7 +28783,7 @@ def _check_sweep_spares_a_held_lock(s):
     return checked
 
 
-@unit(('team-evidence-one-answer', 'what is a team is one answer'))
+@unit(('team-evidence-one-answer', 'what is a team is one answer'), machine=True)
 def _check_team_evidence_one_answer(s):
     checked = []
 
@@ -28392,7 +28798,7 @@ def _check_team_evidence_one_answer(s):
     return checked
 
 
-@unit(('completion-lists-every-team', 'every team the engine knows is offered'))
+@unit(('completion-lists-every-team', 'every team the engine knows is offered'), machine=True)
 def _check_completion_lists_every_team(s):
     checked = []
 
@@ -28924,7 +29330,7 @@ def _check_stop_plan_selects_the_panes_a_run_started(s):
 
     socket, team = "claude-swarm-stop-check", "session-stop-check"
     launched, nested, helper, member, copy, lead = (
-        os.getpid() + 1000000 + offset for offset in range(6))
+        PID_CEILING + 1000000 + offset for offset in range(6))
     processes = [
         # This run started %1. The agent there ran a claude of its own, and an
         # MCP helper that is not a claude at all.
@@ -29113,7 +29519,7 @@ def _check_redirect_offered_not_silent(s):
                                   "teamName": "src"})
         redirect_plan = immutable({
             "launch": redirect_ctx,
-            "lead": {"pid": 1},
+            "lead": {"pid": PID_CEILING + 1},
             "source": "src",
             "destination": "session-dest",
             "confirmation": "pending",
@@ -29414,7 +29820,7 @@ def _check_pick_evidence_names_no_team(s):
     return checked
 
 
-@unit(('population-contains-roster', 'a team population contains its roster'))
+@unit(('population-contains-roster', 'a team population contains its roster'), machine=True)
 def _check_population_contains_roster(s):
     checked = []
 
@@ -29600,11 +30006,11 @@ def _check_crew_split_across_servers(s):
 
     eng10 = Resolver(needs=Needs(maybe=set(NEED)))
     eng10._runtime = lambda table=None: {"live_sessions": [
-        {"pid": 1, "alive": True, "ours": False, "team": "t",
+        {"pid": PID_CEILING + 1, "alive": True, "ours": False, "team": "t",
          "agent_id": "old@t", "session": None, "seat": Seat("sock-old", "%1")},
-        {"pid": 2, "alive": True, "ours": False, "team": "t",
+        {"pid": PID_CEILING + 2, "alive": True, "ours": False, "team": "t",
          "agent_id": "new@t", "session": None, "seat": Seat("sock-new", "%2")},
-        {"pid": 3, "alive": True, "ours": False, "team": "other",
+        {"pid": PID_CEILING + 3, "alive": True, "ours": False, "team": "other",
          "agent_id": "x@other", "session": None, "seat": Seat("sock-other", "%3")}]}
     placement = eng10._crew_placement("t", [])
     check("crew-split-across-servers", "a crew on two servers is reported as two",
@@ -31355,7 +31761,7 @@ def _check_demote_cannot_embed_self(s):
         # One pid up from ours is a stranger by construction: the lineage walk
         # starts at our own pid and follows this table's parents, and this
         # table has no way to reach ours.
-        ours, stranger = [(me, 0, holder)], [(me + 1, 1, holder)]
+        ours, stranger = [(me, 0, holder)], [(PID_CEILING + 1, 1, holder)]
 
         def demoted(args, table):
             """Everything this demote said, refusal or plan, on one line.
@@ -31419,7 +31825,7 @@ def _check_demote_cannot_embed_self(s):
               ", ".join(blind))
 
         holding = []
-        theirs = f"pid {me + 1} is running this conversation"
+        theirs = f"pid {PID_CEILING + 1} is running this conversation"
         if theirs not in outside:
             holding.append(f"a demote under a live holder said: {outside or 'nothing'}")
         if went_through not in outside_forced:
@@ -31523,7 +31929,9 @@ def _check_runtime_api_has_no_legacy_wearers(s):
           f"function={('team_population' in funcs)}, "
           f"callers={sorted(callers_of('team_population'))}")
 
-    raw_readers = callers_of("_cmdline")
+    # The suite's units read a command line to test the readers themselves, the
+    # fence's check among them; the realm is the tool's own code.
+    raw_readers = callers_of("_cmdline") - s.suite_fns
     check("process-command-read-stays-in-realm",
           "raw process commands are read only inside process and tmux evidence readers",
           raw_readers == {"_process_table", "_tmux_server_fact"},
@@ -31809,7 +32217,7 @@ def _check_mail_ledger_joins_deliveries(s):
             engine._projects_dir, engine._teams_dir = Path(td), Path(td) / "teams"
             engine._runtime = lambda table=None: immutable({
                 "table": (), "records": (), "by_pid": {}, "by_agent": {},
-                "by_transcript": {"CAROL": ({"pid": 424242},)},
+                "by_transcript": {"CAROL": ({"pid": PID_CEILING + 424242},)},
                 "transcripts": {}, "by_session": {}, "best_by_session": {},
                 "by_pane": {}, "registry": (), "live_sessions": (),
             })
@@ -32422,7 +32830,8 @@ def _check_restamp_window_start(s):
             RESOLVER._reap_objections = lambda *a, **k: [
                 {"pid": None, "kinds": frozenset({"mail"}),
                  "said": "3 unread for m, oldest x"},
-                {"pid": 9, "kinds": frozenset({"wears"}), "said": "pid 9 wears it"}]
+                {"pid": PID_CEILING + 9, "kinds": frozenset({"wears"}),
+                 "said": f"pid {PID_CEILING + 9} wears it"}]
             blocked_plan = RESOLVER._rebind_plan(
                 "OLD", "NEW", target, (), census=(), force=False)
             told = io.StringIO()
@@ -32434,16 +32843,18 @@ def _check_restamp_window_start(s):
                 if owed not in " ".join(told.getvalue().split()):
                     stray.append(f"a blocker went unremedied: {owed}")
             RESOLVER._reap_objections = lambda *a, **k: [
-                {"pid": 9, "kinds": frozenset({"wears"}), "said": "pid 9 wears it"}]
+                {"pid": PID_CEILING + 9, "kinds": frozenset({"wears"}),
+                 "said": f"pid {PID_CEILING + 9} wears it"}]
             force_plan = RESOLVER._rebind_plan(
                 "OLD", "NEW", target, (), census=(), force=True)
             if force_plan["action"] != "restamp" or not force_plan["restamp"]:
                 stray.append("--force did not select the proved restamp")
             RESOLVER._reap_objections = lambda *a, **k: [
-                {"pid": 9, "kinds": frozenset({"wears"}), "said": "pid 9 wears it"}]
+                {"pid": PID_CEILING + 9, "kinds": frozenset({"wears"}),
+                 "said": f"pid {PID_CEILING + 9} wears it"}]
             held_plan = RESOLVER._rebind_plan(
                 "OLD", "NEW", target,
-                ((4321, 1, (FAKE_AGENT_BIN, "--resume", target.stem)),),
+                ((PID_CEILING + 4321, 1, (FAKE_AGENT_BIN, "--resume", target.stem)),),
                 census=(), force=True)
             if held_plan["action"] != "blocked" or held_plan["restamp"] is not None:
                 stray.append("--force planned a restamp under a live holder")
@@ -33150,13 +33561,13 @@ def _check_no_launch_onto_live_conversation(s):
                                "teamName": team, "role": role},
             process={"snapshot": snapshot, "runtime": runtime}, route=route)
 
-    live_owner = immutable({"pid": 4242, "updated": "x", "alive": True,
+    live_owner = immutable({"pid": PID_CEILING + 4242, "updated": "x", "alive": True,
                             "session": "live-uuid"})
     dead_owner = immutable({**live_owner, "alive": False})
     live_member = role_ctx("live-uuid", "member", "a@t", live_owner)
     live_lead = role_ctx("live-uuid", "lead", "team-lead@t", live_owner)
-    member = role_ctx("u", "member", "a@t", elsewhere=(99,))
-    lead = role_ctx("u", "lead", "team-lead@t", elsewhere=(99,))
+    member = role_ctx("u", "member", "a@t", elsewhere=(PID_CEILING + 99,))
+    lead = role_ctx("u", "lead", "team-lead@t", elsewhere=(PID_CEILING + 99,))
     moved_member = role_ctx(
         "live-uuid", "member", "a@t", live_owner,
         route={"to_team": "t", "automatic": False})
@@ -33164,7 +33575,7 @@ def _check_no_launch_onto_live_conversation(s):
         "live-uuid", "lead", "team-lead@t", live_owner,
         route={"to_team": "t", "automatic": False})
     redirected = role_ctx(
-        "u", "member", "a@t", elsewhere=(99,),
+        "u", "member", "a@t", elsewhere=(PID_CEILING + 99,),
         route={"to_team": "t", "automatic": True})
 
     class _NoForce:
@@ -33182,29 +33593,29 @@ def _check_no_launch_onto_live_conversation(s):
         "a live conversation stops a spawn": bool(already_running(live_member, _NoForce)),
         "and both name the session and the pid": all(
             "live-uuid" in why_of(ctx, _NoForce)
-            and "4242" in why_of(ctx, _NoForce)
+            and str(PID_CEILING + 4242) in why_of(ctx, _NoForce)
             for ctx in (live_lead, live_member)),
         "--force releases the exec": already_running(live_lead, _Forced) is None,
         "--force releases the spawn": already_running(live_member, _Forced) is None,
         "a member's rebind is exempt": already_running(moved_member, _NoForce) is None,
         "a lead's rebind is not exempt here": bool(already_running(moved_lead, _NoForce)),
         "a member already in the pane stops the spawn":
-            already_running(member, _NoForce, here=[77], pane="%3")
-            == ("a@t is already running in pane %3 (pid 77)", True),
+            already_running(member, _NoForce, here=[PID_CEILING + 77], pane="%3")
+            == (f"a@t is already running in pane %3 (pid {PID_CEILING + 77})", True),
         "an explicit rebind may take that pane":
             already_running(role_ctx(
-                "u", "member", "a@t", elsewhere=(99,),
+                "u", "member", "a@t", elsewhere=(PID_CEILING + 99,),
                 route={"to_team": "t", "automatic": False}),
-                _NoForce, here=[77], pane="%3") is None,
+                _NoForce, here=[PID_CEILING + 77], pane="%3") is None,
         "a redirect chosen by the tool may not":
-            already_running(redirected, _NoForce, here=[77], pane="%3") is not None,
+            already_running(redirected, _NoForce, here=[PID_CEILING + 77], pane="%3") is not None,
         "a lead asks no seat question":
-            "pane" not in why_of(live_lead, _NoForce, here=[77], pane="%3"),
+            "pane" not in why_of(live_lead, _NoForce, here=[PID_CEILING + 77], pane="%3"),
         "the same id running elsewhere stops the spawn":
             "outside pane %3" in why_of(member, _NoForce, pane="%3"),
         "and a lead never asks it": already_running(lead, _NoForce, pane="%3") is None,
         "its own pane is not elsewhere": (already_running(
-            member, _NoForce, here=[99], pane="%3") or (None, None))[1] is True,
+            member, _NoForce, here=[PID_CEILING + 99], pane="%3") or (None, None))[1] is True,
         "a dead owner stops nothing": all(
             already_running(role_ctx("live-uuid", role, agent_id, dead_owner),
                             _NoForce) is None
@@ -33483,7 +33894,7 @@ def _check_restored_life_window_start(s):
     eng = corpus_engine()
     eng._session_registry = lambda: []
     eng._process_table = lambda refresh=False: [
-        (424242, 0,
+        (PID_CEILING + 424242, 0,
          ("claude", "--resume", "1e5701ed-1fe5-4701-8ed1-e5701ed1fe57",
           "--agent-id", "team-lead@session-corpus-alpha"))]
     # Started now, after every roster in the corpus was written, so each team
@@ -33624,7 +34035,7 @@ def _check_claimant_corroborated_by_children(s):
     eng = corpus_engine()
     eng._session_registry = lambda: []
     eng._process_table = lambda refresh=False: [
-        (424242, 0,
+        (PID_CEILING + 424242, 0,
          ("claude", "--resume", "d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1",
           "--agent-id", "drift@session-corpus-contested-b"))]
     claimed = {t: {path for _st, path in hits} for t, hits in eng._led_teams().items()}
@@ -33669,7 +34080,7 @@ def _check_address_locates_evidence_places(s):
     eng = corpus_engine()
     eng._session_registry = lambda: []
     eng._process_table = lambda refresh=False: [
-        (424242, 0,
+        (PID_CEILING + 424242, 0,
          ("claude", "--resume", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
           "--agent-id", "team-lead@session-corpus-multiteam-b"))]
     stem = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -33736,12 +34147,12 @@ def _check_live_seat_walks_pane_children(s):
     eng = corpus_engine()
     agent_id = "consultant@session-seat-tree"
     session = "7a285e24-050c-4566-b5e5-c3fd2072a530"
-    agent_pid = 2398884
+    agent_pid = PID_CEILING + 2398884
     table = (
-        (2019447, 1, ("tmux", "-L", "claude-swarm-221893", "new-session")),
-        (3717011, 2019447, ("-zsh",)),
-        (3717012, 3717011, ("/tmp/launch-wrapper",)),
-        (agent_pid, 3717012,
+        (PID_CEILING + 2019447, 1, ("tmux", "-L", "claude-swarm-221893", "new-session")),
+        (PID_CEILING + 3717011, PID_CEILING + 2019447, ("-zsh",)),
+        (PID_CEILING + 3717012, PID_CEILING + 3717011, ("/tmp/launch-wrapper",)),
+        (agent_pid, PID_CEILING + 3717012,
          (FAKE_AGENT_BIN, "--resume", session, "--agent-id", agent_id)),
         (8800001, 1, ("-zsh",)),
     )
@@ -33751,7 +34162,7 @@ def _check_live_seat_walks_pane_children(s):
         "claude-swarm-decoy": [
             {"session": TMUX_SESSION, "window": "@1", "pane": "%6", "pid": 8800001}],
         "claude-swarm-221893": [
-            {"session": TMUX_SESSION, "window": "@2", "pane": "%7", "pid": 3717011}],
+            {"session": TMUX_SESSION, "window": "@2", "pane": "%7", "pid": PID_CEILING + 3717011}],
     }
     queried, registries = [], []
     eng._session_registry = lambda: registries.append("read") or []
@@ -33820,7 +34231,7 @@ def _check_runtime_indexes_share_record_objects(s):
         checked.append((cid, name, ok, detail))
 
     session = "77777777-7777-4777-8777-777777777777"
-    outside_pid, own_pid = 731001, 731002
+    outside_pid, own_pid = PID_CEILING + 731001, PID_CEILING + 731002
     outside_id, own_id = "outside@runtime-check", "ours@runtime-check"
     table = [
         (outside_pid, 1,
@@ -33904,11 +34315,11 @@ def _check_socket_follows_crew(s):
     eng = corpus_engine()
     eng._session_registry = lambda: []
     eng._process_table = lambda refresh=False: [
-        (424242, 0, ("claude", "--agent-id", "petrel@session-corpus-crew")),
-        (424243, 0, ("claude", "--agent-id", "sparrow@session-corpus-crew"))]
+        (PID_CEILING + 424242, 0, ("claude", "--agent-id", "petrel@session-corpus-crew")),
+        (PID_CEILING + 424243, 0, ("claude", "--agent-id", "sparrow@session-corpus-crew"))]
     eng._seat_index = lambda rows: {
-        424242: Seat("sock-crew", "%1"),
-        424243: Seat("sock-crew", "%2"),
+        PID_CEILING + 424242: Seat("sock-crew", "%1"),
+        PID_CEILING + 424243: Seat("sock-crew", "%2"),
     }
     table = eng._process_table()
     runtime = eng._runtime(table)
@@ -33929,7 +34340,7 @@ def _check_socket_follows_crew(s):
     seats = {
         "a crew anchors the seat": placement and placement.destination == LaunchDestination("sock-crew"),
         "the placement retains its selected live provenance":
-            placement and placement.provenance == "live pane %1 of pid 424242",
+            placement and placement.provenance == f"live pane %1 of pid {PID_CEILING + 424242}",
         "an agent that is not running does not change the selected crew seat": absent not in seated,
         "the seat is one a wearer is sitting on": placement and seated == wearers,
         "a listed member that is not running anchors nothing": placement and not (seated & (listed - wearers)),
@@ -34768,7 +35179,7 @@ def _check_verdict_names_actionable(s):
     globals()["RESOLVER"] = eng = corpus_engine()
     eng._session_registry = lambda: []
     eng._process_table = lambda refresh=False: [
-        (424242, 0,
+        (PID_CEILING + 424242, 0,
          ("claude", "--resume", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
           "--agent-id", "team-lead@session-corpus-multiteam-b"))]
     try:
@@ -34907,7 +35318,7 @@ def _check_degraded_arms_named_and_remedied(s):
     globals()["RESOLVER"] = eng = corpus_engine()
     crew = "session-corpus-crew"
     lead_row = (
-        771001, 1,
+        PID_CEILING + 771001, 1,
         (FAKE_AGENT_BIN, "--resume", "11111111-1111-4111-8111-111111111111",
          "--agent-id", f"team-lead@{crew}"),
     )
@@ -34928,16 +35339,16 @@ def _check_degraded_arms_named_and_remedied(s):
         # nothing running and nothing waiting, so no lead reads it either
         "dormant": ([], lambda table: {}, "dormant"),
         # one name, two processes, both on the same server
-        "doubled": ([lead_row, _wearing(771002, "petrel"), _wearing(771003, "petrel")],
+        "doubled": ([lead_row, _wearing(PID_CEILING + 771002, "petrel"), _wearing(PID_CEILING + 771003, "petrel")],
                     lambda table: {pid: Seat("sock-one", "%1")
                                    for pid, _ppid, _args in table},
                     "worn by"),
         # two names, a seat each
-        "split": ([lead_row, _wearing(771002, "petrel"), _wearing(771004, "sparrow")],
+        "split": ([lead_row, _wearing(PID_CEILING + 771002, "petrel"), _wearing(PID_CEILING + 771004, "sparrow")],
                   lambda table: {
-                      pid: (Seat("sock-a", "%1") if pid == 771002
+                      pid: (Seat("sock-a", "%1") if pid == PID_CEILING + 771002
                             else Seat("sock-b", "%2"))
-                      for pid, _ppid, _args in table if pid in {771002, 771004}}, "seated on"),
+                      for pid, _ppid, _args in table if pid in {PID_CEILING + 771002, PID_CEILING + 771004}}, "seated on"),
     }
     arms = {}
     try:
@@ -34988,7 +35399,7 @@ def _check_unseated_member_said_not_judged(s):
     eng._session_registry = lambda: []
     eng._operating_team = lambda pid, snapshot, census=None: fixture_operating(
         pid, crew, argv_team=(snapshot["by_pid"].get(pid) or {}).get("team"))
-    crew_rows = [lead_row, _wearing(771002, "petrel"), _wearing(771004, "sparrow")]
+    crew_rows = [lead_row, _wearing(PID_CEILING + 771002, "petrel"), _wearing(PID_CEILING + 771004, "sparrow")]
     eng._process_table = lambda refresh=False: crew_rows
     blocks = {}
     try:
@@ -34997,7 +35408,7 @@ def _check_unseated_member_said_not_judged(s):
                     pid: Seat("sock-one", "%1") for pid, _ppid, _args in table}),
                 ("unseated", lambda table: {
                     pid: Seat("sock-one", "%1") for pid, _ppid, _args in table
-                    if pid == 771002})):
+                    if pid == PID_CEILING + 771002})):
             eng._seat_index = seat
             eng._runtime_table = eng._runtime_snapshot = None
             try:
@@ -35045,7 +35456,7 @@ def _check_doctor_agent_says_the_seat(s):
     globals()["RESOLVER"] = eng = corpus_engine()
     eng._session_registry = lambda: []
     eng._process_table = lambda refresh=False: [
-        (771005, 0,
+        (PID_CEILING + 771005, 0,
          (FAKE_AGENT_BIN, "--resume", "22222222-2222-4222-8222-222222222222",
           "--agent-id", f"petrel@{crew}"))]
     dossier = io.StringIO()
@@ -35065,7 +35476,7 @@ def _check_doctor_agent_says_the_seat(s):
                      if ln.startswith("seat ")), "")
     check("doctor-agent-says-the-seat",
           "the agent dossier says where the member's own process sits",
-          "outside tmux" in seat_row and "pid 771005" in seat_row,
+          "outside tmux" in seat_row and f"pid {PID_CEILING + 771005}" in seat_row,
           f"said {seat_row!r}")
 
     s.eng = eng
@@ -35151,7 +35562,7 @@ def _check_connected_legend_claims_what_it_tested(s):
     globals()["RESOLVER"] = eng = corpus_engine()
     eng._session_registry = lambda: []
     eng._process_table = lambda refresh=False: [
-        (424242, 0,
+        (PID_CEILING + 424242, 0,
          ("claude", "--resume", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
           "--agent-id", "team-lead@session-corpus-multiteam-b"))]
     eng._inbox_state = lambda team, generation=None: {
@@ -35190,7 +35601,7 @@ def _check_no_grade_without_an_answer(s):
     globals()["RESOLVER"] = eng = corpus_engine()
     eng._session_registry = lambda: []
     eng._process_table = lambda refresh=False: [
-        (424242, 0,
+        (PID_CEILING + 424242, 0,
          ("claude", "--resume", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
           "--agent-id", "team-lead@session-corpus-multiteam-b"))]
     eng._operating_team = lambda pid, snapshot, census=None: fixture_operating(
@@ -36052,7 +36463,7 @@ def _check_team_description_generations(s):
     (teams / BROKEN / "config.json").write_text('{"name": "session-t17-brok')
     # GONE keeps its directory and has no config at all.
 
-    ROWS = ((999001, 1, ("sleep", "60")), (999002, 1, ("sleep", "61")))
+    ROWS = ((PID_CEILING + 999001, 1, ("sleep", "60")), (PID_CEILING + 999002, 1, ("sleep", "61")))
     try:
         eng = Resolver(needs=Needs(maybe=set(NEED)))
         eng._teams_dir, eng._projects_dir = teams, projects
@@ -36457,7 +36868,8 @@ def _check_roster_producers_and_census(s):
               and not mutable_nodes(census))
         roster = by_path[paths["mismatch"]]
         entries = eng._scan_teams(census)
-        pairs = eng._boot_join(immutable({"registry": [{"pid": 77, "alive": True, "started": 1500}]}), census)
+        registry_pid = PID_CEILING + 77
+        pairs = eng._boot_join(immutable({"registry": [{"pid": registry_pid, "alive": True, "started": 1500}]}), census)
         snapshot_node = next(node for node in s.ast.walk(s.engine_node)
                              if isinstance(node, s.ast.ClassDef) and node.name == "RosterSnapshot")
         duplicate_interpretations = []
@@ -36472,7 +36884,7 @@ def _check_roster_producers_and_census(s):
               roster.team == "declared" and by_path[paths["blank"]].team == "blank"
               and by_path[paths["empty"]].team == "empty"
               and any(entry["team"] == "declared" and entry["cfg"] == paths["mismatch"] for entry in entries)
-              and ("declared", 77, 1000) in pairs and ("blank", 77, 900) in pairs
+              and ("declared", registry_pid, 1000) in pairs and ("blank", registry_pid, 900) in pairs
               and not duplicate_interpretations, repr(duplicate_interpretations))
 
         real_stat = Path.stat
@@ -36562,11 +36974,11 @@ def _check_complete_team_selection(s):
               and mode_members["roster_snapshot"].generation == first["roster_snapshot"].generation)
         mutable_census = list(census)
         argv = [FAKE_AGENT_BIN, "--resume", "detached"]
-        rows = [[812345, 1, argv]]
+        rows = [[PID_CEILING + 812345, 1, argv]]
         eng._proc_stat = lambda _pid: ("S", 1, "stable-start")
         held = eng._team_members("A", rows, census=mutable_census)
         argv.append("--changed")
-        rows[0][0] = 812346
+        rows[0][0] = PID_CEILING + 812346
         mutable_census.clear()
         try:
             eng._team_members("A", (), census=({},))
@@ -36574,19 +36986,19 @@ def _check_complete_team_selection(s):
         except TypeError:
             rejected = True
         check('team-selection-detaches-mutable-inputs',
-              held["table"] == ((812345, 1, (FAKE_AGENT_BIN, "--resume", "detached")),)
+              held["table"] == ((PID_CEILING + 812345, 1, (FAKE_AGENT_BIN, "--resume", "detached")),)
               and held["census"] == census and held["census"][0] is census[0]
               and not mutable_nodes(held) and rejected)
 
     with _roster_test_fixture() as f:
-        table = ((712345, 1, (FAKE_AGENT_BIN, "--resume", "resumed-session")),)
+        table = ((PID_CEILING + 712345, 1, (FAKE_AGENT_BIN, "--resume", "resumed-session")),)
         f.transcript("resumed-session")
 
         def prepare():
             eng = Resolver(needs=Needs(maybe=set(NEED)))
             eng._teams_dir, eng._projects_dir = f.engine._teams_dir, f.engine._projects_dir
             eng._process_table = lambda refresh=False: table
-            eng._session_registry = lambda: [{"pid": 712345, "sessionId": "resumed-session", "startedAt": 2000}]
+            eng._session_registry = lambda: [{"pid": PID_CEILING + 712345, "sessionId": "resumed-session", "startedAt": 2000}]
             eng._swarm_sockets = lambda: ()
             eng._pid_alive = lambda *_args: True
             eng._proc_stat = lambda _pid: ("S", 1, "stable-start")
@@ -36714,7 +37126,7 @@ def _check_roster_cache_lifetimes(s):
 
     with _roster_test_fixture() as f:
         eng = f.engine
-        old_table = ((711111, 1, (FAKE_AGENT_BIN, "--agent-id", "mover@A")),)
+        old_table = ((PID_CEILING + 711111, 1, (FAKE_AGENT_BIN, "--agent-id", "mover@A")),)
         eng._proc_stat = lambda _pid: ("S", 1, "stable-start")
         previous = eng._runtime(old_table)
         previous_members = eng._team_members("A", old_table, census=())
@@ -36723,7 +37135,7 @@ def _check_roster_cache_lifetimes(s):
         terminal = eng._terminal_context()
         real_iterdir = Path.iterdir
         eng._cmdline = lambda _pid: (FAKE_AGENT_BIN, "--agent-id", "mover@B")
-        with mock.patch.object(Path, "iterdir", lambda path: iter((Path('/proc/722222'),))
+        with mock.patch.object(Path, "iterdir", lambda path: iter((Path(f'/proc/{PID_CEILING + 722222}'),))
                                if path == Path('/proc') else real_iterdir(path)):
             current_table = Resolver._process_table(eng, refresh=True)
         cleared = all(descriptor.slot not in eng.__dict__
@@ -36734,7 +37146,7 @@ def _check_roster_cache_lifetimes(s):
         description = eng._team_description("A", current_table, census=())
         checked.append(_check_verdict('process-refresh-uses-cache-registry', cleared and current is not previous and members is not previous_members
                         and description is not previous_description and eng._stamps is transcript_cache
-                        and eng._terminal is terminal and current['table'][0][0] == 722222
+                        and eng._terminal is terminal and current['table'][0][0] == PID_CEILING + 722222
                         and previous['table'] is old_table
                         and previous_members['table'] is old_table, ''))
     return checked
@@ -37606,7 +38018,7 @@ def _restamp_test_plan(f, lead=False, reap=False, alias=False):
                    "members": [{"name": name, "agentId": agent_id_of(name, "A"), "isActive": False}]})
     f.config("B", {"name": "B", "leadAgentId": "team-lead@B", "leadSessionId": "destination-lead",
                    "members": [{"name": "team-lead", "agentId": "team-lead@B"}]})
-    f.fake.processes = ([] if reap else [(771234, 1, (FAKE_AGENT_BIN, "--agent-id", "keeper@A"))])
+    f.fake.processes = ([] if reap else [(PID_CEILING + 771234, 1, (FAKE_AGENT_BIN, "--agent-id", "keeper@A"))])
     eng = f.engine
     eng._pid_alive = lambda *_args: True
     eng._proc_stat = lambda _pid: ("S", 1, "stable-start")
@@ -38621,7 +39033,7 @@ def _check_operation_inputs_are_explicit(s):
     # that stopped halfway, and no file at all. A delivery answer that reads
     # the state tells them apart; one that takes a blank cannot.
     TEAM = "session-t20-delivery"
-    wearing = {"pid": 424242, "alive": True, "exact": True,
+    wearing = {"pid": PID_CEILING + 424242, "alive": True, "exact": True,
                "runs_as": TEAM, "runs_as_exact": True, "worn_team": TEAM}
     base = Path(tempfile.mkdtemp(prefix=f"{TOOL}-t20-"))
     teams, projects = base / "teams", base / "projects"
@@ -39010,7 +39422,7 @@ def _check_doctor_and_launch_credential_ownership(s):
           f"Resolver questions={questions}, attributes={attributes}, raw reads={raw_file_reads}, "
           f"reader calls={local_reader_calls}")
 
-    selected_process = immutable({"pid": 12345, "start": 99})
+    selected_process = immutable({"pid": PID_CEILING + 12345, "start": 99})
     selected_credentials = immutable({
         "process": selected_process,
         "values": {"ANTHROPIC_AUTH_TOKEN": "selected-token"},
