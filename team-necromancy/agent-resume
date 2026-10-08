@@ -151,10 +151,11 @@ SOCKET_PREFIX = "claude-swarm-"
 # here, which keeps a fixture's pid from naming a process on the machine.
 PID_CEILING = 1 << 22
 
-# Which processes the engine's /proc readers may read while the selftest runs
-# units. None outside the selftest, where every reader reads what it is asked;
-# while units run it is this process's _ProcessFence, which ran_unit installs
-# and consults.
+# Which processes the engine's /proc readers may read while the selftest runs.
+# None outside it, where every reader reads what it is asked. In a selftest
+# process it is that process's _ProcessFence, which run_selftest installs before
+# anything else; in a tool run a selftest unit started, it is the fence
+# adopt_inherited_fence installs from what the unit handed down.
 PROCESS_FENCE = None
 
 # isAgentSwarmsEnabled activates the --agent-id, --agent-name, and --team-name
@@ -1781,10 +1782,6 @@ class Resolver:
         self._teams_dir = TEAMS_DIR   # overridable so a test resolver can read a synthetic tree
         self._projects_dir = PROJECTS_DIR  # same, for the transcript tree
         self._rewriter = TranscriptRewriter()
-        # While the selftest runs a unit, the fence decides what processes an
-        # engine made there can see; outside the selftest it is None.
-        if PROCESS_FENCE is not None:
-            PROCESS_FENCE.engine_made(self)
 
     def _exercise(self, need):
         """Record one declared compute happening, or refuse an undeclared one."""
@@ -2520,9 +2517,11 @@ class Resolver:
     def _may_read(pid, reader):
         """Whether `reader` may read this pid's /proc entry.
 
-        Outside the selftest, always. While its units run, the fence decides,
-        and a pid it refuses is answered as a process that does not exist,
-        without reading anything.
+        Outside the selftest, always. While it runs, in the selftest process
+        and in every tool run one of its units starts, the fence decides, and
+        a pid it refuses is answered as a process that does not exist. Nothing
+        of it is read but the start time the fence compares for a pid a
+        declared unit's listing named or one the run knows.
         """
         fence = PROCESS_FENCE
         return fence is None or fence.admit(pid, reader)
@@ -2545,7 +2544,9 @@ class Resolver:
         listed = [int(entry.name) for entry in Path("/proc").iterdir()
                   if entry.name.isdigit()]
         if PROCESS_FENCE is not None:
-            PROCESS_FENCE.saw_listed(listed)
+            # While the selftest runs, the fence says which of these the table
+            # may read, before any of them is read (_ProcessFence.listing).
+            listed = PROCESS_FENCE.listing(listed)
         for pid in listed:
             argv = self._cmdline(pid)
             if not argv:
@@ -6926,17 +6927,27 @@ class Resolver:
         return others, ours
 
     def _session_registry(self):
-        """Raw session observations, read once by the runtime snapshot."""
+        """Raw session observations, read once by the runtime snapshot.
+
+        While the selftest runs, only a unit declared to read the machine reads
+        the registry, and its fence is told every pid the registry names;
+        anywhere else in the selftest the registry is empty
+        (_ProcessFence.sees_registry).
+        """
         if self._registry is not None:
             return self._registry
         entries = []
-        for path in SESSIONS_DIR.glob("*.json"):
+        fence = PROCESS_FENCE
+        for path in (SESSIONS_DIR.glob("*.json") if fence is None or fence.sees_registry()
+                     else ()):
             try:
                 data = json.loads(path.read_text())
             except (OSError, ValueError):
                 continue
             if data.get("pid"):
                 entries.append(dict(data))
+        if fence is not None:
+            fence.name(entry["pid"] for entry in entries)
         self._registry = entries
         return entries
 
@@ -14866,6 +14877,65 @@ TIER_SOCKETS = tier_row(
      "every socket name a live check asked about fits the room the run checked its "
      "TMPDIR for"))
 
+# The runner's own check that the process running its units adopts what they
+# orphan. The leak arms of seat-finds-wrapped-agent, smoke-typed-commands and
+# help-is-inert find a process a teardown or a tool run left behind only because
+# it stays under this run. adopt_orphans answers None where the kernel offers
+# no setting, and orphans_go_elsewhere puts the setting back after start_stray,
+# so the row checks what happens instead of trusting either answer: an orphan
+# made on purpose before the first unit and another after the last must both
+# have this process as their parent.
+TIER_ADOPTS = tier_row(
+    ("read-only-tier-adopts-orphans",
+     "the process that ran the read-only units adopted an orphan made before the first "
+     "of them and one made after the last"),
+    ("live-tier-adopts-orphans",
+     "the process that ran the live units adopted an orphan made before the first of "
+     "them and one made after the last"))
+
+# The runner's own check that its units left nothing running. finish_run ends
+# what is still under the run once the units are done and names it on the
+# diagnostic stream; this row states the same, so a leak no unit's own arm
+# caught fails the run rather than passing with a line on stderr. It is stated
+# after the last unit and after the adoption row's second orphan has ended,
+# before the report, and the finish_run in run_selftest's finally stays for a
+# run that raises or is sent SIGTERM. A run_selftest call made while another is
+# in progress in the same process ends nothing (SELFTEST_IN_PROGRESS): it names
+# what started under the process after it began and still runs, which the
+# outermost call then ends.
+TIER_LEFT = tier_row(
+    ("read-only-tier-leaves-nothing-running",
+     "nothing the read-only units started was still running under the run once they were "
+     "done"),
+    ("live-tier-leaves-nothing-running",
+     "nothing the live units started was still running under the run once they were done"))
+
+# The runner's own check that its tier ran no claude. A decoy named claude sits
+# at the front of PATH beside the tmux one and writes down what it is asked.
+# Two units run typed commands with no --claude-bin, so a command that should
+# have been a preview and launched would otherwise start the claude this
+# machine runs, with the operator's environment; the decoy makes that launch a
+# recorded failure instead, wherever in the tier it happened.
+TIER_CLAUDE = tier_row(
+    ("read-only-tier-runs-no-claude",
+     "no read-only check invoked claude while a recording executable "
+     "was first on PATH"),
+    ("live-tier-runs-no-claude",
+     "no live check invoked claude while a recording executable "
+     "was first on PATH"))
+
+# The runner's own check on what its units read. Each refused /proc read, in
+# the selftest process or in a tool run one of its units started, is written
+# down with the unit, the reader and the pid (_ProcessFence.note), and the run
+# goes on, so this row names every one of them while every unit still reports.
+TIER_PROCS = tier_row(
+    ("read-only-tier-reads-only-admitted-processes",
+     "every pid a /proc reader was asked about in the read-only tier, by a unit, a "
+     "tool run a unit started or the runner, was one the process fence admits"),
+    ("live-tier-reads-only-admitted-processes",
+     "every pid a /proc reader was asked about in the live tier, by a unit, a tool "
+     "run a unit started or the runner, was one the process fence admits"))
+
 # The runner's own check that every unit produced valid rows for exactly the
 # ids it registered. Reported in every run, pass or fail, so the listing can
 # name it. Each rejected row and each registered id a unit never produced is
@@ -14905,7 +14975,9 @@ CATALOG_REPORTED = tier_row(
 # that merges the shares states each of them once, folded from every share,
 # rather than registering the same id once per share.
 SHARE_SUMMARY_ROWS = (RUNNER_CHECKS[0], UNIT_ENDED[True], TIER_TMUX[True],
-                      TIER_SOCKETS[True], UNIT_DECLARED[True], IDS_UNIQUE[True])
+                      TIER_SOCKETS[True], TIER_CLAUDE[True], TIER_PROCS[True],
+                      TIER_ADOPTS[True], TIER_LEFT[True], UNIT_DECLARED[True],
+                      IDS_UNIQUE[True])
 
 # How long the read-only child, or one share of a split live run, may take
 # before it is stopped and reported as not having finished.
@@ -14996,12 +15068,11 @@ def worker_room_faults(room, roots):
     return faults
 
 
-# The units that make a room of worker directories under the TMPDIR of the
-# process they run in, each worker's socket root a level below that process's
-# own: the fault fixture splits a copy of this tool, and the other two run
-# run_shares on fixture workers.
-ROOM_MAKING_UNITS = ("_check_runner_paths_on_a_fault_fixture", "_check_shares_cleanup_owner",
-                     "_check_live_workers_share_one_removable_tempdir")
+# The units declared with rooms=True, by function name: each makes a room of
+# worker directories under the TMPDIR of the process it runs in, each worker's
+# socket root a level below that process's own, by running run_shares or by
+# splitting a copy of this tool with --jobs (unit()).
+ROOM_MAKING_UNITS = set()
 
 
 def deepest_socket_root(base, live, jobs, share=None, units=None):
@@ -15010,7 +15081,7 @@ def deepest_socket_root(base, live, jobs, share=None, units=None):
     A run's own socket root is base/s and mkdtemp's eight characters. A split
     live run gives each worker room/<at> as its TMPDIR, a level of rooms with
     the room named by one letter and mkdtemp's characters, and the worker
-    makes its socket root there. A unit of ROOM_MAKING_UNITS makes one more
+    makes its socket root there. A unit declared with rooms=True makes one more
     level below the process it runs in: a read-only run runs the read-only
     units, and a live run that does not split and each share run the live
     ones, a split run's shares a level below the run. units is UNITS unless
@@ -15086,6 +15157,19 @@ def owned_group_refusal(pid, started, bound, name=None):
     return None
 
 
+def ready_to_read(fd, wait=0.0):
+    """Whether fd can be read without blocking, waiting up to wait seconds.
+
+    A pidfd turns ready when its process exits, and a pipe when its last write
+    end is closed. poll, because select.select refuses a descriptor numbered
+    1024 or more.
+    """
+    import select
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    return bool(poller.poll(max(0, int(wait * 1000))))
+
+
 def _pidfd_for(pid, started):
     """An open pidfd for pid while it is still the process that started at started, else None.
 
@@ -15114,15 +15198,14 @@ def end_processes(chosen, grace=3.0, rounds=20):
     is asked to stop, then made to. The next round reads the processes again,
     so what a process started while the last round waited is found, and the
     rounds stop when one finds nothing left to end. A process still running
-    after SIGKILL is not signalled again. ended and left are sorted pids, and a
-    refused process still running is left too; refused holds one sentence per
-    refusal.
+    after SIGKILL is not signalled again. ended and left are sorted pids. left
+    is what chosen still picks after the last round, from a read of its own:
+    a refused process, one that outlived SIGKILL and one whose pidfd could not
+    be opened are all named there. refused holds one sentence per refusal.
     """
-    import select
     import signal
 
-    def gone(fd):
-        return bool(select.select([fd], [], [], 0)[0])
+    gone = ready_to_read
 
     bound = _ProcessFence.start_time(os.getpid())
     ended, refused, refused_at, given_up = set(), [], set(), set()
@@ -15160,13 +15243,7 @@ def end_processes(chosen, grace=3.0, rounds=20):
         finally:
             for _started, fd in targets.values():
                 os.close(fd)
-    else:
-        # Still finding processes after every round: what chosen picks now is
-        # left, unended.
-        given_up |= {(pid, identity[2])
-                     for pid, identity in chosen(_ProcessFence.run_processes()).items()}
-    left = sorted(pid for pid, started in refused_at | given_up
-                  if _ProcessFence.running(pid, started))
+    left = sorted(chosen(_ProcessFence.run_processes()))
     return sorted(ended), left, refused
 
 
@@ -15213,7 +15290,8 @@ def adopt_orphans(adopting=True):
     A run that is one keeps every process its fixtures start under it however
     the processes in between end, so finish_run ends them and nothing the run
     started outlives it unseen. Returns the setting it replaced, or None where
-    the kernel offers none, which changes nothing.
+    the kernel offers none: the run then adopts nothing, and its tier's
+    TIER_ADOPTS row fails and says so.
     """
     import ctypes
     libc = ctypes.CDLL(None, use_errno=True)
@@ -15223,6 +15301,56 @@ def adopt_orphans(adopting=True):
     if libc.prctl(PR_SET_CHILD_SUBREAPER, int(adopting), 0, 0, 0) != 0:
         return None
     return bool(was.value)
+
+
+def orphan_adopted(bound=10):
+    """Make an orphan on purpose and say whether this process adopted it.
+
+    Returns (adopted, its pid, whether it ended). A child that starts a
+    sleeper and exits at once, setsid --fork with this process's setting left
+    as it is, so the sleeper's parent has exited before it is asked about and
+    the kernel has given it to the nearest process that adopts orphans. The
+    sleeper says its pid in a file, as start_stray's does, and waits for end of
+    file on a line whose write end only this process holds. Whether its parent
+    is this process is read off this process's own children files
+    (_ProcessFence.children), which reads nothing outside the run. Then that
+    line is closed and the sleeper ends by itself wherever it went, with no
+    signal sent, and its end is waited for, up to bound seconds, on a life line
+    whose write end only the sleeper holds. An adopted one stays a zombie under
+    this run, which nothing counts; one that was not adopted is outside the
+    run, where nothing of the run's would reach it. pid is 0 when it never said
+    it.
+    """
+    room = Path(tempfile.mkdtemp(prefix="o"))
+    told = room / "pid"
+    hold, release = os.pipe()
+    life, line = os.pipe()
+    adopted, pid, ended = False, 0, False
+    try:
+        try:
+            subprocess.Popen(["setsid", "--fork", sys.executable, "-c",
+                              "import os, sys; open(sys.argv[1], 'w').write(str(os.getpid())); "
+                              "os.read(0, 1)", str(told)],
+                             stdin=hold, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             pass_fds=(line,)).wait()
+        finally:
+            os.close(hold)
+            os.close(line)
+        deadline = time.monotonic() + bound
+        while not pid and time.monotonic() < deadline:
+            with contextlib.suppress(OSError, ValueError):
+                pid = int(told.read_text().strip() or 0)
+            if not pid:
+                time.sleep(0.02)
+        adopted = bool(pid) and pid in _ProcessFence.children(os.getpid())
+    finally:
+        os.close(release)
+        try:
+            ended = ready_to_read(life, bound)
+        finally:
+            os.close(life)
+            shutil.rmtree(room, ignore_errors=True)
+    return adopted, pid, ended
 
 
 @contextlib.contextmanager
@@ -15242,11 +15370,12 @@ def orphans_go_elsewhere():
 
 
 def finish_run(diagnostics=None):
-    """End whatever still runs under this run, and say so; returns (ended, left running).
+    """End whatever still runs under this run, and say so; returns (ended, left running, refused).
 
     A run's units end what they start, so anything found here is a leak: it is
     ended and named on the diagnostic stream, with whatever could not be ended
-    or was refused.
+    or was refused. The outermost run_selftest call also states what this
+    returned in its tier's TIER_LEFT row.
     """
     ended, left, refused = end_run_descendants()
     if ended:
@@ -15255,7 +15384,7 @@ def finish_run(diagnostics=None):
     if left or refused:
         write_diagnostic("the run could not end everything it had started: " + "; ".join(
             [*refused, *(f"pid {pid} is still running" for pid in left)]), diagnostics)
-    return ended, left
+    return ended, left, refused
 
 
 def start_copy_run(argv, env):
@@ -15282,7 +15411,7 @@ def start_wrapped(argv):
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def start_stray(told, *argv, wait=60):
+def start_stray(told, *argv, wait=60, program=None):
     """Start a sleeper outside this run's lineage, as another run's would be; returns (pid, life line).
 
     setsid --fork starts it from a child that exits at once, and this run
@@ -15294,28 +15423,45 @@ def start_stray(told, *argv, wait=60):
     readers do not read it, since it is not under this run: the caller ends
     it with end_stray, by its pid and the life line, the read end of a pipe
     whose write end only the sleeper holds. pid is 0 when it never said it.
+
+    program, when given, is the argv[0] the sleeper wears: the interpreter
+    setsid starts executes itself again under that name before the sleeper
+    says its pid, as the suite's fake agents wear FAKE_AGENT_BIN, so a check
+    can place a process that reads as an agent outside the run.
+
+    Any exception while it is made or while its pid is waited for, Terminated
+    included, ends it through end_stray, by the pid it said by then, and closes
+    the life line, since nothing else ends a stray outside the run.
     """
     life, line = os.pipe()
-    try:
-        with orphans_go_elsewhere():
-            subprocess.Popen(["setsid", "--fork", sys.executable, "-c",
-                              "import os, sys, time;"
-                              "open(sys.argv[1], 'w').write(str(os.getpid()));"
-                              "time.sleep(30)", str(told), *argv],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, pass_fds=(line,)).wait()
-    except BaseException:
-        os.close(life)
-        raise
-    finally:
-        os.close(line)
-    deadline = time.monotonic() + wait
-    while time.monotonic() < deadline:
+    sleeper = ["-c", "import os, sys, time;"
+                     "open(sys.argv[1], 'w').write(str(os.getpid()));"
+                     "time.sleep(30)", str(told), *argv]
+    named = (["-c", "import os, sys; os.execv(sys.executable, sys.argv[1:])", program]
+             if program else [])
+
+    def said():
         with contextlib.suppress(OSError, ValueError):
-            if pid := int(Path(told).read_text().strip() or 0):
+            return int(Path(told).read_text().strip() or 0)
+        return 0
+
+    try:
+        try:
+            with orphans_go_elsewhere():
+                subprocess.Popen(["setsid", "--fork", sys.executable, *named, *sleeper],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, pass_fds=(line,)).wait()
+        finally:
+            os.close(line)
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if pid := said():
                 return pid, life
-        time.sleep(0.02)
-    return 0, life
+            time.sleep(0.02)
+        return 0, life
+    except BaseException:
+        end_stray(said(), life)
+        raise
 
 
 def end_stray(pid, life, grace=3.0):
@@ -15329,11 +15475,10 @@ def end_stray(pid, life, grace=3.0):
     to stop, then made to. never_signalled still holds; the sleeper itself is
     never read. The life line is closed either way.
     """
-    import select
     import signal
 
     def ended():
-        return bool(select.select([life], [], [], 0)[0])
+        return ready_to_read(life)
 
     try:
         if not pid or ended() or never_signalled(pid):
@@ -15446,19 +15591,15 @@ def write_diagnostic(text, stream=None):
 def ran_unit(run, s, diagnostics=None):
     """One unit's rows, and what ended the run when the unit did not report.
 
-    The engine's /proc readers ask this process's fence while the unit runs. A
-    unit that had one of them refused, because it named a process this run did
-    not start, ends the run here like a unit that raised, with the reader and
-    pid it named, whether or not the unit noticed the empty answer it got.
-    Under an audit, which names a record file in the fence variable, the
-    refusals go to that file instead and the run goes on, so one run lists
-    every unit that does it.
-
-    A unit not declared to read the machine sees no processes at all: for its
-    length RESOLVER answers from an empty synthetic world's process table,
-    session registry and process readers, put back here after the unit, and
-    every engine the unit makes gets the same through the fence's engine_made.
-    Sockets stay the engine's own.
+    For the unit's length this process's fence knows which unit runs and
+    whether it is declared with machine=True, and FENCE_UNIT_VAR hands the
+    same to every tool run the unit starts, so the engine's /proc readers here
+    and there read processes by one rule (_ProcessFence). A refused read does
+    not end the run: the fence writes it down, the tier's TIER_PROCS row names
+    the unit, the reader and the pid, and every later unit still runs.
+    RESOLVER's process caches are dropped as the unit starts and again in the
+    finally, so a table a declared unit read of the whole machine reaches no
+    other unit through RESOLVER, whatever ended the unit.
 
     Returns (rows, None) from a unit that reported, and ([], what ended it)
     from one that exited or raised. The tier stops there rather than running
@@ -15482,12 +15623,11 @@ def ran_unit(run, s, diagnostics=None):
     caught beside it, for a unit ended by something that is not a refusal.
     """
     fence = _process_fence()
-    machine = run.__name__ in MACHINE_UNITS
-    fence.enter(run.__name__, machine)
     engine = globals()["RESOLVER"]
-    kept = {name: vars(engine).get(name) for name in _FakeTmux.PROCESS_INPUTS}
-    if not machine:
-        _FakeTmux().attach_processes(engine)
+    engine._invalidate("process")
+    handed = os.environ.get(FENCE_UNIT_VAR)
+    fence.enter(run.__name__, run.__name__ in MACHINE_UNITS)
+    os.environ[FENCE_UNIT_VAR] = fence.handed_down()
     try:
         if TERMINATION["signal"] is not None:
             raise Terminated(f"sent signal {TERMINATION['signal']}")
@@ -15504,144 +15644,324 @@ def ran_unit(run, s, diagnostics=None):
         traceback.print_exc(file=diagnostics or diagnostic_stream())
         produced, stopped = [], f"{type(exc).__name__}: {exc}"
     finally:
-        reads = fence.leave()
-        for name, value in kept.items():
-            if value is None:
-                vars(engine).pop(name, None)
-            else:
-                setattr(engine, name, value)
-    if reads and fence.record is None:
-        named = "; ".join(f"{reader} of pid {pid}" for _unit, reader, pid in reads[:4])
-        more = f" and {len(reads) - 4} more" if len(reads) > 4 else ""
-        return [], f"read processes this run did not start: {named}{more}"
+        fence.leave()
+        if handed is None:
+            os.environ.pop(FENCE_UNIT_VAR, None)
+        else:
+            os.environ[FENCE_UNIT_VAR] = handed
+        engine._invalidate("process")
     return produced, stopped
 
 
 # The variable an audit sets to the file it wants the refusals in. Derived from
-# the tool's name so a copy under another name keeps its own.
+# the tool's name so a copy under another name keeps its own. A run that finds
+# it unset sets it to a file of its own, so each refusal, in a selftest process
+# or in a tool run one of its units started, is written to one file, which the
+# tier's TIER_PROCS row reads.
 FENCE_RECORD_VAR = f"{TOOL.upper().replace('-', '_')}_SELFTEST_FENCE"
+
+# The variable ran_unit sets for one unit's length, so that every tool run the
+# unit starts reads processes by that unit's rule: the root's pid, the root's
+# start time, the fence's token, 1 for a unit declared with machine=True or 0,
+# and the unit's name, separated by spaces. Derived from the tool's name as the
+# record's variable is.
+FENCE_UNIT_VAR = f"{TOOL.upper().replace('-', '_')}_SELFTEST_UNIT"
+
+
+def _whole_pid(pid):
+    """pid as an int when it is a number a process can hold, else None.
+
+    An int above zero, or the decimal digits /proc names one by. A bool, a
+    float, a string such as "self" or "1/task/1", and anything else names no
+    process, or names one by a path the fence never judged.
+    """
+    if type(pid) is int:
+        return pid if pid > 0 else None
+    if type(pid) is str and pid.isascii() and pid.isdigit() and pid == str(int(pid)):
+        return int(pid) or None
+    return None
 
 
 class _ProcessFence:
-    """Which processes a selftest unit may read through the engine's /proc readers.
+    """Which processes the engine's /proc readers may read while the selftest runs.
 
     A fixture can name any pid, and a real process may hold that number: the
     engine would then read a stranger's command line, state or environment,
     and what a check concluded would depend on what happened to run on the
-    machine. So while a unit runs, each reader asks here first. A unit may read
-    this run's own process, any process this run started while it is still
-    under it, and one this run started that has since gone, where the read
-    finds nothing. A unit declared with machine=True reads the real machine on
-    purpose and may also read every pid a real /proc listing named during the
-    run, in that unit or an earlier one, since an engine keeps the table it
-    read and a later unit may use it. Any other pid is refused, written down
-    against the unit, and answered as a process that does not exist.
+    machine. So while the selftest runs, each reader asks here first, in the
+    selftest process and in every tool run one of its units starts.
+
+    The root is the selftest process that runs the units: a read-only run, a
+    serial live run, one share of a split run, or the read-only child a live
+    run starts. Each of them is the subreaper of what it starts, so whatever
+    its units orphan stays under it. The declaration machine=True (unit())
+    decides what the engine's process inputs, _FakeTmux.PROCESS_INPUTS,
+    answer. A unit not declared with it sees through them the root and the
+    processes under it now, and nothing else: the process table lists only
+    those (listing), the session registry is empty (sees_registry), and a
+    reader refuses every other pid. A declared unit reads the real machine on
+    purpose: its table lists every process, its session registry is the real
+    one, and a reader may also read a pid either of them named while that
+    pid's start time is still the one read when it was named, or while no
+    process holds it. In both worlds a reader may read a pid the run knows,
+    because Popen started it here or a walk found it under the root, while its
+    start time is still the one read when the run first learned of it, or once
+    no process holds its number, where the read finds nothing; and any pid from
+    PID_CEILING up, which no process can hold and from which the fixtures number
+    the processes they invent. Outside any unit the undeclared rule holds.
+
+    A refused pid is answered as a process that does not exist, and note
+    writes the refusal down. Nothing of it is read, except the start time admit
+    compares for a pid a declared unit's listing named or one the run knows. A
+    value that is not a whole number above zero names no process and is refused
+    the same way.
+
+    A tool run a unit starts installs its fence from what the unit handed down
+    in FENCE_UNIT_VAR (adopt_inherited_fence), so its root is the selftest
+    process that runs the unit, not the tool run itself, and its unit,
+    declaration and token are that unit's. It checks the root's start time
+    before it walks the root's children, so a root that has gone, whose pid
+    another process may hold by now, leaves it no process at all. Its
+    refusals go to the file FENCE_RECORD_VAR names, which the root's row
+    reads once the tool run has exited.
 
     Popen tells the fence about every process it starts, so a child that
-    exited before anyone asked about it still counts as this run's. The
-    processes under this run are found by walking /proc/<pid>/task/*/children
-    down from it, which reads only this run's own processes. The same walk and
-    a reader of one process's stat file are how the selftest ends what it
+    exited before anyone asked about it is still one the run knows. The
+    processes under the root are found by walking /proc/<pid>/task/*/children
+    down from it, which reads only those processes. A walk reads those files
+    one after another, so a process whose parent exits meanwhile can move to a
+    subreaper inside the run between two of them and be in neither; admit and
+    identity walk again before they count a pid a process holds as outside the
+    run (_found_by). The same walk and a
+    reader of one process's stat file are how the selftest ends what it
     started, in end_processes and the functions that use it.
     """
 
-    def __init__(self, record=None):
-        self.root = os.getpid()
+    def __init__(self, record=None, root=None, root_start=None, token=None, unit=None,
+                 machine=False):
+        self.root = os.getpid() if root is None else root
+        self.root_start = self._start_of(self.root) if root is None else root_start
+        self.token = token or os.urandom(6).hex()
         self.record = record
-        self.started = set()
-        self.unit, self.machine = None, False
-        self.listed, self.refused, self.under = set(), [], set()
+        self.known = {}
+        self.unit, self.machine = unit, machine
+        self.named, self.refused, self.unwritten, self.entered = {}, [], [], []
 
     def enter(self, name, machine):
-        """Begin one unit: its refusals and the processes under it start empty."""
+        """Begin one unit: the pids it may read by name and its refusals start empty."""
+        self.entered.append((self.unit, self.machine, self.named, self.refused))
         self.unit, self.machine = name, machine
-        self.refused, self.under = [], set()
+        self.named, self.refused = {}, []
 
     def leave(self):
-        """End the unit; return its refusals, and write them for an audit."""
+        """End the unit and go back to what held before it; returns the unit's refusals."""
         refused = self.refused
-        if refused and self.record:
-            with open(self.record, "a") as out:
-                for unit, reader, pid in refused:
-                    out.write(json.dumps({"runner": self.root, "unit": unit,
-                                          "reader": reader, "pid": pid}) + "\n")
-        self.unit, self.machine = None, False
-        self.refused, self.under = [], set()
+        self.unit, self.machine, self.named, self.refused = (
+            self.entered.pop() if self.entered else (None, False, {}, []))
         return refused
 
+    def handed_down(self):
+        """What FENCE_UNIT_VAR holds for a tool run that the unit running now starts."""
+        return f"{self.root} {self.root_start} {self.token} {int(self.machine)} {self.unit}"
+
     def spawned(self, pid):
-        """Popen started this process for this run."""
-        self.started.add(pid)
+        """Popen started this process here: the run knows it, with its start time now."""
+        self.known.setdefault(pid, self._start_of(pid))
 
-    def engine_made(self, engine):
-        """An engine made inside a unit that does not read the machine sees no
-        processes: an empty synthetic world's process inputs, its sockets its
-        own. A unit that wants processes installs a world over it."""
-        if self.unit is not None and not self.machine:
-            _FakeTmux().attach_processes(engine)
+    def sees_registry(self):
+        """Whether the session registry is read: only by a unit declared to read the machine."""
+        return self.machine
 
-    def saw_listed(self, pids):
-        """A real /proc listing named these pids; a declared unit may read them."""
-        self.listed.update(pids)
+    def listing(self, pids):
+        """Which of pids, a real /proc listing, the process table may read.
+
+        For a declared unit every one, each named with its start time now.
+        Otherwise the root and the processes under it, found before any of
+        them is read, and pids from PID_CEILING up, which no process can hold,
+        so a fixture that hands the table an invented pid still gets its row.
+        A pid left out is never read and so never refused: a unit is refused
+        only a pid it asked about.
+        """
+        if self.machine:
+            self.name(pids)
+            return list(pids)
+        tree = self._tree()
+        return [pid for pid in pids if pid in tree or pid >= PID_CEILING]
+
+    def name(self, pids):
+        """A real listing or session registry named these pids: keep each one's start time now."""
+        for pid in pids:
+            number = _whole_pid(pid)
+            if number is not None:
+                self.named[number] = self._start_of(number)
 
     def admit(self, pid, reader):
-        """Whether reader may read pid; a refusal is written down against the unit."""
-        try:
-            number = int(pid)
-        except (TypeError, ValueError):
-            return True  # names no process, so reading it finds nothing
-        if number == self.root:
-            return True
-        if self.machine and number in self.listed:
-            return True
-        if number in self.under or number in self._under():
-            return True
-        if number in self.started and not self._exists(number):
-            return True
-        if self.unit is not None:
-            self.refused.append((self.unit, reader, number))
+        """Whether reader may read pid; a refusal is written down by note.
+
+        A pid from PID_CEILING up is admitted, and so, in a declared unit, is a
+        pid a real listing or registry named while its start time is the one
+        read then. A pid the run knows, because Popen started it here or a walk
+        found it under the root, is admitted while its start time is the one
+        read when the run first learned of it, or once no process holds its
+        number, and refused while another process holds it. One under the root
+        now is admitted, and the walk that finds it is how the run learns it.
+        The pid's start time is read only for a named or known pid, the two
+        rules that compare it, so a pid outside the run that neither rule
+        covers is refused without anything of it being read.
+        """
+        number = _whole_pid(pid)
+        if number is not None:
+            if number >= PID_CEILING:
+                return True
+            named = self.machine and number in self.named
+            if named or number in self.known:
+                now = self._start_of(number)
+                if named and now in (None, self.named[number]):
+                    return True
+                if number in self.known and now in (None, self.known[number]):
+                    return True
+            if self._found_by(number, self._tree):
+                return True
+        self.note(reader, pid)
         return False
 
-    def _under(self):
-        """Every process under this run now, by its children files."""
-        self.under = self._walk_down(self.root)
-        return self.under
+    def note(self, reader, pid):
+        """Write down one refused read, in this fence's list for the unit and in the record.
+
+        Each record line holds the fence's token, the root, the process that
+        was refused, the unit (None outside any unit), the reader, and the pid,
+        or the repr of a value that is no pid. A line the record cannot take is
+        kept here for the row in the root's own process, and written to the
+        diagnostic stream in a tool run, which has no row of its own.
+        """
+        number = _whole_pid(pid)
+        shown = number if number is not None else repr(pid)
+        self.refused.append((self.unit, reader, shown))
+        line = json.dumps({"fence": self.token, "root": self.root, "process": os.getpid(),
+                           "unit": self.unit, "reader": reader, "pid": shown})
+        try:
+            if not self.record:
+                raise OSError("no record file is named")
+            with open(self.record, "a") as out:
+                out.write(line + "\n")
+        except OSError as unwritable:
+            if os.getpid() == self.root:
+                self.unwritten.append(line)
+            else:
+                write_diagnostic(f"{TOOL} selftest: a refused read the record could not "
+                                 f"take ({unwritable}): {line}")
+
+    def refusals_in_run(self):
+        """Every refusal under this fence, as (unit, reader, pid, process), in the order written.
+
+        Read from the record by this fence's token, which picks out this
+        process's own refusals and those of every tool run its units started,
+        and from the lines the record could not take.
+        """
+        try:
+            lines = Path(self.record).read_text().splitlines() if self.record else []
+        except OSError:
+            lines = []
+        found = []
+        for line in [*lines, *self.unwritten]:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get("fence") == self.token:
+                found.append((row.get("unit"), row.get("reader"), row.get("pid"),
+                              row.get("process")))
+        return found
+
+    def _tree(self):
+        """The root and every process under it now; none once the root's start time has changed.
+
+        The run learns each pid a walk finds, with its start time, the first
+        time a walk finds it, and keeps it for the run's length (admit).
+        """
+        if self.root_start is None or self._start_of(self.root) != self.root_start:
+            return set()
+        tree = {self.root} | self._walk_down(self.root)
+        for pid in tree:
+            if pid not in self.known:
+                self.known[pid] = self._start_of(pid)
+        return tree
 
     # How the selftest ends what it started, and checks that it did. These
     # readers do not ask admit; what they can reach is limited by how they
     # find it instead. run_processes reads the children files of this process
     # and of every process found under it, and the stat file of each process
     # found that way. identity reads one pid's stat file only when that pid is
-    # this process or the same walk finds it under this process now.
+    # this process or the same walk finds it under this process now, in one of
+    # up to three walks for a pid a process holds (_found_by).
     # ancestors reads the stat files up the chain of parents from this
     # process's own parent, for never_signalled never to signal one of them.
-    # Any other pid reads as no running process and is not read, and while a
-    # unit runs, a refused pid that a process holds is written down against
-    # the unit as admit writes its refusals, so the run ends there the same
-    # way and an audit counts it. A process that left the run's tree and
-    # still runs is told apart from one that has gone that way, rather than
-    # passing for gone.
+    # Any other pid reads as no running process and is not read, and a refused
+    # pid that a process holds is written down by note as the reader "cleanup
+    # stat", the way admit writes its refusals, so the tier's row names it and
+    # an audit counts it. A process that left the run's tree and still runs is
+    # told apart from one that has gone that way, rather than passing for
+    # gone.
 
     @staticmethod
-    def _walk_down(root):
+    def children(pid):
+        """The pids whose parent is pid now, by its threads' children files."""
+        found = set()
+        try:
+            tasks = list(Path(f"/proc/{pid}/task").iterdir())
+        except OSError:
+            return found
+        for task in tasks:
+            try:
+                found.update(map(int, (task / "children").read_text().split()))
+            except OSError:
+                continue
+        return found
+
+    @classmethod
+    def _walk_down(cls, root):
         """Every pid under root now, root left out, by its threads' children files."""
         found, frontier = set(), [root]
         while frontier:
-            parent = frontier.pop()
-            try:
-                tasks = list(Path(f"/proc/{parent}/task").iterdir())
-            except OSError:
-                continue
-            for task in tasks:
-                try:
-                    children = (task / "children").read_text().split()
-                except OSError:
-                    continue
-                for child in map(int, children):
-                    if child not in found:
-                        found.add(child)
-                        frontier.append(child)
+            for child in cls.children(frontier.pop()):
+                if child not in found:
+                    found.add(child)
+                    frontier.append(child)
         return found
+
+    @classmethod
+    def _found_by(cls, pid, walk):
+        """Whether walk, a walk down a tree that returns the pids it found, finds pid.
+
+        A walk reads one children file after another, so a process whose
+        parent exits while the walk is between two of them is handed to a
+        subreaper inside the run and can be in neither file. A pid that a
+        process holds and a walk did not find is looked for again, in up to
+        three walks in all, before it counts as outside the tree; one that no
+        process holds is not looked for again.
+        """
+        for _attempt in range(3):
+            if pid in walk():
+                return True
+            if cls._held(pid)[0] is False:
+                return False
+        return False
+
+    @staticmethod
+    def _start_of(pid):
+        """pid's start time from its stat file, field 22, or None when no process holds pid.
+
+        The fence reads it for the root, for each process Popen starts or a walk
+        finds under the root, for each pid a declared unit's listing or registry
+        names, and, as admit judges a pid, for one the run knows or such a
+        listing named. A zombie keeps its start time until it is reaped. Read as
+        bytes, so a command name that is not UTF-8 does not hide the process.
+        """
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_bytes()
+            return stat[stat.rindex(b")") + 2:].split()[19].decode()
+        except (OSError, ValueError, IndexError):
+            return None
 
     @staticmethod
     def _stat(pid):
@@ -15651,14 +15971,16 @@ class _ProcessFence:
         each with a pid its own walk found. The start time is the kernel's,
         field 22, as the string the engine's _proc_start gives, so a pid the
         kernel has since handed to another process reads with another start
-        time. The command name is the stat file's own. A zombie has ended and
-        reads as None, as a pid no process holds does.
+        time. The command name is the stat file's own, decoded so that a name
+        that is not UTF-8 still reads. A zombie has ended and reads as None, as
+        a pid no process holds does.
         """
         try:
-            stat = Path(f"/proc/{pid}/stat").read_text()
-            name = stat[stat.index("(") + 1:stat.rindex(")")]
-            rest = stat[stat.rindex(")") + 2:].split()
-            state, parent, group, started = rest[0], int(rest[1]), int(rest[2]), rest[19]
+            stat = Path(f"/proc/{pid}/stat").read_bytes()
+            name = stat[stat.index(b"(") + 1:stat.rindex(b")")].decode("utf-8", "replace")
+            rest = stat[stat.rindex(b")") + 2:].split()
+            state, parent, group, started = (rest[0].decode(), int(rest[1]), int(rest[2]),
+                                             rest[19].decode())
         except (OSError, ValueError, IndexError):
             return None
         return None if state in ("Z", "X") else (parent, group, started, name)
@@ -15690,23 +16012,35 @@ class _ProcessFence:
             number = int(pid)
         except (TypeError, ValueError):
             return None  # names no process, so there is nothing to read
-        if number == os.getpid() or number in cls._walk_down(os.getpid()):
+        if number == os.getpid() or cls._found_by(number, lambda: cls._walk_down(os.getpid())):
             return cls._stat(number)
         fence = PROCESS_FENCE
-        if fence is not None and fence.unit is not None and cls._held(number):
-            fence.refused.append((fence.unit, "cleanup stat", number))
+        if fence is not None:
+            held, unknown = cls._held(number)
+            if held:
+                fence.note("cleanup stat", number)
+            elif held is None:
+                fence.note(f"cleanup stat, of a pid pidfd_open could not judge ({unknown})",
+                           number)
         return None
 
     @staticmethod
     def _held(pid):
-        """Whether a process holds pid, by opening a pidfd for it, which neither reads nor signals it."""
+        """Whether a process holds pid, by opening a pidfd for it, which neither reads nor signals it.
+
+        Returns (True, "") when one does and (False, "") on ESRCH, when none
+        does. Any other error says nothing about pid, so it returns (None, the
+        error's name), and the caller names that where a refusal would go and
+        reads pid neither as held nor as gone.
+        """
         try:
             os.close(os.pidfd_open(pid))
         except ProcessLookupError:
-            return False
-        except OSError:
-            return True
-        return True
+            return False, ""
+        except OSError as unknown:
+            import errno
+            return None, errno.errorcode.get(unknown.errno, str(unknown.errno))
+        return True, ""
 
     @classmethod
     def start_time(cls, pid):
@@ -15729,36 +16063,83 @@ class _ProcessFence:
             ancestor = identity[0] if identity else 0
         return found
 
-    @staticmethod
-    def _exists(pid):
-        """Whether any process holds pid, by signal 0, which reads nothing."""
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        return True
+
+def install_process_fence(fence):
+    """Make fence this process's, and have Popen tell whichever fence is installed what it starts.
+
+    Returns fence. Popen is changed once per process, and what it tells goes
+    to the fence installed when it starts a process, so a check that installs
+    a fence of its own for a moment hears about what it starts meanwhile.
+    """
+    global PROCESS_FENCE
+    if not getattr(subprocess.Popen.__init__, "tells_the_fence", False):
+        started = subprocess.Popen.__init__
+
+        def telling(popen, *args, **kwargs):
+            started(popen, *args, **kwargs)
+            if PROCESS_FENCE is not None:
+                PROCESS_FENCE.spawned(popen.pid)
+
+        telling.tells_the_fence = True
+        subprocess.Popen.__init__ = telling
+    PROCESS_FENCE = fence
+    return fence
 
 
 def _process_fence():
-    """This process's fence, installed the first time one of its units runs.
+    """This process's fence, installing one rooted here when none is.
 
-    Popen is told to report what it starts from then on. A selftest process
-    runs units and nothing else, so neither is put back.
+    run_selftest installs its own before anything else; this one is for a
+    caller that runs units without it, such as a probe's unit runner.
     """
-    global PROCESS_FENCE
     if PROCESS_FENCE is None:
-        fence = _ProcessFence(os.environ.get(FENCE_RECORD_VAR) or None)
-        started = subprocess.Popen.__init__
-
-        def reporting(popen, *args, **kwargs):
-            started(popen, *args, **kwargs)
-            fence.spawned(popen.pid)
-
-        subprocess.Popen.__init__ = reporting
-        PROCESS_FENCE = fence
+        install_process_fence(_ProcessFence(os.environ.get(FENCE_RECORD_VAR) or None))
     return PROCESS_FENCE
+
+
+def adopt_inherited_fence():
+    """Install the fence a selftest unit handed down to this tool run, when one did.
+
+    FENCE_UNIT_VAR, which ran_unit sets for a unit's length, names the
+    selftest process that runs the unit, its start time, the fence's token,
+    the unit's declaration and its name. The fence installed here reads
+    processes by that unit's rule and writes its refusals to the file
+    FENCE_RECORD_VAR names, under the same token, so they reach the root's
+    row. main calls this first, before any engine exists. Without the
+    variable this run is no unit's, and nothing is installed; a run that is a
+    selftest itself puts a fence of its own in place of this one as it
+    starts. A value that does not parse ends the run, since a run that cannot
+    tell which processes it may read is not to read any. Returns the fence
+    installed, or None.
+    """
+    handed = os.environ.get(FENCE_UNIT_VAR)
+    if handed is None:
+        return None
+    parts = handed.split(" ", 4)
+    if (len(parts) != 5 or _whole_pid(parts[0]) is None or not parts[1].isdigit()
+            or not parts[2] or parts[3] not in ("0", "1") or not parts[4]):
+        die(f"{FENCE_UNIT_VAR} is {handed!r}: expected the root's pid, its start time, "
+            "the fence's token, 0 or 1, and a unit's name")
+    root, root_start, token, machine, unit = parts
+    return install_process_fence(_ProcessFence(
+        os.environ.get(FENCE_RECORD_VAR) or None, root=int(root), root_start=root_start,
+        token=token, unit=unit, machine=machine == "1"))
+
+
+def refusal_lines(refused, root):
+    """Each refusal a fence wrote down, (unit, reader, pid, process), as its tier's row says it."""
+    return [(f"unit {unit}" if unit else "outside any unit")
+            + (f", in tool run {process}" if process != root else "")
+            + f": {reader} of pid {pid}"
+            for unit, reader, pid, process in refused]
+
+
+def register_procs_row(register, live, fence):
+    """The tier's verdict on the reads its fence refused: its units', their tool runs' and its own."""
+    said = refusal_lines(fence.refusals_in_run(), fence.root)
+    shown = said[:4] + ([f"and {len(said) - 4} more"] if len(said) > 4 else [])
+    register(*TIER_PROCS[live], not said,
+             f"{len(said)} refused read(s): " + "; ".join(shown) if said else "")
 
 
 def declared_unit_rows(unit_name, ids, produced):
@@ -15834,16 +16215,32 @@ def tier_rows(units, s, register, live, diagnostics=None):
     register(*UNIT_ENDED[live], not ended, ended)
 
 
-def unit(*ids, live=False, machine=False):
+def unit(*ids, live=False, machine=False, rooms=False):
     """Register one unit of the suite under the ids it produces.
 
-    machine=True declares a unit that reads the real machine's processes on
-    purpose; the fence lets it read what the real process table lists.
+    machine=True declares a unit whose engines, or the tool runs it starts,
+    must read on purpose, through the engine's process inputs
+    (_FakeTmux.PROCESS_INPUTS), processes outside the tree of the selftest
+    process that runs it, or the real session registry. The declaration
+    decides what those inputs answer, through the fence ran_unit enters for
+    the unit, and admit's rule for the pids a real listing named, and nothing
+    else: the selftest's own process readers on _ProcessFence read the same
+    whether a unit is declared or not, so a unit that reads processes only
+    through them needs no declaration. Each declaration says beside it why
+    the unit needs one.
+
+    rooms=True declares a unit that makes a room of worker directories under
+    the TMPDIR of the process it runs in, by running run_shares or by
+    splitting a copy of this tool with --jobs. deepest_socket_root counts a
+    level of rooms for it, so a run refuses a TMPDIR too long for the room
+    before anything is made.
     """
     def take(run):
         UNITS.append((run.__name__, ids, run, live))
         if machine:
             MACHINE_UNITS.add(run.__name__)
+        if rooms:
+            ROOM_MAKING_UNITS.add(run.__name__)
         return run
     return take
 
@@ -16294,7 +16691,7 @@ UNITS[:] = [
        "and a raising unit's traceback is not counted with it"),
       ("raising-share-stops-alone",
        "a share whose unit raised stops there while the other shares finish and report"),
-      live=True)
+      live=True, rooms=True)
 def _check_runner_paths_on_a_fault_fixture(s):
     """The runner's own paths, end to end, on a copy of this tool with fixture units.
 
@@ -17141,26 +17538,30 @@ def _check_team_batch_revalidation(s):
     return checked
 
 
-@unit(('abort-stops-listed', 'an abort stops what it listed'), ('abort-listing-describes', 'the abort listing says what each process is doing'), live=True, machine=True)
+@unit(('abort-stops-listed', 'an abort stops what it listed'), ('abort-listing-describes', 'the abort listing says what each process is doing'), live=True)
 def _check_abort_stops_listed(s):
     checked = []
 
     def check(cid, name, ok, detail=""):
         checked.append((cid, name, ok, detail))
 
-    with stop_fixture(2) as (engine, ident, victims):
+    with stop_fixture(2) as (engine, ident, victims, near):
         plan = stop_targets(types.SimpleNamespace(
             team=None, agent_id=ident, resume=None))
         with capturing("out") as said:
             killed = abort_agents(plan, assume_yes=True)
         listed = said.getvalue()
         gone = [not engine._pid_alive(victim.pid) for victim in victims]
+        spared = [engine._pid_alive(miss.pid) for miss in near]
 
     titles = [target["title"] for target in plan["targets"]]
+    planned = {target["process"]["pid"] for target in plan["targets"]}
     stopping = {
         "the plan selected both processes": len(plan["targets"]) == 2,
+        "and neither near miss": not planned & {miss.pid for miss in near},
         "it reported stopping both": killed == 2,
         "and both are gone": all(gone),
+        "while both near misses still run": len(spared) == 2 and all(spared),
         "it said so": f"aborted 2 of {len(plan['targets'])}" in listed,
     }
     wrong = sorted(k for k, ok in stopping.items() if not ok)
@@ -17189,7 +17590,7 @@ def _check_abort_stops_listed(s):
       ('abort-without-terminal-asks-nothing',
        'with no terminal on stdin an abort asks nothing, stops nothing and says it left the '
        'process alone'),
-      live=True, machine=True)
+      live=True)
 def _check_abort_refusal_spares(s):
     """An abort refused at its prompt, and an abort with no terminal to prompt on.
 
@@ -17209,13 +17610,14 @@ def _check_abort_refusal_spares(s):
     real_stdin = sys.stdin
 
     def abort_with(stdin):
-        """(plan, killed, spared, prompts asked, what it printed) for one owned target."""
+        """(plan, whether it planned only that target, killed, spared, prompts asked, what it
+        printed) for one owned target."""
         # The prompt goes to input(), not to stdout, so a stand-in that dropped
         # it would leave nothing anywhere saying the question was ever put.
         # Keeping it is what tells a refusal apart from a run that skipped the
         # asking.
         asked = []
-        with stop_fixture(1) as (engine, ident, victims):
+        with stop_fixture(1) as (engine, ident, victims, _near):
             plan = stop_targets(types.SimpleNamespace(
                 team=None, agent_id=ident, resume=None))
             try:
@@ -17231,11 +17633,14 @@ def _check_abort_refusal_spares(s):
                     globals()["input"] = real_input
             # Read before the fixture ends it, which is the next thing that happens.
             spared = engine._pid_alive(victims[0].pid)
-        return plan, killed, spared, asked, said.getvalue()
+        only = {target["process"]["pid"] for target in plan["targets"]} == {victims[0].pid}
+        return plan, only, killed, spared, asked, said.getvalue()
 
-    plan, killed, spared, asked, answered = abort_with(types.SimpleNamespace(isatty=lambda: True))
+    plan, only, killed, spared, asked, answered = abort_with(
+        types.SimpleNamespace(isatty=lambda: True))
     sparing = {
         "there was something to stop": len(plan["targets"]) == 1,
+        "and only the process wearing its id": only,
         "nothing was stopped": killed == 0,
         "the process is still running": spared,
         "it asked before stopping anything":
@@ -17248,9 +17653,10 @@ def _check_abort_refusal_spares(s):
           not wrong, ", ".join(wrong))
 
     with open(os.devnull) as nothing:
-        plan, killed, spared, asked, answered = abort_with(nothing)
+        plan, only, killed, spared, asked, answered = abort_with(nothing)
     untouched = {
         "there was something to stop": len(plan["targets"]) == 1,
+        "and only the process wearing its id": only,
         "it asked nothing": not asked,
         "nothing was stopped": killed == 0,
         "the process is still running": spared,
@@ -17267,7 +17673,7 @@ def _check_abort_refusal_spares(s):
 
 
 @unit(('smoke-typed-commands', 'the commands a person types end in a message, not a traceback'),
-      live=True, machine=True)
+      live=True)
 def _check_smoke_typed_commands(s):
     checked = []
 
@@ -17325,6 +17731,25 @@ def _check_smoke_typed_commands(s):
     shutil.copytree(Path(__file__).resolve().parent / "test" / "corpus", smoke_cfg)
     smoke_env = dict(os.environ, CLAUDE_CONFIG_DIR=str(smoke_cfg), NO_COLOR="1")
     crashed, misbehaved, codes = [], [], set()
+    # A process of this run's own whose command name is not UTF-8, running
+    # while the commands run, so every typed command that reads the process
+    # table meets it and reads its stat file through the branch that answers
+    # for a name it cannot decode. A unit that sees only the processes under
+    # its run meets no other process's name by chance. It exits when its
+    # stdin closes, so it cannot outlive this unit.
+    oddly_named = sp.Popen([sys.executable, "-c",
+                            "import ctypes, sys\n"
+                            "ctypes.CDLL(None).prctl(15, b'\\xff\\xfeselftest', 0, 0, 0)\n"
+                            "print('named', flush=True)\n"
+                            "sys.stdin.read()\n"],
+                           stdin=sp.PIPE, stdout=sp.PIPE)
+    named = oddly_named.stdout.readline().strip() == b"named"
+    with contextlib.suppress(OSError):
+        named = named and b"(\xff\xfeselftest)" in Path(
+            f"/proc/{oddly_named.pid}/stat").read_bytes()
+    if not named:
+        misbehaved.append("the process meant to carry a command name that is not UTF-8 "
+                          "never carried it")
     was_up = started_here()
     try:
         for expect, argv in shapes:
@@ -17352,9 +17777,19 @@ def _check_smoke_typed_commands(s):
                 misbehaved.append(f"{typed}: exit {run.returncode} and said nothing")
     finally:
         shutil.rmtree(smoke_home, ignore_errors=True)
+        oddly_named.stdin.close()
+        try:
+            oddly_named.wait(timeout=10)
+        except sp.TimeoutExpired:
+            oddly_named.kill()
+            oddly_named.wait()
     left_behind = sorted(started_here() - was_up)
     if left_behind:
         misbehaved.append(f"started something and left it: {', '.join(left_behind)}")
+        # Ended here, so that it is in no later unit's view.
+        still = end_left_behind(left_behind)
+        if still:
+            misbehaved.append(f"and could not end {still}")
     if 0 not in codes or not codes - {0}:
         misbehaved.append(f"a run and a refusal must both be covered, "
                           f"and the exit codes seen were {sorted(codes)}")
@@ -17431,7 +17866,7 @@ def _check_stop_preview_ends_nothing(s):
     return checked
 
 
-@unit(('process-table-width-independent', 'the process table is the same at a narrow and a wide terminal for every process whose start time, parent and command line did not change between the two reads'), ('liveness-width-independent', 'an agent that is running is seen as running at either terminal width'), live=True, machine=True)
+@unit(('process-table-width-independent', 'the process table is the same at a narrow and a wide terminal for every process whose start time, parent and command line did not change between the two reads'), ('liveness-width-independent', 'an agent that is running is seen as running at either terminal width'), live=True)
 def _check_process_table_width_independent(s):
     checked = []
 
@@ -17716,8 +18151,7 @@ def _check_poison_preview_changes_nothing(s):
     return checked
 
 
-@unit(('help-is-inert', 'asking for the flags beside a verb does that verb no work'), live=True,
-      machine=True)
+@unit(('help-is-inert', 'asking for the flags beside a verb does that verb no work'), live=True)
 def _check_help_is_inert(s):
     """--help answers a question about the command line, so it must act like
     --dry-run acts: say something and change nothing.
@@ -17763,21 +18197,11 @@ def _check_help_is_inert(s):
             appeared |= started
             asked[named] = (run.returncode, run.stdout, wrote, sorted(started))
     finally:
-        # A shape here starts something only when the tool is broken, which is
-        # exactly when nothing else is going to clean it up: the run that
-        # started it has already exited. So this ends what it saw appear
-        # rather than leaving a real agent and its server on the machine.
-        for name in appeared:
-            if name.isdigit():
-                with contextlib.suppress(OSError):
-                    os.kill(int(name), 9)
-            else:
-                with contextlib.suppress(OSError):
-                    # started_here found it in the directory this run pointed
-                    # tmux at, so that is where it gets removed from. Asking
-                    # the engine instead would look somewhere else the moment
-                    # its answer and the runner's stopped agreeing.
-                    (Path(os.environ["TMUX_TMPDIR"]) / name).unlink()
+        # A pair here starts something only when the tool is broken. The run
+        # that started it has exited, so what it left is under this run, which
+        # ends it only when the whole run finishes. So this ends every process
+        # and removes every socket it saw appear, before the next unit runs.
+        end_left_behind(appeared)
         shutil.rmtree(home, ignore_errors=True)
 
     inert = {
@@ -17865,7 +18289,7 @@ def own(name):
 
 @contextlib.contextmanager
 def stop_fixture(count):
-    """Real processes a stop plan can select, and the engine that selects them.
+    """Real processes a stop plan can select, near misses it must not, and the engine that selects.
 
     The stop checks need three things at once. Processes the kernel really
     has, because what is under test is stopping one. A corpus, because a
@@ -17876,10 +18300,15 @@ def stop_fixture(count):
 
     So the process table is the one input left real and the rest is a world
     with nothing in it. The id carries this run's pid, so a plan built from
-    the machine's whole process table selects these processes and not another
-    run's.
+    the process table selects these processes and not another run's.
 
-    Yields (engine, the id they wear, the processes), and ends them itself.
+    Two near misses run beside them, also this run's own: one wears the same
+    name on another team, one another name on the same team. A plan that
+    matched one half of the id selects one of them, and a stop that ended
+    more than it listed ends one, whatever else runs on the machine.
+
+    Yields (engine, the id they wear, the processes, the near misses), and
+    ends them all itself.
     """
     base = Path(tempfile.mkdtemp(prefix=f"{TOOL}-stop-"))
     shutil.copytree(Path(__file__).resolve().parent / "test" / "corpus", base / "corpus")
@@ -17891,6 +18320,10 @@ def stop_fixture(count):
         [FAKE_AGENT_BIN, "-c", '__import__("time").sleep(30)',
          "--resume", "22222222-2222-4222-8222-222222222222", "--agent-id", ident],
         executable=sys.executable) for _ in range(count)]
+    near = [subprocess.Popen(
+        [FAKE_AGENT_BIN, "-c", '__import__("time").sleep(30)', "--agent-id", own(miss)],
+        executable=sys.executable)
+        for miss in ("probe@session-corpus-beta", "other@session-corpus-alpha")]
     engine = Resolver(needs=Needs(maybe=set(NEED)))
     engine._projects_dir = base / "corpus" / "projects"
     engine._teams_dir = base / "corpus" / "teams"
@@ -17899,9 +18332,9 @@ def stop_fixture(count):
         time.sleep(0.4)          # let them reach the process table
         with _FakeTmux(sockets=[]).installed(engine):
             engine._process_table = real_table
-            yield engine, ident, victims
+            yield engine, ident, victims, near
     finally:
-        for victim in victims:
+        for victim in victims + near:
             with contextlib.suppress(OSError):
                 victim.kill()
             victim.wait()
@@ -18077,6 +18510,10 @@ def _check_shares_cover_the_tier_once(s):
     return checked
 
 
+# Declared to read the machine: its subject is a process wearing a fixture
+# identity outside the tree of the selftest process that runs it, which
+# start_stray puts there with this run's adoption switched off, and only the
+# machine's process table lists such a process.
 @unit(("smoke-counts-only-what-it-started",
        "the smoke tier counts processes it started, not the machine's"), live=True,
       machine=True)
@@ -18518,14 +18955,49 @@ def tree_state(root):
     return state
 
 
-def started_here():
-    """Anything a launch from this run would have added to the machine.
+def end_left_behind(names):
+    """End what started_here found a tool run left; returns the pids still running after.
 
-    Narrowed twice, because the question is what this run started and the
-    machine answers about everything: to agents wearing a fixture identity,
-    since real agents run here too, and then to processes descending from this
-    run. Another run's fixture is its own business, and counting it reports a
-    leak nobody here made.
+    A leftover is under this run, which adopted it, so it would stay in view of
+    every unit after this one until finish_run ends it when the whole run
+    finishes. The unit that found it ends it instead, the way finish_run does,
+    through end_processes: each process named here with what runs under it,
+    signalled only through a pidfd opened while the start time it picked still
+    held. A socket node is removed from the directory this run pointed tmux at,
+    where started_here found it.
+    """
+    pids = {int(name) for name in names if str(name).isdigit()}
+    found = set(pids)
+
+    def chosen(processes):
+        picked = {}
+        for pid in list(found):
+            if pid in processes:
+                picked[pid] = processes[pid]
+                picked.update({member: processes[member]
+                               for member in _ProcessFence.subtree(pid, processes)})
+        found.update(picked)
+        return picked
+
+    left = end_processes(chosen)[1] if pids else []
+    for name in names:
+        if not str(name).isdigit():
+            with contextlib.suppress(OSError):
+                (Path(os.environ["TMUX_TMPDIR"]) / name).unlink()
+    return left
+
+
+def started_here():
+    """The processes under this run that wear a fixture identity, and the tmux sockets named for it.
+
+    A tool run that exits leaves what it started to this run, which adopts it,
+    so a process a tool run left running is among them while it runs; a
+    process that wears no fixture identity, and a socket named otherwise, are
+    not. Narrowed twice, because the question is what this run started and a
+    declared unit's table answers about the whole machine: to processes
+    wearing a fixture identity, since real agents run here too, and then to
+    processes descending from this run. Another run's fixture is its own
+    business, and counting it reports a leak nobody here made.
 
     The sockets are read straight out of the directory this run pointed tmux
     at, kept to nodes named for this pid and to nodes that really are sockets.
@@ -18577,7 +19049,7 @@ def in_share(count, share):
             if share is None or at % share[1] == share[0]]
 
 
-def _live_in_parallel(jobs, diagnostics=None):
+def _live_in_parallel(jobs, diagnostics=None, settle=None):
     """The live units run in jobs processes at once, their verdicts merged.
 
     Each worker owns its fixtures, because a fixture is named for the run that
@@ -18592,6 +19064,11 @@ def _live_in_parallel(jobs, diagnostics=None):
     about their own registrations. The first two are the pair live_checks
     hands back, so a caller adds a row of its own the one way; the third goes
     into the run's one uniqueness row beside this register's collisions.
+
+    settle, when given, is called once the shares have finished and returns
+    what this process found about itself, by summary row id, which the folded
+    rows carry beside what the shares said: run_selftest hands in what its
+    own finish_run ended and the reads its fence refused.
     """
     s = _live_context(diagnostics=diagnostics)
     out, register = check_rows()
@@ -18614,7 +19091,7 @@ def _live_in_parallel(jobs, diagnostics=None):
         finished = []
     finally:
         shutil.rmtree(room, ignore_errors=True)
-    return out, register, fold_shares(finished, jobs, register)
+    return out, register, fold_shares(finished, jobs, register, settle() if settle else None)
 
 
 def run_shares(argvs, room, start=subprocess.Popen, bound=SELFTEST_CHILD_BOUND, inspect=None):
@@ -18686,7 +19163,7 @@ def run_shares(argvs, room, start=subprocess.Popen, bound=SELFTEST_CHILD_BOUND, 
     return finished
 
 
-def fold_shares(finished, jobs, register):
+def fold_shares(finished, jobs, register, own=None):
     """Register what the shares of a split live run reported, as one run's rows.
 
     finished holds each share's finished process in share order, as collected
@@ -18698,6 +19175,10 @@ def fold_shares(finished, jobs, register):
     otherwise. The share row says whether every share's report was whole and
     its exit status the one its verdicts call for, and it carries whatever a
     share wrote to stderr, whole.
+
+    own maps a summary row's id to what the merging run found about itself,
+    which that row carries beside what the shares said: the merging run's own
+    refused reads, for one.
 
     Returns the folded faults of the shares' uniqueness rows instead of
     registering that row: the caller states it once, with this register's own
@@ -18740,6 +19221,7 @@ def fold_shares(finished, jobs, register):
             faults += [f"{label} reported it as {name!r}"
                        for _cid, name, _ok, _detail in rows if name != description]
             faults += [f"{label}: {detail}" for _cid, _name, ok, detail in rows if not ok]
+        faults += list((own or {}).get(cid, ()))
         if cid == IDS_UNIQUE[True][0]:
             unique_faults = faults
         else:
@@ -18751,7 +19233,7 @@ def fold_shares(finished, jobs, register):
        "each worker of a split live run gets its own TMPDIR inside one room, left empty after "
        "the workers so that removing it removes everything, with room left for its socket "
        "paths, and a missing, shared, outside or overlong TMPDIR is refused before any worker "
-       "starts"))
+       "starts"), rooms=True)
 def _check_live_workers_share_one_removable_tempdir(s):
     """run_shares and worker_room_faults on worker processes that run nothing.
 
@@ -18869,6 +19351,20 @@ def _check_run_refuses_a_tmpdir_too_long_for_its_sockets(s):
         checked.append((cid, name, ok, detail))
 
     ast = s.ast
+
+    def makers(tree):
+        """The registered units whose code calls run_shares, or builds an argv list holding
+        --jobs, by the syntax tree."""
+        registered = {name for name, _ids, _run, _live in UNITS}
+        return {node.name for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name in registered
+                and any((isinstance(part, ast.Call)
+                         and getattr(part.func, "id", None) == "run_shares")
+                        or (isinstance(part, ast.List)
+                            and any(isinstance(item, ast.Constant) and item.value == "--jobs"
+                                    for item in part.elts))
+                        for part in ast.walk(node))}
+
     one = Path("/r") / ("w" + "x" * 8) / "1" / WORKER_SOCKET_ROOT
     roomless = [entry for entry in UNITS if entry[0] not in ROOM_MAKING_UNITS]
     two = Path("/r") / ("w" + "x" * 8) / "1" / ("w" + "x" * 8) / "1" / WORKER_SOCKET_ROOT
@@ -18881,8 +19377,8 @@ def _check_run_refuses_a_tmpdir_too_long_for_its_sockets(s):
         "a share whose units make no rooms nests none":
             deepest_socket_root("/r", True, 2, share="0/2", units=roomless)
             == Path("/r") / WORKER_SOCKET_ROOT,
-        "every unit counted as making rooms is registered":
-            all(any(entry[0] == name for entry in UNITS) for name in ROOM_MAKING_UNITS),
+        "the units that run run_shares or split a copy with --jobs are the ones declared "
+        "to make rooms": makers(s.tree) == ROOM_MAKING_UNITS,
         "a share of a split run nests one level":
             deepest_socket_root("/r", True, 2, share="0/2") == one,
         "a short TMPDIR fits": socket_room_fault(deepest_socket_root("/tmp", True, 4)) is None,
@@ -19050,17 +19546,22 @@ shutil.rmtree(made)
 # adopts orphans and no longer descends from the worker; it stays in the
 # worker's process group, so only ending that group ends it. It holds none of
 # the worker's streams, which would keep a reader of them waiting until it ended
-# by itself and so pass for a cleanup. The sleeper's pid goes to the file named
-# by its argument once it runs.
+# by itself and so pass for a cleanup. The worker writes the sleeper's pid to
+# the file named by its argument once the process between them has exited and
+# been waited for, so the sleeper has its new parent by the time anyone reads
+# the file.
 BOUND_WORKER_FIXTURE = r"""
-import subprocess, sys, time
-subprocess.Popen([sys.executable, "-c",
-                  "import os, subprocess, sys\n"
-                  "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'],\n"
-                  "                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
-                  "                         stderr=subprocess.DEVNULL)\n"
-                  "open(sys.argv[1] + '.tmp', 'w').write(str(child.pid))\n"
-                  "os.rename(sys.argv[1] + '.tmp', sys.argv[1])\n", sys.argv[1]]).wait()
+import os, subprocess, sys, time
+middle = subprocess.Popen([sys.executable, "-c",
+                           "import subprocess, sys\n"
+                           "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'],\n"
+                           "                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
+                           "                         stderr=subprocess.DEVNULL)\n"
+                           "print(child.pid)\n"],
+                          stdout=subprocess.PIPE, text=True)
+said = middle.communicate()[0].strip()
+open(sys.argv[1] + ".tmp", "w").write(said)
+os.rename(sys.argv[1] + ".tmp", sys.argv[1])
 time.sleep(300)
 """
 
@@ -19099,7 +19600,7 @@ finished = module.run_shares(
      [sys.executable, "-c", module.WORKER_CLEANS_FIXTURE, worker_told]],
     module.Path(room), inspect=inspect)
 seen["codes"] = [run.returncode for run in finished]
-ended, left = module.finish_run()
+ended, left, _refused = module.finish_run()
 seen["finished"] = {"ended": ended, "left": left}
 with open(told + ".tmp", "w") as out:
     json.dump(seen, out)
@@ -19110,7 +19611,7 @@ os.rename(told + ".tmp", told)
 # program named by its third argument, a sleep reached through a name of
 # systemd, whose pid goes to the file named by its fourth. It waits for the
 # file named by its second argument and then finishes as run_selftest does,
-# printing what finish_run ended and left.
+# printing what finish_run ended, left and refused.
 RUN_FINISH_FIXTURE = r"""
 import importlib.machinery, importlib.util, os, subprocess, sys, time
 tool, go, named, told = sys.argv[1:5]
@@ -19137,8 +19638,9 @@ print(module.finish_run())
 # it, as the seat fixture's pane root is; and a stray outside the run's
 # lineage, as the smoke check's is. It loads the tool as a module, becomes the
 # subreaper of what is under it and makes SIGTERM raise, as run_selftest does,
-# writes "<kind> <pid>" for each to the file named by its second argument and
-# waits. Terminated ends the wait: the stray is ended by the pid and life line
+# writes "<kind> <pid>" for each to the file named by its second argument, with
+# whether it adopts after making the stray and after a raise inside the block
+# that stops it adopting, and waits. Terminated ends the wait: the stray is ended by the pid and life line
 # the run kept, as the smoke check ends it, finish_run ends the rest, and the
 # run exits 143.
 OWN_SESSION_RUN_FIXTURE = r"""
@@ -19165,6 +19667,12 @@ try:
                                     "--agent-id", agent_id])
     stray, life = module.start_stray(told + ".stray", "--agent-id", agent_id)
     adopting_again = module.adopt_orphans(True)
+    try:
+        with module.orphans_go_elsewhere():
+            raise RuntimeError("a raise inside the block that stops this run adopting")
+    except RuntimeError:
+        pass
+    adopting_after_raise = module.adopt_orphans(True)
     copy_child, agent = 0, 0
     deadline = time.monotonic() + 60
     while not (copy_child and agent) and time.monotonic() < deadline:
@@ -19177,6 +19685,7 @@ try:
     lines = [f"{kind} {pid}" for kind, pid in kinds.items()]
     lines.append(f"stray {stray}")
     lines.append(f"adopting {adopting_again}")
+    lines.append(f"adopting-after-raise {adopting_after_raise}")
     with open(told + ".tmp", "w") as out:
         out.write("\n".join(lines) + "\n")
     os.rename(told + ".tmp", told)
@@ -19274,10 +19783,12 @@ finally:
        "a run ends only processes under it that started after it, and never pid 1, itself, "
        "an ancestor of it or a systemd process"),
       ("own-session-processes-end-with-their-run",
-       "every kind of process the suite starts in a session of its own is gone once its run "
-       "is sent SIGTERM: a copy run and its child, a wrapper and its agent, and a stray "
-       "outside the run's lineage, which the run ends by the pid and life line it kept"),
-      live=True)
+       "a copy run and its child, a wrapper and its agent, and a stray outside the run's "
+       "lineage, each started in a session of its own as the suite starts them, are gone once "
+       "their run is sent SIGTERM, the stray ended by the pid and life line the run kept; "
+       "and the run adopts again after making the stray and after a raise inside the block "
+       "that stops it adopting"),
+      live=True, rooms=True)
 def _check_shares_cleanup_owner(s):
     """run_shares, owned_group and collected ending what they own, on processes started here.
 
@@ -19292,8 +19803,8 @@ def _check_shares_cleanup_owner(s):
     process. One that has gone usually stays a zombie under this run, which
     is a subreaper and reaps none it adopts, so it is found there and read as
     gone. One that another process reaped reads as gone without being read,
-    and one that left this run's tree and still runs is refused, which ends
-    the unit instead of passing for gone.
+    and one that left this run's tree and still runs is refused and written
+    down, which fails the tier's refusal row, instead of passing for gone.
     """
     import signal
     checked = []
@@ -19482,7 +19993,7 @@ def _check_shares_cleanup_owner(s):
                        for name, (was_running, gone) in ended.items()
                        if not (was_running and gone))
         # The stand-ins stand for the drive the suite runs, so that drive has
-        # to be the one owned_group records and collected waits on.
+        # to be the one owned_group ends and collected waits on.
         import ast
         import inspect
         drive_tree = ast.parse(textwrap.dedent(inspect.getsource(completion_tab_checks)))
@@ -19670,7 +20181,8 @@ def _check_shares_cleanup_owner(s):
             "processes outside a run, older or younger than it, survive its finish":
                 outside_survived and finisher.returncode == 0,
             "a process under the run that the rules refuse is left running and said to be left":
-                under_survived and finished_said.strip() == f"([], [{under_id[0]}])",
+                under_survived and finished_said.strip()
+                == f"([], [{under_id[0]}], ['pid {under_id[0]} is a systemd process'])",
             "the run names on its diagnostic stream what it could not end":
                 f"pid {under_id[0]} is a systemd process" in finisher_err
                 and f"pid {under_id[0]} is still running" in finisher_err,
@@ -19704,11 +20216,13 @@ def _check_shares_cleanup_owner(s):
                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         identity(own_run.pid)
         said = told.read_text().splitlines() if waited(told.exists) else []
-        kinds, adopting_again = {}, None
+        kinds, adopting_again, adopting_after_raise = {}, None, None
         for line in said:
             kind, pid = (line.split() + ["", ""])[:2]
             if kind == "adopting":
                 adopting_again = pid
+            elif kind == "adopting-after-raise":
+                adopting_after_raise = pid
             elif pid.isdigit() and int(pid):
                 kinds[kind] = identity(int(pid))
         under_run = _ProcessFence.subtree(own_run.pid, _ProcessFence.run_processes())
@@ -19731,6 +20245,8 @@ def _check_shares_cleanup_owner(s):
                 own_run.returncode == 143,
             "none is running after": not any(after.values()),
             "the run adopted again once the stray was made": adopting_again == "True",
+            "and again after a raise inside the block that stops it adopting":
+                adopting_after_raise == "True",
             "the run named what it ended on its diagnostic stream":
                 "the run ended processes it had started and left running: " in own_err
                 and all(str(kinds[kind][0]) in own_err
@@ -19738,10 +20254,11 @@ def _check_shares_cleanup_owner(s):
         }
         wrong = sorted(claim for claim, ok in own_session.items() if not ok)
         check("own-session-processes-end-with-their-run",
-              "every kind of process the suite starts in a session of its own is gone once its "
-              "run is sent SIGTERM: a copy run and its child, a wrapper and its agent, and a "
-              "stray outside the run's lineage, which the run ends by the pid and life line it "
-              "kept",
+              "a copy run and its child, a wrapper and its agent, and a stray outside the run's "
+              "lineage, each started in a session of its own as the suite starts them, are gone "
+              "once their run is sent SIGTERM, the stray ended by the pid and life line the run "
+              "kept; and the run adopts again after making the stray and after a raise inside "
+              "the block that stops it adopting",
               not wrong, ", ".join(wrong) + (f"; kinds {kinds}, before {before}, under the run "
                                              f"{placed}, after {after}, exit {own_run.returncode},"
                                              f" stderr {own_err.strip()[-300:]!r}"
@@ -19759,22 +20276,32 @@ def _check_shares_cleanup_owner(s):
 
 
 @unit(("cleanup-reads-only-its-run",
-       "the selftest's own process readers read the processes under its run, and its "
-       "ancestors only for the guard; any other pid reads as no running process without being "
-       "read, and one a process holds is written down as refused"), live=True)
+       "the selftest's own process readers read the stat files only of the processes under "
+       "its run, and of its ancestors for the guard; any other pid reads as no running "
+       "process and its stat file is not read, one a process holds is written down as "
+       "refused and one pidfd_open cannot judge is written down with the error; and end_stray "
+       "ends the stray it asked about and says so"), live=True)
 def _check_cleanup_reads_only_its_run(s):
     """_ProcessFence's own readers, asked about pids inside and outside this run.
 
-    A sleeper this check starts is under the run and is read. pid 1, this
+    A sleeper this check starts is under the run and is read, and so it is
+    when the first walk identity makes for it misses it, through a stand-in
+    for _ProcessFence._walk_down, as a walk can while a process's parent exits
+    and the process moves to a subreaper inside the run. pid 1, this
     run's parent and a stray start_stray puts outside the run's lineage are
     running and are not read: each reads as no running process and is written
     down as refused. A pid no process can hold reads the same and is not
-    written down, since nothing holds it. The parent is still found by the
-    guard's walk up from this run. The refusals go to a fence of this check's
-    own, entered as an undeclared unit, so they are read here instead of
-    ending the run.
+    written down, since nothing holds it. A pid pidfd_open cannot judge, as a
+    stand-in for it makes one here, is written down with the error and read
+    neither as held nor as gone. The parent is still found by the guard's walk
+    up from this run. Every pid whose stat file is read while the questions
+    are put is recorded, through a stand-in for _ProcessFence._stat put in its
+    place as the lineage stand-in in _check_shares_cleanup_owner is, and each
+    one must be this run, a process under it or an ancestor. The refusals go
+    to a fence of this check's own, entered as an undeclared unit, so they are
+    read here instead of reaching the tier's refusal row.
     """
-    import select
+    import errno
     checked = []
 
     def check(cid, name, ok, detail=""):
@@ -19784,16 +20311,48 @@ def _check_cleanup_reads_only_its_run(s):
     sleeper = subprocess.Popen(["sleep", "30"], stdin=subprocess.DEVNULL,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     stray, life = start_stray(room / "pid")
-    stray_running = bool(stray) and not select.select([life], [], [], 0)[0]
+    stray_running = bool(stray) and not ready_to_read(life)
     runner, fence = PROCESS_FENCE, _ProcessFence()
     held = {"pid 1": 1, "this run's parent": os.getppid(), "a stray outside this run": stray}
+    kept_stat, stat_read = vars(_ProcessFence)["_stat"], []
+
+    def recording(pid):
+        stat_read.append(int(pid))
+        return kept_stat.__func__(pid)
+
+    real_open = os.pidfd_open
+
+    def unjudging(_pid, *_flags):
+        raise OSError(errno.EMFILE, os.strerror(errno.EMFILE))
+
     globals()["PROCESS_FENCE"] = fence
+    _ProcessFence._stat = staticmethod(recording)
     try:
         fence.enter("undeclared", False)
         answers = {name: _ProcessFence.identity(pid) for name, pid in held.items()}
         answers["a pid no process holds"] = _ProcessFence.identity(PID_CEILING + 9)
+        os.pidfd_open = unjudging
+        try:
+            unjudged = _ProcessFence.identity(1)
+        finally:
+            os.pidfd_open = real_open
+        kept_walk, walks = vars(_ProcessFence)["_walk_down"], []
+
+        def missing_first(cls, root):
+            found = kept_walk.__func__(cls, root)
+            walks.append(root)
+            return found - {sleeper.pid} if len(walks) == 1 else found
+
+        before_moving = len(fence.refused)
+        _ProcessFence._walk_down = classmethod(missing_first)
+        try:
+            moving = _ProcessFence.identity(sleeper.pid)
+        finally:
+            _ProcessFence._walk_down = kept_walk
         read = {
             "a process this run started is read": _ProcessFence.identity(sleeper.pid) is not None,
+            "and so it is when one walk misses it while it moves inside the run, unrefused":
+                moving is not None and len(walks) >= 2 and len(fence.refused) == before_moving,
             "and so is this run": _ProcessFence.identity(os.getpid()) is not None,
             "and the sleeper is among the processes found under this run":
                 sleeper.pid in _ProcessFence.run_processes(),
@@ -19801,8 +20360,14 @@ def _check_cleanup_reads_only_its_run(s):
                 os.getppid() == 1 or os.getppid() in _ProcessFence.ancestors(),
         }
         refused = sorted(pid for _unit, reader, pid in fence.refused if reader == "cleanup stat")
+        named = [(reader, pid) for _unit, reader, pid in fence.refused
+                 if reader != "cleanup stat"]
         fence.leave()
+        # Taken while the sleeper still runs, so it counts as under the run.
+        readable = {os.getpid(), *_ProcessFence._walk_down(os.getpid()),
+                    *_ProcessFence.ancestors()}
     finally:
+        _ProcessFence._stat = kept_stat
         globals()["PROCESS_FENCE"] = runner
         ended = end_stray(stray, life)
         sleeper.kill()
@@ -19815,14 +20380,24 @@ def _check_cleanup_reads_only_its_run(s):
             all(answer is None for answer in answers.values()),
         "each one a process holds is written down as refused, and only those":
             refused == sorted(held.values()),
+        "one pidfd_open cannot judge reads as no running process":
+            unjudged is None,
+        "and is written down with the error, apart from the refusals":
+            named == [("cleanup stat, of a pid pidfd_open could not judge (EMFILE)", 1)],
+        "no stat file is read but this run's, those under it and its ancestors'":
+            bool(stat_read) and set(stat_read) <= readable,
         "end_stray ends the stray and says so": ended is True,
     }
     wrong = sorted(claim for claim, ok in claims.items() if not ok)
     check("cleanup-reads-only-its-run",
-          "the selftest's own process readers read the processes under its run, and its "
-          "ancestors only for the guard; any other pid reads as no running process without "
-          "being read, and one a process holds is written down as refused",
-          not wrong, ", ".join(wrong) + (f"; asked {held}, refused {refused}" if wrong else ""))
+          "the selftest's own process readers read the stat files only of the processes under "
+          "its run, and of its ancestors for the guard; any other pid reads as no running "
+          "process and its stat file is not read, one a process holds is written down as "
+          "refused and one pidfd_open cannot judge is written down with the error; and "
+          "end_stray ends the stray it asked about and says so",
+          not wrong, ", ".join(wrong) + (f"; asked {held}, refused {refused}, named {named}, "
+                                         f"read {sorted(set(stat_read) - readable)}"
+                                         if wrong else ""))
     return checked
 
 
@@ -22034,123 +22609,735 @@ def _check_roster_read_one_place(s):
 
 
 @unit(('process-reads-are-fenced',
-       "a /proc reader refuses a pid this run did not start and answers it as gone, "
-       "and reads this run's own processes, and in a unit declared to read the machine "
-       "the pids the real table listed"),
+       "a /proc reader refuses a pid outside its unit's processes, and a value that is not "
+       "a whole number, without reading it, answers it as gone and writes the refusal down, "
+       "in a unit or outside one, and the fence reads nothing of a refused pid but the start "
+       "time its rules compare; it reads the run's own processes, a pid the run learned "
+       "while its start time is the one learned or once no process holds it, in that unit or "
+       "a later one, and in a unit declared to read the machine a pid the real table or "
+       "registry named while that pid's start time holds"),
       ('undeclared-units-see-no-processes',
-       "a unit not declared to read the machine sees no processes or session registry "
-       "through RESOLVER or any engine it makes, their sockets stay their own, and "
-       "RESOLVER gets its inputs back when the unit ends; a declared unit is left as it is"))
+       "a unit not declared to read the machine sees the processes under the selftest "
+       "process that runs it and no others, and no session registry, through RESOLVER and "
+       "every engine it makes, each with all six of its own process inputs; a declared unit "
+       "sees the machine's"),
+      ('unit-runner-drops-process-caches',
+       "the unit runner drops RESOLVER's process caches as a unit starts and again however "
+       "it ends, a raise included, and puts back the fence's unit and the variable a tool "
+       "run inherits"))
 def _check_process_reads_are_fenced(s):
-    # This unit is not declared to read the machine, so the runner has given
-    # RESOLVER a world with no processes for its length, and an engine made here
-    # gets one too. Their socket inputs stay the engine's own.
-    made = Resolver(needs=Needs(maybe=set(NEED)))
-    blind = {}
-    for name, engine in (("RESOLVER", RESOLVER), ("an engine made in the unit", made)):
-        world = getattr(engine._process_table, "world", None)
-        blind[f"{name} sees no processes"] = (
-            world is not None and not world.process_rows()
-            and getattr(engine._proc_stat, "world_reader", False)
-            and getattr(engine._cmdline, "world_reader", False))
-        blind[f"{name} sees no session registry"] = (
-            world is not None and getattr(engine._session_registry, "__self__", None) is world
-            and not world.session_rows())
-        blind[f"{name} keeps its own sockets"] = all(
-            getattr(getattr(engine, attr), "__func__", None) is getattr(Resolver, attr)
-            for attr in ("_swarm_sockets", "_socket_alive"))
+    """The process fence, its readers and the unit runner's edges.
 
-    # The runner's swap itself, driven on two stand-in units under a fence of
-    # this check's own: the undeclared one gets a fresh world and RESOLVER has
-    # its inputs back after it; the declared one is left with what RESOLVER had.
-    def before_and_after():
-        return {name: vars(RESOLVER).get(name) for name in _FakeTmux.PROCESS_INPUTS}
+    Every refusal here is provoked on purpose, so each is provoked under a
+    fence of this check's own, writing to a record of this check's own: the
+    run's fence and its record see none of them, and the run's own row stays
+    about the run. What the run's fence gives this unit, which is not
+    declared, is read without provoking any.
+    """
+    room = Path(tempfile.mkdtemp(prefix=own("fence")))
+    runner, made_fences = PROCESS_FENCE, []
 
-    seen = {}
+    def fence_of_own(**given):
+        fence = _ProcessFence(str(room / f"record-{len(made_fences)}.jsonl"), **given)
+        made_fences.append(fence)
+        globals()["PROCESS_FENCE"] = fence
+        return fence
 
-    def undeclared_stand_in(_s):
-        seen["undeclared"] = getattr(RESOLVER._process_table, "world", None)
-        return []
-
-    def declared_stand_in(_s):
-        seen["declared"] = getattr(RESOLVER._process_table, "world", None)
-        return []
-
-    outer = getattr(RESOLVER._process_table, "world", None)
-    runner = PROCESS_FENCE
-    globals()["PROCESS_FENCE"] = _ProcessFence()
-    MACHINE_UNITS.add(declared_stand_in.__name__)
+    seen, told, edges = {}, {}, {}
+    child = subprocess.Popen(["sleep", "30"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    wrapper, wrapper_started = None, ""
     try:
-        before = before_and_after()
-        ran_unit(undeclared_stand_in, s)
-        blind["an undeclared unit runs in a world of its own"] = (
-            seen.get("undeclared") is not None and seen["undeclared"] is not outer)
-        blind["and RESOLVER has its inputs back after it"] = all(
-            value is before[name] for name, value in before_and_after().items())
-        ran_unit(declared_stand_in, s)
-        blind["a declared unit is left with what RESOLVER had"] = (
-            seen.get("declared") is outer
-            and all(value is before[name] for name, value in before_and_after().items()))
-    finally:
-        MACHINE_UNITS.discard(declared_stand_in.__name__)
+        # Popen returns once the child's exec has begun, and until the exec has
+        # set its arguments its command line reads empty and a table leaves it
+        # out, so the tables below are taken once it is set.
+        deadline = time.monotonic() + 10
+        while not RESOLVER._cmdline(child.pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        # The world the run gives this unit, through RESOLVER and an engine
+        # made here, each still holding the six process inputs it was built with.
+        made = Resolver(needs=Needs(maybe=set(NEED)))
+        for name, engine in (("RESOLVER", RESOLVER), ("an engine made in the unit", made)):
+            seen[f"{name} keeps all six of its own process inputs"] = all(
+                getattr(getattr(engine, attr), "__func__", None) is getattr(Resolver, attr)
+                for attr in _FakeTmux.PROCESS_INPUTS)
+            before = {os.getpid()} | _ProcessFence._walk_down(os.getpid())
+            pids = {pid for pid, _ppid, _argv in engine._process_table(refresh=True)}
+            after = {os.getpid()} | _ProcessFence._walk_down(os.getpid())
+            seen[f"{name}'s table lists this run and the process it started"] = (
+                {os.getpid(), child.pid} <= pids)
+            seen[f"{name}'s table lists nothing outside this run"] = pids <= before | after
+
+        # A registry with one session in it, which this unit does not see and a
+        # declared unit, under a fence of this check's own, does.
+        sessions = room / "sessions"
+        sessions.mkdir()
+        (sessions / "fence-check.json").write_text(json.dumps(
+            {"pid": os.getpid(), "sessionId": "fence-check"}))
+        was_sessions = globals()["SESSIONS_DIR"]
+        globals()["SESSIONS_DIR"] = sessions
+        try:
+            # Read through the runtime snapshot, the one reader of the registry.
+            hidden = (RESOLVER._runtime(RESOLVER._process_table(refresh=True))["registry"],
+                      made._runtime(made._process_table(refresh=True))["registry"])
+            fence = fence_of_own()
+            fence.enter("declared", True)
+            declared = Resolver(needs=Needs(maybe=set(NEED)))
+            shown = declared._runtime(((os.getpid(), os.getppid(), ("python3",)),))["registry"]
+            fence.leave()
+        finally:
+            globals()["SESSIONS_DIR"] = was_sessions
+            globals()["PROCESS_FENCE"] = runner
+        seen["RESOLVER and the engine see no session registry, where a declared unit reads it"] = (
+            hidden == ((), ()) and [entry["pid"] for entry in shown] == [os.getpid()])
+
+        listed = [1, os.getppid(), os.getpid(), child.pid]
+        fence = fence_of_own()
+        undeclared_listing = fence.listing(listed)
+        fence.enter("declared", True)
+        declared_listing = fence.listing(listed)
+        fence.leave()
         globals()["PROCESS_FENCE"] = runner
-    unseen = sorted(k for k, ok in blind.items() if not ok)
-    # A pid at or above PID_CEILING names nothing that runs, so a reader that
-    # failed to refuse it still reads nothing; pid 1 is running and never this
-    # run's, and is read here only through stat, which holds no secret.
-    invented, stranger = PID_CEILING + 7, 1
-    runner = PROCESS_FENCE
-    fence = _ProcessFence()
-    child = subprocess.Popen(["sleep", "30"])
-    told = {}
-    globals()["PROCESS_FENCE"] = fence
-    try:
-        # Made under this check's own fence before it enters a unit, so the
-        # engine keeps its own readers, which are what this checks. An engine
-        # made inside an undeclared unit gets a world with no processes.
+        seen["an undeclared table may read only this run's processes, a declared one the machine's"] = (
+            undeclared_listing == [os.getpid(), child.pid] and declared_listing == listed)
+
+        # RESOLVER's own per-process readers, asked about pid 1, which is
+        # outside every run, under a fence of this check's own. Its environment
+        # cannot be read by this user either, so a reader without its guard
+        # reads nothing of it.
+        fence = fence_of_own()
+        fence.enter("undeclared", False)
+        answers = (RESOLVER._proc_stat(1), RESOLVER._cmdline(1), RESOLVER._proc_env(1, ("PATH",)))
+        start_ms = RESOLVER._process_start_ms({"pid": 1, "proc_start": "100"})
+        refused = sorted((reader, pid) for _unit, reader, pid in fence.leave())
+        globals()["PROCESS_FENCE"] = runner
+        seen["RESOLVER's own readers refuse pid 1, a process outside this run"] = (
+            answers == ((None, None, None), (), {})
+            and refused == [("cmdline", 1), ("environ", 1), ("stat", 1)])
+        seen["and its start time reader reads no process at all"] = (
+            type(start_ms) is int and len(refused) == 3)
+
+        # The narrowing on a tree whose shape is known: a fence rooted at a
+        # wrapper this check started sees the wrapper and the process under it,
+        # and neither this process, its parent nor the sibling sleeper.
+        wrapper = start_wrapped([FAKE_AGENT_BIN, "-c", '__import__("time").sleep(30)'])
+        wrapper_started = _ProcessFence.start_time(wrapper.pid)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not _ProcessFence._walk_down(wrapper.pid):
+            time.sleep(0.02)
+        inside = {wrapper.pid} | _ProcessFence._walk_down(wrapper.pid)
+        fence = fence_of_own(root=wrapper.pid, root_start=wrapper_started)
+        fence.enter("undeclared", False)
+        rooted = {pid for pid, _ppid, _argv
+                  in Resolver(needs=Needs(maybe=set(NEED)))._process_table()}
+        asked_outside = fence.leave()
+        fence = fence_of_own(root=wrapper.pid, root_start="1")
+        fence.enter("undeclared", False)
+        stale = {pid for pid, _ppid, _argv
+                 in Resolver(needs=Needs(maybe=set(NEED)))._process_table()}
+        fence.leave()
+        globals()["PROCESS_FENCE"] = runner
+        seen["a table under a fence rooted at another process lists it and what runs under "
+             "it, and nothing else"] = len(inside) == 2 and rooted == inside
+        seen["and asks that fence about no other pid"] = not asked_outside
+        seen["a root whose start time is another leaves the table empty"] = stale == set()
+
+        # Each reader, under a fence of this check's own, in an undeclared unit,
+        # in a declared one and outside any. A process started and reaped before
+        # that fence exists is one it did not start and no process holds.
+        ended = subprocess.Popen(["true"], stdin=subprocess.DEVNULL)
+        ended.wait()
+        fence = fence_of_own()
         eng = Resolver(needs=Needs(maybe=set(NEED)))
-        fence.enter("unit", False)
-        answers = (eng._proc_stat(invented), eng._cmdline(invented),
-                   eng._proc_env(invented, ("PATH",)))
-        told["each reader refuses a pid nothing started"] = (
-            sorted(reader for _unit, reader, pid in fence.refused if pid == invented)
-            == ["cmdline", "environ", "stat"])
+        everything = []
+        fence.enter("undeclared", False)
+        invented, stranger = PID_CEILING + 7, 1
+        # Every start time the fence reads while it judges, written down by a
+        # stand-in for _start_of; the original is put back after.
+        start_read, real_start_of = [], vars(_ProcessFence)["_start_of"]
+
+        def recorded_start_of(pid):
+            start_read.append(pid)
+            return real_start_of.__func__(pid)
+
+        _ProcessFence._start_of = staticmethod(recorded_start_of)
+        try:
+            answers = (eng._proc_stat(stranger), eng._cmdline(stranger),
+                       eng._proc_env(stranger, ("PATH",)))
+        finally:
+            _ProcessFence._start_of = real_start_of
+        told["each reader refuses a running process outside the run"] = (
+            sorted((reader, pid) for _unit, reader, pid in fence.refused)
+            == [("cmdline", stranger), ("environ", stranger), ("stat", stranger)])
         told["and answers it as a process that does not exist"] = (
             answers == ((None, None, None), (), {}))
+        told["and to refuse it the fence reads no start time of it, while it reads the root's"] = (
+            stranger not in start_read and fence.root in start_read)
         before = len(fence.refused)
+        told["a pid from PID_CEILING up, which no process can hold, reads as nothing, unrefused"] = (
+            (eng._proc_stat(invented), eng._cmdline(invented),
+             eng._proc_env(invented, ("PATH",))) == ((None, None, None), (), {})
+            and len(fence.refused) == before)
         eng._pid_alive(stranger)
         eng._proc_start(stranger)
-        told["a running process this run did not start is refused through stat"] = (
+        told["liveness and start time refuse a running process outside the run, through stat"] = (
             [(reader, pid) for _unit, reader, pid in fence.refused[before:]]
             == [("stat", stranger), ("stat", stranger)])
         before = len(fence.refused)
+        no_pids = ("1/task/1", "self", True, 1.0, 0, -1, "007", None)
+        answers = [eng._proc_stat(value) for value in no_pids]
+        told["a value that is not a whole number is refused without a read"] = (
+            answers == [(None, None, None)] * len(no_pids)
+            and [pid for _unit, _reader, pid in fence.refused[before:]]
+            == [repr(value) for value in no_pids])
+        before = len(fence.refused)
         told["this run's own process is read"] = eng._proc_stat(os.getpid())[0] is not None
         told["and so is a process it started"] = (
-            eng._proc_stat(child.pid)[0] is not None
-            and "sleep" in eng._cmdline(child.pid))
-        fence.spawned(child.pid)
-        child.kill()
-        child.wait()
-        told["one it started that has gone reads as gone"] = (
-            eng._proc_stat(child.pid) == (None, None, None))
+            eng._proc_stat(child.pid)[0] is not None and "sleep" in eng._cmdline(child.pid))
+        gone = subprocess.Popen(["true"], stdin=subprocess.DEVNULL)
+        gone.wait()
+        told["one it started that has gone reads as gone, with no command line or environment"] = (
+            eng._proc_stat(gone.pid) == (None, None, None) and eng._cmdline(gone.pid) == ()
+            and eng._proc_env(gone.pid, ("PATH",)) == {})
         told["and none of those was refused"] = len(fence.refused) == before
-        fence.leave()
+        # A pid the run knows is judged by the start time it learned: pid 1,
+        # outside the run, is read while that is its own start, and refused
+        # once the start the run learned is another process's.
+        fence.known[stranger] = _ProcessFence._start_of(stranger)
+        told["a pid the run knows is read while it is the process the run learned"] = (
+            eng._proc_stat(stranger)[0] is not None and len(fence.refused) == before)
+        fence.known[stranger] = "a start time it never had"
+        eng._proc_stat(stranger)
+        told["and refused once another process holds its number"] = (
+            [(reader, pid) for _unit, reader, pid in fence.refused[before:]]
+            == [("stat", stranger)])
+        del fence.known[stranger]
+        before = len(fence.refused)
+        world = _FakeTmux(panes=[{"session": TMUX_SESSION, "window": "@0", "pane": "%0",
+                                  "pid": stranger}], sockets=["claude-swarm-fence"])
+        with world.installed(eng):
+            fact = eng._tmux_server_fact("claude-swarm-fence")
+        told["the tmux server fact refuses its pane's process outside the run"] = (
+            sorted((reader, pid) for _unit, reader, pid in fence.refused[before:])
+            == [("cmdline", stranger), ("stat", stranger)]
+            and [(pane["root"]["argv"], pane["root"]["state"]) for pane in fact["panes"]]
+            == [((), None)])
+        everything += fence.leave()
+        # A grandchild the run learns in one unit, which its own parent then
+        # reaps: asked about in the next unit, it is gone and known, so it reads
+        # as gone and is not refused.
+        parent = subprocess.Popen([sys.executable, "-c",
+                                   "import subprocess, sys\n"
+                                   "child = subprocess.Popen(['sleep', '30'])\n"
+                                   "print(child.pid, flush=True)\n"
+                                   "sys.stdin.readline()\n"
+                                   "child.kill()\n"
+                                   "child.wait()\n"
+                                   "print('reaped', flush=True)\n"
+                                   "sys.stdin.readline()\n"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            grandchild = int(parent.stdout.readline().strip() or 0)
+            fence.enter("learns", False)
+            learned = bool(grandchild) and eng._proc_stat(grandchild)[0] is not None
+            everything += fence.leave()
+            parent.stdin.write("\n")
+            parent.stdin.flush()
+            reaped = parent.stdout.readline().strip() == "reaped"
+            fence.enter("asks after", False)
+            later = eng._proc_stat(grandchild)
+            asked_after = fence.leave()
+            everything += asked_after
+        finally:
+            parent.stdin.close()
+            parent.wait(timeout=30)
+        told["a grandchild the run learned in one unit reads as gone in the next once its "
+             "parent reaped it, unrefused"] = (
+            learned and reaped and later == (None, None, None) and not asked_after)
         fence.enter("declared", True)
-        fence.saw_listed([stranger])
-        told["a unit declared to read the machine reads what the real table listed"] = (
+        fence.name([stranger])
+        told["a unit declared to read the machine reads a pid a real listing named"] = (
             eng._proc_stat(stranger)[0] is not None and not fence.refused)
-        eng._proc_stat(invented)
-        told["but not a pid the table did not list"] = (
-            [(reader, pid) for _unit, reader, pid in fence.refused] == [("stat", invented)])
-        fence.leave()
+        fence.named[stranger] = "a start time it never had"
+        eng._proc_stat(stranger)
+        told["but not once that pid's start time is another than the one named"] = (
+            [(reader, pid) for _unit, reader, pid in fence.refused] == [("stat", stranger)])
+        before = len(fence.refused)
+        eng._proc_stat(os.getppid())
+        told["nor a running pid no listing named"] = (
+            [(reader, pid) for _unit, reader, pid in fence.refused[before:]]
+            == [("stat", os.getppid())])
+        before = len(fence.refused)
+        fence.named[ended.pid] = "1234"
+        told["a named pid no process holds any more reads as gone, unrefused"] = (
+            eng._proc_stat(ended.pid) == (None, None, None) and len(fence.refused) == before)
+        everything += fence.leave()
+        eng._proc_stat(stranger)
+        told["a refusal outside any unit is written down with no unit"] = (
+            fence.refused == [(None, "stat", stranger)])
+        everything += fence.refused
+        written = fence.refusals_in_run()
+        told["every refusal is in the record, with its unit, reader, pid and process"] = (
+            sorted(repr((unit, reader, pid)) for unit, reader, pid, _process in written)
+            == sorted(map(repr, everything))
+            and {process for *_rest, process in written} == {os.getpid()})
+        lines = refusal_lines(written, fence.root)
+        rows, register = check_rows()
+        register_procs_row(register, False, fence)
+        told["and the tier's row fails, naming each refusal by unit, reader and pid"] = (
+            f"unit undeclared: stat of pid {stranger}" in lines
+            and f"outside any unit: stat of pid {stranger}" in lines
+            and [row[:3] for row in rows] == [(*TIER_PROCS[False], False)]
+            and rows[0][3].startswith(f"{len(written)} refused read(s): {lines[0]}; "))
+        globals()["PROCESS_FENCE"] = runner
+
+        # A process one walk misses while it moves inside the run: the first
+        # walk a new fence makes hides the sleeper this check started, as a
+        # walk between two children files can while a process's parent exits.
+        fence = fence_of_own()
+        real_tree, walks = fence._tree, []
+
+        def missing_first():
+            walks.append(len(walks))
+            tree = real_tree()
+            return tree - {child.pid} if len(walks) == 1 else tree
+
+        fence._tree = missing_first
+        fence.enter("undeclared", False)
+        moved = Resolver(needs=Needs(maybe=set(NEED)))._proc_stat(child.pid)
+        refused_moving = fence.leave()
+        globals()["PROCESS_FENCE"] = runner
+        told["a process one walk misses while it moves inside the run is read after the next "
+             "walk, unrefused"] = moved[0] is not None and not refused_moving and len(walks) >= 2
+
+        # A fence made the way a run makes its own, from the record variable an
+        # audit sets, writes its refusals to the file the variable names.
+        named_record, was_record = room / "named.jsonl", os.environ.get(FENCE_RECORD_VAR)
+        os.environ[FENCE_RECORD_VAR] = str(named_record)
+        globals()["PROCESS_FENCE"] = None
+        try:
+            made_here = _process_fence()
+            made_here.enter("variable", False)
+            Resolver(needs=Needs(maybe=set(NEED)))._proc_stat(stranger)
+            made_here.leave()
+        finally:
+            globals()["PROCESS_FENCE"] = runner
+            if was_record is None:
+                os.environ.pop(FENCE_RECORD_VAR, None)
+            else:
+                os.environ[FENCE_RECORD_VAR] = was_record
+        lines = [json.loads(line) for line in (named_record.read_text().splitlines()
+                                               if named_record.exists() else [])]
+        told["a refusal made under the record variable reaches the file it names"] = (
+            made_here.record == str(named_record)
+            and [(row.get("unit"), row.get("reader"), row.get("pid")) for row in lines]
+            == [("variable", "stat", stranger)])
+
+        # The runner's edges, driven on a stand-in unit that raises Terminated,
+        # which ran_unit lets through, so only a finally can still clean up.
+        fence = fence_of_own()
+        handed = os.environ.get(FENCE_UNIT_VAR)
+        left = ((stranger, 0, ("a table left by something else",)),)
+
+        def raising_stand_in(_s):
+            edges["a process cache left before a unit is gone as the unit starts"] = (
+                RESOLVER._procs is None)
+            edges["the variable a tool run inherits names that unit"] = (
+                os.environ.get(FENCE_UNIT_VAR) == fence.handed_down()
+                and fence.handed_down().endswith(" 0 raising_stand_in"))
+            RESOLVER._procs = left
+            raise Terminated("a stand-in raising past the runner")
+
+        RESOLVER._procs = left
+        try:
+            ran_unit(raising_stand_in, s)
+            edges["the stand-in's raise went past the runner"] = False
+        except Terminated:
+            edges["the stand-in's raise went past the runner"] = True
+        edges["a process cache the unit left is gone after it raised"] = RESOLVER._procs is None
+        edges["the fence is back outside any unit"] = fence.unit is None and not fence.entered
+        edges["and the variable a tool run inherits is back as it was"] = (
+            os.environ.get(FENCE_UNIT_VAR) == handed)
     finally:
         globals()["PROCESS_FENCE"] = runner
-        if child.poll() is None:
-            child.kill()
-            child.wait()
-    wrong = sorted(k for k, ok in told.items() if not ok)
-    return [_check_verdict('process-reads-are-fenced', not wrong, ", ".join(wrong)),
-            _check_verdict('undeclared-units-see-no-processes', not unseen, ", ".join(unseen))]
+        child.kill()
+        child.wait()
+        if wrapper is not None:
+            end_process_tree(wrapper.pid, wrapper_started)
+            if wrapper.poll() is None:
+                wrapper.kill()
+            wrapper.wait()
+        shutil.rmtree(room, ignore_errors=True)
+
+    def verdict(cid, claims):
+        wrong = sorted(claim for claim, ok in claims.items() if not ok)
+        return _check_verdict(cid, bool(claims) and not wrong, ", ".join(wrong))
+
+    return [verdict('process-reads-are-fenced', told),
+            verdict('undeclared-units-see-no-processes', seen),
+            verdict('unit-runner-drops-process-caches', edges)]
+
+
+@unit(('tool-runs-inherit-their-unit-fence',
+       "a tool run a unit starts reads processes by that unit's rule, rooted at the selftest "
+       "process that runs the unit, and none once that root's start time is another; a "
+       "refusal there reaches the record its unit's fence reads, and a selftest run a unit "
+       "starts roots its own unit at itself"), live=True)
+def _check_tool_runs_inherit_their_unit_fence(s):
+    """What a tool run reads, by the fence its unit hands down.
+
+    Two processes wear one fixture id and the fixture agent's argv[0]: a
+    victim this unit starts, under the run, and a stray start_stray puts
+    outside it. A --stop preview this unit starts lists the victim and not the
+    stray; given a root whose start time is another, it lists neither. A
+    child given a fence of this check's own reads this process's parent, and
+    the refusal arrives in that fence's record, named for the child. A copy of
+    this tool run as a selftest from here, with one unit that reads the
+    process that started it, refuses that read in its own row, because it
+    roots its unit at itself and not at this run. Every refusal provoked here
+    goes to a record of this check's own.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    sp = s.sp
+    room = Path(tempfile.mkdtemp(prefix=own("inherit")))
+    config = room / "config"
+    (config / "projects").mkdir(parents=True)
+    (config / "teams").mkdir()
+    ident = own("inherited@selftest-stop")
+    tool = str(Path(__file__).resolve())
+    env = dict(os.environ, CLAUDE_CONFIG_DIR=str(config), NO_COLOR="1")
+    handed = os.environ[FENCE_UNIT_VAR].split(" ", 4)
+    claims = {}
+    # argv[0] is what makes a process a claude, and the binary that runs is
+    # python; the id is what --stop matches on.
+    victim = sp.Popen([FAKE_AGENT_BIN, "-c", '__import__("time").sleep(60)',
+                       "--agent-id", ident], executable=sys.executable, stdin=sp.DEVNULL)
+    stray, life = start_stray(room / "stray-pid", "--agent-id", ident, program=FAKE_AGENT_BIN)
+    try:
+        time.sleep(0.3)          # let the victim reach the process table
+
+        def preview(**given):
+            run = sp.run([sys.executable, tool, "--agent-id", ident, "--stop", "--dry-run"],
+                         capture_output=True, text=True, timeout=120, stdin=sp.DEVNULL,
+                         env={**env, **given})
+            return run, {int(word) for word in re.findall(r"\b\d+\b", run.stdout)}
+
+        run, listed = preview()
+        claims["a --stop preview this unit starts lists the victim under the run"] = (
+            run.returncode == 0 and "would abort" in run.stdout and victim.pid in listed)
+        claims["and not the stray outside it, which wears the same id"] = (
+            bool(stray) and stray not in listed)
+        stale = " ".join([handed[0], "1", own("stale"), *handed[3:]])
+        run, listed = preview(**{FENCE_UNIT_VAR: stale,
+                                 FENCE_RECORD_VAR: str(room / "stale.jsonl")})
+        claims["given a root whose start time is another, it lists neither"] = (
+            run.returncode != 0 and "zero live processes" in run.stderr
+            and victim.pid not in listed and stray not in listed)
+
+        # A tool run that installs its fence the way main does, from a fence of
+        # this check's own, and reads the process that started this run.
+        fence = _ProcessFence(str(room / "child.jsonl"))
+        fence.enter("_check_tool_runs_inherit_their_unit_fence", False)
+        snippet = ("import importlib.machinery, importlib.util, sys\n"
+                   "loader = importlib.machinery.SourceFileLoader('fenced_tool_run', sys.argv[1])\n"
+                   "tool = importlib.util.module_from_spec("
+                   "importlib.util.spec_from_loader(loader.name, loader))\n"
+                   "tool.__file__ = sys.argv[1]\n"
+                   "loader.exec_module(tool)\n"
+                   "tool.adopt_inherited_fence()\n"
+                   "print(tool.Resolver(needs=tool.Needs(maybe=set(tool.NEED)))"
+                   "._proc_stat(int(sys.argv[2])))\n")
+        reading = sp.run([sys.executable, "-c", snippet, tool, str(os.getppid())],
+                         capture_output=True, text=True, timeout=120, stdin=sp.DEVNULL,
+                         env={**env, FENCE_UNIT_VAR: fence.handed_down(),
+                              FENCE_RECORD_VAR: fence.record})
+        fence.leave()
+        written = fence.refusals_in_run()
+        claims["a tool run's refusal reaches the record its unit's fence reads"] = (
+            reading.returncode == 0 and reading.stdout.strip() == "(None, None, None)"
+            and [(unit, reader, pid) for unit, reader, pid, _process in written]
+            == [("_check_tool_runs_inherit_their_unit_fence", "stat", os.getppid())])
+        claims["and its row names the unit, the tool run, the reader and the pid"] = (
+            bool(written) and written[0][3] not in (os.getpid(), None)
+            and refusal_lines(written, fence.root)
+            == [f"unit _check_tool_runs_inherit_their_unit_fence, in tool run {written[0][3]}: "
+                f"stat of pid {os.getppid()}"])
+
+        # A copy of this tool with one unit, run as a selftest from here: it
+        # inherits this unit's variable, and its unit reads this process.
+        copy_room = room / "copy"
+        copy_room.mkdir()
+        guard = '\n\nif __name__ == "__main__":'
+        probe = (
+            '\n\n@unit(("fenced-copy-probe", "a unit that reads the process that started its run"))'
+            '\ndef _check_fenced_copy_probe(s):'
+            '\n    RESOLVER._proc_stat(os.getppid())'
+            '\n    return [("fenced-copy-probe", "a unit that reads the process that started '
+            'its run", True, "")]'
+            '\n\nUNITS[:] = [u for u in UNITS if u[0] == "_check_fenced_copy_probe"]' + guard)
+        source = Path(__file__).resolve()
+        copied = copy_room / TOOL
+        copied.write_text(source.read_text().replace(guard, probe, 1))
+        copied.chmod(0o755)
+        (copy_room / "test").symlink_to(source.parent / "test")
+        copy_record = room / "copy.jsonl"
+        nested = sp.run([sys.executable, str(copied), "--selftest", "--failed"],
+                        capture_output=True, text=True, timeout=300, stdin=sp.DEVNULL,
+                        env={**env, FENCE_RECORD_VAR: str(copy_record)})
+        rows = [json.loads(line) for line in (copy_record.read_text().splitlines()
+                                              if copy_record.exists() else [])]
+        claims["a selftest run this unit starts refuses its own unit a read of this run"] = (
+            [(row.get("unit"), row.get("reader"), row.get("pid")) for row in rows]
+            == [("_check_fenced_copy_probe", "stat", os.getpid())]
+            and all(row.get("fence") != handed[2] for row in rows)
+            and f"unit _check_fenced_copy_probe: stat of pid {os.getpid()}" in nested.stdout)
+    finally:
+        victim.kill()
+        victim.wait()
+        end_stray(stray, life)
+        shutil.rmtree(room, ignore_errors=True)
+    wrong = sorted(claim for claim, ok in claims.items() if not ok)
+    check("tool-runs-inherit-their-unit-fence",
+          "a tool run a unit starts reads processes by that unit's rule, rooted at the selftest "
+          "process that runs the unit, and none once that root's start time is another; a "
+          "refusal there reaches the record its unit's fence reads, and a selftest run a unit "
+          "starts roots its own unit at itself",
+          not wrong, ", ".join(wrong))
+    return checked
+
+
+@unit(('nested-run-leaves-cleanup-to-the-outer-run',
+       "a run_selftest call made while another is in progress in the same process ends "
+       "nothing, leaves adoption as it found it, and names in its leftover row what started "
+       "under the process after it began and still runs"))
+def _check_nested_run_leaves_cleanup_to_the_outer_run(s):
+    """A run inside this one, as a unit's fixture makes one, between two sleepers.
+
+    A sleeper started before the nested run and another started inside it, by
+    a stand-in for its live tier, are both left running. The outermost call,
+    which this unit runs inside, owns the cleanup, so the nested run must end
+    neither, and its leftover row must name the second and not the first.
+    Adoption is off for the nested run's length, the opposite of what a call
+    that owned the cleanup would set, and is read while the stand-in runs and
+    after the run: it must stay off. This unit then ends both sleepers, as a
+    unit ends what it finds left, and puts adoption back.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    def sleeper():
+        return subprocess.Popen(["sleep", "30"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def adopting_now():
+        was = adopt_orphans(False)
+        if was is not None:
+            adopt_orphans(was)
+        return was
+
+    real_live_checks = globals()["live_checks"]
+    left = {}
+
+    def leaving_live_checks(_share=None, _child=None, _diagnostics=None):
+        rows, register = check_rows()
+        left["adopting"] = adopting_now()
+        left["inside"] = sleeper()
+        return rows, register
+
+    report, noise, passed_on = io.StringIO(), io.StringIO(), io.StringIO()
+    in_progress = SELFTEST_IN_PROGRESS["call"]
+    earlier = sleeper()
+    found = adopt_orphans(False)
+    after = code = None
+    try:
+        try:
+            globals()["live_checks"] = leaving_live_checks
+            with capturing("out", into=report), capturing("err", into=noise):
+                code = run_selftest(live=True, failed_only=True, diagnostics=passed_on)
+        finally:
+            globals()["live_checks"] = real_live_checks
+            if found is not None:
+                after = adopt_orphans(found)
+        inside = left.get("inside")
+        running = [made.poll() is None for made in (earlier, inside) if made is not None]
+        row = re.search(r"still running, for the run this one is inside to end: (\d+(?:, \d+)*)",
+                        report.getvalue())
+        named = {int(pid) for pid in row.group(1).split(", ")} if row else set()
+    finally:
+        made = [one for one in (earlier, left.get("inside")) if one is not None]
+        end_left_behind([one.pid for one in made])
+        for one in made:
+            one.wait()
+    told = {
+        "the nested run left running the sleeper already running when it began and the one "
+        "started inside it": inside is not None and running == [True, True],
+        "its leftover row named the one started inside it":
+            inside is not None and inside.pid in named,
+        "and not the one already running": earlier.pid not in named,
+        "it ended nothing and said nothing of ending":
+            "ended processes" not in passed_on.getvalue(),
+        "adoption stayed off, as the nested run found it, while it ran and after it":
+            found is not None and left.get("adopting") is False and after is False,
+        "the call in progress is still the outer one": (
+            in_progress is not None and SELFTEST_IN_PROGRESS["call"] is in_progress),
+    }
+    wrong = sorted(claim for claim, ok in told.items() if not ok)
+    check("nested-run-leaves-cleanup-to-the-outer-run",
+          "a run_selftest call made while another is in progress in the same process ends "
+          "nothing, leaves adoption as it found it, and names in its leftover row what started "
+          "under the process after it began and still runs",
+          not wrong, ", ".join(wrong) + (
+              f"; exit {code}, named {sorted(named)} with the earlier sleeper {earlier.pid} and "
+              f"the inside one {inside.pid if inside else None}, adoption found {found}, "
+              f"while the run ran {left.get('adopting')}, after {after}" if wrong else ""))
+    return checked
+
+
+@unit(('ending-names-what-it-cannot-open',
+       "the cleanup names as left a running process it could not open a pidfd for, and asks "
+       "whether a descriptor is ready with poll, which takes one numbered 1024 or more"))
+def _check_ending_names_what_it_cannot_open(s):
+    """end_process_tree on a sleeper while pidfd_open fails, and ready_to_read on fd 1500.
+
+    A stand-in for os.pidfd_open answers EMFILE, so end_processes cannot open
+    the sleeper and signals nothing; the sleeper has to be named as left all
+    the same. The readiness question is put to a pipe's read end moved to
+    descriptor 1500, above the 1024 select.select takes, with the soft limit
+    on open descriptors raised for the length of the question when it is
+    lower, and put back.
+    """
+    import errno
+    import resource
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    sleeper = subprocess.Popen(["sleep", "30"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    started = _ProcessFence.start_time(sleeper.pid)
+    real_open = os.pidfd_open
+
+    def unopenable(_pid, *_flags):
+        raise OSError(errno.EMFILE, os.strerror(errno.EMFILE))
+
+    try:
+        os.pidfd_open = unopenable
+        try:
+            left = end_process_tree(sleeper.pid, started, grace=0.2)
+        finally:
+            os.pidfd_open = real_open
+        still = sleeper.poll() is None
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+    told = {
+        "a running process it could not open is named as left": left == [sleeper.pid],
+        "and was left running, unsignalled": still,
+    }
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    high = 1500
+    readings = None
+    if hard == resource.RLIM_INFINITY or hard > high:
+        read_end, write_end = os.pipe()
+        try:
+            if soft != resource.RLIM_INFINITY and soft <= high:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (high + 1, hard))
+            os.dup2(read_end, high)
+            try:
+                before = ready_to_read(high)
+                os.close(write_end)
+                write_end = None
+                readings = (before, ready_to_read(high, 1.0))
+            except ValueError:
+                readings = "raised ValueError"
+            finally:
+                os.close(high)
+        finally:
+            os.close(read_end)
+            if write_end is not None:
+                os.close(write_end)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    told["readiness is asked of a descriptor numbered 1500, not ready and then ready"] = (
+        readings == (False, True))
+    wrong = sorted(claim for claim, ok in told.items() if not ok)
+    check("ending-names-what-it-cannot-open",
+          "the cleanup names as left a running process it could not open a pidfd for, and "
+          "asks whether a descriptor is ready with poll, which takes one numbered 1024 or more",
+          not wrong, ", ".join(wrong) + (f"; left {left}, readings {readings}, limit "
+                                         f"{(soft, hard)}" if wrong else ""))
+    return checked
+
+
+@unit(('stray-ends-when-its-making-raises',
+       "a stray start_stray is making when an exception reaches it, once the stray has said "
+       "its pid, is ended before the exception leaves start_stray"))
+def _check_stray_ends_when_its_making_raises(s):
+    """start_stray with a stand-in for time.sleep that raises once the stray has said its pid.
+
+    The stand-in waits for the pid in the told file, opens a pidfd for it, and
+    raises Terminated, as SIGTERM would there. start_stray must end the stray
+    by that pid before the raise leaves it: the pidfd turns ready when the
+    stray exits, whichever process above this run reaps it.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    room = Path(tempfile.mkdtemp(prefix=own("se")))
+    told_file = room / "pid"
+    real_sleep = time.sleep
+    held = {}
+
+    def raising(seconds):
+        if held:
+            return real_sleep(seconds)
+        held["pid"], deadline = 0, time.monotonic() + 10
+        while time.monotonic() < deadline and not held["pid"]:
+            with contextlib.suppress(OSError, ValueError):
+                held["pid"] = int(told_file.read_text().strip() or 0)
+            if not held["pid"]:
+                real_sleep(0.02)
+        with contextlib.suppress(OSError):
+            held["fd"] = os.pidfd_open(held["pid"])
+        raise Terminated("a SIGTERM while start_stray waits")
+
+    raised = False
+    try:
+        time.sleep = raising
+        try:
+            start_stray(told_file)
+        except Terminated:
+            raised = True
+        finally:
+            time.sleep = real_sleep
+        ended = "fd" in held and ready_to_read(held["fd"], 5.0)
+    finally:
+        if "fd" in held:
+            if not ready_to_read(held["fd"]):
+                with contextlib.suppress(OSError):
+                    import signal
+                    signal.pidfd_send_signal(held["fd"], signal.SIGKILL)
+            os.close(held["fd"])
+        shutil.rmtree(room, ignore_errors=True)
+    told = {
+        "the exception left start_stray": raised,
+        "the stray had said its pid": bool(held.get("pid")),
+        "and had ended before start_stray let the exception go": ended,
+    }
+    wrong = sorted(claim for claim, ok in told.items() if not ok)
+    check("stray-ends-when-its-making-raises",
+          "a stray start_stray is making when an exception reaches it, once the stray has said "
+          "its pid, is ended before the exception leaves start_stray",
+          not wrong, ", ".join(wrong) + (f"; {held}" if wrong else ""))
+    return checked
 
 
 @unit(('synthetic-tmux-allowlist-is-exact',
@@ -22278,21 +23465,24 @@ def _check_synthetic_tmux_is_one_fixture(s):
     # hand-written ones this replaced.
     was_tmux, was_resolver = globals()["tmux"], globals()["RESOLVER"]
     probe, eng = _FakeTmux(), Resolver(needs=Needs(maybe=set(NEED)))
-    was_table, was_registry = eng._process_table, eng._session_registry
+    was_inputs = {name: getattr(eng, name) for name in _FakeTmux.ENGINE_INPUTS}
     swapped = False
     try:
         try:
             with probe.installed(eng):
+                # Every one of the eight inputs the fixture installs is its own
+                # while it is installed, so the comparison after the raise is
+                # about inputs that really were replaced.
                 swapped = (globals()["tmux"] is probe and globals()["RESOLVER"] is eng
                            and getattr(eng._process_table, "world", None) is probe
-                           and eng._session_registry == probe.session_rows)
+                           and all(getattr(eng, name) != was
+                                   for name, was in was_inputs.items()))
                 raise ZeroDivisionError("a unit failing part-way through its fixture")
         except ZeroDivisionError:
             pass
         restored = (globals()["tmux"] is was_tmux
                     and globals()["RESOLVER"] is was_resolver
-                    and eng._process_table == was_table
-                    and eng._session_registry == was_registry)
+                    and all(getattr(eng, name) == was for name, was in was_inputs.items()))
     finally:
         # This check is the one place that deliberately leaves a raise inside
         # the fixture, so it is also the one place that must not depend on the
@@ -22301,7 +23491,8 @@ def _check_synthetic_tmux_is_one_fixture(s):
         # back here regardless, or a red verdict here hands every later unit a
         # fake tmux server and turns one failure into a tier of them.
         globals()["tmux"], globals()["RESOLVER"] = was_tmux, was_resolver
-        eng._process_table, eng._session_registry = was_table, was_registry
+        for name, was in was_inputs.items():
+            setattr(eng, name, was)
     check("synthetic-tmux-restores-after-a-raise",
           "a failure inside the fixture still puts the world back",
           swapped and restored,
@@ -23806,8 +24997,8 @@ class _FakeTmux:
         name = socket.name if isinstance(socket, Path) else socket
         return name in self.sockets
 
-    # What attach_processes replaces on the engine: the process table, the
-    # session registry and the readers that answer for one process.
+    # The engine's inputs that read processes: the process table, the session
+    # registry and the readers that answer for one process.
     PROCESS_INPUTS = ("_process_table", "_session_registry", "_process_start_ms",
                       "_proc_env", "_proc_stat", "_cmdline")
 
@@ -23816,13 +25007,14 @@ class _FakeTmux:
     # back is exactly the leak this pair exists to prevent.
     ENGINE_INPUTS = PROCESS_INPUTS + ("_swarm_sockets", "_socket_alive")
 
-    def attach_processes(self, engine):
-        """Give a Resolver this world's processes, session registry and process
-        readers, and leave its sockets as they are.
+    def attach(self, engine):
+        """Give a Resolver this fixture's process, session and socket inputs.
 
-        The runner gives every engine a unit makes this way, and RESOLVER for
-        the length of the unit, unless the unit is declared to read the
-        machine (see _ProcessFence.engine_made and ran_unit).
+        Every input, always, including an empty socket set. A fixture that
+        answered only when it had something to say would let the rest fall
+        through to the machine's own socket directory, so a unit's result would
+        depend on what happened to be running on the box. An empty set is an
+        answer: this world has no sockets.
         """
         # The engine's own table counts reading it as computing PROCS, and a
         # verb's evidence audit holds it to what it declared; the world's table
@@ -23845,22 +25037,10 @@ class _FakeTmux:
             if (current is None or getattr(current, "__func__", None) is own
                     or getattr(current, "world_reader", False)):
                 setattr(engine, name, self._world_reader(answer, own.__get__(engine)))
-        if self.attached_at is None:
-            self.attached_at = int(time.time() * 1000)
-        return engine
-
-    def attach(self, engine):
-        """Give a Resolver this fixture's process, session and socket inputs.
-
-        Every input, always, including an empty socket set. A fixture that
-        answered only when it had something to say would let the rest fall
-        through to the machine's own socket directory, so a unit's result would
-        depend on what happened to be running on the box. An empty set is an
-        answer: this world has no sockets.
-        """
-        self.attach_processes(engine)
         engine._swarm_sockets = self.socket_paths
         engine._socket_alive = self.socket_is_alive
+        if self.attached_at is None:
+            self.attached_at = int(time.time() * 1000)
         return engine
 
     @contextlib.contextmanager
@@ -24578,7 +25758,7 @@ def _check_synthetic_sockets_do_not_couple_engines(s):
 
 
 @unit(('seat-finds-wrapped-agent',
-       'the seat resolver finds an agent wrapped inside the pane root process'), machine=True)
+       'the seat resolver finds an agent wrapped inside the pane root process'))
 def _check_seat_finds_wrapped_agent(s):
     checked = []
 
@@ -24665,6 +25845,8 @@ def _check_seat_finds_wrapped_agent(s):
     # Asked after the teardown: what a fixture that spawns leaves behind is
     # what the next unit trips over.
     left = sorted({row[0] for row in RESOLVER._process_table(refresh=True)} & set(made))
+    # Ended here, so that what the teardown left is in no later unit's view.
+    end_left_behind(left)
     records = agent.get("records") or ()
     # Found by its exact pid, not by argv shape. Shape would go ambiguous
     # between wrapper and child precisely when the argv[0] condition is the
@@ -27357,7 +28539,7 @@ def _check_here_reports_real_terminal(s):
         outside_fact = Resolver()._terminal_context()
         outside = terminal_note(outside_fact)
 
-        os.environ["TMUX"] = "/tmp/tmux-1000/claude-swarm-7,123,0"
+        os.environ["TMUX"] = f"/tmp/tmux-1000/claude-swarm-7,{PID_CEILING + 123},0"
         os.environ["TMUX_PANE"] = "%9"
         pane_fact = Resolver()._terminal_context()
         pane = terminal_note(pane_fact)
@@ -27473,7 +28655,8 @@ def _check_wrap_width_lossless(s):
     def check(cid, name, ok, detail=""):
         checked.append((cid, name, ok, detail))
 
-    tale = ("pid 4242 holds team-lead's transcript in pane %7 and refuses; " * 8).strip()
+    tale = (f"pid {PID_CEILING + 4242} holds team-lead's transcript in pane %7 and refuses; "
+            * 8).strip()
     filled = fill(tale, width=72)
     # A label whose value cannot fit beside it keeps the value anyway: the
     # pair overflows together rather than the label sitting orphaned above it.
@@ -28762,7 +29945,8 @@ def _check_launch_report_fits_exact(s):
         with capturing("out") as told_report:
             report_launch(
                 report_ctx, report_argv, prefix="",
-                extra=[("socket", "claude-swarm-4242  [lead pid 4242] (live)")])
+                extra=[("socket", f"claude-swarm-{PID_CEILING + 4242}  "
+                                  f"[lead pid {PID_CEILING + 4242}] (live)")])
     finally:
         if real_columns is None:
             os.environ.pop("COLUMNS", None)
@@ -31369,7 +32553,7 @@ def _check_sweep_spares_a_held_lock(s):
     return checked
 
 
-@unit(('team-evidence-one-answer', 'what is a team is one answer'), machine=True)
+@unit(('team-evidence-one-answer', 'what is a team is one answer'))
 def _check_team_evidence_one_answer(s):
     checked = []
 
@@ -31384,7 +32568,7 @@ def _check_team_evidence_one_answer(s):
     return checked
 
 
-@unit(('completion-lists-every-team', 'every team the engine knows is offered'), machine=True)
+@unit(('completion-lists-every-team', 'every team the engine knows is offered'))
 def _check_completion_lists_every_team(s):
     checked = []
 
@@ -32406,7 +33590,7 @@ def _check_pick_evidence_names_no_team(s):
     return checked
 
 
-@unit(('population-contains-roster', 'a team population contains its roster'), machine=True)
+@unit(('population-contains-roster', 'a team population contains its roster'))
 def _check_population_contains_roster(s):
     checked = []
 
@@ -32428,6 +33612,41 @@ def _check_population_contains_roster(s):
         listed = {m.get("name") for m in (RESOLVER._roster_of(with_former) or {}).get("members", [])}
         if set(extras) & listed:
             pop_wrong.append(f"{with_former} calls a listed member former")
+
+    # A team of this check's own whose one listed member runs: a process this
+    # run started, wearing the member's id. So a listed member that runs is
+    # always there to be judged, whatever teams this machine holds, and the
+    # process is under this run.
+    base = Path(tempfile.mkdtemp(prefix=own("population")))
+    crew = own("session-corpus-population")
+    member = f"running@{crew}"
+    (base / "projects").mkdir()
+    (base / "teams" / crew / "inboxes").mkdir(parents=True)
+    (base / "teams" / crew / "config.json").write_text(json.dumps({
+        "name": crew, "leadAgentId": f"team-lead@{crew}",
+        "leadSessionId": "0f6f6f6f-6f6f-46f6-8f6f-6f6f6f6f6f6f", "createdAt": 1,
+        "members": [{"agentId": member, "name": "running"}]}))
+    running = subprocess.Popen([FAKE_AGENT_BIN, "-c", '__import__("time").sleep(30)',
+                                "--agent-id", member], executable=sys.executable,
+                               stdin=subprocess.DEVNULL)
+    eng = Resolver(needs=Needs(maybe=set(NEED)))
+    eng._projects_dir, eng._teams_dir = base / "projects", base / "teams"
+    real_table = eng._process_table
+    try:
+        time.sleep(0.3)          # let it reach the process table
+        with _FakeTmux(sockets=[]).installed(eng):
+            eng._process_table = real_table
+            crew_runtime = eng._team_runtime(crew)
+    finally:
+        running.kill()
+        running.wait()
+        shutil.rmtree(base, ignore_errors=True)
+    seen_running = {name for name, facts in crew_runtime["runtimes"].items() if facts["external"]}
+    crew_state = crew_runtime["population"].get("running", (None,))[0]
+    if "running" not in seen_running:
+        pop_wrong.append(f"{crew}'s running member was not seen running")
+    elif crew_state != "listed":
+        pop_wrong.append(f"{crew} calls its running listed member {crew_state}")
     check("population-contains-roster", "a team population contains its roster", not pop_wrong, "; ".join(pop_wrong[:2])
           or f"{len(RESOLVER._known_teams())} teams, unrostered members on {with_former}")
 
@@ -34480,7 +35699,8 @@ def _check_agent_runtime_one_question(s):
       ('team-runtime-owns-population',
        'team population has no runtime-free compatibility projection'),
       ('process-command-read-stays-in-realm',
-       'raw process commands are read only inside process and tmux evidence readers'),
+       'raw process commands are read only inside process and tmux evidence readers, '
+       "the suite's own functions apart"),
       ('runtime-provenance-does-not-branch-on-prose',
        'runtime decisions do not parse resolution provenance prose'),
       ('doctor-consumes-team-runtime',
@@ -34519,7 +35739,8 @@ def _check_runtime_api_has_no_legacy_wearers(s):
     # fence's check among them; the realm is the tool's own code.
     raw_readers = callers_of("_cmdline") - s.suite_fns
     check("process-command-read-stays-in-realm",
-          "raw process commands are read only inside process and tmux evidence readers",
+          "raw process commands are read only inside process and tmux evidence readers, "
+          "the suite's own functions apart",
           raw_readers == {"_process_table", "_tmux_server_fact"},
           ", ".join(sorted(raw_readers)))
 
@@ -42833,6 +44054,7 @@ def _check_shares_fold_into_one_run(s):
     # collision it would be: the declaration and ended rows tier_rows registers,
     # and the mid-run, tmux and uniqueness rows run_selftest adds.
     own_rows = (UNIT_DECLARED[True], UNIT_ENDED[True], RUNNER_CHECKS[0], TIER_TMUX[True],
+                TIER_CLAUDE[True], TIER_PROCS[True], TIER_ADOPTS[True], TIER_LEFT[True],
                 IDS_UNIQUE[True])
 
     def summary(**failing):
@@ -43463,6 +44685,12 @@ def register_ids_unique_row(register, live, share_faults=()):
     register(*IDS_UNIQUE[live], not faults, "; ".join(faults))
 
 
+# The run_selftest call in progress in this process, set by the outermost call
+# for its length and None between runs. A call made while it is set is nested,
+# as a unit's fixture makes one, and leaves the run's cleanup to that call.
+SELFTEST_IN_PROGRESS = {"call": None}
+
+
 def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=None,
                  child=None, diagnostics=None):
     if list_only:
@@ -43471,14 +44699,6 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=N
         for cid, said in rows:
             print(check_line(cid, said, idwidth=column))
         return 0
-    # Every socket question in a run lands where TMUX_TMPDIR points: the
-    # engine's directory answer, anything the suite starts that inherits this
-    # environment, and the leak check in started_here. Left at the machine's,
-    # a suite meant to be synthetic still sees whatever swarm servers are
-    # running on the box, and anything it did create would appear among them.
-    # Pointed at an empty directory nothing else writes to, every socket in it
-    # is one this run made, which is what turns a leak check into reading a
-    # listing. Saved and put back exactly, including having been unset.
     # The corpus every fixture copies lives beside this file. Without it the
     # units do not fail with anything useful: each dies on a FileNotFoundError
     # from its own copytree, in whatever order the tier runs them, and the
@@ -43506,85 +44726,195 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=N
         warn(f"{too_long}. That is the deepest socket root this run makes, mkdtemp's "
              "characters shown as x; run the suite with a shorter TMPDIR")
         return 2
-    sockets = owned_directory("s")
-    was_tmpdir = os.environ.get("TMUX_TMPDIR")
-    os.environ["TMUX_TMPDIR"] = str(sockets)
-
-    # A tmux of this run's own, first on PATH, that records what it is asked
-    # and fails. Every unit and every process they start inherits it, so what
-    # it wrote down at the end is the whole tier's answer rather than a sample
-    # of it, and a check that reached production tmux is caught here even if it
-    # swallowed the failure this returns. Nested runs, a worker or the
-    # read-only child, make their own and report their own, which is what puts
-    # a recording next to the units that caused it.
-    was_path = os.environ.get("PATH")
-    canary = Path(tempfile.mkdtemp(prefix=own(f"{TOOL}-selftest-pathcanary")))
-    asked_for = canary / "asked"
-    decoy = canary / "tmux"
-    decoy.write_text("#!/bin/sh\n"
-                     f'printf "%s\\n" "$*" >> {asked_for}\n'
-                     "exit 1\n")
-    decoy.chmod(0o755)
-    os.environ["PATH"] = (f"{canary}{os.pathsep}{was_path}" if was_path
-                          else str(canary))
-
-    def recorded():
-        return asked_for.read_text().splitlines() if asked_for.exists() else []
-
-    # Everything this run starts stays under it, however the processes in
-    # between end: a run is the subreaper of its own processes, and
-    # finish_run ends what is still running when it finishes. A share is a
-    # run of its own too, and what a share leaves when it dies is adopted by
-    # its parent.
-    adopted = adopt_orphans()
-
-    # Fired on purpose before anything runs, so an empty recording at the end
-    # is evidence and not an absence of wiring. By the path the lookup
-    # returned, since naming tmux as a program to run is what this bans.
-    resolved = shutil.which("tmux")
-    if resolved:
-        subprocess.run([resolved, "-V"], capture_output=True)
-    control = recorded()
-    asked_for.unlink(missing_ok=True)
-
-    # Every socket name a check asks the probe about, recorded for the whole
-    # run on the class every engine is an instance of, and put back after.
-    # Asked once on purpose before anything runs, so a recording that holds
-    # every other name is evidence and not an absence of wiring.
-    asked_sockets = []
-    probe_socket = Resolver._socket_alive
-
-    def recorded_socket_alive(self, socket):
-        asked_sockets.append(socket.name if isinstance(socket, Path) else str(socket))
-        return probe_socket(self, socket)
-
-    Resolver._socket_alive = recorded_socket_alive
-    socket_control = f"{SOCKET_PREFIX}recorder-armed"
-    Resolver(needs=Needs(maybe=set(NEED)))._socket_alive(socket_control)
-
-    def register_sockets_row(register, tier):
-        """The tier's verdict on the socket names its checks asked about."""
-        names = sorted(set(asked_sockets) - {socket_control},
-                       key=lambda name: len(os.fsencode(name)))
-        longest = len(os.fsencode(names[-1])) if names else 0
-        armed = socket_control in asked_sockets
-        register(*TIER_SOCKETS[tier], armed and longest <= SOCKET_NAME_ROOM,
-                 (f"{len(names)} name(s) asked, the longest {names[-1]!r} at {longest} of "
-                  f"{SOCKET_NAME_ROOM} bytes" if names else "no check asked about a socket")
-                 if armed else "the recording was not armed: a deliberate probe was not recorded")
-
-    def register_tmux_row(register, tier):
-        """The tier's verdict on the decoy, stated before PATH goes back."""
-        asked = recorded()
-        armed = resolved == str(decoy) and control == ["-V"]
-        register(*TIER_TMUX[tier], armed and not asked,
-                 f"{len(asked)} call(s): {asked[:3]}" if asked else
-                 "" if armed else
-                 f"the decoy was not armed: tmux resolved to {resolved}, "
-                 f"a deliberate call recorded {control}")
-
+    # Everything below changes this process, and the finally undoes each change
+    # this call made, whatever ends the run. SIGTERM raises Terminated from here
+    # on, before the first change, so a run sent it while it is still setting up
+    # unwinds through the same finally.
     restore_sigterm = raise_on_sigterm()
+    # The outermost run_selftest call in a process owns the run's cleanup: it
+    # makes the process adopt orphans, ends and names what is left, and puts
+    # the setting back. A call made while it is in progress, as a unit's
+    # fixture makes one, does none of the three. Which call is the outermost is
+    # this record, set by that call for its length; the subreaper setting reads
+    # the same in both where the kernel offers none.
+    outermost = SELFTEST_IN_PROGRESS["call"] is None
+    if outermost:
+        SELFTEST_IN_PROGRESS["call"] = object()
+    was_fence, was_handed = PROCESS_FENCE, os.environ.get(FENCE_UNIT_VAR)
+    was_record = os.environ.get(FENCE_RECORD_VAR)
+    was_tmpdir, was_path = os.environ.get("TMUX_TMPDIR"), os.environ.get("PATH")
+    probe_socket = Resolver._socket_alive
+    record_room = sockets = canary = adopted = None
     try:
+        # This run's fence, rooted at this process whatever a unit that
+        # started it handed down, so the units it runs read the processes
+        # under it (_ProcessFence). Its refusals go to the record an audit
+        # named, or else to a file of this run's own, where the tool runs its
+        # units start write theirs too, and TIER_PROCS reads them back.
+        os.environ.pop(FENCE_UNIT_VAR, None)
+        fence = install_process_fence(_ProcessFence(was_record or None))
+        if fence.record is None:
+            record_room = owned_directory("f")
+            fence.record = str(record_room / "refused.jsonl")
+            os.environ[FENCE_RECORD_VAR] = fence.record
+        # Every socket question in a run lands where TMUX_TMPDIR points: the
+        # engine's directory answer, anything the suite starts that inherits
+        # this environment, and the leak check in started_here. Pointed at an
+        # empty directory nothing else writes to, every socket in it is one
+        # this run made. Put back exactly, including having been unset.
+        sockets = owned_directory("s")
+        os.environ["TMUX_TMPDIR"] = str(sockets)
+
+        # A tmux of this run's own, first on PATH, that records what it is
+        # asked and fails. Every unit and every process they start inherits
+        # it, so what it wrote down at the end is the whole tier's answer
+        # rather than a sample of it, and a check that reached production tmux
+        # is caught here even if it swallowed the failure this returns. Nested
+        # runs, a worker or the read-only child, make their own and report
+        # their own, which is what puts a recording next to the units that
+        # caused it.
+        canary = Path(tempfile.mkdtemp(prefix=own(f"{TOOL}-selftest-pathcanary")))
+        asked_for = canary / "asked"
+        decoy = canary / "tmux"
+        decoy.write_text("#!/bin/sh\n"
+                         f'printf "%s\\n" "$*" >> {asked_for}\n'
+                         "exit 1\n")
+        decoy.chmod(0o755)
+        # A claude of this run's own beside it, for the same reason: a unit, or
+        # a tool run one starts, that launches an agent reaches this instead of
+        # the claude on the machine, and what it wrote down is the tier's
+        # answer.
+        claude_asked = canary / "claude-asked"
+        claude_decoy = canary / "claude"
+        claude_decoy.write_text("#!/bin/sh\n"
+                                f'printf "%s\\n" "$*" >> {claude_asked}\n'
+                                "exit 1\n")
+        claude_decoy.chmod(0o755)
+        os.environ["PATH"] = (f"{canary}{os.pathsep}{was_path}" if was_path
+                              else str(canary))
+
+        def recorded():
+            return asked_for.read_text().splitlines() if asked_for.exists() else []
+
+        def claude_recorded():
+            return claude_asked.read_text().splitlines() if claude_asked.exists() else []
+
+        # Everything this run starts stays under it, however the processes in
+        # between end: the outermost call makes this process the subreaper of
+        # what is under it, and finish_run ends what is still running when the
+        # run finishes. A share is a run of its own too, and what a share
+        # leaves when it dies is adopted by its parent.
+        if outermost:
+            adopted = adopt_orphans()
+
+        # Fired on purpose before anything runs, so an empty recording at the
+        # end is evidence and not an absence of wiring. By the path the lookup
+        # returned, since naming tmux as a program to run is what this bans.
+        resolved = shutil.which("tmux")
+        if resolved:
+            subprocess.run([resolved, "-V"], capture_output=True)
+        control = recorded()
+        asked_for.unlink(missing_ok=True)
+        claude_resolved = shutil.which("claude")
+        if claude_resolved:
+            subprocess.run([claude_resolved, "--version"], capture_output=True)
+        claude_control = claude_recorded()
+        claude_asked.unlink(missing_ok=True)
+
+        # Every socket name a check asks the probe about, recorded for the
+        # whole run on the class every engine is an instance of, and put back
+        # after. Asked once on purpose before anything runs, so a recording
+        # that holds every other name is evidence and not an absence of wiring.
+        asked_sockets = []
+
+        def recorded_socket_alive(self, socket):
+            asked_sockets.append(socket.name if isinstance(socket, Path) else str(socket))
+            return probe_socket(self, socket)
+
+        Resolver._socket_alive = recorded_socket_alive
+        socket_control = f"{SOCKET_PREFIX}recorder-armed"
+        Resolver(needs=Needs(maybe=set(NEED)))._socket_alive(socket_control)
+
+        def register_sockets_row(register, tier):
+            """The tier's verdict on the socket names its checks asked about."""
+            names = sorted(set(asked_sockets) - {socket_control},
+                           key=lambda name: len(os.fsencode(name)))
+            longest = len(os.fsencode(names[-1])) if names else 0
+            armed = socket_control in asked_sockets
+            register(*TIER_SOCKETS[tier], armed and longest <= SOCKET_NAME_ROOM,
+                     (f"{len(names)} name(s) asked, the longest {names[-1]!r} at {longest} of "
+                      f"{SOCKET_NAME_ROOM} bytes" if names else "no check asked about a socket")
+                     if armed else
+                     "the recording was not armed: a deliberate probe was not recorded")
+
+        def register_tmux_row(register, tier):
+            """The tier's verdict on the decoy, stated before PATH goes back."""
+            asked = recorded()
+            armed = resolved == str(decoy) and control == ["-V"]
+            register(*TIER_TMUX[tier], armed and not asked,
+                     f"{len(asked)} call(s): {asked[:3]}" if asked else
+                     "" if armed else
+                     f"the decoy was not armed: tmux resolved to {resolved}, "
+                     f"a deliberate call recorded {control}")
+
+        def register_claude_row(register, tier):
+            """The tier's verdict on the claude decoy, stated before PATH goes back."""
+            asked = claude_recorded()
+            armed = claude_resolved == str(claude_decoy) and claude_control == ["--version"]
+            register(*TIER_CLAUDE[tier], armed and not asked,
+                     f"{len(asked)} call(s): {asked[:3]}" if asked else
+                     "" if armed else
+                     f"the decoy was not armed: claude resolved to {claude_resolved}, "
+                     f"a deliberate call recorded {claude_control}")
+
+        def register_adoption_row(register, tier):
+            """The tier's verdict on adoption, from an orphan made before its first unit and one made now."""
+            said = []
+            for when, (taken, pid, ended) in (("before the first unit", adopted_before),
+                                              ("after the last unit", orphan_adopted())):
+                if not taken:
+                    said.append(f"the orphan made {when} was not this run's"
+                                + (f" (pid {pid})" if pid else ", and never said its pid"))
+                if not ended:
+                    said.append(f"the orphan made {when} had not ended 10 seconds after "
+                                "its line was closed")
+            if outermost and adopted is None:
+                said.insert(0, "adopt_orphans could not make this process a subreaper")
+            register(*TIER_ADOPTS[tier], not said, "; ".join(said))
+
+        def left_running():
+            """What this run's units left running, as sentences: finish_run's result for the
+            outermost call, and for a nested call what appeared under this process after it
+            began and still runs, which the outermost call ends."""
+            if outermost:
+                ended, left, refused = finish_run(diagnostics)
+                return ([f"ended {', '.join(map(str, ended))}"] if ended else []) \
+                    + ([f"could not end {', '.join(map(str, left))}"] if left else []) \
+                    + refused
+            left = sorted(pid for pid, identity in _ProcessFence.run_processes().items()
+                          if (pid, identity[2]) not in running_before)
+            return ([f"still running, for the run this one is inside to end: "
+                     f"{', '.join(map(str, left))}"] if left else [])
+
+        def register_left_row(register, tier):
+            """The tier's verdict on what its units left running, stated after the adoption row."""
+            said = left_running()
+            register(*TIER_LEFT[tier], not said, "; ".join(said))
+
+        def settle():
+            """What the merging run of a split live tier found about itself, by summary row id."""
+            left = left_running()
+            refused = refusal_lines(fence.refusals_in_run(), fence.root)
+            return {TIER_LEFT[True][0]: [f"the merging run: {line}" for line in left],
+                    TIER_PROCS[True][0]: [f"the merging run: {line}" for line in refused]}
+
+        # What runs under this process as a nested call begins: it names only
+        # what started after that.
+        running_before = ({(pid, identity[2])
+                           for pid, identity in _ProcessFence.run_processes().items()}
+                          if not outermost else set())
+        # The first orphan made on purpose, before any unit.
+        adopted_before = orphan_adopted()
         share_faults = ()
         if live:
             # live_checks runs the read-only tier as a child, to read its stderr
@@ -43598,7 +44928,8 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=N
             said = io.StringIO()
             with capturing("out", into=said), capturing("err", into=said):
                 if jobs > 1:
-                    results, register, share_faults = _live_in_parallel(jobs, diagnostics)
+                    results, register, share_faults = _live_in_parallel(jobs, diagnostics,
+                                                                         settle)
                 else:
                     results, register = live_checks(share, child, diagnostics)
             loud = [line for line in said.getvalue().splitlines() if line.strip()]
@@ -43617,12 +44948,20 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=N
                          if loud else "")
                 register_tmux_row(register, True)
                 register_sockets_row(register, True)
+                register_claude_row(register, True)
+                register_adoption_row(register, True)
+                register_left_row(register, True)
+                register_procs_row(register, True, fence)
         else:
             s = _suite_context()
             results, register = check_rows()
             tier_rows([entry for entry in UNITS if not entry[3]], s, register, False, diagnostics)
             register_tmux_row(register, False)
             register_sockets_row(register, False)
+            register_claude_row(register, False)
+            register_adoption_row(register, False)
+            register_left_row(register, False)
+            register_procs_row(register, False, fence)
         register_closing_rows(register, results, live,
                               None if share else selftest_catalog(live, jobs), share_faults)
         return _selftest_report(results, failed_only)
@@ -43635,16 +44974,32 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, share=N
     finally:
         restore_sigterm()
         Resolver._socket_alive = probe_socket
-        finish_run(diagnostics)
-        if adopted is not None:
-            adopt_orphans(adopted)
+        if outermost:
+            finish_run(diagnostics)
+            if adopted is not None:
+                adopt_orphans(adopted)
         if was_tmpdir is None:
             os.environ.pop("TMUX_TMPDIR", None)
         else:
             os.environ["TMUX_TMPDIR"] = was_tmpdir
-        os.environ["PATH"] = was_path
-        shutil.rmtree(sockets, ignore_errors=True)
-        shutil.rmtree(canary, ignore_errors=True)
+        if was_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = was_path
+        for made in (sockets, canary, record_room):
+            if made is not None:
+                shutil.rmtree(made, ignore_errors=True)
+        if was_record is None:
+            os.environ.pop(FENCE_RECORD_VAR, None)
+        else:
+            os.environ[FENCE_RECORD_VAR] = was_record
+        globals()["PROCESS_FENCE"] = was_fence
+        if was_handed is None:
+            os.environ.pop(FENCE_UNIT_VAR, None)
+        else:
+            os.environ[FENCE_UNIT_VAR] = was_handed
+        if outermost:
+            SELFTEST_IN_PROGRESS["call"] = None
 
 
 def completion_needs(topic):
@@ -44036,6 +45391,9 @@ def build_parser():
 
 
 def main():
+    # A tool run a selftest unit started reads processes by that unit's rule
+    # from its first read on, so its fence goes in before anything else.
+    adopt_inherited_fence()
     parser = build_parser()
     # Only a *leading* bare word is the selector; later bare words belong to
     # forwarded flags (argparse can't know that --model takes a value).
