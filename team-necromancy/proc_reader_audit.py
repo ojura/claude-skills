@@ -4,8 +4,11 @@
 Runs agent-resume's selftest with its process fence recording instead of
 stopping: every refusal is written to a file, one JSON object a line, and the
 run goes on, so one pass lists every unit that names a process the run did not
-start, the reader it used and the pids it named. Rerun it after each package of
-the consolidation is adapted; an empty result is the pass.
+start, the reader it used and the pids it named. Refusals by the selftest's own
+cleanup readers on _ProcessFence (architecture.md) are written the same way,
+under the reader "cleanup stat", so they are counted too; reads that either kind
+of reader allows are not counted. Rerun it after each package of the
+consolidation is adapted; an empty result is the pass.
 
     proc_reader_audit.py [--live] [--tool PATH] [--static proc-readers.json]
 

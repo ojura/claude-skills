@@ -1055,6 +1055,24 @@ hold. `proc_reader_audit.py` runs the tiers with the fence recording refusals
 instead of stopping and lists every unit that read a process its run did not
 start.
 
+The selftest ends the processes it starts through readers of its own on
+`_ProcessFence`, which do not ask the fence and are limited instead by how they
+find what they read. A run is the subreaper of every process it starts, so what
+its fixtures orphan stays under it. `run_processes` walks down from the run by
+the `children` files of each process's threads and reads the stat file of each
+process it finds. `identity` reads one pid's stat file only when that pid is the
+run itself or the same walk finds it under the run. `ancestors` reads the stat
+files up the chain of parents from the run's parent, so that the run never
+signals one of them. Any other pid reads as no running process without being
+read, and while a unit runs, a refused pid that a process holds is recorded as
+the fence records its refusals, so it ends the run and `proc_reader_audit.py`
+counts it. Ending signals each process through a pidfd opened while its start
+time still matched, and never signals pid 1, the run, an ancestor, a process
+named systemd, or a process that did not start after the run. The smoke check's
+stray is outside the run on purpose and is never read: it holds the write end
+of a pipe whose read end the run keeps, and the run ends it through a pidfd
+opened while that pipe had not yet reached end of file.
+
 Mutation scripts import `probe` and call `probe.expect(...)`. The function runs
 one clean suite and isolated mutants, then raises `ProbeFailure` if the clean run
 fails, a mutant crashes, no check bites, or the expected check does not bite.
