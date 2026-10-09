@@ -4,13 +4,13 @@
 probe.selftest copies this file into a private room under the tool's name and
 runs probe.expect against it, so the verifier's rules are exercised on real
 processes without running the real suite. The clean copy lists CATALOG,
-reports every check as passing and exits 0. Each knob in the block below
+reports every check as passing and exits 0. Each setting in the block below
 changes one thing a verifier must notice. The block is the only place the
-knobs are written: probe.knob_block() reads their names and defaults from
-it, and a test mutation rewrites it with probe.knobs(). So each knob stays a
-line of its own, NAME = value as repr writes the value, the knob lines
-follow each other, and no other top-level assignment of a literal to a name
-in capitals fits on one line.
+settings are written: probe.runner_settings() reads their names and defaults
+from it, and a test mutation rewrites it with probe.settings(). So each
+setting stays a line of its own, NAME = value as repr writes the value, the
+setting lines follow each other, and no other top-level assignment of a
+literal to a name in capitals fits on one line.
 
 FAILING names the checks reported as failed. SUMMARY is exact, missing,
 malformed or short. EXIT replaces the exit status. DROP leaves checks out of
@@ -48,9 +48,9 @@ is how a test sees which copy the verifier ran. With PROBE_SYNTHETIC_ENVIRON
 set, every invocation appends its TMPDIR, TMUX_TMPDIR and XDG_CACHE_HOME and
 the command line of the process that started it, its supervisor, as one JSON
 line, which is how a test sees what the suite was given and which verifier file
-its supervisor loaded. With PROBE_SYNTHETIC_STARTED set, every process those
-five knobs start is appended there as its pid and start time, which is how a
-test sees whether each was ended.
+its supervisor loaded. With PROBE_SYNTHETIC_STARTED set, every process started
+for those five settings is appended there as its pid and start time, which is
+how a test sees whether each was ended.
 """
 
 import json
@@ -109,10 +109,12 @@ if sys.argv[1] == "exits":
 time.sleep(600)
 """
 
-# The code that reads a process's start time and records a process the runner
-# started in the witness file the test reads, the one PROBE_SYNTHETIC_STARTED
-# names, kept as source text: the runner executes it below, and
-# STUBBORN_PROCESS, which runs as a program of its own, begins with it.
+# WITNESS is the source text of two functions: started_at reads a process's
+# start time, and witnessed appends the pid and start time of each process it
+# is given to the witness file, the file PROBE_SYNTHETIC_STARTED names, where
+# the test reads them. The runner executes this text below to define both
+# functions, and STUBBORN_PROCESS, which runs as a separate program, starts
+# with the same text.
 WITNESS = r'''
 import os
 
