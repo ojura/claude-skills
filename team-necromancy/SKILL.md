@@ -1,6 +1,6 @@
 ---
 name: team-necromancy
-description: Resume dead Claude Code teammates and whole teams with their transcripts intact. Covers tmux panes, supervised background jobs with claude --bg --resume, and whole-team recovery by resuming the leader under the team-lead identity. Use when the user wants to resume a teammate, agent, swarm, or team whose process has died, or move a teammate between tmux, in-process, and bg execution modes.
+description: Resume dead Claude Code teammates and whole teams with their transcripts intact. Covers tmux panes, supervised background jobs with claude --bg --resume, and whole-team recovery by resuming the leader under the team-lead identity. Use when the user wants to resume a teammate, agent, swarm, or team after its process has died, or move a teammate between tmux, in-process, and bg execution modes.
 ---
 
 # Team necromancy
@@ -39,12 +39,12 @@ provenance, public methods, caller restrictions, and generation checks.
 Resolver selects transcripts in this order:
 
 1. an explicit session UUID
-2. a live process whose agent ID matches, using its `--resume` value
+2. a live process with a matching agent ID, using its `--resume` value
 3. the roster's `leadSessionId`
 4. a promotion receipt assigning the requested member identity
 5. matching `agentName` and `teamName` transcript stamps
 6. an `agentName` stamp that identifies one roster member
-7. for a lead, a transcript whose spawn records name the team
+7. for a lead, a transcript with spawn records that name the team
 
 A bare name shared by several rosters remains ambiguous. This commonly affects
 `team-lead` because every team uses that name.
@@ -275,8 +275,8 @@ below:
 - process evidence classifies the team as stopped
 - Resolver's transcript search returns an empty result for the lead and every
   member
-- the directory contains a parseable roster and JSON inbox arrays whose messages
-  are all delivered
+- the directory contains a parseable roster and JSON inbox arrays, with every
+  message in them delivered
 - its roster lock permits removal; a live owner, an unreadable owner record, or a
   `proper-lockfile` directory preserves the team
 - the directory is older than 300 seconds, covering the interval between team

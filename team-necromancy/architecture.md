@@ -181,10 +181,10 @@ well-formed and belongs to its own socket namespace.
 
 A peer frame may carry at most 16 attachments. Each source or transfer file is
 bounded to 31,457,280 bytes (30 MiB); staged transfer files expire after one day.
-The sender copies a regular source file into `~/.claude/file-transfers`, whose
-directory is mode `0700`, and writes the staged copy mode `0600`. Attachment
-metadata includes `path`, `file_name`, `file_size`, `sha256`, and optional
-`media_type`.
+The sender copies a regular source file into the directory
+`~/.claude/file-transfers`, mode `0700`, and writes the staged copy mode `0600`.
+Attachment metadata includes `path`, `file_name`, `file_size`, `sha256`, and
+optional `media_type`.
 
 The receiver validates the attachment array and its 16-item limit; requires an
 absolute path without the UNC form; checks that the source is a regular file and
@@ -266,11 +266,11 @@ structured experimental-team message form; that form belongs to the team mailbox
 path rather than the UDS text transport.
 
 UDS is also distinct from local task delivery. The task model distinguishes
-`local_agent` tasks, whose IDs begin with `a`, from `in_process_teammate` tasks,
-whose IDs begin with `t`. An in-process teammate has isolated context, independent
-idle tracking, a prompt-wait loop, and team mailbox integration. A message to a
-live in-process teammate waits for its next tool round; it is not sent through the
-cross-session socket.
+`local_agent` tasks, which have IDs beginning with `a`, from
+`in_process_teammate` tasks, which have IDs beginning with `t`. An in-process
+teammate has isolated context, independent idle tracking, a prompt-wait loop,
+and team mailbox integration. A message to a live in-process teammate waits for
+its next tool round; it is not sent through the cross-session socket.
 
 `TaskUpdate` persists each task as JSON at:
 
@@ -279,9 +279,9 @@ cross-session socket.
 ```
 
 The update path locks and rewrites that record. When agent-swarm ownership changes,
-it also appends a durable team mailbox message whose text contains a
-`task_assignment` object with `taskId`, `subject`, `description`, `assignedBy`,
-and `timestamp`. The mailbox is a JSON array at:
+it also appends a durable message to the team mailbox, and the message text
+contains a `task_assignment` object with `taskId`, `subject`, `description`,
+`assignedBy`, and `timestamp`. The mailbox is a JSON array at:
 
 ```text
 ~/.claude/teams/<team>/inboxes/<agent>.json
@@ -293,14 +293,16 @@ cyan task-assignment rendering, not a teal transport frame and not a UDS receipt
 ## Teammate transcript stamps
 
 Every JSONL line records `sessionKind`. Teammate processes also record
-`agentName` and `teamName`; leader records carry session identity alone. These
-fields control two behaviors:
+`agentName` and `teamName`; leader records carry session identity alone. A
+record's `agentName` and `teamName` are its stamp: the record is stamped with
+the team its `teamName` names, and restamping a transcript rewrites those two
+fields in its records. These fields control two behaviors:
 
 - The /resume picker reads metadata from the **first line**. A session created
   as a bg fork therefore keeps the `bg` badge across interactive resumes, while
   the live process environment determines its behavior. `claude -c` selects
-  transcripts whose first line carries an interactive kind. Forking clears the
-  copied identity stamps and gives the fork its own picker classification.
+  transcripts that carry an interactive kind on their first line. Forking clears
+  the copied identity stamps and gives the fork its own picker classification.
 - Reconnection binds team identity from CLI identity flags or transcript
   stamps. Plain leads launch with session arguments, and their transcripts
   carry session identity alone, so recovery binds a dead lead through the
@@ -341,12 +343,14 @@ including a config absent or unparsable now, which may have loaded and been
 removed since. A config created after the start is a new one, and an earlier
 config of the team may have been there at the mount: when this tool's reap
 receipt for the team shows it retired the team after the process started, the
-answer is unknown rather than no. A process with neither an argv nor a loading
-stamped team takes the implicit team whose creation pairs uniquely with its
-boot. These answers are inferred. When the evidence does not decide, the answer
-names no team and lists the teams still open. The start time is the kernel's,
-read from `/proc/<pid>/stat` and `/proc/uptime`, with the session registry's
-`startedAt` as the fallback.
+answer is unknown rather than no. A process with no argv team, and no stamped
+team that loaded when it started, takes an implicit team created within
+`TEAM_MINT_WINDOW_MS` before it started, when it is the only process that
+started that soon after the team was created and the team is the only one it
+could have created in that time. These answers are inferred. When the evidence
+does not decide, the answer names no team and lists the teams still open. The
+start time is the kernel's, read from `/proc/<pid>/stat` and `/proc/uptime`,
+with the session registry's `startedAt` as the fallback.
 
 A launch that has not started yet is a different question. `restore_answer`
 says whether its window root's team loads in the census the launch was planned
@@ -410,9 +414,9 @@ Cross-process teammates communicate through files:
   live owner, an unreadable or empty record, and a `proper-lockfile` directory
   each preserve the team directory. An empty record can result when a process
   exits between exclusive creation and writing its ownership record; preserving
-  it avoids deleting a lock whose writer may still be alive. An atomic variant
-  can write the record to a temporary file and claim the lock name with a hard
-  link, removing that empty-record interval while keeping the protocol.
+  it avoids deleting a lock while its writer may still be alive. An atomic
+  variant can write the record to a temporary file and claim the lock name with
+  a hard link, removing that empty-record interval while keeping the protocol.
 
   Removal compares the record bytes it read with the bytes present immediately
   before unlinking. This catches another process taking the lock between those
@@ -473,13 +477,13 @@ Resolver ranks available evidence as follows:
 3. A team's `leadSessionId` identifies a fresh lead's conversation exactly
    because the fresh internal ID equals its transcript filename.
 4. A unique, bidirectional match between team `createdAt` and process
-   `startedAt` infers the implicit team a plain process minted at boot.
+   `startedAt` infers the implicit team a plain process created at boot.
 
 Timing needs bidirectional uniqueness because several processes can start in one
 team's interval and one process can fit several team intervals. It also covers
 only eager team creation: a team created at first spawn may appear minutes after
-boot. `agent-resume` therefore asks before applying a redirect whose
-destination is inferred.
+boot. `agent-resume` therefore asks before applying a redirect to an inferred
+destination.
 
 The `SessionStart` hook carries the transcript ID, which associates a process
 with its resumed transcript. Team inference needs the internal ID used in the
@@ -487,11 +491,12 @@ implicit team name. In the measured corpus, one of eight resumed hook IDs mapped
 to an implicit team name, and four of 23 team directories used IDs unique to a
 process life.
 
-Resolver returns an exact result for durable identity and for a process's own
-lines, an inferred result for the mount rule and a unique timing match, and an
-unknown result for the remaining cases. An inferred redirect destination is
-offered with confirmation and defaults to yes. A durable internal-session
-record would turn late-created teams into exact results as well.
+Resolver returns an exact result for durable identity and for the transcript
+records a process wrote since it started, an inferred result for the mount rule
+and a unique timing match, and an unknown result for the remaining cases. An
+inferred redirect destination is offered with confirmation and defaults to yes.
+A durable internal-session record would turn late-created teams into exact
+results as well.
 
 ## Adopt
 
@@ -499,7 +504,7 @@ Adopt recovers work after a process exits or moves to the background. It records
 running shells with PID and start time, and `adopt.json` checkpoints the
 session's shells, agents, workflows, and cron jobs. A later resume claims the
 checkpoint by atomic rename, verifies process identity before reattaching
-shells, and restarts agents whose transcripts show unfinished work.
+shells, and restarts agents when their transcripts show unfinished work.
 `CLAUDE_DISABLE_ADOPT=1` disables this behavior. Adding teammate identity and
 team state to the checkpoint would make team resume part of Adopt.
 
@@ -715,7 +720,7 @@ even when empty. Diagnostic names are optional; only string names are formatted.
 
 Completion checks these retained values without filesystem reads or another
 serialization. Create requires an absent before-observation, replace-empty a
-physical empty file, and keep a physical nonempty file whose reported result is
+physical empty file, and keep a physical nonempty file with a reported result
 equal to the original observation. Equal observations need not be the same Python
 object. The shared written-result comparison first requires a physical
 `FileObservation` and checks each intended operand's exact type against its
@@ -739,8 +744,9 @@ freeze that caller's graph. Successful output contains exactly `launch`,
 `written_roster`, `original_generation`, `replacement_generation`, and
 `objections`. The generation values come from the retained original and accepted
 file observation. Neither result copies raw plan fields or returns the `Applied`
-input, whose frozen outer dataclass does not establish ownership of its nested
-data. Executors and effect tests can retain that input separately.
+input: only that input's outer dataclass is frozen, and freezing it does not
+establish ownership of its nested data. Executors and effect tests can retain
+that input separately.
 
 Only complete acceptance publishes the owned candidate as both the completed
 destination and the census entry. Creation inserts it into an empty census as
@@ -811,8 +817,8 @@ transcript, so a live process holding that transcript is its only conflict. A
 reap counts each moving member's other holders as ended, since the run ends
 them first. A moving member held by this run's own process or one of its
 ancestors cannot be ended, so the decision refuses the move before anything
-changes, with `--force` or without. A running member whose live processes all
-operate as the destination has already moved, whatever roster still lists it:
+changes, with `--force` or without. A running member has already moved when all
+its live processes operate as the destination, whatever roster still lists it:
 the decision marks it `arrived`, and its step reports it running there and
 registers it in the destination's roster, without starting, stopping or
 rebuilding anything.
@@ -831,10 +837,10 @@ does not read its mail.
 A report offers a move only as the planner would make it. `_move_offer` asks
 `_team_redirect` for the command it would offer, as given and then with
 `--with-mail`, and offers the first under which the decision moves someone,
-with those flags. The doctor's remedies for a team whose lead runs elsewhere
-come from `_team_moves`: the team run with `--all`, which starts the stopped
-members on the lead's team, and the run with `--into-team live --all`, which
-restarts the running ones too, each judged on the members `team_run_plan`
+with those flags. When a team's lead runs elsewhere, the doctor's remedies for
+the team come from `_team_moves`: the team run with `--all`, which starts the
+stopped members on the lead's team, and the run with `--into-team live --all`,
+which restarts the running ones too, each judged on the members `team_run_plan`
 would start. So the doctor names `--with-mail` when only waiting mail keeps the
 team from being retired, offers no automatic move when the lead is not known
 exactly or running members stay behind, offers stopping the processes that run
@@ -908,13 +914,13 @@ process, or destination record selected for the prior identity.
 
 A `Seat` is an observed pair of socket and pane. A `LaunchDestination` is a
 selected socket and optional pane reference. They are deliberately distinct: a
-recorded pane is meaningful only on the socket whose roster record supplied it,
-and an observed crew seat can select a destination without authorizing reuse of
-that occupied pane. `CrewPlacement` records all observed crew seats, their
-per-socket grouping, whether they are split, and the selected destination with its
-evidence. `TerminalContext` records the current terminal's seat, or a tmux socket
-without its pane ID; it is captured once for a launch or team run and is not read
-again while rendering or attaching.
+recorded pane is meaningful only on the socket of the roster record that
+supplied it, and an observed crew seat can select a destination without
+authorizing reuse of that occupied pane. `CrewPlacement` records all observed
+crew seats, their per-socket grouping, whether they are split, and the selected
+destination with its evidence. `TerminalContext` records the current terminal's
+seat, or a tmux socket without its pane ID; it is captured once for a launch or
+team run and is not read again while rendering or attaching.
 
 A transcript title is a `TitleFact`, not a string. It contains the selected title
 text, the event kind, transcript path, timestamp, and source record UUID. Every
@@ -966,8 +972,9 @@ demotion, restamping, and archive executors use their selected operation plans.
 
 A mailbox records messages waiting on disk and is pruned when a busy recipient
 takes them into memory. `mail_answer` therefore derives delivery state from
-transcript events, whose history remains available after mailbox uptake. Team
-config and mailbox data answer separate questions and carry separate evidence.
+transcript events, which stay in the transcript after the recipient takes the
+messages from the mailbox. Team config and mailbox data answer separate
+questions and carry separate evidence.
 
 Conversion receipts are versioned, tool-written evidence carried by the
 converted transcript. Resolver reads them to recover team membership, copied
@@ -1074,23 +1081,24 @@ else, so a tool run's root is the selftest process that runs its unit, never the
 tool run itself. It checks the root's start time before walking the root's
 children, so a root that has gone leaves it no processes, and it writes its
 refusals to the file `AGENT_RESUME_SELFTEST_FENCE` names, which the tier's row
-reads once the tool run has exited. A tool run has no row of its own, so one
-whose refusal that file cannot take ends there, naming the refusal on its
-stderr; in the selftest process such a refusal is kept for the row. A tool run
-whose `AGENT_RESUME_SELFTEST_UNIT` does not parse ends before anything else
-runs. The pids the run knows are kept in one record for the whole run, a file
-beside the refusal record: each of the run's fences adds the pids it learns
-there, and reads what the others added before it counts a pid as unknown, so a
-tool run admits a pid the selftest process learned by the same rule. A tool run
-that is a selftest itself roots its own units at itself. `ran_unit` drops
-RESOLVER's process caches as each unit starts and again in its `finally`, so a
-table a declared unit read reaches no other unit. `proc_reader_audit.py` runs
-the tiers with a record file of its own and lists every refusal by unit, reader
-and pid, those of the tool runs included. A `claude` that records its arguments
-and fails sits first on `PATH` beside the tmux one for the whole run, so a unit
-or tool run that launches an agent reaches it instead of the machine's claude,
-and the tier's `read-only-tier-runs-no-claude` or `live-tier-runs-no-claude` row
-says whether anything did.
+reads once the tool run has exited. A tool run has no row of its own, so when
+that file cannot take one of its refusals, the tool run ends there, naming the
+refusal on its stderr; in the selftest process such a refusal is kept for the
+row. A tool run ends before anything else runs when its
+`AGENT_RESUME_SELFTEST_UNIT` does not parse. The pids the run knows are kept in
+one record for the whole run, a file beside the refusal record: each of the
+run's fences adds the pids it learns there, and reads what the others added
+before it counts a pid as unknown, so a tool run admits a pid the selftest
+process learned by the same rule. A tool run that is a selftest itself roots its
+own units at itself. `ran_unit` drops RESOLVER's process caches as each unit
+starts and again in its `finally`, so a table a declared unit read reaches no
+other unit. `proc_reader_audit.py` runs the tiers with a record file of its own
+and lists every refusal by unit, reader and pid, those of the tool runs
+included. A `claude` that records its arguments and fails sits first on `PATH`
+beside the tmux one for the whole run, so a unit or tool run that launches an
+agent reaches it instead of the machine's claude, and the tier's
+`read-only-tier-runs-no-claude` or `live-tier-runs-no-claude` row says whether
+anything did.
 
 The selftest ends the processes it starts through readers of its own on
 `_ProcessFence`, which do not ask the fence and are limited instead by how they
@@ -1112,30 +1120,30 @@ through `end_processes` as `finish_run` does, so no later unit has it in view.
 process's threads and reads the stat file of each process it finds. `identity`
 reads one pid's stat file only when that pid is the run itself or the same walk
 finds it under the run. A pass of the walk reads those files one after another,
-so a process whose parent exits meanwhile can move to a subreaper inside the run
-between two of them and be in neither. The subreaper is the run or under it, so
-the pass read its file before the process got there. After each pass the walk
-reads every children file the pass read once more, and passes again, up to four
-passes, while one of them lists a pid the pass did not find. `run_processes`,
-`identity` and the fence's `admit` all walk that way. `ancestors` reads the stat
-files up the chain of parents from the run's parent, so that the run never
-signals one of them. Any other pid reads as no running process without being
-read; a refused pid that a process holds, and a value that is not a whole
-number, are written down as the fence writes its refusals, in a unit or outside
-one, and a pid `pidfd_open` cannot judge is written down with the error, so the
-tier's row names it and `proc_reader_audit.py` counts it. `end_processes` and
-the functions built on it signal each process through a pidfd opened while its
-start time still matched, and never signal pid 1, the run, an ancestor, a
-process named systemd, or a process that did not start after the run. The smoke
-check's stray is outside the run on purpose, and the cleanup never reads it: the
-stray holds the only write end of a pipe whose read end the run keeps, and the
-run ends it through a pidfd opened while that pipe had not yet reached end of
-file.
+so when a process's parent exits meanwhile, the process can move to a subreaper
+inside the run between two of them and be in neither. The subreaper is the run
+or under it, so the pass read its file before the process got there. After each
+pass the walk reads every children file the pass read once more, and passes
+again, up to four passes, while one of them lists a pid the pass did not find.
+`run_processes`, `identity` and the fence's `admit` all walk that way.
+`ancestors` reads the stat files up the chain of parents from the run's parent,
+so that the run never signals one of them. Any other pid reads as no running
+process without being read; a refused pid that a process holds, and a value that
+is not a whole number, are written down as the fence writes its refusals, in a
+unit or outside one, and a pid `pidfd_open` cannot judge is written down with
+the error, so the tier's row names it and `proc_reader_audit.py` counts it.
+`end_processes` and the functions built on it signal each process through a
+pidfd opened while its start time still matched, and never signal pid 1, the
+run, an ancestor, a process named systemd, or a process that did not start after
+the run. The smoke check's stray is outside the run on purpose, and the cleanup
+never reads it: the stray holds the only write end of a pipe, the run keeps the
+pipe's read end, and the run ends the stray through a pidfd opened while that
+pipe had not yet reached end of file.
 
 Mutation scripts import `probe` and call `probe.expect(...)`. The function runs
 one clean suite and isolated mutants, then raises `ProbeFailure` if the clean run
 fails, a mutant crashes, no check bites, or the expected check does not bite.
-There is no probe command-line interface whose exit status can be separated from
+The probe has no command-line interface, so no exit status can be separated from
 its report by redirection or a surrounding shell command. A positive operation
 fixture reports an unexpected refusal or missing result as a failed named check,
 including the exception type and message. It restores patched globals before
@@ -1163,12 +1171,12 @@ nanosecond modification time. It derives the restored window root, the newest
 team stamp and, when requested, compact mail evidence from one stable read;
 window-start, operating-team and mail questions reuse that answer until any key
 field changes. Runtime reads produce
-one immutable snapshot whose PID records are the exact objects referenced by its
-process, agent, transcript, pane, and session indexes. A question that receives
-a process table carries that snapshot through every helper instead of reading the
-default table partway through. Callers declare optional `REGISTRY`, `SEATS`, and
-launch `PLACEMENT` work through `NEED` rather than selecting among alternate
-runtime APIs. Diagnosis does not declare `PLACEMENT`.
+one immutable snapshot, and its PID records are the exact objects referenced by
+its process, agent, transcript, pane, and session indexes. A question that
+receives a process table carries that snapshot through every helper instead of
+reading the default table partway through. Callers declare optional `REGISTRY`,
+`SEATS`, and launch `PLACEMENT` work through `NEED` rather than selecting among
+alternate runtime APIs. Diagnosis does not declare `PLACEMENT`.
 
 Callers also declare the computations they need. `Resolver(needs=...)` receives
 hard requirements and a `maybe` set for computations reached on selected paths.

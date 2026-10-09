@@ -48,8 +48,8 @@ observed live and confirmed against the Claude Code bundle.
    starts with an empty in-memory teammate map and begins polling members after
    its first teammate spawn initializes that map.
 
-   A flag-bound launch whose transcript stamps name another team carries two
-   identities. Transcript lines use the stamped team. Idle notifications,
+   A flag-bound launch carries two identities when its transcript stamps name
+   another team. Transcript lines use the stamped team. Idle notifications,
    outbound SendMessage resolution, and addressability use the launch team.
    Inbox polling covers both teams. Spawn-registration identity remains a
    separate verification target because the measurement covers the other four
@@ -126,10 +126,10 @@ observed live and confirmed against the Claude Code bundle.
    later resume. Bg workers need durable result files or transcript flushing.
 
 4. **Identity-bound leads retain team state at exit.** Exit cleanup registration
-   belongs to `initializeSessionTeam`, whose `!agentId` condition selects plain
-   leads. A lead launched with identity flags uses the reconnection path, so its
-   team directory and members remain. Upstream should apply one explicit cleanup
-   rule to both lead launch paths.
+   belongs to `initializeSessionTeam`, and its `!agentId` condition selects
+   plain leads. A lead launched with identity flags uses the reconnection path,
+   so its team directory and members remain. Upstream should apply one explicit
+   cleanup rule to both lead launch paths.
 
 5. **An unknown positional argument dispatches a bg prompt.** `claude <word>`
    treats an unrecognized verb as prompt text and starts a bg job. A mistyped

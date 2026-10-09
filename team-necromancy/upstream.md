@@ -19,8 +19,8 @@ Minified identifiers change between builds, so comparisons use stable content:
   minified function name produced 318 false additions because that identifier
   changed.
 - Prose comparisons accept literals made from letters, spaces, and punctuation.
-  This excludes strings containing minified identifiers, whose apparent changes
-  come from identifier renaming.
+  This excludes strings containing minified identifiers, since their apparent
+  changes come from identifier renaming.
 - Region comparisons start from a stable string, expand token by token, and
   require a one-to-one identifier mapping in both directions. Property names
   preceded by `.` and object keys followed by `:` match literally, preventing a
@@ -125,10 +125,10 @@ default such as `myapp-3f`. Peer SendMessage addresses those session names.
 Teammate SendMessage addresses roster member names.
 
 A flag-bound teammate launch binds its peer socket but skips the session registry
-because registration selects processes whose `agentId` is empty. It therefore
-participates in teammate naming and remains outside session-name discovery. This
-also prevents a collision between a resumed teammate name and a session name in
-the peer listing.
+because registration selects only processes with an empty `agentId`. It
+therefore participates in teammate naming and remains outside session-name
+discovery. This also prevents a collision between a resumed teammate name and a
+session name in the peer listing.
 
 ### Registry fields exceed current consumers
 
@@ -209,6 +209,6 @@ lock contention remains file-based even when the caller passes the v5 flag.
 
 Registry fields divide into externally checkable facts and process self-reports.
 `pid`, `procStart`, `cwd`, and `tmux` can be compared with `/proc` and pane state.
-`status`, `tempo`, `name`, `waitingFor`, and `state` are self-reports whose stale
-values can look valid on a wedged process. Any adoption should state which class
-the field belongs to and how Resolver ranks it.
+`status`, `tempo`, `name`, `waitingFor`, and `state` are self-reports, and their
+stale values can look valid on a wedged process. Any adoption should state which
+class the field belongs to and how Resolver ranks it.

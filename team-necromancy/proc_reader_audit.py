@@ -29,7 +29,7 @@ reach a reader, such as the reviewer's proc-readers.json.
 
 Each tier runs under script(1), so it has a terminal of its own on stdin and
 stdout, with its stderr kept apart, and with TMPDIR set to a fresh private
-directory whose path is 11 characters long, with XDG_CACHE_HOME inside it.
+directory at an 11-character path, with XDG_CACHE_HOME inside it.
 A split live run's socket roots sit two room levels below TMPDIR, and at this
 length the suite's longest socket name still fits in the 107 bytes a Unix
 socket path may have. Each tier's run record names the tool's SHA-256, the
@@ -114,7 +114,7 @@ LIVE_PROCS = "live-tier-reads-only-admitted-processes"
 
 
 def private_root():
-    """A fresh 0700 directory whose path is 11 characters long: /tmp/fq and four random ones.
+    """A fresh 0700 directory at an 11-character path: /tmp/fq and four random characters.
 
     Made by hand because mkdtemp always adds eight characters.
     """

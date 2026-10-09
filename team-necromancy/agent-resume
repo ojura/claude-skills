@@ -197,7 +197,7 @@ def poison_said(value, carrier):
 TITLE_TAIL_BYTES = 64 * 1024
 TITLE_HEAD_BYTES = 256 * 1024
 
-# A boot mints its implicit team a few hundred ms before the session file is
+# A boot creates its implicit team a few hundred ms before the session file is
 # written (measured 281ms and 252ms on two 2.1.220 boots); this is the slack.
 TEAM_MINT_WINDOW_MS = 5000
 
@@ -1134,8 +1134,9 @@ def read_one_key():
     saved = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
-        # os.read returns the requested byte directly. sys.stdin.read uses a
-        # buffered text wrapper whose fill behavior can block a one-key prompt.
+        # os.read returns the requested byte directly. sys.stdin.read goes
+        # through a buffered text wrapper, which can block a one-key prompt
+        # while it fills its buffer.
         data = os.read(fd, 1)
         return data.decode("utf-8", "replace") if data else None
     finally:
@@ -1325,7 +1326,7 @@ def render_labeled_row(label, value, trailer=None, width=None,
 
 
 def render_identity_labeled_row(label, agent_id, detail, colour="", width=None):
-    """One labeled identity row whose ANSI spelling does not affect wrapping."""
+    """One labeled identity row, wrapped the same whatever ANSI codes it carries."""
     value = f"{agent_id}  {detail}" if detail else agent_id
     rendered = render_labeled_row(label, value, width=width)
     return RenderedLine(str(rendered).replace(agent_id, paint(agent_id, colour), 1))
@@ -1599,7 +1600,7 @@ class Needs:
 
     @property
     def hard(self):
-        """The needs whose absence from a run is a fat declaration."""
+        """The needs that make a declaration fat when a run leaves them unused."""
         return self._hard
 
     @property
@@ -1871,7 +1872,7 @@ class Resolver:
         return argv + files
 
     def _stamped_candidates(self, name, team=None, verify=True):
-        """Return newest transcripts whose current lines carry these stamps.
+        """Return the newest transcripts with current lines that carry these stamps.
 
         The shared stamp index performs bounded end reads. Verification parses
         candidates because a rebound transcript can mention several teams.
@@ -1960,9 +1961,10 @@ class Resolver:
     def _session_names_team(self, session_id, team):
         """Does this session id name this team?
 
-        True when the team's name was minted and this id opens with the eight
-        hex it was minted from. A team named by a --team-name flag was minted
-        by nobody, so it answers False for every id.
+        True when the team is an implicit one, named session-<eight hex> after
+        a session, and this id opens with those eight hex. A team named by a
+        --team-name flag is named after no session, so it answers False for
+        every id.
 
         The one place a session is matched to a team name. A caller holding a
         registry entry, a transcript stem or a candidate path asks here instead
@@ -1974,7 +1976,7 @@ class Resolver:
         return bool(block and str(session_id or "").startswith(block))
 
     def _sessions_naming(self, team):
-        """Every transcript whose session id names this team, newest first.
+        """Every transcript with a session id that names this team, newest first.
 
         More than one is an ordinary answer, since eight hex is not a session
         id, and all of them come back: which of several conversations to
@@ -1992,12 +1994,13 @@ class Resolver:
                       key=lambda path: path.stat().st_mtime, reverse=True)
 
     def _registry_entries_naming(self, team, snapshot):
-        """Every session registry entry whose session id names this team.
+        """Every session registry entry with a session id that names this team.
 
-        The registry is read only for a name a session could have minted: a
-        flag-named team is nobody's session id, so there is nothing in there to
-        find and the whole of ~/.claude/sessions is left unparsed. The caller
-        supplies the runtime snapshot so one resolution cannot mix observations.
+        The registry is read only for an implicit team's name, which a session
+        id gives: a flag-named team is nobody's session id, so there is nothing
+        in there to find and the whole of ~/.claude/sessions is left unparsed.
+        The caller supplies the runtime snapshot so one resolution cannot mix
+        observations.
         """
         if not implicit_team_block(team):
             return []
@@ -2009,14 +2012,15 @@ class Resolver:
 
         `agent_runtime` exposes this private process read to public callers.
         The lead is first the process holding the lead's conversation: the
-        parent session, or the transcript whose fresh boot named an implicit
-        team. Then a process launched as the team's lead, then a plain process
-        that operates as the team (operating_team), and last the process holding
-        the conversation whose spawn payloads claim the team. That conversation
-        may have spawned into the team in an earlier life, so the last rung says
-        so and is exact only when the claim is corroborated. Which team the lead
-        process operates as now is a separate answer. Socket resolution and
-        credential inheritance both consume this answer.
+        parent session, or the transcript that named an implicit team at its
+        fresh boot. Then a process launched as the team's lead, then a plain
+        process that operates as the team (operating_team), and last the
+        process holding the conversation with spawn payloads that claim the
+        team. That conversation may have spawned into the team in an earlier
+        life, so the last rung says so and is exact only when the claim is
+        corroborated. Which team the lead process operates as now is a separate
+        answer. Socket resolution and credential inheritance both consume this
+        answer.
         """
         def process(pid=None, alive=False, how=None, detail=None, exact=False, kind=None):
             return {"pid": pid, "alive": alive, "how": how, "detail": detail,
@@ -2034,7 +2038,7 @@ class Resolver:
             # A fresh lead shares its internal and transcript IDs, giving its
             # implicit team an exact registry join. The measured corpus contains
             # this relation in 16 of 37 team directories. A later process on the
-            # same transcript keeps that registry session but mints a team of
+            # same transcript keeps that registry session but creates a team of
             # its own, so a process that operates as another team is skipped.
             for data in self._registry_entries_naming(team, snapshot):
                 if data["alive"]:
@@ -2043,8 +2047,8 @@ class Resolver:
                         continue
                     return process(
                         data["pid"], True,
-                        f"pid {data['pid']}, whose session id names team {team}",
-                        f"whose session id names team {team}", True, "session-team",
+                        f"pid {data['pid']} runs the session team {team} is named after",
+                        f"runs the session team {team} is named after", True, "session-team",
                     )
             # A flag-bound lead advertises exact identity in argv. The session
             # registry contains plain launches, so argv supplies this process row.
@@ -2053,14 +2057,15 @@ class Resolver:
             if masquerade:
                 return process(
                     masquerade["pid"], True,
-                    f"pid {masquerade['pid']}, running as {masquerade['agent_id']}",
-                    f"running as {masquerade['agent_id']}", True, "argv",
+                    f"pid {masquerade['pid']} was launched as {masquerade['agent_id']}",
+                    f"was launched as {masquerade['agent_id']}", True, "argv",
                 )
             # A plain process leads a team it operates as. The ones asked are
-            # those that spawned into it since they started or whose boot pairs
-            # with its creation, and the answer itself decides; a plain process
-            # its window-start stamps restore onto the team without either is
-            # not looked for here.
+            # those that spawned into it since they started, and those that
+            # started within TEAM_MINT_WINDOW_MS after it was created, and the
+            # answer itself decides; a plain process that only the stamps on the
+            # first record of its restored window put on the team is not looked
+            # for here.
             paired = {owner for named, owner, _ in self._boot_join(snapshot, census)
                       if named == team}
             operating = []
@@ -2079,18 +2084,22 @@ class Resolver:
                 exact, _updated, pid, answer = max(operating, key=lambda row: row[:3])
                 # Why this pid was picked, in words that name no team: what it
                 # runs as is the separate runs_as answer, and a report prints both.
-                why = {"written": "whose own lines since it started name this team",
-                       "paired": "whose boot pairs with this team's creation",
-                       }.get(answer["rule"], "whose window start names this team")
-                return process(pid, True, f"pid {pid}, {why}", why, exact, "operates")
+                why = {"written": "has written transcript records stamped with this team, "
+                                  "or spawned a teammate into it, since it started",
+                       "paired": f"is the only process that started within "
+                                 f"{TEAM_MINT_WINDOW_MS // 1000} s after this team was created",
+                       }.get(answer["rule"], "resumed a conversation, and the teamName in the "
+                                             "first record of its restored window is this team")
+                return process(pid, True, f"pid {pid} {why}", why, exact, "operates")
             path, claim = self._lead_transcript_for(
                 team, table=snapshot["table"], census=census)
             holder = snapshot["best_by_session"].get(path.stem) if path else None
             if holder and holder["alive"]:
                 return process(
                     holder["pid"], True,
-                    f"pid {holder['pid']}, whose conversation spawned into team {team}",
-                    f"whose conversation spawned into team {team}",
+                    f"pid {holder['pid']} runs the conversation that spawned teammates "
+                    f"into team {team}",
+                    f"runs the conversation that spawned teammates into team {team}",
                     claim.get("basis") is not None, "conversation",
                 )
         return process()
@@ -2154,9 +2163,9 @@ class Resolver:
         # Live members spawned by this claimant provide current process
         # evidence. Fork siblings share child history, so this distinguishes
         # different payload sets while leaving copied histories tied. A member
-        # whose process is this command's own ancestor counts like any other;
-        # dropping it would leave a claimant uncorroborated exactly when the
-        # asker is its own child.
+        # running in a process that is this command's own ancestor counts like
+        # any other; dropping it would leave a claimant uncorroborated exactly
+        # when the asker is its own child.
         if any(self._agent_runtime(agent_id_of(name, team), table,
                                    census=census)["records"]
                for name in spawned):
@@ -2264,7 +2273,7 @@ class Resolver:
 
         argv_records = snapshot["by_agent"].get(agent_id, [])
         add([(row["pid"], row["session"]) for row in argv_records],
-            "argv", lambda pid: f"live pid {pid} running as {agent_id}")
+            "argv", lambda pid: f"live pid {pid} launched as {agent_id}")
 
         name, team = name_and_team(agent_id)
         lead_pid = None
@@ -2317,10 +2326,10 @@ class Resolver:
         pid = lead_pid if name == "team-lead" else (ordered[0][0] if len(ordered) == 1 else None)
         alive = lead_alive if name == "team-lead" else bool(ordered)
         how = lead_how if name == "team-lead" else (
-            f"pid {pid}, running as {agent_id}" if pid else None)
+            f"pid {pid} was launched as {agent_id}" if pid else None)
         exact = lead_exact if name == "team-lead" else bool(pid)
         detail = lead_detail if name == "team-lead" else (
-            f"running as {agent_id}" if pid else None)
+            f"was launched as {agent_id}" if pid else None)
         return immutable({
             "agent_id": agent_id,
             "pid": pid,
@@ -2390,7 +2399,7 @@ class Resolver:
         return list(latest.values())
 
     def _name_rosters(self, name, census=None):
-        """Teams in one census whose roster carries this agent name."""
+        """Teams in one census with a roster that carries this agent name."""
         return frozenset(e["team"] for e in self._scan_teams(census)
                          if e["member"].get("name") == name)
 
@@ -2628,7 +2637,7 @@ class Resolver:
         """Where the lock for this roster lives.
 
         By roster path rather than by team name: both callers already hold the
-        roster whose lock they are about to take or clear, and the layout is
+        roster with the lock they are about to take or clear, and the layout is
         answered here so neither has to spell the filename.
         """
         return cfg.with_name("config.json.lock")
@@ -2670,7 +2679,7 @@ class Resolver:
         empty regular file may belong to a writer between exclusive creation and
         ownership-record publication. Each case preserves the directory.
 
-        A recognized record whose owner has exited permits cleanup because
+        A recognized record permits cleanup once its owner has exited, because
         `sweep_dead_lock` can remove that exact regular file. `lock_holder` supplies
         the shared ownership decision used by roster writes and cleanup.
         """
@@ -2894,8 +2903,9 @@ class Resolver:
                       key=lambda path: path.stat().st_mtime, reverse=True)
 
     def _transcripts_starting(self, block):
-        """Transcripts whose uuid opens with this block. A path question, so it
-        belongs to whoever owns the tree rather than to a caller globbing it."""
+        """Transcripts with a uuid that opens with this block. A path question,
+        so it belongs to whoever owns the tree rather than to a caller globbing
+        it."""
         return list(self._projects_dir.glob(f"*/{block}-*.jsonl"))
 
     def _resolution(self, path=None, fields=None, last_ts=0, via="", strength=0,
@@ -3086,17 +3096,18 @@ class Resolver:
 
     def _boot_join(self, snapshot, census=None):
         """[(team, pid, createdAt)] pairing each implicit team with the live process
-        that minted it, newest first.
+        that created it, newest first.
 
-        A boot mints its implicit team named after its internal session id, while
-        sessions/<pid>.json keeps the *resumed transcript* id. The two diverge after
-        a resume (before one they are the same id, which _lead_process exploits as an
-        exact join), and nothing else records the post-resume internal id, so for
-        those teams time is a join of last resort: a
-        team dir is created a few hundred ms before the session file when a boot
-        mints it eagerly (measured 281, 252 and 402ms), but it can instead be
-        minted at the first spawn, minutes later, which this window does not cover.
-        That is why the exact rungs above it are tried first.
+        A boot creates its implicit team, named after its internal session id,
+        while sessions/<pid>.json keeps the *resumed transcript* id. The two
+        diverge after a resume (before one they are the same id, which
+        _lead_process exploits as an exact join), and nothing else records the
+        post-resume internal id, so for those teams time is a join of last
+        resort: a team dir is created a few hundred ms before the session file
+        when a boot creates it eagerly (measured 281, 252 and 402ms), but it
+        can instead be created at the first spawn, minutes later, which this
+        window does not cover. That is why the exact rungs above it are tried
+        first.
         """
         live = [(row["pid"], row["started"])
                 for row in snapshot["registry"] if row["alive"]]
@@ -3110,9 +3121,9 @@ class Resolver:
         for team in {name for name, _, _ in pairs}:
             owners = {pid for name, pid, _ in pairs if name == team}
             if len(owners) > 1:
-                warn(f"{team} pairs with {len(owners)} processes started within "
-                     f"{TEAM_MINT_WINDOW_MS}ms ({', '.join(map(str, sorted(owners)))}); "
-                     "the pick between them is arbitrary")
+                warn(f"{len(owners)} processes started within {TEAM_MINT_WINDOW_MS}ms "
+                     f"after {team} was created ({', '.join(map(str, sorted(owners)))}), "
+                     "so their start times do not say which one created it")
         return pairs
 
     def _durable_assignment_index(self):
@@ -3617,7 +3628,7 @@ class Resolver:
         })
 
     def _converted_members(self, team):
-        """{name: receipt} for promoted members whose membership is a receipt.
+        """{name: receipt} for promoted members with a membership that is a receipt.
 
         A promote records the spoken identity in the line the transcript
         carries, so the transcript's own existence is the evidence: a demote
@@ -3812,7 +3823,7 @@ class Resolver:
         return tuple(immutable(row) for row in out)
 
     def _nameless_receipts(self):
-        """Promoted transcript roots whose last in-file receipt has no identity."""
+        """Promoted transcript roots with a last in-file receipt that has no identity."""
         return [path.stem for path, receipt in self._carried_receipts().items()
                 if not (receipt.get("name") and receipt.get("team"))]
 
@@ -4091,8 +4102,8 @@ class Resolver:
 
         At mount a process takes its argv team when that config loads, then
         adopts its window root's team when that config loads, so a stamped team
-        that loads wins over argv. A process whose argv team does not load and
-        whose stamps do not load has no team context. `judge(team)` answers
+        that loads wins over argv. A process has no team context when neither
+        its argv team nor its stamped team loads. `judge(team)` answers
         ("yes" | "no" | "unknown", why) for one team. Returns (team, rule,
         possible, why): `rule` is stamped, argv, none, unknown or plain (no
         candidate at all), and `possible` lists the teams an unknown leaves open.
@@ -4100,7 +4111,8 @@ class Resolver:
         said = []
         if stamped:
             verdict, why = judge(stamped)
-            said.append(f"its window start names {stamped}, and {why}")
+            said.append(f"the teamName in the first record of its restored window is "
+                        f"{stamped}, and {why}")
             if verdict == "yes":
                 return stamped, "stamped", (stamped,), said[0]
             if verdict == "unknown":
@@ -4221,7 +4233,8 @@ class Resolver:
 
         The kernel's start time counts clock ticks from boot and exists for every
         live process; a session registry record's startedAt, written once the
-        process is up, is the fallback for a record whose kernel start was not read.
+        process is up, is the fallback for a record when its kernel start was
+        not read.
         """
         ticks = (record or {}).get("proc_start")
         boot = self._boot_ms()
@@ -4238,10 +4251,13 @@ class Resolver:
         name it too. Lines and spawns the process wrote after it started decide,
         and only they are exact. Otherwise the mount rule is applied to whether
         each candidate config could have loaded when the process started, and a
-        process with no argv or stamped team takes the implicit team whose
-        creation pairs with its boot. Spawns written by earlier processes on the
-        same transcript say nothing about this one. When the evidence does not
-        decide, `team` is None and `possible` names the teams left open.
+        process with no argv or stamped team takes the implicit team created
+        within TEAM_MINT_WINDOW_MS before it started, when no other process
+        started that soon after that team and no other team it could have
+        created was created that soon before it. Spawns written by earlier
+        processes on the same transcript say nothing about this one. When the
+        evidence does not decide, `team` is None and `possible` names the teams
+        left open.
         """
         # Kept per retained snapshot and census, which the answer read; with no
         # census the rosters are read now, so nothing is kept.
@@ -4283,8 +4299,9 @@ class Resolver:
                 _at, team, basis = max(written, key=lambda item: item[0])
                 found = answer(team, True, "written", basis)
         if found is None:
-            # The window root is read only now, when the process's own lines
-            # have not decided: finding it walks the whole transcript.
+            # The window root is read only now, when the transcript records the
+            # process wrote since it started have not decided: finding it walks
+            # the whole transcript.
             window = self._window_start(path) if path else None
             team, rule, possible, why = self._mount_rule(
                 window[1] if window else None, argv_team,
@@ -4294,15 +4311,23 @@ class Resolver:
             else:
                 paired = self._sole_mint_pairing(pid, snapshot, census)
                 if paired:
+                    window_s = TEAM_MINT_WINDOW_MS // 1000
                     found = answer(paired, False, "paired",
-                                   f"its boot pairs with {paired}'s creation")
+                                   f"it is the only process that started within {window_s} s "
+                                   f"after {paired} was created, and {paired} is the only team "
+                                   f"it could have created that was created within {window_s} s "
+                                   "before it started")
                 else:
                     candidates = self._mint_candidates(pid, snapshot, census)["teams"]
                     open_teams = tuple(sorted({
                         team for team, owner, _ in self._boot_join(snapshot, census)
                         if owner == pid and team in candidates}))
                     found = answer(None, False, "unknown", "; ".join(filter(None, (
-                        why, "no team's creation pairs with its boot alone"))),
+                        why, "its start time singles out no team it could have created: "
+                        f"that needs exactly one such team created within "
+                        f"{TEAM_MINT_WINDOW_MS // 1000} s before it started, and no other "
+                        f"process started within {TEAM_MINT_WINDOW_MS // 1000} s after that "
+                        "team was created"))),
                         open_teams)
         if census is not None:
             self._operating_answers[key] = (snapshot, census, found)
@@ -4591,8 +4616,8 @@ class Resolver:
         each the decision team_run_plan makes for that command now
         (move_offer), so the doctor offers a move only as the planner would
         make it. --all, because a run without it starts only the members that
-        are running while any are, and the members left behind are the ones
-        whose mail nobody reads. `runtime` is the team's, from a member answer
+        are running while any are, and nobody reads the mail of the members it
+        leaves behind. `runtime` is the team's, from a member answer
         with its transcripts resolved, as team_run_plan reads it.
         """
         if runtime is None:
@@ -4649,9 +4674,9 @@ class Resolver:
         no member's step decides the team's fate again. `movers` are the members
         the run would launch (launch_mover rows). An automatic move leaves a
         running member where it is; an explicit or live one restarts it. A
-        running member whose live processes all operate as the destination has
-        already moved, whatever roster still lists it: it is `arrived`, and the
-        run neither starts, stops nor counts it as staying. `ended` are
+        running member has already moved when all its live processes operate as
+        the destination, whatever roster still lists it: it is `arrived`, and
+        the run neither starts, stops nor counts it as staying. `ended` are
         processes an earlier step ends before this decision is carried out, as
         a lead move does before its crew moves.
         """
@@ -5515,9 +5540,10 @@ class Resolver:
         A fresh boot names its implicit team after its session id and records
         that id as leadSessionId; a resumed life uses a new internal id, which
         names no transcript. A process holding a transcript may be either, so
-        both kinds are candidates and boot timing decides between them: a team
-        the transcript's fresh boot made long before this process started does
-        not pair with it.
+        both kinds are candidates, and creation and start times decide between
+        them: _sole_mint_pairing takes only a team created within
+        TEAM_MINT_WINDOW_MS before this process started, so a team the
+        transcript's fresh boot created long before is not taken.
         """
         entry = next((e for e in snapshot["live_sessions"] if e["pid"] == pid), None)
         session = (entry or {}).get("session")
@@ -5531,10 +5557,10 @@ class Resolver:
                 if self._minted_by_a_resumed_life(t, census)]
         return {"teams": fresh + [t for t in pool if t not in fresh],
                 "own_session": tuple(fresh),
-                "why": "the teams this process's boot could have minted"}
+                "why": "the teams this process could have created when it started"}
 
     def _sole_mint_pairing(self, pid, snapshot, census=None):
-        """The team only this process could have minted, or None if ambiguous.
+        """The team only this process could have created, or None if ambiguous.
 
         Unique in both directions. _boot_join warns when several processes fall
         in one team's window but returns them anyway, and it never asks whether
@@ -6098,11 +6124,11 @@ class Resolver:
     def _resolved_agent_cwd(self, team_entry, receipt, path, fields, fallback=None):
         """Resolve cwd and any launch-only warning for the selected transcript.
 
-        `/cd` can add several cwd values. Prefer the newest recorded cwd whose
-        flattened path matches the transcript's project directory. Promotion keeps
-        the main transcript beside its parent session, so the promotion receipt can
-        supply a matching cwd from that parent transcript. A remaining candidate is
-        used with a warning.
+        `/cd` can add several cwd values. Prefer the newest recorded cwd with a
+        flattened path that matches the transcript's project directory.
+        Promotion keeps the main transcript beside its parent session, so the
+        promotion receipt can supply a matching cwd from that parent
+        transcript. A remaining candidate is used with a warning.
 
         Flattening maps all non-alphanumeric characters to `-`, making the project
         directory name non-invertible. In the measured corpus, 767 of 771
@@ -7576,8 +7602,8 @@ class Resolver:
         The single lookup for both the merge and the completion display, so an
         agent cannot be offered in one colour and launched in another. Cheap path
         first, the lead transcript the roster names; then the cross-file index,
-        which is the only route once a team is named after a boot uuid whose
-        transcript does not exist.
+        which is the only route once a team is named after a boot uuid that
+        names no existing transcript.
         """
         if not agent_id:
             return {}
@@ -7732,7 +7758,7 @@ class Resolver:
 
     @staticmethod
     def _move_remedies(team, lead_team, moves):
-        """The moves a report offers a team whose lead runs as `lead_team`.
+        """The moves a report offers a team with a lead that runs as `lead_team`.
 
         Only those team_moves found the planner would make, each with the flags
         the planner needs. When the live move is not made because live
@@ -7890,7 +7916,7 @@ class Resolver:
                          "restarts it with team flags; it reads this roster on "
                          "the way up and loses its current turn"))
         else:
-            reachable, why = True, f"listed in {lead_team}, whose live lead polls it"
+            reachable, why = True, f"listed in {lead_team}, and {lead_team}'s live lead polls it"
             remedies = ()
         return types.MappingProxyType({
             "lead": delivery["lead"],
@@ -8321,10 +8347,10 @@ class Resolver:
         })
 
     def _spawn_parent_of(self, agent_id):
-        """(stem, evidence) of the transcript whose spawn payload names this
-        agent. The agent dossier's parentage line asks this separately; the
-        answer walks the spawn corpus, so the doctor declares that work when
-        it is pointed at an agent."""
+        """(stem, evidence) of the transcript with a spawn payload that names
+        this agent. The agent dossier's parentage line asks this separately;
+        the answer walks the spawn corpus, so the doctor declares that work
+        when it is pointed at an agent."""
         parent = next((stem for stem, entries in self._every_log().items()
                        for _stamp, payload in entries
                        if payload.get("agent_id") == agent_id), None)
@@ -8334,9 +8360,9 @@ class Resolver:
     def _teams_led_by(self, session_stem):
         """Teams this transcript led, newest first.
 
-        A lead resumed several times mints a fresh implicit team each life and keeps
-        appending to one transcript, so several teams can be named by one file. The
-        newest is the one it was running as when it stopped.
+        A lead resumed several times creates a fresh implicit team each life
+        and keeps appending to one transcript, so several teams can be named by
+        one file. The newest is the one it was running as when it stopped.
         """
         led = self._led_teams()
         mine = [(stamp, team) for team, hits in led.items()
@@ -8379,7 +8405,7 @@ class Resolver:
         A side transcript lives at <project>/<parent-session>/subagents/
         agent-<taskId>.jsonl, with an optional .meta.json beside it. The meta
         contributes a display name and an agent type and classifies nothing:
-        this corpus holds a meta that says fork beside a file whose bytes are
+        this corpus holds a meta that says fork beside a file with the bytes of
         a regular chain, and the file wins.
 
         Grammars, decided by the first record alone:
@@ -10195,7 +10221,7 @@ class TranscriptRewriter:
         Progress records are aliases for their nearest non-progress parent. A
         missing parent gets the same five-second, same-sidechain timestamp
         fallback as 2.1.220. Parallel assistant fragments and their tool results
-        are inserted after the chain assistant whose message id they share.
+        are inserted after the chain assistant with the message id they share.
         """
         messages, progress = {}, {}
         try:
@@ -10329,8 +10355,8 @@ class TranscriptRewriter:
         conversion may touch are closed (sessionId, isSidechain, the fork-reference
         root's parentUuid, known human wrappers' isMeta and optional message content,
         the ref line, its materialized prefix, and last-prompt trailers, in that
-        vocabulary and no other); a line whose transform would need any other field
-        is an objection, not an edit.
+        vocabulary and no other); a line is an objection, not an edit, when its
+        transform would need any other field.
         """
         objections, parsed = [], []
         for n, raw in enumerate(raws, 1):
@@ -10970,8 +10996,8 @@ def _harness_wrote(text):
     Asked in one place because both paths to a title need the same answer and
     only one of them had it: the title records the harness writes, and the
     first user message read when there are none. The filtered path was the
-    rarely taken one, so a conversation whose opening prompt was a slash
-    command was titled with the caveat wrapped around it, which describes the
+    rarely taken one, so a conversation that opened with a slash command as
+    its prompt was titled with the caveat wrapped around it, which describes the
     tool the person was running rather than the work they were doing.
     """
     text = text.lstrip()
@@ -12186,13 +12212,13 @@ def decline_unreachable(plan, args, prefix=""):
     if getattr(args, "keep_team", False):
         return
     if not sys.stdin.isatty():
-        die(f"so {who} can only start on {source}, whose mail its lead "
-            f"(running as {dest}) does not read, and nothing here can ask. "
+        die(f"so {who} can only start on {source}, and its lead (running as {dest}) "
+            f"does not read {source}'s mail, and nothing here can ask. "
             "Clear the blockers above, or pass --keep-team")
     try:
-        whose = "their" if "moving" in plan else "its"
+        possessive = "their" if "moving" in plan else "its"
         answer = input(f"start {who} on {source} anyway, where its lead "
-                       f"will not read {whose} mail? [y/N] ").strip().lower()
+                       f"will not read {possessive} mail? [y/N] ").strip().lower()
     except EOFError:
         answer = ""
     if not answer.startswith("y"):
@@ -12237,7 +12263,7 @@ def end_holder(process, said, args, indent="  "):
     step(args.dry_run, f"would kill {said}", f"killing {said}", indent=indent)
     if args.dry_run:
         # Every answer below this point comes from a table this run did not
-        # change, so the preview says whose liveness it is still counting.
+        # change, so the preview names the process it still counts as alive.
         print(fill(f"{indent}a dry run ends nothing, so what follows is measured "
                    f"with pid {pid} still running"))
         return False
@@ -12433,9 +12459,9 @@ def report_launch(ctx, command, prefix="", extra=(), restore=None):
         print(fill(f"{prefix}{label:<8} {value}"))
     # Read off the command rather than a flag, so the row describes the launch
     # actually being reported. Passing no identity is not the same as having
-    # none: a conversation whose window start carries stamps is adopted by the
-    # harness on the way up, and a reader who typed --bare has every reason to
-    # expect otherwise.
+    # none: when the first record of a conversation's restored window carries
+    # stamps, the harness adopts them on the way up, and a reader who typed
+    # --bare has every reason to expect otherwise.
     if "--agent-id" not in command:
         said = "no team, name, model or effort is passed"
         if restore and restore["state"] == "restored":
@@ -12591,7 +12617,7 @@ def lead_rebind(migration, args, prefix=""):
         print(line)
     if durable_result == "reaped":
         print(fill(f"{prefix}note     their conversations still restore with stamps "
-                   f"naming {source}, whose roster is absent. Plain resume starts a "
+                   f"naming {source}, which has no roster. Plain resume starts a "
                    f"plain session; {TOOL} reapplies member identity flags"))
     elif durable_result == "restamped":
         print(fill(f"{prefix}note     {source} keeps its roster, its mail and its "
@@ -13315,9 +13341,9 @@ def render_doctor_identity(label, member, suffix=None, width=None):
 # What each verdict claims, in the order of how much is wrong.
 DOCTOR_LEGEND = (
     # Only what the verdict tests. Mail waiting in a mailbox does not demote a
-    # team whose lead is live and reading it, and an unrecorded member is a note
-    # rather than a fault, so claiming either here would describe a state this
-    # verdict never asked about.
+    # team when its lead is live and reading it, and an unrecorded member is a
+    # note rather than a fault, so claiming either here would describe a state
+    # this verdict never asked about.
     ("CONNECTED", "a live lead runs this team and reads its mail, and nothing here needs a person"),
     ("DEGRADED", "nothing is lost yet, but a person must act: the team is dormant, "
                  "one agent is worn by two processes, or the crew sits on two servers"),
@@ -13952,7 +13978,7 @@ def promotion_identity(plan, args):
                    f"{undo['identity']['agentId']} exactly"))
         entry = plan["entry"]
         print(fill(f"current  this side transcript now belongs to parent "
-                   f"{entry['parent']}, whose deduced team is "
+                   f"{entry['parent']}, with the deduced team "
                    f"{plan['identity']['team']} ({plan['identity_source']})"))
         if ask_default_no("cleanly undo that demote instead", args.dry_run):
             selected = types.MappingProxyType({
@@ -14190,20 +14216,20 @@ def run_census():
     print(f"census of {CLAUDE_DIR}\n")
     identity = answer["identity"]
     print("identity")
-    print("  roster members whose id is name@team   "
+    print("  roster members with id name@team       "
           + conformance(identity["member_agrees"], identity["member_total"]))
-    print("  rosters whose lead is team-lead@team   "
+    print("  rosters with lead team-lead@team       "
           + conformance(identity["lead_agrees"], identity["roster_total"]))
-    print("  spawn payloads whose id is name@team   "
+    print("  spawn payloads with id name@team       "
           + conformance(identity["payload_agrees"], identity["payload_total"]))
 
     leads = answer["leads"]
     print("\nleads")
     print("  rosters naming a lead session          "
           + conformance(leads["named"], leads["roster_total"]))
-    print("  ...whose session is a real transcript  "
+    print("  ...that is a real transcript           "
           + conformance(leads["resolved"], leads["named"]))
-    print("  ...which is the shape resolved from the roster alone; the rest are")
+    print("  ...which are the leads resolved from the roster alone; the rest are")
     print("     found through the records of who spawned whom")
 
     teams = answer["teams"]
@@ -14237,10 +14263,10 @@ def run_cleanup(dry=False):
     """Everything the SessionStart hook does: reap what nothing can use.
 
     No record is kept of the id a boot is handed: it names the transcript,
-    not the team the boot mints.
+    not the team the boot creates.
 
     The outcome is said first and the per-team reasons after it, because a
-    preview whose first line is its twenty-ninth "keeping" makes the reader
+    preview that opens with its twenty-ninth "keeping" makes the reader
     scroll to learn that nothing happened. In the hook the whole sweep is
     still silent unless something was actually removed.
     """
@@ -14518,7 +14544,7 @@ class Outcome(collections.namedtuple(
 
     `started_in` is the pane this run created for the agent's new process. It
     is None when the run started no process there: a noop, a refusal, a dry
-    run, or a lead whose command was handed to the terminal."""
+    run, or a lead with its command handed to the terminal."""
 
 
 def report_transcript_writes(pending, args, grace=LAUNCH_WRITE_S):
@@ -14623,8 +14649,8 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix="", terminal=
     # at, so the swarm is the only thing left to offer.
     handover = any(o.is_lead and o.status == "manual" for o in outcomes)
     # Offered only where a server exists to attach to: after a launch one
-    # does, and a noop on a dead socket must not promise a keypress whose
-    # only outcome is "nothing to attach to".
+    # does, and a noop on a dead socket must not promise a keypress that can
+    # only end in "nothing to attach to".
     if (not handover and not args.dry_run and socket
             and any(s in ("launched", "noop") for _, s in results)):
         decision = RESOLVER.attach_decision(
@@ -14745,7 +14771,7 @@ def run_team(args, passthrough):
     # team is retired, and the run's one question about it.
     answer, ended = apply_team_redirect(plan, args)
     following = answer == "follow" and selection["action"] == "redirect"
-    # A team whose members follow their lead elsewhere is not rebuilt: its
+    # A team is not rebuilt when its members follow their lead elsewhere: its
     # roster would only make their stamps restore them onto it again.
     if not following and plan["roster_snapshot"].state != "valid":
         config = rebuild_roster(
@@ -14997,7 +15023,7 @@ SOCKET_NAME_ROOM = 58
 WORKER_SOCKET_ROOT = "s" + "x" * 8
 
 # The prctl options that make a process, and ask whether it is, the parent of
-# last resort for every process under it whose own parent ends first, from
+# last resort for every process under it that outlives its own parent, from
 # linux/prctl.h. A run that is one keeps what its fixtures orphan under it.
 PR_SET_CHILD_SUBREAPER = 36
 PR_GET_CHILD_SUBREAPER = 37
@@ -15013,7 +15039,7 @@ def owner_record(directory):
     The run's socket root and its shares' room are named by one letter and
     mkdtemp's eight characters, with no pid, because a socket path has no
     bytes to spare at the depth a split inside a share reaches. A directory a
-    killed run left behind says whose it was through this file instead: the
+    killed run left behind names that run through this file instead: the
     pid, its start time and the command. Returns what it wrote.
     """
     said = {"pid": os.getpid(),
@@ -15201,8 +15227,8 @@ def end_processes(chosen, grace=3.0, rounds=20):
     rounds stop when one finds nothing left to end. A process still running
     after SIGKILL is not signalled again. ended and left are sorted pids. left
     is what chosen still picks after the last round, from a read of its own:
-    a refused process, one that outlived SIGKILL and one whose pidfd could not
-    be opened are all named there. refused holds one sentence per refusal.
+    a refused process, one that outlived SIGKILL and one for which no pidfd
+    could be opened are all named there. refused holds one sentence per refusal.
     """
     import signal
 
@@ -15252,8 +15278,8 @@ def end_process_tree(pid, started, grace=3.0):
     """End pid, while it is the process that started at started, with what it started; returns the pids still running.
 
     What it started is everything under it and every member of its process
-    group, read again each round, because a process whose parent ended first
-    stays in its group though it no longer descends from pid; this run adopts
+    group, read again each round, because a process stays in its group when its
+    parent ends first, though it no longer descends from pid; this run adopts
     such a process, so it is among the processes under the run. A process
     found once is followed into the next round by what it starts in turn.
     Everything here is read from the processes under this run, so pid has to
@@ -15333,15 +15359,15 @@ def orphan_adopted(bound=10):
     left as it is, so the sleeper's parent has exited before anyone asks about
     it and the kernel has given it to the nearest process that adopts orphans.
     The sleeper says its pid in a file, as start_stray's does, and waits for
-    end of file on a line whose write end only this process holds. Whether its
+    end of file on a pipe that only this process can write to. Whether its
     parent is this process is read off this process's own children files
-    (_ProcessFence.children), which reads nothing outside the run. Then that
-    line is closed and the sleeper ends by itself wherever it went, with no
-    signal sent, and its end is waited for, up to bound seconds, on a life line
-    whose write end only the sleeper holds. An adopted one stays a zombie under
-    this run, which nothing counts; one that was not adopted is outside the
-    run, where nothing of the run's would reach it. pid is 0 when it never said
-    it.
+    (_ProcessFence.children), which reads nothing outside the run. Then this
+    process closes its write end of that pipe, and the sleeper ends by itself
+    wherever it went, with no signal sent; its end is waited for, up to bound
+    seconds, on a second pipe that only the sleeper can write to. An adopted
+    one stays a zombie under this run, which nothing counts; one that was not
+    adopted is outside the run, where nothing of the run's would reach it. pid
+    is 0 when it never said it.
     """
     room = Path(tempfile.mkdtemp(prefix="o"))
     told = room / "pid"
@@ -15443,8 +15469,8 @@ def start_stray(told, *argv, wait=60, program=None):
     wait seconds. It holds none of this run's streams, so a reader of them
     never waits on it. Nothing under this run ends it, and _ProcessFence's
     readers do not read it, since it is not under this run: the caller ends
-    it with end_stray, by its pid and the life line, the read end of a pipe
-    whose write end only the sleeper holds. pid is 0 when it never said it.
+    it with end_stray, by its pid and the life line: the read end of a pipe
+    that only the sleeper can write to. pid is 0 when it never said it.
 
     program, when given, is the argv[0] the sleeper wears: the interpreter
     setsid starts executes itself again under that name before the sleeper
@@ -15742,8 +15768,8 @@ class _ProcessFence:
     in FENCE_UNIT_VAR (adopt_inherited_fence), so its root is the selftest
     process that runs the unit, not the tool run itself, and its unit,
     declaration and token are that unit's. It checks the root's start time
-    before it walks the root's children, so a root that has gone, whose pid
-    another process may hold by now, leaves it no process at all. Its
+    before it walks the root's children, so a root that has gone leaves it no
+    process at all, though another process may hold the root's pid by now. Its
     refusals go to the file FENCE_RECORD_VAR names, which the root's row
     reads once the tool run has exited.
 
@@ -15755,9 +15781,11 @@ class _ProcessFence:
     tool run of its units keep one record of known pids between them. The
     processes under the root are found by walking /proc/<pid>/task/*/children
     down from it, which reads only those processes. A pass reads those files
-    one after another, so a process whose parent exits meanwhile can move to a
-    subreaper inside the run between two of them and be in neither; the walk
-    passes again when a pass may have done that (_walk_down). The same walk and a
+    one after another, so when a process's parent exits meanwhile, the process
+    can move to a subreaper inside the run between two of them and be in
+    neither. So after each pass the walk (_walk_down) rereads every children
+    file the pass read, and passes again, up to four passes, while a reread
+    lists a pid the pass did not find. The same walk and a
     reader of one process's stat file are how the selftest ends what it
     started, in end_processes and the functions that use it.
     """
@@ -15985,7 +16013,7 @@ class _ProcessFence:
 
     @classmethod
     def children(cls, pid):
-        """The pids whose parent is pid now, by its threads' children files."""
+        """The pids with pid as their parent now, by its threads' children files."""
         return set().union(*cls._task_children(pid).values())
 
     @staticmethod
@@ -16008,7 +16036,7 @@ class _ProcessFence:
 
     @classmethod
     def _walk_once(cls, root):
-        """One pass down from root: (every pid it found, root left out; each task whose children file it read)."""
+        """One pass down from root: (every pid it found, root left out; the tasks with a children file it read)."""
         found, frontier, read = set(), [root], []
         while frontier:
             for task, listed in cls._task_children(frontier.pop()).items():
@@ -16035,15 +16063,16 @@ class _ProcessFence:
     def _walk_down(cls, root):
         """Every pid under root now, root left out, by its threads' children files.
 
-        A pass reads one children file after another, so a process whose
-        parent exits while the pass is between two of them is handed to a
-        subreaper inside the run and can be in neither file: the subreaper,
-        which is root or under it, had its file read before the process got
-        there. Once there, the process stays in that file, so after each pass
-        the walk reads every children file the pass read once more. One that
-        lists a pid the pass did not find means a process moved, or started,
-        while the pass ran, and the walk passes again, up to four passes.
-        run_processes, identity and admit, through _tree, all walk this way.
+        A pass reads one children file after another, so when a process's
+        parent exits while the pass is between two of them, the process is
+        handed to a subreaper inside the run and can be in neither file: the
+        subreaper, which is root or under it, had its file read before the
+        process got there. Once there, the process stays in that file, so after
+        each pass the walk reads every children file the pass read once more.
+        One that lists a pid the pass did not find means a process moved, or
+        started, while the pass ran, and the walk passes again, up to four
+        passes. run_processes, identity and admit, through _tree, all walk this
+        way.
         """
         for _pass in range(4):
             found, read = cls._walk_once(root)
@@ -16097,7 +16126,7 @@ class _ProcessFence:
 
     @staticmethod
     def subtree(root, processes):
-        """The pids in processes, a run_processes answer, whose parents lead up to root."""
+        """The pids in processes, a run_processes answer, with a chain of parents up to root."""
         children = {}
         for pid, identity in processes.items():
             children.setdefault(identity[0], []).append(pid)
@@ -16253,11 +16282,11 @@ def declared_unit_rows(unit_name, ids, produced):
 
     unit_name is the unit and ids its own (id, description) pairs from the registry.
     Returns (rows to keep, reasons for the rows rejected, registered ids it
-    never produced). A row whose id the unit registered is kept under the
+    never produced). A row with an id the unit registered is kept under the
     registry's description, which makes the registry the one owner of what a
     check is called: the wording a check passed for its own row is not
     consulted, so it cannot drift from the listing. A row that is not four
-    fields, or whose id is not one the unit registered, is rejected with the
+    fields, or that has an id the unit did not register, is rejected with the
     reason.
 
     A unit that gets one row wrong keeps every valid row it produced, passes
@@ -16324,7 +16353,7 @@ def tier_rows(units, s, register, live, diagnostics=None):
 def unit(*ids, live=False, machine=False, rooms=False):
     """Register one unit of the suite under the ids it produces.
 
-    machine=True declares a unit whose engines, or the tool runs it starts,
+    machine=True declares a unit with engines, or tool runs it starts, that
     must read on purpose, through the engine's process inputs
     (_FakeTmux.PROCESS_INPUTS), processes outside the tree of the selftest
     process that runs it, or the real session registry. The declaration
@@ -16587,13 +16616,13 @@ def check_rows():
     would end the tier inside the loop that builds rows, with no rows, no tally
     and no failure line, and nothing left to report the collision.
 
-    A verdict is True or False. check_line prints a row whose verdict is None as
+    A verdict is True or False. check_line prints a row with the verdict None as
     a listing line with no marker while the tally counts it as failed, so a
-    None, or any other object that is not a bool, would print a row whose marker
-    and count disagree. Such a row is not made: its check id and the verdict's
-    type go to register.rejected, and the tier's declaration row reports them
-    with the rest of the rows it rejected. A check with no subject to answer
-    about reports False and says so in its detail.
+    None, or any other object that is not a bool, would print a row with a
+    marker and a count that disagree. Such a row is not made: its check id and
+    the verdict's type go to register.rejected, and the tier's declaration row
+    reports them with the rest of the rows it rejected. A check with no subject
+    to answer about reports False and says so in its detail.
 
     Every producer of rows registers here: the read-only tier, a whole live
     tier, one share of one, and the merge of several shares. A merge folds the
@@ -16690,8 +16719,8 @@ def _live_context(child=None, diagnostics=None):
 
 
 @unit(('read-only-verdicts-survive-the-child',
-       'the read-only verdicts a live run reports come from a child report whose rows, tally and '
-       'exit status agree'), live=True)
+       'the read-only verdicts a live run reports come from a child report with rows, a tally '
+       'and an exit status that agree'), live=True)
 def _check_read_only_verdicts_survive_the_child(s):
     checked = []
 
@@ -16705,8 +16734,8 @@ def _check_read_only_verdicts_survive_the_child(s):
     # bound, reached verdicts this run cannot vouch for.
     report = s.child_report
     check("read-only-verdicts-survive-the-child",
-          "the read-only verdicts a live run reports come from a child report whose rows, tally and "
-          "exit status agree",
+          "the read-only verdicts a live run reports come from a child report with rows, a tally "
+          "and an exit status that agree",
           bool(report.rows) and not report.problems,
           "; ".join([f"{len(report.rows)} row(s) parsed, child said {report.summary!r}",
                      *report.problems]))
@@ -16797,7 +16826,7 @@ UNITS[:] = [
        "what a live tier printed between its verdicts reaches the operator whole, serial or split, "
        "and a raising unit's traceback is not counted with it"),
       ("raising-share-stops-alone",
-       "a share whose unit raised stops there while the other shares finish and report"),
+       "a share stops at a unit that raised, while the other shares finish and report"),
       live=True, rooms=True)
 def _check_runner_paths_on_a_fault_fixture(s):
     """The runner's own paths, end to end, on a copy of this tool with fixture units.
@@ -16805,7 +16834,7 @@ def _check_runner_paths_on_a_fault_fixture(s):
     The copy runs --selftest --live serially and split two ways, so every
     path a diagnostic travels is the real one: the read-only child that
     _live_context starts, the serial tier inside run_selftest's capture, and a
-    share whose stderr the merge reads. A traceback written into a row's
+    share, with its stderr read by the merge. A traceback written into a row's
     detail, or a parser fed text by hand, would prove none of them. What is
     asked is what an operator gets: the run's stderr and its report, with the
     cause and the error of each raise in them whole, and the files the units
@@ -16934,7 +16963,7 @@ def _check_runner_paths_on_a_fault_fixture(s):
     }
     wrong = sorted(claim for claim, ok in alone.items() if not ok)
     check("raising-share-stops-alone",
-          "a share whose unit raised stops there while the other shares finish and report",
+          "a share stops at a unit that raised, while the other shares finish and report",
           not wrong, ", ".join(wrong) + (f"; marked {serial.marked} and {split.marked}"
                                          if wrong else ""))
     return checked
@@ -17202,11 +17231,12 @@ def _check_team_rebuild_preview(s):
         "stopped": ((), "", f"sole payload claimant for {team}, uncorroborated"),
         "running plain": (
             ((lead_pid, 1, lead_argv),), "",
-            f"pid {lead_pid}, whose conversation spawned into team {team}, uncorroborated"),
+            f"pid {lead_pid} runs the conversation that spawned teammates into team {team}, "
+            "uncorroborated"),
         "running flag-bound": (
             ((lead_pid, 1, lead_argv + ("--agent-id", lead_id)),),
             sessions["team-lead"],
-            f"live pid {lead_pid} running as {lead_id}, corroborated by "
+            f"live pid {lead_pid} launched as {lead_id}, corroborated by "
             f"live process launched as {lead_id}"),
     }
     faults, claims = [], []
@@ -17364,11 +17394,11 @@ def _check_every_lead_rung_carries_a_claim(s):
              "live members it spawned", "live members it spawned")),
         "plain live lead": (
             plain, None, False, ((lead_pid, 1, resumed),),
-            ("live-runtime", f"pid {lead_pid}, whose conversation spawned into team "
-             f"{plain}, uncorroborated", None)),
+            ("live-runtime", f"pid {lead_pid} runs the conversation that spawned teammates "
+             f"into team {plain}, uncorroborated", None)),
         "flag-bound live lead": (
             plain, None, False, ((lead_pid, 1, flag_bound),),
-            ("live-runtime", f"live pid {lead_pid} running as "
+            ("live-runtime", f"live pid {lead_pid} launched as "
              f"{agent_id_of('team-lead', plain)}, corroborated by live process "
              f"launched as {agent_id_of('team-lead', plain)}",
              f"live process launched as {agent_id_of('team-lead', plain)}")),
@@ -17409,7 +17439,8 @@ def _check_single_agent_rebuild_follows_corroboration(s):
     members = {"alpha": "44444444-4444-4444-8444-444444444444"}
     faults = []
     # A team name that is not session-<eight hex> says nothing about its
-    # lead. A minted name carries the first eight hex of its lead's session.
+    # lead. An implicit team's name carries the first eight hex of its lead's
+    # session.
     for team, wanted in (("session-preview-rebuild", ""), ("session-33333333", lead)):
         for name in ("team-lead", "alpha"):
             with _roster_test_fixture() as f:
@@ -17850,7 +17881,7 @@ def _check_smoke_typed_commands(s):
     shutil.copytree(Path(__file__).resolve().parent / "test" / "corpus", smoke_cfg)
     smoke_env = dict(os.environ, CLAUDE_CONFIG_DIR=str(smoke_cfg), NO_COLOR="1")
     crashed, misbehaved, codes = [], [], set()
-    # A process of this run's own whose command name is not UTF-8, running
+    # A process of this run's own with a command name that is not UTF-8, running
     # while the commands run, so every typed command that reads the process
     # table meets it and reads its stat file through the branch that answers
     # for a name it cannot decode. A unit that sees only the processes under
@@ -17985,7 +18016,7 @@ def _check_stop_preview_ends_nothing(s):
     return checked
 
 
-@unit(('process-table-width-independent', 'the process table is the same at a narrow and a wide terminal for every process whose start time, parent and command line did not change between the two reads'), ('liveness-width-independent', 'an agent that is running is seen as running at either terminal width'), live=True)
+@unit(('process-table-width-independent', 'the process table is the same at a narrow and a wide terminal for every process with a start time, parent and command line that did not change between the two reads'), ('liveness-width-independent', 'an agent that is running is seen as running at either terminal width'), live=True)
 def _check_process_table_width_independent(s):
     checked = []
 
@@ -18008,7 +18039,7 @@ def _check_process_table_width_independent(s):
     tmuxless = _FakeTmux(sockets=[])
 
     def engine_at(columns):
-        """A fresh engine whose snapshot was taken at this terminal width.
+        """A fresh engine with its snapshot taken at this terminal width.
 
         The engine caches its table, so the width is restored before anything
         is asked of it: what is under test is the snapshot the width produced,
@@ -18065,8 +18096,8 @@ def _check_process_table_width_independent(s):
         churner.stdin.write(b"\n")
         churner.stdin.flush()
         # Until its exec, the churner's command line is the one it started
-        # with, whose code names "churned-by-exec" too; after it, that is its
-        # last argument.
+        # with, and the code in it also contains "churned-by-exec"; after the
+        # exec, "churned-by-exec" is its last argument.
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             with contextlib.suppress(OSError):
@@ -18079,11 +18110,11 @@ def _check_process_table_width_independent(s):
         narrow_rows = {pid: (ppid, args) for pid, ppid, args in narrow._process_table()}
         wide_rows = {pid: (ppid, args) for pid, ppid, args in wide._process_table()}
         # This machine starts, ends, execs and reparents processes while the
-        # suite runs. A pid whose start time, parent or command line changed
-        # between the read before the narrow snapshot and the read after the
-        # wide one changed for its own reasons, so it is left out and counted.
-        # A pid whose identity held and whose two rows still differ is the
-        # fault: the width changed what the table says about it.
+        # suite runs. A pid with a start time, parent or command line that
+        # changed between the read before the narrow snapshot and the read
+        # after the wide one changed for its own reasons, so it is left out and
+        # counted. A pid with an identity that held and two rows that still
+        # differ is the fault: the width changed what the table says about it.
         shared = set(narrow_rows) & set(wide_rows)
         churned = sorted(pid for pid in shared if before.get(pid) != after.get(pid))
         moved = sorted(str(pid) for pid in shared - set(churned)
@@ -18098,13 +18129,13 @@ def _check_process_table_width_independent(s):
             "the fixture that ran exec between them is left out as churn":
                 churner.pid in churned and str(churner.pid) not in moved
                 and wide_rows.get(churner.pid, (0, ()))[1][-1:] == ("churned-by-exec",),
-            "and no row whose identity held says two different things": not moved,
+            "and no row with an identity that held says two different things": not moved,
         }
         wrong = sorted(k for k, ok in widths.items() if not ok)
         check("process-table-width-independent",
               "the process table is the same at a narrow and a wide terminal for every "
-              "process whose start time, parent and command line did not change between the "
-              "two reads",
+              "process with a start time, parent and command line that did not change between "
+              "the two reads",
               not wrong, "; ".join(wrong + [f"{len(churned)} pid(s) changed identity between "
                                             "the snapshots and were left out"])
               + (f"; rows that moved: {', '.join(moved[:3])}" if moved else ""))
@@ -18359,8 +18390,8 @@ def _check_help_is_inert(s):
       ('completion-every-tab-reads-to-its-end',
        'each of the six TABs is read to an end marker unique to that TAB and that drive'),
       ('completion-unread-end-is-not-missing-rows',
-       'a TAB whose rows all arrived but whose end marker never came is reported as unverified, '
-       'not as rows missing'),
+       'a TAB is reported as unverified, not as rows missing, when all its rows arrived but its '
+       'end marker never came'),
       live=True)
 def _check_completion_reads_corpus_once(s):
     checked = []
@@ -18374,7 +18405,7 @@ def _check_completion_reads_corpus_once(s):
         return [(cid, said, False, "no zsh on this machine, and only zsh can answer this")
                 for name, ids, _run, _live in UNITS
                 if name == "_check_completion_reads_corpus_once" for cid, said in ids]
-    # First a drive whose widget leaves out the bare TAB's end marker, the
+    # First a drive with a widget that leaves out the bare TAB's end marker, the
     # second TAB's. Its rows all arrive, so the bare verdict has to say that
     # completeness is unverified rather than count rows as missing, while the
     # other five TABs still read to their ends.
@@ -18383,16 +18414,16 @@ def _check_completion_reads_corpus_once(s):
                  if cid == "completion-bare-tab-offers-whole-corpus"), (None, "no bare verdict"))
     others = sorted(state for site, (state, _why) in endings.items() if site != "bare")
     check("completion-unread-end-is-not-missing-rows",
-          "a TAB whose rows all arrived but whose end marker never came is reported as "
-          "unverified, not as rows missing",
+          "a TAB is reported as unverified, not as rows missing, when all its rows arrived but "
+          "its end marker never came",
           endings.get("bare", ("missing",))[0] == "absent" and bare[0] is False
           and "completeness is unverified" in bare[1] and "rows offered" not in bare[1]
           and others == ["complete"] * 5,
           f"bare TAB {endings.get('bare', ('missing',))[0]}, verdict {bare}, "
           f"other TABs {others}")
 
-    # Then the drive whose rows are reported, told the first drive's nonce so
-    # its markers can be checked to be its own.
+    # Then the drive with the rows that are reported, told the first drive's
+    # nonce so its markers can be checked to be its own.
     rows, _endings, _nonce = completion_tab_checks(earlier=(earlier,))
     for cid, name, ok, detail in rows:
         check(cid, name, ok, detail)
@@ -18734,7 +18765,7 @@ def restamp_receipts(path):
 
 
 @unit(('doctor-reports-a-connected-team',
-       'doctor reports a team whose lead and member are both running'))
+       'doctor reports a team with its lead and a member both running'))
 def _check_doctor_reports_a_connected_team(s):
     checked = []
 
@@ -18796,7 +18827,7 @@ def _check_doctor_reports_a_connected_team(s):
     }
     wrong = sorted(name for name, ok in facts.items() if not ok)
     check("doctor-reports-a-connected-team",
-          "doctor reports a team whose lead and member are both running",
+          "doctor reports a team with its lead and a member both running",
           not wrong, "; ".join(wrong + [f"code {code!r}, said {said[:250]}"]) if wrong else "")
     return checked
 
@@ -18881,8 +18912,8 @@ def collected(proc, bound, stop=None):
     reached, so the caller reads a stopped run's partial output and reports
     the stop instead of losing both to an exception. Anything else that ends
     the wait, a Ctrl-C among them, takes the process down with it. stop, when
-    given, is how the process is stopped, for one whose own children have to
-    be ended with it; otherwise the process alone is killed.
+    given, is how the process is stopped, for one with children of its own
+    that have to be ended with it; otherwise the process alone is killed.
     """
     stop = stop or proc.kill
     try:
@@ -19300,8 +19331,8 @@ def _check_live_workers_share_one_removable_tempdir(s):
 
 
 @unit(("run-refuses-a-tmpdir-too-long-for-its-sockets",
-       "a run whose TMPDIR leaves too little room for a socket name at the deepest socket "
-       "root it makes refuses before it makes anything"))
+       "a run refuses before it makes anything when its TMPDIR leaves too little room for a "
+       "socket name at the deepest socket root it makes"))
 def _check_run_refuses_a_tmpdir_too_long_for_its_sockets(s):
     """deepest_socket_root's levels, where run_selftest asks it, and one real refusal.
 
@@ -19318,7 +19349,7 @@ def _check_run_refuses_a_tmpdir_too_long_for_its_sockets(s):
     ast = s.ast
 
     def makers(tree):
-        """The registered units whose code, read as a syntax tree, calls run_shares or builds an argv list holding --jobs."""
+        """The registered units that call run_shares or build an argv list holding --jobs, found by reading their code as a syntax tree."""
         registered = {name for name, _ids, _run, _live in UNITS}
         return {node.name for node in tree.body
                 if isinstance(node, ast.FunctionDef) and node.name in registered
@@ -19336,9 +19367,9 @@ def _check_run_refuses_a_tmpdir_too_long_for_its_sockets(s):
         "a read-only run nests one level": deepest_socket_root("/r", False, 1) == one,
         "a live run that does not split nests one level": deepest_socket_root("/r", True, 1) == one,
         "a split live run nests two levels": deepest_socket_root("/r", True, 2) == two,
-        "a split live run whose units make no rooms nests one level":
+        "a split live run nests one level when its units make no rooms":
             deepest_socket_root("/r", True, 2, units=roomless) == one,
-        "a share whose units make no rooms nests none":
+        "a share nests none when its units make no rooms":
             deepest_socket_root("/r", True, 2, share="0/2", units=roomless)
             == Path("/r") / WORKER_SOCKET_ROOT,
         "the units that run run_shares or split a copy with --jobs are the ones declared "
@@ -19374,8 +19405,8 @@ def _check_run_refuses_a_tmpdir_too_long_for_its_sockets(s):
     }
     wrong = sorted(claim for claim, ok in {**levels, **refusal}.items() if not ok)
     check("run-refuses-a-tmpdir-too-long-for-its-sockets",
-          "a run whose TMPDIR leaves too little room for a socket name at the deepest socket "
-          "root it makes refuses before it makes anything",
+          "a run refuses before it makes anything when its TMPDIR leaves too little room for "
+          "a socket name at the deepest socket root it makes",
           not wrong, ", ".join(wrong) + (f"; exit {finished.returncode}, said {said[-200:]!r}, "
                                          f"left {left}" if wrong else ""))
     return checked
@@ -19448,8 +19479,8 @@ def _check_run_directories_record_their_owner(s):
     return checked
 
 
-# A stand-in for the completion driver: a process in a session of its own whose
-# terminal child is in a session of its own, as zpty's shell is. The child
+# A stand-in for the completion driver: a process in a session of its own,
+# with a terminal child in a session of its own, as zpty's shell is. The child
 # ignores the hangup its terminal sends when the driver's end closes it, so
 # only an owner that ends it by its identity ends it. The child's pid goes to
 # the file named by its argument once the child runs.
@@ -19861,8 +19892,8 @@ finally:
 
 
 @unit(("worker-start-failure-is-cleaned-up",
-       "a split run whose second worker fails to start ends and reaps the first, removes both "
-       "directories and leaves what it does not own"),
+       "when the second worker of a split run fails to start, the run ends and reaps the "
+       "first, removes both directories and leaves what it does not own"),
       ("worker-killed-mid-run-is-cleaned-up",
        "a worker that exits without its own cleanup leaves its directory to the parent, which "
        "removes it while the other worker's own cleanup left it alone"),
@@ -19968,8 +19999,8 @@ def _check_shares_cleanup_owner(s):
         }
         wrong = sorted(claim for claim, ok in partial.items() if not ok)
         check("worker-start-failure-is-cleaned-up",
-              "a split run whose second worker fails to start ends and reaps the first, removes "
-              "both directories and leaves what it does not own",
+              "when the second worker of a split run fails to start, the run ends and reaps the "
+              "first, removes both directories and leaves what it does not own",
               not wrong, ", ".join(wrong))
 
         # Two workers, split by a run of its own: one dies without its cleanup
@@ -20375,12 +20406,12 @@ def _check_shares_cleanup_owner(s):
 
 
 @unit(("cleanup-reads-only-its-run",
-       "the selftest's own process readers read the stat files only of the processes under "
-       "its run, and of its ancestors for the guard; any other pid reads as no running "
-       "process and its stat file is not read, one a process holds is written down as "
-       "refused, as is a value that is not a whole number, and one pidfd_open cannot judge is "
-       "written down with the error; and end_stray ends the stray it asked about and says "
-       "so"), live=True)
+       "the selftest's own process readers read stat files only for processes under its "
+       "run, and for its ancestors in the guard; for any other pid they read no stat file "
+       "and report no running process; they record as refused a pid that some process "
+       "holds and a value that is not a whole number, and record with its error a pid that "
+       "pidfd_open cannot judge; and end_stray ends the stray it asked about and says so"),
+      live=True)
 def _check_cleanup_reads_only_its_run(s):
     """_ProcessFence's own readers, asked about pids inside and outside this run.
 
@@ -20391,9 +20422,9 @@ def _check_cleanup_reads_only_its_run(s):
     written down, since nothing holds it. A pid pidfd_open cannot judge, as a
     stand-in for it makes one here, is written down with the error and read
     neither as held nor as gone. A value that is no pid, such as a path, True
-    or 3.7, reads as nothing and is written down as admit writes one. The
-    parent is still found by the guard's walk up from this run. Every pid
-    whose stat file is read while the questions are put is recorded, through
+    or 3.7, reads as nothing and is written down as a refusal, as admit writes
+    one. The parent is still found by the guard's walk up from this run. Every
+    pid with a stat file read while the questions are put is recorded, through
     a stand-in for _ProcessFence._stat put in its place as the lineage
     stand-in in _check_shares_cleanup_owner is, and each one must be this
     run, a process under it or an ancestor. The refusals go to a fence of
@@ -20481,12 +20512,11 @@ def _check_cleanup_reads_only_its_run(s):
     }
     wrong = sorted(claim for claim, ok in claims.items() if not ok)
     check("cleanup-reads-only-its-run",
-          "the selftest's own process readers read the stat files only of the processes under "
-          "its run, and of its ancestors for the guard; any other pid reads as no running "
-          "process and its stat file is not read, one a process holds is written down as "
-          "refused, as is a value that is not a whole number, and one pidfd_open cannot judge "
-          "is written down with the error; and end_stray ends the stray it asked about and "
-          "says so",
+          "the selftest's own process readers read stat files only for processes under its "
+          "run, and for its ancestors in the guard; for any other pid they read no stat file "
+          "and report no running process; they record as refused a pid that some process "
+          "holds and a value that is not a whole number, and record with its error a pid that "
+          "pidfd_open cannot judge; and end_stray ends the stray it asked about and says so",
           not wrong, ", ".join(wrong) + (f"; asked {held}, refused {refused}, named {named}, "
                                          f"read {sorted(set(stat_read) - readable)}"
                                          if wrong else ""))
@@ -20496,9 +20526,9 @@ def _check_cleanup_reads_only_its_run(s):
 def live_checks(share=None, child=None, diagnostics=None):
     """Run the live units, or one share of them, against the live context.
 
-    A share is (which, out_of): the units whose place in the registry falls in
-    it, and none of the read-only verdicts, which the run that asked for
-    shares inherits once for all of them.
+    A share is (which, out_of): the units with a place in the registry that
+    falls in it, and none of the read-only verdicts, which the run that asked
+    for shares inherits once for all of them.
 
     The read-only tier's verdicts come from the child the context ran, so a
     live invocation answers those questions once.
@@ -20660,7 +20690,7 @@ print DRIVE_OK
 """
 
 
-# The states tab_ending gives a TAB whose end marker was read, so everything
+# The states tab_ending gives a TAB when its end marker was read, so everything
 # before the marker was read with it.
 TAB_READ_TO_END = ("complete", "delayed")
 
@@ -20675,8 +20705,8 @@ def tab_ending(seq, ending, text, nonce):
     it. A missing end is truncated when the TAB's text stops partway through
     its marker and absent otherwise; either way the TAB may still have shown
     everything, and only the marker could have said so. The marker says the
-    TAB was read to its end and nothing more: a completion whose command
-    failed still ends, and whether its rows are all there is the question of
+    TAB was read to its end and nothing more: a completion still ends when its
+    command failed, and whether its rows are all there is the question of
     the verdict that reads it.
     """
     marker = f"TAB-END:{nonce}:{seq}"
@@ -20714,8 +20744,8 @@ def corpus_tab_verdict(state, why, offered, expected, asked):
 
 @unit(("completion-endings-told-apart",
        "a TAB's ending is told apart as complete, delayed, truncated or absent from its own "
-       "end marker, a failed command whose end came fails on its rows, and rows count as "
-       "missing only when its end was read"))
+       "end marker, a failed command that reached its end fails on its rows, and rows count "
+       "as missing only when its end was read"))
 def _check_completion_endings_told_apart(s):
     """tab_ending and corpus_tab_verdict on the text each kind of ending leaves.
 
@@ -20752,7 +20782,7 @@ def _check_completion_endings_told_apart(s):
         "a complete TAB short of rows names the rows missing":
             corpus_tab_verdict(*endings["complete"], 300, 320, False)
             == (False, "300 of 320 rows offered, zsh asked first: False"),
-        "a failed command whose end came fails on its rows, not its marker":
+        "a failed command that reached its end fails on its rows, not its marker":
             corpus_tab_verdict(*endings["complete"], 0, 320, False)
             == (False, "0 of 320 rows offered, zsh asked first: False"),
         "every row without an end is unverified, not missing":
@@ -20773,8 +20803,8 @@ def _check_completion_endings_told_apart(s):
     wrong = misread + sorted(claim for claim, ok in verdicts.items() if not ok)
     check("completion-endings-told-apart",
           "a TAB's ending is told apart as complete, delayed, truncated or absent from its own "
-          "end marker, a failed command whose end came fails on its rows, and rows count as "
-          "missing only when its end was read",
+          "end marker, a failed command that reached its end fails on its rows, and rows count "
+          "as missing only when its end was read",
           not wrong, "; ".join(wrong))
     return checked
 
@@ -20796,10 +20826,10 @@ def completion_tab_checks(withhold=0, earlier=()):
     stopped seeing the shell's setting would write its cache to the inherited
     one, and the snapshots of the private one would come up empty and say so.
 
-    withhold names a TAB, by its number, whose end marker the widget leaves
-    out, for the check that a TAB read whole but never seen to end is not
+    withhold names a TAB, by its number, for the widget to leave out its end
+    marker, for the check that a TAB read whole but never seen to end is not
     reported as rows missing. earlier holds the nonces of the drives the
-    caller made before this one: a drive whose markers were one of theirs
+    caller made before this one: a drive with the markers of one of theirs
     would not have markers of its own. The drive is a process group of its
     own with a pty under it, written down while it runs so a surviving parent
     can end it, and ended here however the wait ends.
@@ -20836,11 +20866,11 @@ def completion_tab_checks(withhold=0, earlier=()):
         calls = stage / "calls"
         calls.touch()
         stub = binned / TOOL
-        # One flag whose menu row carries every character that means something
-        # to _arguments or to the shell: a bracket pair, a colon, an apostrophe
-        # and a double quote. Proving the escaping against these is the point;
-        # proving it against the flags that happen to exist today would only
-        # say that today's prose is tame.
+        # One flag with a menu row that carries every character that means
+        # something to _arguments or to the shell: a bracket pair, a colon, an
+        # apostrophe and a double quote. Proving the escaping against these is
+        # the point; proving it against the flags that happen to exist today
+        # would only say that today's prose is tame.
         hostile = HOSTILE_ROW
         (stage / "flags").write_text(
             "--plain\ta plain row\t\t\n"
@@ -22538,12 +22568,12 @@ def _check_lead_migration_operation(s):
                         and getattr(node.func.value, "id", None) == "RESOLVER"
                         and node.func.attr == "complete_lead_migration") == 1)
             # A rewrite has to reproduce every other byte of the transcript, so
-            # one whose bytes are not UTF-8 cannot be restamped, though its
-            # window start still names its team. --force drops the live wearer
-            # as a blocker, so the rebind reaches the rewrite and the rewrite is
-            # what refuses. That refusal has to come before any holder is
-            # stopped, or a lead loses its session to a move that was never
-            # going to happen.
+            # one with bytes that are not UTF-8 cannot be restamped, though the
+            # first record of its restored window is still stamped with its
+            # team. --force drops the live wearer as a blocker, so the rebind
+            # reaches the rewrite and the rewrite is what refuses. That refusal
+            # has to come before any holder is stopped, or a lead loses its
+            # session to a move that was never going to happen.
             plain = "session-lead-fixture-plain"
             plain_session = "fixture-plain-lead"
             plain_id = agent_id_of("team-lead", plain)
@@ -22813,7 +22843,7 @@ def _check_process_reads_are_fenced(s):
         seen["and its start time reader reads no process at all"] = (
             type(start_ms) is int and len(refused) == 3)
 
-        # The narrowing on a tree whose processes are known: a fence rooted at a
+        # The narrowing on a tree with known processes: a fence rooted at a
         # wrapper this check started sees the wrapper and the process under it,
         # and neither this process, its parent nor the sibling sleeper.
         wrapper = start_wrapped([FAKE_AGENT_BIN, "-c", '__import__("time").sleep(30)'])
@@ -22836,7 +22866,7 @@ def _check_process_reads_are_fenced(s):
         seen["a table under a fence rooted at another process lists it and what runs under "
              "it, and nothing else"] = len(inside) == 2 and rooted == inside
         seen["and asks that fence about no other pid"] = not asked_outside
-        seen["a root whose start time is another leaves the table empty"] = stale == set()
+        seen["a root with another start time leaves the table empty"] = stale == set()
 
         # Each reader, under a fence of this check's own, in an undeclared unit,
         # in a declared one and outside any. A process started and reaped before
@@ -23083,9 +23113,9 @@ def _check_process_reads_are_fenced(s):
 
 
 @unit(('fence-faults-are-named',
-       "a tool run whose unit variable does not parse ends before anything else runs, naming "
-       "the variable on stderr; a refusal its record cannot take reaches the tier's row in "
-       "the selftest process, and in a tool run ends the run, named on stderr"))
+       "a tool run ends before anything else runs when its unit variable does not parse, "
+       "naming the variable on stderr; a refusal that its record cannot take reaches the "
+       "tier's row in the selftest process, and in a tool run ends the run, named on stderr"))
 def _check_fence_faults_are_named(s):
     """adopt_inherited_fence on a value that does not parse, and note on a record it cannot write.
 
@@ -23106,7 +23136,7 @@ def _check_fence_faults_are_named(s):
             [sys.executable, str(Path(__file__).resolve()), "--help"],
             capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
             env=dict(os.environ, **{FENCE_UNIT_VAR: "not a fence"}))
-        told["a tool run whose unit variable does not parse exits nonzero"] = (
+        told["a tool run exits nonzero when its unit variable does not parse"] = (
             malformed.returncode != 0)
         told["naming the variable on stderr"] = FENCE_UNIT_VAR in malformed.stderr
         told["and runs nothing after it"] = not malformed.stdout.strip()
@@ -23149,7 +23179,7 @@ def _check_fence_faults_are_named(s):
         # with WRAP_ARROW, and never splits a token, so it is read with the
         # markers and the line breaks taken out.
         said = " ".join(reading.stderr.replace(WRAP_ARROW, " ").split())
-        told["a tool run whose record cannot take a refusal exits nonzero"] = (
+        told["a tool run exits nonzero when its record cannot take a refusal"] = (
             reading.returncode != 0)
         told["naming the refusal on stderr"] = (
             '"unit": "faults", "reader": "stat", "pid": 1}' in said)
@@ -23172,7 +23202,7 @@ def _check_tool_runs_inherit_their_unit_fence(s):
     Two processes wear one fixture id and the fixture agent's argv[0]: a
     victim this unit starts, under the run, and a stray start_stray puts
     outside it. A --stop preview this unit starts lists the victim and not the
-    stray; given a root whose start time is another, it lists neither. A
+    stray; given a root with another start time, it lists neither. A
     child given a fence of this check's own reads this process's parent, and
     the refusal arrives in that fence's record, named for the child. A copy of
     this tool run as a selftest from here, with one unit that reads the
@@ -23217,7 +23247,7 @@ def _check_tool_runs_inherit_their_unit_fence(s):
         stale = " ".join([handed[0], "1", own("stale"), *handed[3:]])
         run, listed = preview(**{FENCE_UNIT_VAR: stale,
                                  FENCE_RECORD_VAR: str(room / "stale.jsonl")})
-        claims["given a root whose start time is another, it lists neither"] = (
+        claims["given a root with another start time, it lists neither"] = (
             run.returncode != 0 and "zero live processes" in run.stderr
             and victim.pid not in listed and stray not in listed)
 
@@ -23525,12 +23555,12 @@ def _check_stray_ends_when_its_making_raises(s):
     return checked
 
 
-@unit(('walks-find-a-process-whose-parent-exits-mid-walk',
-       "a process whose parent exits while a walk reads the run's children files is found by "
-       "the walk all the same, also when it is handed to a subreaper below the run: "
-       "end_processes ends it rather than naming it as left, identity reads it and admit "
-       "lets it be read, unrefused, and an undeclared table lists it"))
-def _check_walks_find_a_process_whose_parent_exits_mid_walk(s):
+@unit(('walks-find-a-process-orphaned-mid-walk',
+       "a process orphaned while a walk reads the run's children files is found by the walk "
+       "all the same, also when it is handed to a subreaper below the run: end_processes "
+       "ends it rather than naming it as left, identity reads it and admit lets it be read, "
+       "unrefused, and an undeclared table lists it"))
+def _check_walks_find_a_process_orphaned_mid_walk(s):
     """Each reader that walks, while a real parent exits in the middle of its walk.
 
     Each reader runs in a run of its own, MID_WALK_FIXTURE: end_processes,
@@ -23583,11 +23613,11 @@ def _check_walks_find_a_process_whose_parent_exits_mid_walk(s):
                          if found.get("sleeper")])
         shutil.rmtree(room, ignore_errors=True)
     wrong = sorted(claim for claim, ok in told.items() if not ok)
-    check("walks-find-a-process-whose-parent-exits-mid-walk",
-          "a process whose parent exits while a walk reads the run's children files is found by "
-          "the walk all the same, also when it is handed to a subreaper below the run: "
-          "end_processes ends it rather than naming it as left, identity reads it and admit "
-          "lets it be read, unrefused, and an undeclared table lists it",
+    check("walks-find-a-process-orphaned-mid-walk",
+          "a process orphaned while a walk reads the run's children files is found by the walk "
+          "all the same, also when it is handed to a subreaper below the run: end_processes "
+          "ends it rather than naming it as left, identity reads it and admit lets it be read, "
+          "unrefused, and an undeclared table lists it",
           not wrong, ", ".join(wrong) + (f"; {said}" if wrong else ""))
     return checked
 
@@ -23768,8 +23798,8 @@ def _check_suite_never_reaches_real_tmux(s):
     server back, and it would pass, because a real tmux answers. So the ban
     is on the ways there are of reaching one.
 
-    It bans invoking, not naming. A check whose subject is the tmux command
-    vocabulary has to write the words down, `_FakeTmux` answers by naming
+    It bans invoking, not naming. A check about the tmux command vocabulary
+    has to write the words down, `_FakeTmux` answers by naming
     every command it supports, and a fixture says which synthetic commands
     should fail by naming them. Banning the strings would hit all three and
     need an exemption each, and exemptions are what a rule like this dies of.
@@ -23846,7 +23876,7 @@ def _check_suite_never_reaches_real_tmux(s):
                  "_attached_clients", "_swarm_session_live", "_tmux_server_fact"}
 
     def runs_the_binary(node):
-        """A subprocess call whose program is tmux."""
+        """A subprocess call that runs tmux."""
         func = node.func
         if not (isinstance(func, ast_.Attribute) and func.attr in SPAWNERS):
             return False
@@ -24084,8 +24114,8 @@ def _check_poisoned_path_catches_no_tmux(s):
         marker.unlink(missing_ok=True)
 
         # The synthetic paths that would reach a server if a fixture ever fell
-        # through: a whole resume, and a verb whose entire subject is server
-        # state.
+        # through: a whole resume, and a verb about server state and nothing
+        # else.
         resume_run("willow@session-corpus-alpha", listed=False)
         engine = Resolver(needs=Needs(maybe=set(NEED)))
         server = _FakeTmux(sockets=["claude-swarm-pathcanary"])
@@ -24442,10 +24472,10 @@ def _check_release_gives_the_claim_back(s):
     return checked
 
 
-@unit(('lock-refused-leaves-the-roster-alone', 'a roster whose lock cannot be taken is left byte for byte'),
+@unit(('lock-refused-leaves-the-roster-alone', 'a roster is left byte for byte when its lock cannot be taken'),
       ('lock-without-an-owner-is-never-taken', 'a lock carrying no owner record is waited for, never taken'),
-      ('lock-left-by-a-dead-run-is-taken', 'a lock whose recorded owner is gone is taken, and the run says so'),
-      ('lock-of-a-live-owner-is-kept', 'a lock whose recorded owner is still running is left alone'),
+      ('lock-left-by-a-dead-run-is-taken', 'a lock is taken when its recorded owner is gone, and the run says so'),
+      ('lock-of-a-live-owner-is-kept', 'a lock is left alone while its recorded owner is still running'),
       ('stale-lock-that-will-not-come-away-refuses', 'a stale lock this run cannot remove ends at the deadline, not in a spin'),
       ('lock-replaced-mid-verdict-is-not-taken', "a dead owner's lock replaced by a live one before the removal is left alone"),
       ('release-leaves-a-replacement-lock-alone', 'a lock that replaced ours while we held it is not removed on the way out'))
@@ -24662,7 +24692,7 @@ def _check_team_lock_fails_closed(s):
         shutil.rmtree(lock_base, ignore_errors=True)
 
     check("lock-refused-leaves-the-roster-alone",
-          "a roster whose lock cannot be taken is left byte for byte",
+          "a roster is left byte for byte when its lock cannot be taken",
           bool(live_said) and live_roster,
           f"refused with {live_said!r}, roster unchanged {live_roster}")
     check("lock-without-an-owner-is-never-taken",
@@ -24671,14 +24701,14 @@ def _check_team_lock_fails_closed(s):
           f"empty: kept {empty_kept}, said {empty_said!r}; "
           f"directory: kept {dir_kept}, said {dir_said!r}")
     check("lock-left-by-a-dead-run-is-taken",
-          "a lock whose recorded owner is gone is taken, and the run says so",
+          "a lock is taken when its recorded owner is gone, and the run says so",
           taken_said is None and "late" in taken_listed and taken_gone
           and f"exited pid {os.getpid()}" in taken_out
           and "removing the stale lock" in taken_out,
           f"refused {taken_said!r}, roster lists {taken_listed}, "
           f"said {taken_out.strip()!r}")
     check("lock-of-a-live-owner-is-kept",
-          "a lock whose recorded owner is still running is left alone",
+          "a lock is left alone while its recorded owner is still running",
           live_there and "removing the stale lock" not in live_out,
           f"lock still there {live_there}, said {live_out.strip()!r}")
     check("stale-lock-that-will-not-come-away-refuses",
@@ -24833,8 +24863,8 @@ def _check_refused_teardown_reports(s):
     # three execs booting bare, inheriting whatever the shell exported, which
     # silently sheds the identity anywhere the teams var is not exported. The
     # execs allowed outside it boot something other than the resolved agent:
-    # maybe_attach execs tmux, and run_promote execs this tool, whose child
-    # run prepares its own launch.
+    # maybe_attach execs tmux, and run_promote execs this tool, and that run
+    # prepares its own launch.
     told = []
     becomer = funcs.get("become_agent")
     if becomer is None:
@@ -25168,7 +25198,7 @@ class _FakeTmux:
     with those panes. Faking those inputs here rather than at each caller is
     what makes this an integration fixture: runtime resolution,
     launch placement, seat_note, socket_state, pane_occupants, tint_pane and
-    launch all run unmodified against it. Commands whose output nobody
+    launch all run unmodified against it. Commands with output nobody
     parses answer success and say nothing, which is what the real server does.
     """
 
@@ -25309,8 +25339,8 @@ class _FakeTmux:
         replaces, and restores both in a finally, so a unit that raises leaves
         the process as it found it. Restoring only on the way out of a run
         that succeeded is the case that matters least: a unit that fails
-        half-way is precisely the one whose leftovers reach the next unit, and
-        in a sharded tier that next unit is somebody else's verdict.
+        half-way is precisely the one that leaves something for the next unit,
+        and in a sharded tier that next unit is somebody else's verdict.
         """
         was_global = {name: globals()[name] for name in ("tmux", "RESOLVER")}
         was_engine = {name: getattr(engine, name) for name in self.ENGINE_INPUTS}
@@ -25977,9 +26007,9 @@ def _check_synthetic_sockets_do_not_couple_engines(s):
         {("_swarm_sockets", "socket_paths"),
          ("_socket_alive", "socket_is_alive")} <= plainly)
 
-    # Canaries where a delegation would land: an engine whose own socket
-    # answers record being called and then refuse. attach replaces both, so a
-    # composite socket question asked afterwards is answered out of the
+    # Canaries where a delegation would land: an engine with socket answers of
+    # its own that record being called and then refuse. attach replaces both,
+    # so a composite socket question asked afterwards is answered out of the
     # fixture and reaches neither. This is the half the structural test cannot
     # give: that the engine's own discovery question consumes those two inputs
     # rather than finding sockets some other way.
@@ -27509,8 +27539,9 @@ def operating_conversation(f, start, session, name=None, root_team=None, later=(
      "that process's mount unknown, so retiring it again still counts the process, "
      'while one retired before the process started did not load'),
     ('operating-team-parses-a-transcript-only-for-the-mount-rule',
-     'a process whose own lines since it started decide its team is answered without '
-     'walking its transcript, which only the mount rule needs'),
+     'the team a process operates as is answered without walking its transcript when the '
+     'transcript records the process wrote since it started decide it; only the mount rule '
+     'needs the walk'),
 )
 def _check_operating_team_answer(s):
     checked = []
@@ -27608,7 +27639,7 @@ def _check_operating_team_answer(s):
               and mounted[4309106][:3] == ("EARLY", False, "stamped"), repr(mounted))
 
         unknown = {4309107: said(4309107), 4309108: said(4309108)}
-        # The doctor names the open teams of a lead whose answer is unknown.
+        # The doctor names the open teams of a lead when its answer is unknown.
         with capturing("err"):
             _verdict, lead_lines, _remedies = diagnose_team(
                 eng._team_diagnosis("OPENLEAD", table=table, census=census))
@@ -27647,7 +27678,8 @@ def _check_operating_team_answer(s):
               f"mounts {mounts}, objections {[row['said'] for row in recreated]}")
 
         # Asked again under a census of its own, so nothing is answered from
-        # the cache: own lines need no walk of the transcript, the mount rule does.
+        # the cache: what a process wrote since it started needs no walk of the
+        # transcript, the mount rule does.
         walked, real_snapshot = [], eng._transcript_snapshot
         eng._transcript_snapshot = lambda path, *rest, **kw: (
             walked.append(path.stem), real_snapshot(path, *rest, **kw))[1]
@@ -27661,13 +27693,14 @@ def _check_operating_team_answer(s):
         check('operating-team-parses-a-transcript-only-for-the-mount-rule',
               by_lines == "written" and not walked_for_lines
               and by_mount == "stamped" and "early-lines" in walked,
-              f"own lines {by_lines} walked {walked_for_lines}, mount {by_mount} "
+              f"written since start {by_lines} walked {walked_for_lines}, mount {by_mount} "
               f"walked {walked}")
 
         lead = eng._agent_runtime("team-lead@OLDTEAM", table, census=census)
         check('earlier-spawns-name-a-lead-not-its-team',
               lead["pid"] == 4309111
-              and "whose conversation spawned into team OLDTEAM" in (lead["how"] or "")
+              and "runs the conversation that spawned teammates into team OLDTEAM" in (
+                  lead["how"] or "")
               and lead["runs_as"] != "OLDTEAM" and lead["runs_as_exact"] is False,
               f"pid {lead['pid']}, how {lead['how']!r}, runs as {lead['runs_as']!r} "
               f"exact {lead['runs_as_exact']}")
@@ -27791,8 +27824,9 @@ def _check_redirect_decision(s):
         checked.append(_check_verdict(cid, bool(ok), detail))
 
     # A lead resumed plainly an hour ago: it spawned into SRCTEAM in an earlier
-    # life, and its boot pairs with session-d57d57d5, a team whose
-    # leadSessionId is that boot's internal id and names no transcript.
+    # life, and it started within TEAM_MINT_WINDOW_MS after session-d57d57d5
+    # was created, a team with that boot's internal id as its leadSessionId,
+    # which names no transcript.
     start = int(time.time() * 1000) - 3_600_000
     source, dest = "SRCTEAM", "session-d57d57d5"
     lead_conv = "1ead0001-0000-4000-8000-000000000001"
@@ -27878,8 +27912,8 @@ def _check_redirect_decision(s):
               f"outcomes {outcomes}, asked {asked}")
 
         unsupported = doctor_against_planner(eng, source, census, table)
-        # A transcript whose session id opens with the team's eight hex is the
-        # lead session the planner selects for it, so the move becomes
+        # A transcript with a session id that opens with the team's eight hex
+        # is the lead session the planner selects for it, so the move becomes
         # possible, and the mail waiting for mover is what retiring needs.
         operating_conversation(f, start, "d57d57d5-1111-4111-8111-111111111111")
         eng.refresh_transcript_evidence()
@@ -28275,8 +28309,9 @@ def _check_team_run_decides_once(s):
         return ("decide" in events[:first]
                 and all(kind == "member" for kind in events[first:]))
 
-    # The lead's boot pairs with session-1ead2222, the fresh team its
-    # conversation named at boot, so where the crew goes is inferred and asked.
+    # The lead started within TEAM_MINT_WINDOW_MS after session-1ead2222 was
+    # created, the fresh team its conversation named at boot, so where the crew
+    # goes is inferred and asked.
     lead_conv, dest, source = ("1ead2222-0000-4000-8000-000000000002",
                                "session-1ead2222", "CREWTEAM")
     with _roster_test_fixture() as f:
@@ -28910,7 +28945,7 @@ def _check_wrap_width_lossless(s):
     tale = (f"pid {PID_CEILING + 4242} holds team-lead's transcript in pane %7 and refuses; "
             * 8).strip()
     filled = fill(tale, width=72)
-    # A label whose value cannot fit beside it keeps the value anyway: the
+    # A label keeps its value even when the value cannot fit beside it: the
     # pair overflows together rather than the label sitting orphaned above it.
     labelled = fill("cwd      /" + "x" * 90, width=72)
     # A sentence one word over the width does not leave that word by itself: a
@@ -29099,7 +29134,8 @@ def _check_refusal_names_a_pid_once(s):
         team = "session-doubled" if pid == own else None
         return immutable({
             "pid": pid, "team": team, "exact": False, "rule": "stamped",
-            "basis": "its window start names session-doubled", "possible":
+            "basis": "the teamName in the first record of its restored window is "
+                     "session-doubled", "possible":
             (team,) if team else (), "argv_team": None, "session": "OTHER",
             "start": None})
 
@@ -29118,7 +29154,8 @@ def _check_refusal_names_a_pid_once(s):
     once = {
         "one row per process": sorted(r["pid"] for r in doubled) == sorted((audit, other, own)),
         "a process operating as it says how that is known": any(
-            f"pid {own} operates as it (its window start names session-doubled)" in r["said"]
+            f"pid {own} operates as it (the teamName in the first record of its restored "
+            "window is session-doubled)" in r["said"]
             for r in doubled),
         "a pid is bulleted once": all(
             sum(f"pid {pid}" in each for each in printed) == 1 for pid in (audit, own, other)),
@@ -29234,7 +29271,7 @@ def _check_explain_tags_its_sources(s):
     ('demote-parent-refusal-says-why',
      'a demote with no parent says why it could not find one'),
     ('demote-planner-consumes-parent-resolution',
-     'run_demote asks one complete demotion answer, whose private parent selection feeds conversion'),
+     'run_demote asks one complete demotion answer, and its private parent selection feeds conversion'),
 )
 def _check_demote_parent_refusal_says_why(s):
     checked = []
@@ -29263,7 +29300,7 @@ def _check_demote_parent_refusal_says_why(s):
         # A promoted file's own conversion record, carrying everything but a parent.
         receipted = demote_fixture("CARRIED", "borne", extra=[fixture_line(
             {"type": RECEIPT_RECORD, "receipt": {"grammar": SIDE_GRAMMAR_REGULAR, "root": "x"}})])
-        # The lead whose spawn payload names one of them.
+        # The lead with a spawn payload that names one of them.
         (proj / "LEADER.jsonl").write_text(fixture_line(
             {"parentUuid": None, "type": "user", "uuid": "lead-root",
              "timestamp": "2026-01-01T00:00:00Z", "isSidechain": False,
@@ -29332,7 +29369,7 @@ def _check_demote_parent_refusal_says_why(s):
                  & s.resolver_public_methods)
     )
     check("demote-planner-consumes-parent-resolution",
-          "run_demote asks one complete demotion answer, whose private parent selection feeds conversion",
+          "run_demote asks one complete demotion answer, and its private parent selection feeds conversion",
           ownership,
           f"planner={planner_calls}, parent={parent_calls}, run={sorted(run_calls)}")
     return checked
@@ -29571,7 +29608,7 @@ def _check_doctor_shared_fact_once(s):
           f"dossier={dossier_src.count('render_doctor_identity(')}, "
           f"identity={identity_src.count('render_identity_labeled_row(')}")
     rendered = render_agent_rows([
-        (PID_CEILING + 8822, "a@team", "A title whose continuation has enough words to wrap " * 3, ""),
+        (PID_CEILING + 8822, "a@team", "A title with a continuation of enough words to wrap " * 3, ""),
         (None, "much-longer-name@team", "Short title", ""),
     ], width=72)
     first_lines = [row.splitlines()[0] for row in rendered]
@@ -29688,7 +29725,7 @@ def _check_runtime_provenance_is_structured(s):
                 not plain_res.identity_from_argv()
                 and plain_res.runtime["evidence"][plain_pid]["kind"] == "session-team",
             "plain provenance names the session-to-team evidence":
-                plain_res.via == (f"pid {plain_pid}, whose session id names team {team}"),
+                plain_res.via == (f"pid {plain_pid} runs the session team {team} is named after"),
             "plain identity has no live-argv source": "live argv" not in plain_sources,
             "pid remains an engine-resolved field":
                 plain_ctx["explanation"]["selected"]["pid"][::2]
@@ -30078,7 +30115,7 @@ def _check_doctor_canonical_members(s):
     return checked
 
 
-@unit(('doubtful-lead-both-remedies', 'a lead whose reading is in doubt is offered both remedies'))
+@unit(('doubtful-lead-both-remedies', 'a lead is offered both remedies when its reading is in doubt'))
 def _check_doubtful_lead_both_remedies(s):
     checked = []
 
@@ -30121,7 +30158,7 @@ def _check_doubtful_lead_both_remedies(s):
             (src_of(funcs["run_agent_dossier"]) or ""),
     }
     wrong = sorted(k for k, ok in both.items() if not ok)
-    check("doubtful-lead-both-remedies", "a lead whose reading is in doubt is offered both remedies", not wrong,
+    check("doubtful-lead-both-remedies", "a lead is offered both remedies when its reading is in doubt", not wrong,
           ", ".join(wrong))
     return checked
 
@@ -32609,7 +32646,7 @@ def _check_cleanup_opens_with_outcome(s):
 
 
 @unit(('cleanup-clears-a-lock-we-left',
-       'the sweep removes a roster lock whose recorded owner is gone, and says so'),
+       'the sweep removes a roster lock when its recorded owner is gone, and says so'),
       ('cleanup-keeps-a-lock-that-is-not-ours-to-clear',
        'the sweep leaves every other lock exactly where it is'))
 def _check_cleanup_clears_our_own_dead_lock(s):
@@ -32692,7 +32729,7 @@ def _check_cleanup_clears_our_own_dead_lock(s):
                                                "session-lock-dir")),
     }
     check("cleanup-clears-a-lock-we-left",
-          "the sweep removes a roster lock whose recorded owner is gone, and says so",
+          "the sweep removes a roster lock when its recorded owner is gone, and says so",
           all(cleared.values()), ", ".join(sorted(k for k, ok in cleared.items() if not ok)))
     check("cleanup-keeps-a-lock-that-is-not-ours-to-clear",
           "the sweep leaves every other lock exactly where it is",
@@ -32701,7 +32738,7 @@ def _check_cleanup_clears_our_own_dead_lock(s):
 
 
 @unit(('sweep-spares-a-held-lock',
-       "a team whose roster lock a writer may be inside is not swept"))
+       "a team is not swept while a writer may be inside its roster lock"))
 def _check_sweep_spares_a_held_lock(s):
     """The other half of the lock question: not whether the lock may go, whether
     the directory around it may.
@@ -32794,13 +32831,13 @@ def _check_sweep_spares_a_held_lock(s):
         "none of the three is named as removed":
             not any(name in acted for name in ("session-held-live", "session-held-empty",
                                                "session-held-dir")),
-        "a lock whose owner is gone keeps nothing": not standing["session-held-dead"],
+        "a lock with its owner gone keeps nothing": not standing["session-held-dead"],
         "and the sweep says which team it took": "session-held-dead" in acted,
         "the outcome still comes before the reasons":
             preview.startswith("would remove 1 empty team(s): session-held-dead"),
     }
     check("sweep-spares-a-held-lock",
-          "a team whose roster lock a writer may be inside is not swept",
+          "a team is not swept while a writer may be inside its roster lock",
           all(spared.values()), ", ".join(sorted(k for k, ok in spared.items() if not ok)))
     return checked
 
@@ -33697,9 +33734,9 @@ def _check_terminal_declares_reach(s):
         help = stop = False
 
     # The promoted-lead UUID unit exercises the conditional runtime path directly.
-    # This table covers the selector forms whose lookup tier itself determines the
-    # declaration: bare names and teams always use stamps; agent IDs use them only
-    # when live argv cannot answer.
+    # This table covers the selector forms for which the lookup tier itself
+    # determines the declaration: bare names and teams always use stamps; agent
+    # IDs use them only when live argv cannot answer.
     shapes = {
         "a bare name does not declare the stamps that find it":
             verb_needs(_ByName, "unslop-docs")[NEED.STAMPS] is not DECLARED.HARD,
@@ -33730,7 +33767,8 @@ def _check_blocked_move_not_unreachable(s):
     return checked
 
 
-@unit(('mint-shape-bounds', 'shape bounds which team a process could have minted'))
+@unit(('mint-shape-bounds', "a team's leadSessionId bounds which process could have created it: "
+       "a fresh boot's names a transcript, a resumed life's names none"))
 def _check_mint_shape_bounds(s):
     checked = []
 
@@ -33748,9 +33786,9 @@ def _check_mint_shape_bounds(s):
             eng9._roster_path(name).write_text(json.dumps(
                 {"name": name, "leadSessionId": lead, "members": []}))
         shapes = {
-            "a team whose lead session names a transcript is a fresh boot's":
+            "a team is a fresh boot's when its lead session names a transcript":
                 eng9._minted_by_a_resumed_life("session-aaaaaaaa") is False,
-            "a team whose lead session names nothing is a resumed life's":
+            "a team is a resumed life's when its lead session names nothing":
                 eng9._minted_by_a_resumed_life("session-bbbbbbbb") is True,
         }
         me = os.getpid()
@@ -33769,7 +33807,7 @@ def _check_mint_shape_bounds(s):
         eng9._boot_join = lambda snapshot, census=None: [
             ("session-aaaaaaaa", me, 0)]
         mine = eng9._operating_team(me, snapshot)
-        shapes["a fresh boot's own team pairs by timing, and timing is inferred"] = (
+        shapes["the team named after its session is found by start time, and the answer is inferred"] = (
             mine["team"] == "session-aaaaaaaa" and mine["exact"] is False
             and mine["rule"] == "paired")
         eng9._runtime = lambda table=None: {"live_sessions": [
@@ -33778,15 +33816,17 @@ def _check_mint_shape_bounds(s):
              "agent_id": None}]}
         snapshot = eng9._runtime()
         candidates = eng9._mint_candidates(me, snapshot)
-        # The fresh-boot team is provably somebody else's, so it cannot be
-        # paired with this process however the timing falls.
+        # The fresh-boot team's leadSessionId names another session's
+        # transcript, so this process did not create it, however the timing
+        # falls.
         shapes["a stranger's fresh-boot team is no candidate"] = (
             candidates["teams"] == ["session-bbbbbbbb"]
             and candidates["own_session"] == ())
         shapes["a stranger's fresh-boot team is not the answer"] = (
             eng9._operating_team(me, snapshot)["team"] is None)
         wrong = sorted(k for k, good in shapes.items() if not good)
-        check("mint-shape-bounds", "shape bounds which team a process could have minted", not wrong,
+        check("mint-shape-bounds", "a team's leadSessionId bounds which process could have created "
+              "it: a fresh boot's names a transcript, a resumed life's names none", not wrong,
               ", ".join(wrong))
 
     s.name = name
@@ -33814,7 +33854,8 @@ def _check_pick_evidence_names_no_team(s):
              "members": [{"name": "team-lead", "agentId": f"team-lead@{paired}"}]}))
         me = os.getpid()
         # Our own pid, because the rung asks the kernel whether the process is
-        # alive and a made-up number would drop out of the pairing.
+        # alive, and a made-up number would read as not running and so not be
+        # matched to the team by its start time.
         eng10._session_registry = lambda: [
             {"pid": me, "sessionId": "fedcba98-fedc-4ba9-8fed-cba98fedcba9",
              "startedAt": 1000 + TEAM_MINT_WINDOW_MS - 1, "updatedAt": 0}]
@@ -33823,17 +33864,17 @@ def _check_pick_evidence_names_no_team(s):
         got_pid, got_alive, got_how, got_exact = (
             runtime["pid"], runtime["alive"], runtime["how"], runtime["exact"])
         picked = {
-            "the timing pairing is what answered": got_pid == me and got_alive,
+            "the lead is this process, found by its start time and alive": got_pid == me and got_alive,
             "and it is graded inexact": got_exact is False,
             # got_how is cut into words and every word handed to
             # implicit_team_block, which is what decides whether a name is a
-            # team the harness minted.
+            # team the harness created.
             "the evidence names no team of this shape":
                 bool(got_how) and not any(implicit_team_block(word)
                                           for word in re.findall(r"[\w-]+", got_how)),
             "nor this team by name": bool(got_how) and paired not in got_how,
-            "and it still leads with the pid its readers strip":
-                bool(got_how) and got_how.startswith(f"pid {me}, "),
+            "and it leads with the pid":
+                bool(got_how) and got_how.startswith(f"pid {me} "),
         }
         wrong = sorted(k for k, good in picked.items() if not good)
         check("pick-evidence-names-no-team",
@@ -33865,9 +33906,9 @@ def _check_population_contains_roster(s):
         if set(extras) & listed:
             pop_wrong.append(f"{with_former} calls a listed member former")
 
-    # A team of this check's own whose one listed member runs: a process this
-    # run started, wearing the member's id. So a listed member that runs is
-    # always there to be judged, whatever teams this machine holds, and the
+    # A team of this check's own with one listed member, which runs: a process
+    # this run started, wearing the member's id. So a listed member that runs
+    # is always there to be judged, whatever teams this machine holds, and the
     # process is under this run.
     base = Path(tempfile.mkdtemp(prefix=own("population")))
     crew = own("session-corpus-population")
@@ -34021,7 +34062,7 @@ def _check_holder_kill_one_site(s):
     # stopped() sends the signal and waits; end_holder is the one route a
     # move takes to it, through kill_holder for a migration and a lead move and
     # through settle_stops for a team run, and abort_agents is --stop, the verb
-    # whose whole job is ending processes, which asks its own question of a
+    # that does nothing but end processes, which asks its own question of a
     # list before it ends anything. Everything else reaches a process through
     # one of those.
     killers = {n for n, node in funcs.items() if ends_a_process(node)}
@@ -34237,8 +34278,9 @@ def _check_sidechain_not_evidence(s):
         nested_hits = engine._stamped_candidates("spoof", "session-spoof")
         structured_fallback = ([path for path, _fields, _ts in spaced_hits] == [mid]
                                and not nested_hits)
-    # _last_stamp reads a process's own lines backward from the end of its
-    # transcript, and takes their stamps through the same rule.
+    # _last_stamp reads the records a process wrote since it started,
+    # backward from the end of its transcript, and takes their stamps through
+    # the same rule.
     stamp_owners = s.callers_of("_identity_stamp")
     if stamp_owners != {"_stamps_in", "_scan_transcript",
                         "_derive_transcript_snapshot", "_last_stamp"}:
@@ -34844,7 +34886,7 @@ def _check_conversion_proves_inverse(s):
         oplan = convert(orphan, "promote", identity=("p3", "T"))
         if oplan["proved"] or "does not carry anchor-1" not in "".join(
                 oplan["objections"]):
-            faults.append("a fork whose referenced prefix is gone was promoted anyway")
+            faults.append("a fork was promoted though the prefix it references is gone")
 
         # Claude Code can append any harness record after the promote. The
         # receipt remains active: demote finds it by scanning backward, consumes
@@ -36628,7 +36670,7 @@ def _check_census_zero_note_only_when_nonzero(s):
     return checked
 
 
-@unit(('census-marks-only-what-differs', 'the census annotates the rows whose two numbers differ'))
+@unit(('census-marks-only-what-differs', 'the census annotates the rows with two numbers that differ'))
 def _check_census_marks_only_what_differs(s):
     checked = []
 
@@ -36648,7 +36690,7 @@ def _check_census_marks_only_what_differs(s):
     }
     wrong = sorted(k for k, ok in ratios.items() if not ok)
     check("census-marks-only-what-differs",
-          "the census annotates the rows whose two numbers differ", not wrong,
+          "the census annotates the rows with two numbers that differ", not wrong,
           ", ".join(wrong))
     return checked
 
@@ -36938,7 +36980,7 @@ def _check_restamp_refuses_a_third_field(s):
         proj.mkdir()
 
         def one_window(stem, extra=None):
-            """A transcript whose window-start carries both stamps, plus extra."""
+            """A transcript with a window-start record that carries both stamps, plus extra."""
             start = {"parentUuid": None, "agentName": "mate", "teamName": "OLD",
                      "type": "user", "uuid": f"{stem}-root",
                      "timestamp": "2026-01-01T00:00:01Z"}
@@ -37575,7 +37617,7 @@ def _check_noop_one_function(s):
         body = src_of(fn) or ""
         if 'Outcome("noop"' in body:
             noops.append(fn.name)
-    # Registration is the piece whose absence is invisible: a member running
+    # Registration is the piece that is invisible when absent: a member running
     # in its pane, unlisted, while the run reports success. Probed by removal.
     noop_src = src_of(funcs["noop_outcome"]) or ""
     for needed, missing in (("record_membership(", "does not register what is running"),
@@ -37957,7 +37999,8 @@ def _check_restored_life_window_start(s):
          ("claude", "--resume", "1e5701ed-1fe5-4701-8ed1-e5701ed1fe57",
           "--agent-id", "team-lead@session-corpus-alpha"))]
     # Started now, after every roster in the corpus was written, so each team
-    # its window start names was there to load when it mounted.
+    # stamped on the first record of a restored window was there to load when
+    # it mounted.
     eng._process_start_ms = lambda record: int(time.time() * 1000)
     torn, sighted, restored_n, incomplete = [], 0, 0, 0
     snapshot = eng._runtime()
@@ -39726,8 +39769,8 @@ def _check_agent_diagnosis_follows_own_evidence(s):
         # Reachable is the conjunction of its own parts, so a verdict cannot
         # drift from the facts printed beside it.
         # polls is checked against argv rather than against itself: a lead
-        # whose command line names its team read this roster at boot, and one
-        # that does not cannot be known from outside. Deriving the expectation
+        # with a command line that names its team read this roster at boot, and
+        # one without cannot be known from outside. Deriving the expectation
         # from the answer would agree with any answer.
         worn = next((e.get("team") for e in eng._runtime()["live_sessions"]
                      if e["pid"] == pid), None) if pid and alive else None
@@ -40326,9 +40369,9 @@ def _check_completion_parser_is_strict(s):
 
     A parser that takes whatever arrives is how a row format changes without
     anyone finding out. The rows below are the ways one can be wrong -- short,
-    long, blank where the group belongs, an id that is not one, an id whose
-    team disagrees with the row's own team key -- and each is offered next to
-    rows that are right, so a parser cannot pass by dropping the batch.
+    long, blank where the group belongs, an id that is not one, an id with a
+    team that disagrees with the row's own team key -- and each is offered next
+    to rows that are right, so a parser cannot pass by dropping the batch.
     """
     out = []
     IDS = (("completion-parser-takes-only-six-field-rows",
@@ -40355,8 +40398,8 @@ def _check_completion_parser_is_strict(s):
         "a row a field short": f"names\t{TEAM}\t{GROUP}\tshort@{TEAM}\t36",
         "a row a field long":
             f"names\t{TEAM}\t{GROUP}\tlong@{TEAM}\tjoined 14:21\t36\tspare",
-        "a row whose id is not one": f"names\t{TEAM}\t{GROUP}\tnot-an-id\tjoined 14:22\t36",
-        "a row whose id is another team's":
+        "a row with an id that is not one": f"names\t{TEAM}\t{GROUP}\tnot-an-id\tjoined 14:22\t36",
+        "a row with another team's id":
             f"names\t{TEAM}\t{GROUP}\tstray@{OTHER}\tjoined 14:23\t36",
     }
     # What a shell that cached before the format changed would hand back.
@@ -40706,7 +40749,7 @@ def _check_confirmation_taxonomy(s):
           + (f", unguarded {unguarded}" if unguarded else ""))
 
     # A prompt spelling [Y/n] beside a test that only proceeds on "y" is a
-    # prompt whose default is not the one it advertises.
+    # prompt with a default other than the one it advertises.
     lying = []
     for name, site in sites.items():
         if name in shared or len(site["spelled"]) != 1:
@@ -40911,7 +40954,7 @@ def _check_owned_roster_values(s):
 @unit(
     ('roster-readers-produce-complete-records', 'all disk parse outcomes become complete typed roster records'),
     ('roster-unstable-read-refuses', 'an unstable census read refuses while generation callers retain the diagnostic'),
-    ('roster-interpretation-has-one-owner', 'census, member scan and boot pairing use the snapshot team interpretation'),
+    ('roster-interpretation-has-one-owner', 'the census, the member scan and the match of each implicit team to the process that created it use the snapshot team interpretation'),
     ('roster-census-updates-by-path', 'census updates preserve unrelated paths, order and object identities'),
 )
 def _check_roster_producers_and_census(s):
@@ -41102,8 +41145,9 @@ def _check_complete_team_selection(s):
         # hide behind a stale member answer in this separate control.
         warm._team_member_answers = {}
         new_description = warm._team_description("A", table, census=new_census)
-        # B created within the boot window too makes the pairing ambiguous, so
-        # what the lead runs as becomes unknown rather than the newer team.
+        # B, created within TEAM_MINT_WINDOW_MS before the lead started as A
+        # was, is a second team the lead could have created, so what the lead
+        # runs as becomes unknown rather than the newer team.
         cold_differs = (cold_old["lead"]["runs_as"] == "A"
                         and cold_new["lead"]["runs_as"] is None)
         detail = repr((cold_old["lead"]["runs_as"], cold_new["lead"]["runs_as"],
@@ -42123,7 +42167,7 @@ def _roster_cold_engine(f):
 
 
 def _retained_transcript_answers(eng, path, table, census):
-    """Warm the actual discovery readers whose results a migration changes."""
+    """Warm the actual discovery readers with results a migration changes."""
     stamps = eng._stamp_index()
     assignments = eng._durable_assignment_index()
     fact = eng._transcript_fact(path.stem)
@@ -44552,7 +44596,7 @@ def _check_team_layout_one_owner(s):
     return checked
 
 
-@unit(("implicit-team-shape-one-owner", "one place says what a lazily minted team is named after"))
+@unit(("implicit-team-shape-one-owner", "one place says what an implicit team is named after"))
 def _check_implicit_team_shape_one_owner(s):
     checked = []
 
@@ -44576,11 +44620,11 @@ def _check_implicit_team_shape_one_owner(s):
         forked.append("implicit_team_block matches nothing, so there is no shape to hold")
     else:
         # implicit_team_block is called on four team names and every answer
-        # compared: one the harness minted, one that merely starts like a
-        # minted one, one a --team-name flag gave, and no team at all.
+        # compared: one the harness created, one that merely starts like an
+        # implicit one, one a --team-name flag gave, and no team at all.
         for asked, got, want in (
-                ("a minted name", implicit_team_block("session-a52cb2af"), "a52cb2af"),
-                ("a minted name with more after it",
+                ("an implicit team's name", implicit_team_block("session-a52cb2af"), "a52cb2af"),
+                ("an implicit team's name with more after it",
                  implicit_team_block("session-a52cb2af-two"), None),
                 ("a name a flag gave", implicit_team_block("crew"), None),
                 ("no team at all", implicit_team_block(None), None)):
@@ -44619,7 +44663,7 @@ def _check_implicit_team_shape_one_owner(s):
         if extra:
             forked.append("the block is handed out to " + ", ".join(sorted(extra)))
     check("implicit-team-shape-one-owner",
-          "one place says what a lazily minted team is named after",
+          "one place says what an implicit team is named after",
           not forked, "; ".join(sorted(set(forked))[:3]))
     return checked
 
@@ -44652,8 +44696,8 @@ def _check_agent_id_spelled_one_way(s):
                 forked.append(f"{asked} answers {got}, not {want}")
 
     # A second spelling anywhere else, in either direction: .split("@"),
-    # .partition("@") and their r-forms, and any f-string whose text runs up to
-    # an "@" and then substitutes, which is both f"{name}@{team}" and
+    # .partition("@") and their r-forms, and any f-string with text that runs up
+    # to an "@" and then substitutes, which is both f"{name}@{team}" and
     # f"team-lead@{team}". The suite is left out: its fixtures write the ids a
     # roster really holds and its assertions read the ids a launch really
     # emitted, so both spell them out.
@@ -44767,9 +44811,9 @@ def description_drift(tree, ast):
         else:
             computed += 1
 
-    # A loop or comprehension whose target unpacks two names, and whose body
-    # builds a row from exactly those two, turns each literal pair in its
-    # literal iterable into a row.
+    # A loop or comprehension turns each literal pair in its literal iterable
+    # into a row when its target unpacks two names and its body builds a row
+    # from exactly those two.
     for node in ast.walk(tree):
         if isinstance(node, ast.For):
             loops = [(node.target, node.iter, [sub for stmt in node.body for sub in ast.walk(stmt)])]
@@ -45479,7 +45523,7 @@ def build_parser():
            row='resume a whole team: its members, then its lead')
     offers(picking.add_argument("--all", dest="all_members", action="store_true",
                                 help="with a team, also resume members the roster no longer lists "
-                                     "but whose transcripts are stamped with it"),
+                                     "when their transcripts are stamped with it"),
            row='with a team, also resume members the roster no longer lists')
     offers(picking.add_argument("--no-lead", action="store_true",
                                 help="skip the lead when bringing up the whole team"),
