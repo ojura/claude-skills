@@ -1066,13 +1066,16 @@ processes they invent. Every other pid the run admits, whether a declared unit's
 table or registry named it, Popen started it or a walk found it under the root,
 is under one rule: it is read while its start time is the one recorded when the
 run learned of it, or once no process holds its number, and refused while
-another process holds it. A value that is not a whole number above zero is
-refused. A refused read is answered as a process that does not exist and is
-written down with the unit, the reader and the pid. To refuse a pid, the fence
-reads nothing of it but the start time it compares for a pid a declared unit's
-listing named or one the run knows. The run goes on, and the tier's row
+another process holds it. A pid that a process under the root holds now is
+admitted as well, since the walk that finds it there is how the run learns it. A
+value that is not a whole number above zero is refused. A refused read is
+answered as a process that does not exist and is written down with the unit, the
+reader and the pid. To refuse a pid, the fence reads nothing of it but the start
+time it compares for a pid a declared unit's table or registry named or one the
+run knows. The run goes on, and the tier's row
 `read-only-tier-reads-only-admitted-processes` or
-`live-tier-reads-only-admitted-processes` names every refusal.
+`live-tier-reads-only-admitted-processes` names every refusal, and every fault
+of the fence itself.
 
 `ran_unit` hands a unit's rule to the tool runs the unit starts through
 `AGENT_RESUME_SELFTEST_UNIT`: the root's pid and start time, the fence's token,
@@ -1081,24 +1084,31 @@ else, so a tool run's root is the selftest process that runs its unit, never the
 tool run itself. It checks the root's start time before walking the root's
 children, so a root that has gone leaves it no processes, and it writes its
 refusals to the file `AGENT_RESUME_SELFTEST_FENCE` names, which the tier's row
-reads once the tool run has exited. A tool run has no row of its own, so when
-that file cannot take one of its refusals, the tool run ends there, naming the
-refusal on its stderr; in the selftest process such a refusal is kept for the
-row. A tool run ends before anything else runs when its
-`AGENT_RESUME_SELFTEST_UNIT` does not parse. The pids the run knows are kept in
-one record for the whole run, a file beside the refusal record: each of the
-run's fences adds the pids it learns there, and reads what the others added
-before it counts a pid as unknown, so a tool run admits a pid the selftest
-process learned by the same rule. A tool run that is a selftest itself roots its
-own units at itself. `ran_unit` drops RESOLVER's process caches as each unit
-starts and again in its `finally`, so a table a declared unit read reaches no
-other unit. `proc_reader_audit.py` runs the tiers with a record file of its own
-and lists every refusal by unit, reader and pid, those of the tool runs
-included. A `claude` that records its arguments and fails sits first on `PATH`
-beside the tmux one for the whole run, so a unit or tool run that launches an
-agent reaches it instead of the machine's claude, and the tier's
-`read-only-tier-runs-no-claude` or `live-tier-runs-no-claude` row says whether
-anything did.
+reads once the tool run has exited. The pids the run knows are kept in one
+record for the whole run, a file beside the refusal record: each of the run's
+fences adds the pids it learns there, and reads what the others added before it
+counts a pid as unknown, so a tool run admits a pid the selftest process learned
+by the same rule. The fence meets a fault of its own when the refusal record
+cannot take a refusal, when the record of known pids cannot take a pid or cannot
+be read, when the refusal record cannot be read for the row, or when a walk has
+not settled (below). In the selftest process each fault is kept for the tier's
+row, which fails naming it; a refusal the record could not take is kept there as
+the refusal it is. A tool run has no row of its own, so there a fault ends the
+run: `fence_fault` names it on stderr and raises `FenceFault`, which `answered`
+turns into exit status 70. `FenceFault` is not a `Refusal`, so the product's own
+handlers, which catch a refusal to bring up the rest of a team in `run_agents`
+or to print a roster warning in a rollback, let it through, and no code between
+the read and `answered` absorbs it. A tool run ends with a fence fault before
+anything else runs when its `AGENT_RESUME_SELFTEST_UNIT` does not parse. A tool
+run that is a selftest itself roots its own units at itself. `ran_unit` drops
+RESOLVER's process caches as each unit starts and again in its `finally`, so a
+table a declared unit read reaches no other unit. `proc_reader_audit.py` runs
+the tiers with a record file of its own and lists every refusal by unit, reader
+and pid, those of the tool runs included. A `claude` that records its arguments
+and fails sits first on `PATH` beside the tmux one for the whole run, so a unit
+or tool run that launches an agent reaches it instead of the machine's claude,
+and the tier's `read-only-tier-runs-no-claude` or `live-tier-runs-no-claude` row
+says whether anything did.
 
 The selftest ends the processes it starts through readers of its own on
 `_ProcessFence`, which do not ask the fence and are limited instead by how they
@@ -1113,32 +1123,41 @@ another after the last, must each have the run as its parent. The tier's
 `read-only-tier-leaves-nothing-running` or `live-tier-leaves-nothing-running`
 row states what `finish_run` found once the units were done, so a leak no unit
 caught fails the run. The run that merges the shares of a split live run adds
-its own two orphans and its own `finish_run` to the rows it folds from the
-shares. A unit that finds a process a tool run left behind ends it there,
-through `end_processes` as `finish_run` does, so no later unit has it in view.
-`run_processes` walks down from the run by the `children` files of each
-process's threads and reads the stat file of each process it finds. `identity`
-reads one pid's stat file only when that pid is the run itself or the same walk
-finds it under the run. A pass of the walk reads those files one after another,
-so when a process's parent exits meanwhile, the process can move to a subreaper
-inside the run between two of them and be in neither. The subreaper is the run
-or under it, so the pass read its file before the process got there. After each
-pass the walk reads every children file the pass read once more, and passes
-again, up to four passes, while one of them lists a pid the pass did not find.
-`run_processes`, `identity` and the fence's `admit` all walk that way.
-`ancestors` reads the stat files up the chain of parents from the run's parent,
-so that the run never signals one of them. Any other pid reads as no running
-process without being read; a refused pid that a process holds, and a value that
-is not a whole number, are written down as the fence writes its refusals, in a
-unit or outside one, and a pid `pidfd_open` cannot judge is written down with
-the error, so the tier's row names it and `proc_reader_audit.py` counts it.
-`end_processes` and the functions built on it signal each process through a
-pidfd opened while its start time still matched, and never signal pid 1, the
-run, an ancestor, a process named systemd, or a process that did not start after
-the run. The smoke check's stray is outside the run on purpose, and the cleanup
-never reads it: the stray holds the only write end of a pipe, the run keeps the
-pipe's read end, and the run ends the stray through a pidfd opened while that
-pipe had not yet reached end of file.
+what its own two orphans showed, what its own `finish_run` ended, and its own
+fence's refusals and faults to the rows it folds from the shares. A unit that
+finds a process a tool run left behind ends it there, through `end_processes` as
+`finish_run` does, so no later unit has it in view. `run_processes` walks down
+from the run by the `children` files of each process's threads and reads the
+stat file of each process it finds. Each process's parent is the process with
+the `children` file that listed it in the walk's settled pass, not the parent
+its stat file names, so `subtree`, which `end_process_tree` and
+`end_left_behind` ask, and, under a fence, the engine's process table, which
+`started_here` asks through `_descendants_of`, take the walk's answer.
+`identity` reads one pid's stat file only when that pid is the run itself or the
+same walk finds it under the run, so a pid the run knows that has left the run's
+tree and still runs is refused there, though `admit` admits it. A pass of the
+walk reads those files one after another, so when a process's parent exits
+meanwhile, the process can move to a subreaper inside the run between two of
+them and be in neither. The subreaper is the run or under it, so the pass reads
+its file too, and misses the process when it read that file before the process
+got there. After each pass the walk reads every children file the pass read once
+more, and passes again, up to four passes (`WALK_PASSES`), while one of them
+lists a pid the pass did not find. A walk that still finds one after its last
+pass has not settled, and the reader reports that as a fault of the fence rather
+than judge from it. `run_processes`, `identity` and the fence's `admit` all walk
+that way. `ancestors` reads the stat files up the chain of parents from the
+run's parent, so that the run never signals one of them. Any other pid reads as
+no running process without being read; a refused pid that a process holds, and a
+value that is not a whole number, are written down as the fence writes its
+refusals, in a unit or outside one, and a pid `pidfd_open` cannot judge is
+written down with the error, so the tier's row names it and
+`proc_reader_audit.py` counts it. `end_processes` and the functions built on it
+signal each process through a pidfd opened while its start time still matched,
+and never signal pid 1, the run, an ancestor, a process named systemd, or a
+process that did not start after the run. The smoke check's stray is outside the
+run on purpose, and the cleanup never reads it: the stray holds the only write
+end of a pipe, the run keeps the pipe's read end, and the run ends the stray
+through a pidfd opened while that pipe had not yet reached end of file.
 
 Mutation scripts import `probe` and call `probe.expect(...)`. The function runs
 one clean suite and isolated mutants, then raises `ProbeFailure` if the clean run

@@ -12,9 +12,9 @@ under the reader "cleanup stat", or, for a pid pidfd_open could not judge,
 under a reader that names the error, which the audit lists as a reader of its
 own. Reads the fence allows are not counted. The pids each run learned go to a
 file beside the record, its name with ".known" after it, which every fence of
-that run reads (architecture.md); the audit keeps it with the record. Rerun it
-after each package of the consolidation is adapted; an empty result is the
-pass.
+that run reads (architecture.md); the audit empties it with the record as it
+starts, and keeps it. Rerun it after each package of the consolidation is
+adapted; an empty result is the pass.
 
     proc_reader_audit.py [--live] [--jobs N ...] [--tool PATH] [--record PATH]
                          [--static proc-readers.json]
@@ -38,9 +38,10 @@ with. The audit writes it inside the terminal session: script(1) runs this
 file with --within, which writes the record and then becomes the tool through
 exec, so the environment the record names is the one the tool ran with, after
 the shell script(1) starts added its own variables. It writes a value only
-for a name on SHOWN, matched exactly, and names every other variable with no
-value, no length and no digest, because a rule on names would let a secret
-through under a name it does not match. Whether each variable the audit
+for a name on SHOWN, matched exactly, which is probe.py's SHOWN_VALUES, the
+lead's list for every run record of this work, and names every other variable
+with no value, no length and no digest, because a rule on names would let a
+secret through under a name it does not match. Whether each variable the audit
 handed to script(1) was the same in every tier is compared in memory, and the
 audit names the ones that were not.
 
@@ -53,21 +54,29 @@ unit's fence as main does first. The audit reads those three lines back before
 it runs a tier and leaves them out of the count, so an empty count is evidence
 that nothing was refused on any of those paths, and not a record that nothing
 could reach. It judges each tier by its exit status and by its refusal rows,
-read-only-tier-reads-only-admitted-processes and, in a live tier, also
-live-tier-reads-only-admitted-processes, as well as by the record, so a refusal
-that went elsewhere still counts. The directories it makes for the control and
-the tiers are removed after each run, and one it could not remove is named; the
-record and the outputs beside it are kept.
+the tool's TIER_PROCS, as well as by the record, so a refusal that went
+elsewhere still counts. A refusal row also fails on a fault of the fence
+itself, such as a walk that did not settle, which the row's detail in the
+tier's kept output names. The tool is loaded as a module once, as the control
+loads it, for those row ids and the names of its record and unit variables, so
+the audit holds no copy of either. The directories it makes for the control
+and the tiers are removed after each run, and one it could not remove is
+named; the record and the outputs beside it are kept.
 
 Exit status: 0 when every tier exited 0 and passed its refusal rows and the
 record holds no refusal but the control's; 1 when the record holds one or a
 tier's refusal row failed; 2 when the control did not reach the record as it
-should, or a tier could not run, ran out of time, did not state a refusal row
-or exited nonzero for another reason, such as a failing check of another kind.
+should, a tier could not run, ran out of time, did not state a refusal row or
+exited nonzero for another reason, such as a failing check of another kind, or
+a line of the record does not parse as a JSON object. When both 1 and 2 apply,
+the status is 1, the audit's finding, and the sentences printed name every
+fault either way.
 """
 import argparse
 import collections
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import secrets
@@ -79,38 +88,30 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+
+def load(path, name):
+    """The file at path loaded as a module under name, its main never run.
+
+    Entered in sys.modules under name before it runs, as an import would, for
+    a module that looks itself up there as it loads, as probe.py does.
+    """
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    module.__file__ = str(path)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+
+
 # The variables a run record writes the value of, matched by exact name; every
-# other variable is named only. This is the lead's list for every run record of
-# this work, environment-values-2026-10-08.txt of 8 October 2026: the process
-# and terminal, LANG, LANGUAGE and the thirteen LC_ names of glibc, tmux and the
-# suite's directories, CLAUDE_CONFIG_DIR, the XDG base directories and session,
-# and the 29 names python3 --help-env lists in Python 3.12.3.
-SHOWN = frozenset((
-    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "COLUMNS", "LINES", "TZ", "ZDOTDIR",
-    "NO_COLOR", "FORCE_COLOR",
-    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE",
-    "LC_MONETARY", "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS", "LC_TELEPHONE",
-    "LC_MEASUREMENT", "LC_IDENTIFICATION",
-    "TMUX", "TMUX_PANE", "TMUX_TMPDIR", "TMPDIR",
-    "CLAUDE_CONFIG_DIR",
-    "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR",
-    "XDG_DATA_DIRS", "XDG_CONFIG_DIRS", "XDG_SESSION_TYPE", "XDG_SESSION_CLASS",
-    "XDG_SESSION_DESKTOP", "XDG_CURRENT_DESKTOP", "XDG_SESSION_ID", "XDG_SEAT", "XDG_VTNR",
-    "XDG_MENU_PREFIX",
-    "PYTHONBREAKPOINT", "PYTHONCASEOK", "PYTHONCOERCECLOCALE", "PYTHONDEBUG", "PYTHONDEVMODE",
-    "PYTHONDONTWRITEBYTECODE", "PYTHONFAULTHANDLER", "PYTHONHASHSEED", "PYTHONHOME",
-    "PYTHONINSPECT", "PYTHONINTMAXSTRDIGITS", "PYTHONIOENCODING", "PYTHONMALLOC",
-    "PYTHONNODEBUGRANGES", "PYTHONNOUSERSITE", "PYTHONOPTIMIZE", "PYTHONPATH",
-    "PYTHONPERFSUPPORT", "PYTHONPLATLIBDIR", "PYTHONPROFILEIMPORTTIME", "PYTHONPYCACHEPREFIX",
-    "PYTHONSAFEPATH", "PYTHONSTARTUP", "PYTHONTRACEMALLOC", "PYTHONUNBUFFERED", "PYTHONUTF8",
-    "PYTHONVERBOSE", "PYTHONWARNDEFAULTENCODING", "PYTHONWARNINGS",
-))
+# other variable is named only. The lead's list for every run record of this
+# work, environment-values-2026-10-08.txt of 8 October 2026, which probe.py
+# beside this file holds as SHOWN_VALUES; taken from there, so the list is
+# written once.
+SHOWN = load(HERE / "probe.py", "audit_probe").SHOWN_VALUES
 # How long the control and each tier may take, in seconds.
 CONTROL_BOUND, TIER_BOUND = 600, 1800
-# The rows a tier states about the reads its fence refused: the read-only
-# tier's, which a live tier's read-only child states too, and the live tier's.
-READ_ONLY_PROCS = "read-only-tier-reads-only-admitted-processes"
-LIVE_PROCS = "live-tier-reads-only-admitted-processes"
 
 
 def private_root():
@@ -139,14 +140,34 @@ def removed(root, label):
     return None
 
 
-def run_environment(tool, root, record):
-    """The environment the control and each tier run with: the audit's own, with its directories and record."""
-    prefix = tool.name.upper().replace("-", "_")
+def run_environment(loaded, root, record):
+    """The environment the control and each tier run with: the audit's own, with its directories and record.
+
+    loaded is the tool loaded as a module, which names its record and unit
+    variables.
+    """
     env = dict(os.environ, TMPDIR=str(root), XDG_CACHE_HOME=str(root / "c"))
-    for name in ("TMUX", "TMUX_PANE", "TMUX_TMPDIR", f"{prefix}_SELFTEST_UNIT"):
+    for name in ("TMUX", "TMUX_PANE", "TMUX_TMPDIR", loaded.FENCE_UNIT_VAR):
         env.pop(name, None)
-    env[f"{prefix}_SELFTEST_FENCE"] = str(record)
+    env[loaded.FENCE_RECORD_VAR] = str(record)
     return env
+
+
+def read_record(record):
+    """(the record's lines as objects, a sentence for each line that is not a JSON object)."""
+    rows, wrong = [], []
+    for number, line in enumerate(record.read_text().splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            row = None
+        if isinstance(row, dict):
+            rows.append(row)
+        else:
+            wrong.append(f"line {number} of {record} is not a JSON object: {line[:200]!r}")
+    return rows, wrong
 
 
 # A tool run a unit starts: its fence goes in from the unit variable, as main's
@@ -202,12 +223,12 @@ sys.exit(tool.run_selftest(failed_only=True))
 '''
 
 
-def control(tool, record):
+def control(tool, loaded, record):
     """Make the three control refusals; returns (the record lines they wrote, what went wrong)."""
     root = private_root()
     try:
         done = subprocess.run([sys.executable, "-c", CONTROL, str(tool), TOOL_RUN],
-                              cwd=tool.parent, env=run_environment(tool, root, record),
+                              cwd=tool.parent, env=run_environment(loaded, root, record),
                               capture_output=True, text=True, timeout=CONTROL_BOUND,
                               stdin=subprocess.DEVNULL)
     except (subprocess.TimeoutExpired, OSError) as failed:
@@ -219,7 +240,8 @@ def control(tool, record):
         print(left)
     if done is None:
         return [], wrong
-    rows = [json.loads(line) for line in record.read_text().splitlines() if line.strip()]
+    rows, unparsed = read_record(record)
+    wrong += unparsed
     # It refuses three reads and so fails its own refusal row; any other status
     # is a run that did not get that far.
     if done.returncode != 1:
@@ -256,16 +278,18 @@ def run_record(tool, argv, env):
     return lines
 
 
-def run_tier(tool, label, live, args, record, environments):
+def run_tier(tool, loaded, label, live, args, record, environments):
     """Run one tier with the fence writing into record; returns what went wrong with it.
 
     Each item is (kind, sentence): kind "refused" for a failed refusal row,
     "unjudged" for anything that keeps the tier from being judged. The
     environment handed to script(1) is kept in environments under label, in
-    memory, for main to say which variables differed between the tiers.
+    memory, for main to say which variables differed between the tiers. The
+    refusal rows are the tool's TIER_PROCS: the read-only tier's, which a live
+    tier's read-only child states too, and in a live tier the live one's.
     """
     root = private_root()
-    env = run_environment(tool, root, record)
+    env = run_environment(loaded, root, record)
     environments[label] = env
     argv = [sys.executable, str(tool), *args]
     kept = record.with_name(f"{record.stem}.{label}.out")
@@ -300,10 +324,11 @@ def run_tier(tool, label, live, args, record, environments):
     for check_id, verdict in stated.items():
         if verdict == "FAIL":
             print(f"  FAIL {check_id}")
-    rows = [READ_ONLY_PROCS, *([LIVE_PROCS] if live else [])]
+    rows = [loaded.TIER_PROCS[False][0], *([loaded.TIER_PROCS[True][0]] if live else [])]
     for row in rows:
         if stated.get(row) == "FAIL":
-            wrong.append(("refused", f"{label}: {row} failed"))
+            wrong.append(("refused", f"{label}: {row} failed; its detail in {kept} names each "
+                                     "refusal and fault"))
         elif row not in stated:
             wrong.append(("unjudged", f"{label}: its output states no {row} row"))
     others = sorted(check_id for check_id, verdict in stated.items()
@@ -326,11 +351,14 @@ def main():
     parser.add_argument("--record", type=Path, help="keep the raw refusals here")
     args = parser.parse_args()
     tool = args.tool.resolve()
+    loaded = load(tool, "audited_tool")
     # The suite runs from the tool's own directory, so the record is named by
-    # its absolute path.
+    # its absolute path. The record and the record of known pids beside it
+    # start empty, so each holds this audit's lines only.
     record = (args.record or Path(tempfile.mkstemp(prefix="proc-audit-", suffix=".jsonl")[1])).resolve()
     record.write_text("")
-    controls, wrong = control(tool, record)
+    Path(loaded.known_record_path(record)).write_text("")
+    controls, wrong = control(tool, loaded, record)
     if wrong:
         for sentence in wrong:
             print(f"control: {sentence}")
@@ -345,14 +373,15 @@ def main():
                   for jobs in args.jobs]
     environments = {}
     faults = [fault for label, live, tier_args in tiers
-              for fault in run_tier(tool, label, live, tier_args, record, environments)]
+              for fault in run_tier(tool, loaded, label, live, tier_args, record, environments)]
     names = set().union(*environments.values())
     differing = sorted(name for name in names
                        if len({env.get(name) for env in environments.values()}) > 1)
     print("environment handed to script(1): every variable the same in every tier"
           + (f" but {', '.join(differing)}" if differing else ""))
-    rows = [json.loads(line) for line in record.read_text().splitlines()
-            if line.strip()][len(controls):]
+    rows, unparsed = read_record(record)
+    rows = rows[len(controls):]
+    faults += [("unjudged", sentence) for sentence in unparsed]
     by_unit = collections.defaultdict(lambda: collections.defaultdict(list))
     for row in rows:
         unit = row.get("unit") or "(outside any unit)"
