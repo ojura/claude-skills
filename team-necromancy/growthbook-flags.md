@@ -46,17 +46,22 @@ rather than buried in the large `~/.claude.json`, it survives any future cache
 refresh, and it needs no hand edit of the cache. Prefer it. Fall back to a cache
 edit only for a flag that has no env override.
 
-The env override reads as `nt("flag",default) || Boolean(te.CLAUDE_CODE_X)`, so
-setting the env var to `1` forces the feature on regardless of the cached
-value. Not every flag has one; most are cache-only. The pairs the binary
-actually reads this way, from 2.1.226 unless a row says otherwise:
+In 2.1.226 the env override reads as
+`nt("flag",default) || Boolean(te.CLAUDE_CODE_X)`, so setting the env var to `1`
+forces the feature on regardless of the cached value. In 2.1.296 two of them
+read the other way: when `CLAUDE_CODE_HARBOR_KITE` or
+`CLAUDE_CODE_LOOP_KEEPALIVE` is set, its value decides and the flag is not
+read, so `0` turns the feature off; when it is unset, the flag decides. Not
+every flag has an env override; most are cache-only. The pairs the binary
+actually reads, from 2.1.226 unless a row says otherwise:
 
-| env var (settings.json `env`) | flag it forces on |
+| env var (settings.json `env`) | flag it overrides |
 |---|---|
-| `CLAUDE_CODE_HARBOR_KITE` | `tengu_harbor_kite` (cross-session messaging) |
+| `CLAUDE_CODE_HARBOR_KITE` | `tengu_harbor_kite` (cross-session messaging; in 2.1.296 the variable decides when set, and the flag defaults to true) |
+| `CLAUDE_CODE_LOOP_KEEPALIVE` | `tengu_kairos_loop_keepalive` (2.1.296, `/loop` keepalive wakeups; the variable decides when set, and the flag defaults to true) |
 | `CLAUDE_CODE_FLEETVIEW_SIMPLE` | `tengu_fleetview_simple` |
 | `CLAUDE_CODE_NEW_INIT` | `tengu_slate_harbor_experiment` |
-| `CLAUDE_CODE_LANTERN_PRISM` | `tengu_lantern_prism` |
+| `CLAUDE_CODE_LANTERN_PRISM` | `tengu_lantern_prism` (in 2.1.296, `/skill-doctor`, `/plugin stats` and the plugin Usage menu) |
 | `CLAUDE_CODE_ENABLE_MENU_KIND_LANES` | `tengu_mint_lanes` |
 | `CLAUDE_CODE_PLUGIN_BINARY_ASSETS` | `tengu_plugin_binary_assets` |
 | `CLAUDE_CODE_WALNUT_SPIRE` | `tengu_walnut_spire` |
@@ -94,7 +99,12 @@ in that file moves:
 `k(name, default)` returns `getFeatureValueWithSource(name, default).value`,
 which checks in this order:
 
-1. `CLAUDE_INTERNAL_FC_OVERRIDES`, then config overrides (source `override`).
+1. Overrides (source `override`). Public builds stub both override sources:
+   `getEnvironmentOverrides()` returns `null` and `readConfigOverrides()`
+   returns nothing, so this step never applies. The client is given a
+   `readEnvironmentOverrides` dependency that returns
+   `CLAUDE_INTERNAL_FC_OVERRIDES`, but nothing calls it, so that variable has
+   no effect.
 2. If GrowthBook is disabled and the disk cache is not readable while disabled,
    the default (source `disabled`).
 3. The value in a payload this process fetched (source `payload`).
@@ -166,7 +176,7 @@ in a settings file still works in 2.1.292 and earlier.
 
 | flag | default | what it does |
 |---|---|---|
-| `tengu_harbor_kite` | false | Master gate for cross-session messaging. `YE()` returns `nt("tengu_harbor_kite",false) or CLAUDE_CODE_HARBOR_KITE`, and every messaging entry point checks `YE()`: the `ListAgents` and `SendMessage` tools' `isEnabled`, the uds/bridge send paths, and the socket startup at boot. This one flag turns the whole feature on; `CLAUDE_CODE_HARBOR_KITE=1` forces it on. |
+| `tengu_harbor_kite` | false | Master gate for cross-session messaging. `YE()` returns `nt("tengu_harbor_kite",false) or CLAUDE_CODE_HARBOR_KITE`, and every messaging entry point checks `YE()`: the `ListAgents` and `SendMessage` tools' `isEnabled`, the uds/bridge send paths, and the socket startup at boot. This one flag turns the whole feature on; `CLAUDE_CODE_HARBOR_KITE=1` forces it on. In 2.1.296 the gate is `xi()`: `Qh().messagingBeyondOwnAgentsDisabled` turns messaging off first, then a set `CLAUDE_CODE_HARBOR_KITE` decides on its own, then on Windows `tengu_harbor_kite_win` (default true) must hold, and last `k("tengu_harbor_kite", true)` decides, so the default is true. |
 | `tengu_rosy_wren` | false | Turns on `TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`, which are otherwise absent on Opus 4.8+, Sonnet 5+, Fable 5+ and Mythos 5+. `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` forces it on. Details below. |
 | `tengu_fleetview_peers` | false | Adds other live sessions as rows in the agent-view UI (read behind `YE() && nt("tengu_fleetview_peers",false)`). Cosmetic to the fleet view; messaging works without it. Turn on only if the peer list in agent-view is wanted. |
 | `tengu_harbor_kite_mode_emit` | false | Telemetry only: emits the session's messaging mode as an event (`Hoi()`). |
