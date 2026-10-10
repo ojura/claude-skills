@@ -68,6 +68,7 @@ actually reads, from 2.1.226 unless a row says otherwise:
 | `CLAUDE_CODE_ARTIFACT_DIRECT_UPLOAD` | `tengu_cobalt_plinth_direct` |
 | `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK` | `tengu_disable_streaming_to_non_streaming_fallback` |
 | `CLAUDE_CODE_ENABLE_TODO_TOOLS` | `tengu_rosy_wren` (task tools; both new in 2.1.234) |
+| `CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT` | `tengu_splendid_horizon` (2.1.296, only the `enabled` field: a true value turns the auto-deny timer off; no variable sets the timer's length) |
 
 These are only the `flag-OR-env` overrides. Env vars that gate behaviour on
 their own without a matching flag (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`,
@@ -181,6 +182,7 @@ in a settings file still works in 2.1.292 and earlier.
 | `tengu_fleetview_peers` | false | Adds other live sessions as rows in the agent-view UI (read behind `YE() && nt("tengu_fleetview_peers",false)`). Cosmetic to the fleet view; messaging works without it. Turn on only if the peer list in agent-view is wanted. |
 | `tengu_harbor_kite_mode_emit` | false | Telemetry only: emits the session's messaging mode as an event (`Hoi()`). |
 | `tengu_harbor_kite_limits` | `{}`, meaning built-in defaults | Rate-limit config for peer messaging (bucketCapacity, refillPerSecond, dedupWindowMs, maxSelfHops, maxChainLength, maxTrackedSenders, maxQueuedPeerMessages). The validator falls back to built-in defaults per field, so an absent or empty entry gives the defaults. Set it only to tighten a specific limit. |
+| `tengu_splendid_horizon` | `{}`, meaning built-in defaults | The auto-deny timer on the permission prompt for a dangerous `rm` or `rmdir` in bypass and auto mode. `timeoutMs` (default 120000) is its length, and a disk-cache value for it takes effect. Details below. |
 | `tengu_chair_sermon` | false | Broadens how attachment reminders are moved into tool results. It is not the switch for message-level system entries, and on the non-promoted fallback path ordinary text steering can already join a string-valued tool result while this flag is false. Leave it off unless its mixed-content relocation is specifically wanted; details below. |
 
 ## Tools behind default-false flags (2.1.296)
@@ -498,6 +500,68 @@ id is `CLAUDE_CODE_TASK_LIST_ID`, else the team name, else the session id, so a
 team shares one list and `owner` is how work is assigned across it. TodoWrite
 has no ids, dependencies, owners or hooks, replaces the whole list on every
 call, and stores `[]` once every item is completed.
+
+## Dangerous-rm prompt timer: `tengu_splendid_horizon`
+
+Traced in 2.1.296 and checked live.
+
+The Bash permission check flags an `rm` or `rmdir` whose target can remove far
+more than intended: a shell variable that leaves `/`, `/*` or a top-level path
+when it is empty, the output of a command substitution, a relative glob after
+`cd`, or a system, home or workspace directory. The decision reason it returns
+has `circuitBreaker: "dangerousRemoval"`, and that entry in the table of
+circuit breakers has `bypassImmune: true`. So the call asks for permission even
+in bypass mode, and no allow rule can approve it.
+
+In bypass mode and in auto mode, when the session can show a permission dialog,
+the prompt gets an auto-deny timer, configured by this flag. `q9()` reads it
+with `Fn("tengu_splendid_horizon", {})`, which returns the value together with
+its source, and checks each field separately:
+
+| field | default | where it is read from | effect |
+|---|---|---|---|
+| `enabled` | true | a fetched payload only; a cache value is ignored. A true `CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT` makes it false | false removes the timer, so the prompt waits for an answer |
+| `showDialog` | true | any source | false denies the call at once, without a prompt |
+| `timeoutMs` | 120000 | any source; a value outside 5000 to 3600000 is replaced by the default | how long the prompt stays open before the call is denied |
+| `maxDialogTimeouts` | 3 | any source; an integer from 0 to 100 | after this many prompts in one process have timed out, later flagged removals are denied without a prompt; 0 means no limit |
+
+The other three fields apply only while `enabled` is true. The count for
+`maxDialogTimeouts` goes back to zero whenever someone answers one of these
+prompts or cancels its timer.
+
+While the timer runs, the prompt shows a countdown: "Claude Code will
+automatically deny this request in 0:14, to avoid blocking progress on an
+unattended session". When it reaches zero, the model receives a tool result
+saying that a built-in safety check denied the command, not the user, that the
+command did not run, and that it must not work around the check. The result
+ends with the check's own text, which usually suggests a rewrite such as
+`"${VAR:?}"` or a literal path.
+
+Any keyboard or mouse input except wheel scrolling cancels the timer, and so
+does opening the transcript view while the prompt is open: both emit
+`autoDenyPresence`. The prompt then stays open until someone answers it. The
+timer therefore only denies when nobody touches the terminal.
+
+To shorten the timer, add the flag to the disk cache as
+`"tengu_splendid_horizon": {"timeoutMs": 15000}`. The other fields can be left
+out, because each one that is missing gets its default. The entry only takes
+effect in processes that read the disk cache (see
+[How a flag read resolves](#how-a-flag-read-resolves-21296)), and like any
+cache edit it is lost when a process with GrowthBook enabled fetches a payload.
+
+Checked live on 2026-10-10 with 2.1.296 in interactive sessions in tmux, in
+bypass mode. Each session had its own `CLAUDE_CONFIG_DIR`, telemetry off with
+the disk cache readable, and a local listener that answered the first request
+with a Bash call to `rm -f $CC_RM_A/$CC_RM_B`, both variables unset:
+
+| cache entry | input while the prompt was open | tool result |
+|---|---|---|
+| `{"timeoutMs": 15000}` | none | denied 15.1 s after the Bash call |
+| none | none | denied 120.1 s after the Bash call |
+| `{"timeoutMs": 15000}` | one Down arrow, 2.5 s after the Bash call | none after 142 s; the countdown line disappeared at the keypress and the prompt stayed open |
+
+In the same setup, `rm -f "$CC_RM_UNSET"/name` ran without a prompt, so a test
+needs a target such as `$A/$B`. Auto mode was not tested.
 
 ## Messaging/teams cluster
 
