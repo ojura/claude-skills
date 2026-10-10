@@ -7,10 +7,9 @@ lives here because it was started while tracing cross-session messaging and
 
 ## Why this exists
 
-This box runs with `DISABLE_TELEMETRY=1` in the `env` block of
-`~/.claude/settings.json`. Any telemetry-off setting (`DISABLE_TELEMETRY`,
-`DO_NOT_TRACK`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`) disables GrowthBook,
-so the binary never fetches flags. A flag then reads the disk cache at
+Any telemetry-off setting (`DISABLE_TELEMETRY`, `DO_NOT_TRACK`,
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`) disables GrowthBook, so Claude Code
+does not fetch flags. A flag then reads the disk cache at
 `cachedGrowthBookFeatures` in `~/.claude.json` only if
 `CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF` is true and the provider is
 `firstParty`. Otherwise every flag reads its default, and every feature behind
@@ -19,13 +18,16 @@ warning, when it comes from a settings file, so it has to be in the environment
 Claude Code is launched with; see
 [How a flag read resolves](#how-a-flag-read-resolves-21296).
 
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is not used here: besides disabling
-GrowthBook, it disables `/feedback` and the `SendFeedback` tool outright.
+With telemetry off, a feature behind a flag therefore depends on the value in
+that cache or on an env override. This registry records what each flag does,
+so the right one can be chosen.
+
+Of the three telemetry-off settings, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`
+also disables `/feedback` and the `SendFeedback` tool.
 
 A process with GrowthBook enabled replaces `cachedGrowthBookFeatures` with each
-payload it fetches, so a hand edit lasts only until the next such fetch. On
-2026-10-10 the cache held 856 entries, last written 2026-10-08 15:14 UTC
-(`cachedGrowthBookFeaturesAt`).
+payload it fetches, so a hand edit of the cache lasts only until the next such
+fetch.
 
 A flag read is `k("name", default)` in the 2.1.296 bundle, `tt` in 2.1.234 and
 `nt` in 2.1.226: first argument the flag name, second the value returned when
@@ -40,14 +42,14 @@ the name is worth nothing. Record only what a read site proves.
 Some flags also read a `CLAUDE_CODE_*` environment variable and honour it over
 the cache. Where one exists, the env var in the `env` block of
 `~/.claude/settings.json` is the better switch: it is visible in a short file
-rather than buried in `~/.claude.json` (236KB on 2026-10-10), it survives any
-future cache refresh, and it needs no hand edit of the cache. Prefer it. Fall
-back to a cache edit only for a flag that has no env override.
+rather than buried in the large `~/.claude.json`, it survives any future cache
+refresh, and it needs no hand edit of the cache. Prefer it. Fall back to a cache
+edit only for a flag that has no env override.
 
 The env override reads as `nt("flag",default) || Boolean(te.CLAUDE_CODE_X)`, so
 setting the env var to `1` forces the feature on regardless of the cached
-value. Not every flag has one; most are cache-only. The pairs the 2.1.226
-binary actually reads this way:
+value. Not every flag has one; most are cache-only. The pairs the binary
+actually reads this way, from 2.1.226 unless a row says otherwise:
 
 | env var (settings.json `env`) | flag it forces on |
 |---|---|
@@ -60,6 +62,7 @@ binary actually reads this way:
 | `CLAUDE_CODE_WALNUT_SPIRE` | `tengu_walnut_spire` |
 | `CLAUDE_CODE_ARTIFACT_DIRECT_UPLOAD` | `tengu_cobalt_plinth_direct` |
 | `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK` | `tengu_disable_streaming_to_non_streaming_fallback` |
+| `CLAUDE_CODE_ENABLE_TODO_TOOLS` | `tengu_rosy_wren` (task tools; both new in 2.1.234) |
 
 These are only the `flag-OR-env` overrides. Env vars that gate behaviour on
 their own without a matching flag (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`,
@@ -85,9 +88,6 @@ in that file moves:
 3. replace, re-parse the result as JSON, check the byte count changed by only
    the expected delta
 4. write to a temp file, `os.replace` into place
-
-Done this way for `tengu_harbor_kite` on 2026-08-10; backup
-`/tmp/claude.json.bak-1786351982`.
 
 ## How a flag read resolves (2.1.296)
 
@@ -144,49 +144,38 @@ were present or absent together.
 | 2.1.295 | absent | not run |
 | 2.1.296 | absent | present |
 
-Each run used the launch environment of a session started from a terminal,
-`ANTHROPIC_BASE_URL=http://127.0.0.1:9` (a closed port, so no request left the
-machine; the base URL takes no part in the checks above), a copy of
-`~/.claude.json` and `settings.json` in a separate `CLAUDE_CONFIG_DIR`,
+Each run used a separate `CLAUDE_CONFIG_DIR` whose `.claude.json` cache held
+`tengu_amber_sentinel` and `tengu_kairos_push_notifications` as `true` and
+whose `settings.json` set `DISABLE_TELEMETRY=1` and
+`CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF=1`. The launch environment had
+neither variable, except in the last column, where it had both. Every run also
+had `ANTHROPIC_BASE_URL=http://127.0.0.1:9` (a closed port, so no request left
+the machine; the base URL takes no part in the checks above),
 `--settings '{"disableAllHooks":true}'`, `--strict-mcp-config` and
-`--no-session-persistence`. The process was killed after the `init` event.
-Print mode runs as entrypoint `sdk-cli`, which the `SendFeedback` and
-`EndConversation` gates exclude, so those two cannot be seen this way.
-`Monitor` and `PushNotification` have no entrypoint condition, so their presence
-shows whether the process reads the disk cache.
-
-The transcripts agree. Session `7e1200e6`, started from a terminal with
-`claude --resume`, had `EndConversation` and `SendFeedback` under 2.1.292,
-lost both at its first turns under 2.1.293 (2026-10-08 15:38 and 15:54 UTC),
-and still lacked them under 2.1.296. Session `12019401` lacked
-`EndConversation`, `Monitor` and `PushNotification` under 2.1.294 and had them
-under 2.1.295 on 2026-10-10, in a process started with `--agent-id` whose launch
-environment carries `DISABLE_TELEMETRY=1` and
-`CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF=1`.
+`--no-session-persistence`, and was killed after the `init` event. Print mode
+runs as entrypoint `sdk-cli`, which the `SendFeedback` and `EndConversation`
+gates exclude, so those two cannot be seen this way. `Monitor` and
+`PushNotification` have no entrypoint condition, so their presence shows
+whether the process reads the disk cache.
 
 To keep disk reads, set `CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF=1` in the
-environment of whatever starts `claude` (the shell or the launcher). The copy in
-`settings.json` still applies to 2.1.292 and earlier.
+environment of whatever starts `claude` (the shell or the launcher). Setting it
+in a settings file still works in 2.1.292 and earlier.
 
-## Enabled here
+## Traced flags
 
-| flag | default | set to | why |
-|---|---|---|---|
-| `tengu_harbor_kite` | false | **true** | Master gate for cross-session messaging. `YE()` returns `nt("tengu_harbor_kite",false) or CLAUDE_CODE_HARBOR_KITE`, and every messaging entry point checks `YE()`: the `ListAgents` and `SendMessage` tools' `isEnabled`, the uds/bridge send paths, and the socket startup at boot. This one flag turns the whole feature on. |
-
-## Considered and left off
-
-| flag | default | left at | why not |
-|---|---|---|---|
-| `tengu_fleetview_peers` | false | false | Adds other live sessions as rows in the agent-view UI (read behind `YE() && nt("tengu_fleetview_peers",false)`). Cosmetic to the fleet view; messaging works without it. Turn on only if the peer list in agent-view is wanted. |
-| `tengu_harbor_kite_mode_emit` | false | false | Telemetry only: emits the session's messaging mode as an event (`Hoi()`). Off is correct with nonessential traffic disabled. |
-| `tengu_harbor_kite_limits` | `{}` → built-in defaults | absent | Rate-limit config for peer messaging (bucketCapacity, refillPerSecond, dedupWindowMs, maxSelfHops, maxChainLength, maxTrackedSenders, maxQueuedPeerMessages). The validator falls back to built-in defaults per field, so an absent or empty entry is the working default. The cache already holds `{}`. Only override to tighten a specific limit. |
-| `tengu_chair_sermon` | false | false | Broadens how attachment reminders are moved into tool results. It is not the switch for message-level system entries, and on the non-promoted fallback path ordinary text steering can already join a string-valued tool result while this flag is false. Leave it off unless its mixed-content relocation is specifically wanted; details below. |
+| flag | default | what it does |
+|---|---|---|
+| `tengu_harbor_kite` | false | Master gate for cross-session messaging. `YE()` returns `nt("tengu_harbor_kite",false) or CLAUDE_CODE_HARBOR_KITE`, and every messaging entry point checks `YE()`: the `ListAgents` and `SendMessage` tools' `isEnabled`, the uds/bridge send paths, and the socket startup at boot. This one flag turns the whole feature on; `CLAUDE_CODE_HARBOR_KITE=1` forces it on. |
+| `tengu_rosy_wren` | false | Turns on `TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`, which are otherwise absent on Opus 4.8+, Sonnet 5+, Fable 5+ and Mythos 5+. `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` forces it on. Details below. |
+| `tengu_fleetview_peers` | false | Adds other live sessions as rows in the agent-view UI (read behind `YE() && nt("tengu_fleetview_peers",false)`). Cosmetic to the fleet view; messaging works without it. Turn on only if the peer list in agent-view is wanted. |
+| `tengu_harbor_kite_mode_emit` | false | Telemetry only: emits the session's messaging mode as an event (`Hoi()`). |
+| `tengu_harbor_kite_limits` | `{}`, meaning built-in defaults | Rate-limit config for peer messaging (bucketCapacity, refillPerSecond, dedupWindowMs, maxSelfHops, maxChainLength, maxTrackedSenders, maxQueuedPeerMessages). The validator falls back to built-in defaults per field, so an absent or empty entry gives the defaults. Set it only to tighten a specific limit. |
+| `tengu_chair_sermon` | false | Broadens how attachment reminders are moved into tool results. It is not the switch for message-level system entries, and on the non-promoted fallback path ordinary text steering can already join a string-valued tool result while this flag is false. Leave it off unless its mixed-content relocation is specifically wanted; details below. |
 
 ## Tools behind default-false flags (2.1.296)
 
-Each of these tools is absent whenever its flag reads the default. All four
-flags were `true` in the cache on 2026-10-10.
+Each of these tools is absent whenever its flag reads the default.
 
 | tool | flag | other conditions |
 |---|---|---|
@@ -209,7 +198,7 @@ flags were `true` in the cache on 2026-10-10.
   fetched in this session nor read from `~/.claude/policy-limits.json`
   (`onCacheMiss: "deny"`; it is also denied under HIPAA and ZDR). With
   `CLAUDE_CODE_OAUTH_TOKEN`, the subscription type comes from
-  `CLAUDE_CODE_SUBSCRIPTION_TYPE`, which `settings.json` sets to `max` here;
+  `CLAUDE_CODE_SUBSCRIPTION_TYPE`;
 - the entrypoint is not a remote, Slack or Teams one, and not `sdk-ts`,
   `sdk-py` or `sdk-cli`, so `claude -p` never has the tool;
 - the provider is `firstParty`;
@@ -221,8 +210,8 @@ flags were `true` in the cache on 2026-10-10.
 - the main-loop model is Opus 4.8+, Sonnet 5+, Fable 5+ or Mythos 5+;
 - `tengu_umber_kestrel` is `true` or an object. An object's `scope` sets a
   regex over entrypoint names; otherwise the regex is `^cli$`;
-- the entrypoint matches that regex. With the cached value `true`, only
-  interactive `cli` sessions qualify.
+- the entrypoint matches that regex. With the value `true`, only interactive
+  `cli` sessions qualify.
 
 ## Mid-turn attachments: `tengu_chair_sermon`
 
@@ -397,28 +386,108 @@ available, the chair-sermon flag is bypassed and both flag values take the same
 path closest to native user-message ordering; leaving it false avoids the
 broader tool-output merge only on fallback and mixed-content paths.
 
-## Already in the cache, messaging/teams cluster
+## Task tools: `tengu_rosy_wren`
 
-Recorded here because they share the naming and matter to this tool. Values as
-found in `cachedGrowthBookFeatures` on 2026-08-07; not changed.
+Traced in 2.1.234. Both the flag and its env override are new in that build:
+neither string occurs in 2.1.232. The flag reader is `tt("name", default)` in
+2.1.234, the same function this file calls `nt` at 2.1.226 under a different
+minified name.
 
-| flag | cached value | what it is |
+The flag decides whether `TaskCreate`, `TaskGet`, `TaskList` and `TaskUpdate`
+exist at all on Opus 4.8+, Sonnet 5+, Fable 5+ and Mythos 5+. When the flag
+reads its `false` default, because neither a payload nor the disk cache supplies
+it, the four tools are missing on those models. The env override turns them on
+without the flag.
+
+The read site, deminified:
+
+```js
+function gW(){ if (V.CLAUDE_CODE_ENABLE_TASKS === false) return false; return true }
+
+function aJ(){
+  if (PI() || Hbs()) return true;                     // bg session, or CLI opt-in
+  let m = vxr();                                       // canonical main-loop model id
+  if (m === undefined || !LLr(m, xuv)) return true;    // below threshold: always on
+  if (V.CLAUDE_CODE_ENABLE_TODO_TOOLS === true) return true;
+  return tt("tengu_rosy_wren", false) === true;
+}
+
+function yte(){ return gW() && aJ() }
+
+xuv = [["opus",[4,8]], ["sonnet",[5]], ["fable",[5]], ["mythos",[5]]];
+Voi = [TodoWrite, TaskCreate, TaskGet, TaskUpdate, TaskList];
+```
+
+`LLr` parses `claude-<family>-<version>` and returns true when the version is at
+or above that family's entry in `xuv`. So the flag is only ever consulted on
+Opus 4.8+, Sonnet 5+, Fable 5+ and Mythos 5+. A family absent from `xuv`, such
+as Haiku, makes `LLr` false, `aJ` returns true two lines earlier, and the tools
+are present with nothing set.
+
+Four things satisfy `aJ()`, only three of them local:
+
+1. `CLAUDE_CODE_ENABLE_TODO_TOOLS` set to `1`/`true`/`yes`/`on` (parsed by `$n`).
+2. Naming any of the five tools in `--allowedTools` or `--tools`. Startup runs
+   `Tbs(Voi.some(p))` where `p` tests the CLI tool rules, so mentioning one
+   enables all four.
+3. A background session or job takeover: `PI()` is `As() || r5() !== null`.
+4. The flag.
+
+### Two flags, two jobs
+
+`CLAUDE_CODE_ENABLE_TODO_TOOLS` decides whether a checklist tool exists.
+`CLAUDE_CODE_ENABLE_TASKS` decides which one, and the two `isEnabled` bodies are
+complements on it: the task tools are `gW() && aJ()`, TodoWrite is
+`!gW() && aJ()`. You never get both, and `ENABLE_TASKS=false` on its own gives
+neither, because `aJ()` is still unsatisfied. Verified by diffing the `tools`
+array in the stream-json init event:
+
+| env | tools present |
+|---|---|
+| neither | none |
+| `ENABLE_TODO_TOOLS=1` | TaskCreate, TaskGet, TaskList, TaskUpdate |
+| `ENABLE_TASKS=false` | none |
+| `ENABLE_TASKS=false` + `ENABLE_TODO_TOOLS=1` | TodoWrite |
+| `ENABLE_TASKS=true` | none |
+
+`CLAUDE_CODE_ENABLE_TASKS` is an off-switch only. `Ve.triBool()` parses `true`,
+`false` and `undefined`, but `gW` tests `=== false` alone, so `true` and unset
+take the identical branch. No env var means "tasks on"; the on-switch is
+`ENABLE_TODO_TOOLS`, despite the name.
+
+### Why this matters to this tool
+
+The task tools are a persisted store, not TodoWrite's in-memory list. Each task
+is a file at `~/.claude/tasks/<listId>/<taskId>.json` carrying `status`,
+`owner`, `blocks`, `blockedBy` and `metadata`; creation fires `TaskCreated`
+hooks, and a hook exiting 2 deletes the just-written task and throws. The list
+id is `CLAUDE_CODE_TASK_LIST_ID`, else the team name, else the session id, so a
+team shares one list and `owner` is how work is assigned across it. TodoWrite
+has no ids, dependencies, owners or hooks, replaces the whole list on every
+call, and stores `[]` once every item is completed.
+
+## Messaging/teams cluster
+
+Recorded here because they share the naming and matter to this tool. Values are
+those GrowthBook served on 2026-08-07; they can differ by account and change
+over time.
+
+| flag | served value | what it is |
 |---|---|---|
 | `tengu_amber_flint` | true | Teams killswitch. Read `nt(...,true)`. With teams opted in via `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` or `--agent-teams`, this being true is what lets `isAgentSwarmsEnabled` return true. Turning it false would disable agent teams even when opted in. |
-| `tengu_harbor` | true | Present and true; not yet traced to a behaviour. |
-| `tengu_harbor_permissions` | true | Present and true; not yet traced. |
-| `tengu_harbor_prism` | true | Present and true; not yet traced. |
-| `tengu_cobalt_harbor_notice` | true | Present and true; not yet traced. |
+| `tengu_harbor` | true | Not yet traced to a behaviour. |
+| `tengu_harbor_permissions` | true | Not yet traced. |
+| `tengu_harbor_prism` | true | Not yet traced. |
+| `tengu_cobalt_harbor_notice` | true | Not yet traced. |
 | `tengu_cobalt_harbor` | false | Read `nt("tengu_cobalt_harbor",false)`; a remote-control-at-startup source. Not traced further. |
 | `tengu_harbor_ledger` | list of official plugins (discord, telegram, fakechat, imessage) | A plugin allowlist, not a boolean. |
 | `tengu_flint_harbor` | true | Drives the onboarding-guide generator (`tengu_flint_harbor_prompt` carries its full prompt). Unrelated to messaging despite the name. |
 
-The remaining `*_harbor` / `*_kite` entries in the cache
-(`tengu_slate_harbor_experiment`, `tengu_quiet_harbor`, `tengu_woven_harbor`,
-`tengu_silent_harbor`, `tengu_zinc_harbor`, `tengu_velvet_harbor`,
-`tengu_fennel_kite`, `tengu_gypsum_kite`, `tengu_quill_harbor`,
-`tengu_harbor_willow`) are present but not traced. Add a row when a read site
-is read, not before.
+The remaining `*_harbor` / `*_kite` flags (`tengu_slate_harbor_experiment`,
+`tengu_quiet_harbor`, `tengu_woven_harbor`, `tengu_silent_harbor`,
+`tengu_zinc_harbor`, `tengu_velvet_harbor`, `tengu_fennel_kite`,
+`tengu_gypsum_kite`, `tengu_quill_harbor`, `tengu_harbor_willow`) have not been
+traced. Add a row when a read site is read, not before.
 
 ## New gates in 2.1.226, not traced
 
