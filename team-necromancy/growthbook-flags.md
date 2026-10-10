@@ -7,30 +7,42 @@ lives here because it was started while tracing cross-session messaging and
 
 ## Why this exists
 
-This box runs with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and
-`CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF=1` in `~/.claude/settings.json`.
-With nonessential traffic off, the binary never fetches flags from GrowthBook;
-it reads only the disk cache at `cachedGrowthBookFeatures` in `~/.claude.json`.
-So a feature the server would have turned on stays off here unless its flag is
-written into that cache by hand. The binary must not rewrite `~/.claude.json`
-on its own for this; we choose which flags to add.
+This box runs with `DISABLE_TELEMETRY=1` in the `env` block of
+`~/.claude/settings.json`. Any telemetry-off setting (`DISABLE_TELEMETRY`,
+`DO_NOT_TRACK`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`) disables GrowthBook,
+so the binary never fetches flags. A flag then reads the disk cache at
+`cachedGrowthBookFeatures` in `~/.claude.json` only if
+`CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF` is true and the provider is
+`firstParty`. Otherwise every flag reads its default, and every feature behind
+a default-false flag is off. Since 2.1.293 that variable is ignored, without a
+warning, when it comes from a settings file, so it has to be in the environment
+Claude Code is launched with; see
+[How a flag read resolves](#how-a-flag-read-resolves-21296).
 
-A flag read is `nt("name", default)` in the 2.1.226 minified bundle: first
-argument the flag name, second the fallback used when the cache has no entry.
-`cj("name")` is the async boolean form, default false. `Vue("name", default,
-validator)` reads a config object. To see what a flag does, find its read site
-and follow the value, never the name — the names are deliberately opaque
-(`tengu_thrifty_sonic`, `tengu_hover_rest`), so a guess from the name is worth
-nothing. Record only what a read site proves.
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is not used here: besides disabling
+GrowthBook, it disables `/feedback` and the `SendFeedback` tool outright.
+
+A process with GrowthBook enabled replaces `cachedGrowthBookFeatures` with each
+payload it fetches, so a hand edit lasts only until the next such fetch. On
+2026-10-10 the cache held 856 entries, last written 2026-10-08 15:14 UTC
+(`cachedGrowthBookFeaturesAt`).
+
+A flag read is `k("name", default)` in the 2.1.296 bundle, `tt` in 2.1.234 and
+`nt` in 2.1.226: first argument the flag name, second the value returned when
+the flag cannot be read. `cj("name")` is the async boolean form, default false.
+`Vue("name", default, validator)` reads a config object. To see what a flag
+does, find its read site and follow the value, never the name. The names are
+deliberately opaque (`tengu_thrifty_sonic`, `tengu_hover_rest`), so a guess from
+the name is worth nothing. Record only what a read site proves.
 
 ## Two ways to turn one on
 
 Some flags also read a `CLAUDE_CODE_*` environment variable and honour it over
 the cache. Where one exists, the env var in the `env` block of
-`~/.claude/settings.json` is the better switch: it is visible in a 70-line
-file rather than buried in a 188KB one, it survives any future cache refresh,
-and it needs no textual surgery. Prefer it. Fall back to a cache edit only for
-a flag that has no env override.
+`~/.claude/settings.json` is the better switch: it is visible in a short file
+rather than buried in `~/.claude.json` (236KB on 2026-10-10), it survives any
+future cache refresh, and it needs no hand edit of the cache. Prefer it. Fall
+back to a cache edit only for a flag that has no env override.
 
 The env override reads as `nt("flag",default) || Boolean(te.CLAUDE_CODE_X)`, so
 setting the env var to `1` forces the feature on regardless of the cached
@@ -55,10 +67,18 @@ their own without a matching flag (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`,
 `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`, `DISABLE_GROWTHBOOK`, and many more)
 are a separate set and not listed here.
 
+`CLAUDE_CODE_SEND_FEEDBACK` looks like one of these overrides but is not: in
+2.1.296, `false` turns `SendFeedback` off, while `true` and unset both return
+`k("tengu_juniper_relay", false)`, so it cannot turn the tool on.
+
 ## How to edit the cache
 
+A cache edit has effect only in processes that read the disk cache, which with
+telemetry off means processes launched with
+`CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF` in their environment.
+
 Textual single-occurrence replace, never a full JSON rewrite, so nothing else
-in that 188KB file moves:
+in that file moves:
 
 1. back up `~/.claude.json` to `/tmp` first, 0600
 2. confirm the exact `"flag": value` string occurs exactly once
@@ -68,6 +88,85 @@ in that 188KB file moves:
 
 Done this way for `tengu_harbor_kite` on 2026-08-10; backup
 `/tmp/claude.json.bak-1786351982`.
+
+## How a flag read resolves (2.1.296)
+
+`k(name, default)` returns `getFeatureValueWithSource(name, default).value`,
+which checks in this order:
+
+1. `CLAUDE_INTERNAL_FC_OVERRIDES`, then config overrides (source `override`).
+2. If GrowthBook is disabled and the disk cache is not readable while disabled,
+   the default (source `disabled`).
+3. The value in a payload this process fetched (source `payload`).
+4. If this process holds a payload that lacks the name, the default.
+5. For seven fixed `tengu_*` names that are never read from disk, the default.
+6. `cachedGrowthBookFeatures[name]` from `~/.claude.json` (source `disk`).
+7. Otherwise the default.
+
+GrowthBook is enabled (`mg()`) only when all of these hold:
+
+- `DISABLE_GROWTHBOOK` is not true;
+- the provider is `firstParty`, or `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` is true;
+- no host gateway credential is present;
+- the telemetry level is `default`: `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`
+  and `DISABLE_TELEMETRY` are unset (any non-empty value counts, `0` included)
+  and `DO_NOT_TRACK` is not true;
+- `CLAUDE_CODE_CUSTOM_OAUTH_URL` is unset.
+
+The disk cache is readable while GrowthBook is disabled (`nB()`) only when
+`CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF` is true, `DISABLE_GROWTHBOOK` is
+not true, the telemetry level is not `default`, and the provider is
+`firstParty`.
+`ANTHROPIC_BASE_URL` takes no part in either check, so a session routed through
+a proxy reads flags the same way as a direct one.
+
+### Since 2.1.293 the disk-cache variable must be in the launch environment
+
+`filterSettingsEnv` drops, without a warning, every settings-file env key in a
+fixed set of names that settings files may not set. 2.1.293 added
+`CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF` to that set; the set in 2.1.292
+does not contain it. `DISABLE_TELEMETRY` is not in the set. So when both come
+only from `~/.claude/settings.json`, GrowthBook is disabled, the disk cache is
+not read, and every flag reads its default (source `disabled`). The tools in
+[Tools behind default-false flags](#tools-behind-default-false-flags-21296)
+then disappear.
+
+Measured on 2026-10-10 by starting each installed version in print mode and
+reading the `tools` array of the stream-json `init` event. The table says
+whether `Monitor` and `PushNotification` were in that array; in every run they
+were present or absent together.
+
+| version | both variables only in settings.json | both also in the launch environment |
+|---|---|---|
+| 2.1.292 | present | not run |
+| 2.1.293 | absent | not run |
+| 2.1.294 | absent | not run |
+| 2.1.295 | absent | not run |
+| 2.1.296 | absent | present |
+
+Each run used the launch environment of a session started from a terminal,
+`ANTHROPIC_BASE_URL=http://127.0.0.1:9` (a closed port, so no request left the
+machine; the base URL takes no part in the checks above), a copy of
+`~/.claude.json` and `settings.json` in a separate `CLAUDE_CONFIG_DIR`,
+`--settings '{"disableAllHooks":true}'`, `--strict-mcp-config` and
+`--no-session-persistence`. The process was killed after the `init` event.
+Print mode runs as entrypoint `sdk-cli`, which the `SendFeedback` and
+`EndConversation` gates exclude, so those two cannot be seen this way.
+`Monitor` and `PushNotification` have no entrypoint condition, so their presence
+shows whether the process reads the disk cache.
+
+The transcripts agree. Session `7e1200e6`, started from a terminal with
+`claude --resume`, had `EndConversation` and `SendFeedback` under 2.1.292,
+lost both at its first turns under 2.1.293 (2026-10-08 15:38 and 15:54 UTC),
+and still lacked them under 2.1.296. Session `12019401` lacked
+`EndConversation`, `Monitor` and `PushNotification` under 2.1.294 and had them
+under 2.1.295 on 2026-10-10, in a process started with `--agent-id` whose launch
+environment carries `DISABLE_TELEMETRY=1` and
+`CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF=1`.
+
+To keep disk reads, set `CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF=1` in the
+environment of whatever starts `claude` (the shell or the launcher). The copy in
+`settings.json` still applies to 2.1.292 and earlier.
 
 ## Enabled here
 
@@ -83,6 +182,47 @@ Done this way for `tengu_harbor_kite` on 2026-08-10; backup
 | `tengu_harbor_kite_mode_emit` | false | false | Telemetry only: emits the session's messaging mode as an event (`Hoi()`). Off is correct with nonessential traffic disabled. |
 | `tengu_harbor_kite_limits` | `{}` → built-in defaults | absent | Rate-limit config for peer messaging (bucketCapacity, refillPerSecond, dedupWindowMs, maxSelfHops, maxChainLength, maxTrackedSenders, maxQueuedPeerMessages). The validator falls back to built-in defaults per field, so an absent or empty entry is the working default. The cache already holds `{}`. Only override to tighten a specific limit. |
 | `tengu_chair_sermon` | false | false | Broadens how attachment reminders are moved into tool results. It is not the switch for message-level system entries, and on the non-promoted fallback path ordinary text steering can already join a string-valued tool result while this flag is false. Leave it off unless its mixed-content relocation is specifically wanted; details below. |
+
+## Tools behind default-false flags (2.1.296)
+
+Each of these tools is absent whenever its flag reads the default. All four
+flags were `true` in the cache on 2026-10-10.
+
+| tool | flag | other conditions |
+|---|---|---|
+| `SendFeedback` | `tengu_juniper_relay` | listed below |
+| `EndConversation` | `tengu_umber_kestrel` | entrypoint and model, listed below |
+| `Monitor` | `tengu_amber_sentinel` | on Windows, Git Bash or PowerShell must be available |
+| `PushNotification` | `tengu_kairos_push_notifications` | none |
+
+`SendFeedback` (`isEnabled` is `zG()`) needs all of these:
+
+- the `feedbackDrafts` setting is not `off` (unset means `notify`);
+- `DISABLE_FEEDBACK_COMMAND` and `DISABLE_BUG_COMMAND` are not true, and
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is unset;
+- the policy `allow_product_feedback` allows it. The policy applies only to
+  credentials that `K5()` treats as policy-eligible. OAuth credentials whose
+  subscription type is set and is neither `team` nor `enterprise` are not
+  eligible, so the policy never blocks them. An API key, or OAuth credentials
+  without a subscription type, are eligible, and for them
+  `allow_product_feedback` is denied whenever no policy is loaded, neither
+  fetched in this session nor read from `~/.claude/policy-limits.json`
+  (`onCacheMiss: "deny"`; it is also denied under HIPAA and ZDR). With
+  `CLAUDE_CODE_OAUTH_TOKEN`, the subscription type comes from
+  `CLAUDE_CODE_SUBSCRIPTION_TYPE`, which `settings.json` sets to `max` here;
+- the entrypoint is not a remote, Slack or Teams one, and not `sdk-ts`,
+  `sdk-py` or `sdk-cli`, so `claude -p` never has the tool;
+- the provider is `firstParty`;
+- `CLAUDE_CODE_SEND_FEEDBACK` is not `false`;
+- `tengu_juniper_relay` is true.
+
+`EndConversation` needs all of these:
+
+- the main-loop model is Opus 4.8+, Sonnet 5+, Fable 5+ or Mythos 5+;
+- `tengu_umber_kestrel` is `true` or an object. An object's `scope` sets a
+  regex over entrypoint names; otherwise the regex is `^cli$`;
+- the entrypoint matches that regex. With the cached value `true`, only
+  interactive `cli` sessions qualify.
 
 ## Mid-turn attachments: `tengu_chair_sermon`
 
