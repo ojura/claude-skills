@@ -223,6 +223,29 @@ Each of these tools is absent whenever its flag reads the default.
 - the entrypoint matches that regex. With the value `true`, only interactive
   `cli` sessions qualify.
 
+When the tool is offered and tool search is on, the system prompt also gets a
+one-line hint section, `endconv_deferred_hint`, added only while the session's
+tool list contains `EndConversation`.
+
+The flag is the only way to turn the tool off. Permission settings cannot,
+because `Lre()` is true for `EndConversation` and for no other tool, and every
+place that consults it exempts the tool:
+
+- the deny and allow rule lookups (`Go()`, `y4e()`, `lc()`) return no rule for
+  it, so a `permissions.deny` entry does not remove it. `--disallowedTools`
+  adds deny rules to the same lookups, so by the code it does not either
+  (not tested);
+- the `--tools` launch list never withholds it (`dAt()`);
+- calling it never asks for permission.
+
+Checked live on 2.1.296 in an interactive session in tmux, with requests sent
+to a local listener and tool search on. A `settings.json` deny list naming
+`EndConversation`, `Monitor`, `NotebookEdit` and `Write` removed `Write` from
+the loaded tools and `Monitor` and `NotebookEdit` from the deferred list, while
+`EndConversation` and its hint section stayed. With `tengu_umber_kestrel`
+false in the disk cache, both were gone. A running session also drops the
+tool, without a restart, once it rereads the cache.
+
 ## Mid-turn attachments: `tengu_chair_sermon`
 
 Traced in both 2.1.220 and 2.1.226. The implementation is unchanged apart
