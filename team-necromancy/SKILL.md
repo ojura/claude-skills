@@ -104,7 +104,8 @@ allowlist that records which of them take a value, so a bare token is either
 that value or the selector, independent of position; `--model x NAME`,
 `NAME --model x` and `--stop NAME` are the same command. Two bare tokens are an
 error naming both, since one would otherwise reach the resumed session as a
-prompt nobody typed. Put anything genuinely meant for claude after `--`.
+prompt the user did not mean to send. Put anything genuinely meant for claude
+after `--`.
 
 Team identity survives deletion of its directory in transcript stamps and lead
 spawn records. The tool reconstructs the roster with the recorded members,
@@ -174,11 +175,12 @@ The source row and its original metadata are preserved with `isActive` set to
 row does not enter ordinary selection, completion, or team-run population for
 the source team.
 
-`live` derives the destination from spawn records written during the current
-process life. A resumed lead appends several lives to one transcript, so process
-start time excludes records for earlier teams. Before the current life writes
-its first spawn, Resolver can corroborate an eagerly created team by matching
-team `createdAt` with live-session `startedAt`.
+`live` derives the destination from spawn records written since the current
+process started. A lead resumed several times writes the records of several
+agent instances, one process after another, into one transcript, so process
+start time excludes records for earlier teams. Before the current agent instance
+writes its first spawn, Resolver can corroborate an eagerly created team by
+matching team `createdAt` with live-session `startedAt`.
 
 It composes with `--team`:
 
@@ -209,11 +211,12 @@ destination. When transcript stamps name another team, the command points to
 `--into-team TEAM`; `--force` permits a split identity. An unstamped conversation
 uses the plain lead launch; source-team archival applies to stamped source teams.
 
-Dead members redirect automatically when exact registry or current-life spawn
-evidence identifies a live lead under another team. `--keep-team` preserves the
-recorded team. Live members keep their in-flight turn and receive a migration
-hint. Automatic redirect requires exact registry or current-life spawn
-evidence; timing corroboration remains advisory.
+Dead members redirect automatically when exact registry evidence, or spawn
+evidence written by the lead's current agent instance, identifies a live lead
+under another team. `--keep-team` preserves the recorded team. Live members keep
+their in-flight turn and receive a migration hint. Automatic redirect requires
+exact registry evidence or spawn evidence from the current agent instance;
+timing corroboration remains advisory.
 
 `--keep-team` also supports whole-team recovery in stages: members first resume
 under the recorded or reconstructed team, then the lead resumes into that team.
@@ -511,10 +514,10 @@ show spawned members.
 
 SendMessage resolves through the in-memory map, agent registry, and finally the
 roster file. The roster lookup requires an initialized `teamContext`, which a
-real teammate spawn creates for the current lead life. After that initialization,
-hand-registered members resolve by bare name. Before it, drive the pane with
-keystrokes and read replies from inbox files. Apply the tint explicitly for the
-same visual identity as an Agent-tool spawn:
+real teammate spawn creates for the lead's current agent instance. After that
+initialization, hand-registered members resolve by bare name. Before it, drive
+the pane with keystrokes and read replies from inbox files. Apply the tint
+explicitly for the same visual identity as an Agent-tool spawn:
 
 ```bash
 C=blue  # tmux color; map roster purple->magenta, orange->colour208,
@@ -613,7 +616,7 @@ plain-lead startup owns exit-cleanup registration. The team directory and member
 processes therefore remain after this lead exits.
 
 `--agent-id` requires a nonempty value. Implicit team names use the process's
-internal live session ID, which equals the transcript ID on a fresh boot and
+internal live session ID, which equals the transcript ID for a new agent and
 changes on resume. Read or set the team name explicitly.
 
 ## Driving and observing resurrected agents

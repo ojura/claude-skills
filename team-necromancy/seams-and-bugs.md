@@ -43,8 +43,10 @@ observed live and confirmed against the Claude Code bundle.
    `\x1b[2m` SGR code before attributing the text to a user.
 
 8. **Transcript stamps and launch flags can name different teams.** On a
-   flagless resume, window-start `agentName` and `teamName` stamps set the
-   restored team identity. New transcript lines continue those stamps. The lead
+   flagless resume, the `agentName` and `teamName` stamps on the window start
+   set the restored team identity. The window start is the first record of the
+   compaction window: the part of a conversation since it was last compacted,
+   which a resume restores. New transcript lines continue those stamps. The lead
    starts with an empty in-memory teammate map and begins polling members after
    its first teammate spawn initializes that map.
 
@@ -57,7 +59,7 @@ observed live and confirmed against the Claude Code bundle.
 
    Future resumes read the window-start stamps again. Appending a replacement
    identity record forces a choice between visibility and history: a null-parent
-   record becomes the loaded window root and truncates earlier context, while a
+   record becomes the loaded window start and truncates earlier context, while a
    chained record preserves context and sits outside the restore lookup. A
    durable upstream fix needs either a dedicated rebind record consumed during
    restore or explicit launch flags to outrank stamps. `agent-resume` can also
@@ -66,9 +68,9 @@ observed live and confirmed against the Claude Code bundle.
    When the stamped team directory is absent, a flagless resume writes plain
    session lines. A flag-bound resume can exchange mail under the launch team,
    while teammate hook initialization misses idle notifications and
-   `teamAllowedPaths` for that process life. Compaction under the destination
-   team followed by restart places the destination stamps at the window start
-   and initializes those hooks.
+   `teamAllowedPaths` for as long as that process runs. Compaction under the
+   destination team followed by restart places the destination stamps at the
+   window start and initializes those hooks.
 
 9. **Delivery occurs at turn boundaries.** An idle recipient starts a turn
    immediately. A busy recipient queues mail in AppState and drains it when the

@@ -1,37 +1,39 @@
 # What this file lints, and why each exclusion is here.
 #
-# The tool was checked with pyflakes alone until now, which reads the parsed
-# tree and reports logical faults: undefined names, unused imports and locals,
-# redefinitions. It never sees blank lines or spacing, which is how thirty
-# consecutive blank lines and a dozen copies of one lambda survived unremarked.
+# pyflakes reads the parsed tree and reports logical faults: undefined names,
+# unused imports and locals, redefinitions. It never sees blank lines or
+# spacing, so while the tool was checked with pyflakes alone, thirty
+# consecutive blank lines and a dozen copies of one lambda went unreported.
 # flake8 runs pyflakes and adds pycodestyle, so both are checked in one command.
 #
-# The machine has flake8-docstrings, flake8-quotes, flake8-import-order and
-# flake8-builtins installed globally, and an installed plugin runs whether or
-# not anyone asked for it. Nothing here opted into their opinions: Q000 alone
-# accounts for 9016 complaints about a quote style the whole file uses
+# Plugins installed globally on the machine, such as flake8-docstrings,
+# flake8-quotes, flake8-import-order and flake8-builtins, run whether or not
+# anyone asked for them. This project did not choose their rules: Q000 alone
+# reports tens of thousands of strings for a quote style the whole file uses
 # deliberately. So select names the two that are wanted, pyflakes and
 # pycodestyle, and every plugin code falls outside it.
 [flake8]
 select = E, W, F
 extend-ignore =
-    # Line length. 213 lines exceed 100 characters, nearly all of them message
-    # strings the tool wraps at runtime rather than in the source. Choosing a
-    # limit and reflowing them is a separate piece of work with its own risk;
-    # until then this rule would report a number nobody is acting on.
+    # Line length. Several hundred lines exceed 100 characters, many of them
+    # message strings the tool wraps at runtime rather than in the source.
+    # Choosing a limit and reflowing them is a separate piece of work with its
+    # own risk; until it is done, this rule would report the same long lines on
+    # every run, and a new one would be hard to find among them.
     E501,
     # W503 and W504 contradict each other: one wants the break before a binary
     # operator, the other after. pycodestyle ships both off by default for that
     # reason, and naming them here keeps that true when a future --select does
     # not.
     W503, W504,
-    # Continuation-line indent, 37 places. The file aligns continuations to read
-    # well rather than to a rule, and pycodestyle's preference is not obviously
-    # better; changing them is whitespace churn through code nobody is editing.
+    # Continuation-line indent. The file aligns continuations to read well
+    # rather than to a rule, and pycodestyle's preference is not obviously
+    # better; changing them would only rewrite whitespace in code that is
+    # otherwise unchanged.
     E126, E127, E128, E131,
     # pycodestyle reads inside f-strings, so a dict comprehension written as
     # f"{ {k: v for ...} }" reports whitespace after { and before }. Removing
-    # that space breaks the string. Two occurrences, both false.
+    # that space breaks the string.
     E201, E202
 per-file-ignores =
     # The transformation that cut the suite into units is kept for the record

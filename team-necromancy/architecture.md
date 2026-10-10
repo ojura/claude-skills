@@ -315,45 +315,48 @@ fields in its records. These fields control two behaviors:
 Claude Code 2.1.292 decides a process's team context once, when it mounts.
 `computeInitialTeamContext` takes the argv team when that team's config loads,
 and `initializeTeammateContextFromSession` then adopts the team stamped on the
-window root of the resumed transcript when that config loads, keeping the argv
-context otherwise. A config loads when it parses as a JSON object
-(`readTeamFileAsync`); an absent or unparsable file does not. The inbox poller
-reads from that operating team. `SendMessage` and the idle-notification hook
-use the argv team. So a teammate reads from its operating team and sends to
-its argv team, and a redirect is consistent only when the argv team equals the
-team the first message's stamps (the window root's) will load, or the stamped
-team cannot load at that moment. Lines the process writes are stamped with its
-operating team, and a lead's spawn payloads name it.
+window start of the resumed transcript when that config loads, keeping the argv
+context otherwise. The window start is the first record of the compaction
+window: the part of a conversation since it was last compacted, which a resume
+restores. A config loads when it parses as a JSON object (`readTeamFileAsync`);
+an absent or unparsable file does not. The inbox poller reads from that
+operating team. `SendMessage` and the idle-notification hook use the argv team.
+So a teammate reads from its operating team and sends to its argv team, and a
+redirect is consistent only when the argv team equals the team the stamps on the
+window start will load, or the stamped team cannot load at that moment. Lines
+the process writes are stamped with its operating team, and a lead's spawn
+payloads name it.
 
 Resolver answers this once, in `_operating_team`, for every reader: the lead
 runtime's `runs_as`, the lead process rungs, lead corroboration, retirement
 objections, and a parent's team for promotion. Lines and spawn payloads the
-process wrote after it started decide, and only that answer is exact; the
-process must be the only live holder of its transcript for its lines to be its
-own. Those lines are read backward from the end of the transcript, stopping at
-the first record written before the process started, so a long conversation
-costs only what was written since; the window root, which takes a walk of the
-whole transcript, is read only when the mount rule is needed. Spawns written by
-earlier processes on the same transcript say nothing about the current one.
-Without such lines the mount rule is applied to whether each candidate config
-could have loaded when the process started: yes when the config parses now and
-its bytes or its `createdAt` predate the start, no when its `createdAt` is later
-than the start by more than `TEAM_MINT_WINDOW_MS`, and unknown otherwise,
-including a config absent or unparsable now, which may have loaded and been
-removed since. A config created after the start is a new one, and an earlier
-config of the team may have been there at the mount: when this tool's reap
-receipt for the team shows it retired the team after the process started, the
-answer is unknown rather than no. A process with no argv team, and no stamped
-team that loaded when it started, takes an implicit team created within
-`TEAM_MINT_WINDOW_MS` before it started, when it is the only process that
-started that soon after the team was created and the team is the only one it
-could have created in that time. These answers are inferred. When the evidence
-does not decide, the answer names no team and lists the teams still open. The
-start time is the kernel's, read from `/proc/<pid>/stat` and `/proc/uptime`,
-with the session registry's `startedAt` as the fallback.
+process wrote after it started decide, and only that answer is exact; the lines
+written after the process started come from it only if it is the only live
+holder of its transcript. Those lines are read backward from the end of the
+transcript, stopping at the first record written before the process started, so
+a long conversation costs only what was written since; the window start, which
+takes a walk of the whole transcript, is read only when the mount rule is
+needed. Spawns written by earlier processes on the same transcript are not
+evidence about the current one. Without such lines the mount rule is applied to
+whether each candidate config could have loaded when the process started: yes
+when the config parses now and its bytes or its `createdAt` predate the start,
+no when its `createdAt` is later than the start by more than
+`TEAM_MINT_WINDOW_MS`, and unknown otherwise, including a config absent or
+unparsable now, which may have loaded and been removed since. A config created
+after the start is a new one, and an earlier config of the team may have been
+there at the mount: when this tool's reap receipt for the team shows it retired
+the team after the process started, the answer is unknown rather than no. A
+process with no argv team, and no stamped team that loaded when it started,
+takes an implicit team created within `TEAM_MINT_WINDOW_MS` before it started,
+when it is the only process that started that soon after the team was created
+and the team is the only one it could have created in that time. These answers
+are inferred. When the evidence does not decide, the answer leaves the team
+unknown and lists the teams still open. The start time comes from the kernel,
+read from `/proc/<pid>/stat` and `/proc/uptime`, with the session registry's
+`startedAt` as the fallback.
 
 A launch that has not started yet is a different question. `restore_answer`
-says whether its window root's team loads in the census the launch was planned
+says whether its window start's team loads in the census the launch was planned
 with, so that team takes over from argv. Launch answers do not store it:
 `enforce_restore` asks at the action boundary and `run_one` asks when it
 reports the launch. In a team run that census holds every change the run makes
@@ -473,7 +476,8 @@ Resolver ranks available evidence as follows:
    from is the operating answer above.
 2. Lines and spawn payloads a process wrote after it started identify the team
    it operates as exactly; process start time distinguishes them from records
-   written by earlier lives of the same transcript.
+   written by earlier agent instances (earlier processes) on the same
+   transcript.
 3. A team's `leadSessionId` identifies a fresh lead's conversation exactly
    because the fresh internal ID equals its transcript filename.
 4. A unique, bidirectional match between team `createdAt` and process
@@ -488,8 +492,8 @@ destination.
 The `SessionStart` hook carries the transcript ID, which associates a process
 with its resumed transcript. Team inference needs the internal ID used in the
 implicit team name. In the measured corpus, one of eight resumed hook IDs mapped
-to an implicit team name, and four of 23 team directories used IDs unique to a
-process life.
+to an implicit team name, and four of 23 team directories used IDs that existed
+only for one process's run.
 
 Resolver returns an exact result for durable identity and for the transcript
 records a process wrote since it started, an inferred result for the mount rule
@@ -798,30 +802,30 @@ is one decision per run, made before any member launches by the private
 starts; a run of one member makes it inside `member_redirect_plan`. The decision
 names the destination and its selected lead session, whether a person must
 confirm (an inferred destination), and the retirement: reap the source team when
-nothing that sends or reads as it is left, restamp each moving member's own
+no process that sends or reads as it is left, restamp each moving member's own
 conversation under `--force`, or blocked. `run_team` carries out the team-wide
 part once in `apply_team_redirect`, in the order a single member's move keeps:
 the one question, then every stop (`settle_stops`), then at most one reap, or
 instead one decline. Each running member a move restarts is asked about in
-turn before any process is ended; a declined stop, or one nothing here can ask
-about without `--yes`, refuses the whole move with nothing stopped, retired or
-started. The processes are then ended, the plan is revalidated with them gone,
-and only then is the team retired. Each member's plan receives the decision and
-the run's answer to it in `MemberRedirectRequest.team` and `team_answer`, skips
-the stops the run settled, and carries the rest out without deciding again. The
-decision is the only authority over which team directories exist while the run
-lasts: `run_team` rebuilds a missing roster before the first member only when
-the members stay, and no member's step creates, rebuilds or retires a team, so
-no roster is rebuilt for a team the members leave. A restamp touches one
-transcript, so a live process holding that transcript is its only conflict. A
-reap counts each moving member's other holders as ended, since the run ends
-them first. A moving member held by this run's own process or one of its
-ancestors cannot be ended, so the decision refuses the move before anything
-changes, with `--force` or without. A running member has already moved when all
-its live processes operate as the destination, whatever roster still lists it:
-the decision marks it `arrived`, and its step reports it running there and
-registers it in the destination's roster, without starting, stopping or
-rebuilding anything.
+turn before any process is ended; a declined stop, or one that cannot be asked
+about because there is no terminal and `--yes` was not passed, refuses the whole
+move with nothing stopped, retired or started. The processes are then ended, the
+plan is revalidated with them gone, and only then is the team retired. Each
+member's plan receives the decision and the run's answer to it in
+`MemberRedirectRequest.team` and `team_answer`, skips the stops the run settled,
+and carries the rest out without deciding again. The decision is the only
+authority over which team directories exist while the run lasts: `run_team`
+rebuilds a missing roster before the first member only when the members stay,
+and no member's step creates, rebuilds or retires a team, so no roster is
+rebuilt for a team the members leave. A restamp touches one transcript, so a
+live process holding that transcript is its only conflict. A reap counts each
+moving member's other holders as ended, since the run ends them first. A moving
+member held by this run's own process or one of its ancestors cannot be ended,
+so the decision refuses the move before anything changes, with `--force` or
+without. A running member has already moved when all its live processes operate
+as the destination, whatever roster still lists it: the decision marks it
+`arrived`, and its step reports it running there and registers it in the
+destination's roster, without starting, stopping or rebuilding anything.
 
 Whether a member can be moved onto a team comes from one private answer,
 `_destination_answer`: the team needs a valid roster and a selected lead session
@@ -1049,30 +1053,30 @@ While the selftest runs, Resolver's `/proc` readers (`_proc_stat`, `_cmdline`
 and `_proc_env`, and through them `_pid_alive`, `_proc_start` and the tmux
 server fact) ask a process fence before reading, in the selftest process and in
 every tool run one of its units starts. The fence's root is the selftest process
-that runs the units: a read-only run, a serial live run, one share of a split
-run, or a live run's read-only child. A unit not declared with `machine=True`
-sees the root and the processes under it, and nothing else: `_process_table`
-narrows the `/proc` listing to them before it reads any pid, the session
-registry is empty, and a reader refuses every other pid. A unit declares
-`machine=True` when its engines, or the tool runs it starts, must read on
-purpose, through the engine's process inputs (`_FakeTmux.PROCESS_INPUTS`),
-processes outside that tree or the real session registry, and says why beside
-the declaration. The declaration decides what those inputs answer and nothing
-else: a declared unit's table lists the whole machine and its registry is the
-real one. The selftest's own process readers on `_ProcessFence` read the same
-either way. In both worlds a reader may read any pid from `PID_CEILING`
-(1 << 22) up, which no process can hold and from which fixtures number the
-processes they invent. Every other pid the run admits, whether a declared unit's
-table or registry named it, Popen started it or a walk found it under the root,
-is under one rule: it is read while its start time is the one recorded when the
-run learned of it, or once no process holds its number, and refused while
-another process holds it. A pid that a process under the root holds now is
-admitted as well, since the walk that finds it there is how the run learns it. A
-value that is not a whole number above zero is refused. A refused read is
-answered as a process that does not exist and is written down with the unit, the
-reader and the pid. To refuse a pid, the fence reads nothing of it but the start
-time it compares for a pid a declared unit's table or registry named or one the
-run knows. The run goes on, and the tier's row
+that runs the units: a read-only run, a serial live run, one batch of a split
+run (a batch of live-tier test jobs, which one worker runs), or a live run's
+read-only child. A unit not declared with `machine=True` sees the root and the
+processes under it, and nothing else: `_process_table` narrows the `/proc`
+listing to them before it reads any pid, the session registry is empty, and a
+reader refuses every other pid. A unit declares `machine=True` when its engines,
+or the tool runs it starts, must read on purpose, through the engine's process
+inputs (`_FakeTmux.PROCESS_INPUTS`), processes outside that tree or the real
+session registry, and says why beside the declaration. The declaration decides
+what those inputs answer and nothing else: a declared unit's table lists the
+whole machine and its registry is the real one. The selftest's own process
+readers on `_ProcessFence` read the same either way. In both worlds a reader may
+read any pid from `PID_CEILING` (1 << 22) up, which no process can hold and from
+which fixtures number the processes they invent. Every other pid the run admits,
+whether a declared unit's table or registry named it, Popen started it or a walk
+found it under the root, is under one rule: it is read while its start time is
+the one recorded when the run learned of it, or once no process holds its
+number, and refused while another process holds it. A pid that a process under
+the root holds now is admitted as well, since the walk that finds it there is
+how the run learns it. A value that is not a whole number above zero is refused.
+A refused read is answered as a process that does not exist and is written down
+with the unit, the reader and the pid. To refuse a pid, the fence reads only the
+start time it compares for a pid a declared unit's table or registry named or
+one the run knows. The run goes on, and the tier's row
 `read-only-tier-reads-only-admitted-processes` or
 `live-tier-reads-only-admitted-processes` names every refusal, and every fault
 of the fence itself.
@@ -1088,9 +1092,9 @@ reads once the tool run has exited. The pids the run knows are kept in one
 record for the whole run, a file beside the refusal record: each of the run's
 fences adds the pids it learns there, and reads what the others added before it
 counts a pid as unknown, so a tool run admits a pid the selftest process learned
-by the same rule. The fence meets a fault of its own when the refusal record
-cannot take a refusal, when the record of known pids cannot take a pid or cannot
-be read, when the refusal record cannot be read for the row, or when a walk has
+by the same rule. A fence fault is a failure in the fence's own work: the
+refusal record cannot take a refusal, the record of known pids cannot take a pid
+or cannot be read, the refusal record cannot be read for the row, or a walk has
 not settled (below). In the selftest process each fault is kept for the tier's
 row, which fails naming it; a refusal the record could not take is kept there as
 the refusal it is. A tool run has no row of its own, so there a fault ends the
@@ -1122,9 +1126,9 @@ adoption by what happens: an orphan made on purpose before the first unit, and
 another after the last, must each have the run as its parent. The tier's
 `read-only-tier-leaves-nothing-running` or `live-tier-leaves-nothing-running`
 row states what `finish_run` found once the units were done, so a leak no unit
-caught fails the run. The run that merges the shares of a split live run adds
+caught fails the run. The run that merges the batches of a split live run adds
 what its own two orphans showed, what its own `finish_run` ended, and its own
-fence's refusals and faults to the rows it folds from the shares. A unit that
+fence's refusals and faults to the rows it folds from the batches. A unit that
 finds a process a tool run left behind ends it there, through `end_processes` as
 `finish_run` does, so no later unit has it in view. `run_processes` walks down
 from the run by the `children` files of each process's threads and reads the
@@ -1146,18 +1150,19 @@ lists a pid the pass did not find. A walk that still finds one after its last
 pass has not settled, and the reader reports that as a fault of the fence rather
 than judge from it. `run_processes`, `identity` and the fence's `admit` all walk
 that way. `ancestors` reads the stat files up the chain of parents from the
-run's parent, so that the run never signals one of them. Any other pid reads as
-no running process without being read; a refused pid that a process holds, and a
-value that is not a whole number, are written down as the fence writes its
+run's parent, so that the run never signals one of them. Any other pid is
+reported as not running, without being read; a refused pid that a process holds,
+and a value that is not a whole number, are written down as the fence writes its
 refusals, in a unit or outside one, and a pid `pidfd_open` cannot judge is
 written down with the error, so the tier's row names it and
 `proc_reader_audit.py` counts it. `end_processes` and the functions built on it
 signal each process through a pidfd opened while its start time still matched,
 and never signal pid 1, the run, an ancestor, a process named systemd, or a
-process that did not start after the run. The smoke check's stray is outside the
-run on purpose, and the cleanup never reads it: the stray holds the only write
-end of a pipe, the run keeps the pipe's read end, and the run ends the stray
-through a pidfd opened while that pipe had not yet reached end of file.
+process that did not start after the run. The smoke check's stand-alone process
+is outside the run on purpose, and the cleanup never reads it: the stand-alone
+process holds the only write end of a pipe, the run keeps the pipe's read end,
+its exit pipe, and the run ends the stand-alone process through a pidfd opened
+while that pipe had not yet reached end of file.
 
 Mutation scripts import `probe` and call `probe.expect(...)`. The function runs
 one clean suite and isolated mutants, then raises `ProbeFailure` if the clean run
@@ -1186,16 +1191,16 @@ records from `doctor_answer`; summary and dossier title rows therefore retain th
 same transcript fact by object identity. The canonical transcript fact carries
 path, optional title, and activity time together; there is no separate title
 lookup. A full transcript snapshot is keyed by device, inode, size, and
-nanosecond modification time. It derives the restored window root, the newest
-team stamp and, when requested, compact mail evidence from one stable read;
-window-start, operating-team and mail questions reuse that answer until any key
-field changes. Runtime reads produce
-one immutable snapshot, and its PID records are the exact objects referenced by
-its process, agent, transcript, pane, and session indexes. A question that
-receives a process table carries that snapshot through every helper instead of
-reading the default table partway through. Callers declare optional `REGISTRY`,
-`SEATS`, and launch `PLACEMENT` work through `NEED` rather than selecting among
-alternate runtime APIs. Diagnosis does not declare `PLACEMENT`.
+nanosecond modification time. It derives the window start, the newest team stamp
+and, when requested, compact mail evidence from one stable read; window-start,
+operating-team and mail questions reuse that answer until any key field changes.
+Runtime reads produce one immutable snapshot, and its PID records are the exact
+objects referenced by its process, agent, transcript, pane, and session indexes.
+A question that receives a process table carries that snapshot through every
+helper instead of reading the default table partway through. Callers declare
+optional `REGISTRY`, `SEATS`, and launch `PLACEMENT` work through `NEED` rather
+than selecting among alternate runtime APIs. Diagnosis does not declare
+`PLACEMENT`.
 
 Callers also declare the computations they need. `Resolver(needs=...)` receives
 hard requirements and a `maybe` set for computations reached on selected paths.

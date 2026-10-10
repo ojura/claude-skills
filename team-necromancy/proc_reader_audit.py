@@ -30,20 +30,20 @@ reach a reader, such as the reviewer's proc-readers.json.
 Each tier runs under script(1), so it has a terminal of its own on stdin and
 stdout, with its stderr kept apart, and with TMPDIR set to a fresh private
 directory at an 11-character path, with XDG_CACHE_HOME inside it.
-A split live run's socket roots sit two room levels below TMPDIR, and at this
-length the suite's longest socket name still fits in the 107 bytes a Unix
-socket path may have. Each tier's run record names the tool's SHA-256, the
-interpreter, the command and every variable of the environment the tool ran
-with. The audit writes it inside the terminal session: script(1) runs this
-file with --within, which writes the record and then becomes the tool through
-exec, so the environment the record names is the one the tool ran with, after
-the shell script(1) starts added its own variables. It writes a value only
-for a name on SHOWN, matched exactly, which is probe.py's SHOWN_VALUES, the
-lead's list for every run record of this work, and names every other variable
-with no value, no length and no digest, because a rule on names would let a
-secret through under a name it does not match. Whether each variable the audit
-handed to script(1) was the same in every tier is compared in memory, and the
-audit names the ones that were not.
+A split live run's socket roots sit two levels of worker directories below
+TMPDIR, and at this length the suite's longest socket name still fits in the
+107 bytes a Unix socket path may have. Each tier's run record names the tool's
+SHA-256, the interpreter, the command and every variable of the environment the
+tool ran with. The audit writes it inside the terminal session: script(1) runs
+this file with --within, which writes the record and then becomes the tool
+through exec, so the environment the record names is the one the tool ran with,
+after the shell script(1) starts added its own variables. It writes a value
+only for a name on SHOWN, matched exactly, which is probe.py's SHOWN_VALUES,
+the lead's list for every run record of this work, and names every other
+variable with no value, no length and no digest, because a rule on names would
+let a secret through under a name it does not match. Whether each variable the
+audit handed to script(1) was the same in every tier is compared in memory, and
+the audit names the ones that were not.
 
 Before the tiers it makes one refusal on purpose on each path a refusal takes
 to the record: it runs the tool's selftest with one unit of its own, which
@@ -52,9 +52,9 @@ once in the unit, and once in a tool run the unit starts. The run builds its
 fence from the record variable as a tier does, and the tool run installs its
 unit's fence as main does first. The audit reads those three lines back before
 it runs a tier and leaves them out of the count, so an empty count is evidence
-that nothing was refused on any of those paths, and not a record that nothing
-could reach. It judges each tier by its exit status and by its refusal rows,
-the tool's TIER_PROCS, as well as by the record, so a refusal that went
+that nothing was refused on any of those paths, and not a record that no
+refusal could reach. It judges each tier by its exit status and by its refusal
+rows, the tool's TIER_PROCS, as well as by the record, so a refusal that went
 elsewhere still counts. A refusal row also fails on a fault of the fence
 itself, such as a walk that did not settle, which the row's detail in the
 tier's kept output names. The tool is loaded as a module once, as the control
@@ -64,13 +64,13 @@ and the tiers are removed after each run, and one it could not remove is
 named; the record and the outputs beside it are kept.
 
 Exit status: 0 when every tier exited 0 and passed its refusal rows and the
-record holds no refusal but the control's; 1 when the record holds one or a
-tier's refusal row failed; 2 when the control did not reach the record as it
-should, a tier could not run, ran out of time, did not state a refusal row or
-exited nonzero for another reason, such as a failing check of another kind, or
-a line of the record does not parse as a JSON object. When both 1 and 2 apply,
-the status is 1, the audit's finding, and the sentences printed name every
-fault either way.
+record holds only the control's refusals; 1 when the record holds any other
+refusal or a tier's refusal row failed; 2 when the control did not reach the
+record as it should, a tier could not run, ran out of time, did not state a
+refusal row or exited nonzero for another reason, such as a failing check of
+another kind, or a line of the record does not parse as a JSON object. When
+both 1 and 2 apply, the status is 1, the audit's finding, and the sentences
+printed name every fault either way.
 """
 import argparse
 import collections
@@ -330,7 +330,7 @@ def run_tier(tool, loaded, label, live, args, record, environments):
             wrong.append(("refused", f"{label}: {row} failed; its detail in {kept} names each "
                                      "refusal and fault"))
         elif row not in stated:
-            wrong.append(("unjudged", f"{label}: its output states no {row} row"))
+            wrong.append(("unjudged", f"{label}: its output has no {row} row"))
     others = sorted(check_id for check_id, verdict in stated.items()
                     if verdict == "FAIL" and check_id not in rows)
     refused = any(kind == "refused" for kind, _sentence in wrong)
@@ -363,7 +363,7 @@ def main():
         for sentence in wrong:
             print(f"control: {sentence}")
         print(f"control: the refusals made on purpose did not reach {record} as they should; "
-              "a count read from this record would mean nothing")
+              "a count read from this record would not show whether anything was refused")
         return 2
     print(f"control: one refusal outside any unit, one in a unit and one in a tool run reached "
           f"{record}")
