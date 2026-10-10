@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """A scripted stand-in for agent-resume's selftest.
 
-probe.selftest copies this file into a private room under the tool's name and
-runs probe.expect against it, so the verifier's rules are exercised on real
-processes without running the real suite. The clean copy lists CATALOG,
+probe.selftest copies this file into a private directory under the tool's name
+and runs probe.expect against it, so the verifier's rules are exercised on
+real processes without running the real suite. The clean copy lists CATALOG,
 reports every check as passing and exits 0. Each setting in the block below
 changes one thing a verifier must notice. The block is the only place the
 settings are written: probe.runner_settings() reads their names and defaults
@@ -39,7 +39,7 @@ makes a --list run start a driver that stays, as OWNED_DRIVER="stays" does
 for a report. LOCKED_TMPDIR names a directory: a run given a TMPDIR inside it
 makes a directory in that TMPDIR, puts a file in it and takes away its write
 permission, so removing the TMPDIR leaves both; a run given any other TMPDIR
-does nothing.
+makes no directory in it.
 
 With PROBE_SYNTHETIC_LOG set, every invocation appends its arguments to that
 file as one JSON line, which is how a test sees what the verifier asked. With
@@ -63,7 +63,7 @@ import time
 CATALOG = (
     ("target-check", "the check a case names"),
     ("other-check", "a check a case may justify as a co-failure"),
-    ("third-check", "a check nothing touches"),
+    ("third-check", "a check that no case names"),
     ("every-unit-reported", "no unit ended the run before it reported"),
 )
 
