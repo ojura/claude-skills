@@ -513,8 +513,11 @@ has `circuitBreaker: "dangerousRemoval"`, and that entry in the table of
 circuit breakers has `bypassImmune: true`. So the call asks for permission even
 in bypass mode, and no allow rule can approve it.
 
-In bypass mode and in auto mode, when the session can show a permission dialog,
-the prompt gets an auto-deny timer, configured by this flag. `q9()` reads it
+In bypass mode and in auto mode, the prompt gets an auto-deny timer, configured
+by this flag, but only when `Mpn()` holds: the context can request a dialog, no
+SDK dialog host is active, prompts are not suppressed
+(`shouldAvoidPermissionPrompts`), and `TZt()` is false; `TZt()` is true for a
+teammate and for a background (async) agent. `q9()` reads it
 with `Fn("tengu_splendid_horizon", {})`, which returns the value together with
 its source, and checks each field separately:
 
@@ -542,6 +545,15 @@ does opening the transcript view while the prompt is open: both emit
 `autoDenyPresence`. The prompt then stays open until someone answers it. The
 timer therefore only denies when nobody touches the terminal.
 
+Without the timer, what happens depends on the caller. Headless `claude -p`
+denies the call at once, and the tool result is the check's own text with its
+rewrite hint, without the preamble above. A background subagent of an
+interactive session gets no denial at all: in bypass mode, `_pn()` passes the
+ask on unchanged when `shouldAvoidPermissionPrompts` is false, as it is for
+such an agent. The parent session shows the prompt, marked with the agent's
+type ("from the general-purpose agent"), without a countdown, and the prompt
+stays open until someone answers it.
+
 To shorten the timer, add the flag to the disk cache as
 `"tengu_splendid_horizon": {"timeoutMs": 15000}`. The other fields can be left
 out, because each one that is missing gets its default. The entry only takes
@@ -549,16 +561,20 @@ effect in processes that read the disk cache (see
 [How a flag read resolves](#how-a-flag-read-resolves-21296)), and like any
 cache edit it is lost when a process with GrowthBook enabled fetches a payload.
 
-Checked live on 2026-10-10 with 2.1.296 in interactive sessions in tmux, in
-bypass mode. Each session had its own `CLAUDE_CONFIG_DIR`, telemetry off with
-the disk cache readable, and a local listener that answered the first request
-with a Bash call to `rm -f $CC_RM_A/$CC_RM_B`, both variables unset:
+Checked live on 2026-10-10 with 2.1.296 in bypass mode. Each session had its
+own `CLAUDE_CONFIG_DIR`, telemetry off with the disk cache readable, and a local
+listener that answered with a Bash call to `rm -f $CC_RM_A/$CC_RM_B`, both
+variables unset. Interactive sessions ran in tmux. For the subagent row the
+listener first answered with an Agent call, and the general-purpose agent it
+started made the Bash call:
 
-| cache entry | input while the prompt was open | tool result |
-|---|---|---|
-| `{"timeoutMs": 15000}` | none | denied 15.1 s after the Bash call |
-| none | none | denied 120.1 s after the Bash call |
-| `{"timeoutMs": 15000}` | one Down arrow, 2.5 s after the Bash call | none after 142 s; the countdown line disappeared at the keypress and the prompt stayed open |
+| session | cache entry | input while the prompt was open | tool result |
+|---|---|---|---|
+| interactive | `{"timeoutMs": 15000}` | none | denied 15.1 s after the Bash call |
+| interactive | none | none | denied 120.1 s after the Bash call |
+| interactive | `{"timeoutMs": 15000}` | one Down arrow, 2.5 s after the Bash call | none after 142 s; the countdown line disappeared at the keypress and the prompt stayed open |
+| `claude -p` | none | no prompt was shown | denied 0.03 s after the Bash call, with the check's text alone |
+| background subagent of an interactive session | none | none | none after 167 s; the prompt in the parent had no countdown |
 
 In the same setup, `rm -f "$CC_RM_UNSET"/name` ran without a prompt, so a test
 needs a target such as `$A/$B`. Auto mode was not tested.
