@@ -25,13 +25,17 @@ moved to `~/claude-archive`, never deleted. [Read more](archive-conversation-for
 
 ### remote-shell-over-chisel
 
-Gives Claude a shell (and optional Chrome/CDP control) on a machine you own from
-a sandbox whose egress only allows HTTPS - the kind of TLS-MITM L7 proxy that
-rejects raw SSH on any port. Tunnels SSH and the cdp-daemon port inside an HTTPS
-WebSocket via chisel, with a self-healing connect script that detects stale
-forwards and caches state across sessions. All host/user/secret details live in
-a gitignored `config.sh`; nothing machine-specific is committed. Pairs with
-`cdp-daemon` for driving your real logged-in browser remotely.
+Reaches a machine you own from networks that block SSH but pass HTTPS, by
+carrying SSH inside an HTTPS WebSocket via chisel. In sandbox mode it gives
+Claude a shell (and optional Chrome/CDP control) on your machine from a sandbox
+behind an HTTPS-only proxy, with a connect script that detects stale forwards
+and keeps its state across sessions. In workstation mode, `source` one script
+and every ssh, scp, rsync and git-over-SSH connection from that shell goes out
+through your machine. Both modes share one SSH connection between sessions, so
+only the first pays for the handshakes, and it closes itself when unused. All
+host/user/secret details live in a gitignored `config.sh`, so the repo does not
+contain anything machine-specific. Pairs with `cdp-daemon` for driving your real
+logged-in browser remotely. [Read more](remote-shell-over-chisel).
 
 ### open-thinking
 

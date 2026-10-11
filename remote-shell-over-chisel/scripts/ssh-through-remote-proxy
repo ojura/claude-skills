@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# The ProxyCommand that the lines from ssh-config.sh give ssh while
+# SSH_THROUGH_CHISEL is set. Connects stdin and stdout to HOST:PORT as seen
+# from the remote machine:
+#
+#   ssh-through-remote-proxy HOST PORT
+#
+# Every connection goes through one SSH master connection to the remote,
+# which runs over a single chisel client against $CHISEL_SERVER. The first
+# connection starts the master (master_ensure in common.sh), and the master
+# exits after $MASTER_IDLE without use. The remote's sshd opens the TCP
+# connection to HOST:PORT, so the chisel server needs neither --socks5 nor
+# --reverse for this.
+
+set -u
+
+if [ $# -ne 2 ]; then
+  echo "usage: $(basename "$0") HOST PORT" >&2
+  exit 2
+fi
+host=$1
+port=$2
+
+# shellcheck source=common.sh
+. "$(dirname "$(readlink -f "$0")")/common.sh"
+load_config || exit 1
+
+# Every ssh below connects to the remote itself, so it must not be routed
+# through this script again by the Match blocks.
+unset SSH_THROUGH_CHISEL
+
+ensure_chisel || exit 1
+
+# chisel reads its credentials from AUTH, which keeps the token out of ps.
+export AUTH="$CHISEL_TOKEN"
+chisel_stdio="exec $(printf '%q' "$CHISEL_BIN") client --max-retry-count 1 $(printf '%q' "$CHISEL_SERVER") stdio:127.0.0.1:$SSH_REMOTE_PORT 2>>$(printf '%q' "$MASTER_LOG")"
+
+# The master logs in as REMOTE_USER and records the remote's host key under
+# SSH_ALIAS, the same as `ssh SSH_ALIAS`, whichever way it is reached.
+ssh_opts=(-o User="$REMOTE_USER" -o HostKeyAlias="$SSH_ALIAS" -o ProxyCommand="$chisel_stdio")
+# The socket is named after the user, as the ControlPath in the ssh-config.sh
+# lines is, so `ssh root@ALIAS` does not land in REMOTE_USER's master.
+sock="$SOCKET_DIR/master-$REMOTE_USER.sock"
+
+if ! master_ensure "$sock" "$SSH_ALIAS" "${ssh_opts[@]}"; then
+  echo "[$REMOTE_NAME] could not connect to $SSH_ALIAS through $CHISEL_SERVER; see $MASTER_LOG" >&2
+  exit 1
+fi
+
+# ssh -W needs an IPv6 address in brackets.
+case $host in *:*) host="[$host]" ;; esac
+
+# If the master has exited since the check above, this ssh falls back to a
+# connection of its own over a separate chisel client.
+exec ssh "${ssh_opts[@]}" -o ControlPath="$sock" -o ControlMaster=no -W "$host:$port" "$SSH_ALIAS"

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# What $REMOTE_SSH runs: ssh to the remote through the tunnel connect.sh keeps
+# up, with the arguments passed on to ssh as the command to run.
+#
+#   $REMOTE_SSH "uname -a"
+#
+# The calls share one SSH master connection over the tunnel, so only the first
+# one pays for the SSH handshake. The master starts on first use (master_ensure
+# in common.sh) and exits after $MASTER_IDLE without a call. If it cannot
+# start, the call makes an SSH connection of its own through the tunnel.
+
+set -u
+
+# shellcheck source=common.sh
+. "$(dirname "$(readlink -f "$0")")/common.sh"
+load_config || exit 1
+forward_ssh_settings
+
+# These calls connect to the tunnel's local port, which must not be routed
+# through ssh-through-remote-proxy on a machine that also uses that.
+unset SSH_THROUGH_CHISEL
+
+if ! master_ensure "$FORWARD_SOCK" "$FORWARD_DEST" "${FORWARD_SSH_OPTS[@]}"; then
+  echo "[$REMOTE_NAME] the shared SSH connection did not start, so this call connects on its own; see $MASTER_LOG" >&2
+fi
+
+exec ssh "${FORWARD_SSH_OPTS[@]}" -o ControlPath="$FORWARD_SOCK" -o ControlMaster=no \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 "$FORWARD_DEST" "$@"
