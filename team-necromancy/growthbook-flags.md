@@ -229,6 +229,28 @@ for a generic feature override, but the public 2.1.296 build implements
 this flag on. These implementations are at `/tmp/claude-2.1.296.js:2243` and
 were also matched in the installed 2.1.296 executable.
 
+### Local feature-map injection
+
+`processRemoteEvalPayload()` populates `remoteEvalFeatureValues` from a GrowthBook
+client's payload. The internal `answerNextGrowthBookRemoteEvalWith()` function
+registers an answerer for the next fetch; it does not populate the map itself.
+Both `createClient()` and `refreshFeatures()` return before fetching when
+GrowthBook is disabled. These methods are at `/tmp/claude-2.1.296.js:2243`; the
+answerer is exported at `:25921`.
+
+Filling the map directly would make `hasFreshFeatures()` true, but it would not
+change `mg()`. The restart command would still be unavailable with telemetry
+disabled. An isolated test of the extracted client and command functions
+confirmed this after `processRemoteEvalPayload()` accepted a local payload
+containing `tengu_fancy_wand: {value: true}`.
+
+A partial map also changes ordinary flag lookups: once the map is nonempty,
+`getFeatureValueWithSource()` returns the default for a name missing from that
+map instead of consulting its disk-cache value. In the isolated test, inserting
+only `tengu_fancy_wand` made `tengu_amber_sentinel` read its `false` default despite
+its disk-cache value being `true`. The map-writing, disabled-fetch, and lookup
+checks were also matched in the installed 2.1.296 executable.
+
 ### Session requirements
 
 `bjt()` requires these conditions independently of the flag:
