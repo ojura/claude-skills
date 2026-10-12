@@ -13,7 +13,8 @@ identity used by promotion. --team selects the agents operated on.
 --install creates the ~/.local/bin symlink, installs zsh completion, and adds the
 Claude Code startup hook that runs --cleanup.
 
-A bare selector can be replaced with --agent-id and/or --resume <session-uuid>.
+A bare selector can be replaced with --agent-id and/or
+--resume <session uuid or title>.
 The tool reconstructs team, type, color, model, effort, permission mode, cwd,
 parent session, tmux socket, and pane from disk records and live processes.
 Dated observations use newest-first precedence; explicit identity assignment and
@@ -48,6 +49,7 @@ import textwrap
 import time
 import traceback
 import types
+import unicodedata
 from collections import defaultdict
 from collections.abc import Mapping
 from datetime import datetime
@@ -61,11 +63,17 @@ TOOL = Path(__file__).resolve().name
 # them. Hand wrapping preserves the selector table columns.
 SELECTOR_HELP = f"""Resume a Claude Code teammate in its swarm tmux session.
 
-The bare selector accepts four forms:
+The bare selector accepts five forms:
     2a38de2d-bd34-...   session UUID       -> --resume
     teammate@session-x  full agent id      -> --agent-id
     session-a52cb2af    a dir under teams/ -> --team (whole roster, lead last)
     teammate            bare agent name    -> one matching transcript
+    "fix the parser"    session title      -> --resume (that session)
+
+A session title is the custom title, or the AI title of a session without
+one, compared in any letter case and without surrounding whitespace, as
+claude --resume compares it. --resume takes a title too. A team or an agent
+name that is also the title of a session selects the team or the agent.
 
 The selector can appear among the flags. A flag that takes a value consumes its
 value, so selector position is independent. Two bare tokens produce an error
@@ -193,10 +201,15 @@ def poison_said(value, carrier):
 
 # Title lookup reads the tail first (titles are rewritten every few turns, so the
 # current one is almost always there) and only falls back to the head.
+# The title shown falls back to the first TITLE_HEAD_BYTES. The title a
+# --resume value is compared with falls back to the first RESUME_HEAD_BYTES:
+# claude 2.1.296 reads 64 KiB at each end of a transcript for the title it
+# compares, so this tail is TITLE_TAIL_BYTES too.
 
 
 TITLE_TAIL_BYTES = 64 * 1024
 TITLE_HEAD_BYTES = 256 * 1024
+RESUME_HEAD_BYTES = 64 * 1024
 
 # A boot creates its implicit team a few hundred ms before the session file is
 # written (measured 281ms and 252ms on two 2.1.220 boots); this is the slack.
@@ -1058,6 +1071,17 @@ def some_of(names, most=6):
     return ", ".join(names[:most]) + f", and {len(names) - most} more"
 
 
+def near_match_note(near):
+    """What a refusal adds for roster agent ids that differ from the requested name only in case.
+
+    near is _same_name_other_case's list; the note is empty when the list is.
+    """
+    if not near:
+        return ""
+    return (f"; {some_of(near)} {'differs' if len(near) == 1 else 'differ'} from it only "
+            "in case")
+
+
 def stop_targets(args):
     """Return Resolver's complete immutable answer for one stop request."""
     plan = RESOLVER.stop_plan(
@@ -1915,7 +1939,7 @@ class Resolver:
             # so re-ask over whole files before saying so.
             deep = self._grep_files('"agentName"', [self._projects_dir], True)
             if deep is None:  # grep unavailable
-                deep = sorted(self._projects_dir.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+                deep = self._transcripts_by_mtime()
             elif team and deep:
                 deep = self._grep_files('"teamName"', deep, False) or []
             seen = set(files)
@@ -2487,9 +2511,10 @@ class Resolver:
         """The values this process was given for these environment variables.
 
         Env is fixed at exec, so this is what the process is actually running
-        with rather than what anyone since has set. No reader outside the
-        process can read it and stay honest: /proc/<pid>/environ is the only
-        source.
+        with rather than what anyone since has set. A reader outside the
+        process can learn these values only from /proc/<pid>/environ: another
+        record of them, such as a launch command or the parent's environment,
+        can differ from what the process was given.
         """
         if not self._may_read(pid, "environ"):
             return {}
@@ -2913,9 +2938,18 @@ class Resolver:
         return reads
 
     def _transcripts_by_mtime(self):
-        """Every transcript, newest first."""
-        return sorted(self._projects_dir.glob("*/*.jsonl"),
-                      key=lambda path: path.stat().st_mtime, reverse=True)
+        """The transcripts in the project directories, newest first.
+
+        A transcript removed between the glob and its stat is left out.
+        """
+        dated = []
+        for path in self._projects_dir.glob("*/*.jsonl"):
+            try:
+                dated.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+        dated.sort(key=lambda item: item[0], reverse=True)
+        return [path for _mtime, path in dated]
 
     def _transcripts_starting(self, block):
         """Transcripts with a uuid that opens with this block. A path question,
@@ -2924,8 +2958,7 @@ class Resolver:
         return list(self._projects_dir.glob(f"*/{block}-*.jsonl"))
 
     def _resolution(self, path=None, fields=None, last_ts=0, via="", strength=0,
-                    others=(), reason="", answered=False, runtime=None,
-                    evidence=None):
+                    others=(), reason="", runtime=None, evidence=None):
         """Build one complete immutable transcript resolution."""
         return Resolution(
             path=path,
@@ -2935,7 +2968,6 @@ class Resolver:
             strength=strength,
             others=immutable(others),
             reason=reason,
-            answered=answered,
             runtime=immutable(runtime) if runtime is not None else None,
             evidence=immutable(evidence or {}),
             transcript=self._transcript_fact(path=path) if path else None,
@@ -2963,14 +2995,16 @@ class Resolver:
                     reason=(f"{len(paths)} transcript files carry session {session_uuid}; "
                             "the UUID cannot choose between them, so resolve the duplicate "
                             "files before resuming"),
-                    answered=True,
                     evidence={"kind": "session-ambiguity", "paths": paths},
                 )
             if paths:
                 path = paths[0]
                 fields, last = ({}, 0) if quick else self._scan_transcript(path)
                 return self._resolution(path, fields, last, via="session uuid", strength=EXACT)
-            return self._resolution(reason=f"no transcript file for session {session_uuid}")
+            return self._resolution(
+                reason=(f"{session_uuid}.jsonl is not in any project directory under "
+                        f"{self._projects_dir}"),
+                evidence={"kind": "not-found"})
 
         # Live runtime outranks recorded identity. Members and flag-bound leads
         # state identity in argv; plain leads join through session and team
@@ -3026,7 +3060,8 @@ class Resolver:
                     )
 
         if lead_session or is_lead:
-            path = self._transcript_path(lead_session) if lead_session else None
+            carriers = self._transcript_paths(lead_session) if lead_session else ()
+            path = carriers[0] if len(carriers) == 1 else None
             if path:
                 fields, last = ({}, 0) if quick else self._scan_transcript(path)
                 return self._resolution(
@@ -3044,8 +3079,16 @@ class Resolver:
                     path, fields, last, via=claim["why"], strength=EXACT,
                     evidence=claim,
                 )
-            named = (f"roster names lead session {lead_session}, which has no transcript, and "
-                     if lead_session else "")
+            # carriers does not hold exactly one file: the roster's session does
+            # not have a transcript file, or several files carry it.
+            if carriers:
+                named = (f"roster names lead session {lead_session}, and {len(carriers)} "
+                         "transcript files carry it, so the UUID cannot choose between them; ")
+            elif lead_session:
+                named = (f"roster names lead session {lead_session}, and {lead_session}.jsonl "
+                         f"is not in any project directory under {self._projects_dir}; ")
+            else:
+                named = ""
             return self._resolution(reason=f"{named}{claim['why']}")
 
         if team and name:
@@ -3062,7 +3105,6 @@ class Resolver:
                     reason=(f"{len(promoted)} promotion receipts assign "
                             f"{agent_id_of(name, team)} to different conversations; "
                             "choose one with --resume"),
-                    answered=True,
                     evidence={"kind": "promoted-ambiguity",
                               "paths": tuple(path for path, _receipt in promoted)},
                 )
@@ -3098,17 +3140,40 @@ class Resolver:
                 return self._resolution(
                     *hits[0], via="agentName only (unique across rosters)", strength=NAME_ONLY,
                     others=hits[1:])
-        label = agent_id_of(name or "?", team or "?")
+        # The agent id, or the agentName alone when the lookup was not given a
+        # team and searched the stamps for the name only.
+        label = (f"the agentName {name!r}" if name and not team
+                 else agent_id_of(name or "?", team or "?"))
         # Every rung is spent. If a roster carries this word under different
         # capitals, saying so is the whole difference between a dead end and a
         # typo, and it costs one pass over rosters already read.
         near = self._same_name_other_case(name, team, census)
         if near:
-            return self._resolution(answered=True, reason=(
-                f"no transcript found for {label}; {some_of(near)} "
-                f"{'differs' if len(near) == 1 else 'differ'} from it only in case"
-            ))
-        return self._resolution(reason=f"no transcript found for {label}")
+            return self._resolution(
+                reason=f"the lookup did not find a transcript for {label}{near_match_note(near)}",
+                evidence={"kind": "near-match", "names": tuple(near)})
+        # What the rungs above checked. A full lookup compares the latest
+        # agentName stamp of each transcript, and a quick one the stamp that
+        # _stamp_index read from the windows named here.
+        if quick:
+            stamps = (f"whether {name!r} is the last agentName stamp in the last "
+                      f"{INDEX_CHUNK // 1024} KiB of a transcript, or in its first "
+                      f"{INDEX_CHUNK // 1024} KiB when those do not hold an agentName or "
+                      "teamName stamp, each extended to whole records, or in the whole "
+                      "file of a promoted transcript")
+        else:
+            stamps = f"whether {name!r} is the latest agentName stamp of a transcript"
+        if name and team:
+            searched = (f"; it checked whether a live process runs {label} on a conversation "
+                        "with exactly one transcript file, whether the last promotion receipt "
+                        f"in a transcript assigns {label}, and {stamps}")
+        elif name:
+            searched = f"; it checked {stamps}"
+        else:
+            searched = ""
+        return self._resolution(
+            reason=f"the lookup did not find a transcript for {label}{searched}",
+            evidence={"kind": "not-found"})
 
     def _boot_join(self, snapshot, census=None):
         """[(team, pid, createdAt)] pairing each implicit team with the live process
@@ -3663,9 +3728,9 @@ class Resolver:
         the sender's transcript as a SendMessage tool use, and every delivery
         lands in the recipient's as a teammate-message wrapper carrying the
         body unchanged. The join is pure evidence-reading, and an unmatched
-        send has four honest states rather than one: still in the inbox
-        file (queued), the recipient has not written since (pending a turn
-        boundary), taken into a live recipient's memory (in memory - the
+        send is in one of four states the evidence tells apart: still in the
+        inbox file (queued), the recipient has not written since (pending a
+        turn boundary), taken into a live recipient's memory (in memory - the
         drain-then-die window while it stands open), or the recipient has
         written and no delivery matches (unexplained - what that window
         leaves behind when it closes on a loss). Seven states in all, with
@@ -5870,9 +5935,10 @@ class Resolver:
                     path.stem, self._transcript_fact(path=path), limit=ABORT_TITLE)
                     for path in res.evidence["paths"]]
                 reason += "\n" + "\n".join(f"  {row}" for row in rows)
-            die(reason if res.answered else
-                f"{reason}; a truly in-process agent leaves only a sidechain under the lead's "
-                "subagents/ dir, which no CLI can resume")
+            elif res.evidence.get("kind") in {"not-found", "near-match"} and requested_name:
+                reason += side_transcripts_note(
+                    requested_name, self._sides_named(requested_name))
+            die(reason)
         objections = self._objections(res, name, team)
         transcript = (res.path, res.fields, res.last_ts)
         others = [(p, f, t) for p, f, t in res.others]
@@ -6648,8 +6714,12 @@ class Resolver:
                 "candidates": (),
                 "ambiguity": None,
                 "reason": selection["via"],
+                "sides": (),
             })
 
+        # Trimmed as a --resume value is (resume_answer), before _classify
+        # checks it for a session id.
+        token = token.strip(self.ECMASCRIPT_TRIM)
         kind, value, reason = self._classify(token)
         candidates = ()
         selection = value
@@ -6676,6 +6746,11 @@ class Resolver:
                 }))
             candidates = tuple(rows)
             selection = None
+        elif kind == "title":
+            selection = value["session"]
+        elif kind == "titles":
+            candidates = value
+            selection = None
         return types.MappingProxyType({
             "kind": kind,
             "token": token,
@@ -6683,7 +6758,45 @@ class Resolver:
             "candidates": candidates,
             "ambiguity": ambiguity,
             "reason": reason,
+            # For the refusal of an unknown token: the side transcripts that
+            # have it as their task id or agent name.
+            "sides": self._sides_named(token) if kind == "unknown" else (),
         })
+
+    def resume_answer(self, value):
+        """What a --resume value selects: a session by its id or file name, or by its title.
+
+        The value is trimmed of ECMASCRIPT_TRIM first: claude trims it before
+        its session-id check with --print, and before its title lookup in an
+        interactive launch. A session uuid, and a value that is the name of a
+        transcript file in a project directory, are kept; the transcript
+        lookup that follows refuses a uuid without a transcript. Any other
+        value is looked up as a session title (_sessions_titled). A value
+        with a glob character or a slash is looked up as a title only, since
+        _transcript_paths would read it as a pattern or a path. A value that
+        is empty once trimmed is refused.
+        """
+        trimmed = value.strip(self.ECMASCRIPT_TRIM)
+        if not trimmed:
+            return immutable({
+                "kind": "missing", "session": None, "sessions": (), "sides": (),
+                "reason": f"the --resume value {value!r} is empty once trimmed of whitespace"})
+        value = trimmed
+        if UUID_RE.match(value) or (not set(value) & set("*?[/")
+                                    and self._transcript_paths(value)):
+            return immutable({"kind": "session", "session": value,
+                              "sessions": (), "sides": (), "reason": ""})
+        titled = self._sessions_titled(value)
+        if titled:
+            return immutable({
+                "kind": "title" if len(titled) == 1 else "titles",
+                "session": titled[0]["session"] if len(titled) == 1 else None,
+                "sessions": titled, "sides": (), "reason": ""})
+        return immutable({
+            "kind": "missing", "session": None, "sessions": (),
+            "sides": self._sides_named(value),
+            "reason": (f"{value}.jsonl is not in any project directory under "
+                       f"{self._projects_dir}, and {value!r} is not the title of any session")})
 
     def launch_plan(self, session_uuid=None, agent_id=None, for_team=None,
                     keep_team=False, table=None, census=None, terminal=None,
@@ -6753,11 +6866,19 @@ class Resolver:
         return objections
 
     def _classify(self, token):
-        """Classify a selector as UUID, agent ID, team, name, ambiguity, or unknown.
+        """Classify a selector as UUID, agent ID, team, name, ambiguity, session title, or unknown.
 
         Ambiguous results include candidates so callers can render live state while
-        Resolver retains the classification decision.
+        Resolver retains the classification decision. A token that does not match
+        any of the other forms is looked up last as a session title, so a team or
+        an agent name that is also the title of a session selects the team or the
+        agent. A token in the form of an implicit team's name that is not a known
+        team is refused without a title lookup. selector_answer trims the token
+        of ECMASCRIPT_TRIM before this reads it, and a token that is empty once
+        trimmed is refused.
         """
+        if not token:
+            return "unknown", None, "is empty once trimmed of whitespace"
         if UUID_RE.match(token):
             return "uuid", token, "a session uuid"
         if "@" in token:
@@ -6782,7 +6903,16 @@ class Resolver:
         found = self._resolve_transcript(name=token)
         if found:
             return "name", found, f"matched by transcript ({found.via})"
-        return "unknown", None, f"roster search returned empty: {found.reason}"
+        titled = self._sessions_titled(token)
+        if len(titled) == 1:
+            return "title", titled[0], "the title of one session"
+        if titled:
+            return "titles", titled, f"the title of {len(titled)} sessions"
+        near = (found.evidence["names"] if found.evidence.get("kind") == "near-match"
+                else ())
+        return "unknown", None, ("did not match a team, a member's name in a roster, the "
+                                 "latest agentName stamp of a transcript, or a session title"
+                                 f"{near_match_note(near)}")
 
     def _roster_entries(self, agent_id=None, name=None, team=None, lead_only=False,
                        census=None):
@@ -8408,24 +8538,92 @@ class Resolver:
         return hits[0] if len(hits) == 1 else None
 
     def _transcript_fact(self, session_uuid=None, path=None):
-        """Immutable path, title, and activity time for one transcript."""
+        """Immutable path, titles, and activity time for one transcript.
+
+        "title" is the TitleFact shown for it, and "resume_title" the title a
+        --resume value or a bare selector is compared with; _session_title
+        reads both.
+        """
         path = Path(path) if path else self._transcript_path(session_uuid)
         if not path:
             return None
         if path in self._transcript_facts:
             return self._transcript_facts[path]
-        title = None
+        title = resume_title = None
         if self._needs[NEED.TITLES] is not DECLARED.ABSENT:
             self._exercise(NEED.TITLES)
-            title = _session_title(path)
+            title, resume_title = _session_title(path)
         try:
             mtime = int(path.stat().st_mtime * 1000)
         except OSError:
             mtime = None
         fact = types.MappingProxyType({"session": path.stem, "path": path,
-                                       "title": title, "mtime": mtime})
+                                       "title": title, "resume_title": resume_title,
+                                       "mtime": mtime})
         self._transcript_facts[path] = fact
         return fact
+
+    # The code points that String.prototype.trim removes from both ends of a
+    # string, ECMAScript's WhiteSpace and LineTerminator: claude trims a
+    # --resume value and each title with it. str.strip() removes a different
+    # set: it keeps U+FEFF and removes U+001C to U+001F and U+0085.
+    ECMASCRIPT_TRIM = (
+        "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680"
+        "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
+        "\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+        "\ufeff")
+
+    def _sessions_titled(self, title):
+        """The transcript facts of the sessions with title as their resume title, newest first.
+
+        A session matches when its resume title (_session_title) equals title
+        once both are lowered and stripped of ECMASCRIPT_TRIM, which is how
+        claude 2.1.296 matches a --resume value that is not a session id.
+        claude looks among the sessions of the current project; this looks in
+        each project directory under _projects_dir, since a title given to
+        this tool is not tied to a directory.
+        A transcript that starts with a sidechain record is left out; claude
+        leaves out a transcript with a sidechain record anywhere in its first
+        64 KiB. A transcript with a teamName stays in, where claude leaves it
+        out, since resuming team members is what this tool is for. A session
+        with several matching files is listed once, by its newest file. As in
+        claude, a blank title does not match any session, and an empty custom
+        title hides the AI title.
+        """
+        wanted = title.lower().strip(self.ECMASCRIPT_TRIM)
+        if not wanted:
+            return ()
+        self._exercise(NEED.TITLES)
+        found = {}
+        for path in self._transcripts_by_mtime():
+            if not UUID_RE.match(path.stem) or path.stem in found:
+                continue
+            fact = self._transcript_fact(path=path)
+            named = fact["resume_title"]
+            if (named is not None
+                    and named.lower().strip(self.ECMASCRIPT_TRIM) == wanted
+                    and not self._starts_as_sidechain(path)):
+                found[path.stem] = fact
+        return tuple(found.values())
+
+    @staticmethod
+    def _starts_as_sidechain(path):
+        """Whether the first record of a transcript is a sidechain record."""
+        try:
+            with path.open("rb") as handle:
+                first = json.loads(handle.readline())
+        except (OSError, ValueError):
+            return False
+        return isinstance(first, dict) and first.get("isSidechain") is True
+
+    def _sides_named(self, value):
+        """The side transcripts with value as their task id or agent name, from _side_listing.
+
+        _side_listing reads paths and meta files only, so a failed lookup that
+        calls this does not read the side transcripts themselves.
+        """
+        return immutable([entry for entry in self._side_listing()
+                          if value in (entry["task_id"], entry["name"])])
 
     def _side_transcripts(self, parent=None):
         """Every side transcript on this machine, classified by its own bytes.
@@ -11087,8 +11285,53 @@ def _first_user_message(head_lines):
     return None
 
 
+def claude_cleaned_title(text):
+    """text cleaned as claude 2.1.296 cleans the title in custom-title.json (its ci).
+
+    Trimmed of Resolver.ECMASCRIPT_TRIM; each run of code points in the
+    Unicode categories Cc (control) or Cf (format), or U+2028 or U+2029,
+    replaced by one space; cut to the first 200 code points; trimmed again.
+    Before the cut claude also removes U+0000 to U+001F and U+007F to U+009F,
+    which leaves the text as it is: those are the code points of Cc, and the
+    replacement has already turned them into spaces. The categories are
+    Python's unicodedata.
+    """
+    cleaned, in_run = [], False
+    for char in text.strip(Resolver.ECMASCRIPT_TRIM):
+        special = (unicodedata.category(char) in ("Cc", "Cf")
+                   or char in "\u2028\u2029")
+        if not (special and in_run):
+            cleaned.append(" " if special else char)
+        in_run = special
+    return "".join(cleaned)[:200].strip(Resolver.ECMASCRIPT_TRIM)
+
+
+def _refuse_json_constant(constant):
+    """json.loads's parse_constant for a file that claude parses with JSON.parse,
+    which refuses NaN, Infinity and -Infinity."""
+    raise ValueError(f"{constant} is not JSON")
+
+
 def _session_title(path):
-    """Newest custom title, else newest AI title, else first human user text."""
+    """The title shown for one transcript, and the title a --resume value is compared with.
+
+    Both come from here, in one pass over the file, so titles are parsed in
+    one place. The shown title is the newest custom title, else the newest AI
+    title, else the first human user text. The resume title is the title
+    claude 2.1.296 compares a --resume value with: the custom title in the
+    last TITLE_TAIL_BYTES, else the one in custom-title.json in the session's
+    directory beside the transcript, else the one in the first
+    RESUME_HEAD_BYTES; without a custom title in any of those, the AI title in
+    the last TITLE_TAIL_BYTES, else the one in the first RESUME_HEAD_BYTES. A
+    title from a record is taken as written in it. custom-title.json is read
+    as claude reads it: decoded as UTF-8 with U+FFFD in place of each invalid
+    sequence, parsed by JSON.parse's rules, which refuse NaN and Infinity, and
+    its title cleaned by claude_cleaned_title; a file that does not parse, or
+    that gives an empty cleaned title, does not give a title. claude finds
+    each title by searching the raw text for its field, so it also finds a
+    title field inside another record, such as a tool call's input; this reads
+    titles from title records only. Returns (TitleFact or None, str or None).
+    """
     path = Path(path)
 
     def pick(found):
@@ -11118,10 +11361,12 @@ def _session_title(path):
                 fh.seek(tail_at - 1)
                 drop_first = fh.read(1) != b"\n"
             fh.seek(tail_at)
-            found = {}
+            tail = {}
             for event in _title_events_in(fh.read(), drop_first=drop_first):
-                found[event[0]] = event
+                tail[event[0]] = event
+            found = dict(tail)
             title = pick(found)
+            head_raw = None
             if not title:
                 had_records = bool(found)
                 fh.seek(0)
@@ -11141,9 +11386,34 @@ def _session_title(path):
                             re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text).split())
                         title = (TitleFact(value, kind, path, timestamp, record_uuid)
                                  if value else None)
+            resume = tail["custom-title"][1] if "custom-title" in tail else None
+            if resume is None:
+                try:
+                    beside = json.loads(
+                        (path.parent / path.stem / "custom-title.json").read_text(
+                            encoding="utf-8", errors="replace"),
+                        parse_constant=_refuse_json_constant)
+                except (OSError, ValueError):
+                    beside = None
+                named = beside.get("customTitle") if isinstance(beside, dict) else None
+                cleaned = claude_cleaned_title(named) if isinstance(named, str) else ""
+                if cleaned:
+                    resume = cleaned
+            if resume is None:
+                if head_raw is None:
+                    fh.seek(0)
+                    head_raw = fh.read(RESUME_HEAD_BYTES)
+                window = head_raw[:RESUME_HEAD_BYTES]
+                cut = size > len(window) and not window.endswith(b"\n")
+                head = {}
+                for event in _title_events_in(window, drop_last=cut):
+                    head[event[0]] = event
+                resume = next((event[1] for event in (
+                    head.get("custom-title"), tail.get("ai-title"), head.get("ai-title"))
+                    if event), None)
     except OSError:
-        return None
-    return title
+        return None, None
+    return title, resume
 
 
 def title_value(title):
@@ -11181,7 +11451,6 @@ class Resolution:
     strength: int = 0
     others: tuple = ()
     reason: str = ""
-    answered: bool = False
     runtime: object = None
     evidence: object = None
     transcript: object = None
@@ -11410,9 +11679,10 @@ def enforce_identity(target, objections, allow_team_change, force):
                 # histories produce the disagreement and the remedy is the
                 # same, but the diagnosis is not: a launch that carried the
                 # wrong name, or a session that was a teammate first and was
-                # later resumed into leading a team. The second has an honest
-                # past, so naming only the first would accuse it of damage it
-                # does not have. Both are stated and neither is assumed.
+                # later resumed into leading a team. The second is a normal
+                # sequence of events, not damage, so naming only the first
+                # would claim damage that such a session does not have. The
+                # message states both and does not assume either.
                 message += (f"; that evidence is corroborated and says {wanted!r}, so the "
                             f"stamp is either a launch that carried the wrong name or an "
                             f"earlier agent instance, an earlier process on this transcript, "
@@ -11448,15 +11718,24 @@ def apply_selector(token, args):
 
     The engine decides what the token is; this sets the flag and does the talking.
     An ambiguous name is refused here rather than in the engine because the
-    refusal is worth annotating with who is running, which is presentation.
+    refusal is worth annotating with who is running, which is presentation. A
+    session title becomes --resume with the id of the session it selects.
     """
     answer = RESOLVER.selector_answer(token=token)
     kind, value, why = answer["kind"], answer["selection"], answer["reason"]
 
     if kind == "uuid":
-        if args.resume and args.resume != token:
-            die(f"conflicting sessions: {token} and --resume {args.resume}")
-        args.resume = token
+        if args.resume and args.resume != value:
+            die(f"conflicting sessions: {value} and --resume {args.resume}")
+        args.resume = value
+    elif kind == "title":
+        if args.resume and args.resume != value:
+            die(f"conflicting sessions: {value} (the session titled {token!r}) and "
+                f"--resume {args.resume}")
+        warn(f"{token!r} is the title of session {value}")
+        args.resume = value
+    elif kind == "titles":
+        die(titled_sessions_refusal(token, answer["candidates"]))
     elif kind == "agent_id":
         if args.agent_id and args.agent_id != value:
             die(f"conflicting agents: {token} and --agent-id {args.agent_id}")
@@ -11470,7 +11749,7 @@ def apply_selector(token, args):
                 "every member of it; name the one agent to run here")
         if why != "a roster on disk":
             print(f"team     {token} has no roster on disk; rebuilding it from {why}")
-        args.team = token
+        args.team = value
     elif kind == "name":
         if answer["candidates"]:
             warn(f"{token!r} is {why}")
@@ -11486,7 +11765,57 @@ def apply_selector(token, args):
                  f"{ms_str(candidate['joined'])}  [{state}]")
         die("pass one of those ids, or a session uuid")
     else:
-        die(f"{token} {why}")
+        die(f"{token!r} {why}{side_transcripts_note(token, answer['sides'])}")
+
+
+def apply_resume_title(args):
+    """Turn a --resume value that is a session title into the session's id.
+
+    claude --resume takes a session's title in place of its id, and so does
+    this tool; the engine's resume_answer classifies a value as one or the
+    other, and a session id is kept as resume_answer trimmed it. main calls
+    this before apply_selector, so when --resume and the bare selector are
+    both given, the conflict check there compares session ids.
+    """
+    if not args.resume:
+        return
+    answer = RESOLVER.resume_answer(args.resume)
+    if answer["kind"] == "session":
+        args.resume = answer["session"]
+    elif answer["kind"] == "title":
+        warn(f"{args.resume!r} is the title of session {answer['session']}")
+        args.resume = answer["session"]
+    elif answer["kind"] == "titles":
+        die(titled_sessions_refusal(args.resume, answer["sessions"]))
+    elif answer["kind"] == "missing":
+        die(answer["reason"] + side_transcripts_note(args.resume, answer["sides"]))
+
+
+def titled_sessions_refusal(title, facts):
+    """The refusal for a title that several sessions have, with a row for each."""
+    rows = "\n".join(
+        f"  {render_transcript_row(fact['session'], fact, limit=ABORT_TITLE)}"
+        for fact in facts)
+    return (f"{len(facts)} sessions have the title {title!r}; pass the id of the one "
+            f"you mean:\n{rows}")
+
+
+def side_transcripts_note(value, sides):
+    """What a refusal adds when subagent side transcripts have value as task id or name.
+
+    claude --resume does not take a side transcript, and the lookups here do
+    not search them; --promote turns one into a teammate that can be resumed.
+    The note is empty when the value is not the task id or the name of any side
+    transcript.
+    """
+    if not sides:
+        return ""
+    which = ("a subagent side transcript" if len(sides) == 1
+             else f"{len(sides)} subagent side transcripts")
+    where = some_of(str(entry["path"]) for entry in sides)
+    return (f"; {value!r} is the task id or the name of {which} ({where}), and "
+            f"--promote {value} turns a side transcript into a teammate that can "
+            "be resumed")
 
 
 # ---------------------------------------------------------------- tmux
@@ -13759,9 +14088,9 @@ def differing(before, after):
 def said_reads(reads):
     """What a read covered, and the facts each entry was read under.
 
-    The facts are the honest part of a preview: they say which version of the
-    file the reader was looking at, so a line about what a receipt would hold
-    can be checked against what is on disk now.
+    The facts say which version of the file the reader was looking at, so a
+    line of a preview about what a receipt would hold can be checked against
+    what is on disk now.
     """
     return ", ".join(
         (f"{name} ({read['size']} bytes, last written "
@@ -16784,6 +17113,7 @@ PUBLIC_RESOLVER_QUESTIONS = {
     "refresh_transcript_evidence": ("apply_restamp", "embed", "materialize"),
     "rebuild_plan": ("apply_rebuild_plan", "rebuild_roster", "rebuild_team"),
     "restore_answer": ("enforce_restore", "run_one"),
+    "resume_answer": ("apply_resume_title",),
     "revalidate_cleanup": ("run_cleanup",),
     "revalidate_cleanup_cut": ("remove_cleanup_action",),
     "revalidate_conversion": ("embed", "materialize"),
@@ -16940,7 +17270,8 @@ def _check_read_only_verdicts_survive_the_child(s):
     # a summary that counts exactly the rows read, every row readable, and an
     # exit status that is the one those rows call for. A child that printed a
     # full passing table and then crashed, or was ended by a signal or its
-    # bound, reached verdicts this run cannot vouch for.
+    # bound, leaves a report that is not whole: report_of lists a problem for
+    # each of these endings, so the check fails.
     report = s.child_report
     check("read-only-verdicts-survive-the-child",
           "the read-only verdicts a live run reports come from a child report with rows, a tally "
@@ -18066,6 +18397,11 @@ def _check_smoke_typed_commands(s):
         # a session uuid, held and not held
         ("runs", [here_uuid, "--dry-run"]),
         ("refuses", [gone_uuid, "--dry-run"]),
+        # a session title, behind --resume and bare; the copy of the corpus
+        # below gives the held session one
+        ("runs", ["--resume", "corpus smoke title", "--dry-run"]),
+        ("runs", ["corpus smoke title", "--dry-run"]),
+        ("refuses", ["--resume", "unknown smoke title", "--dry-run"]),
         # a team, bare and behind the flag. Either way round: whether a team
         # comes up depends on whether its lead is live on this machine, which
         # the fixture does not control.
@@ -18080,6 +18416,8 @@ def _check_smoke_typed_commands(s):
         ("refuses", ["nosuchagent@session-corpus-alpha", "--doctor"]),
         ("runs", [here_uuid, "--doctor"]),
         ("refuses", [gone_uuid, "--doctor"]),
+        ("runs", ["--resume", "corpus smoke title", "--doctor"]),
+        ("runs", ["corpus smoke title", "--doctor"]),
         ("runs", ["session-corpus-alpha", "--doctor"]),
         ("refuses", ["nosuchteam", "--doctor"]),
         ("refuses", ["willow", "--standing"]),
@@ -18090,6 +18428,8 @@ def _check_smoke_typed_commands(s):
         # no process was launched with this agent id, so the stop does not find
         # one to end and does not prompt
         ("refuses", ["--agent-id", "ghost@session-corpus-alpha", "--stop"]),
+        # and the session this title selects does not run in any process
+        ("refuses", ["--resume", "corpus smoke title", "--stop"]),
         ("refuses", ["--frobnicate", "willow"]),
     ]
 
@@ -18098,6 +18438,11 @@ def _check_smoke_typed_commands(s):
     smoke_home = Path(tempfile.mkdtemp(prefix=f"{TOOL}-smoke-"))
     smoke_cfg = smoke_home / "claude"
     shutil.copytree(Path(__file__).resolve().parent / "test" / "corpus", smoke_cfg)
+    # The held session gets a title, in custom-title.json in the session's
+    # directory, for the commands that select it by its title.
+    titled = smoke_cfg / "projects" / "corpus" / here_uuid
+    titled.mkdir()
+    (titled / "custom-title.json").write_text(json.dumps({"customTitle": "Corpus smoke title"}))
     smoke_env = dict(os.environ, CLAUDE_CONFIG_DIR=str(smoke_cfg), NO_COLOR="1")
     crashed, misbehaved, codes = [], [], set()
     # A process of this run's own with a command name that is not UTF-8, running
@@ -26011,12 +26356,13 @@ def resume_run(agent_id, *, listed=True, server=None, table=(), registry=(),
         members = json.loads(cfg.read_text()).get("members", [])
         return next((m for m in members if m.get("name") == who), None)
 
-    # The socket this run happens on belongs to the fixture, listed and called
-    # live by the fixture. There is no socket node anywhere: binding one
-    # made socket_alive answer by connecting, which was honest about the
-    # probe and dishonest about everything around it, since the rest of
-    # the world was already synthetic and a bound node is one more thing
-    # a failed run can leave on the machine.
+    # The fake server lists the run's socket, claude-swarm-test, and answers
+    # the liveness probe for it: installed() puts its answers in place of the
+    # engine's _swarm_sockets and _socket_alive. The fixture does not bind a
+    # socket node in sockdir. A bound node would give code that reaches the
+    # real _socket_alive a live server to connect to, one the fixture did not
+    # start, while the tmux server and the process table around it are fakes;
+    # and it is one more thing a failed run can leave on the machine.
     sockdir = base / "tmux"
     sockdir.mkdir()
 
@@ -26615,8 +26961,9 @@ def _check_seat_finds_wrapped_agent(s):
     # A parent that starts the agent and waits on it, start_wrapped, so the
     # agent is a real child of a real process. Whether the resolver walks from
     # a pane's root process down to an agent running inside it is the one
-    # fact a synthetic table cannot honestly stand in for. The socket, the
-    # pane and the pane root all come from the fixture.
+    # fact a synthetic table cannot establish, since it holds only the
+    # parentage the fixture wrote into it. The socket, the pane and the pane
+    # root all come from the fixture.
 
     def is_the_agent(row):
         """The agent itself, not the parent that started it.
@@ -26870,7 +27217,8 @@ def _check_promoted_member_root_stamps(s):
     ('uuid-resume-declares-runtime-stamps',
      'a promoted lead resumed by UUID declares the stamp search used by live runtime mapping'),
     ('transcript-with-no-identity-refused',
-     'a transcript that no record on disk identifies still gets the honest refusal'),
+     'a transcript that the records on disk do not identify is refused, naming the two empty '
+     'identity sources and offering --agent-id'),
 )
 def _check_promoted_member_resolves_by_its_receipt(s):
     checked = []
@@ -27051,16 +27399,17 @@ def _check_promoted_member_resolves_by_its_receipt(s):
             except Refusal:
                 refused = True
         said = " ".join(without_wrap_arrows(refusal.getvalue()).split())
-        honest = {
+        blank_refusal = {
             "plain session history is refused": refused,
             "the refusal names both empty identity sources":
                 "complete agent stamps" in said and "teammate spawn records" in said
                 and "both resolve empty" in said,
             "the refusal offers explicit identity assignment": "--agent-id" in said,
         }
-        wrong = sorted(k for k, ok in honest.items() if not ok)
+        wrong = sorted(k for k, ok in blank_refusal.items() if not ok)
         check("transcript-with-no-identity-refused",
-              "a transcript that no record on disk identifies still gets the honest refusal",
+              "a transcript that the records on disk do not identify is refused, naming the two "
+              "empty identity sources and offering --agent-id",
               not wrong, ", ".join(wrong))
 
     s.eng = eng
@@ -27081,34 +27430,32 @@ def _check_refusal_names_a_case_near_match(s):
     roster_names = {e["member"].get("name") for e in eng_case._scan_teams()}
     typo = eng_case._resolve_transcript(name="WILLOW", team="session-corpus-alpha", quick=True)
     plain = eng_case._resolve_transcript(name="zzzznotreal", team="session-corpus-alpha", quick=True)
-    # Driven through the caller too, because the flag is only worth setting if
-    # the caller reads it: the message a person sees is the one built here.
+    # Driven through the caller too, because the message a person sees is the
+    # one _identity prints.
 
     def cased_refusal(asked):
-        """What identity() printed when it refused this name, as one line."""
+        """What identity() printed when it refused this name, as one line without wrap markers."""
         with capturing("err") as told:
             try:
                 corpus_engine()._identity(agent_id=f"{asked}@session-corpus-alpha")
             except Refusal:
                 pass
-        return " ".join(told.getvalue().split())
+        return " ".join(without_wrap_arrows(told.getvalue()).split())
 
     typo_said, plain_said = cased_refusal("WILLOW"), cased_refusal("zzzznotreal")
-    tail = "a truly in-process agent"
+    tail = "whether the last promotion receipt in a transcript assigns"
     cased = {
         "the corpus carries the name in the other case": "willow" in roster_names,
         "and not the way this asks for it": "WILLOW" not in roster_names,
         "the refusal names the near match":
             "willow@session-corpus-alpha" in (typo.reason or ""),
         "and says what is different about it": "only in case" in (typo.reason or ""),
-        "it needs no further explaining": typo.answered,
         "a name that no agent has gets no near-match suggestion":
             "only in case" not in (plain.reason or ""),
-        "and still leaves its caller to explain": not plain.answered,
         "the printed refusal names the near match too":
             "willow@session-corpus-alpha" in typo_said and "only in case" in typo_said,
-        "and drops the explanation it does not need": tail not in typo_said,
-        "which the refusal that needs it still carries": tail in plain_said,
+        "and leaves out the list of what was searched": tail not in typo_said,
+        "which the refusal without a near match gives": tail in plain_said,
     }
     wrong = sorted(k for k, ok in cased.items() if not ok)
     check("refusal-names-a-case-near-match",
@@ -30521,7 +30868,7 @@ def _check_doctor_canonical_members(s):
                 and ordinary_member["resolution"].transcript["session"] == ordinary_session,
             "a missing member keeps one explicit refusal":
                 missing_member["resolution"].transcript is None
-                and "no transcript found" in missing_member["resolution"].reason,
+                and "did not find a transcript" in missing_member["resolution"].reason,
             "a promoted member is represented before first launch":
                 promoted_member["membership"][0] == "converted"
                 and promoted_member["resolution"].via == "conversion receipt",
@@ -31596,8 +31943,8 @@ def _check_title_skips_the_harness(s):
         # well against a version that threw every title away.
         chosen = transcript(into, "chosen", [spoken(caveat, "chosen-caveat"),
                                               titled("Rewrite the parser", "chosen-title")])
-        # Nothing but machinery: the honest answer gives no title, not the
-        # caveat.
+        # Only records the harness wrote: the transcript does not have a
+        # title, and the caveat must not become one.
         only_machinery = transcript(into, "only", [spoken(caveat, "only-caveat"),
                                                     titled(caveat, "only-title")])
         nested = transcript(into, "nested", [
@@ -31660,6 +32007,448 @@ def _check_title_skips_the_harness(s):
           and bool(resolution) and runtime_fact is resolution.transcript
           and fact_immutable,
           ", ".join(sorted(title_owners)))
+    return checked
+
+
+@unit(('resume-takes-a-session-title',
+       'a --resume value that is not a session id or a transcript name resumes the session with '
+       'that title, compared in any letter case and without surrounding whitespace'),
+      ('title-lookup-refuses-several-sessions',
+       'a title that several sessions have is refused, with one row per session giving its id, '
+       'project directory and modified time'),
+      ('selector-takes-a-session-title',
+       'a bare selector that is not a team or an agent name selects the session with that title'),
+      ('lookup-failure-says-what-was-searched',
+       'the refusal of a failed lookup says what was searched, and names a subagent side '
+       'transcript only when one has the value as its task id or name'))
+def _check_resume_takes_a_session_title(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    def opening(**fields):
+        return {"type": "user", "parentUuid": None, "isSidechain": False,
+                "message": {"role": "user", "content": "hello"}, **fields}
+
+    def custom(text):
+        return {"type": "custom-title", "customTitle": text}
+
+    def ai(text):
+        return {"type": "ai-title", "aiTitle": text}
+
+    # More than RESUME_HEAD_BYTES and TITLE_TAIL_BYTES, so a title before it
+    # is in the head window only and a title after it in the tail window only.
+    filler = [{"type": "assistant", "message": {"role": "assistant", "content": "x" * 1000}}
+              for _ in range(80)]
+    real_resolver = globals()["RESOLVER"]
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        projects, teams = root / "projects", root / "teams"
+        here, there = projects / "-work-here", projects / "-work-there"
+        for directory in (here, there, teams / "crew"):
+            directory.mkdir(parents=True)
+        # A roster member with the same name as the AI title of a session: the
+        # agent name takes precedence. Scribe is the near match of a selector
+        # that differs from it only in letter case.
+        (teams / "crew" / "config.json").write_text(json.dumps({
+            "name": "crew", "leadAgentId": agent_id_of("team-lead", "crew"),
+            "leadSessionId": "lead-crew", "createdAt": 1,
+            "members": [{"name": "Refactor", "agentId": agent_id_of("Refactor", "crew"),
+                         "joinedAt": 1},
+                        {"name": "Scribe", "agentId": agent_id_of("Scribe", "crew"),
+                         "joinedAt": 2}]}))
+        made = []
+
+        def session(directory, *records, first=None, sid=None, when=None):
+            sid = sid or f"7e1200e6-0000-4000-8000-{len(made):012d}"
+            path = directory / f"{sid}.jsonl"
+            path.write_text("\n".join(fixture_line(r) for r in (
+                first or opening(uuid=f"root-{len(made)}"), *records)) + "\n")
+            if when is not None:
+                os.utime(path, (when, when))
+            made.append(path)
+            return sid
+
+        named = session(here, custom("Proxy handover readiness check"))
+        by_ai = session(here, ai("Fix the parser"))
+        renamed = session(here, ai("Old name"), custom("New name"))
+        session(here, ai("Shadowed by a blank"), custom(""))
+        one_word = session(there, ai("Refactor"))
+        beside = session(here, ai("Hidden by the file"))
+        (here / beside).mkdir()
+        (here / beside / "custom-title.json").write_text(
+            json.dumps({"customTitle": "  Title from the file  "}))
+        late = session(there, custom("Early name"), *filler, custom("Late name"))
+        early = session(there, custom("Head custom"), *filler, ai("Tail ai"))
+        session(here, custom("Side title"), first=opening(uuid="side-root", isSidechain=True))
+        twin = session(here, custom("Twin title"), when=1_700_000_000)
+        session(there, custom("Twin title"), sid=twin, when=1_700_000_100)
+        session(here, {"type": "assistant", "message": {
+            "role": "assistant", "content": [{
+                "type": "tool_use", "name": "fixture",
+                "input": {"type": "custom-title", "customTitle": "Nested title"}}]}})
+        mate = session(here, custom("Mate title"),
+                       first=opening(uuid="mate-root", agentName="Refactor", teamName="crew"))
+        # A name that only transcript stamps carry, and another session with
+        # that name as its title: the stamped transcript takes precedence.
+        loner = session(there, first=opening(uuid="loner-root", agentName="Loner",
+                                             teamName="solo"))
+        session(here, custom("Loner"))
+        shared = (session(here, custom("Shared title"), when=1_700_000_200),
+                  session(there, custom("Shared title"), when=1_700_000_300))
+        # Titles padded with U+FEFF, which String.prototype.trim removes and
+        # str.strip() keeps, and with U+001F, which str.strip() removes and
+        # String.prototype.trim keeps; and a custom-title.json title of U+FEFF
+        # alone, empty once trimmed, so the custom title in the first
+        # RESUME_HEAD_BYTES is the title.
+        # custom-title.json files that claude cleans or refuses: a title of
+        # U+200B alone, in Cf, which becomes a space, so the file does not give
+        # a title and the custom title in the first RESUME_HEAD_BYTES is the
+        # title; U+200B before Foo; U+001F before 205 y, where U+001F becomes a
+        # space that the cut to 200 code points keeps and the last trim
+        # removes; a byte that is not UTF-8; and a NaN, which JSON.parse
+        # refuses.
+        feff = session(here, custom("\ufeffFeff padded\ufeff"))
+        unit = session(here, custom("\x1fUnit padded\x1f"))
+        fallback = session(there, custom("Head after a blank file"), *filler,
+                           ai("Tail of the fallback"))
+        (there / fallback).mkdir()
+        (there / fallback / "custom-title.json").write_text(
+            json.dumps({"customTitle": "\ufeff"}))
+        zero_width = session(there, custom("Head after a zero width file"), *filler,
+                             ai("Tail of the zero width file"))
+        before_foo = session(here, ai("Hidden by Foo"))
+        cut = session(here)
+        bad_byte = session(here)
+        not_json = session(there, custom("Head after a NaN file"), *filler,
+                           ai("Tail of the NaN file"))
+        for directory, sid, text in (
+                (there, zero_width, json.dumps({"customTitle": "\u200b"})),
+                (here, before_foo, json.dumps({"customTitle": "\u200bFoo"})),
+                (here, cut, json.dumps({"customTitle": "\x1f" + "y" * 205})),
+                (there, not_json, '{"customTitle": "NaN file title", "n": NaN}')):
+            (directory / sid).mkdir()
+            (directory / sid / "custom-title.json").write_text(text)
+        (here / bad_byte).mkdir()
+        (here / bad_byte / "custom-title.json").write_bytes(
+            b'{"customTitle": "Bad \xff byte"}')
+        # Titles that the selector does not reach: a team's name, and the name
+        # of an implicit team that does not exist.
+        crew_titled = session(here, custom("crew"))
+        implicit_titled = session(here, custom("session-0123abcd"))
+        # A member renamed by --resume ... --force: its first record carries
+        # the old agentName and the later one the new.
+        rename_stamps = session(here, {
+            "type": "user", "uuid": "rename-2", "parentUuid": "rename-root",
+            "isSidechain": False, "agentName": "Newname", "teamName": "crew",
+            "message": {"role": "user", "content": "renamed"}},
+            first=opening(uuid="rename-root", agentName="Oldname", teamName="crew"))
+        (here / "one.jsonl").write_text(fixture_line(opening(uuid="one-root")) + "\n")
+        task = "a0b1c2d3e4f5a6b7c"
+        subagents = here / named / "subagents"
+        subagents.mkdir(parents=True)
+        (subagents / f"agent-{task}.jsonl").write_text(fixture_line({
+            "type": "user", "uuid": "scout-root", "parentUuid": None, "isSidechain": True,
+            "message": {"role": "user", "content": "look around"}}) + "\n")
+        (subagents / f"agent-{task}.meta.json").write_text(
+            json.dumps({"name": "scout", "agentType": "general-purpose"}))
+        # A side transcript named like a roster member in other letters, for
+        # the near-match refusal.
+        near_task = "b1c2d3e4f5a6b7c8d"
+        (subagents / f"agent-{near_task}.jsonl").write_text(fixture_line({
+            "type": "user", "uuid": "scribe-root", "parentUuid": None, "isSidechain": True,
+            "message": {"role": "user", "content": "take notes"}}) + "\n")
+        (subagents / f"agent-{near_task}.meta.json").write_text(
+            json.dumps({"name": "scribe", "agentType": "general-purpose"}))
+
+        def engine():
+            eng = Resolver(needs=Needs(maybe=set(NEED)))
+            eng._projects_dir, eng._teams_dir = projects, teams
+            return _FakeTmux().attach(eng)
+
+        eng = engine()
+
+        def found(title):
+            return [fact["session"] for fact in eng._sessions_titled(title)]
+
+        def args_for(resume=None):
+            return types.SimpleNamespace(resume=resume, agent_id=None, team=None, here=False)
+
+        def told(call, *given):
+            """Whether call(*given) refused, and its stderr as one line without wrap markers."""
+            with capturing("err") as said:
+                try:
+                    call(*given)
+                    refused = False
+                except Refusal:
+                    refused = True
+            return refused, " ".join(without_wrap_arrows(said.getvalue()).split())
+
+        globals()["RESOLVER"] = engine()
+        try:
+            by_title = args_for("  FIX the Parser ")
+            title_refused, title_said = told(apply_resume_title, by_title)
+            kept = [args_for(value)
+                    for value in (twin, "one", "7e1200e6-ffff-4fff-8fff-ffffffffffff")]
+            for args in kept:
+                told(apply_resume_title, args)
+            padded_id = args_for(f"\ufeff {by_ai} \u3000")
+            padded_refused, _padded_said = told(apply_resume_title, padded_id)
+            blank_refused, blank_said = told(apply_resume_title, args_for(" \u3000 "))
+            several = args_for("shared title")
+            several_refused, several_said = told(apply_resume_title, several)
+            missing_refused, missing_said = told(apply_resume_title, args_for("nosuchtitle"))
+            task_refused, task_said = told(apply_resume_title, args_for(task))
+            scout_refused, scout_said = told(apply_resume_title, args_for("scout"))
+            selected = args_for()
+            select_refused, select_said = told(apply_selector, "fix the parser", selected)
+            agent = args_for()
+            told(apply_selector, "Refactor", agent)
+            stamped = args_for()
+            told(apply_selector, "Loner", stamped)
+            pick_refused, pick_said = told(apply_selector, "shared title", args_for())
+            none_refused, none_said = told(apply_selector, "nosuchtitle", args_for())
+            cased_refused, cased_said = told(apply_selector, "SCRIBE", args_for())
+            side_pick_refused, side_pick_said = told(apply_selector, "scout", args_for())
+            padded_pick = args_for()
+            told(apply_selector, f"\ufeff\u3000 {by_ai} ", padded_pick)
+            blank_pick_refused, blank_pick_said = told(apply_selector, "\u3000 ", args_for())
+            team_pick = args_for()
+            team_pick_refused, _team_said = told(apply_selector, "crew", team_pick)
+            implicit_pick = args_for()
+            implicit_refused, implicit_said = told(apply_selector, "session-0123abcd",
+                                                   implicit_pick)
+            renamed_pick_refused, renamed_pick_said = told(apply_selector, "Oldname", args_for())
+        finally:
+            globals()["RESOLVER"] = real_resolver
+        unknown_agent = told(lambda: engine()._identity(agent_id="nobody@crew"))
+        unteamed = told(lambda: engine()._identity(agent_id="nobody"))
+        side_agent = told(lambda: engine()._identity(agent_id="scout@crew"))
+        near_side = told(lambda: engine()._identity(agent_id="scribe@crew"))
+        renamed_old = told(lambda: engine()._identity(agent_id="Oldname@crew"))
+        old_stamped = '"agentName":"Oldname"' in (here / f"{rename_stamps}.jsonl").read_text()
+        with capturing("err"):
+            lead_none = engine()._resolve_transcript(
+                lead_session="lead-crew", team="crew", name="team-lead", is_lead=True)
+            lead_two = engine()._resolve_transcript(
+                lead_session=twin, team="crew", name="team-lead", is_lead=True)
+            quick_none = engine()._resolve_transcript(name="nobody", team="crew", quick=True)
+        crew_found, implicit_found = found("crew"), found("session-0123abcd")
+        # A transcript that is gone by the time it is stat'ed: a link to a file
+        # that does not exist, which the glob lists and stat refuses.
+        gone = here / "7e1200e6-dead-4000-8000-000000000000.jsonl"
+        gone.symlink_to(here / "no-such-file")
+        try:
+            gone_engine = engine()
+            gone_left_out = gone not in gone_engine._transcripts_by_mtime()
+            gone_lookup = [fact["session"]
+                           for fact in gone_engine._sessions_titled("fix the parser")]
+        except OSError:
+            gone_left_out, gone_lookup = False, None
+        finally:
+            gone.unlink()
+        unknown_uuid = told(lambda: engine()._identity(
+            session_uuid="7e1200e6-ffff-4fff-8fff-ffffffffffff"))
+        twin_fact = eng._sessions_titled("twin title")
+        shared_facts = eng._sessions_titled("shared title")
+        rows = titled_sessions_refusal("shared title", shared_facts)
+
+        # Evaluated while the fixture files exist.
+        took = {
+            "a custom title selects its session":
+                found("Proxy handover readiness check") == [named],
+            "matching ignores letter case and surrounding spaces":
+                found("  PROXY handover Readiness CHECK ") == [named],
+            "the value and the titles in the transcript are trimmed of ECMASCRIPT_TRIM:"
+            " U+FEFF at the ends goes, U+001F stays":
+                found("feff padded") == [feff] and found("unit padded") == []
+                and found("\x1fUNIT PADDED\x1f") == [unit],
+            "a custom-title.json title of U+FEFF alone or U+200B alone gives an empty"
+            " cleaned title, so the custom title in the first RESUME_HEAD_BYTES is the title":
+                found("head after a blank file") == [fallback]
+                and found("head after a zero width file") == [zero_width]
+                and found("\u200b") == [],
+            "a custom-title.json title of U+200B before Foo matches foo":
+                found("foo") == [before_foo] and found("hidden by foo") == [],
+            "a custom-title.json title is cut to 200 code points after U+001F becomes a"
+            " space and before the last trim: U+001F and 205 y give 199 y":
+                found("y" * 199) == [cut] and found("y" * 200) == [],
+            "custom-title.json is decoded as UTF-8 with an invalid byte as U+FFFD, as"
+            " claude reads it":
+                found("bad \ufffd byte") == [bad_byte],
+            "a custom-title.json that JSON.parse refuses, for a NaN, does not give a title":
+                found("head after a nan file") == [not_json] and found("nan file title") == [],
+            "a --resume value is trimmed of ECMASCRIPT_TRIM before the session-id check:"
+            " U+FEFF, a space and U+3000 around a session id leave the id":
+                not padded_refused and padded_id.resume == by_ai,
+            "a --resume value that the trim empties is refused, saying so":
+                blank_refused and "is empty once trimmed of whitespace" in blank_said,
+            "a transcript removed between the glob and its stat is left out, and the title"
+            " lookup goes on":
+                gone_left_out and gone_lookup == [by_ai],
+            "an AI title selects a session without a custom title":
+                found("fix the parser") == [by_ai],
+            "a custom title hides the AI title":
+                found("old name") == [] and found("new name") == [renamed],
+            "an empty custom title hides it too, and a blank value does not match any session":
+                found("shadowed by a blank") == [] and found("   ") == [] and found("") == [],
+            "a one-word AI title matches, though the shown title skips it":
+                found("refactor") == [one_word],
+            "custom-title.json gives the custom title when the tail does not have one":
+                found("title from the file") == [beside] and found("hidden by the file") == [],
+            "the last custom title in the tail takes precedence over one in the head":
+                found("late name") == [late] and found("early name") == [],
+            "a custom title in the head takes precedence over an AI title in the tail":
+                found("head custom") == [early] and found("tail ai") == [],
+            "a transcript with a sidechain record first is left out": found("side title") == [],
+            "two matching files of one session give one match, the newer file":
+                [fact["path"] for fact in twin_fact] == [there / f"{twin}.jsonl"],
+            "a title object inside another record is not a title record":
+                found("nested title") == [],
+            "a transcript with a teamName matches": found("mate title") == [mate],
+            "--resume with a title becomes the session id":
+                not title_refused and by_title.resume == by_ai,
+            "and the tool prints the id of the session the title selected": by_ai in title_said,
+            "a session id, a transcript name and an unknown uuid stay as given":
+                [args.resume for args in kept]
+                == [twin, "one", "7e1200e6-ffff-4fff-8fff-ffffffffffff"],
+        }
+    wrong = sorted(k for k, ok in took.items() if not ok)
+    check("resume-takes-a-session-title",
+          "a --resume value that is not a session id or a transcript name resumes the session with "
+          "that title, compared in any letter case and without surrounding whitespace",
+          not wrong, ", ".join(wrong))
+
+    listed = {
+        "a title that several sessions have is refused":
+            several_refused and several.resume == "shared title",
+        "each session is listed by its id": all(sid in several_said for sid in shared),
+        "with its project directory": "-work-here" in rows and "-work-there" in rows,
+        "and its modified time": all(ms_str(fact["mtime"]) in rows for fact in shared_facts),
+        "newest first": [fact["session"] for fact in shared_facts] == list(reversed(shared)),
+    }
+    wrong = sorted(k for k, ok in listed.items() if not ok)
+    check("title-lookup-refuses-several-sessions",
+          "a title that several sessions have is refused, with one row per session giving its id, "
+          "project directory and modified time",
+          not wrong, ", ".join(wrong))
+
+    picked = {
+        "a selector that is a session title resumes that session":
+            not select_refused and selected.resume == by_ai and by_ai in select_said,
+        "an agent name that is also a session title selects the agent":
+            agent.agent_id == agent_id_of("Refactor", "crew") and agent.resume is None,
+        "and so does a name that only transcript stamps carry": stamped.resume == loner,
+        "a selector title that several sessions have is refused":
+            pick_refused and all(sid in pick_said for sid in shared),
+        "an unknown selector is refused": none_refused,
+        "a selector is trimmed before the session-id check: U+FEFF, U+3000 and a space"
+        " around a session id select it": padded_pick.resume == by_ai,
+        "a selector that the trim empties is refused, saying so":
+            blank_pick_refused and "is empty once trimmed of whitespace" in blank_pick_said,
+        "a team name that is also a session title selects the team":
+            crew_found == [crew_titled] and not team_pick_refused
+            and team_pick.team == "crew" and team_pick.resume is None,
+        "a token in the form of an implicit team's name is refused without a title lookup,"
+        " though a session has it as its title":
+            implicit_found == [implicit_titled] and implicit_refused
+            and implicit_pick.resume is None and "matches implicit-team syntax" in implicit_said,
+    }
+    wrong = sorted(k for k, ok in picked.items() if not ok)
+    check("selector-takes-a-session-title",
+          "a bare selector that is not a team or an agent name selects the session with that title",
+          not wrong, ", ".join(wrong))
+
+    side_file = f"agent-{task}.jsonl"
+    searched = {
+        "a --resume value without a matching session is refused": missing_refused,
+        "with the file it looked for": "nosuchtitle.jsonl" in missing_said,
+        "and the title it looked for":
+            "'nosuchtitle' is not the title of any session" in missing_said,
+        "an unknown selector is refused, quoted once, at the start":
+            none_refused and none_said.startswith(f"{TOOL}: 'nosuchtitle' ")
+            and none_said.count("nosuchtitle") == 1,
+        "naming each lookup: a team, a member's name in a roster, the latest agentName stamp"
+        " of a transcript, a session title":
+            ("'nosuchtitle' did not match a team, a member's name in a roster, the latest "
+             "agentName stamp of a transcript, or a session title") in none_said,
+        "without an agent id label or the roster search's reason":
+            "@?" not in none_said and "returned empty" not in none_said,
+        "the refusal of a selector that differs from a roster name only in case gives that "
+        "agent's id":
+            cased_refused and cased_said.startswith(f"{TOOL}: 'SCRIBE' did not match a team")
+            and cased_said.endswith("; Scribe@crew differs from it only in case"),
+        "the refusal of a selector that a side transcript has as its name gives that file, "
+        "after the sentence":
+            side_pick_refused and side_pick_said.startswith(f"{TOOL}: 'scout' did not match a team")
+            and side_file in side_pick_said and "--promote scout" in side_pick_said,
+        "a refusal mentions side transcripts only when one has the value":
+            all("side transcript" not in said
+                for said in (missing_said, none_said, cased_said)),
+        "a side transcript's task id is named with its path and --promote":
+            task_refused and side_file in task_said and f"--promote {task}" in task_said,
+        "and so is a side transcript's agent name": scout_refused and side_file in scout_said,
+        "an unknown agent id is refused, saying what the lookup checked":
+            unknown_agent[0]
+            and ("the lookup did not find a transcript for nobody@crew; it checked whether a "
+                 "live process runs nobody@crew on a conversation with exactly one transcript "
+                 "file, whether the last promotion receipt in a transcript assigns nobody@crew, "
+                 "and whether 'nobody' is the latest agentName stamp of a transcript")
+            in unknown_agent[1]
+            and "side transcript" not in unknown_agent[1],
+        "an agent id without a team is refused, with the agentName where the agent id would be":
+            unteamed[0] and ("the lookup did not find a transcript for the agentName 'nobody'; "
+                             "it checked whether 'nobody' is the latest agentName stamp of a "
+                             "transcript") in unteamed[1]
+            and "@?" not in unteamed[1],
+        "and names a side transcript that has its agent name": side_file in side_agent[1],
+        "after a rename, the refusal of the old name says that the lookup checked the latest"
+        " agentName stamp, which is the new name, while an earlier stamp has the old one":
+            renamed_old[0] and old_stamped
+            and "whether 'Oldname' is the latest agentName stamp of a transcript" in renamed_old[1],
+        "and so does the refusal of the old name given as a bare selector":
+            renamed_pick_refused
+            and ("'Oldname' did not match a team, a member's name in a roster, the latest "
+                 "agentName stamp of a transcript, or a session title") in renamed_pick_said,
+        "a quick lookup's refusal names the windows the stamp index reads":
+            not quick_none
+            and ("; it checked whether a live process runs nobody@crew on a conversation with "
+                 "exactly one transcript file, whether the last promotion receipt in a "
+                 "transcript assigns nobody@crew, and whether 'nobody' is the last agentName "
+                 f"stamp in the last {INDEX_CHUNK // 1024} KiB of a transcript, or in its first "
+                 f"{INDEX_CHUNK // 1024} KiB when those do not hold an agentName or teamName "
+                 "stamp, each extended to whole records, or in the whole file of a promoted "
+                 "transcript") in (quick_none.reason or ""),
+        "the lead refusal names the file it looked for when the roster's session does not"
+        " have a transcript file":
+            not lead_none
+            and (lead_none.reason or "").startswith(
+                "roster names lead session lead-crew, and lead-crew.jsonl is not in any project "
+                "directory under "),
+        "and says that several files carry it when several do":
+            not lead_two
+            and (lead_two.reason or "").startswith(
+                f"roster names lead session {twin}, and 2 transcript files carry it, so the "
+                "UUID cannot choose between them; "),
+        "a near-match refusal names a side transcript that has the requested name too":
+            near_side[0] and "Scribe@crew differs from it only in case" in near_side[1]
+            and f"agent-{near_task}.jsonl" in near_side[1],
+        "an unknown session uuid is refused, saying which file it looked for":
+            unknown_uuid[0] and "7e1200e6-ffff-4fff-8fff-ffffffffffff.jsonl" in unknown_uuid[1],
+        "the refusals this check reads do not mention an in-process agent": not any(
+            "in-process" in said for said in (missing_said, task_said, scout_said, none_said,
+                                               cased_said, side_pick_said, unknown_agent[1],
+                                               unteamed[1], side_agent[1], unknown_uuid[1],
+                                               near_side[1], renamed_old[1], renamed_pick_said,
+                                               quick_none.reason or "", lead_none.reason or "",
+                                               lead_two.reason or "")),
+    }
+    wrong = sorted(k for k, ok in searched.items() if not ok)
+    check("lookup-failure-says-what-was-searched",
+          "the refusal of a failed lookup says what was searched, and names a subagent side "
+          "transcript only when one has the value as its task id or name",
+          not wrong, ", ".join(wrong))
     return checked
 
 
@@ -32762,7 +33551,8 @@ def _check_resume_target_is_one_result(s):
           "duplicate promotion claims print full UUID and title rows through the shared renderer",
           transcript_rows_ok
           and {"_identity", "render_completion_answer"} <= row_callers
-          and row_callers <= {"_identity", "render_completion_answer", "run_agent_dossier"},
+          and row_callers <= {"_identity", "render_completion_answer", "run_agent_dossier",
+                              "titled_sessions_refusal"},
           f"callers={sorted(row_callers)}, output={duplicate_text!r}")
     transcript_path_src = s.src_of(s.resolver_methods["_transcript_path"]) or ""
     check("duplicate-session-files-use-transcript-rows",
@@ -33810,7 +34600,7 @@ def _check_forge_preview_matches_real(s):
     return checked
 
 
-@unit(('roster-without-lead-refuses', 'a roster with no lead cannot corroborate one'))
+@unit(('roster-without-lead-refuses', 'a roster without a lead cannot corroborate one'))
 def _check_roster_without_lead_refuses(s):
     checked = []
 
@@ -33825,12 +34615,12 @@ def _check_roster_without_lead_refuses(s):
     try:
         snapshot = Resolver.RosterSnapshot.preview(Path("/nowhere/config.json"), forged)
         RESOLVER._rosters = lambda census=None: (snapshot,)
-        vouched = [e for e in RESOLVER._roster_entries(team="session-forgecheck")
-                   if e.get("leadSessionId")]
+        with_lead_session = [e for e in RESOLVER._roster_entries(team="session-forgecheck")
+                             if e.get("leadSessionId")]
     finally:
         RESOLVER._rosters = real_rosters
-    check("roster-without-lead-refuses", "a roster with no lead cannot corroborate one", not vouched,
-          f"{len(vouched)} entries vouched")
+    check("roster-without-lead-refuses", "a roster without a lead cannot corroborate one",
+          not with_lead_session, f"{len(with_lead_session)} entries name a lead session")
     return checked
 
 
@@ -46134,10 +46924,10 @@ def build_parser():
     offers(picking.add_argument("--agent-id", help="resume this agent (by its full id, name@team)"),
            completes='agent-ids',
            row='resume this agent by its full id, name@team')
-    offers(picking.add_argument("--resume", metavar="SESSION_UUID",
-                                help="resume this session transcript (by uuid)"),
+    offers(picking.add_argument("--resume", metavar="SESSION",
+                                help="resume this session transcript (by uuid or by its title)"),
            completes='sessions',
-           row='resume this session transcript by uuid')
+           row='resume this session transcript by uuid or title')
     offers(picking.add_argument("--team", metavar="TEAM",
                                 help="resume this whole team by name: the members, then the lead"),
            completes='teams',
@@ -46367,6 +47157,7 @@ def main():
         # Before empty-hand help handling because a sweep needs no selector.
         # A named run uses the main selector interpreter before the doctor reads
         # the resolved agent, session, or team fields.
+        apply_resume_title(args)
         if selector:
             apply_selector(selector, args)
         check_selection_conflicts(args)
@@ -46413,6 +47204,7 @@ def main():
         set_tmux_target(args.tmux_session, args.tmux_window)
 
     check_teammate_mode()
+    apply_resume_title(args)
     if selector:
         apply_selector(selector, args)
     check_selection_conflicts(args)

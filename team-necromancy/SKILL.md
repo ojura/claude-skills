@@ -38,7 +38,7 @@ provenance, public methods, caller restrictions, and generation checks.
 
 Resolver selects transcripts in this order:
 
-1. an explicit session UUID
+1. an explicit session UUID, or a session title (below)
 2. a live process with a matching agent ID, using its `--resume` value
 3. the roster's `leadSessionId`
 4. a promotion receipt assigning the requested member identity
@@ -120,6 +120,18 @@ receipts assign one `name@team` to different conversations, it prints one full
 UUID-and-title row per conversation and requires `--resume`. If the same UUID
 exists in several project directories, it prints those rows and refuses rather
 than choosing by file modification time.
+
+`--resume` also takes a session title, as `claude --resume <title>` does, and
+so does the bare selector when the token is not a session ID, an agent ID, a
+team or an agent name, and does not have the form of an implicit team's name
+(`session-` and eight hex digits). A session's title is its custom title, or
+its AI title when it does not have a custom title, and a value matches it in
+any letter case and without surrounding whitespace. The lookup covers each
+project directory under `~/.claude/projects/`, where claude covers the
+current project and its worktrees, and leaves out a transcript that starts
+with a sidechain record. When several sessions have the title, the tool
+prints one row per session, with its ID, project directory and modified
+time, and refuses.
 
 Three flags name destinations:
 

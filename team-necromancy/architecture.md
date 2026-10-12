@@ -563,6 +563,7 @@ private Resolver methods, and require an empty `PUBLIC_RESOLVER_ATTRIBUTES` map.
 | `rebuild_plan` | `apply_rebuild_plan`, `rebuild_roster`, `rebuild_team` |
 | `refresh_transcript_evidence` | `apply_restamp`, `embed`, `materialize` |
 | `restore_answer` | `enforce_restore`, `run_one` |
+| `resume_answer` | `apply_resume_title` |
 | `revalidate_cleanup` | `run_cleanup` |
 | `revalidate_cleanup_cut` | `remove_cleanup_action` |
 | `revalidate_conversion` | `embed`, `materialize` |
@@ -910,6 +911,8 @@ transcript move. A writer may make the final check required by that plan, but it
 does not choose a new identity, parent, destination, or member set.
 
 `selector_answer` selects a conversation without selecting a tmux destination.
+`resume_answer` returns what a `--resume` value selects: a session by its ID or
+transcript file name, or the sessions that have it as their title.
 `launch_plan` adds identity, settings, cwd, provenance, the roster
 record to write, terminal context, lead and member runtime facts, `CrewPlacement`,
 `LaunchDestination`, and `RosterPaneReference`. `_retarget_launch` rebuilds those
@@ -930,7 +933,21 @@ A transcript title is a `TitleFact`, not a string. It contains the selected titl
 text, the event kind, transcript path, timestamp, and source record UUID. Every
 reporting answer carries that one object, so a title's text and the event that
 provided it cannot diverge between a summary, dossier, completion candidate, or
-launch report.
+launch report. The transcript fact also carries, as a string, the title that a
+`--resume` value or a bare selector is compared with. `_session_title` reads it
+in the same pass from `custom-title` and `ai-title` records and from
+`custom-title.json`, taking the sources in the order `claude --resume` takes
+them: the custom title from the last 64 KiB of the transcript, else from
+`custom-title.json` in the session's directory, else from the first 64 KiB;
+without a custom title, the AI title from the last 64 KiB, else from the
+first. Titles from records are taken as written, without the filter of the
+shown title, which skips harness text, one-word AI titles and the AI title
+"new session". `custom-title.json` is decoded as UTF-8, with U+FFFD in place
+of each invalid sequence, and its title is cleaned as claude cleans it:
+trimmed, each run of control or format characters (Unicode categories Cc and
+Cf), U+2028 or U+2029 replaced by one space, cut to 200 code points and
+trimmed again. A file that gives an empty title is passed over, and so is one
+that is not JSON by `JSON.parse`'s rules.
 
 ### Verification scope
 
@@ -1189,8 +1206,9 @@ Reporters receive completed immutable answers and render them. Resume reporters
 receive the immutable target. Doctor reporters receive the canonical member
 records from `doctor_answer`; summary and dossier title rows therefore retain the
 same transcript fact by object identity. The canonical transcript fact carries
-path, optional title, and activity time together; there is no separate title
-lookup. A full transcript snapshot is keyed by device, inode, size, and
+path, optional titles, and activity time together, and the reporters that
+show a title and the `--resume` title lookup read it from that fact.
+A full transcript snapshot is keyed by device, inode, size, and
 nanosecond modification time. It derives the window start, the newest team stamp
 and, when requested, compact mail evidence from one stable read; window-start,
 operating-team and mail questions reuse that answer until any key field changes.
