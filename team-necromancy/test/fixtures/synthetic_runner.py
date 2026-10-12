@@ -9,8 +9,8 @@ changes one thing a verifier must notice. The block is the only place the
 settings are written: probe.runner_settings() reads their names and defaults
 from it, and a test mutation rewrites it with probe.settings(). So each
 setting stays a line of its own, NAME = value as repr writes the value, the
-setting lines follow each other, and no other top-level assignment of a
-literal to a name in capitals fits on one line.
+setting lines follow each other, and every other top-level assignment of a
+literal to a name in capitals takes more than one line.
 
 FAILING names the checks reported as failed. SUMMARY is exact, missing,
 malformed or short. EXIT replaces the exit status. DROP leaves checks out of
@@ -32,14 +32,14 @@ suite's completion drive does; with "stays" the driver keeps running, and with
 adopts orphans. STUBBORN starts a process that ignores SIGTERM and answers it
 by starting another process, so a cleanup that read the process table once
 and never again misses the newer one. NAMED_SYSTEMD starts a process that
-calls itself systemd, which no cleanup may signal. NAME_NOT_UTF8 starts a
+calls itself systemd, which a cleanup must not signal. NAME_NOT_UTF8 starts a
 process that gives itself a command name in bytes that are not UTF-8, with a
 sleeping child, so a cleanup that decodes names loses both. LISTING_LEAVES
 makes a --list run start a driver that stays, as OWNED_DRIVER="stays" does
 for a report. LOCKED_TMPDIR names a directory: a run given a TMPDIR inside it
 makes a directory in that TMPDIR, puts a file in it and takes away its write
 permission, so removing the TMPDIR leaves both; a run given any other TMPDIR
-makes no directory in it.
+does not make a directory in it.
 
 With PROBE_SYNTHETIC_LOG set, every invocation appends its arguments to that
 file as one JSON line, which is how a test sees what the verifier asked. With
@@ -63,8 +63,8 @@ import time
 CATALOG = (
     ("target-check", "the check a case names"),
     ("other-check", "a check a case may justify as a co-failure"),
-    ("third-check", "a check that no case names"),
-    ("every-unit-reported", "no unit ended the run before it reported"),
+    ("third-check", "a check that the cases do not name"),
+    ("every-unit-reported", "every unit reported before the run ended"),
 )
 
 FAILING = []
@@ -86,12 +86,13 @@ NAME_NOT_UTF8 = False
 LISTING_LEAVES = False
 LOCKED_TMPDIR = None
 
-# The driver OWNED_DRIVER starts. Its child is a terminal's: pty.fork puts it in
-# a session of its own, and it ignores the hangup the pty sends when the driver
-# ends, so only an owner that ends it by identity ends it. The child says ready
-# on the terminal once it ignores the hangup, and the driver waits for that
-# before it says who its child is, so a driver that ends at once cannot take
-# the child with it. Given "exits", the driver then ends.
+# The driver OWNED_DRIVER starts. Its child has the pty as its controlling
+# terminal: pty.fork puts it in a session of its own, and it ignores the hangup
+# the pty sends when the driver ends, so only an owner that ends it by identity
+# ends it. The child says ready on the terminal once it ignores the hangup, and
+# the driver waits for that before it says who its child is, so a driver that
+# ends at once cannot take the child with it. Given "exits", the driver then
+# ends.
 DRIVER = r"""
 import os, pty, signal, sys, time
 child, terminal = pty.fork()

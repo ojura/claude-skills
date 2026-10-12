@@ -40,18 +40,17 @@ expectation judged it.
 Certification is asked for, not inferred: ``expect(..., certify=True)`` runs
 only with a timeout of its own and such a retained expectation, adjudications
 included, when it still reads the same from its files, every adjudication is
-decided, each approved entry names a row of the mapping and a mode in which the
-mapping emits that row, each refused entry names a row the mapping does not
-emit in its mode, and its frozen source is the tool under test; only while the
-verifier on disk is the one this process loaded and the code running was
-compiled from it, and only after the verifier's own selftest passes. Its
-listing and clean suite run from a private copy of the tool tree, and its
-supervisors from a private copy of the verifier, each hashed before and after
-the runs, and its result says it certified. Every other call is a development
-run. Without ``expected`` the clean listing stands in for the population, which
-checks that the listing, the clean run and the mutants agree with each other
-and nothing more; a bare mapping has no recorded origin. Both still judge every
-run strictly, and both return a result that says it does not certify the tool.
+decided and fits the mapping by the rules misplaced() checks, and its frozen
+source is the tool under test; only while the verifier on disk is the one this
+process loaded and the code running was compiled from it, and only after the
+verifier's own selftest passes. Its listing and clean suite run from a private
+copy of the tool tree, and its supervisors from a private copy of the verifier,
+each hashed before and after the runs, and its result says it certified. Every
+other call is a development run. Without ``expected`` the clean listing stands
+in for the population, which checks only that the listing, the clean run and
+the mutants agree with each other; a bare mapping does not record its origin.
+Both still judge every run strictly, and both return a result that says it does
+not certify the tool.
 """
 
 import ast
@@ -90,6 +89,8 @@ ENDED_CHECKS = {"every-unit-reported", "every-live-unit-reported"}
 # clean run is seconds; the time limit is here for the mutation that loops
 # forever or blocks on a lock, because results are read only once every suite
 # has finished and one hung suite would otherwise cost the whole run's report.
+# run_suite and expect read this constant when they are called, not as a
+# default argument, so a caller can lower it without editing them.
 SUITE_TIMEOUT_S = 120.0
 # How long a stopped suite gets to die before it is killed outright.
 SUITE_GRACE_S = 5.0
@@ -102,23 +103,23 @@ VERIFIER = Path(__file__).resolve()
 # The sha256 of the verifier's bytes, and whether the code this process runs is
 # what those bytes compile to. The bytes are read once. In a supervisor, the
 # bootstrap code that _supervised_run writes reads them, checks their digest
-# and hands them to the module, under the name HANDED_BYTES gives, before
-# running them; in any other process they are read here when the module is
-# imported. A cached .pyc runs in place of the source, without being read
-# against it, when the size and modification time it records match the
-# source's, so the module's own code object is compared with the bytes compiled
-# as the import system compiles them. A certifying run names the verifier in
-# its record and a reader checks the file on disk, so certification is refused
-# when that file is no longer these bytes or when the code that ran was not
-# compiled from them. run_unit.py, a tool outside this repository, reads the
-# assignment to HANDED_BYTES from this file's bytes and hands them over the
-# same way.
+# and hands them to the module, under the name HANDED_BYTES holds, before
+# running them, and the module removes that name from its globals as it takes
+# them; in any other process they are read here when the module is imported. A
+# cached .pyc runs in place of the source, without being read against it, when
+# the size and modification time it records match the source's, so the module's
+# own code object is compared with the bytes compiled as the import system
+# compiles them. A certifying run names the verifier in its record and a reader
+# checks the file on disk, so certification is refused when that file is no
+# longer these bytes or when the code that ran was not compiled from them.
+# run_unit.py, a tool outside this repository, reads the assignment to
+# HANDED_BYTES from this file's bytes and hands them over the same way.
 HANDED_BYTES = "_VERIFIER_BYTES"
-_VERIFIER_BYTES = globals().get(HANDED_BYTES)
-if _VERIFIER_BYTES is None:
-    _VERIFIER_BYTES = VERIFIER.read_bytes()
-VERIFIER_LOADED = hashlib.sha256(_VERIFIER_BYTES).hexdigest()
-_VERIFIER_CODE = compile(_VERIFIER_BYTES, str(VERIFIER), "exec", dont_inherit=True)
+_LOADED_BYTES = globals().pop(HANDED_BYTES, None)
+if _LOADED_BYTES is None:
+    _LOADED_BYTES = VERIFIER.read_bytes()
+VERIFIER_LOADED = hashlib.sha256(_LOADED_BYTES).hexdigest()
+_VERIFIER_CODE = compile(_LOADED_BYTES, str(VERIFIER), "exec", dont_inherit=True)
 VERIFIER_FROM_SOURCE = sys._getframe().f_code == _VERIFIER_CODE
 # The code of every function the module defines at its top level, as its bytes
 # compile it. A function replaced in the module after the import runs code that
@@ -128,17 +129,17 @@ VERIFIER_FROM_SOURCE = sys._getframe().f_code == _VERIFIER_CODE
 VERIFIER_FUNCTIONS = {code.co_name: code for code in _VERIFIER_CODE.co_consts
                       if isinstance(code, types.CodeType) and code.co_name.isidentifier()
                       and code.co_flags & inspect.CO_OPTIMIZED}
-del _VERIFIER_BYTES, _VERIFIER_CODE
+del _LOADED_BYTES, _VERIFIER_CODE
 
 
 def replaced_functions():
     """Names in this module that no longer hold the function the verifier's bytes define.
 
     A name defined by a def at the top level that now holds another function,
-    or no function at all, is named; so is a top-level name holding a function
-    that the bytes define under another name, and one holding a function that
-    had its code, its defaults or its keyword defaults changed in place since
-    the import, as VERIFIER_DEFAULTS holds them.
+    or a value that is not a function, is named; so is a top-level name holding
+    a function that the bytes define under another name, and one holding a
+    function that had its code, its defaults or its keyword defaults changed in
+    place since the import, as VERIFIER_DEFAULTS holds them.
     """
     module = sys.modules[__name__]
     replaced = []
@@ -158,7 +159,7 @@ def _function_state(function):
 def _method_state(value):
     """The _function_state of every function a class attribute runs, in a fixed order.
 
-    A function is its own; a staticmethod or classmethod runs the function it
+    A function runs itself; a staticmethod or classmethod runs the function it
     wraps, and a property its getter, setter and deleter.
     """
     if isinstance(value, (staticmethod, classmethod)):
@@ -215,9 +216,9 @@ def _module_snapshot():
     Returns (classes, constants, defaults). classes maps each class this
     module defines to the class, its methods and each method's
     _method_state; constants maps each name written in capitals that is not
-    in NOT_CONSTANTS and holds no class, function or module to the digest of
-    its value; defaults maps each function VERIFIER_FUNCTIONS names to its
-    defaults and keyword defaults.
+    in NOT_CONSTANTS and does not hold a class, function or module to the
+    digest of its value; defaults maps each function VERIFIER_FUNCTIONS names
+    to its defaults and keyword defaults.
     """
     module = sys.modules[__name__]
     classes = {}
@@ -304,7 +305,7 @@ class Run:
     # time, such as "exited 9"; empty otherwise.
     supervisor_ended: str = ""
     # The directory made for the suite, when it could not be removed; empty
-    # when none was made or it was removed.
+    # when it was not made or was removed.
     directory_left: str = ""
     # Every environment variable the suite was given, (name, value) pairs in
     # name order. The Run's repr leaves it out, so a test that prints a Run
@@ -320,9 +321,9 @@ class Outcome:
     description) pairs for a listing, (id, description, ok, detail) for a
     report. failed holds the ids of the FAIL rows. reasons holds every refusal,
     as a sentence; an empty tuple is acceptance. stray_lines holds the stray
-    lines, the text printed before the first row, kept for the reader and not
-    refused here: whether a suite talks between its verdicts is the suite's own
-    check.
+    lines, the text printed before the first row. They are kept for the reader,
+    and the probe does not refuse a run for them: it leaves to the suite's own
+    checks whether a suite may print text before its first row.
     """
 
     label: str
@@ -409,22 +410,23 @@ PR_SET_CHILD_SUBREAPER = 36
 CLEANUP_ROUNDS = 20
 # The variables that decide where a suite writes its temporary files, its tmux
 # sockets and its completion cache. A certifying run gives every suite a short
-# directory of its own for each, so no verdict depends on where the caller's
-# own variables point. The tool under test must refuse a socket path that is
-# too long for its socket.
+# directory of its own for each, so the verdicts do not depend on where the
+# caller's own variables point. The tool under test must refuse a socket path
+# that is too long for its socket.
 SUITE_DIRECTORIES = ("TMPDIR", "TMUX_TMPDIR", "XDG_CACHE_HOME")
 
 
 def _proc_identity(pid):
     """(parent pid, process group, start time, command name) from /proc/<pid>/stat, or None.
 
-    The start time is the kernel's, field 22, so a pid the kernel has handed
-    to another process does not match. The command name is the stat's own,
-    which a process can set for itself to any bytes but NUL. So the stat is
-    read as bytes and its fields are taken after the last ")", which ends the
-    name, and the name is kept as _name_text writes it: a name that is not
-    UTF-8 then neither hides its process nor the processes under it. A zombie
-    has ended and is not a process to stop, so this returns None for it.
+    The start time comes from the kernel, in field 22, so a pid the kernel has
+    handed to another process does not match. The command name is the comm
+    field of the stat, which a process can set for itself to any bytes but NUL.
+    So the stat is read as bytes and its fields are taken after the last ")",
+    which ends the name, and the name is kept as _name_text writes it: a name
+    that is not UTF-8 then does not hide its process or the processes under it.
+    A zombie has ended and is not a process to stop, so this returns None for
+    it.
     """
     try:
         with open(f"/proc/{pid}/stat", "rb") as stat_file:
@@ -448,7 +450,7 @@ def _name_text(name):
 
 
 def _started(pid):
-    """The kernel's start time of pid as a string, or None for no live process."""
+    """The kernel's start time of pid as a string, or None when pid is not the pid of a live process."""
     identity = _proc_identity(pid)
     return identity[2] if identity else None
 
@@ -519,7 +521,7 @@ def ending_refusal(pid, started, bound, table=None):
     """Why a supervisor must not signal pid, which started at started, or None.
 
     never_signalled's guards come first. Then the start time: a process under
-    the supervisor started no earlier than the supervisor did, bound, in its
+    the supervisor did not start earlier than the supervisor did, bound, in its
     clock tick or a later one, so a process with an earlier start time is not
     one whatever its parentage read said, and a process is not signalled at
     all when its start time or the bound cannot be read.
@@ -538,8 +540,9 @@ def _pidfd_for(pid, started):
     """An open pidfd for pid while it is still the process that started at started, else None.
 
     Opened first and compared after: a pidfd names one process for as long as
-    it is open, so once the start time read through /proc still matches, no
-    signal sent through it can reach a process the kernel later gives the pid.
+    it is open, so once the start time read through /proc still matches, a
+    signal sent through it cannot reach a process the kernel later gives the
+    pid.
     """
     try:
         fd = os.pidfd_open(pid)
@@ -556,17 +559,23 @@ def _exited(fd):
     return bool(select.select([fd], [], [], 0)[0])
 
 
+# The longest time end_descendants waits with its defaults, in seconds: each of
+# its CLEANUP_ROUNDS rounds waits up to SUITE_GRACE_S after SIGTERM and up to
+# SUITE_GRACE_S again after SIGKILL.
+LONGEST_ENDING_WAIT_S = CLEANUP_ROUNDS * 2 * SUITE_GRACE_S
+
+
 def end_descendants(root, bound, grace=None, rounds=None, reap=None):
     """End every process under root; returns (ended, left running, refused).
 
     A round reads the process table, opens a pidfd for each process under
-    root that ending_refusal has no reason against, sends each SIGTERM, waits
-    up to grace for them to end and sends SIGKILL to the rest. The next round
-    reads the table again, so a process forked while a round waited is found;
-    the rounds stop when one finds nothing left to end. A process still
-    running after SIGKILL is not signalled again. ended and left are sorted
-    (pid, start time, name) triples, and a refused process still running is
-    left too; refused holds one sentence per refused process. reap, when
+    root for which ending_refusal returns None, sends each SIGTERM, waits up to
+    grace for them to end and sends SIGKILL to the rest. The next round reads
+    the table again, so a process forked while a round waited is found; the
+    rounds stop when a round does not find a process left to end. A process
+    still running after SIGKILL is not signalled again. ended and left are
+    sorted (pid, start time, name) triples, and a refused process still running
+    is left too; refused holds one sentence per refused process. reap, when
     given, is called while waiting, for a subreaper collecting the children
     it adopts.
     """
@@ -621,6 +630,24 @@ def end_descendants(root, bound, grace=None, rounds=None, reap=None):
     return sorted(ended), left, refused
 
 
+def reap_children():
+    """Collect the children of this process that have ended, as (pid, exit status) pairs.
+
+    The exit status is negative for a signal, as Popen gives it. A subreaper
+    calls this while it waits, so that a process it adopted does not stay a
+    zombie once it has ended.
+    """
+    reaped = []
+    while True:
+        try:
+            pid, wait_status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return reaped
+        if pid == 0:
+            return reaped
+        reaped.append((pid, os.waitstatus_to_exitcode(wait_status)))
+
+
 # The words that begin the status lines a supervisor writes to its verifier,
 # one line for each event: STATUS_STARTED and the suite's pid; STATUS_EXITED
 # and the suite's exit status, negative for a signal as Popen gives it;
@@ -629,9 +656,9 @@ def end_descendants(root, bound, grace=None, rounds=None, reap=None):
 # STATUS_DONE after the last line about a suite that started. A supervisor that
 # does not start its suite writes one line, STATUS_UNSTARTED and why. supervise
 # writes these lines and _supervised_run reads them. When the verifier file has
-# another digest than the run names, the bootstrap code that _supervised_run
-# writes replies with that STATUS_UNSTARTED line itself. In the other
-# direction, the verifier asks the supervisor to end what is under it by
+# a digest other than the one the run names, the bootstrap code that
+# _supervised_run writes replies with that STATUS_UNSTARTED line itself. In the
+# other direction, the verifier asks the supervisor to end what is under it by
 # closing the control descriptor.
 STATUS_STARTED, STATUS_EXITED, STATUS_REFUSED, STATUS_ENDED, STATUS_LEFT = (
     "started", "exited", "refused", "ended", "left")
@@ -644,7 +671,7 @@ STATUS_UNSTARTED, STATUS_DONE = "unstarted", "done"
 # a suite's output too, which the suite writes in its own locale's encoding,
 # so a byte that is not UTF-8 is read as the four characters \xNN instead of
 # stopping the reader or going missing. The verifier prints what it reports
-# with the same handler, so no character stops its report either.
+# with the same handler, so its report does not stop at any character either.
 PIPE_ENCODING, WRITE_ERRORS, READ_ERRORS = "utf-8", "surrogateescape", "backslashreplace"
 
 
@@ -653,25 +680,26 @@ def supervise(argv):
 
     run_suite starts an interpreter that reads a verifier file, checks the
     digest of its bytes and runs them as this module, then calls this, so the
-    module stays an API with no command line of its own. argv is the status
+    module stays an API without a command line of its own. argv is the status
     descriptor, the control descriptor, "--" and the suite's command. It
-    makes itself the subreaper of everything under it. The kernel reparents an
-    orphaned process to the nearest living subreaper among its ancestors, so a
-    process the suite leaves behind stays under this one, whichever of its
+    makes itself the subreaper of every process under it. The kernel reparents
+    an orphaned process to the nearest living subreaper among its ancestors, so
+    a process the suite leaves behind stays under this one, whichever of its
     parents ended first, instead of being reparented to an ancestor of this
     one. It writes a STATUS_STARTED line once the suite runs and a
     STATUS_EXITED line when the suite's own process ends. It then waits for the
     verifier to close the control descriptor, which is also what the verifier's
     own death looks like from here, or for SIGTERM, and ends every process
     under it under end_descendants' rules, the suite too when it still runs,
-    with its own start time as the bound below which nothing is signalled. It
-    writes a STATUS_REFUSED, STATUS_ENDED or STATUS_LEFT line for each process
-    it refused to signal, ended or left running, then STATUS_DONE. When it does
-    not start the suite, because of a subreaper it could not become or a
-    command that cannot be started, it writes STATUS_UNSTARTED and why, as the
-    bootstrap does for bytes with another digest. Either way it returns 0,
-    since its lines say what happened; it returns 2, writing nothing, when argv
-    has fewer than four items or no "--" as its third.
+    with its own start time as the bound: a process that started before it is
+    not signalled. It writes a STATUS_REFUSED, STATUS_ENDED or STATUS_LEFT line
+    for each process it refused to signal, ended or left running, then
+    STATUS_DONE. When it does not start the suite, because of a subreaper it
+    could not become or a command that cannot be started, it writes
+    STATUS_UNSTARTED and why, as the bootstrap does for bytes with another
+    digest. Either way it returns 0, since its lines say what happened. It
+    returns 2 without writing any output when argv has fewer than four items or
+    its third item is not "--".
     """
     if len(argv) < 4 or argv[2] != "--":
         return 2
@@ -707,16 +735,10 @@ def supervise(argv):
     exited = []
 
     def reap():
-        """Collect every child that has ended, saying when the suite was one."""
-        while True:
-            try:
-                pid, wait_status = os.waitpid(-1, os.WNOHANG)
-            except ChildProcessError:
-                return
-            if pid == 0:
-                return
+        """Collect the children that have ended, saying when the suite was one."""
+        for pid, code in reap_children():
             if pid == suite and not exited:
-                exited.append(os.waitstatus_to_exitcode(wait_status))
+                exited.append(code)
                 tell(f"{STATUS_EXITED} {exited[0]}")
 
     suite_fd = os.pidfd_open(suite)
@@ -748,7 +770,7 @@ def run_suite(argv, timeout=None, owned_under=None, supervisor_source=None):
     removed is named in the Run's stderr and directory_left.
     supervisor_source is the verifier file the supervisor loads and the
     sha256 its bytes must have; without it, this file and the bytes this
-    process loaded. Everything else is _supervised_run.
+    process loaded. _supervised_run runs the suite and builds its Run.
     """
     timeout = SUITE_TIMEOUT_S if timeout is None else timeout
     env = dict(os.environ)
@@ -774,24 +796,22 @@ def run_suite(argv, timeout=None, owned_under=None, supervisor_source=None):
 def _supervised_run(argv, timeout, env, supervisor_source=None):
     """Run one suite with env and a time limit under a supervisor of its own; return its Run.
 
-    The time limit is read here rather than fixed as a default argument, so the
-    one constant above decides it and a caller can lower it without editing
-    this.
+    timeout is the run's time limit in seconds.
 
     The suite runs as the child of a supervisor, an interpreter of its own in a
     session of its own that reads a verifier file once, does not start the
     suite unless those bytes have the digest the run names, runs those same
     bytes as the module and calls the module's supervise. supervise makes
-    itself the subreaper of everything under it, so whatever the suite starts
-    stays under it however the processes in between end, and a process outside
-    the suite is never under it. When the suite's own process ends, or when the
-    run runs out of time, the supervisor is asked to end everything still under
-    it, the suite too when it still runs. A run that ran out of time comes back
-    with returncode None and whatever it had printed, and one that was never
-    started with returncode None and why in unstarted. A suite that exited by
-    itself and left processes running comes back with them in left_running.
-    Whatever was ended, left running or refused is named at the end of the
-    run's stderr.
+    itself the subreaper of every process under it, so whatever the suite
+    starts stays under it however the processes in between end, and a process
+    outside the suite is never under it. When the suite's own process ends, or
+    when the run runs out of time, the supervisor is asked to end every process
+    still under it, the suite too when it still runs. A run that ran out of
+    time comes back with returncode None and whatever it had printed, and one
+    that was never started with returncode None and why in unstarted. A suite
+    that exited by itself and left processes running comes back with them in
+    left_running. Whatever was ended, left running or refused is named at the
+    end of the run's stderr.
 
     supervisor_source names the verifier file the supervisor reads and the
     sha256 its bytes must have; without it, this file and the bytes this
@@ -804,14 +824,14 @@ def _supervised_run(argv, timeout, env, supervisor_source=None):
     # The supervisor's interpreter reads the verifier file once and compares
     # the sha256 of those bytes with the digest the run names, before any of
     # them runs. It then compiles and runs those same bytes as the module,
-    # handing them to it under the name HANDED_BYTES gives, so nothing is read
-    # or imported from the file after the check: no check inside the module,
-    # which a changed copy could leave out or answer falsely, decides whether
-    # the suite starts, and no cached bytecode runs in place of the bytes. -B,
-    # so the interpreter writes no bytecode either. When the digests differ, it
-    # writes the reply supervise writes when it does not start the suite: a
-    # STATUS_UNSTARTED line naming the file, the digest of what it read and the
-    # digest the run named.
+    # handing them to it under the name HANDED_BYTES holds, so the file is not
+    # read or imported after the check: a check inside the module, which a
+    # changed copy could leave out or answer falsely, does not decide whether
+    # the suite starts, and cached bytecode does not run in place of the bytes.
+    # -B, so the interpreter does not write bytecode either. When the digests
+    # differ, it writes the reply supervise writes when it does not start the
+    # suite: a STATUS_UNSTARTED line naming the file, the digest of what it
+    # read and the digest the run named.
     reply_head = f"{STATUS_UNSTARTED} the verifier it loaded, "
     reply_tail = " its run names\n"
     bootstrap = (
@@ -867,13 +887,15 @@ def _supervised_run(argv, timeout, env, supervisor_source=None):
     try:
         timed_out = not settled.wait(timeout)
     finally:
-        # Asked whatever ended the wait, so an interrupted verifier still
-        # leaves no process of the suite running: closing the control
-        # descriptor is the request.
+        # The supervisor is asked to end what is under it whatever ended the
+        # wait, so an interrupted verifier still does not leave a process of
+        # the suite running: closing the control descriptor is the request.
         os.close(control_write)
     notes = []
     try:
-        supervisor.wait(timeout=CLEANUP_ROUNDS * (2 * SUITE_GRACE_S + 1) + 10)
+        # The supervisor's ending waits, and 30 seconds more for its reads of
+        # the process table, its signals and its exit.
+        supervisor.wait(timeout=LONGEST_ENDING_WAIT_S + 30)
     except subprocess.TimeoutExpired:
         supervisor.kill()
         supervisor.wait()
@@ -901,8 +923,8 @@ def _supervised_run(argv, timeout, env, supervisor_source=None):
     if unstarted:
         notes.append(f"probe: the supervisor did not start the suite: {unstarted}")
     # A supervisor that ended after starting the suite, before saying how the
-    # suite's own process ended and before the run ran out of time, ended no
-    # process under it.
+    # suite's own process ended and before the run ran out of time, did not end
+    # any process under it.
     supervisor_ended = ""
     if started and returncode is None and not timed_out:
         code = supervisor.returncode
@@ -916,7 +938,7 @@ def _supervised_run(argv, timeout, env, supervisor_source=None):
                       "it: " if timed_out else "probe: ended processes the suite left running: ")
                      + ", ".join(f"{pid} ({name})" for pid, name in ended))
     if left:
-        notes.append("probe: still running after the suite and everything under it were "
+        notes.append("probe: still running after the suite and every process under it were "
                      "ended: " + ", ".join(f"{pid} ({name})" for pid, name in left))
     if STATUS_DONE not in said and not notes:
         notes.append("probe: the suite's supervisor ended without saying what it ended")
@@ -927,8 +949,10 @@ def _supervised_run(argv, timeout, env, supervisor_source=None):
               tuple((name, env.get(name)) for name in SUITE_DIRECTORIES),
               unstarted=unstarted, supervisor_ended=supervisor_ended,
               environ=tuple(sorted(env.items())))
-    # A suite that exited by itself, as how_ended tells it from one cut short
-    # or ended by a signal, carries what its supervisor ended or left.
+    # When how_ended finds that the suite exited by itself, not cut short and
+    # not ended by a signal, the Run's left_running lists the pid of each
+    # process the suite left running, whether its supervisor then ended it or
+    # left it.
     if how_ended(run) is None:
         run = dataclasses.replace(run, left_running=tuple(pid for pid, _name in ended + left))
     return run
@@ -993,8 +1017,8 @@ def said_environments(runs):
     it. Every other run's environment is compared here with the first's,
     every value included whether a record shows it or not, and each variable
     that differs is named without its values; with one run, the record says
-    that nothing was compared. Each line begins as ENVIRONMENT_LINE_STARTS
-    says.
+    that the other suites did not run, so the first run's environment was not
+    compared with another. Each line begins as ENVIRONMENT_LINE_STARTS says.
     """
     environment, directories = ENVIRONMENT_LINE_STARTS
     first_name, first = runs[0]
@@ -1019,8 +1043,8 @@ def said_environments(runs):
             differing.append(f"{name} ({', '.join(names)})")
     compared = "every value compared, shown or not"
     if len(runs) == 1:
-        lines.append(f"{environment}: no other suite ran, so nothing was compared with the "
-                     f"{first_name}'s")
+        lines.append(f"{environment}: the other suites did not run, so the {first_name}'s "
+                     "environment was not compared with another suite's")
     else:
         lines.append(f"{environment}: every other suite was given the {first_name}'s, "
                      f"{compared}" if not differing else f"{environment} differs from the "
@@ -1058,8 +1082,8 @@ def read_report(stdout):
     the rows, a verdict line without an id and description. stray_lines holds
     the stray lines, the text before the first row. A detail that spans lines
     is read whole, because its continuation lines belong to the row above them,
-    and no text makes this function raise: whatever a run printed comes back as
-    rows and problems.
+    and this function does not raise on any text: whatever a run printed comes
+    back as rows and problems.
     """
     lines = stdout.splitlines()
     tail = [at for at, line in enumerate(lines) if line.strip()]
@@ -1075,7 +1099,7 @@ def read_report(stdout):
             problems.append(f"malformed summary: {last!r}")
         body = lines[:tail[-1]]
     else:
-        problems.append("no summary line; the run is incomplete")
+        problems.append("the summary line is missing; the run is incomplete")
     rows, stray_lines = [], []
     for line in body:
         said = line.strip()
@@ -1110,7 +1134,7 @@ def read_report(stdout):
 def read_failed_report(stdout, expected):
     """Rows and summary of one --failed report.
 
-    A failure line carries no verdict word, so a row is recognised by an
+    A failure line does not carry a verdict word, so a row is recognised by an
     expected id and description at its start; a detail that spans lines cannot
     be read as a row that way. Returns (pairs, summary, problems), where
     summary is (ok, failed) or None.
@@ -1125,7 +1149,7 @@ def read_failed_report(stdout, expected):
             problems.append(f"malformed summary: {lines[-1]!r}")
         lines = lines[:-1]
     else:
-        problems.append("no summary line; the run is incomplete")
+        problems.append("the summary line is missing; the run is incomplete")
     pairs = []
     for line in lines:
         for cid, description in expected.items():
@@ -1175,7 +1199,7 @@ def signal_name(number):
 
 
 def how_ended(run):
-    """How a run ended, or None for a suite that exited by itself. No other code decides this.
+    """How a run ended, or None for a suite that exited by itself.
 
     Returns (reason, words). unfinished hands reason to the judges; cut_short
     hands words to said(), for a record line, and to raw_output(), for the
@@ -1185,7 +1209,13 @@ def how_ended(run):
     the suite ended, the suite exited or a signal ended it, or the run ran
     out of time. _supervised_run sets at most one of unstarted and
     supervisor_ended, since a supervisor that ended first had started the
-    suite, so a run with neither and no returncode ran out of time.
+    suite, so a run with both fields empty and a returncode of None ran out of
+    time.
+
+    _supervised_run words its stderr note on what the supervisor ended from the
+    time-out it measured, before the Run exists; the Run it builds carries that
+    time-out as returncode None with unstarted and supervisor_ended empty,
+    which how_ended reads as a time-out.
     """
     if run.unstarted:
         words = f"never started: {run.unstarted}"
@@ -1200,7 +1230,7 @@ def how_ended(run):
                     f"{run.returncode})", None)
         return None
     return (f"did not finish within {run.timeout:g}s; its supervisor was then asked to end "
-            "it and the processes under it one pidfd at a time, signalling no group",
+            "it and the processes under it one pidfd at a time, without signalling a group",
             f"timed out after {run.timeout:g}s")
 
 
@@ -1219,10 +1249,10 @@ def cut_short(run):
 def status_problems(run, failed_rows):
     """How the exit status of a finished run disagrees with its rows.
 
-    A suite exits 1 when a check failed and 0 when none did. Every other
-    pairing is named for what it is: passing text with a nonzero exit, failing
-    rows with exit 0, or failing rows with a status that is not the failure
-    exit. Each is a different defect and gets a different sentence.
+    A suite exits 1 when a check failed and 0 when every check passed. Every
+    other pairing is named for what it is: passing text with a nonzero exit,
+    failing rows with exit 0, or failing rows with a status that is not the
+    failure exit. Each is a different defect and gets a different sentence.
     """
     code = run.returncode
     if failed_rows and code == 0:
@@ -1238,8 +1268,8 @@ def status_problems(run, failed_rows):
 def judge_listing(run, expected):
     """Judge one --list run against the expected mapping.
 
-    With no expectation the listing is only checked against itself: a repeated
-    id, or one id listed under two descriptions, is still refused.
+    Without an expectation the listing is only checked against itself: a
+    repeated id, or one id listed under two descriptions, is still refused.
     """
     pairs, problems = read_listing(run.stdout)
     reasons = unfinished(run)
@@ -1255,15 +1285,15 @@ def judge_listing(run, expected):
 def judge_report(run, expected, label, check=None, co_failures=None):
     """Judge one unfiltered run against the expected mapping and failure set.
 
-    With check None the run is the clean suite and nothing may fail. Otherwise
-    the FAIL rows must be exactly the named check and the co-failures, each of
-    which the caller justified with a reason; an absent one is named with that
-    reason, an extra one is named as unjustified.
+    With check None the run is the clean suite and every check must pass.
+    Otherwise the FAIL rows must be exactly the named check and the
+    co-failures, each of which the caller justified with a reason; an absent
+    one is named with that reason, an extra one is named as unjustified.
 
-    A run that did not finish, or printed no summary, is judged for that alone,
-    with the expected ids it never reported, so an incomplete run is never
-    read as evidence about which checks failed. A finished run is judged in
-    full: status against rows, the text's own problems, the mapping, a unit
+    A run that did not finish, or did not print a summary, is judged for that
+    alone, with the expected ids it never reported, so an incomplete run is
+    never read as evidence about which checks failed. A finished run is judged
+    in full: status against rows, the text's own problems, the mapping, a unit
     that ended the run early, and the failure set.
     """
     text = read_report(run.stdout)
@@ -1306,17 +1336,18 @@ def judge_filtering(full, run, expected):
     did, and exit as the full run exited. It is not evidence about the
     population: a check the filtered report does not name may have passed or
     may never have run, and only the unfiltered comparison can tell. An
-    unfiltered run that did not finish, whichever ending how_ended names, has
-    no whole report to compare with, so that is said and nothing is compared.
-    The ending is named in cut_short's few words, or in unfinished's reason
-    for a signal, which has no words.
+    unfiltered run that did not finish, whichever ending how_ended names, does
+    not have a whole report to compare with, so the --failed run gets a reason
+    saying so and is not compared with it. The reason names the ending in
+    cut_short's few words, or in unfinished's reason when a signal ended the
+    run, since how_ended's words are None for a signal.
     """
     reasons = unfinished(run)
     pairs, summary, problems = read_failed_report(run.stdout, expected)
     full_unfinished = unfinished(full.run)
     if not reasons and full_unfinished:
-        reasons.append("its unfiltered run did not finish, so nothing was compared with it: "
-                       + (cut_short(full.run) or full_unfinished[0]))
+        reasons.append("its unfiltered run did not finish, so the --failed run was not compared "
+                       "with it: " + (cut_short(full.run) or full_unfinished[0]))
     if not reasons:
         reasons.extend(problems)
         listed = collections.Counter(cid for cid, _description in pairs)
@@ -1421,7 +1452,7 @@ def said(outcome):
         return short
     if outcome.summary is not None:
         return f"{outcome.summary[0]}/{outcome.summary[1]} checks passed"
-    return f"exit {outcome.run.returncode}, no summary"
+    return f"exit {outcome.run.returncode}, without a summary"
 
 
 def batch(entries, run):
@@ -1477,7 +1508,8 @@ def retained_expectation(path, *, live=False, jobs=1, adjudications=None):
 
     adjudications names the approved record of the decisions the rows carry.
     It must name this mapping by sha256 under frozen_mapping, so a record
-    made for another mapping is refused. No code here reads the tested tool.
+    made for another mapping is refused. The code here does not read the tested
+    tool.
     """
     path = Path(path)
     data, record = _json_record(path, "expected mapping")
@@ -1494,9 +1526,9 @@ def _expectation_from(path, data, record, live, jobs, adjudications=None, adjudi
 
     data and record are the mapping file's bytes and what they parse to;
     adjudicated and decided the same for the adjudications record, when one
-    is named. Nothing is read here, so what is judged is exactly what the
-    caller read and hashed: retained_expectation reads each file once, and
-    certification reads each once again and judges those bytes.
+    is named. This function does not read a file, so what is judged is exactly
+    what the caller read and hashed: retained_expectation reads each file once,
+    and certification reads each once again and judges those bytes.
     """
     if not isinstance(record, dict) or record.get("schema") != "expected-mapping-v1":
         raise ProbeFailure([f"{path} does not carry schema expected-mapping-v1"])
@@ -1509,7 +1541,7 @@ def _expectation_from(path, data, record, live, jobs, adjudications=None, adjudi
     selection = selection_name(live, jobs)
     modes = record.get("modes")
     if not isinstance(modes, dict) or selection not in modes:
-        raise ProbeFailure([f"{path} has no selection {selection}; it has: "
+        raise ProbeFailure([f"{path} does not have the selection {selection}; it has: "
                             + ", ".join(sorted(modes if isinstance(modes, dict) else ()))])
     rows = record.get("rows")
     if not isinstance(rows, list):
@@ -1523,8 +1555,7 @@ def _expectation_from(path, data, record, live, jobs, adjudications=None, adjudi
         for key in ("emitted_in", "not_emitted_in"):
             where = row.get(key, {})
             if not isinstance(where, (dict, list)):
-                failures.append(f"row {at} ({row.get('id')!r}): {key} is neither an "
-                                "object nor a list")
+                failures.append(f"row {at} ({row.get('id')!r}): {key} is not an object or a list")
             placed[key] = selection in where if isinstance(where, (dict, list)) else False
         if placed["emitted_in"] and placed["not_emitted_in"]:
             failures.append(f"row {at} ({row.get('id')!r}) is both emitted and "
@@ -1541,7 +1572,8 @@ def _expectation_from(path, data, record, live, jobs, adjudications=None, adjudi
     if failures:
         raise ProbeFailure(failures)
     # Read-only, so the mapping that judges a run is the one the file's bytes
-    # gave, and no later edit in place can change what a certifying run cites.
+    # gave, and a later edit in place cannot change what a certifying run
+    # cites.
     mapping = types.MappingProxyType(_normalize_expected(pairs))
     adjudications_digest = ""
     if adjudications is not None:
@@ -1619,7 +1651,7 @@ def _normalize_cases(cases):
             continue
         normalized.append((check, old, new, dict(co_failures)))
     if not normalized and not failures:
-        failures.append("no mutation cases were supplied")
+        failures.append("the list of mutation cases is empty")
     if failures:
         raise ProbeFailure(failures)
     return tuple(normalized)
@@ -1640,14 +1672,15 @@ def case_set_digest(cases):
 
 
 def _printed(report, stream):
-    """Print report to stream, writing each character the stream cannot encode as an escape.
+    """Print report to stream, writing as an escape each character the stream cannot encode.
 
     The escapes are those of READ_ERRORS, the handler the verifier reads status
-    lines and suite output with, so no character stops a report. Under
-    LC_ALL=C with PYTHONUTF8=0, where sys.stdout encodes ASCII, an e-acute
-    prints as \\xe9, and a byte of a path that the locale could not decode,
-    which Python holds as a lone surrogate, prints as \\udcNN. A stream with
-    no encoding of its own, such as a StringIO, takes the text as it is.
+    lines and suite output with, so a report does not stop at any character.
+    Under LC_ALL=C with PYTHONUTF8=0, where sys.stdout encodes ASCII, an
+    e-acute prints as \\xe9, and a byte of a path that the locale could not
+    decode, which Python holds as a lone surrogate, prints as \\udcNN. A stream
+    without an encoding of its own, such as a StringIO, takes the text as it
+    is.
     """
     encoding = getattr(stream, "encoding", None)
     if encoding:
@@ -1659,8 +1692,8 @@ def _refusal(outcomes, lines, stream, failures=()):
     """Print the report with the raw output of every refused run, then the exception.
 
     The exception lists each refused run's reasons, then failures: refusals
-    that concern no single run, such as a case naming a check that is not among
-    the expected checks.
+    that do not concern a single run, such as a case naming a check that is not
+    among the expected checks.
     """
     refused = [outcome for outcome in outcomes if outcome.reasons]
     report = "\n".join([*lines, "", *(line for outcome in refused
@@ -1672,16 +1705,17 @@ def _refusal(outcomes, lines, stream, failures=()):
 
 
 def undecided(record):
-    """The entries of an approved-adjudications record that carry no decision, as sentences.
+    """The entries of an approved-adjudications record that do not carry a decision, as sentences.
 
-    The record must hold an entries list, and an empty one says there was
-    nothing to adjudicate. An entry is decided when its decision is a string
-    that begins with approved or refused; with a missing, empty or pending
-    one, the frozen rows carry a decision that was never approved or refused.
+    The record must hold an entries list, and an empty one says that
+    adjudication was not needed. An entry is decided when its decision is a
+    string that begins with approved or refused; with a missing, empty or
+    pending one, the frozen rows carry a decision that was never approved or
+    refused.
     """
     entries = record.get("entries") if isinstance(record, dict) else None
     if not isinstance(entries, list):
-        return ["the adjudications record holds no entries list"]
+        return ["the adjudications record does not hold an entries list"]
     gaps = []
     for at, entry in enumerate(entries, 1):
         if not isinstance(entry, dict):
@@ -1690,7 +1724,7 @@ def undecided(record):
         named = f"adjudication entry {at}" + (f" ({entry['id']!r})" if entry.get("id") else "")
         decision = entry.get("decision")
         if "decision" not in entry:
-            gaps.append(f"{named} has no decision")
+            gaps.append(f"{named} does not have a decision")
         elif not (isinstance(decision, str) and decision.strip()):
             gaps.append(f"{named} has an empty decision: {decision!r}")
         elif not decision.startswith(("approved", "refused")):
@@ -1753,19 +1787,18 @@ def certification_gaps(expected, live, jobs, tool_digest, verifier_digest):
     Expectation carries are only what it says of itself, so the file and the
     adjudications record are each read once more here, hashed, and judged
     from those same bytes: they must give the same mapping and the same
-    source, every adjudication must be decided, and every entry must name a
-    row of the mapping in a selection that emits it. The plan accepts one
-    exact executable, so the tool must be the source the mapping was frozen
-    for; a changed tool needs its own mapping. verifier_digest is the sha256
-    of the verifier file as the run found it on disk, which must be the
-    VERIFIER_LOADED this process runs.
+    source, and every adjudication must be decided and fit the mapping by the
+    rules misplaced() checks. The plan accepts one exact executable, so the
+    tool must be the source the mapping was frozen for; a changed tool needs
+    its own mapping. verifier_digest is the sha256 of the verifier file as the
+    run found it on disk, which must be the VERIFIER_LOADED this process runs.
     """
     if expected is None:
-        return ["no expectation was supplied, so the listing would stand in for "
-                "the population"]
+        return ["the expectation was not supplied, so the listing would stand in for the "
+                "population"]
     if not isinstance(expected, Expectation):
-        return ["the expectation is a bare mapping with no recorded origin; read it "
-                "with retained_expectation"]
+        return ["the expectation is a bare mapping without a recorded origin; read it with "
+                "retained_expectation"]
     gaps = []
     if verifier_digest != VERIFIER_LOADED:
         gaps.append(f"the verifier {VERIFIER} on disk has sha256 {verifier_digest}, not the "
@@ -1854,8 +1887,8 @@ def verifier_selftest(run=None):
                             for failure in exc.failures])
     lines = said.getvalue().strip().splitlines()
     if not lines:
-        raise ProbeFailure(["the verifier's own selftest printed nothing, so no output shows "
-                            "that it ran"])
+        raise ProbeFailure(["the verifier's own selftest did not print anything, "
+                            "so its output does not show that it ran"])
     return lines[-1]
 
 
@@ -1872,14 +1905,14 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
     it with an underscore before its name, and the test tree beside it is
     copied with them. ``timeout`` is the number of seconds each run may take.
     With ``filtering`` every run also happens with --failed, and that report
-    must be the failures of the unfiltered one and nothing else.
+    must be exactly the failures of the unfiltered one.
 
     ``certify`` asks for a certifying run. It is refused before any suite runs
     unless it names its timeout, ``expected`` came from
     ``retained_expectation`` with its source and approved adjudications, reads
     again from its files as it was read, every adjudication is decided and
-    points where its decision can (misplaced), the tool is the source the
-    mapping was frozen for, the verifier on disk is the one this process
+    fits the mapping by the rules misplaced() checks, the tool is the source
+    the mapping was frozen for, the verifier on disk is the one this process
     loaded, the code running was compiled from it, and the verifier's own
     selftest passes. ``verifier`` is that selftest: selftest itself when it is
     None, or a stand-in the caller supplies. The verifier's own tests supply
@@ -1979,9 +2012,9 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
     elif expected is not None:
         expected = _normalize_expected(expected)
         lines.append(f"expectation: a supplied mapping of {len(expected)} check(s), "
-                     "with no recorded origin")
+                     "without a recorded origin")
     else:
-        lines.append("expectation: none supplied, so the listing is the population")
+        lines.append("expectation: not supplied, so the listing is the population")
     lines.insert(0, "certifying: yes" if certified else
                  "certifying: no; the verifier's own selftest was a stand-in the caller "
                  "supplied, so this run does not certify the tool" if certify else
@@ -1998,8 +2031,8 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
         return full, filtered
 
     with tempfile.TemporaryDirectory() as scratch:
-        # A certifying run's listing and clean suite run from a copy that no
-        # other process writes to, hashed after copying and again after the
+        # A certifying run's listing and clean suite run from a copy that other
+        # processes do not write to, hashed after copying and again after the
         # runs, so the record names the bytes that ran and a run that wrote
         # into its own copy is refused as one that wrote into the original
         # would be.
@@ -2017,8 +2050,8 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
                          f"{copied[clean_tool]}, companion sha256 {copied[clean_comp]}, "
                          f"test tree {copied_count} file(s), digest {copied_digest}")
             # The supervisors run the verifier too, so they load a copy of it
-            # that no other process writes to, and each checks the bytes it
-            # loaded.
+            # that other processes do not write to, and each checks the bytes
+            # it loaded.
             verifier_copy = Path(scratch) / "verifier" / VERIFIER.name
             verifier_copy.parent.mkdir()
             shutil.copy2(VERIFIER, verifier_copy)
@@ -2091,7 +2124,7 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
     labels = ["clean", *(f"case {at}" for at in range(1, len(prepared) + 1))]
     lines.append("--failed checked for: " + (", ".join(
         label for label, (_full, filtered) in zip(labels, runs) if filtered is not None)
-        or "no run"))
+        or "none"))
     every_run = [("listing", listed.run)] + [
         (name, run) for label, (full, filtered) in zip(labels, runs)
         for name, run in ((label, full), (f"{label} --failed", filtered)) if run is not None]
@@ -2119,8 +2152,8 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
                                           for line in raw_output(outcome))])
         _printed(report, stream)
         raise ProbeFailure(["the tool, its companion, the verifier or the test tree "
-                            f"changed while the suites ran ({', '.join(changed)}); no "
-                            "verdict here describes what is on disk now"],
+                            f"changed while the suites ran ({', '.join(changed)}); the verdicts "
+                            "here do not describe what is on disk now"],
                            report=report, outcomes=discarded)
 
     clean = judge_report(runs[0][0], population, "clean")
@@ -2169,7 +2202,7 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
         lines.extend(f"{indent}co-failure {cid}: {why}" for cid, why in co_failures.items())
         lines.append(f"{indent}probed: {said(outcome)}")
         lines.append(f"{indent}failed: " + ", ".join(sorted(outcome.failed))
-                     if outcome.failed else f"{indent}nothing failed")
+                     if outcome.failed else f"{indent}failed: none")
         lines.extend(f"{indent}refused: {reason}" for judged_outcome in judged
                      for reason in judged_outcome.reasons)
         results.append({
@@ -2193,8 +2226,8 @@ def expect(cases, *, live=False, jobs=1, expected=None, tool=None, timeout=None,
 SYNTHETIC_EXPECTED = {
     "target-check": "the check a case names",
     "other-check": "a check a case may justify as a co-failure",
-    "third-check": "a check that no case names",
-    "every-unit-reported": "no unit ended the run before it reported",
+    "third-check": "a check that the cases do not name",
+    "every-unit-reported": "every unit reported before the run ended",
 }
 
 
@@ -2205,10 +2238,10 @@ def runner_settings():
     a top-level assignment of a literal to a name in capitals on one line of
     its own, and the block is those lines, one after another. It is read when
     a test asks for it, not as the module loads, since only the tests use it,
-    and a certifying run's supervisors load a copy of the verifier that has no
-    runner beside it. A test mutation rewrites the block as one text, so a
-    runner is refused when its setting lines do not follow each other or are
-    not written as settings_lines writes them.
+    and a certifying run's supervisors load a copy of the verifier that does
+    not have a runner beside it. A test mutation rewrites the block as one
+    text, so a runner is refused when its setting lines do not follow each
+    other or are not written as settings_lines writes them.
     """
     source = SYNTHETIC_RUNNER.read_text()
     names, defaults, lines = [], {}, []
@@ -2223,9 +2256,9 @@ def runner_settings():
     block = "".join(source.splitlines(keepends=True)[lines[0] - 1:lines[-1]]) if lines else ""
     if (not lines or lines != list(range(lines[0], lines[0] + len(lines)))
             or block != settings_lines(names, defaults)):
-        raise ProbeFailure([f"{SYNTHETIC_RUNNER} has no block of settings written one per line, "
-                            f"one after another, as settings_lines writes them: setting lines "
-                            f"{lines}"])
+        raise ProbeFailure([f"{SYNTHETIC_RUNNER} does not have a block of settings written one "
+                            "per line, one after another, as settings_lines writes them: setting "
+                            f"lines {lines}"])
     return names, defaults
 
 
@@ -2239,7 +2272,7 @@ def settings(**changes):
     names, defaults = runner_settings()
     unknown = sorted(set(changes) - set(names))
     if unknown:
-        raise ProbeFailure([f"the stand-in runner has no setting {', '.join(unknown)}"])
+        raise ProbeFailure([f"the stand-in runner does not have the setting {', '.join(unknown)}"])
     return settings_lines(names, {**defaults, **changes})
 
 
@@ -2278,7 +2311,7 @@ def _selftest_checks(verifier):
         return len(checks)
 
     def without_environment_lines(record):
-        """A record's text without the lines said_environments writes.
+        """A record's text without the lines said_environments writes on the suites' directories and environment.
 
         A failure detail that quotes a certifying record quotes it so, since
         a mutant's record can hold any value of the environment it was given.
@@ -2289,9 +2322,10 @@ def _selftest_checks(verifier):
     def start_time(pid):
         """pid's start time, field 22 of its stat, read by this test's own code, or None.
 
-        None means no running process. The read does not go through
-        _proc_identity, so a mutation of the module's reader cannot hide from a
-        test what a supervisor missed, nor keep it from being ended here.
+        None means that pid is not the pid of a running process. The read does
+        not go through _proc_identity, so a mutation of the module's reader
+        cannot hide from a test what a supervisor missed, nor keep it from
+        being ended here.
         """
         try:
             with open(f"/proc/{pid}/stat", "rb") as stat_file:
@@ -2336,7 +2370,10 @@ def _selftest_checks(verifier):
         return named, still
 
     def refused(name, call, phrase):
-        """call must raise a ProbeFailure carrying phrase; anything else fails name."""
+        """Check that call raises a ProbeFailure carrying phrase.
+
+        A ProbeFailure without phrase, another exception or a return fails name.
+        """
         try:
             call()
         except ProbeFailure as exc:
@@ -2352,7 +2389,7 @@ def _selftest_checks(verifier):
                 and all(reason.startswith(start) for reason, start in zip(reasons, starts)))
 
     source = Path(__file__).read_text()
-    check("no-command-line-interface",
+    check("module-does-not-have-a-command-line-interface",
           "def " + "main(" not in source and "sys." + "argv" not in source
           and not Path(__file__).with_suffix("").exists(),
           "a probe entry point remains")
@@ -2380,7 +2417,7 @@ def _selftest_checks(verifier):
     expected = {
         "alpha": "the first check",
         "beta": "the second check",
-        "every-unit-reported": "no unit ended the read-only run before it reported",
+        "every-unit-reported": "every unit reported before the read-only run ended",
     }
 
     def record(stdout, returncode=0, stderr=""):
@@ -2489,12 +2526,12 @@ def _selftest_checks(verifier):
     # Summaries and rows that cannot be read as a result.
     outcome = judge_report(record(table(passing, summary=False), returncode=1), expected, "clean")
     check("missing-summary-refused-alone",
-          only(outcome.reasons, "no summary line; the run is incomplete"),
+          only(outcome.reasons, "the summary line is missing; the run is incomplete"),
           repr(outcome.reasons))
     outcome = judge_report(record(table(passing[:1], summary=False), returncode=1),
                            expected, "clean")
     check("missing-summary-names-unexecuted-checks",
-          only(outcome.reasons, "no summary line; the run is incomplete",
+          only(outcome.reasons, "the summary line is missing; the run is incomplete",
                "missing expected check(s): beta, every-unit-reported"),
           repr(outcome.reasons))
     outcome = judge_report(record(table(passing) + "3/x checks passed\n"), expected, "clean")
@@ -2516,16 +2553,17 @@ def _selftest_checks(verifier):
     outcome = partial_outcome = judge_report(partial, expected, "case 1", "beta")
     check("timeout-refused-alone",
           only(outcome.reasons, "did not finish within 1s; its supervisor was then asked to end "
-               "it and the processes under it one pidfd at a time, signalling no group",
+               "it and the processes under it one pidfd at a time, without signalling a group",
                "missing expected check(s): beta, every-unit-reported"),
           repr(outcome.reasons))
     # When a run's supervisor did not start the suite, the run is judged for
     # that alone and is not read as one that ran out of time.
     never = Run(("python3", "agent-resume", "--selftest", "--jobs", "1"), None, "", "", 1.0,
-                unstarted="its command could not be started: no such file")
+                unstarted="its command could not be started: the file does not exist")
     outcome = never_outcome = judge_report(never, expected, "case 1", "beta")
     check("never-started-refused-alone",
-          only(outcome.reasons, "never started: its command could not be started: no such file",
+          only(outcome.reasons, "never started: its command could not be started: the file does "
+                                "not exist",
                "missing expected check(s): ")
           and not any("did not finish" in reason for reason in outcome.reasons),
           repr(outcome.reasons))
@@ -2547,10 +2585,10 @@ def _selftest_checks(verifier):
     cut = {
         "a run that never started is said with its reason":
             said_function(never_outcome)
-            == "never started: its command could not be started: no such file",
+            == "never started: its command could not be started: the file does not exist",
         "and its raw output's status line says the same":
             raw_output(never_outcome)[0].endswith(
-                "(never started: its command could not be started: no such file)"),
+                "(never started: its command could not be started: the file does not exist)"),
         "a run's record line says when its supervisor ended first":
             said_function(lost_outcome)
             == "its supervisor was ended by SIGKILL before the suite's end was seen",
@@ -2655,39 +2693,40 @@ def _selftest_checks(verifier):
     outcome = judge_filtering(
         full, record("beta  the second check  (scripted)\n", returncode=1), expected)
     check("failed-only-missing-summary",
-          only(outcome.reasons, "no summary line; the run is incomplete"),
+          only(outcome.reasons, "the summary line is missing; the run is incomplete"),
           repr(outcome.reasons))
     stopped = Run(("python3", "agent-resume", "--selftest", "--failed"), None,
                   "beta  the second check  (scripted)\n", "", 1.0)
     outcome = judge_filtering(full, stopped, expected)
     check("failed-only-timeout-judged-alone",
           only(outcome.reasons, "did not finish within 1s; its supervisor was then asked to end "
-               "it and the processes under it one pidfd at a time, signalling no group"),
+               "it and the processes under it one pidfd at a time, without signalling a group"),
           repr(outcome.reasons))
     outcome = judge_filtering(full, record(filtered, returncode=-9), expected)
     check("failed-only-signal-judged-alone",
           only(outcome.reasons, "was ended by SIGKILL (returncode -9)"), repr(outcome.reasons))
-    # An unfiltered run that did not finish has no whole report: the --failed
-    # run judged against it gets a reason saying so, and nothing is compared.
-    # The reason names the ending in the few words cut_short gives a record,
-    # or, for a signal, which has no such words, in unfinished's reason.
+    # An unfiltered run that did not finish does not have a whole report: the
+    # --failed run judged against it gets a reason saying so and is not
+    # compared with it. The reason names the ending in the few words cut_short
+    # gives a record, or in unfinished's reason when a signal ended the run,
+    # since how_ended's words are None for a signal.
     against = {label: judge_filtering(short, record(filtered, returncode=1), expected).reasons
                for label, short in (("never started", never_outcome),
                                     ("its supervisor ended", lost_outcome),
                                     ("out of time", partial_outcome),
                                     ("a signal", signalled_outcome))}
-    told = "its unfiltered run did not finish, so nothing was compared with it: "
+    told = "its unfiltered run did not finish, so the --failed run was not compared with it: "
     check("failed-only-beside-an-unfinished-run-is-not-compared",
           against == {
-              "never started": (f"{told}never started: its command could not be started: no "
-                                "such file",),
+              "never started": (f"{told}never started: its command could not be started: the file "
+                                "does not exist",),
               "its supervisor ended": (f"{told}its supervisor was ended by SIGKILL before the "
                                        "suite's end was seen",),
               "out of time": (f"{told}timed out after 1s",),
               "a signal": (f"{told}was ended by SIGTERM (returncode -15)",)},
           repr(against))
-    # A failure detail that quotes a record leaves out every line
-    # said_environments writes, and no other line.
+    # A failure detail that quotes a record leaves out exactly the lines
+    # said_environments writes.
     written = said_environments([
         (label, Run(("suite",), 0, "", "", environment=(("TMPDIR", f"/tmp/{label}"),),
                     environ=(("LC_PROBE_SELFTEST", value), ("PATH", "/bin"))))
@@ -2720,7 +2759,7 @@ def _selftest_checks(verifier):
     try:
         _normalize_cases([])
     except ProbeFailure as exc:
-        empty_raised = "no mutation cases" in str(exc)
+        empty_raised = "the list of mutation cases is empty" in str(exc)
     else:
         empty_raised = False
     check("empty-request-raises", empty_raised, "did not raise")
@@ -2829,11 +2868,11 @@ def _selftest_checks(verifier):
                 f"expected mapping {Path(td) / 'absent.json'} cannot be read")
         no_description = {"id": "delta", "emitted_in": {"read-only": "MECHANISM"},
                           "not_emitted_in": {}}
-        no_id = {"description": "a row with no id", "emitted_in": {"read-only": "MECHANISM"}}
+        no_id = {"description": "a row without an id", "emitted_in": {"read-only": "MECHANISM"}}
         for name, text, options, phrase in (
             ("retained-expectation-unknown-selection-refused", frozen(rows),
-             {"live": True, "jobs": 3}, "has no selection live-jobs-3; it has: live-jobs-1, "
-             "read-only"),
+             {"live": True, "jobs": 3}, "does not have the selection live-jobs-3; it has: "
+             "live-jobs-1, read-only"),
             ("retained-expectation-wrong-schema-refused", frozen(rows, schema="other"), {},
              "does not carry schema expected-mapping-v1"),
             ("retained-expectation-emitted-and-withheld-refused",
@@ -2855,7 +2894,7 @@ def _selftest_checks(verifier):
             ("retained-expectation-placement-not-a-collection-refused",
              frozen(rows, rows=[{"id": "alpha", "description": "the first check",
                                  "emitted_in": "read-only"}]), {},
-             "row 1 ('alpha'): emitted_in is neither an object nor a list"),
+             "row 1 ('alpha'): emitted_in is not an object or a list"),
             ("retained-expectation-row-without-description-refused",
              frozen(rows, rows=[{"id": "alpha", "description": "the first check",
                                  "emitted_in": {"read-only": "MECHANISM"}}, no_description]), {},
@@ -2865,7 +2904,7 @@ def _selftest_checks(verifier):
             ("retained-expectation-modes-not-an-object-refused",
              json.dumps({"schema": "expected-mapping-v1", "frozen_for_source": {"sha256": "f" * 64},
                          "modes": ["read-only"], "rows": []}).encode(), {},
-             "has no selection read-only; it has: "),
+             "does not have the selection read-only; it has: "),
         ):
             record_path.write_bytes(text)
             refused(name, lambda options=options: retained_expectation(record_path, **options),
@@ -2879,7 +2918,7 @@ def _selftest_checks(verifier):
         ("undecided-names-an-empty-decision", [{"id": "x", "decision": ""}],
          ["adjudication entry 1 ('x') has an empty decision: ''"]),
         ("undecided-names-a-missing-decision", [{"id": "x"}],
-         ["adjudication entry 1 ('x') has no decision"]),
+         ["adjudication entry 1 ('x') does not have a decision"]),
         ("undecided-names-an-entry-that-is-not-an-object", ["x"],
          ["adjudication entry 1 is not an object"]),
     ):
@@ -2957,8 +2996,8 @@ def _selftest_checks(verifier):
           f"maximum active={capped['maximum']}")
 
     # The whole path, on the stand-in runner as real processes. Every test
-    # below rewrites the runner's block of settings, so none of them runs
-    # unless that block reads back as it is written.
+    # below rewrites the runner's block of settings, so each of them runs only
+    # when that block reads back as it is written.
     runner_text = SYNTHETIC_RUNNER.read_text()
     try:
         runner_settings()
@@ -2967,7 +3006,7 @@ def _selftest_checks(verifier):
         return summed_up()
     check("stand-in-runner-settings-are-read-from-its-block", True)
     refused("a-setting-the-runner-lacks-is-refused", lambda: settings(NO_SUCH_SETTING=1),
-            "the stand-in runner has no setting NO_SUCH_SETTING")
+            "the stand-in runner does not have the setting NO_SUCH_SETTING")
     was_log = os.environ.get("PROBE_SYNTHETIC_LOG")
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -2979,7 +3018,8 @@ def _selftest_checks(verifier):
         log = base / "argv.log"
         os.environ["PROBE_SYNTHETIC_LOG"] = str(log)
         # Every certifying run here makes its suites' directories under base,
-        # so one this test runs under a broken rule leaves nothing in /tmp.
+        # so one this test runs under a broken rule does not leave anything in
+        # /tmp.
         suites = base / "certified-suites"
         suites.mkdir()
 
@@ -3053,13 +3093,14 @@ def _selftest_checks(verifier):
                      ("missing expected check(s): third-check",)),
                     (2, "synthetic-timeout-refused",
                      ("did not finish within 1.5s; its supervisor was then asked to end it and "
-                      "the processes under it one pidfd at a time, signalling no group",
+                      "the processes under it one pidfd at a time, without signalling a group",
                       "missing expected check(s): every-unit-reported, other-check, "
                       "target-check, third-check")),
                     (3, "synthetic-signal-refused", ("was ended by SIGTERM (returncode -15)",)),
                     (4, "synthetic-wrong-failure-exit",
                      ("1 failed row(s) but the suite exited 0; a failing suite exits 1",)),
-                    (5, "synthetic-missing-summary", ("no summary line; the run is incomplete",)),
+                    (5, "synthetic-missing-summary", ("the summary line is missing; the run is "
+                                                      "incomplete",)),
                     (6, "synthetic-malformed-summary", ("malformed summary: '3/x checks passed'",)),
                     (7, "synthetic-short-summary",
                      ("summary counts 2/3 but 4 row(s) were read, 3 passed",)),
@@ -3138,15 +3179,15 @@ def _selftest_checks(verifier):
                              timeout=20.0, stream=stream)
             check("run-without-expectation-says-the-listing-stood-in",
                   results.certified is False
-                  and "expectation: none supplied, so the listing is the population"
+                  and "expectation: not supplied, so the listing is the population"
                   in stream.getvalue()
-                  and "--failed checked for: no run\n" in stream.getvalue(), stream.getvalue())
+                  and "--failed checked for: none\n" in stream.getvalue(), stream.getvalue())
             stream = io.StringIO()
             results = expect([("target-check", settings(), bite)], live=True, jobs=3, tool=tool,
                              expected=SYNTHETIC_EXPECTED, timeout=20.0, stream=stream)
-            check("run-with-a-bare-mapping-says-it-has-no-origin",
+            check("run-with-a-bare-mapping-says-it-lacks-a-recorded-origin",
                   results.certified is False
-                  and "expectation: a supplied mapping of 4 check(s), with no recorded origin"
+                  and "expectation: a supplied mapping of 4 check(s), without a recorded origin"
                   in stream.getvalue(), stream.getvalue())
 
             # Every suite run needs the companion beside the tool, so its absence
@@ -3159,7 +3200,7 @@ def _selftest_checks(verifier):
                         lambda: expect([("target-check", settings(), bite)], live=True, jobs=3,
                                        tool=tool, timeout=20.0, stream=io.StringIO()),
                         f"the companion {companion} is not a file")
-                check("missing-companion-runs-no-suite", log.read_text() == commands_before,
+                check("missing-companion-does-not-run-a-suite", log.read_text() == commands_before,
                       log.read_text()[len(commands_before):])
             finally:
                 (base / "companion-aside").rename(companion)
@@ -3235,10 +3276,10 @@ def _selftest_checks(verifier):
             reworded = types.MappingProxyType({**certifying.mapping, "target-check": "reworded"})
             for name, given, gaps in (
                 ("certify-without-expectation-refused", None,
-                 ["no expectation was supplied, so the listing would stand in for the "
+                 ["the expectation was not supplied, so the listing would stand in for the "
                   "population"]),
                 ("certify-with-bare-mapping-refused", SYNTHETIC_EXPECTED,
-                 ["the expectation is a bare mapping with no recorded origin; read it with "
+                 ["the expectation is a bare mapping without a recorded origin; read it with "
                   "retained_expectation"]),
                 ("certify-without-adjudications-refused", sourced,
                  ["the expectation does not name approved adjudications; pass them to "
@@ -3283,7 +3324,7 @@ def _selftest_checks(verifier):
                   "'pending review'"]),
                 ("certify-adjudications-without-entries-refused",
                  retained_expectation(bare_path, live=True, jobs=3, adjudications=bare_approved),
-                 ["the adjudications record holds no entries list"]),
+                 ["the adjudications record does not hold an entries list"]),
                 ("certify-with-a-replaced-source-refused",
                  dataclasses.replace(certifying, source={**source, "commit": "beefcafe"}),
                  [f"the frozen source in use is not the one {source_path} names"]),
@@ -3330,7 +3371,8 @@ def _selftest_checks(verifier):
             v1_rows = [(cid, description, ("live-jobs-1", "live-jobs-2", "live-jobs-3",
                                            "live-jobs-4"), ())
                        for cid, description in SYNTHETIC_EXPECTED.items()]
-            v1_rows.append(("read-only-tier-runs-no-tmux", "the read-only tier runs no tmux",
+            v1_rows.append(("read-only-tier-does-not-run-tmux",
+                            "the read-only tier does not run tmux",
                             ("live-jobs-1", "live-jobs-2", "live-jobs-4"), ("live-jobs-3",)))
             v1_path.write_bytes(frozen(v1_rows, modes=("live-jobs-1", "live-jobs-2", "live-jobs-3",
                                                        "live-jobs-4"), source=source))
@@ -3351,7 +3393,8 @@ def _selftest_checks(verifier):
                              "mapping_v1_state": "included in the expected set for this mode",
                              "decision": "approved: expected row"}
                             for mode in ("live-jobs-1", "live-jobs-2", "live-jobs-4")
-                            for cid in ("every-unit-reported", "read-only-tier-runs-no-tmux")],
+                            for cid in ("every-unit-reported",
+                                        "read-only-tier-does-not-run-tmux")],
                 "consequence": "the listing changes", "note": "a note"}))
             v1_form = retained_expectation(v1_path, live=True, jobs=3, adjudications=v1_approved)
             check("certify-accepts-the-v1-adjudications-form",
@@ -3384,8 +3427,8 @@ def _selftest_checks(verifier):
                                    tool=tool, expected=certifying, certify=True,
                                    stream=io.StringIO(), verifier=verifier, suite_parent=suites),
                     "a certifying run names its timeout")
-            check("certify-without-a-timeout-runs-no-suite", log.read_text() == commands_before,
-                  log.read_text()[len(commands_before):])
+            check("certify-without-a-timeout-does-not-run-a-suite",
+                  log.read_text() == commands_before, log.read_text()[len(commands_before):])
 
             # The verifier on disk is the one this process loaded.
             loaded = globals()["VERIFIER_LOADED"]
@@ -3430,8 +3473,8 @@ def _selftest_checks(verifier):
                         f"the code this process runs is not what {VERIFIER} compiles to")
             finally:
                 globals()["VERIFIER_FROM_SOURCE"] = from_source
-            check("certify-refused-for-bytecode-runs-no-suite", log.read_text() == commands_before,
-                  log.read_text()[len(commands_before):])
+            check("certify-refused-for-bytecode-does-not-run-a-suite",
+                  log.read_text() == commands_before, log.read_text()[len(commands_before):])
             stale = base / "stale"
             stale.mkdir()
             source_text = VERIFIER.read_text()
@@ -3459,14 +3502,14 @@ def _selftest_checks(verifier):
                   and len(changed_text.encode()) == kept.st_size, repr((fresh, behind)))
 
             # verifier_selftest on stand-ins: a failing one refuses, a silent one
-            # refuses, a passing one gives its last line; given none, it runs
-            # selftest.
+            # refuses, a passing one gives its last line; without a stand-in, it
+            # runs selftest.
             def failing_stand_in():
                 raise ProbeFailure(["a stand-in check"])
 
-            refused("verifier-selftest-refuses-a-selftest-that-prints-nothing",
+            refused("verifier-selftest-refuses-a-silent-selftest",
                     lambda: verifier_selftest(lambda: None),
-                    "the verifier's own selftest printed nothing")
+                    "the verifier's own selftest did not print anything")
             real_selftest = globals()["selftest"]
             globals()["selftest"] = lambda: print("probe checks: 9 ok, 0 failed")
             try:
@@ -3475,7 +3518,7 @@ def _selftest_checks(verifier):
                 ran = f"refused: {exc.failures}"
             finally:
                 globals()["selftest"] = real_selftest
-            check("verifier-selftest-runs-selftest-when-given-none",
+            check("verifier-selftest-runs-selftest-without-a-stand-in",
                   ran == "probe checks: 9 ok, 0 failed", repr(ran))
 
             refused("verifier-selftest-refuses-a-failing-selftest",
@@ -3488,9 +3531,9 @@ def _selftest_checks(verifier):
             # Certification refuses a verifier with functions replaced after its
             # import, so what a certifying run does differently is shown on a
             # copy of this verifier with its text changed, certifying in an
-            # interpreter of its own where nothing is replaced. The copy's
-            # selftest says one fixed line, since the real one cannot run
-            # inside itself.
+            # interpreter of its own where the copy's functions are not
+            # replaced. The copy's selftest says one fixed line, since the real
+            # one cannot run inside itself.
             quick_selftest = (
                 '    return _selftest_checks(lambda: print("running; this certifying run is one '
                 'of its own "\n                                          "checks"))\n',
@@ -3556,7 +3599,7 @@ def _selftest_checks(verifier):
                   any("is not the tool, companion and test tree it was copied from" in failure
                       for failure in differing.get("failures", ())),
                   repr({key: value for key, value in differing.items() if key != "printed"})[:1500])
-            check("certify-refused-for-a-differing-copy-runs-no-suite",
+            check("certify-refused-for-a-differing-copy-does-not-run-a-suite",
                   log.read_text() == commands_before, log.read_text()[len(commands_before):])
 
             # A failing verifier selftest refuses certification before any suite runs.
@@ -3696,8 +3739,8 @@ def _selftest_checks(verifier):
             # Y4, in place: each change below leaves every name holding the
             # object the import made and changes what that object runs: a
             # function's code, its defaults and its keyword defaults, and a
-            # method's code and its defaults. Each is named alone, and no
-            # change is named once it is put back.
+            # method's code and its defaults. Each is named alone, and a change
+            # is not named once it is put back.
             class _StandIn(AssertionError):
                 def __init__(self, failures, report="", outcomes=()):
                     super().__init__("a stand-in")
@@ -3885,10 +3928,11 @@ def _selftest_checks(verifier):
             clean_named = [line for line in printed.splitlines()
                            if line.startswith("clean: suite directories ")]
             owned = {
-                "every suite ran with all three under the parent, in one directory of its own":
+                "every suite ran with its TMPDIR, TMUX_TMPDIR and XDG_CACHE_HOME under the "
+                "parent, in one directory of its own":
                     bool(given) and all(len(home) == 1 and next(iter(home)).parent == owned_parent
                                         for home in homes),
-                "no two suites shared a directory":
+                "each suite had a different directory":
                     len({next(iter(home)) for home in homes if home}) == len(given),
                 "each directory was removed after its suite":
                     sorted(entry.name for entry in owned_parent.iterdir()) == [],
@@ -3957,9 +4001,9 @@ def _selftest_checks(verifier):
                     "ZDOTDIR='probe-selftest-shown'" in shown_items,
                 "and the caller's PATH with its value":
                     f"PATH={os.environ.get('PATH', '')!r}" in shown_items,
-                "and names an unlisted one with nothing after the name":
+                "and names an unlisted one without a value after the name":
                     "LC_PROBE_SELFTEST" in unshown_items,
-                "and writes down neither its value, its length nor a digest of it":
+                "and does not write down its value, its length or a digest of it":
                     unlisted not in printed and "LC_PROBE_SELFTEST=" not in printed
                     and hashlib.sha256(unlisted.encode()).hexdigest()[:16] not in printed
                     and len(unshown_lines) == 1
@@ -3981,8 +4025,9 @@ def _selftest_checks(verifier):
             check("certify-record-names-the-whole-suite-environment", not wrong, ", ".join(wrong))
             # A certifying run refused at its listing still names what became of
             # the listing's directories and the environment it was given, and
-            # says that no other suite ran to compare it with. This tool's
-            # listing describes other-check otherwise than the expectation.
+            # says that the other suites did not run, so its environment was not
+            # compared. This tool's listing describes other-check otherwise than
+            # the expectation.
             renamed = settings(DESCRIBE={"other-check": "renamed"})
             refused_dir = base / "listing-refused"
             (refused_dir / "test").mkdir(parents=True)
@@ -4018,13 +4063,12 @@ def _selftest_checks(verifier):
                             for line in refused_lines)
                     and any(line.startswith("suite directories of the listing: ")
                             for line in refused_lines),
-                "and says that nothing was compared with it":
-                    "suite environment: no other suite ran, so nothing was compared with the "
-                    "listing's" in refused_lines,
+                "and says that the other suites did not run, so its environment was not compared":
+                    "suite environment: the other suites did not run, so the listing's "
+                    "environment was not compared with another suite's" in refused_lines,
             }
             wrong = sorted(claim for claim, ok in at_listing.items() if not ok)
-            check("certify-refused-at-its-listing-still-records-the-listings-directories-and-"
-                  "environment",
+            check("certify-refused-at-its-listing-still-records-the-listings-directories-and-environment",
                   not wrong, ", ".join(wrong))
             # So does a certifying run refused once its listing has run: for a
             # case naming a check that is not among the expected checks, and
@@ -4055,13 +4099,13 @@ def _selftest_checks(verifier):
                         for start in ("suite environment of the listing, apart ",
                                       "suite environment of the listing, variables ",
                                       "suite directories of the listing: ")),
-                    f"{label}: and says that nothing was compared with it":
-                        "suite environment: no other suite ran, so nothing was compared with the "
-                        "listing's" in stopped_lines,
+                    f"{label}: and says that the other suites did not run, so its environment was "
+                    "not compared":
+                        "suite environment: the other suites did not run, so the listing's "
+                        "environment was not compared with another suite's" in stopped_lines,
                 })
             wrong = sorted(claim for claim, ok in after_listing.items() if not ok)
-            check("certify-refused-after-its-listing-still-records-the-listings-directories-and-"
-                  "environment",
+            check("certify-refused-after-its-listing-still-records-the-listings-directories-and-environment",
                   not wrong, ", ".join(wrong))
             # A suite directory that cannot be removed is named in the record:
             # here every clean run's TMPDIR holds a directory without write
@@ -4148,8 +4192,8 @@ def _selftest_checks(verifier):
             leak = base / "test" / "leak"
             check("changed-inputs-refused", exc is not None
                   and exc.failures == ("the tool, its companion, the verifier or the test "
-                                       f"tree changed while the suites ran ({leak}); no "
-                                       "verdict here describes what is on disk now",)
+                                       f"tree changed while the suites ran ({leak}); the verdicts "
+                                       "here do not describe what is on disk now",)
                   and f"changed while the suites ran: {leak}" in exc.report,
                   repr(exc and exc.failures))
             check("changed-inputs-keep-the-discarded-output", exc is not None
@@ -4187,7 +4231,7 @@ def _selftest_checks(verifier):
         def supervised_run(label, timeout, **values):
             """Run the stand-in through run_suite; returns the run, the processes it
             started and the ones still running, which are then ended here so a
-            failing rule leaves nothing behind."""
+            failing rule does not leave a process behind."""
             here = Path(td) / label
             here.mkdir()
             copy = here / "agent-resume"
@@ -4205,7 +4249,7 @@ def _selftest_checks(verifier):
             return run, named, alive
 
         run, named, alive = supervised_run("stopped", 3.0, OWNED_DRIVER="stays", SLEEP=30)
-        check("stopped-suite-ends-everything-under-it",
+        check("stopped-suite-ends-every-process-under-it",
               run.returncode is None and len(named) == 2 and not alive,
               f"returncode {run.returncode}, named {named}, still running {alive}")
         # Y2: the driver has ended, so its terminal child's parent is whichever
@@ -4228,9 +4272,9 @@ def _selftest_checks(verifier):
 
         # A supervisor does not start the suite unless the bytes it read have
         # the digest its run names. The copy here differs from this file by one
-        # comment line, and its module checks no digest of its own: named with
-        # this file's digest it does not start the suite, which the stand-in's
-        # own log shows, and named with its own it runs the suite.
+        # comment line, and its module does not check a digest of its own:
+        # named with this file's digest it does not start the suite, which the
+        # stand-in's own log shows, and named with its own it runs the suite.
         other = Path(td) / "other" / VERIFIER.name
         other.parent.mkdir()
         other.write_bytes(VERIFIER.read_bytes() + b"# one more line\n")
@@ -4256,7 +4300,7 @@ def _selftest_checks(verifier):
                 os.environ["PROBE_SYNTHETIC_LOG"] = was_log
         mismatch = (f"the verifier it loaded, {other}, has sha256 {other_digest}, not the "
                     f"{VERIFIER_LOADED} its run names")
-        check("supervisor-starts-no-suite-from-other-bytes",
+        check("supervisor-does-not-start-the-suite-from-other-bytes",
               refused_run.unstarted == mismatch and refused_run.returncode is None
               and ran_before == "" and unfinished(refused_run) == [f"never started: {mismatch}"]
               and f"probe: the supervisor did not start the suite: {mismatch}" in refused_run.stderr
@@ -4264,38 +4308,38 @@ def _selftest_checks(verifier):
               f"refused {refused_run.unstarted!r}, ran before {ran_before!r}, started "
               f"{started_run.returncode} {started_run.unstarted!r}")
         # The check is made on the bytes that then run, so a copy does not
-        # start the suite either when its module vouches for itself, here by
-        # naming the run's digest as its own.
+        # start the suite either when its module sets VERIFIER_LOADED to the
+        # run's digest in place of the digest of its own bytes.
         original = VERIFIER.read_bytes()
-        vouching = Path(td) / "vouching" / VERIFIER.name
-        vouching.parent.mkdir()
-        vouching.write_bytes(original.replace(
-            b"VERIFIER_LOADED = hashlib.sha256(_VERIFIER_BYTES).hexdigest()\n",
+        preset = Path(td) / "preset" / VERIFIER.name
+        preset.parent.mkdir()
+        preset.write_bytes(original.replace(
+            b"VERIFIER_LOADED = hashlib.sha256(_LOADED_BYTES).hexdigest()\n",
             f"VERIFIER_LOADED = {VERIFIER_LOADED!r}\n".encode(), 1))
-        vouching_digest = hashlib.sha256(vouching.read_bytes()).hexdigest()
+        preset_digest = hashlib.sha256(preset.read_bytes()).hexdigest()
         log.unlink(missing_ok=True)
         os.environ["PROBE_SYNTHETIC_LOG"] = str(log)
         try:
-            vouching_run = run_suite(suite_argv(copy, live=True), timeout=20.0,
-                                     supervisor_source=(vouching, VERIFIER_LOADED))
+            preset_run = run_suite(suite_argv(copy, live=True), timeout=20.0,
+                                   supervisor_source=(preset, VERIFIER_LOADED))
         finally:
             if was_log is None:
                 os.environ.pop("PROBE_SYNTHETIC_LOG", None)
             else:
                 os.environ["PROBE_SYNTHETIC_LOG"] = was_log
-        vouched = (f"the verifier it loaded, {vouching}, has sha256 {vouching_digest}, not the "
-                   f"{VERIFIER_LOADED} its run names")
-        check("supervisor-starts-no-suite-from-a-copy-that-vouches-for-itself",
-              vouching_digest != VERIFIER_LOADED and vouching_run.unstarted == vouched
-              and vouching_run.returncode is None and not log.exists(),
-              f"{vouching_run.unstarted!r}, ran {log.read_text() if log.exists() else ''!r}")
-        # A supervisor runs the bytes it read, compiled as it read them, and no
-        # cached bytecode. Beside the copy here sits a .pyc compiled from a
-        # variant of the same size, in which supervise does not start the
-        # suite, carrying the copy's size and modification time, which is all
-        # an import of the file would compare. It is written by its own name
-        # with a timestamp, so neither SOURCE_DATE_EPOCH nor
-        # PYTHONPYCACHEPREFIX changes it.
+        preset_mismatch = (f"the verifier it loaded, {preset}, has sha256 {preset_digest}, "
+                           f"not the {VERIFIER_LOADED} its run names")
+        check("supervisor-does-not-start-the-suite-from-a-copy-that-sets-verifier-loaded-to-the-run-digest",
+              preset_digest != VERIFIER_LOADED and preset_run.unstarted == preset_mismatch
+              and preset_run.returncode is None and not log.exists(),
+              f"{preset_run.unstarted!r}, ran {log.read_text() if log.exists() else ''!r}")
+        # A supervisor runs the bytes it read, compiled as it read them, and
+        # does not run cached bytecode. Beside the copy here sits a .pyc
+        # compiled from a variant of the same size, in which supervise does not
+        # start the suite, carrying the copy's size and modification time,
+        # which is all an import of the file would compare. It is written by
+        # its own name with a timestamp, so setting SOURCE_DATE_EPOCH or
+        # PYTHONPYCACHEPREFIX does not change it.
         stale = Path(td) / "stale" / VERIFIER.name
         stale.parent.mkdir()
         statement = b"    libc = ctypes.CDLL(None, use_errno=True)\n"
@@ -4352,8 +4396,10 @@ def _selftest_checks(verifier):
         # ASCII, and last a line of JSON, which escapes every character outside
         # ASCII. It runs without the caller's PYTHONIOENCODING, which would set
         # the encoding or the error handler of that stdout in place of the
-        # locale's, so what the refusal prints depends only on the code under
-        # test.
+        # locale's, and it reports that stdout's encoding and error handler and
+        # whether they write an e-acute without _printed's escapes. The check
+        # requires a stdout that cannot write an e-acute by itself, so a plain
+        # print fails the check whatever set up that stdout.
         located = Path(td) / "locale"
         located.mkdir()
         names = (b"\xc3\xa9", b"\xff")
@@ -4363,7 +4409,13 @@ def _selftest_checks(verifier):
             "         for key, values in json.loads(os.environ['PROBE_LOCALE_CALL']).items()}\n"
             "sys.path.insert(0, given['verifier'][0])\n"
             "import probe\n"
-            "said = {'encoding': codecs.lookup(locale.getpreferredencoding(False)).name}\n"
+            "said = {'encoding': codecs.lookup(locale.getpreferredencoding(False)).name,\n"
+            "        'stdout': [sys.stdout.encoding, sys.stdout.errors]}\n"
+            "try:\n"
+            "    '\\u00e9'.encode(sys.stdout.encoding, sys.stdout.errors)\n"
+            "    said['stdout_writes_e_acute'] = True\n"
+            "except UnicodeError:\n"
+            "    said['stdout_writes_e_acute'] = False\n"
             "for at, name in enumerate(given['names']):\n"
             "    inside = os.path.join(given['parent'][0], name)\n"
             "    os.mkdir(inside)\n"
@@ -4407,11 +4459,22 @@ def _selftest_checks(verifier):
         check("status-lines-are-read-as-utf8-in-any-locale", not wrong,
               ", ".join(wrong) + f"; {read_there!r}"[:900])
         # The refusal it printed holds the refused run's stderr line, which
-        # names the path, with the e-acute written as an escape.
-        check("refusal-naming-a-path-outside-ascii-prints-in-an-ascii-locale",
-              read_there.get("printed") == "printed"
-              and "\n  its verifier at /\\xe9/probe.py differs\n" in shown,
-              f"{read_there.get('printed')!r}; {shown[-900:]!r}")
+        # names the path, with the e-acute written as an escape, and the
+        # child's stdout cannot write an e-acute by itself, so _printed wrote
+        # the escape.
+        child_stdout = read_there.get("stdout") or [None, None]
+        printed_claims = {
+            "the refusal printed": read_there.get("printed") == "printed",
+            "the refused run's stderr line names the path with the e-acute as an escape":
+                "\n  its verifier at /\\xe9/probe.py differs\n" in shown,
+            "the child's stdout cannot write an e-acute by itself":
+                read_there.get("stdout_writes_e_acute") is False,
+        }
+        wrong = sorted(claim for claim, ok in printed_claims.items() if not ok)
+        check("refusal-naming-a-path-outside-ascii-prints-in-an-ascii-locale", not wrong,
+              ", ".join(wrong) + f"; the child's stdout had the encoding {child_stdout[0]!r} and "
+              f"the error handler {child_stdout[1]!r}; printed {read_there.get('printed')!r}; "
+              f"{shown[-900:]!r}")
         # A command that cannot be started is a suite that never started, not
         # one that ran out of time.
         missing = Path(td) / "no-such-tool"
@@ -4468,10 +4531,10 @@ def _selftest_checks(verifier):
                   "processes under it may still run" in abrupt_run.stderr,
               f"{abrupt_run.supervisor_ended!r}, returncode {abrupt_run.returncode}, "
               f"{unfinished(abrupt_run)}, stderr {abrupt_run.stderr[-300:]!r}")
-        # supervise returns 2 and writes nothing when its argv lacks the
-        # separator or a command. The descriptors named here are not numbers,
-        # so a supervise that went on would raise at once instead of writing to
-        # a descriptor of this process.
+        # supervise returns 2 without writing any output when its argv lacks
+        # the separator or a command. The descriptors named here are not
+        # numbers, so a supervise that went on would raise at once instead of
+        # writing to a descriptor of this process.
         answers = {}
         for argv in ([], ["status", "control", "--"], ["status", "control", "-", "suite"]):
             try:
@@ -4497,7 +4560,7 @@ def _selftest_checks(verifier):
             "every row is read, in order":
                 [row[0] for row in raw_outcome.rows] == list(SYNTHETIC_EXPECTED),
             "and the summary after them": raw_outcome.summary == (3, 4),
-            "and the run is judged on them, with nothing refused": not raw_outcome.reasons,
+            "and the run is judged on them without a refusal": not raw_outcome.reasons,
             "the failing row's detail holds the byte, written as \\xff":
                 ("target-check", SYNTHETIC_EXPECTED["target-check"], False,
                  "scripted failure \\xff") in raw_outcome.rows,
@@ -4569,7 +4632,7 @@ def _selftest_checks(verifier):
               f"returncode {run.returncode}, left_running {run.left_running}, named {named}, "
               f"alive {alive}, stderr {run.stderr[-300:]!r}")
         run, named, alive = supervised_run("clean", 20.0)
-        check("self-exiting-suite-that-left-no-process-has-no-process-ended",
+        check("self-exiting-suite-that-did-not-leave-a-process-is-not-reported-as-leaving-one",
               run.returncode == 0 and run.left_running == () and "probe:" not in run.stderr,
               f"returncode {run.returncode}, left_running {run.left_running}, "
               f"stderr {run.stderr[-300:]!r}")
@@ -4580,7 +4643,7 @@ def _selftest_checks(verifier):
         check("descendant-named-systemd-is-refused-and-left",
               run.returncode == 0 and len(named) == 1 and len(alive) == 1
               and f"refused to signal pid {pid} (systemd), a systemd process" in run.stderr
-              and f"still running after the suite and everything under it were ended: {pid} "
+              and f"still running after the suite and every process under it were ended: {pid} "
                   "(systemd)" in run.stderr
               and run.left_running == (int(pid),),
               f"returncode {run.returncode}, named {named}, alive {alive}, left_running "
@@ -4598,9 +4661,10 @@ def _selftest_checks(verifier):
               f"returncode {run.returncode}, named {named}, alive {alive}, left_running "
               f"{run.left_running}, stderr {run.stderr[-400:]!r}")
 
-        # The rules a supervisor ends by, asked of process tables made up here
-        # so that nothing is signalled to test them. The made-up pids are above
-        # the largest the kernel hands out, so no process holds any of them.
+        # The rules a supervisor ends by, asked of process tables made up here,
+        # so that testing them does not signal a process. The made-up pids are
+        # above the largest pid the kernel hands out, so the kernel cannot have
+        # given any of them to a process.
         me = os.getpid()
         made_up = {4194401: (me, me, "100", "sleep"), 4194402: (4194401, me, "300", "sleep"),
                    4194403: (me, me, "300", "systemd"), 4194404: (4194499, me, "300", "sleep")}
@@ -4660,8 +4724,9 @@ def _selftest_checks(verifier):
 
         # The guards that hold whatever else is true of a process: read, never signalled.
         sleeper = subprocess.Popen(["sleep", "30"], start_new_session=True)
-        # A process of this test's own named systemd, which no other guard
-        # covers: the machine's own managers are pid 1 or this run's ancestors.
+        # A process of this test's own named systemd, which the other guards do
+        # not cover: the machine's own managers are pid 1 or this run's
+        # ancestors.
         named_systemd = Path(td) / "systemd"
         named_systemd.symlink_to(shutil.which("sleep"))
         imitation = subprocess.Popen([str(named_systemd), "30"], start_new_session=True)
@@ -4703,11 +4768,12 @@ def _selftest_checks(verifier):
     # asked only to be unchanged.
     bytecode_after = {path.name: path.stat().st_mtime_ns for path in
                       VERIFIER.parent.glob(f"__pycache__/{VERIFIER.stem}.*.pyc")}
-    check("supervised-runs-write-no-bytecode-beside-the-verifier",
+    check("supervised-runs-do-not-write-bytecode-beside-the-verifier",
           bytecode_after == bytecode_before, f"before {bytecode_before}, after {bytecode_after}")
     # Of the processes the stand-in recorded, each one still running when its
     # test was over ended within five seconds of the SIGKILL sent here.
-    check("selftest-ends-what-its-stand-ins-left", not unended, ", ".join(unended))
+    check("stand-in-processes-that-outlive-their-test-are-ended-within-five-seconds-of-sigkill",
+          not unended, ", ".join(unended))
     return summed_up()
 
 
