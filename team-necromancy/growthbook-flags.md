@@ -18,9 +18,11 @@ warning, when it comes from a settings file, so it has to be in the environment
 Claude Code is launched with; see
 [How a flag read resolves](#how-a-flag-read-resolves-21296).
 
-With telemetry off, a feature behind a flag therefore depends on the value in
-that cache or on an env override. This registry records what each flag does,
-so the right one can be chosen.
+With telemetry off, ordinary flag reads therefore depend on the value in that
+cache or on an env override. A feature can impose further requirements:
+[native restart](#native-restart-tengu_fancy_wand-21296) requires a payload fetched
+by the current process and does not accept a disk-cache value alone. This
+registry records the flag reads and the conditions imposed by their callers.
 
 Of the three telemetry-off settings, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`
 also disables `/feedback` and the `SendFeedback` tool.
@@ -179,11 +181,75 @@ in a settings file still works in 2.1.292 and earlier.
 |---|---|---|
 | `tengu_harbor_kite` | false | Master gate for cross-session messaging. `YE()` returns `nt("tengu_harbor_kite",false) or CLAUDE_CODE_HARBOR_KITE`, and every messaging entry point checks `YE()`: the `ListAgents` and `SendMessage` tools' `isEnabled`, the uds/bridge send paths, and the socket startup at boot. This one flag turns the whole feature on; `CLAUDE_CODE_HARBOR_KITE=1` forces it on. In 2.1.296 the gate is `xi()`: `Qh().messagingBeyondOwnAgentsDisabled` turns messaging off first, then a set `CLAUDE_CODE_HARBOR_KITE` decides on its own, then on Windows `tengu_harbor_kite_win` (default true) must hold, and last `k("tengu_harbor_kite", true)` decides, so the default is true. |
 | `tengu_rosy_wren` | false | Turns on `TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`, which are otherwise absent on Opus 4.8+, Sonnet 5+, Fable 5+ and Mythos 5+. `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` forces it on. Details below. |
+| `tengu_fancy_wand` | false | Controls native `/restart` and its `/update` alias. In 2.1.296 it requires a fetched true value; the offline cache alone cannot enable the command. Teammates and background sessions are excluded. Details below. |
+| `tengu_fancy_wand_copy` | `{}` | Replaces the update notice's restart text when `offer` is a nonempty string. It does not enable `/restart`. |
 | `tengu_fleetview_peers` | false | Adds other live sessions as rows in the agent-view UI (read behind `YE() && nt("tengu_fleetview_peers",false)`). Cosmetic to the fleet view; messaging works without it. Turn on only if the peer list in agent-view is wanted. |
 | `tengu_harbor_kite_mode_emit` | false | Telemetry only: emits the session's messaging mode as an event (`Hoi()`). |
 | `tengu_harbor_kite_limits` | `{}`, meaning built-in defaults | Rate-limit config for peer messaging (bucketCapacity, refillPerSecond, dedupWindowMs, maxSelfHops, maxChainLength, maxTrackedSenders, maxQueuedPeerMessages). The validator falls back to built-in defaults per field, so an absent or empty entry gives the defaults. Set it only to tighten a specific limit. |
 | `tengu_splendid_horizon` | `{}`, meaning built-in defaults | The auto-deny timer on the permission prompt for a dangerous `rm` or `rmdir` in bypass and auto mode. `timeoutMs` (default 120000) is its length, and a disk-cache value for it takes effect. Details below. |
 | `tengu_chair_sermon` | false | Broadens how attachment reminders are moved into tool results. It is not the switch for message-level system entries, and on the non-promoted fallback path ordinary text steering can already join a string-valued tool result while this flag is false. Leave it off unless its mixed-content relocation is specifically wanted; details below. |
+
+## Native restart: `tengu_fancy_wand` (2.1.296)
+
+The flag controls native `/restart` and its `/update` alias. Both names refer to
+the command whose `isEnabled` is `kjt()` and whose `isHidden` returns `!kjt()`.
+The command is disabled when the flag is missing or is not boolean `true`.
+
+The checks in `/tmp/claude-2.1.296.js:12302`, formatted for reading:
+
+```js
+var b5 = "tengu_fancy_wand";
+function Sjt() { return lct(b5) || (mg() && ya()); }
+function _To() {
+  if (!Sjt()) return false;
+  return lct(b5) ? k(b5, false) === true : C7()[b5] === true;
+}
+function kjt() { return bjt() && _To(); }
+```
+
+`mg()` checks whether GrowthBook is enabled. `ya()` calls
+`hasFreshFeatures()`, which requires a nonempty `remoteEvalFeatureValues` map
+populated by a fetched payload. When that map is populated, `C7()` returns its
+flag values as an object.
+
+### Offline cache does not enable this command
+
+With telemetry disabled, `mg()` is false. Enabling
+`CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF` permits ordinary flag reads to use
+the disk cache, but it does not satisfy `mg() && ya()`. Setting
+`cachedGrowthBookFeatures.tengu_fancy_wand` to `true` therefore does not enable
+`/restart` in an offline session.
+
+### Environment override
+
+The restart checks do not read a dedicated environment variable. `lct()` tests
+for a generic feature override, but the public 2.1.296 build implements
+`getEnvironmentOverrides()` as `return null` and `readConfigOverrides()` as
+`return` without a value. `CLAUDE_INTERNAL_FC_OVERRIDES` therefore does not force
+this flag on. These implementations are at `/tmp/claude-2.1.296.js:2243` and
+were also matched in the installed 2.1.296 executable.
+
+### Session requirements
+
+`bjt()` requires these conditions independently of the flag:
+
+- standard input and standard output are terminals;
+- the platform is Linux or macOS;
+- the executable is a native installation recognized by `s5()`;
+- `teammateAgentId()` is undefined;
+- the entrypoint is not `bg`;
+- the workspace is not remote and the process does not have an active remote
+  connection;
+- slash commands are not disabled.
+
+A teammate therefore cannot use `/restart` even when the fetched flag is true.
+The command's flag checks and teammate exclusion were also matched in the
+installed 2.1.296 executable.
+
+The separate `tengu_fancy_wand_copy` config, read at
+`/tmp/claude-2.1.296.js:24856` with default `{}`, can replace the update notice's
+restart text through a nonempty string in `offer`. It does not enable the
+command.
 
 ## Tools behind default-false flags (2.1.296)
 
