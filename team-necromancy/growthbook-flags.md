@@ -175,6 +175,98 @@ To keep disk reads, set `CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF=1` in the
 environment of whatever starts `claude` (the shell or the launcher). Setting it
 in a settings file still works in 2.1.292 and earlier.
 
+## Feature fetching and local responses (2.1.296)
+
+### Endpoint selection
+
+`zBn()` returns the fixed host `https://api.anthropic.com/`, and `zO()` returns
+client key `sdk-zAZezfDKGoZuXXKe` (`/tmp/claude-2.1.296.js:2243`).
+`CLAUDE_CODE_GB_BASE_URL` is declared in the environment registry but is not read
+by this public build's host selector. `ANTHROPIC_BASE_URL` does not redirect
+GrowthBook requests either.
+
+The normal request is `POST /api/eval/sdk-zAZezfDKGoZuXXKe`. The SDK builds its
+JSON body from `attributes`, `forcedVariations`, `forcedFeatures`, and `url`
+(`:2229`). When `tengu_gb_eval_authed_enable` is truthy, the client first tries
+`/api/eval-authed/sdk-zAZezfDKGoZuXXKe`; a failed request falls back to the ordinary
+endpoint (`:2243`). Authentication headers, when available, accompany these
+requests. Attributes can include account, organization, device and session
+identifiers and an email address.
+
+A local response can represent an entry from `cachedGrowthBookFeatures` as
+`"name": {"defaultValue": value}` inside a top-level `features` object.
+`processRemoteEvalPayload()` also accepts `value` in place of `defaultValue`.
+Boolean values written directly under `features` are rejected as non-object
+entries. Include the intended set of cached flags, because a populated response
+makes names missing from it use their defaults instead of disk-cache values.
+
+### Transport and telemetry
+
+The public build supports `HTTPS_PROXY`/`HTTP_PROXY` and `NODE_EXTRA_CA_CERTS`.
+A TLS-intercepting local proxy could answer the fixed GrowthBook origin with
+local data. This requires proxy routing and a certificate trusted by the client;
+it is not a direct localhost endpoint setting. Redirecting DNS or operating-system
+traffic would also need trusted TLS and can affect other applications. Neither
+approach changes the pre-fetch `mg()` check.
+
+GrowthBook fetching requires the application's telemetry level to be `default`.
+`DISABLE_TELEMETRY` must be unset or empty, rather than set to the nonempty strings
+`"0"` or `"false"`; the other conditions under
+[How a flag read resolves](#how-a-flag-read-resolves-21296) still apply.
+Blocking telemetry transmission through a proxy is a separate configuration from
+keeping that application opt-out enabled. Proxy filtering alone does not prove
+that a network client which ignores the proxy cannot transmit data.
+
+`tengu_frond_boric` is an object read by `mOt(pipeline)` with default `{}`.
+A boolean `firstParty: true` stops first-party event emission and is checked by
+that event exporter's `isKilled` callback (`:2274`). `datadog: true` stops Datadog
+event dispatch (`:14582`). These fields do not disable the separate first-party
+metrics reader. `Dn()` adds that reader independently of the user OpenTelemetry
+exporters when `Ve()` permits it (`:36322` and `:36324`). Its exporter can request
+`/api/claude_code/organizations/metrics_enabled` and post to
+`/api/claude_code/metrics`. `OTEL_LOGS_EXPORTER` and `OTEL_METRICS_EXPORTER` do not
+control those first-party event and metric exporters, and `OTEL_SDK_DISABLED`
+is not referenced in this build's JavaScript. `DISABLE_ERROR_REPORTING` independently disables the
+error-reporting check at `:8323`. When `Ve()` permits first-party metrics, these
+controls do not disable that reader, so they do not replace the global
+`DISABLE_TELEMETRY` opt-out.
+
+### Initialization, refresh and cache writes
+
+Missing authentication skips the initial SDK `init()` fetch but retains the
+client. `initializeClient()` still starts periodic refresh, and a later
+`refreshFeatures()` can make an unauthenticated request that a local responder
+can accept. The default interval is 360 minutes. A positive numeric value of
+`tengu_gb_refresh_interval_minutes` is clamped to a nominal 5 through 360 minutes,
+then multiplied by a random factor from 0.9 to 1.1 and capped at 360 minutes
+(`:2274`).
+
+Calling `initialize()` while fetching is disabled stores promises that resolve
+to `null`. Clearing the telemetry setting alone does not replace those promises.
+`refreshAfterAuthChange()` resets the client before initializing it again
+(`:2243`). Transport trust and routing must also be configured. A successful
+later payload emits a refresh event; the interactive session subscribes with
+`eu(this.refilterCommands)` and rebuilds its command list (`:40875`). Command
+availability is therefore recalculated after a fetch, rather than fixed at
+startup. This does not establish that a running native process can adopt a new
+proxy or certificate configuration through environment changes alone.
+
+The fetched response is written back to `cachedGrowthBookFeatures` and updates
+`cachedGrowthBookFeaturesAt`. A response containing only `defaultValue` entries
+also clears `cachedExperimentFeatures` and `cachedExperimentData`, because the
+client rebuilds those from `source: "experiment"`, `experiment.key`, and
+`experimentResult.variationId` in the response. The Slack-specific client mode
+skips these disk writes. Serving static cached values does not perform fresh
+server-side targeting.
+
+The endpoint, initialization and command-refresh checks were matched against the
+installed 2.1.296 executable. Thirteen isolated checks using extracted request
+and client functions, test SDK dependencies, Bun 1.3.13, and a loopback-only TLS
+proxy verified payload handling and refresh behavior. That is not an end-to-end
+native transport test: the installed executable embeds Bun 1.4.3. Network
+namespace isolation was unavailable in the test environment, so the native
+application was not run with feature fetching enabled.
+
 ## Traced flags
 
 | flag | default | what it does |
@@ -183,6 +275,9 @@ in a settings file still works in 2.1.292 and earlier.
 | `tengu_rosy_wren` | false | Turns on `TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`, which are otherwise absent on Opus 4.8+, Sonnet 5+, Fable 5+ and Mythos 5+. `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` forces it on. Details below. |
 | `tengu_fancy_wand` | false | Controls native `/restart` and its `/update` alias. In 2.1.296 it requires a fetched true value; the offline cache alone cannot enable the command. Teammates and background sessions are excluded. Details below. |
 | `tengu_fancy_wand_copy` | `{}` | Replaces the update notice's restart text when `offer` is a nonempty string. It does not enable `/restart`. |
+| `tengu_gb_eval_authed_enable` | false | Tries `/api/eval-authed/<clientKey>` before the ordinary `/api/eval/<clientKey>` endpoint. A failed authenticated request falls back to the ordinary endpoint. |
+| `tengu_gb_refresh_interval_minutes` | `null`, meaning 360 minutes | Sets the nominal periodic feature-refresh interval. A positive numeric value is clamped to 5 through 360 minutes before jitter and a final 360-minute cap. |
+| `tengu_frond_boric` | `{}` | Boolean fields `firstParty` and `datadog` stop those event pipelines. They do not disable the separate first-party metrics exporter. See the feature-fetching section above. |
 | `tengu_fleetview_peers` | false | Adds other live sessions as rows in the agent-view UI (read behind `YE() && nt("tengu_fleetview_peers",false)`). Cosmetic to the fleet view; messaging works without it. Turn on only if the peer list in agent-view is wanted. |
 | `tengu_harbor_kite_mode_emit` | false | Telemetry only: emits the session's messaging mode as an event (`Hoi()`). |
 | `tengu_harbor_kite_limits` | `{}`, meaning built-in defaults | Rate-limit config for peer messaging (bucketCapacity, refillPerSecond, dedupWindowMs, maxSelfHops, maxChainLength, maxTrackedSenders, maxQueuedPeerMessages). The validator falls back to built-in defaults per field, so an absent or empty entry gives the defaults. Set it only to tighten a specific limit. |
