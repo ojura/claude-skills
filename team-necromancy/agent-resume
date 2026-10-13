@@ -7811,9 +7811,24 @@ class Resolver:
             "command": command,
         })
 
+    def _now(self):
+        """The clock launch_observation measures its appear and settle budgets against.
+
+        A method rather than a direct time.monotonic() call, so the suite can
+        put its own clock here, the way it puts its own process table on the
+        engine. launch_observation takes each reading that bounds a wait from
+        here and waits only through _wait, so a replacement clock has to agree
+        only with itself.
+        """
+        return time.monotonic()
+
+    def _wait(self, seconds):
+        """Wait `seconds` before launch_observation looks at the launch again."""
+        time.sleep(seconds)
+
     def launch_observation(self, seat, agent_id, transcript=None, since=None):
         """Wait for one launch and return its complete immutable observation."""
-        started = time.monotonic()
+        started = self._now()
 
         def present():
             table = self._process_table(refresh=True)
@@ -7832,8 +7847,8 @@ class Resolver:
 
         deadline = started + LAUNCH_APPEAR_S
         appeared, process = present()
-        while not appeared and time.monotonic() <= deadline:
-            time.sleep(0.1)
+        while not appeared and self._now() <= deadline:
+            self._wait(0.1)
             appeared, process = present()
         if not appeared:
             return immutable({
@@ -7843,9 +7858,9 @@ class Resolver:
                 "detail": f"the process did not appear within {LAUNCH_APPEAR_S:.0f}s",
             })
 
-        settle_until = time.monotonic() + LAUNCH_SETTLE_S
+        settle_until = self._now() + LAUNCH_SETTLE_S
         wrote = False
-        while time.monotonic() < settle_until:
+        while self._now() < settle_until:
             if transcript and since is not None:
                 try:
                     if transcript.stat().st_mtime > since:
@@ -7853,7 +7868,7 @@ class Resolver:
                         break
                 except OSError:
                     pass
-            time.sleep(0.1)
+            self._wait(0.1)
         survived, current = present()
         if wrote:
             survived, detail, state = True, "wrote to its transcript", "running"
@@ -25216,15 +25231,22 @@ def _check_synthetic_tmux_is_one_fixture(s):
     # hand-written ones this replaced.
     was_tmux, was_resolver = globals()["tmux"], globals()["RESOLVER"]
     probe, eng = _FakeTmux(), Resolver(needs=Needs(maybe=set(NEED)))
-    was_inputs = {name: getattr(eng, name) for name in _FakeTmux.ENGINE_INPUTS}
+    # The names attach sets, learned by attaching a fixture to a scratch engine
+    # rather than read from ENGINE_INPUTS, so an input that attach sets and the
+    # restore list leaves out is compared below as well.
+    scratch = Resolver(needs=Needs(maybe=set(NEED)))
+    fresh = dict(vars(scratch))
+    _FakeTmux().attach(scratch)
+    attached = {name for name, value in vars(scratch).items() if fresh.get(name) is not value}
+    was_inputs = {name: getattr(eng, name)
+                  for name in attached | set(_FakeTmux.ENGINE_INPUTS)}
     swapped = False
     try:
         try:
             with probe.installed(eng):
-                # Every one of the eight inputs the fixture installs differs
-                # from the engine's original while it is installed, so the
-                # comparison after the raise is about inputs that really were
-                # replaced.
+                # Each input the fixture installs differs from the engine's
+                # original while it is installed, so the comparison after the
+                # raise is about inputs that really were replaced.
                 swapped = (globals()["tmux"] is probe and globals()["RESOLVER"] is eng
                            and getattr(eng._process_table, "world", None) is probe
                            and all(getattr(eng, name) != was
@@ -27077,12 +27099,12 @@ def _invented_pid(pid):
 class _FakeTmux:
     """A tmux server kept in a dict, answering the tmux commands the tool
     uses. It also owns the process table and session registry associated
-    with those panes. Faking those inputs here rather than at each caller is
-    what makes this an integration fixture: runtime resolution,
-    launch placement, seat_note, socket_state, pane_occupants, tint_pane and
-    launch all run unmodified against it. Commands with output that the callers
-    do not parse answer success with empty output, which is what the real
-    server does.
+    with those panes, and the clock launch_observation waits against.
+    Faking those inputs here rather than at each caller is what makes this
+    an integration fixture: runtime resolution, launch placement, seat_note,
+    socket_state, pane_occupants, tint_pane and launch run unmodified
+    against it. Commands with output that the callers do not parse answer
+    success with empty output, which is what the real server does.
     """
 
     def __init__(self, session_exists=True, panes=(), processes=(), registry=(),
@@ -27110,9 +27132,45 @@ class _FakeTmux:
         if not all(isinstance(answer, SocketLiveness) for answer in self.sockets.values()):
             raise TypeError("a fixture socket answers with a SocketLiveness")
         self.socket_dir = Path(f"/nonexistent/{TOOL}-selftest/sockets")
+        # This world's clock, which the engine reads through _now and _wait.
+        # It moves only by the waits it credits, and `waited` is their sum, so
+        # a unit can say how long a loop waited. It starts at the monotonic
+        # reading taken here rather than at zero, so a deadline computed from a
+        # direct time.monotonic() reading is reached after its budget of
+        # credited waits rather than a machine uptime away.
+        self.clock_start = time.monotonic()
+        self.waited = 0.0
+
+    # How much waiting this world credits before it calls the loop waiting one
+    # that does not end: two hundred launches' worth of both launch budgets,
+    # far longer than a unit has reason to wait.
+    WAIT_CEILING_S = 200 * (LAUNCH_APPEAR_S + LAUNCH_SETTLE_S)
 
     def process_rows(self, refresh=False):
         return list(self.processes)
+
+    def now(self):
+        """Where this world's clock has reached: its start plus the waits it credited.
+
+        Real seconds do not move it, so what a poll loop measures is its own
+        waiting, and a loop that would wait out its budget spends the budget
+        without the run spending the seconds.
+        """
+        return self.clock_start + self.waited
+
+    def wait(self, seconds):
+        """Credit a wait without sleeping, and refuse one that will not end.
+
+        Past WAIT_CEILING_S of credited waiting this raises AssertionError: a
+        loop with a deadline from a clock this world does not move would
+        otherwise poll forever, and the run would stop without naming the unit.
+        """
+        self.waited += seconds
+        if self.waited > self.WAIT_CEILING_S:
+            raise AssertionError(
+                f"this world has credited {self.waited:.0f}s of waiting, past its "
+                f"{self.WAIT_CEILING_S:.0f}s ceiling; the loop waiting measures against "
+                "a clock this world does not move")
 
     @staticmethod
     def _world_reader(answer, real):
@@ -27178,16 +27236,21 @@ class _FakeTmux:
     # What attach replaces on the engine, named once so the restore below
     # cannot fall behind it: adding an input here and forgetting to put it
     # back is exactly the leak this pair exists to prevent.
-    ENGINE_INPUTS = PROCESS_INPUTS + ("_swarm_sockets", "_socket_alive")
+    ENGINE_INPUTS = PROCESS_INPUTS + ("_swarm_sockets", "_socket_alive", "_now", "_wait")
 
     def attach(self, engine):
-        """Give a Resolver this fixture's process, session and socket inputs.
+        """Give a Resolver this fixture's process, session, socket and clock inputs.
 
         Every input, always, including an empty socket set. A fixture that
         answered only when it had something to say would let the rest fall
         through to the machine's own socket directory, so a unit's result would
         depend on what happened to be running on the box. An empty set is an
         answer: this world does not have any sockets.
+
+        The clock is an input on the same terms. launch_observation polls a
+        process table this world owns, and a world that answered the table
+        but left the waiting to real seconds would make a unit sit through a
+        budget to reach an answer the world has already decided.
         """
         # The engine's own table counts reading it as computing PROCS, and a
         # verb's evidence audit holds it to what it declared; the world's table
@@ -27213,6 +27276,8 @@ class _FakeTmux:
                 setattr(engine, name, self._world_reader(answer, own.__get__(engine)))
         engine._swarm_sockets = self.socket_paths
         engine._socket_alive = self.socket_liveness
+        engine._now = self.now
+        engine._wait = self.wait
         if self.attached_at is None:
             self.attached_at = int(time.time() * 1000)
         return engine
@@ -38062,6 +38127,199 @@ def _check_launch_followup_per_agent(s):
         shutil.rmtree(watch, ignore_errors=True)
     wrong = sorted(k for k, good in writes.items() if not good)
     check("launch-followup-per-agent", "a launch is followed up per agent", not wrong, ", ".join(wrong))
+    return checked
+
+
+@unit(('launch-absence-waits-out-the-appear-budget',
+       'a launched process that does not appear is called absent only after the whole '
+       'appear budget'),
+      ('launch-that-wrote-is-not-kept-waiting',
+       'a launch that has written its transcript is called running before the settle loop waits'),
+      ('launch-without-a-write-is-watched-for-the-settle-budget',
+       'a launch that runs without writing its transcript is watched for the whole settle budget'),
+      ('launch-that-exits-is-called-exited-after-the-settle-budget',
+       'a launch that exits during the settle budget is called exited, with the budget in the detail'),
+      ('launch-observation-reads-the-engine-clock',
+       "launch_observation reads its clock and waits only through the engine's _now and _wait"))
+def _check_launch_observation_spends_its_budgets(s):
+    """The two waits of launch_observation, run for real against a clock that credits its waits.
+
+    Each case gives the engine a _FakeTmux world, which answers the process
+    table and the clock. The loops are the product's own: each poll and each
+    classification runs, and the world credits each wait without sleeping,
+    so a loop spends its whole budget without the run spending the seconds,
+    and the world's `waited` says what the loop spent.
+
+    The expected details are built from LAUNCH_APPEAR_S and LAUNCH_SETTLE_S, so
+    a detail with the number written into it stops matching when the constant
+    moves. The credited waits are compared with the same constants, so a
+    deadline written as a literal fails here when it differs from them.
+
+    The appear case is the only one that waits out the appear budget. The
+    settle cases keep three outcomes apart: a launch that has written leaves
+    the settle loop before its first wait, one that runs without writing is
+    watched for the whole settle budget, and one that exits is called exited
+    after it.
+
+    Each case catches its own exception, so a case that raises fails alone.
+    """
+    ast = s.ast
+    checked = []
+
+    def check(cid, ok, detail=""):
+        checked.append(_check_verdict(cid, bool(ok), detail))
+
+    def case(cid, block):
+        try:
+            ok, detail = block()
+        except (Exception, Refusal) as exc:
+            ok, detail = False, f"raised {type(exc).__name__}: {exc}"
+        check(cid, ok, detail)
+
+    agent = "alpha@team-launch-clock"
+    launched = (PID_CEILING + 7101, 1,
+                (FAKE_AGENT_BIN, "--resume", "x", "--agent-id", agent))
+
+    class Leaving(_FakeTmux):
+        """A world where the launched process exits during the first wait."""
+
+        def wait(self, seconds):
+            self.processes = []
+            super().wait(seconds)
+
+    def observe(world, transcript=None, since=None):
+        """What launch_observation answers in this world, and how long it waited."""
+        engine = Resolver(needs=Needs(maybe=set(NEED)))
+        with world.installed(engine):
+            answer = engine.launch_observation(None, agent, transcript=transcript,
+                                               since=since)
+        return answer, world.waited
+
+    def spent(waited, budget):
+        """Whether a loop spent its budget: the whole budget, and at most half a second more."""
+        return budget <= waited <= budget + 0.5
+
+    def judged(answer, waited, state, detail, budget):
+        wrong = []
+        if answer["state"] != state:
+            wrong.append(f"the state was {answer['state']}, not {state}")
+        if answer["detail"] != detail:
+            wrong.append(f"it said {answer['detail']!r} rather than {detail!r}")
+        if budget is None and waited:
+            wrong.append(f"it waited {waited:.1f}s before answering")
+        if budget is not None and not spent(waited, budget):
+            wrong.append(f"the loop waited {waited:.1f}s of a {budget:.1f}s budget")
+        return not wrong, "; ".join(wrong)
+
+    folder = Path(tempfile.mkdtemp())
+    try:
+        written, silent = folder / "written.jsonl", folder / "silent.jsonl"
+        for transcript in (written, silent):
+            transcript.write_text("{}\n")
+            os.utime(transcript, (1000, 1000))
+        os.utime(written, None)
+
+        def absent():
+            answer, waited = observe(_FakeTmux(sockets=["claude-swarm-test"]))
+            return judged(answer, waited, "absent",
+                          f"the process did not appear within {LAUNCH_APPEAR_S:.0f}s",
+                          LAUNCH_APPEAR_S)
+
+        def wrote():
+            answer, waited = observe(_FakeTmux(processes=[launched]), written, 1000)
+            return judged(answer, waited, "running", "wrote to its transcript", None)
+
+        def watched():
+            answer, waited = observe(_FakeTmux(processes=[launched]), silent, 1000)
+            return judged(answer, waited, "running",
+                          "running, has not written to its transcript yet", LAUNCH_SETTLE_S)
+
+        def exited():
+            answer, waited = observe(Leaving(processes=[launched]), silent, 1000)
+            return judged(answer, waited, "exited",
+                          f"it started and exited within {LAUNCH_SETTLE_S:.1f}s",
+                          LAUNCH_SETTLE_S)
+
+        def reads_the_engine_clock():
+            node = s.resolver_methods.get("launch_observation")
+            if node is None:
+                return False, "launch_observation was not found in Resolver"
+            direct, through = [], set()
+            for sub in ast.walk(node):
+                if not (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                        and isinstance(sub.func.value, ast.Name)):
+                    continue
+                if sub.func.value.id == "time":
+                    direct.append(f"time.{sub.func.attr} at line {sub.lineno}")
+                elif sub.func.value.id == "self" and sub.func.attr in ("_now", "_wait"):
+                    through.add(sub.func.attr)
+            wrong = []
+            if direct:
+                wrong.append("it calls " + ", ".join(direct))
+            if through != {"_now", "_wait"}:
+                wrong.append("it does not call self." + " or self.".join(
+                    sorted({"_now", "_wait"} - through)))
+            return not wrong, "; ".join(wrong)
+
+        case("launch-absence-waits-out-the-appear-budget", absent)
+        case("launch-that-wrote-is-not-kept-waiting", wrote)
+        case("launch-without-a-write-is-watched-for-the-settle-budget", watched)
+        case("launch-that-exits-is-called-exited-after-the-settle-budget", exited)
+        case("launch-observation-reads-the-engine-clock", reads_the_engine_clock)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    return checked
+
+
+@unit(('fixture-clock-reaches-a-monotonic-deadline',
+       "a deadline taken from time.monotonic() is reached after its budget of the fixture's "
+       "credited waits"),
+      ('fixture-clock-refuses-a-wait-past-its-ceiling',
+       'the fixture answers a wait past its ceiling with a failure instead of crediting it'))
+def _check_fixture_clock(s):
+    """_FakeTmux's clock, the one the launch units wait against.
+
+    launch_observation takes both readings of each budget from the engine's
+    clock, so there a world's clock has to agree only with itself. Starting
+    the clock at time.monotonic() also lets a deadline computed from a direct
+    monotonic reading be reached after its budget of credited waits, rather
+    than a machine uptime away. The ceiling keeps a loop that measures against
+    a clock the world does not move from polling forever: past it the world
+    raises, and the unit running the loop reports a failure.
+    """
+    checked = []
+
+    def check(cid, ok, detail=""):
+        checked.append(_check_verdict(cid, bool(ok), detail))
+
+    def case(cid, block):
+        try:
+            ok, detail = block()
+        except (Exception, Refusal) as exc:
+            ok, detail = False, f"raised {type(exc).__name__}: {exc}"
+        check(cid, ok, detail)
+
+    def reaches():
+        world = _FakeTmux()
+        deadline = time.monotonic() + LAUNCH_APPEAR_S
+        while world.now() <= deadline:
+            world.wait(0.1)
+        waited = world.waited
+        return (LAUNCH_APPEAR_S <= waited <= LAUNCH_APPEAR_S + 0.5,
+                f"it credited {waited:.1f}s to pass a {LAUNCH_APPEAR_S:.1f}s deadline")
+
+    def refuses():
+        world = _FakeTmux()
+        world.wait(world.WAIT_CEILING_S)
+        try:
+            world.wait(1)
+        except AssertionError as refused:
+            return "ceiling" in str(refused), f"it said {str(refused)!r}"
+        return False, (f"it credited {world.waited:.0f}s, past its "
+                       f"{world.WAIT_CEILING_S:.0f}s ceiling")
+
+    case("fixture-clock-reaches-a-monotonic-deadline", reaches)
+    case("fixture-clock-refuses-a-wait-past-its-ceiling", refuses)
     return checked
 
 

@@ -1314,6 +1314,19 @@ fixed; this private-reader substitution does not claim that public refresh leave
 the member cache intact. Dry-run checks retain directory entries as well as file
 bytes, so creating an empty directory counts as a change.
 
+`launch_observation` measures two budgets against Resolver's `_now` and waits
+between polls through `_wait`: `LAUNCH_APPEAR_S` for the launched process to
+appear, and `LAUNCH_SETTLE_S`, during which it watches the transcript for a
+write before it checks that the process is still running. Outside the selftest
+they are `time.monotonic()` and `time.sleep()`, and
+`launch-observation-reads-the-engine-clock` requires `launch_observation` to
+read its clock and wait only through them. `_FakeTmux` supplies both as engine
+inputs beside the process table it owns. Its clock starts at `time.monotonic()`
+and moves only by the waits it credits, so a unit runs both loops through their
+whole budgets in milliseconds and reads how long a loop waited. Past 200
+launches' worth of both budgets the fixture raises `AssertionError`, so a loop
+that measures against a clock the fixture does not move ends as a failing check.
+
 Every remedy named in a refusal needs an implementation and a test because the
 refusal promises that the remedy preserves the user's data.
 
