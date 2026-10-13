@@ -1000,6 +1000,27 @@ that runs in the current pane does not read the server and is not refused. A
 `SocketLiveness` raises `TypeError` when read as a truth value, so a caller
 compares its state.
 
+A process record is a `ProcessFact`: one process generation, a pid with the
+start time the kernel gives it, read as a mapping. The runtime snapshot holds
+each generation in `by_generation` under its `(pid, proc_start)` pair, and the
+generation each pid runs now in `by_pid`. A session registry row joins the
+generation its recorded start time names. A row that names another generation
+of a running pid, or does not name a start time, does not give that generation
+its session; a running generation without a session of its own is then
+incomplete, with the objection `stale-session-generation`. A live registry row
+for a pid that the process table does not list is a generation of its own,
+incomplete, with the objection `missing-process-evidence`. A record's
+`placement` is a `ProcessPlacement`: `seated` with its `Seat`, `outside` when
+the panes were read and the process is not under any of them, or `unknown` with
+the reason when the run did not read the panes (it did not declare `SEATS`) or
+knows the process only from the registry. A reader that needs seated or
+outside says that the placement is unknown, with the reason, instead of taking
+it for outside: the dossier, the noop and the question that ends a holder say
+so, the doctor names such members apart and does not tell them to stop, a
+socket choice skips them and says what it chose without, and a member that
+already runs where its lead reads keeps the pane its roster records. A
+`ProcessPlacement` raises `TypeError` when read as a truth value.
+
 Each question the tool asks goes through one of two askers. `ask_default_yes`
 asks a `Y/n` question, and a run without a terminal takes its default unless the
 caller passes `unattended=False`, as the redirect onto an inferred destination
@@ -1355,8 +1376,9 @@ A full transcript snapshot is keyed by device, inode, size, and
 nanosecond modification time. It derives the window start, the newest team stamp
 and, when requested, compact mail evidence from one stable read; window-start,
 operating-team and mail questions reuse that answer until any key field changes.
-Runtime reads produce one immutable snapshot, and its PID records are the exact
-objects referenced by its process, agent, transcript, pane, and session indexes.
+Runtime reads produce one immutable snapshot, and its process records are the
+exact objects referenced by its generation, process, agent, transcript, pane, and
+session indexes.
 A question that receives a process table carries that snapshot through every
 helper instead of reading the default table partway through. Callers declare
 optional `REGISTRY`, `SEATS`, and launch `PLACEMENT` work through `NEED` rather

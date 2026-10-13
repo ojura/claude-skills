@@ -862,6 +862,75 @@ class Seat:
 
 
 @dataclasses.dataclass(frozen=True)
+class ProcessPlacement:
+    """Where one process generation sits, as far as the runtime evidence says.
+
+    seated: under a pane of a live swarm server, which seat names. outside:
+    the panes were read, and the process is not under any of them. unknown:
+    reason says why the placement is not known, which is that the run did not
+    read the panes (it did not declare NEED.SEATS), or that the process is
+    known only from the session registry. An unknown placement is neither
+    seated nor outside, so a reader that needs one of the two says that the
+    placement is unknown, with the reason, instead of taking it for outside.
+
+    It cannot be read as a truth value; a caller compares its state.
+    """
+
+    state: str
+    seat: object = None
+    reason: str = ""
+
+    STATES = ("seated", "outside", "unknown")
+
+    def __post_init__(self):
+        if self.state not in self.STATES:
+            raise ValueError(f"unknown process placement state {self.state!r}")
+        if (self.state == "seated") != isinstance(self.seat, Seat):
+            raise ValueError("a seated placement carries its Seat, and only it does")
+        if (self.state == "unknown") != bool(self.reason):
+            raise ValueError("an unknown placement carries its reason, and only it does")
+
+    def said(self):
+        """The placement in words: the pane, outside tmux, or unknown with its reason."""
+        if self.state == "seated":
+            return f"pane {self.seat.pane} on {self.seat.socket}"
+        if self.state == "outside":
+            return "outside tmux"
+        return f"placement unknown: {self.reason}"
+
+    def __bool__(self):
+        raise TypeError("a process placement has three states; compare its state")
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class ProcessFact(Mapping):
+    """One process generation and the runtime evidence joined to it, read as a mapping.
+
+    A generation is a pid with the start time the kernel gives it, so a pid
+    number that another process reuses is another generation. placement is a
+    ProcessPlacement. complete is False when part of the evidence is missing:
+    missing names the parts, and objection says why, as
+    stale-session-generation or missing-process-evidence.
+    """
+
+    data: object
+
+    @property
+    def generation(self):
+        """The (pid, proc_start) pair that names this process generation."""
+        return (self.data["pid"], self.data["proc_start"])
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def __len__(self):
+        return len(self.data)
+
+
+@dataclasses.dataclass(frozen=True)
 class SocketLiveness:
     """What one connection attempt found at a tmux socket path.
 
@@ -933,13 +1002,15 @@ class TerminalContext:
 
 @dataclasses.dataclass(frozen=True)
 class CrewPlacement:
-    """All observed crew seats and the destination selected from them."""
+    """All observed crew seats, the destination selected from them, and the
+    crew processes with an unknown placement, which cannot name a seat."""
 
     seats: tuple
     by_socket: object
     split: bool
     destination: object
     provenance: object
+    unplaced: tuple = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2690,17 +2761,21 @@ class Resolver:
                         if pid in process_index]
         other_rows = [row for row in process_rows if not row["ours"]]
         our_rows = [row for row in process_rows if row["ours"]]
-        seated_rows = [row for row in process_rows if row["seat"] is not None]
-        unseated_rows = [row for row in process_rows if row["seat"] is None]
-        seats = tuple(row["seat"] for row in seated_rows)
+        placements = {row["placement"].state for row in process_rows}
+        seats = tuple(row["placement"].seat for row in process_rows
+                      if row["placement"].state == "seated")
+        # Outside tmux only when the panes were read and the processes are not
+        # under any of them; with the panes unread the state is unknown.
         if not ordered:
             seat_state = "stopped"
-        elif seated_rows and unseated_rows:
+        elif len(placements) > 1:
             seat_state = "mixed"
-        elif seated_rows:
+        elif placements == {"seated"}:
             seat_state = "seated"
-        else:
+        elif placements == {"outside"}:
             seat_state = "outside tmux"
+        else:
+            seat_state = "unknown"
         pid = lead_pid if name == "team-lead" else (ordered[0][0] if len(ordered) == 1 else None)
         alive = lead_alive if name == "team-lead" else bool(ordered)
         how = lead_how if name == "team-lead" else (
@@ -3900,14 +3975,32 @@ class Resolver:
 
     @staticmethod
     def _socket_for_ids(snapshot, agent_ids):
-        """Return the first external seated process for these exact identities."""
-        for agent_id in agent_ids:
-            for process in snapshot["by_agent"].get(agent_id, ()):
-                seat = process["seat"]
-                if not process["ours"] and seat:
-                    return (seat.socket,
-                            f"live pane {seat.pane} of pid {process['pid']}")
-        return None, None
+        """The socket of the first external seated process for these exact identities,
+        with what _seated_socket says about it."""
+        return Resolver._seated_socket(
+            process for agent_id in agent_ids
+            for process in snapshot["by_agent"].get(agent_id, ())
+            if not process["ours"])
+
+    @staticmethod
+    def _seated_socket(records):
+        """The socket of the first seated process among records.
+
+        Returns the socket of the first seated record, why it was chosen, and
+        an empty tuple. When the records do not include a seated one, it
+        returns None, None and the records with an unknown placement, so that
+        a caller that then chooses another socket says which processes it
+        chose without.
+        """
+        unplaced = []
+        for record in records:
+            placement = record["placement"]
+            if placement.state == "seated":
+                return (placement.seat.socket,
+                        f"live pane {placement.seat.pane} of pid {record['pid']}", ())
+            if placement.state == "unknown":
+                unplaced.append(record)
+        return None, None, tuple(unplaced)
 
     @staticmethod
     def _select_team_jobs(members, population, live, lead_id, all_members, team):
@@ -4019,12 +4112,17 @@ class Resolver:
             crew_ids = sorted(
                 row["agent_id"] for row in snapshot["live_sessions"]
                 if row.get("team") == team and row.get("agent_id"))
-            socket, socket_why = self._socket_for_ids(snapshot, crew_ids)
+            socket, socket_why, unplaced = self._socket_for_ids(snapshot, crew_ids)
             if not socket:
                 listed_ids = [member.get("agentId") for member in members
                               if member.get("agentId")
                               and member.get("agentId") != lead_id]
-                socket, socket_why = self._socket_for_ids(snapshot, listed_ids)
+                socket, socket_why, listed_unplaced = self._socket_for_ids(
+                    snapshot, listed_ids)
+                unplaced = tuple({record["pid"]: record
+                                  for record in unplaced + listed_unplaced}.values())
+            if not socket and unplaced:
+                warnings.append(f"the socket is chosen without {unplaced_note(unplaced)}")
             if not socket:
                 lead = runtime["lead"]
                 pid = lead["pid"]
@@ -7062,17 +7160,19 @@ class Resolver:
         warnings = []
         socket = requested_socket
         why = socket_reason or "--socket" if requested_socket else None
+        unplaced = {}
         if not socket:
             crew = process["crew"]
             if crew.destination:
                 socket, why = crew.destination.socket, crew.provenance
+            unplaced.update((record["pid"], record) for record in crew.unplaced)
         if not socket:
-            for record in (process.get("runtime") or {}).get("external", ()):
-                seat = record["seat"]
-                if seat:
-                    socket = seat.socket
-                    why = f"live pane {seat.pane} of pid {record['pid']}"
-                    break
+            socket, why, external_unplaced = self._seated_socket(
+                (process.get("runtime") or {}).get("external", ()))
+            unplaced.update((record["pid"], record) for record in external_unplaced)
+        if not socket and unplaced:
+            warnings.append(
+                f"the socket is chosen without {unplaced_note(tuple(unplaced.values()))}")
         if not socket:
             team = launch["identity"]["teamName"]
             lead = process["lead"]
@@ -7963,7 +8063,20 @@ class Resolver:
         return tuple(rows)
 
     def _runtime(self, table=None):
-        """One canonical runtime snapshot, limited to the declared evidence."""
+        """One canonical runtime snapshot, limited to the declared evidence.
+
+        One ProcessFact per process generation, a pid with the start time the
+        kernel gives it. A process table row is the generation its pid has now,
+        and by_pid holds that generation; by_generation holds each generation
+        by its (pid, proc_start) pair. A session registry row joins the
+        generation its recorded start time names. A row that names another
+        generation of a running pid, or does not name a start time, does not
+        give that generation its session: a running generation without a
+        session of its own is then incomplete (stale-session-generation), and
+        its session is unknown rather than absent. A live registry row for a
+        pid that the table does not list is a generation of its own, incomplete
+        (missing-process-evidence), with an unknown placement.
+        """
         table = self._retained_table(self._process_table() if table is None else table)
         if table is self._runtime_table and self._runtime_snapshot is not None:
             return self._runtime_snapshot
@@ -7973,7 +8086,7 @@ class Resolver:
         if want_seats:
             self._exercise(NEED.SEATS)
         lineage = self._own_lineage(table)
-        by_pid = {}
+        by_generation, current = {}, {}
         for pid, ppid, argv in table:
             seat = seats.get(pid)
             proc_state, _current_ppid, started = self._proc_stat(pid)
@@ -7981,53 +8094,91 @@ class Resolver:
             options = self._argv_options(argv) if claude_process else {}
             session = options.get("--resume")
             agent_id = options.get("--agent-id")
-            by_pid[pid] = {"pid": pid, "ppid": ppid,
-                           "proc_start": started or "",
-                           "proc_state": proc_state or "",
-                           "state_note": self._state_note(pid, proc_state),
-                           "argv": argv, "args": shlex.join(argv),
-                           "is_claude": claude_process,
-                           "alive": True, "ours": pid in lineage,
-                           "agent_id": agent_id, "session": session,
-                           "team": name_and_team(agent_id)[1] if agent_id else None,
-                           "seat": seat, "registry": [],
-                           "updated": 0, "started": 0}
+            generation = (pid, started or "")
+            current[pid] = generation
+            by_generation[generation] = {
+                "pid": pid, "ppid": ppid,
+                "proc_start": started or "",
+                "proc_state": proc_state or "",
+                "state_note": self._state_note(pid, proc_state),
+                "argv": argv, "args": shlex.join(argv),
+                "is_claude": claude_process,
+                "alive": True, "ours": pid in lineage,
+                "agent_id": agent_id, "session": session,
+                "team": name_and_team(agent_id)[1] if agent_id else None,
+                "placement": (ProcessPlacement("seated", seat) if seat is not None else
+                              ProcessPlacement("outside") if want_seats else
+                              ProcessPlacement("unknown", reason="the tmux panes were not read")),
+                "registry": [], "updated": 0, "started": 0,
+                "complete": True, "missing": (), "objection": None}
+
+        def join(record, observation):
+            record["registry"].append(observation)
+            record["session"] = record["session"] or observation["session"]
+            record["updated"] = max(record["updated"], observation["updated"])
+            record["started"] = max(record["started"], observation["started"])
 
         observations = []
         if want_registry:
             self._exercise(NEED.REGISTRY)
             for data in self._session_registry():
-                alive = self._pid_alive(data["pid"], data.get("procStart"))
+                pid = data["pid"]
+                recorded = str(data.get("procStart") or "")
+                alive = self._pid_alive(pid, data.get("procStart"))
                 observation = types.MappingProxyType({
-                    "pid": data["pid"], "session": data.get("sessionId"),
+                    "pid": pid, "session": data.get("sessionId"),
                     "updated": data.get("updatedAt") or 0,
                     "started": data.get("startedAt") or 0, "alive": alive})
                 observations.append(observation)
-                record = by_pid.get(data["pid"])
-                if alive and record is None:
-                    proc_state, ppid, started = self._proc_stat(data["pid"])
-                    record = by_pid[data["pid"]] = {
-                        "pid": data["pid"], "ppid": ppid,
-                        "proc_start": started or data.get("procStart") or "",
-                        "proc_state": proc_state or "",
-                        "state_note": self._state_note(data["pid"], proc_state),
-                        "argv": (), "args": "", "is_claude": False,
-                        "alive": True, "ours": data["pid"] in lineage,
-                        "agent_id": None, "session": None, "team": None,
-                        "seat": None, "registry": [],
-                        "updated": 0, "started": 0}
-                if alive:
-                    record["registry"].append(observation)
-                    record["session"] = record["session"] or observation["session"]
-                    record["updated"] = max(record["updated"], observation["updated"])
-                    record["started"] = max(record["started"], observation["started"])
+                running = current.get(pid)
+                if running is not None:
+                    record = by_generation[running]
+                    if recorded and (pid, recorded) == running:
+                        join(record, observation)
+                    elif not record["session"] and observation["session"]:
+                        missing = tuple(dict.fromkeys((*record["missing"], "session")))
+                        record.update({
+                            "complete": False, "missing": missing,
+                            "objection": immutable({
+                                "kind": "stale-session-generation", "pid": pid,
+                                "generation": running,
+                                "recorded_generation": (pid, recorded),
+                                "session": observation["session"],
+                                "missing": missing,
+                            })})
+                    continue
+                if not alive:
+                    continue
+                proc_state, ppid, started = self._proc_stat(pid)
+                generation = (pid, recorded or started or "")
+                missing = ("process table", "argv", "placement")
+                current[pid] = generation
+                record = by_generation.setdefault(generation, {
+                    "pid": pid, "ppid": ppid,
+                    "proc_start": generation[1],
+                    "proc_state": proc_state or "",
+                    "state_note": self._state_note(pid, proc_state),
+                    "argv": (), "args": "", "is_claude": False,
+                    "alive": True, "ours": pid in lineage,
+                    "agent_id": None, "session": None, "team": None,
+                    "placement": ProcessPlacement(
+                        "unknown", reason="the process is known only from the session registry"),
+                    "registry": [],
+                    "updated": 0, "started": 0,
+                    "complete": False, "missing": missing,
+                    "objection": immutable({
+                        "kind": "missing-process-evidence", "pid": pid,
+                        "generation": generation, "missing": missing,
+                    })})
+                join(record, observation)
 
-        for record in by_pid.values():
+        for record in by_generation.values():
             record["transcript"] = (self._transcript_fact(record["session"])
                                     if record["session"] else None)
-        by_pid = {pid: types.MappingProxyType(
-            {**record, "registry": tuple(record["registry"])})
-            for pid, record in by_pid.items()}
+        by_generation = {generation: ProcessFact(types.MappingProxyType(
+            {**record, "registry": tuple(record["registry"])}))
+            for generation, record in by_generation.items()}
+        by_pid = {pid: by_generation[generation] for pid, generation in current.items()}
         by_agent = defaultdict(list)
         by_transcript = defaultdict(list)
         by_seat = defaultdict(list)
@@ -8039,8 +8190,8 @@ class Resolver:
             if record["session"]:
                 by_transcript[record["session"]].append(record)
                 by_session[record["session"]].append(record)
-            if record["seat"]:
-                by_seat[record["seat"]].append(record)
+            if record["placement"].state == "seated":
+                by_seat[record["placement"].seat].append(record)
             if record["session"] or record["agent_id"] or record["registry"]:
                 live_session_records.append(record)
         for observation in observations:
@@ -8064,6 +8215,7 @@ class Resolver:
         snapshot = types.MappingProxyType({
             "table": table,
             "records": tuple(by_pid.values()),
+            "by_generation": types.MappingProxyType(by_generation),
             "by_pid": types.MappingProxyType(by_pid),
             "by_agent": types.MappingProxyType(
                 {key: tuple(rows) for key, rows in by_agent.items()}),
@@ -8096,11 +8248,10 @@ class Resolver:
                     or record["session"] in sessions
                     or record["team"] in teams):
                 continue
-            seat = record["seat"]
             rows.append((
                 record["pid"], record["ppid"], record["proc_start"],
                 record["argv"], record["agent_id"], record["session"],
-                record["team"], seat,
+                record["team"], record["placement"],
             ))
         return tuple(sorted(rows, key=lambda row: row[0]))
 
@@ -8112,7 +8263,7 @@ class Resolver:
         return (
             record["pid"], record.get("ppid"), record.get("proc_start") or "",
             tuple(record.get("argv") or ()), record.get("agent_id"),
-            record.get("session"), record.get("team"), record.get("seat"),
+            record.get("session"), record.get("team"), record.get("placement"),
         )
 
     def stop_plan(self, team=None, agent_id=None, seats=(), session=None,
@@ -8247,24 +8398,26 @@ class Resolver:
         """Return every external crew Seat and one selected launch destination."""
         if not team:
             return CrewPlacement((), types.MappingProxyType({}), False, None, None)
-        records = sorted(
+        crew = sorted(
             (record for record in self._runtime(table)["live_sessions"]
              if record.get("team") == team and record.get("agent_id")
-             and not record["ours"] and record["seat"]),
+             and not record["ours"]),
             key=lambda record: (record["agent_id"], record["pid"]))
-        seats = tuple(record["seat"] for record in records)
+        records = [record for record in crew if record["placement"].state == "seated"]
+        unplaced = tuple(record for record in crew if record["placement"].state == "unknown")
+        seats = tuple(record["placement"].seat for record in records)
         grouped = collections.defaultdict(list)
         for record in records:
-            grouped[record["seat"].socket].append(record["agent_id"])
+            grouped[record["placement"].seat.socket].append(record["agent_id"])
         by_socket = types.MappingProxyType({
             socket: tuple(agent_ids) for socket, agent_ids in sorted(grouped.items())})
         selected = records[0] if records else None
-        destination = (LaunchDestination(selected["seat"].socket)
+        destination = (LaunchDestination(selected["placement"].seat.socket)
                        if selected else None)
-        provenance = (f"live pane {selected['seat'].pane} of pid {selected['pid']}"
+        provenance = (f"live pane {selected['placement'].seat.pane} of pid {selected['pid']}"
                       if selected else None)
         return CrewPlacement(
-            seats, by_socket, len(by_socket) > 1, destination, provenance)
+            seats, by_socket, len(by_socket) > 1, destination, provenance, unplaced)
 
     def _spawn_by_agent(self):
         """{"name@team": payload} for every teammate any lead ever spawned.
@@ -8812,12 +8965,15 @@ class Resolver:
             "seats": tuple(sorted(set(socket_seats[socket]))),
         }) for socket in sorted(socket_members))
         seats = tuple(seat for record in sockets for seat in record["seats"])
-        unseated = tuple(sorted(
+        # A member that is not under a pane is told how to seat it. One with an
+        # unknown placement may sit in a pane, so it is named apart and not
+        # told to stop.
+        unseated, unplaced = (tuple(sorted(
             member["name"] for member in members
             if member["name"] != "team-lead"
-            and any(record["seat"] is None
+            and any(record["placement"].state == state
                     for record in member["runtime"]["records"])
-        ))
+        )) for state in ("outside", "unknown"))
         reads = bool(
             lead["pid"] and lead["alive"] and lead["runs_as"] == team)
         remedies = []
@@ -8886,6 +9042,7 @@ class Resolver:
             "sockets": sockets,
             "split": len(sockets) > 1,
             "unseated": unseated,
+            "unplaced": unplaced,
             "reads": reads,
             "dormant": dormant,
             "verdict": verdict,
@@ -12076,10 +12233,16 @@ def already_running(ctx, args, here=(), pane=None):
             processes = (ctx["process"].get("runtime") or {}).get(
                 "records", ())
             holder = next((row for row in processes if row["pid"] == owner["pid"]), None)
-            holder = holder or next((row for row in processes if row["seat"]), None)
-            seat = holder["seat"] if holder else None
-            where = (f", in pane {seat.pane} on {seat.socket}"
-                     if seat else ", outside any tmux pane")
+            holder = holder or next((row for row in processes
+                                     if row["placement"].state == "seated"), None)
+            placement = holder["placement"] if holder else None
+            # Outside a pane only where the panes were read and the process is
+            # not under one; otherwise the placement is said to be unknown.
+            where = (f", placement unknown: pid {owner['pid']} is not one of "
+                     f"{agent_id}'s processes" if placement is None
+                     else f", in {placement.said()}" if placement.state == "seated"
+                     else ", outside any tmux pane" if placement.state == "outside"
+                     else f", {placement.said()}")
         owner_record = ctx["process"]["snapshot"]["by_pid"].get(owner["pid"]) or {}
         return (f"session {ctx['session']} is live as pid {owner['pid']}"
                 f"{owner_record.get('state_note', '')}{where}; pass --force to run a second copy", False)
@@ -12315,6 +12478,48 @@ def roster_pane_note(reference):
         return (f"(recorded {reference.recorded}, not checked: the state of the server "
                 f"on {reference.destination.socket} is unknown)")
     return "(none recorded)"
+
+
+def holder_where(process, socket=None):
+    """Where a holder a run is about to end sits, for the sentence that asks.
+
+    Returns " in pane P on S" for a seated holder and " (placement unknown:
+    REASON)" for a holder with an unknown placement. For a holder outside
+    tmux it returns " outside SOCKET" when a socket is given, and "" when it
+    is not.
+    """
+    placement = process["placement"]
+    if placement.state == "seated":
+        return f" in {placement.said()}"
+    if placement.state == "unknown":
+        return f" ({placement.said()})"
+    return f" outside {socket}" if socket else ""
+
+
+def arrived_placement(records, recorded_pane):
+    """The socket, pane and note a member that already runs where its lead reads is
+    registered with.
+
+    The pane of its first seated process. Without a seated one, when a process
+    has an unknown placement, the pane the roster records stays, since the
+    runtime does not show that the member is outside a pane, and the note says
+    why; when the processes are outside, the member is registered without a pane.
+    """
+    seat = next((record["placement"].seat for record in records
+                 if record["placement"].state == "seated"), None)
+    if seat is not None:
+        return seat.socket, seat.pane, ""
+    unplaced = unplaced_note(records)
+    if unplaced:
+        return None, recorded_pane or None, f"the roster keeps the pane it records: {unplaced}"
+    return None, None, ""
+
+
+def unplaced_note(records):
+    """The processes among records with an unknown placement, each pid with its
+    reason, for a sentence that says what a choice was made without."""
+    return some_of(f"pid {record['pid']} ({record['placement'].said()})"
+                   for record in records if record["placement"].state == "unknown")
 
 
 def terminal_note(terminal):
@@ -13218,12 +13423,8 @@ def settle_stops(selection, args, prefix=""):
     if not stops:
         return ()
 
-    def where(process):
-        seat = process.get("seat")
-        return f" in pane {seat.pane} on {seat.socket}" if seat else ""
-
     said = [(stop, f"pid {stop['process']['pid']}, which holds {stop['agent_id']}'s "
-                   f"conversation{where(stop['process'])}")
+                   f"conversation{holder_where(stop['process'])}")
             for stop in stops]
     answers = [(stop, agree_to_end(text, args)) for stop, text in said]
 
@@ -13426,9 +13627,7 @@ def apply_member_migration(plan, args, prefix="", confirmation=True):
     cleared = True
     socket = (launch["destination"].socket if launch.get("destination") else None)
     for holder in holders["others"]:
-        seat = holder["seat"]
-        where = (f" in pane {seat.pane} on {seat.socket}" if seat else
-                 f" outside {socket}" if socket else "")
+        where = holder_where(holder, socket)
         cleared = (kill_holder(holder, where, args, indent=prefix)
                    or args.dry_run) and cleared
     if holders["others"] and not cleared:
@@ -13688,13 +13887,12 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
         # runs as: the run does not start it, and it is registered where it
         # runs.
         records = (ctx["process"]["runtime"] or {}).get("records", ())
-        seat = next((row["seat"] for row in records if row["seat"]), None)
+        socket, pane, note = arrived_placement(records, ctx["settings"].get("tmuxPaneId"))
         pids = ", ".join(str(row["pid"]) for row in records)
-        return noop_outcome(
-            ctx, args, prefix, socket=seat.socket if seat else None,
-            pane=seat.pane if seat else None, report=True,
-            why=f"{ctx['identity']['agentName']} already runs as {ctx['identity']['agentId']}"
-                + (f" (pid {pids})" if pids else "") + ", where its lead reads")
+        why = (f"{ctx['identity']['agentName']} already runs as {ctx['identity']['agentId']}"
+               + (f" (pid {pids})" if pids else "") + ", where its lead reads"
+               + (f"; {note}" if note else ""))
+        return noop_outcome(ctx, args, prefix, socket=socket, pane=pane, report=True, why=why)
     # The redirect is decided before any roster is rebuilt: a member that
     # follows its lead elsewhere leaves its source team as it is, so a rebuild
     # here would only make the stamps restore it there again. A team run
@@ -14223,9 +14421,7 @@ def run_agent_dossier(member, shared=None):
     else:
         parts = []
         for row in rows:
-            seat = row["seat"]
-            place = (f"pane {seat.pane} on {seat.socket}"
-                     if seat else "outside tmux")
+            place = row["placement"].said()
             inside = ", which this command is running inside" if row["ours"] else ""
             parts.append(f"{place} (pid {row['pid']}{inside})")
         seat_text = "; ".join(parts)
@@ -14431,6 +14627,12 @@ def diagnose_team(state):
                      f"find {it}. To seat {it}: {TOOL} --stop {stop}, then run the "
                      "team again, at the cost of "
                      f"{'its turn' if one else 'their turns'}")
+    unplaced = conclusion.get("unplaced", ())
+    if unplaced:
+        one = len(unplaced) == 1
+        lines.append(f"note     {', '.join(unplaced)} {'is' if one else 'are'} live with an "
+                     "unknown placement, so this report does not say whether "
+                     f"{'it sits' if one else 'they sit'} in a tmux pane")
     if unrecorded:
         one = len(unrecorded) == 1
         lines.append(f"note     {', '.join(unrecorded)} "
@@ -16101,6 +16303,16 @@ def owned_directory(prefix, parent=None):
     return made
 
 
+def handed_socket_root():
+    """The outermost run's socket root this run was handed (SOCKET_BASE_VAR), or None.
+
+    The one reading of the variable. An empty value is read as unset, so a run
+    given one makes its root under TMPDIR and hands that root down, as the
+    outermost run does.
+    """
+    return os.environ.get(SOCKET_BASE_VAR) or None
+
+
 def deepest_socket_root():
     """The deepest socket root a run started now makes, mkdtemp's characters shown as x.
 
@@ -16112,8 +16324,8 @@ def deepest_socket_root():
     Checking this path against the byte budget once, before anything is made,
     refuses a TMPDIR the run cannot use instead of failing later.
     """
-    handed = os.environ.get(SOCKET_BASE_VAR)
-    if handed:
+    handed = handed_socket_root()
+    if handed is not None:
         return Path(handed) / SOCKET_ROOT_NAME
     return Path(tempfile.gettempdir()) / SOCKET_ROOT_NAME / SOCKET_ROOT_NAME
 
@@ -18817,7 +19029,7 @@ def _check_team_batch_revalidation(s):
         "pid": PID_CEILING + 8000, "ppid": 1, "proc_start": "process-start",
         "proc_state": "R", "argv": ("claude", "--agent-id", "member@team"),
         "agent_id": "member@team", "session": "session-id", "team": "team",
-        "seat": Seat("claude-swarm-test", "%0"),
+        "placement": ProcessPlacement("seated", Seat("claude-swarm-test", "%0")),
     })
     sleeping_process = immutable({**process, "proc_state": "S"})
     replaced_process = immutable({
@@ -22351,16 +22563,17 @@ def _suite_context():
     import ast
     import tempfile
 
-    def corpus_engine():
+    def corpus_engine(needs=None):
         """A Resolver pointed at test/corpus/ instead of this machine.
 
         A fresh instance every call, never the shared RESOLVER: sharing one
         would let one check's cached stamps or spawn index leak into the
         next. The fixture is checked-in data, composed once, so every machine
         that runs this suite, a laptop with years of real teams or a bare CI
-        checkout without teams, exercises the same behaviour.
+        checkout without teams, exercises the same behaviour. needs is what
+        the engine declares, every NEED unless a unit names less.
         """
-        eng = Resolver(needs=Needs(maybe=set(NEED)))
+        eng = Resolver(needs=Needs(maybe=set(NEED)) if needs is None else needs)
         corpus = Path(__file__).resolve().parent / "test" / "corpus"
         eng._projects_dir = corpus / "projects"
         eng._teams_dir = corpus / "teams"
@@ -28523,7 +28736,10 @@ def _check_socket_control_probes(s):
        'the socket name budget counts the tmux-UID directory below a socket root'),
       ('nested-run-makes-its-socket-root-inside-the-outermost-root',
        "a run handed the outermost run's socket root makes its own directly inside it, and a "
-       "run that was not handed one makes its own under TMPDIR and hands it down"))
+       "run that was not handed one makes its own under TMPDIR and hands it down"),
+      ('empty-socket-base-reads-as-unset',
+       'an empty socket base variable is read as unset, by the deepest root a run budgets for '
+       'and by the root it makes'))
 def _check_socket_directory(s):
     """_socket_dir against what tmux 3.4 did with TMUX_TMPDIR, the leak check's
     directory against the engine's, the socket name budget against a socket
@@ -28644,8 +28860,8 @@ def _check_socket_directory(s):
 
     # A run inside this one, as a unit's fixture makes one, with a stand-in for
     # its live tier that reads the socket variables while it runs: once handed
-    # this run's outermost root, and once with that root taken away, as the
-    # outermost run of a tree of its own.
+    # this run's outermost root, once with that root taken away, as the
+    # outermost run of a tree of its own, and once with the variable empty.
     real_live_checks = globals()["live_checks"]
     seen, after = [], {}
 
@@ -28660,19 +28876,21 @@ def _check_socket_directory(s):
     outer_base, outer_root = os.environ.get(SOCKET_BASE_VAR), os.environ.get("TMUX_TMPDIR")
     try:
         globals()["live_checks"] = reading_live_checks
-        for handed in (True, False):
-            if not handed:
+        for case in ("handed", "unset", "empty"):
+            if case == "unset":
                 os.environ.pop(SOCKET_BASE_VAR, None)
+            elif case == "empty":
+                os.environ[SOCKET_BASE_VAR] = ""
             try:
                 with capturing("out"), capturing("err"):
                     run_selftest(live=True, failed_only=True, diagnostics=io.StringIO())
             finally:
-                after[handed] = (os.environ.get(SOCKET_BASE_VAR), os.environ.get("TMUX_TMPDIR"))
+                after[case] = (os.environ.get(SOCKET_BASE_VAR), os.environ.get("TMUX_TMPDIR"))
                 if outer_base is not None:
                     os.environ[SOCKET_BASE_VAR] = outer_base
     finally:
         globals()["live_checks"] = real_live_checks
-    nested, alone = (seen + [{}, {}])[:2]
+    nested, alone, given_empty = (seen + [{}, {}, {}])[:3]
     nesting = {
         "a run handed the outermost root makes its own directly inside it":
             outer_base is not None and nested.get("root") is not None
@@ -28685,12 +28903,12 @@ def _check_socket_directory(s):
         "each made its socket directory with the mode tmux gives it":
             nested.get("mode") == 0o700 and alone.get("mode") == 0o700,
         "after each, TMUX_TMPDIR names this run's root again":
-            [after.get(True, (None, None))[1], after.get(False, (None, None))[1]]
+            [after.get(case, (None, None))[1] for case in ("handed", "unset")]
             == [outer_root, outer_root],
         "after the one handed a root, the handed root is still this run's":
-            after.get(True, (None, None))[0] == outer_base,
+            after.get("handed", (None, None))[0] == outer_base,
         "after the one that was not handed a root, the variable is unset again":
-            False in after and after[False][0] is None,
+            "unset" in after and after["unset"][0] is None,
         "each removed its root when it ended":
             all(entry.get("root") and not Path(entry["root"]).exists()
                 for entry in (nested, alone)),
@@ -28701,6 +28919,31 @@ def _check_socket_directory(s):
           "run that was not handed one makes its own under TMPDIR and hands it down",
           not wrong, "; ".join(wrong + ([f"outer {outer_base}, seen {seen}, after {after}"]
                                         if wrong else [])))
+
+    was = os.environ.get(SOCKET_BASE_VAR)
+    try:
+        os.environ[SOCKET_BASE_VAR] = ""
+        deepest_empty = deepest_socket_root()
+    finally:
+        if was is None:
+            os.environ.pop(SOCKET_BASE_VAR, None)
+        else:
+            os.environ[SOCKET_BASE_VAR] = was
+    emptied = {
+        "the deepest root budgeted for is two roots below TMPDIR":
+            deepest_empty == Path(tempfile.gettempdir()) / SOCKET_ROOT_NAME / SOCKET_ROOT_NAME,
+        "a run given the empty value makes its root under TMPDIR":
+            given_empty.get("root") is not None
+            and Path(given_empty["root"]).parent == Path(tempfile.gettempdir()),
+        "and hands that root down": given_empty.get("handed") == given_empty.get("root"),
+        "after it, the variable is empty again": after.get("empty", (None, None))[0] == "",
+    }
+    wrong = sorted(name for name, ok in emptied.items() if not ok)
+    check("empty-socket-base-reads-as-unset",
+          "an empty socket base variable is read as unset, by the deepest root a run budgets for "
+          "and by the root it makes",
+          not wrong, "; ".join(wrong + ([f"deepest {deepest_empty}, seen {given_empty}, after "
+                                         f"{after.get('empty')}"] if wrong else [])))
     return checked
 
 
@@ -34455,7 +34698,10 @@ def _check_attach_only_if_server(s):
     return checked
 
 
-@unit(('noop-says-live-location', 'a noop says where the live process actually sits'))
+@unit(('noop-says-live-location', 'a noop says where the live process actually sits'),
+      ('noop-says-an-unknown-placement',
+       'a noop on a live process with an unknown placement says so with the reason, and does '
+       'not say that it is outside a pane'))
 def _check_noop_says_live_location(s):
     checked = []
 
@@ -34464,49 +34710,53 @@ def _check_noop_says_live_location(s):
 
     class _NoForceSeat:
         force = False
+
+    member = {"agentId": "m@t", "agentName": "m", "teamName": "t"}
+    owner = {"pid": PID_CEILING + 777, "updated": "x", "alive": True, "session": "seat-uuid"}
+
+    def said_for(placement):
+        """What already_running says of the owner pid, with its record placed so,
+        or without a record of the agent's for it when placement is None."""
+        rows = (() if placement is None else
+                (immutable({"pid": owner["pid"], "placement": placement}),))
+        answer = already_running(
+            fixture_target(
+                "seat-uuid", identity=member,
+                process={
+                    "snapshot": immutable({
+                        "best_by_session": {"seat-uuid": owner},
+                        "by_pid": {owner["pid"]: {"pid": owner["pid"]}},
+                    }),
+                    "runtime": immutable({"records": rows, "external": (), "lineage": ()}),
+                }),
+            _NoForceSeat)
+        return answer[0] if answer else ""
+
     with capturing("err"):
-        member = {"agentId": "m@t", "agentName": "m", "teamName": "t"}
-        owner = {"pid": PID_CEILING + 777, "updated": "x", "alive": True,
-                 "session": "seat-uuid"}
-        unseated = already_running(
-            fixture_target(
-                "seat-uuid", identity=member,
-                process={
-                    "snapshot": immutable({
-                        "best_by_session": {"seat-uuid": owner},
-                        "by_pid": {PID_CEILING + 777: {"pid": PID_CEILING + 777, "seat": None}},
-                    }),
-                    "runtime": immutable({
-                        "records": (immutable({"pid": PID_CEILING + 777, "seat": None}),),
-                        "external": (), "lineage": (), "seats": (),
-                        "seat_state": "outside tmux",
-                    }),
-                }),
-            _NoForceSeat)
-        seated = already_running(
-            fixture_target(
-                "seat-uuid", identity=member,
-                process={
-                    "snapshot": immutable({
-                        "best_by_session": {"seat-uuid": owner},
-                        "by_pid": {PID_CEILING + 777: {"pid": PID_CEILING + 777, "seat": Seat("sock-z", "%9")}},
-                    }),
-                    "runtime": immutable({
-                        "records": (immutable({"pid": PID_CEILING + 777,
-                                               "seat": Seat("sock-z", "%9")}),),
-                        "external": (), "lineage": (),
-                        "seats": (Seat("sock-z", "%9"),),
-                        "seat_state": "seated",
-                    }),
-                }),
-            _NoForceSeat)
+        outside = said_for(ProcessPlacement("outside"))
+        seated = said_for(ProcessPlacement("seated", Seat("sock-z", "%9")))
+        unknown = said_for(ProcessPlacement("unknown", reason="the tmux panes were not read"))
+        unlisted = said_for(None)
     seat_says = {
-        "outside tmux is said": unseated and "outside any tmux pane" in unseated[0],
-        "a real seat is named": seated and "sock-z" in seated[0],
+        "outside tmux is said": "outside any tmux pane" in outside,
+        "a real seat is named": "pane %9 on sock-z" in seated,
     }
     wrong = sorted(k for k, ok in seat_says.items() if not ok)
     check("noop-says-live-location", "a noop says where the live process actually sits", not wrong,
           ", ".join(wrong))
+    unknown_says = {
+        "an unknown placement is said with its reason":
+            "placement unknown: the tmux panes were not read" in unknown,
+        "and not as outside a pane": "outside" not in unknown,
+        "a pid that is not one of the agent's processes is said to be unknown":
+            f"placement unknown: pid {owner['pid']} is not one of m@t's processes" in unlisted,
+        "and not as outside a pane either": "outside" not in unlisted,
+    }
+    wrong = sorted(k for k, ok in unknown_says.items() if not ok)
+    check("noop-says-an-unknown-placement",
+          "a noop on a live process with an unknown placement says so with the reason, and does "
+          "not say that it is outside a pane",
+          not wrong, "; ".join(wrong + ([f"said {unknown!r} and {unlisted!r}"] if wrong else [])))
     return checked
 
 
@@ -34584,7 +34834,7 @@ def _check_stop_resolves_agent_id_team_and_session(s):
         "transcripts": {"abcd-1234": {"others": ({
             "pid": PID_CEILING + 3, "ppid": 1, "proc_start": "3", "proc_state": "S",
             "argv": (), "agent_id": None, "session": "abcd-1234", "team": None,
-            "seat": None, "ours": False,
+            "placement": ProcessPlacement("outside"), "ours": False,
         },)}},
     })
 
@@ -34594,7 +34844,7 @@ def _check_stop_resolves_agent_id_team_and_session(s):
         return immutable({"external": ({
             "pid": pid, "ppid": 1, "proc_start": str(pid), "proc_state": "S",
             "argv": (), "agent_id": agent_id, "session": "abcd-1234", "team": team,
-            "seat": None, "ours": False,
+            "placement": ProcessPlacement("outside"), "ours": False,
         },)})
 
     RESOLVER._agent_runtime = selected_runtime
@@ -38994,11 +39244,14 @@ def _check_crew_split_across_servers(s):
     eng10 = Resolver(needs=Needs(maybe=set(NEED)))
     eng10._runtime = lambda table=None: {"live_sessions": [
         {"pid": PID_CEILING + 1, "alive": True, "ours": False, "team": "t",
-         "agent_id": "old@t", "session": None, "seat": Seat("sock-old", "%1")},
+         "agent_id": "old@t", "session": None,
+         "placement": ProcessPlacement("seated", Seat("sock-old", "%1"))},
         {"pid": PID_CEILING + 2, "alive": True, "ours": False, "team": "t",
-         "agent_id": "new@t", "session": None, "seat": Seat("sock-new", "%2")},
+         "agent_id": "new@t", "session": None,
+         "placement": ProcessPlacement("seated", Seat("sock-new", "%2"))},
         {"pid": PID_CEILING + 3, "alive": True, "ours": False, "team": "other",
-         "agent_id": "x@other", "session": None, "seat": Seat("sock-other", "%3")}]}
+         "agent_id": "x@other", "session": None,
+         "placement": ProcessPlacement("seated", Seat("sock-other", "%3"))}]}
     placement = eng10._crew_placement("t", [])
     check("crew-split-across-servers", "a crew on two servers is reported as two",
           placement.split and placement.by_socket == {
@@ -42566,7 +42819,8 @@ def _check_launch_stops_at_a_live_conversation(s):
             "by_pid": ({owner["pid"]: {"pid": owner["pid"], "state_note": ""}}
                        if owner is not None else {}),
         })
-        records = tuple(immutable({"pid": pid, "seat": None}) for pid in elsewhere)
+        records = tuple(immutable({"pid": pid, "placement": ProcessPlacement("outside")})
+                        for pid in elsewhere)
         runtime = immutable({
             "records": records, "external": records, "lineage": (),
             "seats": (), "seat_state": "outside tmux" if records else "stopped",
@@ -43200,14 +43454,15 @@ def _check_live_seat_walks_pane_children(s):
         "the complete pane child tree is searched":
             agent["seats"] == (expected_seat,),
         "socket and pane are retained together":
-            agent["records"] and agent["records"][0]["seat"] == expected_seat,
+            agent["records"]
+            and agent["records"][0]["placement"] == ProcessPlacement("seated", expected_seat),
         "the process keeps the exact argv tuple":
             agent["records"] and agent["records"][0]["argv"] == (
                 FAKE_AGENT_BIN, "--resume", session, "--agent-id", agent_id),
         "agent and transcript views share the exact process record":
             bool(holder) and holder is agent["records"][0],
         "the shared process record carries the resolved seat":
-            bool(holder) and holder["seat"] == expected_seat
+            bool(holder) and holder["placement"] == ProcessPlacement("seated", expected_seat)
             and agent["seat_state"] == "seated",
         "the runtime separates external and lineage records":
             agent["external"] == agent["records"] and not agent["lineage"],
@@ -43239,7 +43494,7 @@ def _check_live_seat_walks_pane_children(s):
     check("runtime-skips-undeclared-evidence",
           "the runtime snapshot does not read registry or tmux evidence unless declared",
           not touched and not lean_snapshot["registry"] and immutable
-          and all(row["seat"] is None for row in lean_snapshot["records"]),
+          and all(row["placement"].state == "unknown" for row in lean_snapshot["records"]),
           ", ".join(touched))
     return checked
 
@@ -43268,8 +43523,11 @@ def _check_runtime_indexes_share_record_objects(s):
         outside_pid: outside_seat,
         own_pid: own_seat,
     }
+    # Both generations start at one recorded time, and the registry row names
+    # the outside process's generation by it.
+    eng._proc_stat = lambda pid: ("S", 1, "731000")
     eng._session_registry = lambda: [{
-        "pid": outside_pid, "sessionId": session,
+        "pid": outside_pid, "sessionId": session, "procStart": "731000",
         "updatedAt": 9, "startedAt": 4,
     }]
     eng._pid_alive = lambda pid, procstart=None: pid == outside_pid
@@ -43302,7 +43560,7 @@ def _check_runtime_indexes_share_record_objects(s):
         "session ours": snapshot["by_session"][session][1] is ours,
         "best session": snapshot["best_by_session"][session] is outside,
         "processes retain the exact Seat objects":
-            outside["seat"] is outside_seat and ours["seat"] is own_seat,
+            outside["placement"].seat is outside_seat and ours["placement"].seat is own_seat,
         "seat index reuses the canonical process records":
             snapshot["by_seat"][outside_seat][0] is outside
             and snapshot["by_seat"][own_seat][0] is ours,
@@ -43322,6 +43580,339 @@ def _check_runtime_indexes_share_record_objects(s):
     check("runtime-indexes-share-record-objects",
           "every runtime index references the canonical PID record",
           not wrong, ", ".join(wrong))
+    return checked
+
+
+@unit(('registry-row-of-another-generation-does-not-give-its-session',
+       'a session registry row that names another generation of a running pid, or does not '
+       'name a start time, does not give its session to the generation that runs, which is incomplete '
+       'without a session of its own'),
+      ('live-registry-row-without-a-table-row-is-incomplete',
+       'a live session registry row for a pid that the process table does not list is a '
+       'generation of its own, incomplete, with an unknown placement'))
+def _check_process_generations(s):
+    """Which generation a session registry row joins, read from runtime snapshots.
+
+    The table lists one process, started at 200. A registry row names a start
+    time, and the kernel's answer for each pid is the start time given here,
+    so a row names the generation that runs or another one, or does not name a
+    start time.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    pid, unlisted = PID_CEILING + 820001, PID_CEILING + 820002
+    old_session = "82000000-0000-4000-8000-000000000001"
+    own_session = "82000000-0000-4000-8000-000000000002"
+
+    def snapshot(rows, argv_session=None, running=()):
+        """The runtime of the table process with these registry rows. A pid in
+        running runs, at start time 300, though the table does not list it."""
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
+        starts = {pid: "200", **{other: "300" for other in running}}
+        eng._proc_stat = lambda p: ("S", 1, starts[p]) if p in starts else (None, None, None)
+        eng._session_registry = lambda: [dict(row) for row in rows]
+        eng._seat_index = lambda table: {}
+        eng._own_lineage = lambda table: set()
+        eng._transcript_fact = lambda session=None, path=None: None
+        argv = (FAKE_AGENT_BIN, "--agent-id", "generation@runtime-generations",
+                *(("--resume", argv_session) if argv_session else ()))
+        return eng._runtime(((pid, 1, argv),))
+
+    def row(procstart, of=pid):
+        return {"pid": of, "sessionId": old_session, "procStart": procstart,
+                "updatedAt": 5, "startedAt": 4}
+
+    stale = snapshot([row("100")])
+    record = stale["by_pid"][pid]
+    joined = snapshot([row("200")])["by_pid"][pid]
+    unstarted = snapshot([row("")])["by_pid"][pid]
+    own = snapshot([row("100")], argv_session=own_session)["by_pid"][pid]
+    objection = record["objection"]
+    generations = {
+        "the generation that runs does not take another generation's session":
+            record["session"] is None,
+        "it is incomplete, for want of a session":
+            not record["complete"] and record["missing"] == ("session",),
+        "the objection names both generations and the session":
+            objection is not None and dict(objection) == {
+                "kind": "stale-session-generation", "pid": pid,
+                "generation": (pid, "200"), "recorded_generation": (pid, "100"),
+                "session": old_session, "missing": ("session",)},
+        "a row that names the generation that runs gives it the session":
+            joined["session"] == old_session and joined["complete"]
+            and joined["objection"] is None,
+        "a row without a start time does not give it either":
+            unstarted["session"] is None and not unstarted["complete"],
+        "a generation with a session of its own keeps it, complete":
+            own["session"] == own_session and own["complete"] and own["objection"] is None,
+        "each generation is indexed by its pid and start time":
+            stale["by_generation"].get((pid, "200")) is record,
+    }
+    wrong = sorted(name for name, ok in generations.items() if not ok)
+    check("registry-row-of-another-generation-does-not-give-its-session",
+          "a session registry row that names another generation of a running pid, or does not "
+          "name a start time, does not give its session to the generation that runs, which is incomplete "
+          "without a session of its own",
+          not wrong, "; ".join(wrong + ([f"stale {dict(record)}"] if wrong else [])))
+
+    lone = snapshot([row("300", unlisted)], running=(unlisted,))
+    gone = snapshot([row("300", unlisted)])
+    alone = lone["by_pid"].get(unlisted)
+    missing = ("process table", "argv", "placement")
+    registry_only = {
+        "a live row for a pid that the table does not list is a generation of its own":
+            alone is not None and lone["by_generation"].get((unlisted, "300")) is alone,
+        "it is incomplete, without the table's evidence for it":
+            alone is not None and not alone["complete"] and alone["missing"] == missing,
+        "the objection says so":
+            alone is not None and dict(alone["objection"]) == {
+                "kind": "missing-process-evidence", "pid": unlisted,
+                "generation": (unlisted, "300"), "missing": missing},
+        "its placement is unknown, with the reason":
+            alone is not None and alone["placement"] == ProcessPlacement(
+                "unknown", reason="the process is known only from the session registry"),
+        "it holds the session its row names":
+            alone is not None and alone["session"] == old_session,
+        "a dead row for such a pid is not a generation": unlisted not in gone["by_pid"],
+        "the table's own generation stays complete": lone["by_pid"][pid]["complete"],
+    }
+    wrong = sorted(name for name, ok in registry_only.items() if not ok)
+    check("live-registry-row-without-a-table-row-is-incomplete",
+          "a live session registry row for a pid that the process table does not list is a "
+          "generation of its own, incomplete, with an unknown placement",
+          not wrong, "; ".join(wrong + ([f"alone {dict(alone) if alone else None}"]
+                                        if wrong else [])))
+    return checked
+
+
+@unit(('process-placement-says-each-state',
+       'a process placement says its pane, outside tmux, or unknown with the reason, refuses '
+       'an inconsistent state and cannot be read as true or false'),
+      ('agent-runtime-says-an-unknown-placement',
+       "an agent's runtime says its placement is unknown where the panes were not read, and "
+       'outside tmux only where they were'),
+      ('holder-where-says-an-unknown-placement',
+       'the question that ends a holder says where it sits, and an unknown placement with '
+       'the reason, not outside the socket; a record without a placement raises KeyError'),
+      ('socket-choice-says-an-unknown-placement',
+       'a socket choice skips a process with an unknown placement and says what it chose '
+       'without, in a launch and in a team run'),
+      ('crew-placement-names-an-unknown-placement',
+       'the crew placement names the crew processes with an unknown placement and does not '
+       'choose a destination from them'),
+      ('arrived-noop-keeps-the-recorded-pane',
+       'a member that already runs where its lead reads keeps the pane the roster records when '
+       'its placement is unknown, and says why'),
+      ('runtime-fingerprint-carries-the-placement',
+       'the runtime generation and the process signature tell an unknown placement from an '
+       'outside one and one pane from another'))
+def _check_placement_readers(s):
+    """What each reader of a process placement does with an unknown one."""
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    corpus_engine = s.corpus_engine
+    seat = Seat("sock-p", "%4")
+    seated, outside = ProcessPlacement("seated", seat), ProcessPlacement("outside")
+    unknown = ProcessPlacement("unknown", reason="the tmux panes were not read")
+    unread = Needs(maybe=set(NEED) - {NEED.SEATS})
+
+    def refused(**kwargs):
+        try:
+            ProcessPlacement(**kwargs)
+        except ValueError:
+            return True
+        return False
+
+    def as_bool(placement):
+        try:
+            bool(placement)
+        except TypeError:
+            return "refused"
+        return "read"
+
+    said = {
+        "seated says its pane and socket": seated.said() == "pane %4 on sock-p",
+        "outside says outside tmux": outside.said() == "outside tmux",
+        "unknown says so with the reason":
+            unknown.said() == "placement unknown: the tmux panes were not read",
+        "a seated placement needs its Seat": refused(state="seated"),
+        "an outside one cannot carry a Seat": refused(state="outside", seat=seat),
+        "an unknown one needs its reason": refused(state="unknown"),
+        "and only an unknown one carries a reason": refused(state="outside", reason="r"),
+        "it cannot be read as true or false":
+            [as_bool(placement) for placement in (seated, outside, unknown)] == ["refused"] * 3,
+    }
+    wrong = sorted(name for name, ok in said.items() if not ok)
+    check("process-placement-says-each-state",
+          "a process placement says its pane, outside tmux, or unknown with the reason, refuses "
+          "an inconsistent state and cannot be read as true or false",
+          not wrong, "; ".join(wrong))
+
+    agent_id, agent_pid = "placed@runtime-placement", PID_CEILING + 830001
+    table = ((agent_pid, 1, (FAKE_AGENT_BIN, "--agent-id", agent_id)),)
+
+    def seat_state(needs=None, seats=None):
+        eng = corpus_engine(needs)
+        eng._seat_index = lambda rows: dict(seats or {})
+        return eng._agent_runtime(agent_id, table)["seat_state"]
+
+    states = {
+        "with the panes unread, the state is unknown": seat_state(unread) == "unknown",
+        "with the panes read and the process not under any of them, outside tmux":
+            seat_state() == "outside tmux",
+        "with the process under a pane, seated": seat_state(seats={agent_pid: seat}) == "seated",
+    }
+    wrong = sorted(name for name, ok in states.items() if not ok)
+    check("agent-runtime-says-an-unknown-placement",
+          "an agent's runtime says its placement is unknown where the panes were not read, and "
+          "outside tmux only where they were",
+          not wrong, "; ".join(wrong))
+
+    def where_of(process, socket=None):
+        try:
+            return holder_where(process, socket)
+        except KeyError:
+            return "refused"
+
+    wheres = {
+        "a seated holder is said in its pane": holder_where({"placement": seated}) == " in pane %4 on sock-p",
+        "an outside holder is said outside the socket":
+            holder_where({"placement": outside}, "sock-q") == " outside sock-q",
+        "or not at all without a socket": holder_where({"placement": outside}) == "",
+        "an unknown holder is said with the reason, not outside the socket":
+            holder_where({"placement": unknown}, "sock-q")
+            == " (placement unknown: the tmux panes were not read)",
+        "a record without a placement raises KeyError rather than being said outside the socket":
+            where_of({"pid": PID_CEILING + 830002}, "sock-q") == "refused",
+    }
+    wrong = sorted(name for name, ok in wheres.items() if not ok)
+    check("holder-where-says-an-unknown-placement",
+          "the question that ends a holder says where it sits, and an unknown placement with "
+          "the reason, not outside the socket; a record without a placement raises KeyError",
+          not wrong, "; ".join(wrong))
+
+    def record(pid, placement, agent="choice@placing", team="placing"):
+        return ProcessFact(types.MappingProxyType({
+            "pid": pid, "proc_start": "1", "agent_id": agent, "team": team,
+            "ours": False, "placement": placement}))
+
+    first, second, third = (record(PID_CEILING + 830011, unknown),
+                            record(PID_CEILING + 830012, outside),
+                            record(PID_CEILING + 830013, seated))
+    found = Resolver._seated_socket((first, second, third))
+    not_found = Resolver._seated_socket((first, second))
+    eng = corpus_engine()
+    launch = {
+        "process": {
+            "crew": CrewPlacement((), types.MappingProxyType({}), False, None, None, (first,)),
+            "runtime": {"external": (second, record(PID_CEILING + 830014, unknown))},
+            "lead": {"pid": None, "alive": False, "how": None}, "diagnosis": None,
+        },
+        "identity": {"teamName": "placing"},
+        "route": {"to_team": None, "stale_team_warned": False},
+        "settings": {},
+    }
+    with _FakeTmux().installed(eng):
+        destination = eng._with_launch_destination(launch)
+    launch_said = " ".join(destination["destination_warnings"])
+    crew = "session-corpus-crew"
+    crew_rows = [(PID_CEILING + 830021, 0, (FAKE_AGENT_BIN, "--agent-id", f"petrel@{crew}"))]
+    team_warnings = {}
+    for case, needs in (("unread", unread), ("read", None)):
+        team_eng = corpus_engine(needs)
+        team_eng._process_table = lambda refresh=False: crew_rows
+        try:
+            team_warnings[case] = " ".join(team_eng.team_run_plan(
+                crew, crew_rows, census=team_eng._roster_census())["warnings"])
+        except BaseException as exc:  # a plan that raises is a failed one
+            team_warnings[case] = f"raised {type(exc).__name__}: {exc}"
+    choices = {
+        "a seated process names the socket, after the ones it skipped":
+            found == ("sock-p", f"live pane %4 of pid {PID_CEILING + 830013}", ()),
+        "without one, the unknown process is named and the outside one is not":
+            not_found == (None, None, (first,)),
+        "a launch says what its socket is chosen without, the crew's and its own":
+            f"the socket is chosen without pid {PID_CEILING + 830011} (placement unknown: "
+            f"the tmux panes were not read), pid {PID_CEILING + 830014} (placement unknown: "
+            "the tmux panes were not read)" in launch_said,
+        "a team run with its panes unread says what it chose its socket without":
+            f"the socket is chosen without pid {PID_CEILING + 830021} (placement unknown: the "
+            "tmux panes were not read)" in team_warnings["unread"],
+        "one with its panes read does not": "chosen without" not in team_warnings["read"],
+    }
+    wrong = sorted(name for name, ok in choices.items() if not ok)
+    check("socket-choice-says-an-unknown-placement",
+          "a socket choice skips a process with an unknown placement and says what it chose "
+          "without, in a launch and in a team run",
+          not wrong, "; ".join(wrong + ([f"launch said {launch_said!r}, team said "
+                                         f"{team_warnings}"] if wrong else [])))
+
+    def crew_placement(records):
+        crew_eng = Resolver(needs=Needs(maybe=set(NEED)))
+        crew_eng._runtime = lambda table=None: {"live_sessions": records}
+        return crew_eng._crew_placement("placing", [])
+
+    mixed = crew_placement([third, first])
+    only_unknown = crew_placement([first])
+    crews = {
+        "a seated crew process chooses the destination":
+            mixed.destination == LaunchDestination("sock-p"),
+        "the crew process with an unknown placement is named": mixed.unplaced == (first,),
+        "a crew of unknown placement does not choose one":
+            only_unknown.destination is None and only_unknown.unplaced == (first,),
+        "and does not hold a seat": only_unknown.seats == (),
+    }
+    wrong = sorted(name for name, ok in crews.items() if not ok)
+    check("crew-placement-names-an-unknown-placement",
+          "the crew placement names the crew processes with an unknown placement and does not "
+          "choose a destination from them",
+          not wrong, "; ".join(wrong))
+
+    kept = arrived_placement((first,), "%7")
+    arrivals = {
+        "a seated member is registered in its pane":
+            arrived_placement((third,), "%7") == ("sock-p", "%4", ""),
+        "an outside one without a pane": arrived_placement((second,), "%7") == (None, None, ""),
+        "an unknown one keeps the pane the roster records": kept[:2] == (None, "%7"),
+        "and says why":
+            kept[2] == (f"the roster keeps the pane it records: pid {PID_CEILING + 830011} "
+                        "(placement unknown: the tmux panes were not read)"),
+    }
+    wrong = sorted(name for name, ok in arrivals.items() if not ok)
+    check("arrived-noop-keeps-the-recorded-pane",
+          "a member that already runs where its lead reads keeps the pane the roster records when "
+          "its placement is unknown, and says why",
+          not wrong, "; ".join(wrong + ([f"kept {kept}"] if wrong else [])))
+
+    base = {"pid": PID_CEILING + 830031, "ppid": 1, "proc_start": "1", "argv": ("x",),
+            "agent_id": "print@t", "session": None, "team": "t"}
+
+    def fingerprints(placement):
+        fact = {**base, "placement": placement}
+        return (Resolver._runtime_generation({"records": (fact,)}, agent_ids=("print@t",)),
+                Resolver._process_fact_signature(fact))
+
+    other_pane = ProcessPlacement("seated", Seat("sock-p", "%5"))
+    prints = {
+        "an unknown placement is not an outside one":
+            fingerprints(unknown)[0] != fingerprints(outside)[0]
+            and fingerprints(unknown)[1] != fingerprints(outside)[1],
+        "one pane is not another": fingerprints(seated) != fingerprints(other_pane),
+        "the same placement gives the same fingerprints":
+            fingerprints(unknown) == fingerprints(
+                ProcessPlacement("unknown", reason="the tmux panes were not read")),
+    }
+    wrong = sorted(name for name, ok in prints.items() if not ok)
+    check("runtime-fingerprint-carries-the-placement",
+          "the runtime generation and the process signature tell an unknown placement from an "
+          "outside one and one pane from another",
+          not wrong, "; ".join(wrong))
     return checked
 
 
@@ -44411,7 +45002,10 @@ def _check_degraded_states_named_and_remedied(s):
 
 
 @unit(('unseated-member-said-not-judged', 'a live member that is not in any pane is said in the '
-                                          'block and does not change the verdict'))
+                                          'block and does not change the verdict'),
+      ('unplaced-member-not-told-to-stop',
+       'a live member with an unknown placement is named apart, is not told to stop, and '
+       'does not change the verdict'))
 def _check_unseated_member_said_not_judged(s):
     checked = []
 
@@ -44424,24 +45018,32 @@ def _check_unseated_member_said_not_judged(s):
     lead_row = s.lead_row
 
     real_resolver = globals()["RESOLVER"]
-    globals()["RESOLVER"] = eng = corpus_engine()
-    eng._session_registry = lambda: []
-    eng._operating_team = lambda pid, snapshot, census=None: fixture_operating(
-        pid, crew, argv_team=(snapshot["by_pid"].get(pid) or {}).get("team"))
     crew_rows = [lead_row, _launched_row(PID_CEILING + 771002, "petrel"), _launched_row(PID_CEILING + 771004, "sparrow")]
-    eng._process_table = lambda refresh=False: crew_rows
+
+    def crew_engine(needs=None):
+        eng = corpus_engine(needs)
+        eng._session_registry = lambda: []
+        eng._operating_team = lambda pid, snapshot, census=None: fixture_operating(
+            pid, crew, argv_team=(snapshot["by_pid"].get(pid) or {}).get("team"))
+        eng._process_table = lambda refresh=False: crew_rows
+        return eng
+
+    eng = crew_engine()
     blocks = {}
     try:
-        for case, seat in (
+        for case, seat, engine in (
                 ("seated", lambda table: {
-                    pid: Seat("sock-one", "%1") for pid, _ppid, _args in table}),
+                    pid: Seat("sock-one", "%1") for pid, _ppid, _args in table}, eng),
                 ("unseated", lambda table: {
                     pid: Seat("sock-one", "%1") for pid, _ppid, _args in table
-                    if pid == PID_CEILING + 771002})):
-            eng._seat_index = seat
-            eng._runtime_table = eng._runtime_snapshot = None
+                    if pid == PID_CEILING + 771002}, eng),
+                ("unknown", None, crew_engine(Needs(maybe=set(NEED) - {NEED.SEATS})))):
+            globals()["RESOLVER"] = engine
+            if seat is not None:
+                engine._seat_index = seat
+            engine._runtime_table = engine._runtime_snapshot = None
             try:
-                state = eng._team_diagnosis(crew, table=crew_rows)
+                state = engine._team_diagnosis(crew, table=crew_rows)
                 with capturing("err"):
                     blocks[case] = diagnose_team(state)
             except BaseException as exc:  # a diagnosis that crashes is a failed one
@@ -44468,12 +45070,30 @@ def _check_unseated_member_said_not_judged(s):
           "not change the verdict",
           not wrong, ", ".join(wrong) or f"{blocks['seated'][0]} either way")
 
+    unknown_lines = blocks["unknown"][1]
+    noted = [ln for ln in unknown_lines if "unknown placement" in ln]
+    unknown_facts = {
+        "the members with an unknown placement are named":
+            bool(noted) and "petrel" in noted[0] and "sparrow" in noted[0],
+        "they are not told they are outside a pane, or to stop":
+            not [ln for ln in unknown_lines if "not in any tmux pane" in ln],
+        "the verdict is the seated crew's": blocks["unknown"][0] == blocks["seated"][0],
+    }
+    wrong = sorted(k for k, ok in unknown_facts.items() if not ok)
+    check("unplaced-member-not-told-to-stop",
+          "a live member with an unknown placement is named apart, is not told to stop, and "
+          "does not change the verdict",
+          not wrong, "; ".join(wrong + ([f"said {unknown_lines}"] if wrong else [])))
+
     s.eng = eng
     return checked
 
 
 @unit(('doctor-agent-says-the-seat',
-       "the agent dossier says where the member's own process sits"))
+       "the agent dossier says where the member's own process sits"),
+      ('doctor-agent-says-an-unknown-placement',
+       'the agent dossier says that the placement of a process is unknown, with the reason, '
+       'where the panes were not read'))
 def _check_doctor_agent_says_the_seat(s):
     checked = []
 
@@ -44483,34 +45103,44 @@ def _check_doctor_agent_says_the_seat(s):
     corpus_engine = s.corpus_engine
     crew = s.crew
 
-    real_resolver = globals()["RESOLVER"]
-    globals()["RESOLVER"] = eng = corpus_engine()
-    eng._session_registry = lambda: []
-    eng._process_table = lambda refresh=False: [
-        (PID_CEILING + 771005, 0,
-         (FAKE_AGENT_BIN, "--resume", "22222222-2222-4222-8222-222222222222",
-          "--agent-id", f"petrel@{crew}"))]
-    dossier = io.StringIO()
-    try:
-        table = eng._process_table()
-        agent_id = f"petrel@{crew}"
-        state = eng._team_diagnosis(
-            crew, requested=agent_id, deep=True, table=table)
-        with capturing("err"), \
-                capturing("out", into=dossier):
-            run_agent_dossier(state["by_agent"][agent_id])
-    except BaseException as exc:  # a dossier that crashes is a failed one
-        dossier.write(f"seat     dossier raised {type(exc).__name__}\n")
-    finally:
-        globals()["RESOLVER"] = real_resolver
-    seat_row = next((ln for ln in dossier.getvalue().splitlines()
+    def seat_row(needs=None):
+        """The dossier's seat row for petrel, from an engine declaring needs."""
+        real_resolver = globals()["RESOLVER"]
+        globals()["RESOLVER"] = eng = corpus_engine(needs)
+        eng._session_registry = lambda: []
+        eng._process_table = lambda refresh=False: [
+            (PID_CEILING + 771005, 0,
+             (FAKE_AGENT_BIN, "--resume", "22222222-2222-4222-8222-222222222222",
+              "--agent-id", f"petrel@{crew}"))]
+        dossier = io.StringIO()
+        try:
+            table = eng._process_table()
+            agent_id = f"petrel@{crew}"
+            state = eng._team_diagnosis(
+                crew, requested=agent_id, deep=True, table=table)
+            with capturing("err"), \
+                    capturing("out", into=dossier):
+                run_agent_dossier(state["by_agent"][agent_id])
+        except BaseException as exc:  # a dossier that crashes is a failed one
+            dossier.write(f"seat     dossier raised {type(exc).__name__}\n")
+        finally:
+            globals()["RESOLVER"] = real_resolver
+        s.eng = eng
+        return next((ln for ln in dossier.getvalue().splitlines()
                      if ln.startswith("seat ")), "")
+
+    read = seat_row()
     check("doctor-agent-says-the-seat",
           "the agent dossier says where the member's own process sits",
-          "outside tmux" in seat_row and f"pid {PID_CEILING + 771005}" in seat_row,
-          f"said {seat_row!r}")
-
-    s.eng = eng
+          "outside tmux" in read and f"pid {PID_CEILING + 771005}" in read,
+          f"said {read!r}")
+    unread = seat_row(Needs(maybe=set(NEED) - {NEED.SEATS}))
+    check("doctor-agent-says-an-unknown-placement",
+          "the agent dossier says that the placement of a process is unknown, with the reason, "
+          "where the panes were not read",
+          "placement unknown: the tmux panes were not read" in unread
+          and f"pid {PID_CEILING + 771005}" in unread and "outside" not in unread,
+          f"said {unread!r}")
     return checked
 
 
@@ -50474,9 +51104,10 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, batch=N
         # mode tmux gives it, so the leak check can list it before any socket
         # question is asked. Both variables are put back exactly, including
         # having been unset.
-        sockets = owned_directory("s", parent=was_base)
+        handed = handed_socket_root()
+        sockets = owned_directory("s", parent=handed)
         os.environ["TMUX_TMPDIR"] = str(sockets)
-        if was_base is None:
+        if handed is None:
             os.environ[SOCKET_BASE_VAR] = str(sockets)
         run_socket_dir().mkdir(mode=0o700)
 
