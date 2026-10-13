@@ -232,8 +232,30 @@ DEFAULT_AGENT_TYPE = "claude"
 # performed. Spelled once.
 SYNCED_FIELDS = ("color", "model", "agentType")
 
-# Window read from each end of a transcript when indexing stamps.
+# Window read from each end of a transcript when indexing stamps. It decides
+# which transcripts _stamp_index calls stamped: apart from a promoted
+# transcript with a copied prefix, which it scans whole, a transcript is in the
+# index only when a line reaching into its first or last INDEX_CHUNK bytes
+# carries a stamp, so changing the value changes the index's answers.
 INDEX_CHUNK = 8 * 1024
+
+# Bytes _lines_backward takes per read. The reader reads and splits each byte
+# once at any block size, so this sets how many reads a backward scan makes
+# and does not change which lines it yields.
+SCAN_BLOCK = 256 * 1024
+
+# The literal searches read transcript files and leave out the sidechain
+# transcripts under subagents/ directories, which are never evidence
+# candidates. _searcher passes both rules to ripgrep and grep, and
+# _search_scope applies them when a search does not complete.
+SEARCH_SUFFIX = ".jsonl"
+SEARCH_SKIPPED_DIR = "subagents"
+
+# Bytes the file arguments of one literal search may take, counting each path
+# with its terminating NUL and its argv pointer. Linux refuses to start a
+# program with more argument and environment bytes than ARG_MAX, 2 MiB with
+# the default 8 MiB stack, so a longer file list is searched in runs.
+SEARCH_ARGV_BUDGET = 128 * 1024
 
 
 NEWLINE_TEXT = {"none": "", "lf": "\n", "crlf": "\r\n"}
@@ -276,6 +298,183 @@ def _jsonl_text(lines, newline):
     if not separator and len(lines) > 1:
         raise ValueError("multiple JSONL records need a line separator")
     return separator.join(lines) + NEWLINE_TEXT[newline["final"]]
+
+
+def _last_record_at(raws, record_type, field):
+    """(payload, one-based line) for the last admissible record, or (None, None).
+
+    A record is admissible when its line parses as a JSON object with this
+    `type` at the top level and its `field` is an object. Text that only
+    mentions the record type, in a message or nested in another record, is
+    not a record of the type. The Resolver's record census and the
+    TranscriptRewriter's conversion and restamp plans select the current
+    record of a type by this one rule.
+    """
+    for index in range(len(raws) - 1, -1, -1):
+        try:
+            rec = json.loads(raws[index])
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != record_type:
+            continue
+        payload = rec.get(field)
+        if isinstance(payload, dict):
+            return payload, index + 1
+    return None, None
+
+
+def _record_type_literal(record_type):
+    """The text a compactly written record of this type holds at its top level.
+
+    The record census searches for it, and a check holds each record writer
+    against it.
+    """
+    return f'"type":"{record_type}"'
+
+
+def _receipt_objection(receipt):
+    """Return why a conversion receipt is not the current complete schema."""
+    if not isinstance(receipt, dict):
+        return "the conversion receipt is not an object"
+    missing = sorted(RECEIPT_REQUIRED - set(receipt))
+    if missing:
+        return "the conversion receipt is missing " + ", ".join(missing)
+    unknown = sorted(set(receipt) - set(RECEIPT_KEYS))
+    if unknown:
+        return "the conversion receipt has unknown fields " + ", ".join(unknown)
+    null_optional = sorted(field for field in set(receipt) - RECEIPT_REQUIRED
+                           if receipt[field] is None)
+    if null_optional:
+        return ("the conversion receipt must omit empty optional fields "
+                + ", ".join(null_optional))
+    if type(receipt["schema_version"]) is not int:
+        return "the conversion receipt has invalid schema_version value"
+    if receipt["schema_version"] != 1:
+        return (f"unsupported conversion receipt schema_version "
+                f"{receipt['schema_version']!r}; expected 1")
+    for field in ("dest_stem", "parent", "task_id"):
+        if not isinstance(receipt[field], str) or not receipt[field]:
+            return f"the conversion receipt has invalid {field} value"
+    if (receipt["root"] is not None
+            and (not isinstance(receipt["root"], str) or not receipt["root"])):
+        return "the conversion receipt has invalid root value"
+    if receipt["direction"] == "promote" and not receipt["root"]:
+        return "a promotion receipt does not have a root"
+    if (not isinstance(receipt["direction"], str)
+            or receipt["direction"] not in ("promote", "demote")):
+        return f"the conversion receipt has invalid direction {receipt['direction']!r}"
+    if (not isinstance(receipt["grammar"], str)
+            or receipt["grammar"] not in SIDE_GRAMMARS):
+        return (f"unsupported conversion grammar {receipt['grammar']!r}; expected "
+                f"{SIDE_GRAMMAR_OPTIONS}")
+    fork_fields = (receipt.get("graft"), receipt.get("ref"),
+                   receipt.get("prefix_uuids"))
+    if receipt["grammar"] == SIDE_GRAMMAR_FORK_REFERENCE:
+        if (not all(fork_fields[:2]) or not isinstance(fork_fields[2], list)
+                or not fork_fields[2]):
+            return "a fork-reference receipt is missing its copied-prefix fields"
+    elif any(value is not None for value in fork_fields):
+        return "a regular receipt carries fork-reference fields"
+    if not isinstance(receipt["unwrapped"], bool):
+        return "the conversion receipt has invalid unwrapped value"
+    edits = receipt["visible_human_wrapper_edits"]
+    if not isinstance(edits, dict) or set(edits) != {"original_payloads", "intervals"}:
+        return "the conversion receipt has invalid visible_human_wrapper_edits value"
+    payloads, intervals = edits["original_payloads"], edits["intervals"]
+    if (not isinstance(payloads, list)
+            or not all(isinstance(item, list) and len(item) == 2
+                       and isinstance(item[0], str)
+                       and item[0] in HUMAN_MESSAGE_WRAPPERS
+                       and isinstance(item[1], str) for item in payloads)):
+        return "the conversion receipt has invalid original_payloads value"
+    if (not isinstance(intervals, list)
+            or not all(isinstance(item, list) and len(item) == 3
+                       and isinstance(item[0], str) and item[0]
+                       and isinstance(item[1], str) and item[1]
+                       and isinstance(item[2], list)
+                       and all(type(ref) is int and 0 <= ref < len(payloads)
+                               for ref in item[2]) for item in intervals)):
+        return "the conversion receipt has invalid wrapper edit intervals value"
+    refs = [ref for _first, _last, interval_refs in intervals
+            for ref in interval_refs]
+    if not receipt["unwrapped"] and (payloads or refs):
+        return "a wrapped conversion receipt carries unneeded original payloads"
+    if receipt["unwrapped"] and (
+            any(not interval_refs for _first, _last, interval_refs in intervals)
+            or len(refs) != len(set(refs))
+            or set(refs) != set(range(len(payloads)))):
+        return "an unwrapped conversion receipt has inconsistent payload references"
+    if not _valid_newline(receipt["source_newline"]):
+        return "the conversion receipt has invalid source_newline metadata"
+    if bool(receipt.get("name")) != bool(receipt.get("team")):
+        return "the conversion receipt must carry both name and team, or leave both out"
+    for field in ("name", "team"):
+        if field in receipt and (not isinstance(receipt[field], str)
+                                 or not receipt[field]):
+            return f"the conversion receipt has invalid {field} value"
+    for field in ("graft", "previous_record", "ref"):
+        if (field in receipt
+                and (not isinstance(receipt[field], str) or not receipt[field])):
+            return f"the conversion receipt has invalid {field} value"
+    if ("side_meta_b64" in receipt) != ("side_meta_mode" in receipt):
+        return "the conversion receipt must pair side_meta_b64 and side_meta_mode"
+    if "side_meta_b64" in receipt:
+        encoded = receipt["side_meta_b64"]
+        mode = receipt["side_meta_mode"]
+        if not isinstance(encoded, str):
+            return "the conversion receipt has invalid side_meta_b64 value"
+        if type(mode) is not int or not 0 <= mode <= 0o777:
+            return "the conversion receipt has invalid side_meta_mode value"
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return "the conversion receipt has invalid side_meta_b64 value"
+        if base64.b64encode(decoded).decode("ascii") != encoded:
+            return "the conversion receipt has non-canonical side_meta_b64 value"
+    for field in ("inserted_sidechain", "prefix_uuids"):
+        value = receipt.get(field)
+        if value is not None and (not isinstance(value, list) or not value
+                                  or not all(isinstance(item, str) and item
+                                             for item in value)
+                                  or len(value) != len(set(value))):
+            return f"the conversion receipt has invalid {field} value"
+    if bool(receipt.get("previous_record") is not None) != bool(
+            receipt.get("previous_position") is not None):
+        return "the conversion receipt must pair previous_record and previous_position"
+    if (receipt.get("previous_position") is not None
+            and (type(receipt["previous_position"]) is not int
+                 or receipt["previous_position"] < 0)):
+        return "the conversion receipt has invalid previous_position value"
+    stripped = receipt.get("stripped")
+    if stripped is not None and (not isinstance(stripped, list) or not stripped
+                                 or not all(isinstance(item, list) and len(item) == 2
+                                            and type(item[0]) is int and item[0] >= 0
+                                            and isinstance(item[1], str) and item[1]
+                                            for item in stripped)):
+        return "the conversion receipt has invalid stripped value"
+    root_stamps = receipt.get("root_stamps")
+    member_identity = bool(receipt.get("name") and receipt.get("team")
+                           and receipt.get("name") != "team-lead")
+    if member_identity and root_stamps is None:
+        return "a member conversion receipt must carry root_stamps"
+    if not member_identity and root_stamps is not None:
+        return "a non-member conversion receipt must not carry root_stamps"
+    if root_stamps is not None and not (
+            isinstance(root_stamps, dict)
+            and set(root_stamps) == {"agentName", "teamName"}
+            and all(isinstance(root_stamps[field], list)
+                    and len(root_stamps[field]) == 2
+                    and isinstance(root_stamps[field][0], bool)
+                    and (root_stamps[field][0]
+                         or root_stamps[field][1] is None)
+                    for field in ("agentName", "teamName"))):
+        return "the conversion receipt has invalid root_stamps"
+    return None
+
+
+def _valid_receipt(receipt):
+    """This conversion receipt when it is the current complete schema, else None."""
+    return receipt if receipt and not _receipt_objection(receipt) else None
 
 
 def _prompt_text(rec):
@@ -470,6 +669,55 @@ def _complete_head_window(handle, size, span):
     if len(chunk) < size and not chunk.endswith(b"\n"):
         chunk += handle.readline()
     return chunk
+
+
+def _lines_backward(handle, size):
+    """Yield the newline-separated pieces of the first `size` bytes, last first.
+
+    The pieces are the ones `data.split(b"\\n")` returns, in reverse order, so
+    a file that ends with a newline yields an empty piece first. Reads
+    SCAN_BLOCK bytes at a time from the end and splits only the block it just
+    read. A line longer than a block is kept as a list of fragments and
+    joined once when its start is read, so each byte is read, split and
+    copied once whatever the line lengths. Raises OSError when the file holds
+    fewer than `size` bytes at a read, which happens when it shrinks during
+    the scan.
+    """
+    pending, at = [], size
+    while at:
+        take = min(SCAN_BLOCK, at)
+        at -= take
+        handle.seek(at)
+        block = handle.read(take)
+        if len(block) != take:
+            raise OSError(f"the file shrank below {at + take} bytes during a backward read")
+        parts = block.split(b"\n")
+        pending.append(parts[-1])
+        if len(parts) == 1:
+            continue
+        yield b"".join(reversed(pending))
+        yield from reversed(parts[1:-1])
+        pending = [parts[0]]
+    yield b"".join(reversed(pending))
+
+
+def _argv_batches(paths, budget):
+    """Split `paths` into consecutive runs that fit in `budget` argv bytes.
+
+    A path counts its encoded bytes, its terminating NUL and its 8-byte argv
+    pointer, as the kernel counts arguments. A path larger than the budget
+    forms a run of its own.
+    """
+    batch, used = [], 0
+    for path in paths:
+        size = len(os.fsencode(path)) + 9
+        if batch and used + size > budget:
+            yield batch
+            batch, used = [], 0
+        batch.append(path)
+        used += size
+    if batch:
+        yield batch
 
 
 def _stamps_in(chunk):
@@ -1634,7 +1882,7 @@ class NEED(enum.Enum):
     SIDES = "side transcript classification"
     MAIL = "the send-vs-delivery mail join"
     TITLES = "transcript titles"
-    CONVERSION_CENSUS = "the promoted-member conversion receipt corpus"
+    CONVERSION_CENSUS = "the conversion receipt and restamp record corpus"
     PLACEMENT = "launch team placement"
 
 
@@ -1828,9 +2076,12 @@ class Resolver:
     # The descriptor registry also supplies cache ownership and invalidation.
     _procs = Cache({"process"})
     _stamps = Cache({"transcript"})
-    _carried = Cache({"transcript"})
-    _carried_scope = Cache({"transcript"})
-    _receipts = Cache({"transcript"}, dict)
+    # One census answer per record type, current until the next transcript
+    # refresh. The per-file results it was built from stay across refreshes,
+    # each with the file generation it was read at, so a later census reads
+    # only files that changed.
+    _census = Cache({"transcript"}, dict)
+    _record_reads = Cache(set(), dict)
     _spawns = Cache({"transcript"}, dict)
     _spawn_log = Cache({"transcript"}, dict)
     _by_agent = Cache({"transcript"})
@@ -1840,6 +2091,9 @@ class Resolver:
     _runtime_table = Cache({"process", "transcript"})
     _runtime_snapshot = Cache({"process", "transcript"})
     _team_assignments = Cache({"transcript"})
+    # Each transcript's assignment record with the inputs it was built from,
+    # kept across refreshes so an unchanged transcript keeps its record object.
+    _assignment_rows = Cache(set(), dict)
     _team_member_answers = Cache({"process", "transcript"}, dict)
     _team_descriptions = Cache({"process", "transcript"}, dict)
     _registry = Cache({"process"})
@@ -1909,13 +2163,76 @@ class Resolver:
         """Discard discovery evidence after this command attempts transcript changes."""
         self._invalidate("transcript")
 
-    def _grep_files(self, needle, scope, recursive):
-        """Files containing this literal."""
-        result = self._search("files", needle, scope, recursive)
-        if result.returncode > 1:
-            warn(f"search failed ({result.stderr.strip() or 'unknown'}); falling back to a full scan")
-            return None
-        return [Path(p) for p in result.stdout.splitlines() if p]
+    def _literal_search(self, kind, needle, scope, recursive):
+        """A literal search's answer, or its whole scope where the search did not complete.
+
+        kind "files" answers the files that contain `needle`, and kind "lines"
+        answers (file, line) for each line that contains it. The scope is
+        searched in runs that fit SEARCH_ARGV_BUDGET. A search completes when
+        it exits with 0, after finding the literal, or with 1, after not
+        finding it. When it cannot start, exits with another code, such as 2
+        after a file it could not read, or is ended by a signal, the output it
+        printed can be incomplete, so the answer covers the whole scope of
+        that run instead: each file in it for "files", and for "lines" each
+        line holding `needle` in each file, read here. A warning names the
+        search that did not complete. The Resolver runs each literal search
+        through this method, so a reader does not take an incomplete search
+        as an empty one.
+        """
+        found = []
+        for batch in _argv_batches(scope, SEARCH_ARGV_BUDGET):
+            try:
+                result = self._search(kind, needle, batch, recursive)
+            except OSError as err:
+                failure = f"it could not start: {err}"
+            else:
+                if result.returncode in (0, 1):
+                    lines = [line for line in result.stdout.split("\n") if line]
+                    if kind == "files":
+                        found.extend(Path(line) for line in lines)
+                    else:
+                        found.extend((Path(where), text) for where, _, text
+                                     in (line.partition(":") for line in lines))
+                    continue
+                failure = (result.stderr.strip()
+                           or (f"ended by signal {-result.returncode}" if result.returncode < 0
+                               else f"exit status {result.returncode}"))
+            files = self._search_scope(batch, recursive)
+            warn(f"the search for {needle} did not complete ({failure}); reading the "
+                 f"{len(files)} files it covers instead")
+            if kind == "files":
+                found.extend(files)
+                continue
+            marker = needle.encode()
+            for path in files:
+                try:
+                    with open(path, "rb") as handle:
+                        found.extend((path, raw.rstrip(b"\n").decode("utf-8", "replace"))
+                                     for raw in handle if marker in raw)
+                except OSError:
+                    continue
+        return found
+
+    @staticmethod
+    def _search_scope(scope, recursive):
+        """The files a literal search over `scope` covers.
+
+        A recursive search covers the SEARCH_SUFFIX files under each directory
+        in the scope, outside SEARCH_SKIPPED_DIR directories, as _searcher tells
+        ripgrep and grep; any other entry is a file it covers as given.
+        ripgrep also leaves out hidden files and directories, and grep and this
+        method do not.
+        """
+        files = []
+        for entry in map(Path, scope):
+            if not (recursive and entry.is_dir()):
+                files.append(entry)
+                continue
+            for root, dirs, names in os.walk(entry):
+                dirs[:] = sorted(name for name in dirs if name != SEARCH_SKIPPED_DIR)
+                files.extend(Path(root) / name for name in sorted(names)
+                             if name.endswith(SEARCH_SUFFIX))
+        return files
 
     def _search(self, kind, needle, paths, recursive):
         """Run a literal search with command-owned options.
@@ -1932,17 +2249,15 @@ class Resolver:
     def _searcher(self, kind, needle, paths, recursive):
         """Build literal-search argv, preferring ripgrep for parallel traversal."""
         files = [str(p) for p in paths]
-        # subagents/ holds sidechain transcripts, which are never evidence
-        # candidates, so a recursive sweep does not descend into them.
         if shutil.which("rg"):
             argv = ["rg", "--no-ignore", "-F", needle]
             argv += ["-l"] if kind == "files" else ["-N", "-H"]
             if recursive:
-                argv += ["--glob", "*.jsonl", "--glob", "!**/subagents/**"]
+                argv += ["--glob", f"*{SEARCH_SUFFIX}", "--glob", f"!**/{SEARCH_SKIPPED_DIR}/**"]
             return argv + files
         argv = ["grep", "-F", needle, "-l" if kind == "files" else "-H"]
         if recursive:
-            argv += ["-r", "--include=*.jsonl", "--exclude-dir=subagents"]
+            argv += ["-r", f"--include=*{SEARCH_SUFFIX}", f"--exclude-dir={SEARCH_SKIPPED_DIR}"]
         return argv + files
 
     def _stamped_candidates(self, name, team=None, verify=True):
@@ -1984,11 +2299,9 @@ class Resolver:
             # The index can both miss (stamps only mid-history) and mislead (a stamp
             # quoted inside message content). Either way the answer is not yet "no",
             # so re-ask over whole files before saying so.
-            deep = self._grep_files('"agentName"', [self._projects_dir], True)
-            if deep is None:  # grep unavailable
-                deep = self._transcripts_by_mtime()
-            elif team and deep:
-                deep = self._grep_files('"teamName"', deep, False) or []
+            deep = self._literal_search("files", '"agentName"', [self._projects_dir], True)
+            if team and deep:
+                deep = self._literal_search("files", '"teamName"', deep, False)
             seen = set(files)
             found = confirm(p for p in deep if p not in seen)
         return found
@@ -2007,13 +2320,8 @@ class Resolver:
             self._spawns[path.stem], self._spawn_log[path.stem] = {}, []
         if not paths:
             return
-        result = self._search("lines", SPAWN_MARKER, paths, False)
-        if result.returncode > 1:
-            warn(f"search failed reading spawn records ({result.stderr.strip() or 'unknown'})")
-            return
-        for line in result.stdout.splitlines():
-            where, _, text = line.partition(":")
-            stem = Path(where).stem
+        for where, text in self._literal_search("lines", SPAWN_MARKER, paths, False):
+            stem = where.stem
             if stem not in self._spawns:
                 continue
             try:
@@ -2023,7 +2331,7 @@ class Resolver:
             # A sidechain line belongs to a subagent. A materialized promotion
             # prefix belongs to the parent conversation. Both remain context,
             # but they are not actions authored by this transcript.
-            if record.get("isSidechain") or not self._authored_here(Path(where), record):
+            if record.get("isSidechain") or not self._authored_here(where, record):
                 continue
             payload = _spawn_event(record)
             if payload is None:
@@ -2305,7 +2613,7 @@ class Resolver:
         if self._by_team is not None:
             return self._by_team
         self._by_team = {}
-        leads = self._grep_files(SPAWN_MARKER, [self._projects_dir], True) or []
+        leads = self._literal_search("files", SPAWN_MARKER, [self._projects_dir], True)
         self._ingest_spawn_lines(leads)
         for path in leads:
             newest = {}
@@ -3295,61 +3603,109 @@ class Resolver:
         transcripts use their indexed complete identity pair. File generations are
         retained opaquely; callers never index into the tuples, which differ in
         layout.
+
+        The index covers the transcripts in the stamp index, the receipt
+        census and the restamp census, so a transcript is in it when only its
+        restamp record assigns it, without a stamp near either end or a
+        receipt. A transcript with the same generation, stamp pair, receipt
+        object and restamp object as when the previous index was built keeps
+        its record object.
         """
         if self._team_assignments is not None:
             return self._team_assignments
         stamps = self._stamp_index()
         carried = self._carried_receipts()
+        restamped = self._record_census(RESTAMP_RECORD, self._restamp_in_file)["records"]
+        rows = self._assignment_rows
+        paths = sorted(set(stamps) | set(carried) | set(restamped))
+        for gone in set(rows) - set(paths):
+            del rows[gone]
         records = []
-        for path in sorted(set(stamps) | set(carried)):
-            restamp = self._rewriter._last_record_in_file(
-                path, RESTAMP_RECORD, "restamp")
-            moved = (restamp or {}).get("new") or {}
-            receipt = carried.get(path) or {}
-            stamped_name, stamped_team = stamps.get(path) or (None, None)
-            if moved.get("agentName") and moved.get("teamName"):
-                name, assigned_team = moved["agentName"], moved["teamName"]
-                source = "restamp receipt"
-            elif receipt.get("name") and receipt.get("team"):
-                name, assigned_team = receipt["name"], receipt["team"]
-                source = "conversion receipt"
-            else:
-                name, assigned_team = stamped_name, stamped_team
-                source = "transcript identity"
-            if not (name and assigned_team):
-                continue
-            records.append(types.MappingProxyType({
-                "agent_id": agent_id_of(name, assigned_team),
-                "name": name,
-                "team": assigned_team,
-                "path": path,
-                "source": source,
-                "generation": self._path_generation(path),
-            }))
+        for path in paths:
+            inputs = (self._path_generation(path), stamps.get(path),
+                      self._receipt_carried_by(path), self._restamp_carried_by(path))
+            held = rows.get(path)
+            if held is None or not (held[0][:2] == inputs[:2] and held[0][2] is inputs[2]
+                                    and held[0][3] is inputs[3]):
+                held = rows[path] = (inputs, self._assignment_record(path, *inputs))
+            if held[1] is not None:
+                records.append(held[1])
         by_agent, by_name, by_team = defaultdict(list), defaultdict(list), defaultdict(list)
+        by_moved_from = defaultdict(list)
         for record in records:
             by_agent[record["agent_id"]].append(record)
             by_name[record["name"]].append(record)
             by_team[record["team"]].append(record)
+            if record["moved_from"]:
+                by_moved_from[record["moved_from"]].append(record)
         self._team_assignments = types.MappingProxyType({
             "records": tuple(records),
             "by_agent": immutable(dict(by_agent)),
             "by_name": immutable(dict(by_name)),
             "by_team": immutable(dict(by_team)),
+            "by_moved_from": immutable(dict(by_moved_from)),
             "generation": tuple(
                 (record["path"], record["generation"], record["agent_id"])
                 for record in records),
         })
         return self._team_assignments
 
+    @staticmethod
+    def _assignment_record(path, generation, stamped, receipt, restamp):
+        """The durable assignment one transcript's evidence selects, or None.
+
+        A restamp counts only when its `new` value names both an agent and a
+        team as nonempty strings. `moved_from` is the agent id its `old` value
+        names, when that is complete too: the identity the restamp moved the
+        conversation away from. A second restamp of one conversation keeps
+        the first `old`, so `moved_from` is where a chain of moves started.
+        """
+        def pair(value):
+            if not isinstance(value, Mapping):
+                return None
+            named = (value.get("agentName"), value.get("teamName"))
+            return named if all(isinstance(part, str) and part for part in named) else None
+
+        moved = pair((restamp or {}).get("new"))
+        origin = pair((restamp or {}).get("old")) if moved else None
+        if moved:
+            (name, assigned_team), source = moved, "restamp receipt"
+        elif receipt and receipt.get("name") and receipt.get("team"):
+            name, assigned_team = receipt["name"], receipt["team"]
+            source = "conversion receipt"
+        else:
+            name, assigned_team = stamped or (None, None)
+            source = "transcript identity"
+        if not (name and assigned_team):
+            return None
+        return types.MappingProxyType({
+            "agent_id": agent_id_of(name, assigned_team),
+            "name": name,
+            "team": assigned_team,
+            "path": path,
+            "source": source,
+            "generation": generation,
+            "moved_from": agent_id_of(*origin) if origin else None,
+        })
+
     def _team_members(self, team, table=None, census=None, enrich=False):
         """Return one immutable current member answer for exact retained inputs.
 
-        The source roster row of a moved member remains historical. When that row
-        is inactive and one durable transcript assignment names another team, it
-        does not enter this team's current order. Activity never chooses between
-        source and destination. Runtime, transcript, title, color, membership, and
-        display activity are selected once and reused by every projection.
+        A roster row is historical when a restamp moved a conversation away from
+        the row's agent id and the durable assignments do not hold that agent id
+        now: the member moved to another team, and the row does not enter this
+        team's current order. isActive, how many teams a name appears in and
+        when either roster was written do not decide it. An assignment in
+        another team for the same name does not decide it either, because a
+        team's lead is always named team-lead and member names repeat across
+        teams.
+
+        A second restamp keeps the first identity as the record's `old`, so in
+        a chain of moves from T through M to D only T's row is historical. M's
+        row stays current until the restamp record keeps each identity the
+        conversation left. Runtime, transcript, title, color, membership, and
+        display activity are selected once, and the projections of this answer
+        reuse them.
         """
         census = (self._roster_census() if census is None else
                   self._retained_census(census))
@@ -3394,11 +3750,8 @@ class Resolver:
                 continue
             agent_id = member.get("agentId") or agent_id_of(name, team)
             exact = assignments["by_agent"].get(agent_id, ())
-            other = tuple(record for record in assignments["by_name"].get(name, ())
-                          if record["team"] != team)
-            historical = (member.get("isActive") is False
-                          and not exact and len({row["agent_id"] for row in other}) == 1)
-            if historical:
+            # A restamp moved this agent id away, and the assignments do not hold it.
+            if assignments["by_moved_from"].get(agent_id) and not exact:
                 continue
             if name not in seeds:
                 roster_order.append(name)
@@ -4226,44 +4579,34 @@ class Resolver:
         or after `since_ms`, or None.
 
         A process stamps every line it writes with the team it operates as, so
-        a stamp written after it started is its own statement of that team. A
-        transcript is only appended to, so it is read backward from the end and
-        the read stops at the first record written before `since_ms`: what a
-        process wrote since it started is all that is read, however long the
-        conversation behind it.
+        a stamp written after it started is its own statement of that team.
+        The transcript is read backward from the end, and the last stamped
+        record in file order with a timestamp at or after `since_ms` decides.
+        File order is not timestamp order: Claude Code appends records with
+        timestamps older than records already in the file, such as the
+        summary and the commands a compaction writes after its boundary
+        record, attachments, and blocks of earlier records. A record written
+        before `since_ms` can therefore follow the process's own stamped
+        lines, so the read continues past it, to the start of the file when it
+        does not find a stamped record written at or after `since_ms`. Only
+        lines that contain "teamName" are parsed.
         """
         try:
-            size = path.stat().st_size
-            handle = path.open("rb")
-        except OSError:
-            return None
-        carry, at = b"", size
-        with handle:
-            while at or carry:
-                if at:
-                    take = min(INDEX_CHUNK, at)
-                    at -= take
-                    handle.seek(at)
-                    lines = (handle.read(take) + carry).split(b"\n")
-                    carry = lines.pop(0) if at else b""
-                else:
-                    lines, carry = [carry], b""
-                for raw in reversed(lines):
-                    if b'"timestamp"' not in raw:
+            with open(path, "rb") as handle:
+                for raw in _lines_backward(handle, os.fstat(handle.fileno()).st_size):
+                    if b'"teamName"' not in raw:
                         continue
                     try:
                         record = json.loads(raw)
                     except ValueError:
                         continue
-                    written_at = (iso_ms(record.get("timestamp"))
-                                  if isinstance(record, dict) else None)
-                    if not written_at:
-                        continue
-                    if written_at < since_ms:
-                        return None
                     stamp = _identity_stamp(record)
-                    if stamp.get("teamName"):
+                    written_at = (iso_ms(record.get("timestamp"))
+                                  if stamp.get("teamName") else None)
+                    if written_at and written_at >= since_ms:
                         return written_at, stamp.get("agentName"), stamp["teamName"]
+        except OSError:
+            return None
         return None
 
     @staticmethod
@@ -7926,7 +8269,7 @@ class Resolver:
         if self._by_agent is not None:
             return self._by_agent
         self._by_agent = {}
-        leads = self._grep_files(SPAWN_MARKER, [self._projects_dir], True) or []
+        leads = self._literal_search("files", SPAWN_MARKER, [self._projects_dir], True)
         self._ingest_spawn_lines(leads)
         for path in leads:
             for _, payload in self._log(path.stem):
@@ -8019,40 +8362,163 @@ class Resolver:
         self._stamps = index
         return self._stamps
 
-    def _carried_receipts(self):
-        """{path: last in-file receipt} for promoted main transcripts.
+    @staticmethod
+    def _last_record_in_file(path, record_type, field):
+        """The payload of the last admissible `record_type` record in one JSONL.
 
-        This is the corpus-wide conversion census. A literal search narrows the
-        main transcript tree first; only matching files are parsed backward to
-        validate the record and select the last receipt. Search failure keeps the
-        old full scan as the correctness fallback, while zero matches means zero.
+        Reads the file backward with _lines_backward and parses only lines
+        that contain the record type's name, so a transcript without the
+        record costs one read of its bytes. _last_record_at says which record
+        is admissible. Returns None when the file does not hold one, and raises
+        OSError when the file cannot be read to the end of its scan.
+        """
+        marker = record_type.encode()
+        with open(path, "rb") as handle:
+            for raw in _lines_backward(handle, os.fstat(handle.fileno()).st_size):
+                if marker in raw:
+                    payload, _line = _last_record_at((raw,), record_type, field)
+                    if payload is not None:
+                        return payload
+        return None
+
+    @classmethod
+    def _receipt_in_file(cls, path):
+        """The last conversion receipt in one JSONL when it is valid, else None.
+
+        A later invalid receipt is the current one, so an earlier valid receipt
+        does not stand in for it. Raises OSError when the file cannot be read.
+        """
+        return _valid_receipt(cls._last_record_in_file(path, RECEIPT_RECORD, "receipt"))
+
+    @classmethod
+    def _restamp_in_file(cls, path):
+        """The payload of the last restamp record in one JSONL, or None.
+
+        Raises OSError when the file cannot be read.
+        """
+        return cls._last_record_in_file(path, RESTAMP_RECORD, "restamp")
+
+    @staticmethod
+    def _terminal_receipt_in_file(path):
+        """The valid conversion receipt on the last line of one JSONL, or None.
+
+        Embedded receipts supply demotion defaults. A receipt on the last line
+        also marks the conversion as immediately reversible. A newline at the
+        end of the file ends the last line rather than starting an empty one.
+        """
+        try:
+            with open(path, "rb") as handle:
+                lines = _lines_backward(handle, os.fstat(handle.fileno()).st_size)
+                last = next(lines)
+                if not last:
+                    last = next(lines, b"")
+        except OSError:
+            return None
+        return _valid_receipt(_last_record_at((last,), RECEIPT_RECORD, "receipt")[0])
+
+    def _record_census(self, record_type, read_one):
+        """The last record of one type in each main transcript, as one answer.
+
+        `read_one(path)` returns the last admissible record of the type in one
+        transcript, or None, and raises OSError when it cannot read the file.
+        The answer is immutable and holds:
+
+        - `records`: each transcript holding such a record, mapped to it;
+        - `scope`: the transcripts the census examined, so a path in scope
+          and not in `records` does not hold such a record;
+        - `unreadable`: the transcripts that could not be read. They are not
+          in scope, because whether they hold a record is unknown.
+
+        A literal search for the compact `"type":"<record type>"` decides
+        which files are read: a file the search does not list does not hold
+        such a record, and it is in scope without being read. When the search
+        does not complete, _literal_search answers each file it was given, so
+        the census reads each file it examines.
+
+        Callers share one answer until refresh_transcript_evidence discards
+        it, so asking about a known absence again does not read the file. Each
+        file's result is kept with the file's generation, and the next census
+        reads and searches only the files that are new, changed or unreadable
+        before. An unchanged file keeps its record object. The census forgets
+        the kept result of each path it does not list: a removed file leaves
+        the answer, and a side transcript read directly is read again the next
+        time it is asked about.
         """
         self._exercise(NEED.CONVERSION_CENSUS)
-        if self._carried is None:
-            scope = tuple(self._projects_dir.glob("*/*.jsonl"))
-            self._carried_scope = frozenset(scope)
-            marker = f'"type":"{RECEIPT_RECORD}"'
-            candidates = self._grep_files(marker, [self._projects_dir], True)
-            if candidates is None:
-                candidates = scope
-            found = {}
-            for path in candidates:
-                receipt = self._receipt_carried_by(path)
-                if receipt:
-                    found[path] = receipt
-            self._carried = types.MappingProxyType(found)
-        return self._carried
+        if record_type in self._census:
+            return self._census[record_type]
+        known = self._record_reads.setdefault(record_type, {})
+        listed = {}
+        for path in self._projects_dir.glob("*/*.jsonl"):
+            try:
+                listed[path] = self._snapshot_signature(path.stat())
+            except OSError:
+                continue
+        for gone in set(known) - set(listed):
+            del known[gone]
+        examine = [path for path, generation in listed.items()
+                   if path not in known or known[path][0] != generation]
+        candidates = (set(self._literal_search(
+            "files", _record_type_literal(record_type), examine, False)) if examine else set())
+        unreadable = []
+        for path in examine:
+            record = None
+            if path in candidates:
+                try:
+                    record = read_one(path)
+                except OSError:
+                    known.pop(path, None)
+                    unreadable.append(path)
+                    continue
+            known[path] = (listed[path], immutable(record) if record else None)
+        self._census[record_type] = types.MappingProxyType({
+            "records": types.MappingProxyType({
+                path: held[1] for path, held in sorted(known.items())
+                if held[1] is not None}),
+            "scope": frozenset(known),
+            "unreadable": frozenset(unreadable),
+        })
+        return self._census[record_type]
+
+    def _record_carried_by(self, path, record_type, read_one):
+        """The census record of one type for one transcript, or None.
+
+        A path in the scope of the current census is answered from it, absence
+        included. Any other path, such as one added since the census, a side
+        transcript, or one that could not be read, is read directly, once per
+        file generation, and a later census that lists the path reuses that
+        result while the file keeps its generation. A file that cannot be read
+        gives None.
+        """
+        path = Path(path)
+        census = self._census.get(record_type)
+        if census is not None and path in census["scope"]:
+            return census["records"].get(path)
+        known = self._record_reads.setdefault(record_type, {})
+        try:
+            generation = self._snapshot_signature(path.stat())
+        except OSError:
+            return None
+        if path in known and known[path][0] == generation:
+            return known[path][1]
+        try:
+            record = read_one(path)
+        except OSError:
+            return None
+        known[path] = (generation, immutable(record) if record else None)
+        return known[path][1]
+
+    def _carried_receipts(self):
+        """{path: last valid conversion receipt} across the main transcripts."""
+        return self._record_census(RECEIPT_RECORD, self._receipt_in_file)["records"]
 
     def _receipt_carried_by(self, path):
-        """The canonical parsed conversion receipt for one transcript, or None."""
-        path = Path(path)
-        if path not in self._receipts:
-            covered = (self._carried is not None
-                       and path in (self._carried_scope or ()))
-            parsed = (self._carried.get(path) if covered
-                      else self._rewriter.receipt_in_file(path))
-            self._receipts[path] = immutable(parsed) if parsed else None
-        return self._receipts[path]
+        """The last valid conversion receipt in one transcript, or None."""
+        return self._record_carried_by(path, RECEIPT_RECORD, self._receipt_in_file)
+
+    def _restamp_carried_by(self, path):
+        """The last restamp record in one transcript, or None."""
+        return self._record_carried_by(path, RESTAMP_RECORD, self._restamp_in_file)
 
     def _copied_prefix_uuids(self, path):
         """UUIDs copied from a parent into this promoted transcript."""
@@ -10013,7 +10479,7 @@ class Resolver:
                 f"not have a deducible team ({team_evidence}); type "
                 f"--as-agent {agent_id_of(name, '<team>')}")
 
-        terminal = self._rewriter.terminal_receipt_in_file(entry["path"])
+        terminal = self._terminal_receipt_in_file(entry["path"])
         if (terminal and not typed_name and terminal["direction"] == "demote"
                 and terminal.get("team") == team and terminal.get("name")):
             name = terminal["name"]
@@ -10144,7 +10610,7 @@ class Resolver:
                               (f". {parent['remedy']}" if parent["remedy"] else ""))
 
         parent_uuids = None
-        terminal = self._rewriter.terminal_receipt_in_file(path)
+        terminal = self._terminal_receipt_in_file(path)
         if terminal and terminal.get("ref"):
             try:
                 ref = json.loads(terminal["ref"])
@@ -10289,24 +10755,9 @@ class TranscriptRewriter:
     """Transform closed transcript inputs and prove each inverse in memory."""
 
     @staticmethod
-    def _last_record_at(raws, record_type, field):
-        """(payload, one-based line) for the last matching JSONL record."""
-        for index in range(len(raws) - 1, -1, -1):
-            try:
-                rec = json.loads(raws[index])
-            except (ValueError, UnicodeDecodeError):
-                continue
-            if not isinstance(rec, dict) or rec.get("type") != record_type:
-                continue
-            payload = rec.get(field)
-            if isinstance(payload, dict):
-                return payload, index + 1
-        return None, None
-
-    @classmethod
-    def _consume_last_record(cls, raws, record_type, field):
+    def _consume_last_record(raws, record_type, field):
         """Last payload, raw line, position, and lines without that record."""
-        payload, line = cls._last_record_at(raws, record_type, field)
+        payload, line = _last_record_at(raws, record_type, field)
         if line is None:
             return None, None, None, list(raws)
         remaining = list(raws)
@@ -10399,202 +10850,6 @@ class TranscriptRewriter:
                     "receipt": receipt, "objections": [], "proved": True}
         return {"objections": [f"identity record {uuid} not found as a line"],
                 "proved": False}
-
-    @classmethod
-    def _last_record_in_file(cls, path, record_type, field):
-        """The payload from the last matching record in a JSONL, read backward."""
-        marker = record_type.encode()
-        try:
-            size = path.stat().st_size
-            handle = path.open("rb")
-        except OSError:
-            return None
-        carry, at = b"", size
-        with handle:
-            while at:
-                take = min(INDEX_CHUNK, at)
-                at -= take
-                handle.seek(at)
-                block = handle.read(take) + carry
-                lines = block.split(b"\n")
-                carry = lines.pop(0) if at else b""
-                candidates = [raw for raw in lines if marker in raw]
-                payload, _line = cls._last_record_at(candidates, record_type, field)
-                if payload is not None:
-                    return payload
-            if carry and marker in carry:
-                payload, _line = cls._last_record_at([carry], record_type, field)
-                return payload
-        return None
-
-    @staticmethod
-    def receipt_objection(receipt):
-        """Return why a conversion receipt is not the current complete schema."""
-        if not isinstance(receipt, dict):
-            return "the conversion receipt is not an object"
-        missing = sorted(RECEIPT_REQUIRED - set(receipt))
-        if missing:
-            return "the conversion receipt is missing " + ", ".join(missing)
-        unknown = sorted(set(receipt) - set(RECEIPT_KEYS))
-        if unknown:
-            return "the conversion receipt has unknown fields " + ", ".join(unknown)
-        null_optional = sorted(field for field in set(receipt) - RECEIPT_REQUIRED
-                               if receipt[field] is None)
-        if null_optional:
-            return ("the conversion receipt must omit empty optional fields "
-                    + ", ".join(null_optional))
-        if type(receipt["schema_version"]) is not int:
-            return "the conversion receipt has invalid schema_version value"
-        if receipt["schema_version"] != 1:
-            return (f"unsupported conversion receipt schema_version "
-                    f"{receipt['schema_version']!r}; expected 1")
-        for field in ("dest_stem", "parent", "task_id"):
-            if not isinstance(receipt[field], str) or not receipt[field]:
-                return f"the conversion receipt has invalid {field} value"
-        if (receipt["root"] is not None
-                and (not isinstance(receipt["root"], str) or not receipt["root"])):
-            return "the conversion receipt has invalid root value"
-        if receipt["direction"] == "promote" and not receipt["root"]:
-            return "a promotion receipt does not have a root"
-        if (not isinstance(receipt["direction"], str)
-                or receipt["direction"] not in ("promote", "demote")):
-            return f"the conversion receipt has invalid direction {receipt['direction']!r}"
-        if (not isinstance(receipt["grammar"], str)
-                or receipt["grammar"] not in SIDE_GRAMMARS):
-            return (f"unsupported conversion grammar {receipt['grammar']!r}; expected "
-                    f"{SIDE_GRAMMAR_OPTIONS}")
-        fork_fields = (receipt.get("graft"), receipt.get("ref"),
-                       receipt.get("prefix_uuids"))
-        if receipt["grammar"] == SIDE_GRAMMAR_FORK_REFERENCE:
-            if (not all(fork_fields[:2]) or not isinstance(fork_fields[2], list)
-                    or not fork_fields[2]):
-                return "a fork-reference receipt is missing its copied-prefix fields"
-        elif any(value is not None for value in fork_fields):
-            return "a regular receipt carries fork-reference fields"
-        if not isinstance(receipt["unwrapped"], bool):
-            return "the conversion receipt has invalid unwrapped value"
-        edits = receipt["visible_human_wrapper_edits"]
-        if not isinstance(edits, dict) or set(edits) != {"original_payloads", "intervals"}:
-            return "the conversion receipt has invalid visible_human_wrapper_edits value"
-        payloads, intervals = edits["original_payloads"], edits["intervals"]
-        if (not isinstance(payloads, list)
-                or not all(isinstance(item, list) and len(item) == 2
-                           and isinstance(item[0], str)
-                           and item[0] in HUMAN_MESSAGE_WRAPPERS
-                           and isinstance(item[1], str) for item in payloads)):
-            return "the conversion receipt has invalid original_payloads value"
-        if (not isinstance(intervals, list)
-                or not all(isinstance(item, list) and len(item) == 3
-                           and isinstance(item[0], str) and item[0]
-                           and isinstance(item[1], str) and item[1]
-                           and isinstance(item[2], list)
-                           and all(type(ref) is int and 0 <= ref < len(payloads)
-                                   for ref in item[2]) for item in intervals)):
-            return "the conversion receipt has invalid wrapper edit intervals value"
-        refs = [ref for _first, _last, interval_refs in intervals
-                for ref in interval_refs]
-        if not receipt["unwrapped"] and (payloads or refs):
-            return "a wrapped conversion receipt carries unneeded original payloads"
-        if receipt["unwrapped"] and (
-                any(not interval_refs for _first, _last, interval_refs in intervals)
-                or len(refs) != len(set(refs))
-                or set(refs) != set(range(len(payloads)))):
-            return "an unwrapped conversion receipt has inconsistent payload references"
-        if not _valid_newline(receipt["source_newline"]):
-            return "the conversion receipt has invalid source_newline metadata"
-        if bool(receipt.get("name")) != bool(receipt.get("team")):
-            return "the conversion receipt must carry both name and team, or leave both out"
-        for field in ("name", "team"):
-            if field in receipt and (not isinstance(receipt[field], str)
-                                     or not receipt[field]):
-                return f"the conversion receipt has invalid {field} value"
-        for field in ("graft", "previous_record", "ref"):
-            if (field in receipt
-                    and (not isinstance(receipt[field], str) or not receipt[field])):
-                return f"the conversion receipt has invalid {field} value"
-        if ("side_meta_b64" in receipt) != ("side_meta_mode" in receipt):
-            return "the conversion receipt must pair side_meta_b64 and side_meta_mode"
-        if "side_meta_b64" in receipt:
-            encoded = receipt["side_meta_b64"]
-            mode = receipt["side_meta_mode"]
-            if not isinstance(encoded, str):
-                return "the conversion receipt has invalid side_meta_b64 value"
-            if type(mode) is not int or not 0 <= mode <= 0o777:
-                return "the conversion receipt has invalid side_meta_mode value"
-            try:
-                decoded = base64.b64decode(encoded, validate=True)
-            except (binascii.Error, ValueError):
-                return "the conversion receipt has invalid side_meta_b64 value"
-            if base64.b64encode(decoded).decode("ascii") != encoded:
-                return "the conversion receipt has non-canonical side_meta_b64 value"
-        for field in ("inserted_sidechain", "prefix_uuids"):
-            value = receipt.get(field)
-            if value is not None and (not isinstance(value, list) or not value
-                                      or not all(isinstance(item, str) and item
-                                                 for item in value)
-                                      or len(value) != len(set(value))):
-                return f"the conversion receipt has invalid {field} value"
-        if bool(receipt.get("previous_record") is not None) != bool(
-                receipt.get("previous_position") is not None):
-            return "the conversion receipt must pair previous_record and previous_position"
-        if (receipt.get("previous_position") is not None
-                and (type(receipt["previous_position"]) is not int
-                     or receipt["previous_position"] < 0)):
-            return "the conversion receipt has invalid previous_position value"
-        stripped = receipt.get("stripped")
-        if stripped is not None and (not isinstance(stripped, list) or not stripped
-                                     or not all(isinstance(item, list) and len(item) == 2
-                                                and type(item[0]) is int and item[0] >= 0
-                                                and isinstance(item[1], str) and item[1]
-                                                for item in stripped)):
-            return "the conversion receipt has invalid stripped value"
-        root_stamps = receipt.get("root_stamps")
-        member_identity = bool(receipt.get("name") and receipt.get("team")
-                               and receipt.get("name") != "team-lead")
-        if member_identity and root_stamps is None:
-            return "a member conversion receipt must carry root_stamps"
-        if not member_identity and root_stamps is not None:
-            return "a non-member conversion receipt must not carry root_stamps"
-        if root_stamps is not None and not (
-                isinstance(root_stamps, dict)
-                and set(root_stamps) == {"agentName", "teamName"}
-                and all(isinstance(root_stamps[field], list)
-                        and len(root_stamps[field]) == 2
-                        and isinstance(root_stamps[field][0], bool)
-                        and (root_stamps[field][0]
-                             or root_stamps[field][1] is None)
-                        for field in ("agentName", "teamName"))):
-            return "the conversion receipt has invalid root_stamps"
-        return None
-
-    @classmethod
-    def receipt_in_file(cls, path):
-        """The last valid current-schema conversion receipt in one JSONL."""
-        receipt = cls._last_record_in_file(path, RECEIPT_RECORD, "receipt")
-        return receipt if receipt and not cls.receipt_objection(receipt) else None
-
-    @classmethod
-    def terminal_receipt_in_file(cls, path):
-        """Return a conversion receipt when it occupies the final nonempty line.
-
-        Embedded receipts supply demotion defaults. A final receipt additionally
-        represents the immediately reversible conversion.
-        """
-        try:
-            raws = Path(path).read_text(errors="strict").splitlines()
-        except (OSError, UnicodeDecodeError):
-            return None
-        if not raws:
-            return None
-        try:
-            rec = json.loads(raws[-1])
-        except ValueError:
-            return None
-        if not isinstance(rec, dict) or rec.get("type") != RECEIPT_RECORD:
-            return None
-        receipt = rec.get("receipt")
-        return (receipt if receipt and not cls.receipt_objection(receipt)
-                else None)
 
     # -- side transcript <-> teammate conversion: this rewriter plans, proves
     #    the inverse, and never writes; materialize/embed consume a proved plan.
@@ -11104,15 +11359,9 @@ class TranscriptRewriter:
                           separators=(",", ":"), ensure_ascii=False, sort_keys=True)
 
     @staticmethod
-    def _carried_receipt_at(raws):
-        """(receipt, one-based line) for the last conversion receipt."""
-        return TranscriptRewriter._last_record_at(raws, RECEIPT_RECORD, "receipt")
-
-    @classmethod
-    def carried_receipt(cls, raws):
+    def carried_receipt(raws):
         """The last valid current-schema receipt in these JSONL lines."""
-        receipt = cls._carried_receipt_at(raws)[0]
-        return receipt if receipt and not cls.receipt_objection(receipt) else None
+        return _valid_receipt(_last_record_at(raws, RECEIPT_RECORD, "receipt")[0])
 
     @staticmethod
     def _edit_closure(before, after, extra=()):
@@ -11154,9 +11403,9 @@ class TranscriptRewriter:
 
         carried, carried_raw, carried_position, without_carried = \
             self._consume_last_record(raws, RECEIPT_RECORD, "receipt")
-        receipt_objection = self.receipt_objection(carried) if carried is not None else None
-        if receipt_objection:
-            return immutable({"objections": (receipt_objection,), "proved": False})
+        objection = _receipt_objection(carried) if carried is not None else None
+        if objection:
+            return immutable({"objections": (objection,), "proved": False})
         carried_direction = carried["direction"] if carried is not None else None
         consumes = carried is not None and carried_direction != direction
         body = without_carried if consumes else list(raws)
@@ -29208,24 +29457,24 @@ def _check_receipt_conditional_schema(s):
 
     member = fixture_receipt(name="member", team="TEAM")
     member.pop("root_stamps")
-    member_said = TranscriptRewriter.receipt_objection(member) or ""
+    member_said = _receipt_objection(member) or ""
 
     lead = fixture_receipt(name="team-lead", team="TEAM", root_stamps={
         "agentName": [False, None], "teamName": [False, None]})
-    lead_said = TranscriptRewriter.receipt_objection(lead) or ""
+    lead_said = _receipt_objection(lead) or ""
 
     forked = fixture_receipt(grammar=SIDE_GRAMMAR_FORK_REFERENCE)
     forked.pop("graft")
-    fork_said = TranscriptRewriter.receipt_objection(forked) or ""
+    fork_said = _receipt_objection(forked) or ""
 
     regular = fixture_receipt(graft="g", ref="r", prefix_uuids=["g"])
-    regular_said = TranscriptRewriter.receipt_objection(regular) or ""
+    regular_said = _receipt_objection(regular) or ""
 
     previous = fixture_receipt(previous_record="raw")
-    previous_said = TranscriptRewriter.receipt_objection(previous) or ""
+    previous_said = _receipt_objection(previous) or ""
 
     side_meta = fixture_receipt(side_meta_b64="")
-    side_meta_said = TranscriptRewriter.receipt_objection(side_meta) or ""
+    side_meta_said = _receipt_objection(side_meta) or ""
 
     malformed = []
 
@@ -29233,7 +29482,7 @@ def _check_receipt_conditional_schema(s):
         receipt = fixture_receipt()
         alter(receipt)
         try:
-            said = TranscriptRewriter.receipt_objection(receipt)
+            said = _receipt_objection(receipt)
         except Exception as err:
             malformed.append(f"{label} raised {type(err).__name__}: {err}")
         else:
@@ -29286,15 +29535,15 @@ def _check_receipt_conditional_schema(s):
                        root_stamps={"agentName": [False, "unused"],
                                     "teamName": [False, None]}))
     optional_forms = {
-        "null side metadata": TranscriptRewriter.receipt_objection(
+        "null side metadata": _receipt_objection(
             fixture_receipt(side_meta_b64=None)) or "",
-        "empty inserted UUIDs": TranscriptRewriter.receipt_objection(
+        "empty inserted UUIDs": _receipt_objection(
             fixture_receipt(inserted_sidechain=[])) or "",
-        "empty stripped records": TranscriptRewriter.receipt_objection(
+        "empty stripped records": _receipt_objection(
             fixture_receipt(stripped=[])) or "",
-        "empty demotion root": TranscriptRewriter.receipt_objection(
+        "empty demotion root": _receipt_objection(
             fixture_receipt(direction="demote", root="")) or "",
-        "empty previous record": TranscriptRewriter.receipt_objection(
+        "empty previous record": _receipt_objection(
             fixture_receipt(previous_record="", previous_position=0)) or "",
     }
 
@@ -29952,6 +30201,9 @@ def operating_conversation(f, start, session, name=None, start_team=None, later=
      'the team a process operates as is answered without walking its transcript when the '
      'transcript records the process wrote since it started decide it; only the mount rule '
      'needs the walk'),
+    ('operating-team-reads-past-older-records',
+     'a record appended with a timestamp from before the process started, stamped or not, '
+     'does not hide the stamped lines the process wrote since it started'),
 )
 def _check_operating_team_answer(s):
     checked = []
@@ -30010,6 +30262,13 @@ def _check_operating_team_answer(s):
         operating_conversation(f, start, "old-lead", spawns=(("OLDTEAM", -3_600_000),))
         operating_conversation(f, start, "open-lead", "team-lead", "CLOSE")
         operating_conversation(f, start, "recreated-stamp", "mate", "RECREATED")
+        # Each process wrote a NEW line ten seconds after it started, and then
+        # a record a minute older than its start was appended, as compaction
+        # and attachments do: one stamped OLD and one without a team.
+        operating_conversation(f, start, "older-stamped", "mate", "OLD",
+                               later=(("NEW", 10_000), ("OLD", -60_000)))
+        operating_conversation(f, start, "older-plain", "mate", "OLD",
+                               later=(("NEW", 10_000), (None, -60_000)))
         f.fake.processes[:] = [
             member(4309101, "own-lines", "ARGV"),
             member(4309102, "early-lines", "ARGV"),
@@ -30025,6 +30284,8 @@ def _check_operating_team_answer(s):
             (4309112, 1, (FAKE_AGENT_BIN, "--resume", "open-lead",
                           "--agent-id", "team-lead@OPENLEAD")),
             member(4309113, "recreated-stamp", "DEST"),
+            member(4309114, "older-stamped", "ARGV"),
+            member(4309115, "older-plain", "ARGV"),
         ]
         f.fake.started.update({pid: start for pid, _p, _a in f.fake.processes})
         f.fake.started[4309108] = None
@@ -30105,6 +30366,10 @@ def _check_operating_team_answer(s):
               and by_mount == "stamped" and "early-lines" in walked,
               f"written since start {by_lines} walked {walked_for_lines}, mount {by_mount} "
               f"walked {walked}")
+
+        past = {4309114: said(4309114), 4309115: said(4309115)}
+        check('operating-team-reads-past-older-records',
+              past[4309114][:3] == past[4309115][:3] == ("NEW", True, "written"), repr(past))
 
         lead = eng._agent_runtime("team-lead@OLDTEAM", table, census=census)
         check('earlier-spawns-name-a-lead-not-its-team',
@@ -36203,29 +36468,33 @@ def _check_completion_conversion_census_boundary(s):
                 refusal = ""
             except RuntimeError as err:
                 refusal = str(err)
-            targeted = TranscriptRewriter.receipt_in_file(carrier)
+            targeted = Resolver._receipt_in_file(carrier)
             boundary_ok = ("NEED.CONVERSION_CENSUS" in refusal
                            and (targeted or {}).get("name") == "member")
             check('conversion-census-requires-need',
                   'the full conversion receipt census refuses unless its NEED is declared',
                   boundary_ok, refusal or repr(targeted))
 
+            # The census reads each file through the Resolver's own reader, so
+            # the spies replace that reader on the engine under test.
             narrowed = Resolver(needs=Needs(hard={NEED.CONVERSION_CENSUS}))
             narrowed._projects_dir = projects
             parsed = []
-            original = narrowed._rewriter.receipt_in_file
-            narrowed._rewriter.receipt_in_file = lambda path: parsed.append(Path(path)) or original(path)
+            original = narrowed._receipt_in_file
+            narrowed._receipt_in_file = lambda path: parsed.append(Path(path)) or original(path)
             found = narrowed._carried_receipts()
             narrowed_ok = set(parsed) == {carrier} and set(found) == {carrier}
 
             fallback = Resolver(needs=Needs(hard={NEED.CONVERSION_CENSUS}))
             fallback._projects_dir = projects
-            fallback._grep_files = lambda *args: None
+            fallback._search = lambda *args: subprocess.CompletedProcess(
+                ["rg"], 2, "", "synthetic search failure")
             fallback_parsed = []
-            fallback_original = fallback._rewriter.receipt_in_file
-            fallback._rewriter.receipt_in_file = lambda path: (
+            fallback_original = fallback._receipt_in_file
+            fallback._receipt_in_file = lambda path: (
                 fallback_parsed.append(Path(path)) or fallback_original(path))
-            fallback_found = fallback._carried_receipts()
+            with capturing("err"):
+                fallback_found = fallback._carried_receipts()
             main_files = set(main_dir.glob("*.jsonl"))
             fallback_ok = (set(fallback_parsed) == main_files
                            and set(fallback_found) == {carrier} and side not in fallback_parsed)
@@ -36237,24 +36506,29 @@ def _check_completion_conversion_census_boundary(s):
             canonical = Resolver(needs=Needs(hard={NEED.CONVERSION_CENSUS}))
             canonical._projects_dir = projects
             canonical_parsed = []
-            canonical_original = canonical._rewriter.receipt_in_file
-            canonical._rewriter.receipt_in_file = lambda path: (
+            canonical_original = canonical._receipt_in_file
+            canonical._receipt_in_file = lambda path: (
                 canonical_parsed.append(Path(path)) or canonical_original(path))
             direct = canonical._receipt_carried_by(carrier)
             census_receipt = canonical._carried_receipts().get(carrier)
             canonical._receipt_carried_by(carrier)
+            # Two absent answers are one object too, so the shared object has
+            # to be the parsed receipt itself.
             check('conversion-receipt-is-one-canonical-object',
                   'a path lookup and the conversion census share one parsed receipt object',
-                  direct is census_receipt and canonical_parsed == [carrier],
-                  f"same={direct is census_receipt}, parsed={canonical_parsed!r}")
+                  direct is census_receipt and direct == immutable(receipt)
+                  and canonical_parsed == [carrier],
+                  f"same={direct is census_receipt}, receipt={direct!r}, "
+                  f"parsed={canonical_parsed!r}")
 
             absent = main_dir / "plain-0.jsonl"
             zero = Resolver(needs=Needs(hard={NEED.CONVERSION_CENSUS}))
             zero._projects_dir = projects
-            zero._grep_files = lambda *args: []
+            # A search that completes without a match.
+            zero._search = lambda *args: subprocess.CompletedProcess(["rg"], 1, "", "")
             zero_parsed = []
-            zero_original = zero._rewriter.receipt_in_file
-            zero._rewriter.receipt_in_file = lambda path: (
+            zero_original = zero._receipt_in_file
+            zero._receipt_in_file = lambda path: (
                 zero_parsed.append(Path(path)) or zero_original(path))
             zero._carried_receipts()
             absent.write_text(TranscriptRewriter._receipt_line(receipt) + "\n")
@@ -36333,6 +36607,1061 @@ def _check_completion_conversion_census_boundary(s):
     finally:
         globals()["RESOLVER"] = real_resolver
     return checked
+
+
+def _census_call_sites(tree, ast_mod):
+    """(named, unresolved): the record types Resolver._record_census is asked for.
+
+    The one reading of the census call sites, shared by the checks that ask
+    which record types the census reads. `named` holds the names of the constants
+    passed as the record type, which is how the checks key each type's
+    writer. `unresolved` lists, with its line, each recognized call that
+    passes its record type as something other than a constant name: such a
+    call narrows the census while `named` stays nonempty, so it is reported
+    rather than dropped.
+
+    Recognized calls are self._record_census(NAME, ...), the unbound
+    Resolver._record_census(self, NAME, ...), a call through a name assigned
+    from an attribute named _record_census, getattr(x, "_record_census")(NAME,
+    ...), and record_type=NAME given as a keyword. The record type may be
+    NAME, module.NAME (read as NAME) or a conditional expression of such
+    names, which counts both branches. A string literal or any other
+    expression is reported in `unresolved`.
+
+    An unreadable argument inside a recognized call is reported. A call that
+    reaches _record_census in a form not listed above, such as through a
+    dispatch table, functools.partial, a second level of aliasing or a
+    decorator, is not recognized, so it is not in either set.
+    """
+    classes = {node.name for node in ast_mod.walk(tree)
+               if isinstance(node, ast_mod.ClassDef)}
+    aliases = {node.targets[0].id for node in ast_mod.walk(tree)
+               if isinstance(node, ast_mod.Assign) and len(node.targets) == 1
+               and isinstance(node.targets[0], ast_mod.Name)
+               and isinstance(node.value, ast_mod.Attribute)
+               and node.value.attr == "_record_census"}
+
+    def census_call(call):
+        """(whether this call reaches _record_census, index of its record type)."""
+        func = call.func
+        if isinstance(func, ast_mod.Attribute) and func.attr == "_record_census":
+            # Called through the class, the receiver comes first.
+            unbound = isinstance(func.value, ast_mod.Name) and func.value.id in classes
+            return True, 1 if unbound else 0
+        if isinstance(func, ast_mod.Name) and func.id in aliases:
+            return True, 0
+        if (isinstance(func, ast_mod.Call) and isinstance(func.func, ast_mod.Name)
+                and func.func.id == "getattr" and len(func.args) == 2
+                and isinstance(func.args[1], ast_mod.Constant)
+                and func.args[1].value == "_record_census"):
+            return True, 0
+        return False, 0
+
+    def names_in(node):
+        """The constant names this expression can pass, or None."""
+        if isinstance(node, ast_mod.Name):
+            return {node.id}
+        if isinstance(node, ast_mod.Attribute):
+            return {node.attr}
+        if isinstance(node, ast_mod.IfExp):
+            both = names_in(node.body), names_in(node.orelse)
+            return None if None in both else both[0] | both[1]
+        return None
+
+    named, unresolved = set(), []
+    for call in ast_mod.walk(tree):
+        if not isinstance(call, ast_mod.Call):
+            continue
+        hit, start = census_call(call)
+        if not hit:
+            continue
+        argument = call.args[start] if len(call.args) > start else next(
+            (keyword.value for keyword in call.keywords if keyword.arg == "record_type"), None)
+        if argument is None:
+            unresolved.append(f"line {call.lineno}: the call does not pass a record type")
+            continue
+        found = names_in(argument)
+        if found is None:
+            unresolved.append(f"line {call.lineno}: {ast_mod.dump(argument)[:40]} is not a name")
+        else:
+            named |= found
+    return named, sorted(unresolved)
+
+
+@unit(('census-narrowing-finds-what-the-writers-emit',
+       'the writers of the censused record types emit them in the form the census search lists'))
+def _check_census_narrowing_finds_what_the_writers_emit(s):
+    # The census reads a file only when a search for the compact literal
+    # "type":"<record type>" lists it, so a record written with other
+    # separators would be in a file the census counts as not holding one. The
+    # real writer output of each censused type is checked against that literal
+    # and against the search itself. The types come from _census_call_sites, so a
+    # type added to the census without a writer here fails.
+    censused, unresolved = _census_call_sites(s.tree, s.ast)
+    written, told = {}, []
+    with tempfile.TemporaryDirectory(prefix=f"{TOOL}-narrow-") as td:
+        base = Path(td)
+        projects = base / "projects" / "corpus"
+        projects.mkdir(parents=True)
+        written["RECEIPT_RECORD"] = TranscriptRewriter._receipt_line(fixture_receipt())
+        # restamp_plan renders the restamp record into the lines it plans, so
+        # the line is taken from a real plan.
+        moving = projects / "moving.jsonl"
+        moving.write_text("".join(fixture_line(row) + "\n" for row in (
+            {"type": "user", "uuid": "narrow-root", "parentUuid": None,
+             "sessionId": "moving", "agentName": "mover", "teamName": "before",
+             "timestamp": "2026-01-01T00:00:01Z",
+             "message": {"role": "user", "content": "hi"}},
+            {"type": "last-prompt", "leafUuid": "narrow-root", "sessionId": "moving"})))
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
+        eng._projects_dir, eng._teams_dir = base / "projects", base / "teams"
+        with _FakeTmux(sockets=[]).installed(eng):
+            plan = eng._rewriter.restamp_plan(moving, "after", start=eng._window_start(moving))
+            for raw in plan["lines"] if plan.get("proved") else ():
+                try:
+                    record = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(record, dict) and record.get("type") == RESTAMP_RECORD:
+                    written["RESTAMP_RECORD"] = raw
+            for name, raw in sorted(written.items()):
+                literal = _record_type_literal(globals()[name])
+                carrier = projects / f"{name.lower()}.jsonl"
+                carrier.write_text(raw + "\n")
+                if literal not in raw:
+                    told.append(f"{name}'s writer emits a line without {literal}")
+                # The census searches the files it examines by name, as here.
+                # The search itself is asked: _literal_search would answer each
+                # file it was given if the search did not complete.
+                searched = eng._search("files", literal, [carrier], False)
+                if searched.returncode != 0 or str(carrier) not in searched.stdout.split("\n"):
+                    told.append(f"the census search does not list a file holding {name}'s "
+                                "writer output")
+    told += [f"{name} is censused, and this check does not have writer output for it"
+             for name in sorted(censused - set(written))]
+    told += [f"a census call with a record type that is not a name: {site}" for site in unresolved]
+    if not censused:
+        told.append("the check did not find a call of _record_census, so it did not check a writer")
+    return [_check_verdict('census-narrowing-finds-what-the-writers-emit', not told,
+                           "; ".join(told))]
+
+
+def _census_fixture_line(name, old_team, new_team):
+    """A restamp record moving `name` from `old_team` to `new_team`, as one JSONL line."""
+    return fixture_line({"type": RESTAMP_RECORD, "restamp": {
+        "kind": "restamp", "old": {"agentName": name, "teamName": old_team},
+        "new": {"agentName": name, "teamName": new_team}}})
+
+
+def _census_padding(tag):
+    """One record longer than two INDEX_CHUNK windows, without an identity field at any level."""
+    return fixture_line({"type": "user", "uuid": f"pad-{tag}", "text": "p" * (INDEX_CHUNK * 2)})
+
+
+@unit(('restamp-census-covers-unstamped-transcripts',
+       'the durable index takes the assignment of a transcript that only its restamp record names'))
+def _check_restamp_census_covers_unstamped_transcripts(s):
+    # The subject is stamped only mid-history, more than INDEX_CHUNK from
+    # either end, and does not carry a conversion receipt, so the stamp index
+    # and the receipt census do not hold it. Its restamp record is the only
+    # evidence of its assignment. The control is an ordinary transcript
+    # stamped at its end, so an empty index fails too.
+    name, source_team, dest_team = "mover", "census-source", "census-destination"
+    with tempfile.TemporaryDirectory(prefix=f"{TOOL}-restamp-census-") as td:
+        base = Path(td)
+        projects = base / "projects" / "corpus"
+        projects.mkdir(parents=True)
+        subject = projects / "mover.jsonl"
+        subject.write_text("\n".join([
+            _census_padding("head"),
+            fixture_line({"type": "user", "uuid": "subject-mid", "parentUuid": None,
+                          "sessionId": "mover", "agentName": name, "teamName": dest_team,
+                          "timestamp": "2026-01-01T00:00:00Z"}),
+            _census_padding("tail"),
+            _census_fixture_line(name, source_team, dest_team),
+        ]) + "\n")
+        (projects / "steady.jsonl").write_text(fixture_line({
+            "type": "user", "uuid": "control", "parentUuid": None, "sessionId": "steady",
+            "agentName": "steady", "teamName": "census-control",
+            "timestamp": "2026-01-01T00:00:00Z"}) + "\n")
+        eng = Resolver(needs=Needs(hard={NEED.STAMPS, NEED.CONVERSION_CENSUS}))
+        eng._projects_dir, eng._teams_dir = base / "projects", base / "teams"
+        with _FakeTmux(sockets=[]).installed(eng):
+            stamps, carried = eng._stamp_index(), eng._carried_receipts()
+            index = eng._durable_assignment_index()
+            generation = eng._path_generation(subject)
+    mine = [record for record in index["records"] if record["path"] == subject]
+    moved_id, source_id = agent_id_of(name, dest_team), agent_id_of(name, source_team)
+    facts = {
+        # Were either index to hold the subject, the check would not test the
+        # restamp census any more, so it says so.
+        "the stamp index does not hold the subject": subject not in stamps,
+        "the receipt census does not hold the subject": subject not in carried,
+        "the control is indexed": agent_id_of("steady", "census-control") in index["by_agent"],
+        "the subject has exactly one record": len(mine) == 1,
+        "the subject's record comes from its restamp":
+            bool(mine) and mine[0]["source"] == "restamp receipt",
+        "the subject is assigned its destination":
+            moved_id in index["by_agent"] and dest_team in index["by_team"],
+        "the record names the identity it moved from":
+            bool(mine) and mine[0]["moved_from"] == source_id,
+        "the generation entry names the subject": (subject, generation, moved_id) in index["generation"],
+        "the source identity is not assigned":
+            source_id not in index["by_agent"] and source_team not in index["by_team"],
+    }
+    wrong = sorted(fact for fact, ok in facts.items() if not ok)
+    return [_check_verdict('restamp-census-covers-unstamped-transcripts', not wrong,
+                           "; ".join(wrong))]
+
+
+@unit(
+    ('census-reads-top-level-records',
+     'text that names a record type inside another record, nested or quoted, is not a record of it'),
+    ('census-takes-the-last-admissible-record',
+     'the last record of the type with an object payload wins, past a later one with another '
+     'payload and past a cut-off final line'),
+    ('census-search-falls-back-when-unavailable',
+     'the census gives the same records through ripgrep, through grep when ripgrep is missing, '
+     'and by reading each file it examines when the search fails, ends on a signal or cannot '
+     'start'),
+)
+def _check_census_record_selection(s):
+    from unittest import mock
+    checked = []
+    with tempfile.TemporaryDirectory(prefix=f"{TOOL}-census-select-") as td:
+        base = Path(td)
+        projects = base / "projects" / "corpus"
+        projects.mkdir(parents=True)
+        nested = projects / "nested.jsonl"
+        nested.write_text(fixture_line({
+            "type": "user", "uuid": "nested-root", "message": {"role": "user", "content": [
+                {"type": RESTAMP_RECORD, "restamp": {
+                    "old": {"agentName": "spoof", "teamName": "S"},
+                    "new": {"agentName": "spoof", "teamName": "N"}}}]}}) + "\n")
+        quoted = projects / "quoted.jsonl"
+        quoted.write_text(fixture_line({
+            "type": "user", "uuid": "quoted-root", "message": {
+                "role": "user", "content": _census_fixture_line("spoof", "S", "Q")}}) + "\n")
+        layered = projects / "layered.jsonl"
+        layered.write_text("\n".join([
+            _census_fixture_line("mover", "T", "FIRST"),
+            _census_fixture_line("mover", "T", "LAST"),
+            fixture_line({"type": RESTAMP_RECORD, "restamp": "not an object"}),
+            fixture_line({"type": "assistant", "uuid": "after"}),
+            _census_fixture_line("mover", "T", "CUT")[:-9],
+        ]))
+        plain = projects / "plain.jsonl"
+        plain.write_text(fixture_line({"type": "user", "uuid": "plain-root"}) + "\n")
+        files = {nested, quoted, layered, plain}
+
+        def census(prepare=lambda eng: contextlib.nullcontext()):
+            eng = Resolver(needs=Needs(hard={NEED.CONVERSION_CENSUS}))
+            eng._projects_dir, eng._teams_dir = base / "projects", base / "teams"
+            read, real = [], eng._restamp_in_file
+            eng._restamp_in_file = lambda path: read.append(Path(path)) or real(path)
+            with prepare(eng), capturing("err"):
+                answer = eng._record_census(RESTAMP_RECORD, eng._restamp_in_file)
+            return answer, set(read)
+
+        normal, normal_read = census()
+        records = {path: dict(record.get("new") or {}) for path, record in normal["records"].items()}
+        check_top = (nested in normal["scope"] and quoted in normal["scope"]
+                     and nested not in normal["records"] and quoted not in normal["records"]
+                     and quoted not in normal_read)
+        checked.append(_check_verdict('census-reads-top-level-records', check_top,
+                                      f"records={records}, read={sorted(p.name for p in normal_read)}"))
+        checked.append(_check_verdict(
+            'census-takes-the-last-admissible-record',
+            records == {layered: {"agentName": "mover", "teamName": "LAST"}},
+            f"records={records}"))
+
+        real_which = shutil.which
+        empty = base / "searcher-missing"
+        empty.mkdir()
+
+        def without_rg(eng):
+            return mock.patch.object(shutil, "which", lambda name, *rest, **kw: (
+                None if name == "rg" else real_which(name, *rest, **kw)))
+
+        @contextlib.contextmanager
+        def without_searcher(eng):
+            with without_rg(eng), mock.patch.dict(os.environ, {"PATH": str(empty)}):
+                yield
+
+        def failing(eng):
+            return mock.patch.object(eng, "_search", lambda *args: subprocess.CompletedProcess(
+                ["rg"], 2, "", "synthetic search failure"))
+
+        def signalled(eng):
+            # SIGTERM ended this search after it printed one file of its list.
+            return mock.patch.object(eng, "_search", lambda *args: subprocess.CompletedProcess(
+                ["rg"], -15, f"{layered}\n", ""))
+
+        outcomes = {"ripgrep": (normal, normal_read)}
+        for label, prepare in (("grep", without_rg), ("searcher missing", without_searcher),
+                               ("failed search", failing), ("search ended by a signal", signalled)):
+            outcomes[label] = census(prepare)
+        said = {label: (sorted(p.name for p in answer["records"]), sorted(p.name for p in read))
+                for label, (answer, read) in outcomes.items()}
+        narrowed = {nested, layered}
+        same = all(dict(answer["records"]) == dict(normal["records"])
+                   and answer["scope"] == normal["scope"]
+                   for answer, _read in outcomes.values())
+        reads_ok = (outcomes["ripgrep"][1] == narrowed and outcomes["grep"][1] == narrowed
+                    and outcomes["searcher missing"][1] == files
+                    and outcomes["failed search"][1] == files
+                    and outcomes["search ended by a signal"][1] == files)
+        checked.append(_check_verdict('census-search-falls-back-when-unavailable',
+                                      same and reads_ok and bool(normal["records"]), repr(said)))
+    return checked
+
+
+@unit(
+    ('census-refreshes-by-file-generation',
+     'after a refresh the census reads only new, changed and earlier unreadable files, keeps '
+     'the record objects of the other files, and reports removed, unreadable and cut-off files '
+     'apart'),
+    ('assignment-rows-keep-identity-across-refresh',
+     'after a refresh an unchanged transcript keeps its durable assignment record object, a '
+     'changed one gets a new record, and a removed one leaves the index'),
+)
+def _check_census_generations(s):
+    checked = []
+    with _roster_test_fixture() as f:
+        eng = f.engine
+        # The census reads a file again only when its generation changes, and
+        # chmod leaves the generation as it was, so the unreadable file is also
+        # appended to before its permissions are removed.
+        paths = {name: f.project / f"{name}.jsonl" for name in (
+            "unchanged", "changed", "removed", "unreadable", "cut", "added", "plain")}
+        for name in ("unchanged", "changed", "removed", "unreadable"):
+            paths[name].write_text(_census_fixture_line(name, "T", "D") + "\n")
+        paths["cut"].write_text(_census_fixture_line("cut", "T", "D")[:-9])
+        paths["plain"].write_text(fixture_line({"type": "user", "uuid": "plain"}) + "\n")
+        read, real = [], eng._restamp_in_file
+        eng._restamp_in_file = lambda path: read.append(Path(path).stem) or real(path)
+        first = eng._record_census(RESTAMP_RECORD, eng._restamp_in_file)
+        first_records = dict(first["records"])
+        first_read = sorted(read)
+        first_index = eng._durable_assignment_index()
+        first_rows = {record["path"].stem: record for record in first_index["records"]}
+
+        for name in ("changed", "unreadable"):
+            with paths[name].open("a") as handle:
+                handle.write(_census_fixture_line(name, "T", "E") + "\n")
+        paths["removed"].unlink()
+        paths["unreadable"].chmod(0)
+        paths["added"].write_text(_census_fixture_line("added", "T", "D") + "\n")
+        try:
+            paths["unreadable"].open("rb").close()
+            blocked = False
+        except OSError:
+            blocked = True
+        del read[:]
+        eng.refresh_transcript_evidence()
+        with capturing("err"):
+            second = eng._record_census(RESTAMP_RECORD, eng._restamp_in_file)
+            second_read = sorted(read)
+            second_index = eng._durable_assignment_index()
+            unreadable_direct = eng._restamp_carried_by(paths["unreadable"])
+        second_rows = {record["path"].stem: record for record in second_index["records"]}
+        paths["unreadable"].chmod(0o600)
+        stems = {name: path for name, path in paths.items()}
+        facts = {
+            "the fixture made one file unreadable": blocked,
+            "the first census read each file listed by the search":
+                first_read == ["changed", "cut", "removed", "unchanged", "unreadable"],
+            "the second census read only the changed, unreadable and added files":
+                second_read == ["added", "changed", "unreadable"],
+            "an unchanged file keeps its record object":
+                second["records"].get(stems["unchanged"]) is first_records.get(stems["unchanged"])
+                is not None,
+            "a changed file's record is read again":
+                (second["records"].get(stems["changed"]) or {}).get("new", {}).get("teamName") == "E",
+            "a removed file leaves the census":
+                stems["removed"] not in second["scope"] and stems["removed"] not in second["records"],
+            "an unreadable file is reported, outside scope and without its earlier record":
+                stems["unreadable"] in second["unreadable"]
+                and stems["unreadable"] not in second["scope"]
+                and stems["unreadable"] not in second["records"] and unreadable_direct is None,
+            "a cut-off file stays in scope without a record":
+                stems["cut"] in second["scope"] and stems["cut"] not in second["records"],
+            "an added file is admitted": stems["added"] in second["records"],
+            "the earlier answer is unchanged and distinct from the current one":
+                dict(first["records"]) == first_records and second is not first,
+        }
+        wrong = sorted(fact for fact, ok in facts.items() if not ok)
+        checked.append(_check_verdict('census-refreshes-by-file-generation', not wrong,
+                                      "; ".join(wrong)))
+        rows = {
+            "the unchanged transcript keeps its record object":
+                second_rows.get("unchanged") is first_rows.get("unchanged") is not None,
+            "the changed transcript has a new record":
+                "changed" in second_rows and second_rows["changed"] is not first_rows.get("changed")
+                and second_rows["changed"]["team"] == "E",
+            "the removed transcript leaves the index": "removed" not in second_rows,
+            "the added transcript is indexed": "added" in second_rows,
+        }
+        wrong = sorted(fact for fact, ok in rows.items() if not ok)
+        checked.append(_check_verdict('assignment-rows-keep-identity-across-refresh', not wrong,
+                                      "; ".join(wrong) + f"; first={sorted(first_rows)}, "
+                                      f"second={sorted(second_rows)}"))
+    return checked
+
+
+@unit(('census-narrowing-keeps-completion-rows',
+       'team and name completion print the same rows when each search fails and its readers '
+       'read their whole scope as when the searches complete'))
+def _check_census_narrowing_keeps_completion_rows(s):
+    from unittest import mock
+    real_resolver = globals()["RESOLVER"]
+    with _roster_test_fixture() as f:
+        moving = f.transcript("moving", "mover", "T", (
+            {"type": "last-prompt", "leafUuid": "moving-root", "sessionId": "moving"},))
+        f.transcript("steady", "steady", "T")
+        f.config("T", {"name": "T", "members": [
+            {"name": "mover", "agentId": "mover@T", "isActive": False},
+            {"name": "steady", "agentId": "steady@T"}]})
+        f.config("D", {"name": "D", "members": [
+            {"name": "mover", "agentId": "mover@D", "isActive": False}]})
+        plan = f.engine._rewriter.restamp_plan(moving, "D", start=f.engine._window_start(moving))
+        with capturing("out"), capturing("err"):
+            apply_restamp(plan)
+        rows = {}
+        # Rows can say how long ago something happened, so both runs read
+        # one clock value.
+        now = time.time()
+        try:
+            for label in ("narrowed", "unnarrowed"):
+                eng = _roster_cold_engine(f)
+                if label == "unnarrowed":
+                    # Each search this engine runs fails, so each reader reads its
+                    # whole scope.
+                    eng._search = lambda *args: subprocess.CompletedProcess(
+                        ["rg"], 2, "", "synthetic search failure")
+                globals()["RESOLVER"] = eng
+                printed = []
+                for topic in ("teams", "names"):
+                    out = io.StringIO()
+                    with capturing("out", into=out), capturing("err"), \
+                            mock.patch.object(time, "time", lambda: now):
+                        run_complete(topic)
+                    printed.append(out.getvalue())
+                rows[label] = (printed, eng._durable_assignment_index()["by_moved_from"])
+        finally:
+            globals()["RESOLVER"] = real_resolver
+    narrowed, unnarrowed = rows["narrowed"], rows["unnarrowed"]
+    okay = (narrowed[0] == unnarrowed[0] and all(narrowed[0])
+            and "mover@T" in narrowed[1] and "mover@T" in unnarrowed[1])
+    return [_check_verdict('census-narrowing-keeps-completion-rows', okay,
+                           f"narrowed={narrowed[0]!r}, unnarrowed={unnarrowed[0]!r}")]
+
+
+@unit(
+    ('spawn-evidence-falls-back-when-the-search-fails',
+     'spawn records are the same when the file or line search fails, cannot start or is ended '
+     'by a signal as when it completes, and a spawn in a sidechain transcript stays out either '
+     'way'),
+    ('stamp-lookup-keeps-candidates-when-the-team-filter-fails',
+     'a transcript stamped only mid-history is found when the team filter search or the first '
+     'search does not complete, as when both complete'),
+    ('literal-searches-share-one-failure-rule',
+     'the one Resolver method that runs a literal search is _literal_search'),
+    ('literal-search-splits-long-file-lists',
+     'a file list longer than the argv budget is searched in runs within it, each file once, '
+     'with the answer one search gives, and the census reads the same files'),
+)
+def _check_literal_search_fallbacks(s):
+    from unittest import mock
+    checked = []
+
+    def failed(*_args):
+        return subprocess.CompletedProcess(["rg"], 2, "", "synthetic search failure")
+
+    def signalled(*_args):
+        return subprocess.CompletedProcess(["rg"], -15, "", "")
+
+    def unstartable(*_args):
+        raise FileNotFoundError("synthetic missing searcher")
+
+    def only(kind_or_needle, outcome):
+        """Fail the searches of one kind or for one needle, and run the others."""
+        def install(eng):
+            real = eng._search
+            eng._search = lambda kind, needle, *rest: (
+                outcome() if kind_or_needle in (kind, needle) else real(kind, needle, *rest))
+        return install
+
+    def everywhere(outcome):
+        def install(eng):
+            eng._search = outcome
+        return install
+
+    with _roster_test_fixture() as f:
+        def spawn(session, name):
+            return {"type": "user", "uuid": f"spawn-{name}", "parentUuid": f"{session}-root",
+                    "isSidechain": False, "sessionId": session, "agentName": "team-lead",
+                    "teamName": "T", "timestamp": "2026-01-01T00:00:01Z",
+                    "message": {"role": "user", "content": []},
+                    "toolUseResult": {"status": SPAWN_MARKER, "name": name, "team_name": "T",
+                                      "agent_id": agent_id_of(name, "T")}}
+
+        f.transcript("lead", "team-lead", "T", (spawn("lead", "worker"),))
+        f.transcript("plain", "steady", "T")
+        # A spawn record in a sidechain transcript: only the path keeps it out.
+        side = f.project / "lead" / SEARCH_SKIPPED_DIR / "agent-side.jsonl"
+        side.parent.mkdir(parents=True)
+        side.write_text(fixture_line(spawn("lead", "ghost")) + "\n")
+
+        # The spawn readers are asked here, in the unit itself, since
+        # spawn-payload-one-lookup counts any other function that asks them.
+        evidence = {}
+        for label, prepare in (("completed", None),
+                               ("each search fails", everywhere(failed)),
+                               ("each search is ended by a signal", everywhere(signalled)),
+                               ("the searcher cannot start", everywhere(unstartable)),
+                               ("the line search fails", only("lines", failed)),
+                               ("the file search fails", only("files", failed))):
+            eng = _roster_cold_engine(f)
+            if prepare is not None:
+                prepare(eng)
+            with capturing("err"):
+                evidence[label] = (dict(eng._spawn_by_agent()),
+                                   {team: [str(path) for _stamp, path in rows]
+                                    for team, rows in eng._led_teams().items()})
+        completed = evidence.pop("completed")
+        differ = sorted(label for label, answer in evidence.items() if answer != completed)
+        present = (agent_id_of("worker", "T") in completed[0]
+                   and agent_id_of("ghost", "T") not in completed[0])
+        checked.append(_check_verdict(
+            'spawn-evidence-falls-back-when-the-search-fails', present and not differ,
+            f"differ: {differ}, completed: {sorted(completed[0])}"))
+
+    with _roster_test_fixture() as f:
+        mid = f.project / "mid.jsonl"
+        mid.write_text("\n".join([
+            _census_padding("head"),
+            fixture_line({"type": "user", "uuid": "mid-stamp", "parentUuid": None,
+                          "sessionId": "mid", "agentName": "worker", "teamName": "T",
+                          "timestamp": "2026-01-01T00:00:00Z"}),
+            _census_padding("tail"),
+        ]) + "\n")
+
+        def lookup(prepare=None):
+            eng = _roster_cold_engine(f)
+            if prepare is not None:
+                prepare(eng)
+            with capturing("err"):
+                return [path for path, _fields, _ts in eng._stamped_candidates("worker", "T")]
+
+        found = {"both searches complete": lookup(),
+                 "the team filter fails": lookup(only('"teamName"', failed)),
+                 "the first search fails": lookup(only('"agentName"', failed))}
+        indexed = mid in _roster_cold_engine(f)._stamp_index()
+        checked.append(_check_verdict(
+            'stamp-lookup-keeps-candidates-when-the-team-filter-fails',
+            not indexed and all(paths == [mid] for paths in found.values()),
+            f"indexed={indexed}, found={ {label: [p.name for p in paths] for label, paths in found.items()} }"))
+
+    resolver = next(node for node in s.tree.body
+                    if isinstance(node, s.ast.ClassDef) and node.name == "Resolver")
+    searching = set()
+    for method in resolver.body:
+        if not isinstance(method, s.ast.FunctionDef):
+            continue
+        for node in s.ast.walk(method):
+            if isinstance(node, s.ast.Call):
+                spelled = (node.func.attr if isinstance(node.func, s.ast.Attribute)
+                           else getattr(node.func, "id", None))
+                if spelled == "_search":
+                    searching.add(method.name)
+    checked.append(_check_verdict(
+        'literal-searches-share-one-failure-rule', searching == {"_literal_search"},
+        f"Resolver methods that run a search: {sorted(searching)}"))
+
+    with tempfile.TemporaryDirectory(prefix=f"{TOOL}-batches-") as td:
+        projects = Path(td) / "projects" / "corpus"
+        projects.mkdir(parents=True)
+        files = []
+        for index in range(7):
+            path = projects / f"file-{index}.jsonl"
+            path.write_text((_census_fixture_line(f"mover{index}", "T", "D") if index % 2 == 0
+                             else fixture_line({"type": "user", "uuid": f"plain-{index}"})) + "\n")
+            files.append(path)
+        literal = _record_type_literal(RESTAMP_RECORD)
+        budget = 3 * (len(os.fsencode(files[0])) + 9)
+
+        def engine():
+            eng = Resolver(needs=Needs(maybe=set(NEED)))
+            eng._projects_dir, eng._teams_dir = projects.parent, Path(td) / "teams"
+            return eng
+
+        def run(small, ask):
+            eng, runs, read = engine(), [], []
+            real_search, real_read = eng._search, eng._restamp_in_file
+            eng._search = lambda kind, needle, paths, recursive: (
+                runs.append(list(paths)), real_search(kind, needle, paths, recursive))[1]
+            eng._restamp_in_file = lambda path: read.append(Path(path)) or real_read(path)
+            with mock.patch.dict(globals(), {"SEARCH_ARGV_BUDGET": budget} if small else {}):
+                answer = ask(eng)
+            return answer, runs, sorted(read)
+
+        whole = {kind: run(False, lambda eng, kind=kind: eng._literal_search(kind, literal, files, False))
+                 for kind in ("files", "lines")}
+        split = {kind: run(True, lambda eng, kind=kind: eng._literal_search(kind, literal, files, False))
+                 for kind in ("files", "lines")}
+        census = [run(small, lambda eng: eng._record_census(RESTAMP_RECORD, eng._restamp_in_file))
+                  for small in (False, True)]
+        runs = split["files"][1]
+        facts = {
+            "the answer is not empty": bool(whole["files"][0]) and bool(whole["lines"][0]),
+            "the runs answer what one search answers":
+                all(sorted(split[kind][0]) == sorted(whole[kind][0]) for kind in whole),
+            "one search ran without the small budget": len(whole["files"][1]) == 1,
+            "more than one search ran within the small budget": len(runs) > 1,
+            "each run fits the budget":
+                all(sum(len(os.fsencode(path)) + 9 for path in run_paths) <= budget
+                    for run_paths in runs),
+            "each file is searched once, in order":
+                [path for run_paths in runs for path in run_paths] == files,
+            "the census gives the same answer and reads the same files":
+                (dict(census[0][0]["records"]) == dict(census[1][0]["records"])
+                 and census[0][0]["scope"] == census[1][0]["scope"]
+                 and census[0][2] == census[1][2] and len(census[1][1]) > 1),
+        }
+        wrong = sorted(fact for fact, ok in facts.items() if not ok)
+        checked.append(_check_verdict('literal-search-splits-long-file-lists', not wrong,
+                                      "; ".join(wrong) + f"; runs={[len(r) for r in runs]}"))
+    return checked
+
+
+@unit(
+    ('resolver-rewriter-edges-are-exact',
+     'the Resolver reaches the TranscriptRewriter only through conversion_plan and restamp_plan'),
+)
+def _check_resolver_rewriter_edges(s):
+    # Read from the Resolver's own syntax: an attribute taken from
+    # self._rewriter or from the TranscriptRewriter class is an edge, and
+    # another use of either, or a string naming either as getattr or globals()
+    # would take it, is reported, since it can reach a method this list does
+    # not show. The constructor that builds self._rewriter is the one
+    # exception. A route through a module function is outside this reading;
+    # resolver-evidence-reads-do-not-run-rewriter-code watches the calls instead.
+    ast = s.ast
+    resolver = next(node for node in s.tree.body
+                    if isinstance(node, ast.ClassDef) and node.name == "Resolver")
+    parents = {child: node for node in ast.walk(resolver)
+               for child in ast.iter_child_nodes(node)}
+    edges, unresolved = set(), []
+    for node in ast.walk(resolver):
+        holder = parents.get(node)
+        if isinstance(node, ast.Attribute) and node.attr == "_rewriter":
+            self_held = isinstance(node.value, ast.Name) and node.value.id == "self"
+            if self_held and isinstance(holder, ast.Attribute) and holder.value is node:
+                edges.add(holder.attr)
+            elif not (self_held and isinstance(holder, ast.Assign) and node in holder.targets
+                      and isinstance(holder.value, ast.Call)
+                      and isinstance(holder.value.func, ast.Name)
+                      and holder.value.func.id == "TranscriptRewriter"):
+                unresolved.append(f"line {node.lineno}: _rewriter is used other than as "
+                                  "self._rewriter.<attribute>")
+        elif isinstance(node, ast.Name) and node.id == "TranscriptRewriter":
+            if isinstance(holder, ast.Attribute) and holder.value is node:
+                edges.add(holder.attr)
+            elif not (isinstance(holder, ast.Call) and holder.func is node and not holder.args):
+                unresolved.append(f"line {node.lineno}: TranscriptRewriter is used other than "
+                                  "by an attribute")
+        elif isinstance(node, ast.Constant) and node.value in ("_rewriter", "TranscriptRewriter"):
+            unresolved.append(f"line {node.lineno}: the string {node.value!r} can name it")
+    allowed = {"conversion_plan", "restamp_plan"}
+    told = ([f"an edge outside the allowed ones: {edge}" for edge in sorted(edges - allowed)]
+            + [f"an allowed edge that is gone: {edge}" for edge in sorted(allowed - edges)]
+            + unresolved)
+    return [_check_verdict('resolver-rewriter-edges-are-exact', not told, "; ".join(told))]
+
+
+def _rewriter_code_objects():
+    """The code objects defined in the TranscriptRewriter class body, nested ones included."""
+    found, pending = set(), []
+    for value in vars(TranscriptRewriter).values():
+        code = getattr(getattr(value, "__func__", value), "__code__", None)
+        if code is not None:
+            pending.append(code)
+    while pending:
+        code = pending.pop()
+        if code not in found:
+            found.add(code)
+            pending.extend(const for const in code.co_consts if isinstance(const, types.CodeType))
+    return found
+
+
+@unit(
+    ('resolver-evidence-reads-do-not-run-rewriter-code',
+     'the Resolver reads stamps, receipts and restamps without running TranscriptRewriter code, '
+     'mapping a file or keeping one open'),
+)
+def _check_resolver_evidence_reads_outside_rewriter_code(s):
+    # Watches what runs rather than what is named: a profile hook records the
+    # calls into TranscriptRewriter code, and open, os.open and mmap.mmap
+    # record the files the reads open, each with whether a TranscriptRewriter
+    # frame is on the stack. A method with a writer's name that reads evidence is still a
+    # TranscriptRewriter frame. A planned restamp runs under the same hooks
+    # first, so the hooks are shown to see the TranscriptRewriter reading.
+    import builtins
+    import mmap as mmap_module
+    from unittest import mock
+    codes = _rewriter_code_objects()
+
+    def rewriter_frame():
+        frame = sys._getframe(2)
+        while frame is not None:
+            if frame.f_code in codes:
+                return getattr(frame.f_code, "co_qualname", frame.f_code.co_name)
+            frame = frame.f_back
+        return None
+
+    def watched(run):
+        ran, opened, handles, mapped = [], [], [], []
+        real_open, real_os_open, real_mmap = builtins.open, os.open, mmap_module.mmap
+
+        def opening(file, *args, **kwargs):
+            handle = real_open(file, *args, **kwargs)
+            opened.append((str(file), rewriter_frame()))
+            handles.append(handle)
+            return handle
+
+        def os_opening(file, *args, **kwargs):
+            opened.append((str(file), rewriter_frame()))
+            return real_os_open(file, *args, **kwargs)
+
+        def mapping(*args, **kwargs):
+            mapped.append(rewriter_frame() or "the Resolver")
+            return real_mmap(*args, **kwargs)
+
+        def profile(frame, event, _arg):
+            if event == "call" and frame.f_code in codes:
+                ran.append(getattr(frame.f_code, "co_qualname", frame.f_code.co_name))
+
+        previous = sys.getprofile()
+        with mock.patch.object(builtins, "open", opening), mock.patch.object(io, "open", opening), \
+                mock.patch.object(os, "open", os_opening), \
+                mock.patch.object(mmap_module, "mmap", mapping), capturing("err"):
+            sys.setprofile(profile)
+            try:
+                run()
+            finally:
+                sys.setprofile(previous)
+        return ran, opened, handles, mapped
+
+    told = []
+    with _roster_test_fixture() as f:
+        eng = f.engine
+        moving = f.transcript("moving", "mover", "A", (
+            {"type": "last-prompt", "leafUuid": "moving-root", "sessionId": "moving"},))
+        f.config("A", {"name": "A", "members": [{"name": "mover", "agentId": "mover@A"}]})
+        f.config("B", {"name": "B", "members": []})
+        receipt = fixture_receipt(name="member", team="B", dest_stem="promoted", parent="moving",
+                                  task_id="task", root="promoted-root")
+        promoted = f.project / "promoted.jsonl"
+        promoted.write_text(fixture_line({
+            "type": "user", "uuid": "promoted-root", "parentUuid": None, "sessionId": "promoted",
+            "agentName": "member", "teamName": "B", "timestamp": "2026-01-01T00:00:00Z"})
+            + "\n" + TranscriptRewriter._receipt_line(receipt) + "\n")
+        side = f.project / "moving" / "subagents" / "agent-side.jsonl"
+        side.parent.mkdir(parents=True)
+        side.write_text(TranscriptRewriter._receipt_line(receipt) + "\n")
+
+        def control():
+            plan = eng._rewriter.restamp_plan(moving, "B", start=eng._window_start(moving))
+            if plan["objections"] or not plan["proved"]:
+                told.append(f"the control restamp was not planned: {plan['objections']}")
+            control.plan = plan
+
+        ran, opened, handles, mapped = watched(control)
+        seen = [name for path, name in opened if path == str(moving) and name]
+        if not ran or not seen:
+            told.append(f"the hooks did not see the control: ran {ran[:3]}, opened {opened[:3]}")
+        for handle in handles:
+            handle.close()
+        with capturing("out"):
+            apply_restamp(control.plan)
+
+        # Each read runs on an engine with empty caches, so it reads files.
+        reads = {
+            "the stamp index": lambda cold: cold._stamp_index(),
+            "the receipt census": lambda cold: cold._carried_receipts(),
+            "the restamp census":
+                lambda cold: cold._record_census(RESTAMP_RECORD, cold._restamp_in_file),
+            "the durable assignment index": lambda cold: cold._durable_assignment_index(),
+            "a side transcript's receipt": lambda cold: cold._receipt_carried_by(side),
+            "a restamp read outside the census": lambda cold: cold._restamp_carried_by(side),
+            "a terminal receipt": lambda cold: cold._terminal_receipt_in_file(promoted),
+            "a copied prefix": lambda cold: cold._copied_prefix_uuids(promoted),
+            "a window start": lambda cold: cold._window_start(moving),
+            "a stamp since a start": lambda cold: cold._last_stamp(moving, 0),
+            "team membership":
+                lambda cold: cold._team_members("B", (), census=cold._roster_census()),
+        }
+        for label, read in reads.items():
+            cold = _roster_cold_engine(f)
+            ran, opened, handles, mapped = watched(lambda: read(cold))
+            if ran:
+                told.append(f"{label} ran {sorted(set(ran))}")
+            through = sorted({path for path, name in opened if name})
+            if through:
+                told.append(f"{label} opened {through} under a TranscriptRewriter frame")
+            if mapped:
+                told.append(f"{label} mapped a file")
+            if any(not handle.closed for handle in handles):
+                told.append(f"{label} kept a file open")
+                for handle in handles:
+                    handle.close()
+            if not any(path.startswith(str(eng._projects_dir)) for path, _name in opened):
+                told.append(f"{label} did not open a transcript, so the check did not watch it read one")
+        kept = [name for name, value in list(vars(eng._rewriter).items())
+                + list(vars(TranscriptRewriter).items())
+                if isinstance(value, (io.IOBase, mmap_module.mmap))]
+        if kept:
+            told.append(f"the TranscriptRewriter holds open files: {kept}")
+    return [_check_verdict('resolver-evidence-reads-do-not-run-rewriter-code', not told,
+                           "; ".join(told))]
+
+
+@unit(
+    ('backward-lines-match-a-forward-split',
+     'the backward line reader yields the pieces a forward split gives, last first, and refuses '
+     'a file that shrinks'),
+    ('backward-lines-read-and-split-each-byte-once',
+     'the backward line reader reads and splits each byte once, in reads of SCAN_BLOCK bytes'),
+)
+def _check_backward_line_reader(s):
+    checked = []
+    block = SCAN_BLOCK
+    cases = {
+        "an empty file": b"",
+        "one line without a newline": b'{"a":1}',
+        "one line and its newline": b'{"a":1}\n',
+        "blank lines": b"\n\n\n",
+        "CRLF lines": b"a\r\nb\r\n",
+        "a newline that starts a block": b"a" * 10 + b"\n" + b"b" * (block - 1),
+        "a newline that ends a block": b"a" * 10 + b"\n" + b"b" * block,
+        "a line longer than three blocks": b"x" * (3 * block + 17) + b"\nend",
+        "only newlines across a block": b"\n" * (block + 3),
+        "many short lines across blocks": b"".join(b"%d\n" % number for number in range(60000)),
+        "long and short lines across blocks": b"\n".join(
+            b"y" * (block // 2 + number * 997) for number in range(7)),
+    }
+    told = []
+    with tempfile.TemporaryDirectory(prefix=f"{TOOL}-backward-") as td:
+        target = Path(td) / "lines.jsonl"
+        for label, data in cases.items():
+            target.write_bytes(data + b"tail that the size leaves out")
+            with target.open("rb") as handle:
+                got = list(_lines_backward(handle, len(data)))
+            expected = list(reversed(data.split(b"\n")))
+            if got != expected:
+                told.append(f"{label}: {len(got)} pieces, expected {len(expected)}")
+        long_lines = [data for data in cases.values() if any(len(piece) > block
+                                                               for piece in data.split(b"\n"))]
+        if not long_lines:
+            told.append("the cases do not include a line longer than a block")
+        target.write_bytes(b"z\n" * block)
+        with target.open("rb") as handle:
+            lines = _lines_backward(handle, 2 * block)
+            next(lines)
+            os.truncate(target, block // 2)
+            try:
+                list(lines)
+                told.append("a file that shrank during the read did not raise OSError")
+            except OSError:
+                pass
+        checked.append(_check_verdict('backward-lines-match-a-forward-split', not told,
+                                      "; ".join(told)))
+
+        reads, splits = [], []
+
+        class Counted(bytes):
+            def split(self, *args, **kwargs):
+                splits.append(len(self))
+                return bytes.split(self, *args, **kwargs)
+
+        class Watched:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def seek(self, at):
+                return self.handle.seek(at)
+
+            def read(self, count):
+                reads.append(count)
+                return Counted(self.handle.read(count))
+
+        data = cases["long and short lines across blocks"] + b"\n" + cases["a line longer than three blocks"]
+        target.write_bytes(data)
+        with target.open("rb") as handle:
+            got = list(_lines_backward(Watched(handle), len(data)))
+        expected_reads = -(-len(data) // block)
+        facts = {
+            "the pieces are a forward split's": got == list(reversed(data.split(b"\n"))),
+            f"{expected_reads} reads of at most SCAN_BLOCK bytes":
+                len(reads) == expected_reads and max(reads) <= block,
+            "each byte is read once": sum(reads) == len(data),
+            "each byte is split once": sum(splits) == len(data),
+        }
+        wrong = sorted(fact for fact, ok in facts.items() if not ok)
+        checked.append(_check_verdict(
+            'backward-lines-read-and-split-each-byte-once', not wrong,
+            "; ".join(wrong) + f"; reads={len(reads)} of {sum(reads)} bytes, split {sum(splits)} "
+            f"bytes, file {len(data)} bytes"))
+    return checked
+
+
+@unit(
+    ('restamp-source-row-is-historical',
+     'a roster row is historical when a restamp moved its agent id away and the assignments do '
+     'not hold it: after one move with the row inactive, active or without isActive, at the start '
+     'of a chain of moves, and for the source row of a lead migration'),
+    ('restamp-chain-middle-row-stays-current',
+     'the middle team of a chain of moves keeps its row current, because a second restamp keeps '
+     'the first identity as old; this check fails once the restamp record keeps each identity '
+     'the conversation left'),
+    ('shared-name-row-stays-current',
+     'a team-lead row without an assignment of its own while other leads have one, and a member '
+     'name reused in another team without a restamp, stay current'),
+    ('row-held-here-stays-current',
+     'a row stays current while an assignment holds its agent id, even when a restamp moved '
+     'another conversation away from that id'),
+    ('restamp-only-transcript-is-classified',
+     'a transcript that only its restamp record assigns, stamped far from both ends and without '
+     'a receipt, makes its source row historical'),
+)
+def _check_assignment_membership(s):
+    ids = ('restamp-source-row-is-historical', 'restamp-chain-middle-row-stays-current',
+           'shared-name-row-stays-current', 'row-held-here-stays-current',
+           'restamp-only-transcript-is-classified')
+    faults = {cid: [] for cid in ids}
+
+    def answer(f, team):
+        eng = f.engine
+        return eng._team_members(team, (), census=eng._roster_census())
+
+    def order(f, team):
+        return answer(f, team)["member_order"]
+
+    # A current row is in the answer with its roster entry. A name the answer
+    # takes from an assignment alone is not the row staying current.
+    def row_kept(f, team, name):
+        record = answer(f, team)["by_name"].get(name)
+        return record is not None and record["roster_member"] is not None
+
+    def conversation(f, session, name, team):
+        return f.transcript(session, name, team, (
+            {"type": "last-prompt", "leafUuid": f"{session}-root", "sessionId": session},))
+
+    def move(f, path, team):
+        eng = f.engine
+        plan = eng._rewriter.restamp_plan(path, team, start=eng._window_start(path))
+        if plan["objections"] or not plan["proved"]:
+            raise ValueError(f"fixture restamp of {path.name} to {team}: {plan['objections']}")
+        with capturing("out"), capturing("err"):
+            apply_restamp(plan)
+
+    def roster(f, team, row, lead_session=None):
+        f.config(team, {"name": team, **({"leadSessionId": lead_session} if lead_session else {}),
+                        "members": [row]})
+
+    for label, flag in (("inactive", {"isActive": False}), ("active", {"isActive": True}),
+                        ("without isActive", {})):
+        with _roster_test_fixture() as f:
+            path = conversation(f, "moving", "mover", "T")
+            roster(f, "T", {"name": "mover", "agentId": "mover@T", **flag})
+            roster(f, "D", {"name": "mover", "agentId": "mover@D", "isActive": False})
+            move(f, path, "D")
+            orders = {team: order(f, team) for team in ("T", "D")}
+            if "mover" in orders["T"] or "mover" not in orders["D"]:
+                faults['restamp-source-row-is-historical'].append(
+                    f"one move, source row {label}: {orders}")
+
+    with _roster_test_fixture() as f:
+        path = conversation(f, "moving", "mover", "T")
+        for team in ("T", "M", "D"):
+            roster(f, team, {"name": "mover", "agentId": f"mover@{team}", "isActive": False})
+        move(f, path, "M")
+        move(f, path, "D")
+        moved = f.engine._durable_assignment_index()["by_moved_from"]
+        orders = {team: order(f, team) for team in ("T", "M", "D")}
+        if "mover" in orders["T"] or "mover" not in orders["D"]:
+            faults['restamp-source-row-is-historical'].append(f"chain T, M, D: {orders}")
+        # restamp_plan keeps the first identity as old, so the record does not name M.
+        if not row_kept(f, "M", "mover") or "mover@M" in moved or "mover@T" not in moved:
+            faults['restamp-chain-middle-row-stays-current'].append(
+                f"chain T, M, D: {orders}, moved from {sorted(moved)}")
+
+    with _roster_test_fixture() as f:
+        f.transcript("lead-c", "team-lead", "C")
+        roster(f, "C", {"name": "team-lead", "agentId": "team-lead@C"}, "lead-c")
+        plan, _path = _restamp_test_plan(f, lead=True)
+        with capturing("out"), capturing("err"):
+            lead_rebind(plan, _Run(dry_run=False, force=True, yes=True, no_attach=True))
+        leads = sorted(record["agent_id"] for record in
+                       f.engine._durable_assignment_index()["by_name"].get("team-lead", ()))
+        if "team-lead" in order(f, "A") or len(set(leads) - {"team-lead@A"}) < 2:
+            faults['restamp-source-row-is-historical'].append(
+                f"lead migration from A: A {order(f, 'A')}, lead assignments {leads}")
+
+    with _roster_test_fixture() as f:
+        f.transcript("lead-x")
+        for team in ("Y", "Z"):
+            f.transcript(f"lead-{team.lower()}", "team-lead", team)
+        for team in ("X", "Y", "Z"):
+            roster(f, team, {"name": "team-lead", "agentId": f"team-lead@{team}"},
+                   f"lead-{team.lower()}")
+        f.transcript("worker-q", "worker", "Q")
+        roster(f, "P", {"name": "worker", "agentId": "worker@P"})
+        roster(f, "Q", {"name": "worker", "agentId": "worker@Q"})
+        assigned = f.engine._durable_assignment_index()["by_agent"]
+        present = all(agent in assigned for agent in ("team-lead@Y", "team-lead@Z", "worker@Q"))
+        absent = not any(agent in assigned for agent in ("team-lead@X", "worker@P"))
+        if not (present and absent):
+            faults['shared-name-row-stays-current'].append(
+                f"the fixture's assignments are not the ones described: {sorted(assigned)}")
+        if not row_kept(f, "X", "team-lead") or not row_kept(f, "P", "worker"):
+            faults['shared-name-row-stays-current'].append(
+                f"X {order(f, 'X')}, P {order(f, 'P')}")
+
+    with _roster_test_fixture() as f:
+        first = conversation(f, "first", "mover", "T")
+        f.transcript("second", "mover", "T")
+        roster(f, "T", {"name": "mover", "agentId": "mover@T", "isActive": False})
+        roster(f, "D", {"name": "mover", "agentId": "mover@D", "isActive": False})
+        move(f, first, "D")
+        index = f.engine._durable_assignment_index()
+        if "mover@T" not in index["by_moved_from"] or "mover@T" not in index["by_agent"]:
+            faults['row-held-here-stays-current'].append(
+                f"the fixture does not hold both: moved from {sorted(index['by_moved_from'])}, "
+                f"assigned {sorted(index['by_agent'])}")
+        if not row_kept(f, "T", "mover"):
+            faults['row-held-here-stays-current'].append(f"T {order(f, 'T')}")
+
+    with _roster_test_fixture() as f:
+        subject = f.project / "subject.jsonl"
+        subject.write_text("\n".join([
+            _census_padding("head"),
+            fixture_line({"type": "user", "uuid": "subject-mid", "parentUuid": None,
+                          "sessionId": "subject", "agentName": "mover", "teamName": "D",
+                          "timestamp": "2026-01-01T00:00:00Z"}),
+            _census_padding("tail"),
+            _census_fixture_line("mover", "T", "D"),
+        ]) + "\n")
+        roster(f, "T", {"name": "mover", "agentId": "mover@T", "isActive": False})
+        roster(f, "D", {"name": "mover", "agentId": "mover@D", "isActive": False})
+        if subject in f.engine._stamp_index():
+            faults['restamp-only-transcript-is-classified'].append(
+                "the stamp index holds the subject, so the restamp census is not what decides")
+        if "mover" in order(f, "T") or "mover" not in order(f, "D"):
+            faults['restamp-only-transcript-is-classified'].append(
+                f"T {order(f, 'T')}, D {order(f, 'D')}")
+    return [_check_verdict(cid, not faults[cid], "; ".join(faults[cid])) for cid in ids]
 
 
 @unit(('named-lead-still-leads', 'a lead with a name of its own still leads its team'))
@@ -37489,7 +38818,7 @@ def _check_sidechain_not_evidence(s):
         deep = Path(td) / "proj" / "subagents"
         deep.mkdir(parents=True)
         (deep / "agent-x.jsonl").write_text(json.dumps(side) + "\n")
-        hits = RESOLVER._grep_files(SPAWN_MARKER, [Path(td)], True) or []
+        hits = RESOLVER._literal_search("files", SPAWN_MARKER, [Path(td)], True)
         if any("subagents" in p.parts for p in hits):
             leaks.append("the recursive searcher")
 
@@ -37548,7 +38877,7 @@ def _check_search_ignores_rg_config(s):
         os.environ["RIPGREP_CONFIG_PATH"] = str(poison)
         try:
             found = sorted(p.name for p in
-                           RESOLVER._grep_files(SPAWN_MARKER, [Path(td)], True) or [])
+                           RESOLVER._literal_search("files", SPAWN_MARKER, [Path(td)], True))
         finally:
             if was is None:
                 os.environ.pop("RIPGREP_CONFIG_PATH", None)
@@ -37722,7 +39051,7 @@ def _check_conversion_interactive_defaults(s):
             eng = Resolver(needs=Needs(maybe=set(NEED)))
             eng._side_transcript = lambda selector: (entry, "")
             eng._team_for_parent_session = lambda parent: ("CURRENT-TEAM", "fixture parent")
-            eng._rewriter.terminal_receipt_in_file = lambda candidate: None
+            eng._terminal_receipt_in_file = lambda candidate: None
             eng._rewriter.conversion_plan = lambda *a, **kw: immutable({
                 "proved": True, "receipt": {"_emitted": False}, "objections": (),
                 "dest_path": Path(td) / "promoted.jsonl",
@@ -37745,7 +39074,7 @@ def _check_conversion_interactive_defaults(s):
                   f"explicit={dict(explicit['identity'])}")
 
             old = {"direction": "demote", "name": "from-meta", "team": "OLD-TEAM"}
-            eng._rewriter.terminal_receipt_in_file = lambda candidate: old
+            eng._terminal_receipt_in_file = lambda candidate: old
             sys.stdin = types.SimpleNamespace(isatty=lambda: True)
             prompts = []
             globals()["input"] = lambda prompt="": prompts.append(prompt) or "n"
@@ -38167,9 +39496,9 @@ def _check_conversion_proves_inverse(s):
                           "sessionId": "cv-root"}),
         ]
         grown.write_text("\n".join(grown_lines) + "\n")
-        if eng._rewriter.terminal_receipt_in_file(grown) is not None:
+        if eng._terminal_receipt_in_file(grown) is not None:
             faults.append("a historical receipt was mistaken for the final action")
-        if moved_side.exists() and eng._rewriter.terminal_receipt_in_file(moved_side) is None:
+        if moved_side.exists() and eng._terminal_receipt_in_file(moved_side) is None:
             faults.append("a receipt on the final line was not recognized as the final action")
         expected_carried = TranscriptRewriter.carried_receipt([
             eng._rewriter._receipt_line(plan["receipt"])])
@@ -40060,7 +41389,7 @@ def _check_restamp_window_start(s):
                     "new": {"teamName": "NEW", "agentName": "mate"}}}) + "\n" +
                 fixture_line({"type": "mode", "mode": "plan"}) + "\n")
             multi_plan = restamp(multi, "FAR")
-            multi_last = TranscriptRewriter._last_record_at(
+            multi_last = _last_record_at(
                 multi_plan.get("lines") or [], RESTAMP_RECORD, "restamp")[0]
             if not multi_plan.get("proved") or (multi_last or {}).get("old", {}).get(
                     "teamName") != "OLD" or (multi_last or {}).get("new", {}).get(
@@ -40087,8 +41416,7 @@ def _check_restamp_window_start(s):
             # retire it: the reverse scan still selects and consumes it.
             if provable(plan, "the first restamp did not apply"):
                 apply_restamp(plan)
-                stored = eng7._rewriter._last_record_in_file(
-                    target, RESTAMP_RECORD, "restamp")
+                stored = eng7._restamp_in_file(target)
                 if (stored or {}).get("old", {}).get("teamName") != "OLD":
                     stray.append("the in-file receipt did not record the old value")
                 if list(Path(td).rglob("*.restamp.json")):
@@ -45917,7 +47245,7 @@ def _check_conversion_cache_lifetimes(s):
                     before = read(eng, source, dest)
                     old_stamps = dict(before["stamps"])
                     old_assignments = before["assignments"]["records"]
-                    old_receipts = eng._receipts
+                    old_receipts = eng._carried_receipts()
                     old_receipt_values = dict(old_receipts)
                     real_refresh, real_write = eng.refresh_transcript_evidence, write_new_bytes
                     real_open, real_fsync = os.open, os.fsync

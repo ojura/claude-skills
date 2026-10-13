@@ -182,9 +182,13 @@ remain registered under the previous team. Rebinding relaunches the member with
 the destination identity, stops any process still holding the transcript,
 registers the destination roster entry, and marks the source entry inactive.
 The source row and its original metadata are preserved with `isActive` set to
-`false`; the destination row becomes the current assignment. The inactive source
-row does not enter ordinary selection, completion, or team-run population for
-the source team.
+`false`; the destination row becomes the current assignment. When the move
+restamps the conversation, the restamp record names the source identity as the
+one the conversation left, and the source row leaves the source team's
+selection, completion and team runs while that identity is not assigned to a
+transcript; `isActive` does not decide it. After a chain of moves from T
+through M to D, the row in M stays in M's population, because the restamp
+record keeps only the first identity, T.
 
 `live` derives the destination from spawn records written since the current
 process started. A lead resumed several times writes the records of several

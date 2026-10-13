@@ -296,8 +296,7 @@ cyan task-assignment rendering, not a teal transport frame and not a UDS receipt
 Every JSONL line records `sessionKind`. Teammate processes also record
 `agentName` and `teamName`; leader records carry session identity alone. A
 record's `agentName` and `teamName` are its stamp: the record is stamped with
-the team its `teamName` names, and restamping a transcript rewrites those two
-fields in its records. These fields control two behaviors:
+the team its `teamName` names. These fields control two behaviors:
 
 - The /resume picker reads metadata from the **first line**. A session created
   as a bg fork therefore keeps the `bg` badge across interactive resumes, while
@@ -310,6 +309,13 @@ fields in its records. These fields control two behaviors:
   teammate path. `isAgentSwarmsEnabled` activates identity-flag binding in
   2.1.220 and 2.1.226. Every exec and pane launch therefore carries `TEAM_ENV`
   inline, independent of the invoking shell's environment.
+
+Restamping a transcript rewrites the stamp of the record at its window start,
+which decides the team a resume comes back as, and appends an
+`agent-resume-restamp` record naming the identity the conversation had before
+its first restamp (`old`) and the one it has now (`new`). A later restamp
+replaces that record and keeps the first `old`; a restamp back to that
+identity removes it.
 
 ### The team a live process operates as
 
@@ -334,25 +340,29 @@ objections, and a parent's team for promotion. Lines and spawn payloads the
 process wrote after it started decide, and only that answer is exact; the lines
 written after the process started come from it only if it is the only live
 holder of its transcript. Those lines are read backward from the end of the
-transcript, stopping at the first record written before the process started, so
-a long conversation costs only what was written since; the window start, which
-takes a walk of the whole transcript, is read only when the mount rule is
-needed. Spawns written by earlier processes on the same transcript are not
-evidence about the current one. Without such lines the mount rule is applied to
-whether each candidate config could have loaded when the process started: yes
-when the config parses now and its bytes or its `createdAt` predate the start,
-no when its `createdAt` is later than the start by more than
-`TEAM_MINT_WINDOW_MS`, and unknown otherwise, including a config absent or
-unparsable now, which may have loaded and been removed since. A config created
-after the start is a new one, and an earlier config of the team may have been
-there at the mount: when this tool's reap receipt for the team shows it retired
-the team after the process started, the answer is unknown rather than no. A
-process without an argv team, and without a stamped team that loaded when it
-started, takes an implicit team created within `TEAM_MINT_WINDOW_MS` before it
-started, when it is the only process that started that soon after the team was
-created and the team is the only one it could have created in that time. These
-answers are inferred. When the evidence does not decide, the answer leaves the
-team unknown and lists the teams still open. The start time comes from the
+transcript, and the last stamped line in file order written after the process
+started decides. File order is not timestamp order: Claude Code appends records
+with older timestamps, such as the summary and commands a compaction writes
+after its boundary record, attachments, and blocks of earlier records. The read
+therefore continues past an older record, to the start of the file when the
+process has not written a stamped line yet, and parses only lines that contain
+`teamName`. The window start, which takes a walk of the whole transcript, is
+read only when the mount rule is needed. Spawns written by earlier processes on
+the same transcript are not evidence about the current one. Without such lines
+the mount rule is applied to whether each candidate config could have loaded
+when the process started: yes when the config parses now and its bytes or its
+`createdAt` predate the start, no when its `createdAt` is later than the start
+by more than `TEAM_MINT_WINDOW_MS`, and unknown otherwise, including a config
+absent or unparsable now, which may have loaded and been removed since. A config
+created after the start is a new one, and an earlier config of the team may have
+been there at the mount: when this tool's reap receipt for the team shows it
+retired the team after the process started, the answer is unknown rather than
+no. A process without an argv team, and without a stamped team that loaded when
+it started, takes an implicit team created within `TEAM_MINT_WINDOW_MS` before
+it started, when it is the only process that started that soon after the team
+was created and the team is the only one it could have created in that time.
+These answers are inferred. When the evidence does not decide, the answer leaves
+the team unknown and lists the teams still open. The start time comes from the
 kernel, read from `/proc/<pid>/stat` and `/proc/uptime`, with the session
 registry's `startedAt` as the fallback.
 
@@ -669,6 +679,20 @@ check, so repeated absent-team queries reuse their complete answer too.
 member-answer identity. A change to another roster can change lead inference,
 which is why the selected team's generation alone cannot identify these inputs.
 
+The durable assignment index holds at most one assignment for each transcript in
+the stamp index or in either record census: the restamp record's `new` identity,
+else the conversion receipt's, else the indexed stamp pair, when that names both
+an agent and a team. A roster row is historical when a restamp record names the
+row's agent id as the identity its conversation left (`old`) and the durable
+assignments do not hold that agent id now. A historical row is not in the team's
+current member order, which completion, the doctor and team runs read.
+`isActive`, how many teams a name appears in and when either roster was written
+do not decide it, and an assignment of the same name in another team does not
+decide it either: a team's lead is always named `team-lead`, and member names
+repeat across teams. Because a later restamp keeps the first `old`, after a
+chain of moves from T through M to D only T's row is historical, and M's row
+stays current until the restamp record keeps each identity a conversation left.
+
 `_update_census` inserts, replaces, or removes a record by its physical config
 path. It preserves unrelated order and identity and returns the original tuple
 for a no-op. Previews and accepted rebuild effects use this operation.
@@ -688,16 +712,24 @@ Subsequent readers reconstruct evidence through their existing loaders.
 
 | Event | Caches discarded |
 |---|---|
-| Transcript | `_stamps`, `_carried`, `_carried_scope`, `_receipts`, `_spawns`, `_spawn_log`, `_by_agent`, `_by_team`, `_team_assignments`, `_transcript_facts`, `_transcript_snapshots`, `_copied_prefixes` |
+| Transcript | `_stamps`, `_census`, `_spawns`, `_spawn_log`, `_by_agent`, `_by_team`, `_team_assignments`, `_transcript_facts`, `_transcript_snapshots`, `_copied_prefixes` |
 | Process | `_procs`, `_seat_table`, `_seats`, `_registry` |
 | Either | `_runtime_table`, `_runtime_snapshot`, `_team_member_answers`, `_team_descriptions`, `_operating_answers` |
-| Never | `_terminal`, `_boot_time` |
+| Never | `_record_reads`, `_assignment_rows`, `_terminal`, `_boot_time` |
 
 The active `_process_table(refresh=True)` uses this registry. Transcript writers
 call `refresh_transcript_evidence`. The two events do not reset configured
 directories, `_needs`, `_exercised`, the cache-free rewriter, or previously
 selected answers. This responds to this command's writes, not arbitrary external
 transcript edits.
+
+`_record_reads` and `_assignment_rows` keep per-transcript results across both
+events. Each entry holds the generation of the file it was built from (device,
+inode, size and modification time), and a reader uses the entry only while the
+file still has that generation; an assignment row also needs the same stamp
+pair and the same receipt and restamp record objects. A census after a refresh
+therefore reads only the transcripts written since, and an unchanged
+transcript keeps its record objects.
 
 `apply_restamp` refreshes immediately after atomic replacement succeeds, before
 member or lead completion can refuse. Atomic writers capture and validate the
@@ -1027,7 +1059,11 @@ either condition.
 reverse conversion restores the source bytes. Resolver passes the selected
 identity, parent, side grammar, mailbox, destination, collision, and generation
 facts to the rewriter. The rewriter does not query Resolver or inspect Resolver
-paths. Module-level commands do not reach through `RESOLVER.rewriter`; promotion,
+paths. Resolver calls it for two plans, `conversion_plan` and `restamp_plan`. An
+AST check holds the Resolver class to those two attributes, and a second check
+runs the Resolver's stamp, receipt and restamp reads under a profile hook and
+fails when one of them runs rewriter code, maps a file or leaves one open.
+Module-level commands do not reach through `RESOLVER.rewriter`; promotion,
 demotion, restamping, and archive executors use their selected operation plans.
 
 A mailbox records messages waiting on disk and is pruned when a busy recipient
@@ -1039,12 +1075,46 @@ questions and carry separate evidence.
 Conversion receipts are versioned, tool-written evidence carried by the
 converted transcript. Resolver reads them to recover team membership, copied
 parent-record ownership, and the intentional identity assigned by promotion.
-The corpus census retains the main transcript paths it examined, so a path
-without a matching receipt is a known absence until transcript evidence is
-invalidated. A new path or one outside that census still receives direct receipt
-validation. Ordinary later stamps and roster observations do not silently
-replace the assigned identity. An explicit complete identity or an intentional
-move can replace it.
+Restamp records are the evidence of an intentional move. Ordinary later stamps
+and roster observations do not silently replace the assigned identity. An
+explicit complete identity or an intentional move can replace it.
+
+Resolver keeps one census for each of the two record types, receipts and restamp
+records, over the main transcripts (`*/*.jsonl` under the projects directory). A
+census answer maps each transcript that carries the record to its current
+record, lists the transcripts it examined as its scope, and lists apart the ones
+it could not read, which are outside its scope. A transcript in scope without a
+record is a known absence until transcript evidence is invalidated. The
+per-transcript results outlive that invalidation together with the file
+generation they were read at, so the next census reads only transcripts that are
+new or have another generation. Before reading, a census searches those
+transcripts for the compact literal `"type":"<record type>"`
+(`_record_type_literal`) and reads the ones the search lists. A path outside the
+census, such as a side transcript or one written since, is read directly, once
+per file generation.
+
+The Resolver runs each literal search through `_literal_search`, with ripgrep
+when `shutil.which` finds it and with grep otherwise. It passes the files in
+runs that fit `SEARCH_ARGV_BUDGET`, so a long file list stays below the kernel's
+limit on argument bytes. A search completes when it exits with 0 or 1. When it
+cannot start, exits with another code, or is ended by a signal, its output can
+be incomplete, and `_literal_search` answers the whole scope of that run
+instead, with a warning: each file in it, or for a line search each line that
+holds the literal, read directly. So the census reads each transcript it
+examines, the spawn readers read each transcript for spawn records, and the
+stamp lookup keeps the candidates of its first search when its team filter does
+not complete. A recursive search covers the `.jsonl` files under its directories
+and leaves out `subagents/` directories, which hold sidechain transcripts.
+
+The current record of a type is the last line that parses as a JSON object
+with that `type` at the top level and an object in its payload field
+(`_last_record_at`); text that names the type inside another record is not a
+record. The censuses, the direct reads and the rewriter's conversion and
+restamp plans use this one rule, and a receipt counts only when it is the
+current complete schema (`_receipt_objection`). Resolver reads these records
+with its own readers, `_receipt_in_file`, `_restamp_in_file` and
+`_terminal_receipt_in_file`, which read the transcript backward in
+`SCAN_BLOCK` blocks with `_lines_backward`.
 
 Resolution produces one immutable target containing the exact session, canonical
 transcript fact and path, resolved cwd, effective identity and role, provenance,
