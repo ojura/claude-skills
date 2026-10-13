@@ -7808,11 +7808,7 @@ class Resolver:
         return types.MappingProxyType({
             "selection": selection,
             "targets": external,
-            "external_holders": external,
             "self_holders": self_holders,
-            "generation": tuple(
-                self._process_fact_signature(target["process"])
-                for target in external),
             "roster": roster,
             "objection": objection,
         })
