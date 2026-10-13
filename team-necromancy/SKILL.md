@@ -298,10 +298,20 @@ Team-directory removal requires every condition below:
 - the directory is older than 300 seconds, covering the interval between team
   creation and session discovery
 
-Cleanup repeats these checks immediately before deletion and preserves entries
-that appeared between the checks. It removes `config.json` last so an interrupted
-run remains eligible for the next cleanup. Deletion is confined to `teams/` and
-`tasks/`.
+These conditions decide which teams are candidates. Before the first deletion,
+cleanup compares what it selected with the current team directories, task
+directories, roster locks and process table, once for the whole run, and stops
+before the first removal when one of them changed. Then, for each candidate, it
+takes the team's roster lock without waiting and holds it while it compares the
+directory with its selection, renames it, compares the renamed copy, and deletes
+it. A roster write by this tool or by Claude Code needs the same lock, so the
+write either holds the lock first, and the team stays until a later cleanup, or
+finds the lock taken and then the directory gone. When a team's lock is taken
+at that point, the team stays, with a warning on stderr. The process table is
+read once, in the whole-run comparison, so a lead that starts after that
+comparison and before its team's removal does not keep its team. Cleanup
+removes `config.json` last so an interrupted run remains eligible for the next
+cleanup. Deletion is confined to `teams/` and `tasks/`.
 
 For a retained team, the hook removes a regular-file `config.json.lock` when its
 owner record belongs to this tool and names a stopped process. Claude Code uses

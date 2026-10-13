@@ -407,27 +407,46 @@ Cross-process teammates communicate through files:
   retries for about 0.65 seconds (10 retries, from 5 ms to 100 ms), declares an
   unrefreshed lock stale after 10 seconds, and clears stale locks with `rmdir`.
 
-  `agent-resume` uses an exclusive regular file at the same path. The two forms
-  exclude each other through `EEXIST`. A regular-file lock makes `rmdir` return
+  `agent-resume` uses a regular file at the same path. The two forms exclude
+  each other through `EEXIST`. A regular-file lock makes `rmdir` return
   `ENOTDIR`, so `agent-resume --cleanup` owns removal of regular-file leftovers.
   `removeTeamMember`, `setMemberActive`, `setMemberMode`, and
   `removeMemberByAgentId` catch `ENOTDIR` and retain the current roster state.
   `reserveTeammateIdentity` propagates it, so the leftover blocks later spawns.
 
-  Cleanup removes a regular-file lock when its record names a dead owner. A
-  live owner, an unreadable or empty record, and a `proper-lockfile` directory
-  each preserve the team directory. An empty record can result when a process
-  exits between exclusive creation and writing its ownership record; preserving
-  it avoids deleting a lock while its writer may still be alive. An atomic
-  variant can write the record to a temporary file and claim the lock name with
-  a hard link, removing that empty-record interval while keeping the protocol.
+  Each attempt to take the lock writes the owner record (this tool's name, the
+  PID and the process start time) into a new unnamed inode, made with
+  `O_TMPFILE` in the team directory, syncs it, and links it at
+  `config.json.lock` with `linkat` through `/proc/self/fd`, which the tool's
+  process reads already need mounted. The link fails with `EEXIST` when the
+  name is taken, so the name never exists without the complete record, and a
+  run killed before the link leaves the directory as it was. An attempt writes
+  only to its new inode and never opens an existing file, so it cannot change
+  the record of a lock that is already published. On a filesystem without
+  `O_TMPFILE` support the open fails, and membership writes and the sweep's
+  team removal refuse: this is the only way the tool publishes a lock. On
+  release a run removes the lock only while the name still links the inode it
+  holds open. A lock that another run published at the name stays in place, and
+  a lock that was deleted on purpose or moved away with its directory is not
+  warned about.
 
-  Removal compares the record bytes it read with the bytes present immediately
-  before unlinking. This catches another process taking the lock between those
-  two operations. Device and inode identity can repeat after replacement because
+  A run takes a lock over, and cleanup removes one, when its record names this
+  tool and a process that has exited. A live owner, an unreadable or empty
+  record, and a `proper-lockfile` directory each keep the lock and the team
+  directory. An empty record keeps the lock because earlier releases of this
+  tool created the lock before writing the record: a run of such a release may
+  be inside an empty lock now, or may have been killed there.
+
+  Removing a dead owner's lock, for a takeover or in cleanup, compares the
+  record bytes read for the verdict with the bytes present immediately before
+  unlinking. This catches another process taking the lock between those two
+  operations. Device and inode identity can repeat after replacement because
   the filesystem reuses the freed inode immediately, so byte equality is the
-  useful ownership check. Claude Code 2.1.200 and 2.1.226 contain the same
-  locking module apart from minified names; `upstream.md` records the comparison.
+  useful ownership check there. A release compares device and inode instead:
+  the descriptor the run holds keeps its inode allocated, so another file at
+  the name cannot have that inode number. Claude Code 2.1.200 and 2.1.226
+  contain the same locking module apart from minified names; `upstream.md`
+  records the comparison.
 
   In-process teammates use the reservation helper twice: first for a bare
   reservation, then for a patch that sets `tmuxPaneId` and `backendType` to
@@ -558,6 +577,7 @@ reject module calls to private Resolver methods, and require an empty
 | `launch_observation` | `launch_survived` |
 | `launch_plan` | `build` |
 | `lead_migration_plan` | `run_one` |
+| `lock_answer` | `team_lock` |
 | `mail_answer` | `run_mail_ledger` |
 | `member_redirect_plan` | `auto_redirect`, `run_one` |
 | `membership_plan` | `record_membership`, `release_membership`, `reserve_membership`, `restore_member` |
@@ -572,7 +592,7 @@ reject module calls to private Resolver methods, and require an empty
 | `revalidate_launch` | `run_one` |
 | `revalidate_lead_migration` | `lead_rebind` |
 | `revalidate_member_redirect` | `apply_member_migration` |
-| `revalidate_membership` | `apply_membership`, `team_lock` |
+| `revalidate_membership` | `apply_membership` |
 | `revalidate_reap` | `archive_inbox`, `reap_team` |
 | `revalidate_rebuild` | `apply_rebuild_plan` |
 | `revalidate_stop` | `stopped` |
@@ -777,7 +797,8 @@ replace an older invocation's `.bak-agent-resume`; later writes leave it alone.
 This differs from rebuild, which requires an absent invalid-roster backup path.
 Several membership writes are not rolled back as one transaction: a late
 refusal may follow an inbox change or a completed write to the first roster.
-The existing lock publication procedure is unchanged.
+Each roster lock is published and released as "The mailbox and the roster"
+describes.
 
 ### Operation behavior
 
@@ -1048,7 +1069,8 @@ in Resolver:
   occur in Resolver. `roster-read-one-place` keeps roster parsing in one reader.
 - `settings-read-engine-only` assigns settings inspection to Resolver.
 - `proc-read-engine-only` assigns `/proc` reads and signal-0 liveness probes to
-  Resolver.
+  Resolver. The `/proc/self/fd/` path through which `publish_lock` links a lock
+  names a descriptor of the running process and does not read a process.
 - `server-liveness-engine-only` assigns AF_UNIX probes and tmux server, session,
   and client queries to Resolver. `pane-question-engine-only` assigns pane lists
   and pane-identifying environment reads to Resolver. These are separate checks
@@ -1058,8 +1080,9 @@ in Resolver:
 
 The structural checks distinguish reads from actions. `claude_binary` chooses
 an executable. `launch` chooses a tmux command from Resolver's pane answer. A
-cleanup action stages a directory, asks Resolver to check it again, and unlinks
-it. An archive copies roster or mailbox bytes into a receipt before deletion.
+cleanup action takes the team's roster lock, asks Resolver to check the
+directory, stages it, asks again, and unlinks it. An archive copies roster or
+mailbox bytes into a receipt before deletion.
 The installer edits `settings.json`. Process termination asks Resolver to
 confirm exit.
 

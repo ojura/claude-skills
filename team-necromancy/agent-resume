@@ -142,6 +142,7 @@ RECEIPT_KEYS = ("dest_stem", "direction", "graft", "grammar",
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 TEAMS_DIR = CLAUDE_DIR / "teams"
+TASKS_DIR = CLAUDE_DIR / "tasks"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
 # The running process and implicit team-directory name carry the internal session
 # ID. Resolver uses timing only for corroboration when durable identity is absent.
@@ -1853,6 +1854,7 @@ class Resolver:
         self._exercised = set()
         self._teams_dir = TEAMS_DIR   # overridable so a test resolver can read a synthetic tree
         self._projects_dir = PROJECTS_DIR  # same, for the transcript tree
+        self._tasks_dir = TASKS_DIR   # same, for the task directories the sweep removes
         self._rewriter = TranscriptRewriter()
 
     def _exercise(self, need):
@@ -2719,9 +2721,10 @@ class Resolver:
     def _lock_for(self, cfg):
         """Where the lock for this roster lives.
 
-        By roster path rather than by team name: both callers already hold the
-        roster with the lock they are about to take or clear, and the layout is
-        answered here so the callers do not have to spell the filename.
+        By roster path rather than by team name: the engine methods that call
+        it already hold the roster's path, or the team directory it sits in,
+        and the layout is answered here so the callers do not have to spell the
+        filename.
         """
         return cfg.with_name("config.json.lock")
 
@@ -2754,29 +2757,51 @@ class Resolver:
             return None, False, raw
         return owner, not self._pid_alive(owner["pid"], owner["procStart"]), raw
 
-    def _lock_objection(self, lock):
-        """Return the reason a roster lock preserves its team directory.
+    def _lock_objection(self, lock, holder=None):
+        """Return the reason a roster lock is taken, as a sentence that names it.
 
         A `proper-lockfile` directory belongs to Claude Code. A recognized record
-        with a live owner belongs to an active `team_lock` writer. An unreadable or
-        empty regular file may belong to a writer between exclusive creation and
-        ownership-record publication. Each case preserves the directory.
+        with a live owner belongs to a run of this tool that holds the lock. A
+        regular file without a recognized record, an empty one included, is not
+        evidence that its owner is gone: earlier releases of this tool created
+        the lock before writing the record, so a run of such a release may be
+        inside an empty lock now, or may have been killed there. Each of these
+        keeps the lock where it is, and the sweep keeps the team directory
+        around it.
 
-        A recognized record permits cleanup once its owner has exited, because
-        `sweep_dead_lock` can remove that exact regular file. `lock_holder` supplies
-        the shared ownership decision used by roster writes and cleanup.
+        None means the lock is absent or its recognized owner has exited, so
+        `team_lock` may take it over and `sweep_dead_lock` may remove it, each
+        through `drop_lock`. `holder` is what `_lock_holder` read, for a caller
+        that already read it, so the reason and the holder come from one read.
         """
         if lock.is_dir():
             return f"{lock.name} is a directory, which is the harness's own lock on this roster"
-        owner, gone, seen = self._lock_holder(lock)
+        owner, gone, seen = self._lock_holder(lock) if holder is None else holder
         if seen is not None:
             if owner:
                 return None if gone else f"{lock.name} is held by pid {owner['pid']}, which is running"
             return (f"{lock.name} lacks an owner record, so a run of this tool is either "
                     "inside it or was killed inside it")
-        # A missing path permits removal. Sockets, FIFOs, and inaccessible paths
-        # preserve the directory as unexpected entries.
-        return None if not lock.exists() else f"{lock.name} is not a regular file"
+        # An absent path permits removal. Sockets, FIFOs, dangling symlinks and
+        # inaccessible paths keep the lock where it is.
+        return None if not os.path.lexists(lock) else f"{lock.name} is not a regular file"
+
+    def lock_answer(self, lock):
+        """What holds a roster lock, for a run that found the lock's name taken.
+
+        `owner`, `gone` and `seen` are what `_lock_holder` read, and `objection`
+        is the keep rule's sentence about that same read: None once the lock is
+        absent again or its recognized owner has exited.
+        """
+        holder = self._lock_holder(lock)
+        owner, gone, seen = holder
+        return immutable({"owner": owner, "gone": gone, "seen": seen,
+                          "objection": self._lock_objection(lock, holder)})
+
+    def _lock_owner(self):
+        """The owner record this run publishes in each roster lock it takes."""
+        return immutable({"tool": TOOL, "pid": os.getpid(),
+                          "procStart": self._proc_start(os.getpid())})
 
     def _inbox_path(self, team, name):
         """Where this member's mailbox lives."""
@@ -9331,13 +9356,13 @@ class Resolver:
             actions.append(immutable({
                 "team": team,
                 "team_dir": team_dir,
-                "tasks_dir": CLAUDE_DIR / "tasks" / team,
+                "tasks_dir": self._tasks_dir / team,
                 "cfg": cfg,
                 "action": "keep" if reason else "remove",
                 "reason": reason,
                 "generation": self._directory_generation(team_dir),
                 "tasks_generation": self._directory_generation(
-                    CLAUDE_DIR / "tasks" / team),
+                    self._tasks_dir / team),
                 "owned": tuple(path.relative_to(team_dir) for path in mine),
                 "strays": tuple(strays),
                 "lock": immutable({
@@ -9345,6 +9370,10 @@ class Resolver:
                     "seen": seen,
                     "generation": self._path_generation(lock),
                 }),
+                # The owner record the sweep publishes in this team's lock when
+                # it removes the team. It holds the lock from the comparison
+                # before the rename until the directory is gone.
+                "lock_owner": None if reason else self._lock_owner(),
             }))
         sockets = tuple(immutable({
             "path": path,
@@ -9389,16 +9418,34 @@ class Resolver:
             "changed": tuple(changed),
         })
 
-    def revalidate_cleanup_cut(self, action, staged):
-        """Compare one renamed cleanup directory before deleting its contents."""
-        current = self._directory_generation(staged)
-        return immutable({
-            "matches": current == action["generation"],
-            "changed": () if current == action["generation"] else
-                       (f"staged team directory {action['team']}",),
-            "selected": action["generation"],
-            "current": current,
-        })
+    def revalidate_cleanup_cut(self, action, where, held):
+        """Compare one team directory with its cleanup selection, under the sweep's lock.
+
+        `where` is the directory at its own name before the sweep renames it, or
+        the renamed copy after. `held` is the device and inode of the lock the
+        sweep published in it. The selection was read before the sweep published
+        that lock, and linking the lock, or replacing a stale one, changes the
+        directory's modification time and can change its size. So the lock has
+        to be the inode `held` names, and the rest is compared without the
+        lock's row and without those two fields of the directory's own row.
+        """
+        where = Path(where)
+        lock = self._lock_for(self._roster_in(where))
+        try:
+            there = lock.lstat()
+            ours = (there.st_dev, there.st_ino) == tuple(held)
+        except OSError:
+            ours = False
+
+        def compared(generation):
+            return tuple((name, row[:3] if name == "." and row != ("absent",) else row)
+                         for name, row in generation if name != lock.name)
+
+        same = compared(self._directory_generation(where)) == compared(action["generation"])
+        place = "team directory" if where == action["team_dir"] else "staged team directory"
+        changed = (() if ours else (f"roster lock {action['team']}",)) + (
+            () if same else (f"{place} {action['team']}",))
+        return immutable({"matches": not changed, "changed": changed})
 
     @staticmethod
     def _selected_write(original, raw, mode):
@@ -9433,10 +9480,7 @@ class Resolver:
         return immutable({
             **write, "team": roster.team, "roster": roster, "backup": backup,
             "lock": self._lock_for(roster.path),
-            "lock_owner": immutable({
-                "tool": TOOL, "pid": os.getpid(),
-                "procStart": self._proc_start(os.getpid()),
-            }),
+            "lock_owner": self._lock_owner(),
         })
 
     def _complete_rebuild(self, launch, applied):
@@ -9897,11 +9941,9 @@ class Resolver:
             "objections": tuple(objections),
         })
 
-    def revalidate_membership(self, plan, inspect_lock=False, only_team=None,
-                              include_inboxes=True):
+    def revalidate_membership(self, plan, only_team=None, include_inboxes=True):
         """Compare selected roster, backup, and inbox observations before persistence."""
         changed = []
-        locks = []
         for write in plan["writes"]:
             if only_team is not None and write["team"] != only_team:
                 continue
@@ -9911,12 +9953,6 @@ class Resolver:
             backup = write["backup"]
             if backup and self._file_observation(backup["path"]) != backup["original"]:
                 changed.append(f"backup {write['team']}")
-            if inspect_lock:
-                owner, gone, seen = self._lock_holder(write["lock"])
-                locks.append(immutable({
-                    "path": write["lock"], "owner": owner,
-                    "gone": gone, "seen": seen,
-                }))
         if include_inboxes:
             for inbox in plan["inboxes"]:
                 if self._file_observation(inbox["observation"].path) != inbox["observation"]:
@@ -9924,7 +9960,6 @@ class Resolver:
         return immutable({
             "matches": not changed,
             "changed": tuple(changed),
-            "locks": tuple(locks),
         })
 
     def promotion_plan(self, selector, as_agent=None, unwrap=None, force=False,
@@ -12381,67 +12416,129 @@ def drop_lock(lock, seen):
     return True, ""
 
 
-@contextlib.contextmanager
-def team_lock(plan, write, timeout=LOCK_WAIT_S):
-    """Hold the selected roster lock while its exact generation is written."""
-    lock = write["lock"]
-    started = time.monotonic()
-    handle, said_waiting = None, False
-    while handle is None:
-        try:
-            handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            state = RESOLVER.revalidate_membership(
-                plan, inspect_lock=True, only_team=write["team"],
-                include_inboxes=False)
-            lock_state = next((item for item in state["locks"]
-                               if item["path"] == lock), None)
-            owner = lock_state["owner"] if lock_state else None
-            gone = lock_state["gone"] if lock_state else False
-            seen = lock_state["seen"] if lock_state else None
-            if gone:
-                took, stuck = drop_lock(lock, seen)
-                if took:
-                    warn(f"{lock.name} belongs to exited pid {owner['pid']}; "
-                         "removing the stale lock")
-                    continue
-                if not stuck:
-                    continue
-            else:
-                stuck = ""
-            if owner:
-                situation = f"is held by pid {owner['pid']}"
-            elif seen is None:
-                situation = "is a directory owned by Claude Code's lock helper"
-            else:
-                situation = "does not have a readable owner record"
-            if stuck:
-                situation += f", and stale-lock removal failed ({stuck})"
-            if time.monotonic() - started > timeout:
-                die(f"{lock} {situation}; it remained held for {timeout:g}s. "
-                    f"{write['path'].name} remains unchanged")
-            if not said_waiting and time.monotonic() - started > 1.0:
-                warn(f"waiting for {lock.name}, which {situation}")
-                said_waiting = True
-            time.sleep(0.05)
-        except OSError as exc:
-            die(f"lock acquisition failed for {lock} ({exc}); "
-                f"{write['path'].name} remains unchanged")
+class LockNotTaken(Exception):
+    """A roster lock this run could not take, and why, for its caller to report.
+
+    `why` is a sentence about the lock: what kept it taken at the last attempt,
+    or the error that stopped its publication. `waited` is how many seconds the
+    run waited for it, or None when an error ended the attempt.
+    """
+
+    def __init__(self, why, waited=None):
+        super().__init__(why)
+        self.why = why
+        self.waited = waited
+
+
+def publish_lock(team, lock, record):
+    """Give a new inode holding `record` the lock's name, and return a descriptor of it.
+
+    The inode is made with O_TMPFILE in the lock's directory, so it is unnamed
+    while the record is written and synced, and the link gives it the lock's
+    name or fails with FileExistsError when the name is taken. The name
+    therefore never exists without the complete record, and a run killed before
+    the link leaves the directory as it was. An existing file is never opened,
+    so a stale draft, or a second name that shares a published lock's inode,
+    keeps its bytes. An exception that arrives after the link removes the name
+    again through release_lock.
+
+    The destination is a path, not one relative to a descriptor of the
+    directory, so a directory renamed away before the link makes it fail with
+    FileNotFoundError instead of publishing the lock in the moved directory.
+    A filesystem without O_TMPFILE support fails the open, and the caller
+    refuses: this is the only way the tool publishes a lock.
+    """
+    handle = os.open(lock.parent, os.O_TMPFILE | os.O_WRONLY, 0o600)
     try:
-        os.write(handle, json.dumps(json_value(write["lock_owner"])).encode())
-        yield
-    finally:
+        unwritten = memoryview(record)
+        while unwritten:
+            unwritten = unwritten[os.write(handle, unwritten):]
+        os.fsync(handle)
+        # link(2) does not follow the /proc magic link and fails with EXDEV.
+        # Passing src_dir_fd makes os.link call linkat with AT_SYMLINK_FOLLOW,
+        # which links the inode the descriptor holds; the source path is
+        # absolute, so linkat ignores the descriptor itself.
+        os.link(f"/proc/self/fd/{handle}", lock, src_dir_fd=handle, follow_symlinks=True)
+    except BaseException:
+        release_lock(team, lock, handle)
+        raise
+    return handle
+
+
+def release_lock(team, lock, handle):
+    """Remove the lock while its name still links the inode `handle` holds open, then close it.
+
+    The open descriptor keeps that inode allocated, so the name's device and
+    inode match the descriptor's only while the name links this run's lock. A
+    lock deleted on purpose, a lock that moved away with its directory and a
+    lock another run published at the name each fail that comparison, and stay
+    as they are.
+    """
+    try:
+        mine, there = os.fstat(handle), os.lstat(lock)
+        ours = (mine.st_dev, mine.st_ino) == (there.st_dev, there.st_ino)
+    except OSError:
+        ours = False
+    if ours:
         try:
-            mine, there = os.fstat(handle), os.stat(lock)
-            still_ours = (mine.st_dev, mine.st_ino) == (there.st_dev, there.st_ino)
-        except OSError:
-            still_ours = False
-        os.close(handle)
-        if still_ours:
-            try:
-                lock.unlink()
-            except OSError as exc:
-                warn(f"cannot remove {lock}: {exc}")
+            lock.unlink()
+        except OSError as exc:
+            warn(f"cannot remove the roster lock of team {team} at {lock}: {exc}")
+    os.close(handle)
+
+
+@contextlib.contextmanager
+def team_lock(team, lock, owner, timeout=LOCK_WAIT_S):
+    """Hold a team's roster lock, published by publish_lock with `owner` as its record.
+
+    A taken lock is waited for, up to `timeout` seconds. One with a recognized
+    owner that has exited is removed through drop_lock and published again at
+    once. A live owner's lock, a file without this tool's owner record and the
+    harness's lock directory stay where they are. LockNotTaken says what kept
+    the lock taken at the deadline, or which error stopped its publication, and
+    apply_membership and remove_cleanup_action report it in their own terms.
+    Yields the device and inode of the published lock, and releases it through
+    release_lock on the way out.
+    """
+    record = json.dumps(json_value(owner)).encode()
+    started = time.monotonic()
+    said_waiting = False
+    while True:
+        try:
+            handle = publish_lock(team, lock, record)
+            break
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise LockNotTaken(f"publishing {lock.name} in {lock.parent} failed "
+                               f"({exc.strerror or exc})") from None
+        state = RESOLVER.lock_answer(lock)
+        if state["gone"]:
+            took, stuck = drop_lock(lock, state["seen"])
+            if took:
+                warn(f"the roster lock of team {team} belongs to exited pid "
+                     f"{state['owner']['pid']}; removing the stale lock")
+                continue
+            if not stuck:
+                continue
+            why = (f"{lock.name} belongs to exited pid {state['owner']['pid']}, "
+                   f"and stale-lock removal failed ({stuck})")
+        else:
+            why = (state["objection"]
+                   or f"{lock.name} was taken when this run tried to publish it")
+        if time.monotonic() - started > timeout:
+            raise LockNotTaken(why, timeout)
+        if state["objection"] is None and not state["gone"]:
+            continue   # the lock was released after the link failed: publish again
+        if not said_waiting and time.monotonic() - started > 1.0:
+            warn(f"waiting for the roster lock of team {team}: {why}")
+            said_waiting = True
+        time.sleep(0.05)
+    try:
+        held = os.fstat(handle)
+        yield (held.st_dev, held.st_ino)
+    finally:
+        release_lock(team, lock, handle)
 
 
 _BACKED_UP = set()
@@ -12475,22 +12572,27 @@ def apply_membership(plan, dry=False):
         seed_selected_inbox(inbox)
     for write in plan["writes"]:
         write["path"].parent.mkdir(parents=True, exist_ok=True)
-        with team_lock(plan, write):
-            checked = RESOLVER.revalidate_membership(
-                plan, only_team=write["team"], include_inboxes=False)
-            if not checked["matches"]:
-                die("the selected roster changed while its lock was acquired (" +
-                    ", ".join(checked["changed"]) + "); it remains unchanged")
-            cfg = write["path"]
-            suffix = ""
-            if write["backup"] is not None:
-                backup = write["backup"]
-                observed_backup = apply_selected_write(backup)
-                require_selected_write(backup, observed_backup)
-                _BACKED_UP.add(cfg)
-                suffix = f" (backup: {backup['path'].name})"
-            observed = apply_selected_write(write)
-            require_selected_write(write, observed)
+        try:
+            with team_lock(write["team"], write["lock"], write["lock_owner"]):
+                checked = RESOLVER.revalidate_membership(
+                    plan, only_team=write["team"], include_inboxes=False)
+                if not checked["matches"]:
+                    die("the selected roster changed while its lock was acquired (" +
+                        ", ".join(checked["changed"]) + "); it remains unchanged")
+                cfg = write["path"]
+                suffix = ""
+                if write["backup"] is not None:
+                    backup = write["backup"]
+                    observed_backup = apply_selected_write(backup)
+                    require_selected_write(backup, observed_backup)
+                    _BACKED_UP.add(cfg)
+                    suffix = f" (backup: {backup['path'].name})"
+                observed = apply_selected_write(write)
+                require_selected_write(write, observed)
+        except LockNotTaken as refused:
+            waited = "" if refused.waited is None else f" within {refused.waited:g}s"
+            die(f"cannot take the roster lock of team {write['team']}{waited}: "
+                f"{refused.why}. The roster {write['path']} remains unchanged")
         print(f"  {past} {plan['record']['agentId']} in {cfg}{suffix}")
     return plan["claim"] if plan["operation"] == "reserve" else plan["rollback"]
 
@@ -13745,34 +13847,61 @@ def sweep_dead_lock(action, dry):
 
 
 def remove_cleanup_action(action, dry):
-    """Remove one exact team-directory generation selected by cleanup_plan."""
+    """Remove one exact team-directory generation selected by cleanup_plan.
+
+    The team's roster lock is taken first, without waiting, and held through
+    the comparison with the selection, the rename and the deletion. A roster
+    writer that takes the lock first keeps the team for a later sweep, and one
+    that comes later waits on the sweep's lock and then finds the directory
+    gone. A write that does not take the roster lock, such as mail arriving in
+    an inbox, is what the comparison after the rename catches.
+
+    The renamed directory is emptied in this order: the selected entries other
+    than the roster and the lock, then the lock, which the second comparison
+    found to be this run's, then config.json, so that a run interrupted before
+    the end leaves a roster the next sweep can judge. The release that follows
+    finds the lock's name gone with its directory.
+    """
     path = action["team_dir"]
     if dry:
         return True
-    staged = staged_path(path)
     try:
-        os.rename(path, staged)
-    except OSError as exc:
-        warn(f"cannot stage {path} for removal: {exc}")
-        return False
-    checked = RESOLVER.revalidate_cleanup_cut(action, staged)
-    if not checked["matches"]:
-        try:
-            os.rename(staged, path)
-            warn(f"not removing {path.name}: its contents changed after selection")
-        except OSError as exc:
-            warn(f"{path.name} changed and restoring it failed: {exc}; it is at {staged}")
-        return False
-    try:
-        owned = [staged / relative for relative in action["owned"]]
-        for item in sorted(owned, key=lambda value: value.name == "config.json"):
-            item.unlink()
-        inboxes = staged / "inboxes"
-        if inboxes.is_dir():
-            inboxes.rmdir()
-        staged.rmdir()
-    except OSError as exc:
-        warn(f"cannot remove {staged}: {exc}")
+        with team_lock(action["team"], action["lock"]["path"], action["lock_owner"],
+                       timeout=0) as held:
+            if not RESOLVER.revalidate_cleanup_cut(action, path, held)["matches"]:
+                warn(f"not removing {path.name}: its contents changed after selection")
+                return False
+            staged = staged_path(path)
+            try:
+                os.rename(path, staged)
+            except OSError as exc:
+                warn(f"cannot stage {path} for removal: {exc}")
+                return False
+            if not RESOLVER.revalidate_cleanup_cut(action, staged, held)["matches"]:
+                try:
+                    os.rename(staged, path)
+                    warn(f"not removing {path.name}: its contents changed after selection")
+                except OSError as exc:
+                    warn(f"{path.name} changed and restoring it failed: {exc}; it is at {staged}")
+                return False
+            roster, lock = staged / action["cfg"].name, staged / action["lock"]["path"].name
+            owned = [staged / relative for relative in action["owned"]]
+            try:
+                for item in owned:
+                    if item not in (roster, lock):
+                        item.unlink()
+                lock.unlink()
+                if roster in owned:
+                    roster.unlink()
+                inboxes = staged / "inboxes"
+                if inboxes.is_dir():
+                    inboxes.rmdir()
+                staged.rmdir()
+            except OSError as exc:
+                warn(f"cannot remove {staged}: {exc}")
+                return False
+    except LockNotTaken as refused:
+        warn(f"not removing {action['team']}: {refused.why}")
         return False
     tasks = action["tasks_dir"]
     if tasks.is_dir():
@@ -17303,6 +17432,7 @@ PUBLIC_RESOLVER_QUESTIONS = {
     "launch_observation": ("launch_survived",),
     "launch_plan": ("build",),
     "lead_migration_plan": ("run_one",),
+    "lock_answer": ("team_lock",),
     "mail_answer": ("run_mail_ledger",),
     "member_redirect_plan": ("auto_redirect", "run_one"),
     "membership_plan": ("record_membership", "release_membership",
@@ -17318,7 +17448,7 @@ PUBLIC_RESOLVER_QUESTIONS = {
     "revalidate_launch": ("run_one",),
     "revalidate_lead_migration": ("lead_rebind",),
     "revalidate_member_redirect": ("apply_member_migration",),
-    "revalidate_membership": ("apply_membership", "team_lock"),
+    "revalidate_membership": ("apply_membership",),
     "revalidate_reap": ("archive_inbox", "reap_team"),
     "revalidate_rebuild": ("apply_rebuild_plan",),
     "revalidate_stop": ("stopped",),
@@ -22630,6 +22760,7 @@ def _check_final_answers_have_generation_or_consumer_proofs(s):
         inbox.write_text("[]")
         eng = Resolver(needs=Needs(maybe=set(NEED)))
         eng._projects_dir, eng._teams_dir = root / "projects", teams
+        eng._tasks_dir = root / "tasks"
         eng._process_table = lambda refresh=False: ()
         eng._dead_sockets = lambda: ()
         return eng, team, team_dir, inbox
@@ -24204,7 +24335,7 @@ def _check_fixtures_install_the_unit_fence(s):
                       and "exec_module(" in value)
     expected = {"WORKER_DIES_FIXTURE", "DYING_WORKER_RUN_FIXTURE", "RUN_FINISH_FIXTURE",
                 "MID_WALK_FIXTURE", "OWN_SESSION_RUN_FIXTURE", "TERMINATED_OWNER_FIXTURE",
-                "STUBBORN_FIXTURE", "FENCE_FAULTS_FIXTURE"}
+                "STUBBORN_FIXTURE", "FENCE_FAULTS_FIXTURE", "LOCK_KILLED_FIXTURE"}
     went_on = []
     for name in fixtures:
         scratch = Path(tempfile.mkdtemp(prefix=own("fx")))
@@ -25609,9 +25740,12 @@ def _check_release_gives_the_claim_back(s):
       ('lock-of-a-live-owner-is-kept', 'a lock is left alone while its recorded owner is still running'),
       ('stale-lock-that-will-not-come-away-refuses', 'a stale lock this run cannot remove ends at the deadline, not in a spin'),
       ('lock-replaced-mid-verdict-is-not-taken', "a dead owner's lock replaced by a live one before the removal is left alone"),
-      ('release-leaves-a-replacement-lock-alone', 'a lock that replaced ours while we held it is not removed on the way out'))
+      ('release-leaves-a-replacement-lock-alone', 'a lock that replaced ours while we held it is not removed on the way out'),
+      ('lock-refusals-name-the-team', 'the refusals of roster writes, the waiting warning, the takeover warning and the warning of a release that cannot remove its lock name the team'))
 def _check_team_lock_fails_closed(s):
+    import errno
     import threading
+    from unittest import mock
 
     checked = []
 
@@ -25649,16 +25783,17 @@ def _check_team_lock_fails_closed(s):
 
         stragglers = []
 
-        def write_against(content, aged=False, exists=False, meanwhile=None):
+        def write_against(content, aged=False, exists=False, meanwhile=None, wait=0.1):
             """One roster write against a lock: a file holding `content`, or a
             directory when `content` is None.
 
             Returns what it refused with or None, and everything it said. A
             tenth of a second stands in for the ten a real run waits: which
             locks it will take is the question here, not how long it waits
-            before saying it could not take one. `exists` is for a lock the
-            caller has already put in place, because the directory it sits in
-            is no longer writable by the time this runs.
+            before saying it could not take one. `wait` is longer for the one
+            case that needs the run to say it is waiting, which it does after
+            a second. `exists` says the caller has already put the lock in
+            place, so write_against does not write one.
 
             The write runs in a thread with a deadline of its own, because one
             of the cases below exists to catch a wait that never reaches its
@@ -25685,7 +25820,7 @@ def _check_team_lock_fails_closed(s):
                 old = time.time() - 3600
                 os.utime(lock, (old, old))
             globals()["team_lock"] = (
-                lambda plan, write, timeout=0.1: real_lock(plan, write, timeout))
+                lambda team, lock, owner, timeout=wait: real_lock(team, lock, owner, timeout))
             real_holder = RESOLVER._lock_holder
             if meanwhile:
                 def racing(path):
@@ -25735,22 +25870,37 @@ def _check_team_lock_fails_closed(s):
         live_roster, live_there = lcfg.read_bytes() == untouched, lock.is_file()
         clear_lock()
 
+        waited_said, waited_out = write_against(live_owner, wait=1.2)
+        clear_lock()
+
+        # A release that cannot remove this run's own lock says so: the
+        # directory is read-only by then, so the unlink answers EACCES.
+        with capturing("err") as released:
+            with real_lock(lteam, lock, {
+                    "tool": TOOL, "pid": os.getpid(),
+                    "procStart": RESOLVER._proc_start(os.getpid())}, 0.1):
+                os.chmod(lock.parent, 0o500)
+        os.chmod(lock.parent, 0o700)
+        release_said = released.getvalue()
+        clear_lock()
+
         empty_said, empty_out = write_against(b"", aged=True)
-        empty_kept = lock.is_file() and "taking it over" not in empty_out
+        empty_kept = lock.is_file() and "removing the stale lock" not in empty_out
         clear_lock()
 
         dir_said, dir_out = write_against(None, aged=True)
-        dir_kept = lock.is_dir() and "taking it over" not in dir_out
+        dir_kept = lock.is_dir() and "removing the stale lock" not in dir_out
         clear_lock()
 
-        # A lock this run judges stale and then cannot remove: the parent
-        # directory is read-only, so the create still answers EEXIST and the
-        # unlink answers EACCES. An earlier draft looped on that pair without
-        # ever reaching its deadline. It runs last of all, at the bottom of this
-        # block: the regression it catches is a write that never returns, and
-        # the thread carrying it is still spinning on this same lockfile when
-        # the deadline hands the run back. Anything staged after it would be
-        # answering against a fixture that thread is still writing to.
+        # A lock this run judges stale and then cannot remove: the publication
+        # finds the name taken and the unlink answers EACCES. A team_lock that
+        # returned to the publication after a failed removal without checking
+        # its deadline would repeat that pair forever. That case runs last, at
+        # the bottom of this block: the regression it catches is a write that
+        # never returns, and the thread running such a write is still spinning
+        # on this same lockfile when write_against stops waiting for it. A case
+        # placed after it would run against a fixture that the thread is still
+        # writing to.
 
         # A second run takes a dead owner's lock over in the gap between this
         # run reading that record and acting on it. What sits at the name by
@@ -25779,10 +25929,10 @@ def _check_team_lock_fails_closed(s):
         # take this one away, so what keeps it is the guard and not a removal
         # that happens to fail.
         stranger = b'{"tool": "somebody else"}'
-        with real_lock({}, {"lock": lock, "lock_owner": {
+        with real_lock(lteam, lock, {
                 "tool": TOOL, "pid": os.getpid(),
                 "procStart": RESOLVER._proc_start(os.getpid()),
-        }}, 0.1):
+        }, 0.1):
             lock.unlink()
             lock.write_bytes(stranger)
         replacement_kept = lock.is_file() and lock.read_bytes() == stranger
@@ -25795,17 +25945,20 @@ def _check_team_lock_fails_closed(s):
         lcfg.write_bytes(untouched)
         clear_lock()
 
-        # A lock this run judges stale and then cannot remove: the parent
-        # directory is read-only, so the create still answers EEXIST and the
-        # unlink answers EACCES. Root ignores those bits, so on a run as root
-        # the removal succeeds and this case reports a failure rather than a
-        # hang, which is the safe way round.
+        # A lock this run judges stale and then cannot remove: its unlink
+        # answers EACCES. A read-only directory cannot stand in for this, since
+        # the publication's O_TMPFILE open then fails before the name is ever
+        # found taken; the unlink is made to fail instead.
         lock.write_bytes(dead_owner)
-        os.chmod(lock.parent, 0o500)
-        try:
+        real_unlink = Path.unlink
+
+        def unlink_refused(path, *args, **kwargs):
+            if path == lock:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path))
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", unlink_refused):
             stuck_said, stuck_out = write_against(dead_owner, exists=True)
-        finally:
-            os.chmod(lock.parent, 0o700)
         stuck_kept = lock.is_file() and lcfg.read_bytes() == untouched
 
         # A write that missed its deadline is still going. Whatever it says when
@@ -25857,6 +26010,382 @@ def _check_team_lock_fails_closed(s):
     check("release-leaves-a-replacement-lock-alone",
           "a lock that replaced ours while we held it is not removed on the way out",
           replacement_kept, f"replacement still there {replacement_kept}")
+    named = {
+        "the refusal names the team": f"roster lock of team {lteam}" in (live_said or ""),
+        "and says its roster is unchanged":
+            f"The roster {lcfg} remains unchanged" in (live_said or ""),
+        "the refusal at a stale lock that stays names the team":
+            f"roster lock of team {lteam}" in (stuck_said or ""),
+        "the waiting warning names the team":
+            f"waiting for the roster lock of team {lteam}: " in waited_out,
+        "the takeover warning names the team":
+            f"the roster lock of team {lteam} belongs to exited pid {os.getpid()}" in taken_out,
+        "the release warning names the team":
+            f"cannot remove the roster lock of team {lteam} at {lock}" in release_said,
+    }
+    unnamed = sorted(k for k, ok in named.items() if not ok)
+    check("lock-refusals-name-the-team",
+          "the refusals of roster writes, the waiting warning, the takeover warning and the "
+          "warning of a release that cannot remove its lock name the team",
+          not unnamed, ", ".join(unnamed) + (
+              f"; refused {live_said!r}, after waiting {waited_said!r}" if unnamed else ""))
+    return checked
+
+
+# A run of its own that takes a roster lock and is killed with SIGKILL at the
+# link that publishes it: before the link when its fourth argument is
+# "before", and right after it when that argument is "after". Its other
+# arguments are the tool, the lock's path and the team. It loads the tool as a
+# module and publishes the owner record the engine selects for this run.
+LOCK_KILLED_FIXTURE = r"""
+import importlib.machinery, importlib.util, os, signal, sys
+tool, lock, team, when = sys.argv[1:5]
+loader = importlib.machinery.SourceFileLoader("lock_killed_fixture", tool)
+module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+module.__file__ = tool
+loader.exec_module(module)
+module.adopt_inherited_fence()
+link = os.link
+
+
+def killed_at_the_link(*args, **kwargs):
+    if when == "after":
+        link(*args, **kwargs)
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
+os.link = killed_at_the_link
+with module.team_lock(team, module.Path(lock), module.RESOLVER._lock_owner()):
+    pass
+"""
+
+
+@unit(('lock-is-published-with-its-record',
+       'a roster lock gets its name only after its whole owner record is written and synced'),
+      ('lock-attempt-never-writes-an-existing-name',
+       "a lock attempt writes only a new inode, so a stale draft and a second name for a lock's "
+       "inode keep their bytes"),
+      ('lock-interrupted-leaves-the-directory-or-a-whole-record',
+       'a run killed before the link leaves the directory as it was, and one killed after it '
+       'leaves a whole record that the next run takes over'),
+      ('lock-publication-failure-refuses-cleanly',
+       'a publication that fails for a reason other than a taken name refuses, naming the '
+       'directory and the error, and the directory stays as it was'),
+      ('lock-won-by-another-owner-is-left-to-it',
+       "a lock that another owner publishes first is waited for, and the winner's record keeps "
+       "its bytes"),
+      ('lock-release-after-deliberate-deletion-is-quiet',
+       "a release that finds its lock deleted on purpose, or the lock's directory gone, stays silent"),
+      ('lock-refused-when-its-directory-moved',
+       "a run that finds a lock's directory moved away, before its attempt or during it, refuses "
+       "with a reason that names the directory; the old path stays absent and the moved "
+       "directory keeps its entries"))
+def _check_lock_publication(s):
+    """How a roster lock gets its name, and what an attempt does to the names already there.
+
+    The owner record has to exist before the name, so that a run killed
+    between creating the lock and writing its record cannot leave an empty
+    lock, which this tool does not take over because an empty file does not
+    say whether its owner has exited. A draft written under a name fixed by
+    team and pid and then linked at the lock's name meets that, but a later run
+    with the same pid opens that draft name again, and when an interrupted run
+    left the name linked to the published lock, truncating the draft truncates
+    the lock. Each attempt writes a new unnamed inode instead, and these cases
+    check that the names such a draft would use keep their bytes, whether or
+    not they link the lock's inode.
+
+    Each case starts from the same fixture, a team directory holding only its
+    roster. An exception in one case is that case's failure, so a mutation
+    fails the cases it breaks and the other cases still reach their verdicts.
+    """
+    import errno
+    import signal
+    from unittest import mock
+
+    checked = []
+
+    def check(cid, ok, detail=""):
+        checked.append(_check_verdict(cid, bool(ok), detail))
+
+    real_link, real_open, real_fsync = os.link, os.open, os.fsync
+    with _cleanup_test_fixture() as (engine, _root):
+        team = "session-lock-publication"
+        team_dir = engine._teams_dir / team
+        roster = engine._roster_path(team)
+        lock = engine._lock_for(roster)
+        moved = team_dir.with_name(f"{team}-moved")
+        owner = engine._lock_owner()
+        mine = json.dumps(json_value(owner)).encode()
+        # Another live run's record: this run's pid and start time, so its
+        # owner is running, in bytes this run never writes.
+        theirs = json.dumps(json_value(owner), indent=1).encode()
+        dead = json.dumps({"tool": TOOL, "pid": os.getpid(), "procStart": "1"}).encode()
+        # A draft name fixed by team and pid, in the teams directory. This
+        # run's pid in the name is the pid reuse case: a later run with that
+        # pid would open that same name.
+        draft = engine._teams_dir / f".lock-draft-{TOOL}-{team}-{os.getpid()}"
+
+        def tree():
+            """The names under the teams directory and its subdirectories, with their inodes."""
+            return sorted((str(item.relative_to(engine._teams_dir)), item.lstat().st_ino)
+                          for item in engine._teams_dir.rglob("*"))
+
+        def read(path):
+            try:
+                return path.read_bytes()
+            except OSError:
+                return None
+
+        def reset():
+            """The team directory back at its name, writable, holding only its roster."""
+            if moved.exists() and not team_dir.exists():
+                moved.rename(team_dir)
+            team_dir.mkdir(exist_ok=True)
+            os.chmod(team_dir, 0o700)
+            for item in [*team_dir.iterdir(), *engine._teams_dir.iterdir()]:
+                if item in (roster, team_dir):
+                    continue
+                if item.is_dir() and not item.is_symlink():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+            roster.write_text(json.dumps({"name": team, "members": []}))
+
+        def take(timeout=0.1):
+            """One team_lock attempt: what it held, or its refusal, and what it said.
+
+            What it held is the identity team_lock yielded, the bytes at the
+            lock's name and that name's lstat, the three read inside the lock.
+            """
+            with capturing("err") as said:
+                try:
+                    with team_lock(team, lock, owner, timeout) as held:
+                        inside = (held, read(lock), lock.lstat())
+                except LockNotTaken as refused:
+                    return None, refused, said.getvalue()
+            return inside, None, said.getvalue()
+
+        def case(cid, block):
+            try:
+                reset()
+                ok, detail = block()
+            except (Exception, Refusal) as exc:
+                ok, detail = False, f"raised {type(exc).__name__}: {exc}"
+            check(cid, ok, detail)
+
+        def published():
+            at_link, synced = [], []
+
+            def syncing(descriptor):
+                synced.append(descriptor)
+                return real_fsync(descriptor)
+
+            def watched(source, destination, **kwargs):
+                held = os.fspath(source).rsplit("/", 1)[-1]
+                facts = os.fstat(int(held)) if held.isdigit() else os.lstat(source)
+                at_link.append((read(Path(source)), facts.st_nlink, facts.st_mode & 0o777,
+                                os.path.lexists(destination),
+                                held.isdigit() and int(held) in synced))
+                return real_link(source, destination, **kwargs)
+
+            with mock.patch.object(os, "fsync", syncing):
+                with mock.patch.object(os, "link", watched):
+                    inside, refused, _said = take()
+            held, there, facts = inside or (None, None, None)
+            first = at_link[0] if at_link else (b"", None, None, None, False)
+            try:
+                linked = json.loads(first[0] or b"")
+            except ValueError:
+                linked = None
+            found = {
+                "one link was attempted": len(at_link) == 1,
+                "the whole record was there before the name": linked == json_value(owner),
+                "and synced before the link": first[4] is True,
+                "the inode was unnamed until the link": first[1] == 0 and first[3] is False,
+                "only its owner can read it": first[2] == 0o600,
+                "the name holds that record": there == mine,
+                "the name links the inode the run holds":
+                    facts is not None and (facts.st_dev, facts.st_ino) == held
+                    and facts.st_nlink == 1,
+                "the release removed it": not os.path.lexists(lock),
+            }
+            wrong = sorted(k for k, ok in found.items() if not ok)
+            return not wrong, ", ".join(wrong) + (f"; refused {refused.why!r}" if refused else "")
+
+        def existing_names():
+            draft.write_bytes(b'{"tool": "a stale draft"}')
+            stale_ino = draft.lstat().st_ino
+            inside, _refused, _said = take()
+            unlinked_kept = (inside is not None and read(draft) == b'{"tool": "a stale draft"}'
+                             and draft.lstat().st_ino == stale_ino and inside[0][1] != stale_ino)
+            reset()
+            lock.write_bytes(theirs)
+            os.link(lock, draft)
+            inside, refused, _said = take()
+            live_kept = (inside is None and refused is not None
+                         and read(lock) == theirs and read(draft) == theirs
+                         and lock.lstat().st_ino == draft.lstat().st_ino)
+            reset()
+            lock.write_bytes(dead)
+            os.link(lock, draft)
+            leftover = draft.lstat().st_ino
+            inside, _refused, said = take()
+            dead_kept = (inside is not None and inside[1] == mine and read(draft) == dead
+                         and draft.lstat().st_ino == leftover and inside[0][1] != leftover
+                         and "removing the stale lock" in said)
+            names = {"an unlinked stale draft keeps its bytes": unlinked_kept,
+                     "a second name for a live owner's lock keeps its bytes": live_kept,
+                     "a second name for a dead owner's lock keeps its bytes when this pid "
+                     "takes the lock over": dead_kept}
+            written = sorted(k for k, ok in names.items() if not ok)
+            return not written, ", ".join(written)
+
+        def interrupted():
+            def killed(when):
+                """Run LOCK_KILLED_FIXTURE, killed at the link: its pid, status and stderr."""
+                child = subprocess.Popen(
+                    [sys.executable, "-B", "-c", LOCK_KILLED_FIXTURE,
+                     str(Path(__file__).resolve()), str(lock), team, when],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    text=True)
+                try:
+                    _out, err = child.communicate(timeout=60)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    _out, err = child.communicate()
+                    err = f"did not finish in 60s; {err}"
+                return child.pid, child.returncode, err
+
+            before = tree()
+            _pid, early_code, early_err = killed("before")
+            early_kept = early_code == -signal.SIGKILL and tree() == before
+            reset()
+            late_pid, late_code, late_err = killed("after")
+            try:
+                left = json.loads(read(lock) or b"")
+            except ValueError:
+                left = None
+            late_whole = (late_code == -signal.SIGKILL and isinstance(left, dict)
+                          and left.get("tool") == TOOL and left.get("pid") == late_pid
+                          and bool(left.get("procStart")))
+            inside, _refused, said = take()
+            late_taken = (inside is not None and inside[1] == mine
+                          and f"exited pid {late_pid}" in said and "removing the stale lock" in said)
+            found = {"killed before the link, the directory is as it was": early_kept,
+                     "killed after the link, the lock holds its whole record": late_whole,
+                     "the next run takes that lock over": late_taken}
+            lost = sorted(k for k, ok in found.items() if not ok)
+            return not lost, ", ".join(lost) + (
+                f"; before: exit {early_code} {early_err.strip()!r}; after: exit {late_code} "
+                f"{late_err.strip()!r}, left {left!r}" if lost else "")
+
+        def failed_publication():
+            before = tree()
+            os.chmod(team_dir, 0o500)
+            try:
+                _inside, read_only, _said = take()
+            finally:
+                os.chmod(team_dir, 0o700)
+
+            def without_tmpfile(path, flags, *args, **kwargs):
+                if flags & os.O_TMPFILE == os.O_TMPFILE:
+                    raise OSError(errno.EOPNOTSUPP, os.strerror(errno.EOPNOTSUPP), str(path))
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(os, "open", without_tmpfile):
+                _inside, unsupported, _said = take()
+
+            def link_refused(source, destination, **kwargs):
+                raise OSError(errno.EMLINK, os.strerror(errno.EMLINK), source, None, destination)
+
+            with mock.patch.object(os, "link", link_refused):
+                _inside, too_many, _said = take()
+            failures = {"a read-only directory": (read_only, errno.EACCES),
+                        "a filesystem without O_TMPFILE": (unsupported, errno.EOPNOTSUPP),
+                        "a link that fails with EMLINK": (too_many, errno.EMLINK)}
+            unclean = sorted(
+                name for name, (refusal, code) in failures.items()
+                if refusal is None or refusal.waited is not None
+                or refusal.why != f"publishing {lock.name} in {team_dir} failed "
+                                  f"({os.strerror(code)})")
+            if tree() != before:
+                unclean.append("the teams directory changed")
+            return not unclean, ", ".join(unclean) + (
+                f"; read-only: {read_only.why if read_only else None!r}" if unclean else "")
+
+        def won_by_another():
+            winner = []
+
+            def beaten(source, destination, **kwargs):
+                # Another run's lock, published first, at the lock's absolute
+                # path, so it is in place whether the attempt passes the
+                # destination as a path or as a name relative to a directory
+                # descriptor.
+                if not winner:
+                    lock.write_bytes(theirs)
+                    winner.append(lock.lstat().st_ino)
+                return real_link(source, destination, **kwargs)
+
+            with mock.patch.object(os, "link", beaten):
+                inside, lost_to, _said = take()
+            left_to_it = (inside is None and lost_to is not None and bool(winner)
+                          and lost_to.why == f"{lock.name} is held by pid {os.getpid()}, "
+                                             "which is running"
+                          and read(lock) == theirs and lock.lstat().st_ino == winner[0])
+            return left_to_it, "" if left_to_it else (
+                f"refused {lost_to.why if lost_to else None!r}; the lock holds {read(lock)!r}")
+
+        def deliberate_deletion():
+            gone_team = "session-lock-gone"
+            gone_dir = engine._teams_dir / gone_team
+            gone_dir.mkdir()
+            gone_lock = engine._lock_for(engine._roster_path(gone_team))
+            with capturing("err") as quiet:
+                with team_lock(team, lock, owner, 0.1):
+                    lock.unlink()
+                with team_lock(gone_team, gone_lock, owner, 0.1):
+                    gone_lock.unlink()
+                    gone_dir.rmdir()
+            quiet_and_gone = (quiet.getvalue() == "" and not os.path.lexists(lock)
+                              and not gone_dir.exists())
+            return quiet_and_gone, "" if quiet_and_gone else f"said {quiet.getvalue().strip()!r}"
+
+        def directory_moved():
+            before = sorted((item.name, item.lstat().st_ino) for item in team_dir.iterdir())
+            team_dir.rename(moved)
+            _inside, moved_first, _said = take()
+            first_absent = not os.path.lexists(team_dir)
+            moved.rename(team_dir)
+
+            def moved_away(source, destination, **kwargs):
+                team_dir.rename(moved)
+                return real_link(source, destination, **kwargs)
+
+            with mock.patch.object(os, "link", moved_away):
+                _inside, moved_later, _said = take()
+            later_absent = not os.path.lexists(team_dir)
+            moved_listing = sorted((item.name, item.lstat().st_ino) for item in moved.iterdir())
+            missing = f"publishing {lock.name} in {team_dir} failed ({os.strerror(errno.ENOENT)})"
+            found = {
+                "a directory gone before the attempt refuses":
+                    moved_first is not None and moved_first.why == missing and first_absent,
+                "a directory gone between the open and the link refuses":
+                    moved_later is not None and moved_later.why == missing and later_absent,
+                "and the moved directory holds what it held": moved_listing == before,
+            }
+            wrong = sorted(k for k, ok in found.items() if not ok)
+            return not wrong, ", ".join(wrong) + (
+                f"; refused {moved_first.why if moved_first else None!r} and "
+                f"{moved_later.why if moved_later else None!r}" if wrong else "")
+
+        case("lock-is-published-with-its-record", published)
+        case("lock-attempt-never-writes-an-existing-name", existing_names)
+        case("lock-interrupted-leaves-the-directory-or-a-whole-record", interrupted)
+        case("lock-publication-failure-refuses-cleanly", failed_publication)
+        case("lock-won-by-another-owner-is-left-to-it", won_by_another)
+        case("lock-release-after-deliberate-deletion-is-quiet", deliberate_deletion)
+        case("lock-refused-when-its-directory-moved", directory_moved)
+        reset()
     return checked
 
 
@@ -25907,7 +26436,7 @@ def _check_refused_teardown_reports(s):
         glock.write_bytes(b"")
         gbefore = gcfg.read_bytes()
         globals()["team_lock"] = (
-            lambda plan, write, timeout=0.1: real_lock(plan, write, timeout))
+            lambda team, lock, owner, timeout=0.1: real_lock(team, lock, owner, timeout))
         with capturing("out"), capturing("err"):
             try:
                 apply_membership(release)
@@ -30253,7 +30782,8 @@ def _check_engine_caches_declare_themselves(s):
     ast = s.ast
     engine_node = s.engine_node
 
-    state_fields = {"_needs", "_exercised", "_teams_dir", "_projects_dir", "_rewriter"}
+    state_fields = {"_needs", "_exercised", "_teams_dir", "_projects_dir", "_tasks_dir",
+                    "_rewriter"}
     unmarked = sorted({
         f"{target.attr} at line {target.lineno}"
         for node in ast.walk(engine_node) if isinstance(node, ast.Assign)
@@ -30351,16 +30881,18 @@ def _check_preview_line_counterpart(s):
 
 @unit(('lock-verdict-one-place', 'whether a roster lock may be taken away is decided in one place'))
 def _check_lock_verdict_one_place(s):
-    """Three places act on this lockfile and they must never disagree.
+    """Four places act on this lockfile and they must never disagree.
 
-    A roster write takes the lock over when the run that left it is gone, the
-    startup sweep clears the same leftover when that team's lock is never
-    wanted again, and the sweep's keep-check asks whether anything is inside
-    the lock before removing the directory it sits in. A private second answer
-    in any of them is how the sweep ends up removing a lock a live run is
-    inside, so the engine decides the question, and the removal is one actor
-    both removers call. lock_objection asks the question and never reaches that
-    actor, because it does not remove anything.
+    A roster write takes the lock over when the run that left it is gone, and
+    so does the sweep when it removes a team, both through team_lock, which
+    asks lock_answer. The startup sweep clears the same leftover from a team
+    it keeps once the lock's recorded owner has exited, and the sweep's
+    keep-check asks whether a run is inside the lock before selecting the
+    directory it sits in. A private second answer in one of them is how the
+    sweep ends up removing a lock a live run is inside, so the engine decides
+    the question, and the removal is one function, drop_lock, which both
+    removers call. _lock_objection asks the question and does not call
+    drop_lock, because it does not remove a lock.
     """
     checked = []
 
@@ -30383,8 +30915,8 @@ def _check_lock_verdict_one_place(s):
     if spelled:
         forked.append("the lockfile is named outside the engine at " + ", ".join(spelled))
     for question, want in (("_lock_holder", {"_lock_objection", "cleanup_plan",
-                                               "revalidate_membership"}),
-                           ("_lock_objection", {"_scaffolding_objection"}),
+                                               "lock_answer"}),
+                           ("_lock_objection", {"_scaffolding_objection", "lock_answer"}),
                            ("drop_lock", {"team_lock", "sweep_dead_lock"})):
         asked = callers_of(question) - s.suite_fns
         if asked != want:
@@ -30392,10 +30924,13 @@ def _check_lock_verdict_one_place(s):
                           f"{sorted(want)}")
     for named, node in (
             ("team_lock", funcs.get("team_lock")),
+            ("publish_lock", funcs.get("publish_lock")),
+            ("release_lock", funcs.get("release_lock")),
             ("sweep_dead_lock", funcs.get("sweep_dead_lock")),
             ("drop_lock", funcs.get("drop_lock")),
             ("_lock_holder", s.resolver_methods.get("_lock_holder")),
-            ("_lock_objection", s.resolver_methods.get("_lock_objection"))):
+            ("_lock_objection", s.resolver_methods.get("_lock_objection")),
+            ("lock_answer", s.resolver_methods.get("lock_answer"))):
         if node is None:
             forked.append(f"{named} is gone, so the set this holds together is not there")
         elif "pid_alive" in {getattr(sub.func, "attr", None) for sub in ast.walk(node)
@@ -30622,7 +31157,10 @@ def _check_proc_read_engine_only(s):
         line = getattr(node, "lineno", None)
         if line is None or line in engine_lines or line in selftest_lines:
             continue
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and "/proc/" in node.value:
+        # /proc/self/fd/ names a descriptor of this process: publish_lock links
+        # the inode it holds through it, which does not read a process.
+        if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and "/proc/" in node.value and node.value != "/proc/self/fd/"):
             proc_readers.add(f"a /proc path at line {line}")
         elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "kill" and len(node.args) == 2
@@ -34761,12 +35299,13 @@ def _check_reaper_spares_resurrectable(s):
         checked.append((cid, name, ok, detail))
 
     reap_base = Path(tempfile.mkdtemp())
-    real_teams_dir, aged = RESOLVER._teams_dir, time.time() - 86400
+    real_teams_dir, real_tasks_dir = RESOLVER._teams_dir, RESOLVER._tasks_dir
+    aged = time.time() - 86400
     try:
-        RESOLVER._teams_dir = reap_base
+        RESOLVER._teams_dir, RESOLVER._tasks_dir = reap_base / "teams", reap_base / "tasks"
 
         def stage(name, members):
-            directory = reap_base / name
+            directory = RESOLVER._teams_dir / name
             (directory / "inboxes").mkdir(parents=True)
             (directory / "inboxes" / "team-lead.json").write_text("[]")
             cfg = directory / "config.json"
@@ -34794,7 +35333,7 @@ def _check_reaper_spares_resurrectable(s):
             reapable = actions[gone]["action"] == "remove"
             kept = actions[held]["action"] == "keep" if held else True
     finally:
-        RESOLVER._teams_dir = real_teams_dir
+        RESOLVER._teams_dir, RESOLVER._tasks_dir = real_teams_dir, real_tasks_dir
         shutil.rmtree(reap_base, ignore_errors=True)
     check("reaper-spares-retained-mail", "the reaper spares a team with retained mail", reapable and kept,
           f"dead reapable: {reapable}, live kept: {kept}")
@@ -34808,16 +35347,11 @@ def _check_cleanup_opens_with_outcome(s):
     def check(cid, name, ok, detail=""):
         checked.append((cid, name, ok, detail))
 
-    sweep_base = Path(tempfile.mkdtemp())
-    real_teams_dir, real_sockets = RESOLVER._teams_dir, RESOLVER._dead_sockets
     aged = time.time() - 86400
-    sweep = {}
-    try:
-        RESOLVER._teams_dir = sweep_base
-        RESOLVER._dead_sockets = lambda: []   # this fixture is about team dirs
+    with _cleanup_test_fixture() as (engine, _root):
 
         def sweep_stage(name, backdate):
-            directory = sweep_base / name
+            directory = engine._teams_dir / name
             (directory / "inboxes").mkdir(parents=True)
             (directory / "inboxes" / "team-lead.json").write_text("[]")
             (directory / "config.json").write_text(json.dumps(
@@ -34857,9 +35391,6 @@ def _check_cleanup_opens_with_outcome(s):
                 len(acted) == 1 and acted[0].startswith("removed "),
             "the hook stays silent without anything to do": again.getvalue() == "",
         }
-    finally:
-        RESOLVER._teams_dir, RESOLVER._dead_sockets = real_teams_dir, real_sockets
-        shutil.rmtree(sweep_base, ignore_errors=True)
     wrong = sorted(k for k, ok in sweep.items() if not ok)
     check("cleanup-opens-with-outcome", "the sweep says its outcome before its reasons",
           not wrong, ", ".join(wrong))
@@ -34885,16 +35416,12 @@ def _check_cleanup_clears_our_own_dead_lock(s):
     def check(cid, name, ok, detail=""):
         checked.append((cid, name, ok, detail))
 
-    lock_sweep = Path(tempfile.mkdtemp())
-    real_teams_dir, real_sockets = RESOLVER._teams_dir, RESOLVER._dead_sockets
-    try:
-        RESOLVER._teams_dir = lock_sweep
-        RESOLVER._dead_sockets = lambda: []   # this fixture is about lockfiles
+    with _cleanup_test_fixture() as (engine, _root):
 
         def with_a_lock(name, content):
             """A team young enough that the sweep keeps it, holding a lock: a
             file holding `content`, or a directory when `content` is None."""
-            (lock_sweep / name / "inboxes").mkdir(parents=True)
+            (engine._teams_dir / name / "inboxes").mkdir(parents=True)
             RESOLVER._roster_path(name).write_text(json.dumps(
                 {"name": name, "leadAgentId": agent_id_of("team-lead", name),
                  "leadSessionId": "no-such-session-uuid",
@@ -34930,9 +35457,6 @@ def _check_cleanup_clears_our_own_dead_lock(s):
         # because the fixture was removed rather than because the sweep took it.
         dead_gone, live_there = not dead.exists(), live.is_file()
         empty_there, theirs_there = empty.is_file(), theirs.is_dir()
-    finally:
-        RESOLVER._teams_dir, RESOLVER._dead_sockets = real_teams_dir, real_sockets
-        shutil.rmtree(lock_sweep, ignore_errors=True)
 
     cleared = {
         "the preview names the team and the pid that left it":
@@ -34977,12 +35501,8 @@ def _check_sweep_spares_a_held_lock(s):
     def check(cid, name, ok, detail=""):
         checked.append((cid, name, ok, detail))
 
-    held_sweep = Path(tempfile.mkdtemp())
-    real_teams_dir, real_sockets = RESOLVER._teams_dir, RESOLVER._dead_sockets
     aged = time.time() - 86400
-    try:
-        RESOLVER._teams_dir = held_sweep
-        RESOLVER._dead_sockets = lambda: []   # this fixture is about team dirs
+    with _cleanup_test_fixture() as (engine, _root):
 
         def unresurrectable(name, content):
             """A team that cannot be resurrected, holding a lock: a file
@@ -34992,7 +35512,7 @@ def _check_sweep_spares_a_held_lock(s):
             resolve to a transcript, and every mtime is a day old, so the only
             thing left between it and the sweep is what its lock says.
             """
-            team_dir = held_sweep / name
+            team_dir = engine._teams_dir / name
             (team_dir / "inboxes").mkdir(parents=True)
             (team_dir / "inboxes" / "team-lead.json").write_text("[]")
             RESOLVER._roster_path(name).write_text(json.dumps(
@@ -35034,9 +35554,6 @@ def _check_sweep_spares_a_held_lock(s):
         # Read before the fixture goes, or every answer below says "not there"
         # because the tree was removed rather than because the sweep took it.
         standing = {team.name: team.is_dir() for team in planted}
-    finally:
-        RESOLVER._teams_dir, RESOLVER._dead_sockets = real_teams_dir, real_sockets
-        shutil.rmtree(held_sweep, ignore_errors=True)
 
     spared = {
         "a lock a live run holds keeps its team": standing["session-held-live"],
@@ -35062,6 +35579,313 @@ def _check_sweep_spares_a_held_lock(s):
     check("sweep-spares-a-held-lock",
           "a team is not swept while a writer may be inside its roster lock",
           all(spared.values()), ", ".join(sorted(k for k, ok in spared.items() if not ok)))
+    return checked
+
+
+@unit(('sweep-holds-the-lock-through-removal',
+       "the sweep keeps its own lock in the team directory through both comparisons, the "
+       "rename and the removal of the other files, and removes it just before the roster"),
+      ('sweep-skips-a-team-locked-after-selection',
+       'a team that a writer locks after the sweep selected it is kept without waiting, with '
+       'a warning that names it'),
+      ('sweep-lock-makes-a-writer-wait-then-refuse',
+       'a writer that reaches the lock while the sweep holds it finds it taken, and afterwards '
+       'refuses without making the directory again'),
+      ('sweep-comparison-leaves-out-only-its-own-lock',
+       "the sweep's comparison leaves out its own lock and the directory's own modification "
+       "time and size, and compares the directory's other entries"),
+      ('cleanup-fixture-removes-only-its-own-directory',
+       'the cleanup fixture points RESOLVER, CLAUDE_CONFIG_DIR and TMUX_TMPDIR at its '
+       'directory, gives them back, and removes the directory only while the owner record it '
+       'wrote is still there'))
+def _check_sweep_holds_the_team_lock(s):
+    """The sweep holds a team's roster lock across its check, rename and delete.
+
+    The keep rule spares a team when its lock is taken as the sweep selects it.
+    These cases are about the interval after that: from the comparison with
+    the selection, through the rename, to the last deletion, the lock is the
+    sweep's, so a roster writer either holds it first and the team is kept, or
+    finds it taken and then finds the directory gone.
+
+    Each case has a fixture of its own, and an exception in one case is that
+    case's failure, so the other cases still reach their verdicts.
+    """
+    import errno
+    from unittest import mock
+
+    checked = []
+
+    def check(cid, ok, detail=""):
+        checked.append(_check_verdict(cid, bool(ok), detail))
+
+    def case(cid, block):
+        try:
+            ok, detail = block()
+        except (Exception, Refusal) as exc:
+            ok, detail = False, f"raised {type(exc).__name__}: {exc}"
+        check(cid, ok, detail)
+
+    def read(path):
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
+
+    aged = time.time() - 86400
+
+    def unresurrectable(engine, name):
+        """A team the sweep removes, with an empty task directory that goes with it.
+
+        Its lead's session is not on disk, it lists only its lead, and the
+        mtimes of its directory and files are a day old.
+        """
+        team_dir = engine._teams_dir / name
+        (team_dir / "inboxes").mkdir(parents=True)
+        (team_dir / "inboxes" / "team-lead.json").write_text("[]")
+        engine._roster_path(name).write_text(json.dumps(
+            {"name": name, "leadAgentId": agent_id_of("team-lead", name),
+             "leadSessionId": "no-such-session-uuid",
+             "members": [{"agentId": agent_id_of("team-lead", name), "name": "team-lead"}]}))
+        (engine._tasks_dir / name).mkdir()
+        for path in (engine._roster_path(name), team_dir / "inboxes" / "team-lead.json",
+                     team_dir / "inboxes", team_dir):
+            os.utime(path, (aged, aged))
+        return team_dir
+
+    def holds_through_removal():
+        with _cleanup_test_fixture() as (engine, _root):
+            team = "session-sweep-locked"
+            team_dir = unresurrectable(engine, team)
+            staged = staged_path(team_dir)
+            tasks = engine._tasks_dir / team
+            lock_name = engine._lock_for(engine._roster_path(team)).name
+            mine = json_value(engine._lock_owner())
+            held, events = [], []
+            real_cut, real_rename = engine.revalidate_cleanup_cut, os.rename
+            real_unlink, real_rmdir = Path.unlink, Path.rmdir
+
+            def named(path):
+                """A path inside the team directory, under the name of where the directory is."""
+                path = Path(path)
+                for where, label in ((team_dir, "<team>"), (staged, "<staged>")):
+                    if path == where or where in path.parents:
+                        return "/".join((label, *path.relative_to(where).parts))
+                return "<tasks>" if path == tasks else str(path)
+
+            def holding():
+                """Whether the lock in the team directory, at either name, is the sweep's own."""
+                for where in (team_dir, staged):
+                    try:
+                        facts = (where / lock_name).lstat()
+                    except OSError:
+                        continue
+                    return bool(held) and (facts.st_dev, facts.st_ino) == held[0]
+                return False
+
+            def compared(action, where, identity):
+                held[:] = held or [tuple(identity)]
+                try:
+                    record = json.loads((Path(where) / lock_name).read_bytes())
+                except (OSError, ValueError):
+                    record = None
+                events.append(("compare", named(where), holding(), record == mine))
+                return real_cut(action, where, identity)
+
+            def renamed(source, destination, *args, **kwargs):
+                events.append(("rename", named(source), holding()))
+                return real_rename(source, destination, *args, **kwargs)
+
+            def unlinked(path, *args, **kwargs):
+                events.append(("unlink", named(path), holding()))
+                return real_unlink(path, *args, **kwargs)
+
+            def removed_directory(path, *args, **kwargs):
+                events.append(("rmdir", named(path), holding()))
+                return real_rmdir(path, *args, **kwargs)
+
+            engine.revalidate_cleanup_cut = compared
+            with mock.patch.object(os, "rename", renamed):
+                with mock.patch.object(Path, "unlink", unlinked):
+                    with mock.patch.object(Path, "rmdir", removed_directory):
+                        with capturing("err") as warned, capturing("out") as said:
+                            run_cleanup(dry=False)
+            # Each step with whether the sweep's own lock was in the team
+            # directory as the step began, and for a comparison whether that
+            # lock held this run's record.
+            steps = [("compare", "<team>", True, True),
+                     ("rename", "<team>", True),
+                     ("compare", "<staged>", True, True),
+                     ("unlink", "<staged>/inboxes/team-lead.json", True),
+                     ("unlink", f"<staged>/{lock_name}", True),
+                     ("unlink", "<staged>/config.json", False),
+                     ("rmdir", "<staged>/inboxes", False),
+                     ("rmdir", "<staged>", False),
+                     ("rmdir", "<tasks>", False)]
+            holds = {
+                "the lock was the sweep's own from the first comparison until the roster went":
+                    events == steps,
+                "the team and its task directory are gone":
+                    not team_dir.exists() and not tasks.exists(),
+                "the teams directory is empty": not any(engine._teams_dir.iterdir()),
+                "the sweep said what it removed and did not warn":
+                    said.getvalue().startswith(f"removed 1 empty team(s): {team}")
+                    and warned.getvalue() == "",
+            }
+            unheld = sorted(k for k, ok in holds.items() if not ok)
+            return not unheld, ", ".join(unheld) + (
+                f"; steps {events}, said {said.getvalue()!r}, warned {warned.getvalue()!r}"
+                if unheld else "")
+
+    def skips_a_locked_team():
+        with _cleanup_test_fixture() as (engine, _root):
+            team = "session-sweep-raced"
+            team_dir = unresurrectable(engine, team)
+            roster = engine._roster_path(team)
+            lock = engine._lock_for(roster)
+            writer = json.dumps({"tool": TOOL, "pid": os.getpid(),
+                                 "procStart": engine._proc_start(os.getpid())}).encode()
+            listed = roster.read_bytes()
+            real_check = engine.revalidate_cleanup
+
+            def then_a_writer(plan):
+                answer = real_check(plan)
+                lock.write_bytes(writer)   # a roster writer takes the lock after the check
+                return answer
+
+            engine.revalidate_cleanup = then_a_writer
+            started = time.monotonic()
+            with capturing("err") as warned, capturing("out") as said:
+                code = run_cleanup(dry=False)
+            elapsed = time.monotonic() - started
+            warning = " ".join(warned.getvalue().split())
+            skipped = {
+                "the team is kept as it was":
+                    team_dir.is_dir() and read(roster) == listed
+                    and (engine._tasks_dir / team).is_dir(),
+                "the writer's lock keeps its bytes": read(lock) == writer,
+                "the warning names the team and the holder":
+                    f"not removing {team}: {lock.name} is held by pid {os.getpid()}, "
+                    "which is running" in warning,
+                "stdout stays silent and the run exits 0": said.getvalue() == "" and code == 0,
+                "the sweep did not wait for the lock":
+                    elapsed < LOCK_WAIT_S / 2 and "waiting for" not in warning,
+            }
+            unskipped = sorted(k for k, ok in skipped.items() if not ok)
+            return not unskipped, ", ".join(unskipped) + (
+                f"; warned {warning!r} after {elapsed:.1f}s" if unskipped else "")
+
+    def writer_waits():
+        with _cleanup_test_fixture() as (engine, _root):
+            team = "session-sweep-writer"
+            team_dir = unresurrectable(engine, team)
+            lock = engine._lock_for(engine._roster_path(team))
+            writer = engine._lock_owner()
+            during = []
+            real_cut = engine.revalidate_cleanup_cut
+
+            def writer_arrives(action, where, held):
+                if not during:
+                    try:
+                        with team_lock(team, lock, writer, 0):
+                            during.append("taken")
+                    except LockNotTaken as refused:
+                        during.append(refused.why)
+                return real_cut(action, where, held)
+
+            engine.revalidate_cleanup_cut = writer_arrives
+            with capturing("err"), capturing("out"):
+                run_cleanup(dry=False)
+            try:
+                with team_lock(team, lock, writer, 0):
+                    after = "taken"
+            except LockNotTaken as refused:
+                after = refused.why
+            waited = {
+                "inside the sweep the writer finds the sweep's lock":
+                    during == [f"{lock.name} is held by pid {os.getpid()}, which is running"],
+                "afterwards it refuses because the directory is gone":
+                    after == f"publishing {lock.name} in {team_dir} failed "
+                             f"({os.strerror(errno.ENOENT)})",
+                "and the directory stays gone": not os.path.lexists(team_dir),
+            }
+            unwaited = sorted(k for k, ok in waited.items() if not ok)
+            return not unwaited, ", ".join(unwaited) + (
+                f"; during {during}, after {after!r}" if unwaited else "")
+
+    def comparison():
+        with _cleanup_test_fixture() as (engine, root):
+            team = "session-sweep-compared"
+            team_dir = unresurrectable(engine, team)
+            lock = engine._lock_for(engine._roster_path(team))
+            action = next(item for item in engine.cleanup_plan()["team_actions"]
+                          if item["team"] == team)
+            staged = staged_path(team_dir)
+            answers = {}
+            with team_lock(team, lock, engine._lock_owner(), 0) as held:
+                answers["its own lock"] = engine.revalidate_cleanup_cut(action, team_dir, held)
+                (team_dir / "late").write_text("x")
+                answers["a new entry"] = engine.revalidate_cleanup_cut(action, team_dir, held)
+                (team_dir / "late").unlink()
+                answers["the new entry gone again"] = engine.revalidate_cleanup_cut(
+                    action, team_dir, held)
+                os.rename(lock, root / "aside")
+                lock.write_bytes((root / "aside").read_bytes())
+                answers["the same record in another inode"] = engine.revalidate_cleanup_cut(
+                    action, team_dir, held)
+                lock.unlink()
+                os.rename(root / "aside", lock)
+                team_dir.rename(staged)
+                answers["renamed"] = engine.revalidate_cleanup_cut(action, staged, held)
+                (staged / "inboxes" / "team-lead.json").write_text('[{"from": "fixture"}]')
+                answers["renamed, with mail"] = engine.revalidate_cleanup_cut(
+                    action, staged, held)
+                staged.rename(team_dir)
+            wanted = {
+                "its own lock": (),
+                "a new entry": (f"team directory {team}",),
+                "the new entry gone again": (),
+                "the same record in another inode": (f"roster lock {team}",),
+                "renamed": (),
+                "renamed, with mail": (f"staged team directory {team}",),
+            }
+            differs = sorted(
+                f"{name}: {answers[name]['changed']}" for name, changed in wanted.items()
+                if answers[name]["changed"] != changed
+                or answers[name]["matches"] != (not changed))
+            return not differs, "; ".join(differs)
+
+    def fixture_owns():
+        def pointed():
+            return (globals()["RESOLVER"], os.environ.get("CLAUDE_CONFIG_DIR"),
+                    os.environ.get("TMUX_TMPDIR"))
+
+        before, made, inside = pointed(), None, None
+        with _cleanup_test_fixture() as (engine, root):
+            made, inside = root, pointed() == (engine, str(root), str(root / "sockets"))
+        removed = made is not None and not made.exists()
+        refused, tampered = None, None
+        try:
+            with _cleanup_test_fixture() as (engine, root):
+                tampered = root
+                (root / "owner").write_text('{"pid": 1}\n')
+        except RuntimeError as exc:
+            refused = str(exc)
+        restored = pointed() == before
+        kept = tampered is not None and tampered.is_dir()
+        if kept and (tampered / "owner").read_text() == '{"pid": 1}\n':
+            shutil.rmtree(tampered)   # the record there is the one this case wrote over the fixture's
+        owned = {"inside, RESOLVER and both variables name the fixture's": inside,
+                 "a directory with its own record is removed": removed,
+                 "one with another record is refused and kept": refused is not None and kept,
+                 "RESOLVER and both variables get their values back": restored}
+        unowned = sorted(k for k, ok in owned.items() if not ok)
+        return not unowned, ", ".join(unowned)
+
+    case("sweep-holds-the-lock-through-removal", holds_through_removal)
+    case("sweep-skips-a-team-locked-after-selection", skips_a_locked_team)
+    case("sweep-lock-makes-a-writer-wait-then-refuse", writer_waits)
+    case("sweep-comparison-leaves-out-only-its-own-lock", comparison)
+    case("cleanup-fixture-removes-only-its-own-directory", fixture_owns)
     return checked
 
 
@@ -42386,15 +43210,17 @@ def _check_mail_mid_removal_not_deleted(s):
         real_resolver = globals()["RESOLVER"]
         eng = Resolver(needs=Needs(maybe=set(NEED)))
         eng._teams_dir, eng._projects_dir = base, base / "projects"
+        eng._tasks_dir = base / "tasks"
         eng._projects_dir.mkdir()
         eng._process_table = lambda refresh=False: ()
         eng._dead_sockets = lambda: ()
         eng._made_moments_ago = lambda path: False
         real_cut = eng.revalidate_cleanup_cut
 
-        def racing(action, staged):
-            (staged / "inboxes" / "team-lead.json").write_text('[{"from":"x"}]')
-            return real_cut(action, staged)
+        def racing(action, where, held):
+            if where != action["team_dir"]:   # the mail arrives after the rename
+                (where / "inboxes" / "team-lead.json").write_text('[{"from":"x"}]')
+            return real_cut(action, where, held)
 
         globals()["RESOLVER"] = eng
         try:
@@ -43151,6 +43977,56 @@ def _roster_test_fixture():
             globals()["RECEIPTS_DIR"] = receipts
             _BACKED_UP.clear()
             _BACKED_UP.update(backed_up)
+
+
+@contextlib.contextmanager
+def _cleanup_test_fixture():
+    """An engine that sweeps only inside a directory this run owns.
+
+    The directory is made by owned_directory, which writes this run's owner
+    record into it. The engine's teams, task and transcript directories are
+    the ones inside it, set on the engine because this file computed its own
+    paths from CLAUDE_CONFIG_DIR when it was loaded. For the fixture's length
+    CLAUDE_CONFIG_DIR names the directory too, for a tool run started inside
+    the fixture, and TMUX_TMPDIR names an empty directory there. The engine's
+    process table is empty, so a sweep run against it reads and removes only
+    what the fixture made. The engine is RESOLVER for the fixture's length,
+    because the sweep's executors ask RESOLVER. On the way out RESOLVER and
+    both variables get their values back, and the directory is removed only
+    while its owner record holds the bytes owned_directory wrote; when it
+    does not, the fixture raises and leaves the directory in place.
+    Yields the engine and the directory.
+    """
+    root = owned_directory("c")
+    written = (root / "owner").read_bytes()
+    engine = Resolver(needs=Needs(maybe=set(NEED)))
+    engine._teams_dir, engine._tasks_dir, engine._projects_dir = (
+        root / "teams", root / "tasks", root / "projects")
+    for made in (engine._teams_dir, engine._tasks_dir, engine._projects_dir, root / "sockets"):
+        made.mkdir()
+    engine._process_table = lambda refresh=False: ()
+    real_resolver = globals()["RESOLVER"]
+    variables = {"CLAUDE_CONFIG_DIR": str(root), "TMUX_TMPDIR": str(root / "sockets")}
+    saved = {name: os.environ.get(name) for name in variables}
+    globals()["RESOLVER"] = engine
+    os.environ.update(variables)
+    try:
+        yield engine, root
+    finally:
+        globals()["RESOLVER"] = real_resolver
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        try:
+            ours = (root / "owner").read_bytes() == written
+        except OSError:
+            ours = False
+        if not ours:
+            raise RuntimeError(f"{root} no longer holds the owner record this run wrote there, "
+                               "so it was left in place")
+        shutil.rmtree(root)
 
 
 @unit(
@@ -44393,10 +45269,10 @@ def _check_membership_selected_writes(s):
                 real_lock = team_lock
 
                 @contextlib.contextmanager
-                def changed_lock(selected, current, **kwargs):
-                    with real_lock(selected, current, **kwargs):
-                        if current is write:
-                            current["path"].chmod(0o600)
+                def changed_lock(team, lock, owner, **kwargs):
+                    with real_lock(team, lock, owner, **kwargs):
+                        if lock == write["lock"]:
+                            write["path"].chmod(0o600)
                         yield
 
                 if not under_lock:
