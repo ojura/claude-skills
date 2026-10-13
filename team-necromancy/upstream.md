@@ -168,8 +168,8 @@ The plain process writes `sessions/<pid>.json`, records its
 
 For members, roster messaging provides the intended address path. A lead resumed
 through teammate identity can discover and message other peer sessions. Peer
-discovery returns an empty result for that lead because the socket has no
-registry record. Graceful exit removes it; SIGKILL leaves the file until
+discovery returns an empty result for that lead because the socket does not have
+a registry record. Graceful exit removes it; SIGKILL leaves the file until
 runtime-directory cleanup.
 
 ### Cleanup ownership

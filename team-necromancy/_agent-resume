@@ -5,8 +5,8 @@
 # "cand:desc" or "cand<TAB>desc<TAB>ansi-color" form. Names rows in the selector
 # topic use exactly six TAB-delimited fields:
 #   names<TAB>team-key<TAB>group-description<TAB>agent-id<TAB>member-description<TAB>colour
-# Rows with fewer or more fields, a blank team-key, or an agent-id whose team
-# component does not match team-key are rejected. This file pads names for
+# Rows with fewer or more fields, a blank team-key, or an agent-id with a team
+# component that does not match team-key are rejected. This file pads names for
 # aligned @session columns and generates list-colors patterns from the rendered
 # rows.
 #
@@ -27,8 +27,8 @@ typeset -gA _RA_CACHE _RA_CACHE_KEY _RA_CACHE_AT
 
 _ra_agent_team() {  # agent-id -> REPLY (team after first @), or nonzero if invalid
   # Mirrors Python's name_and_team which uses str.partition("@"): the name is
-  # before the first @, the team is everything after it. Returns 1 for no @,
-  # empty name, or empty team.
+  # before the first @, the team is everything after it. Returns 1 for an id
+  # without an @, with an empty name, or with an empty team.
   local id=$1
   [[ $id == *@* ]] || return 1
   local name=${id%%@*}
@@ -167,7 +167,7 @@ _ra_widths() {  # lines... -> maxname maxid (caller's locals)
   done
   # Only zsh knows the terminal width, so the columns are sized here. The name
   # cap has to land before the id width is measured, or one agentName that is
-  # really a task description sizes the id column for everybody.
+  # really a task description sizes the id column for every row.
   local -i width=${COLUMNS:-80}
   local -i namecap=$(( width / 4 )) idcap=$(( width / 2 ))
   (( namecap > 24 )) && namecap=24

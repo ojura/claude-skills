@@ -37,5 +37,5 @@ extend-ignore =
     E201, E202
 per-file-ignores =
     # The transformation that cut the suite into units is kept for the record
-    # rather than maintained, and has no callers.
+    # rather than maintained, and does not have callers.
     migrate-suite/*:E501,E302,E305

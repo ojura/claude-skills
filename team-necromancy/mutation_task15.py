@@ -2,17 +2,17 @@
 
 Run this file as Python after the task-15 clean selftest passes. ``probe.expect``
 runs a clean suite and one isolated mutant for each case, reads every report in
-full, and refuses a mutant whose failure set is not exactly the set its case
+full, and refuses a mutant when its failure set is not exactly the set its case
 names: the named check, plus any co-failure the case justifies with a reason.
 It also refuses a run during which the tool, its companion, the verifier or the
-test tree changed. This module has no probe command-line interface.
+test tree changed. This module does not have a probe command-line interface.
 """
 
 import probe
 
 
-# These generation boundaries have no category-specific registered verdict that
-# can distinguish the requested race from ordinary behavior. Keep the exact
+# These generation boundaries do not have a category-specific registered verdict
+# that can distinguish the requested race from ordinary behavior. Keep the exact
 # removal sites visible so later coverage does not substitute a weaker check for
 # the generation it is supposed to protect.
 BLOCKED_GENERATION_CASES = (
@@ -34,14 +34,14 @@ BLOCKED_GENERATION_CASES = (
     (
         "rebind and migration generations",
         "revalidate_rebind",
-        "no named rebind or lead-migration generation verdict is registered",
+        "a named rebind or lead-migration generation verdict is not registered",
     ),
 )
 
-# Some of these final owners now exist, but none has an exact registered verdict
-# for removal or bypass of the final call or revalidation. A later script must
-# name that verdict; it must not replace one of these omissions with a nearby
-# behavior check or weaker structural mutation.
+# Some of these final owners now exist, but they do not have an exact
+# registered verdict for removal or bypass of the final call or revalidation. A
+# later script must name that verdict; it must not replace one of these
+# omissions with a nearby behavior check or weaker structural mutation.
 BLOCKED_FINAL_PLAN_CASES = (
     ("rebuild final revalidation", "rebuild_plan"),
     ("membership final revalidation", "membership_plan"),
@@ -233,7 +233,7 @@ CASES = [
         "        ctx[\"merged\"]\n",
     ),
     (
-        "resume-target-has-no-parallel-projections",
+        "resume-target-does-not-have-parallel-projections",
         "def build_command(ctx, args, passthrough):\n",
         "def build_command(ctx, args, passthrough):\n"
         "    if False:\n"
@@ -250,7 +250,7 @@ CASES = [
     # Reporters receive facts. They neither query Resolver nor grow a second
     # member or placement model in an executor.
     (
-        "doctor-renderers-read-no-evidence",
+        "doctor-renderers-do-not-read-evidence",
         "def run_agent_dossier(member, shared=None):\n",
         "def run_agent_dossier(member, shared=None):\n"
         "    if False:\n"
@@ -322,8 +322,8 @@ CASES = [
         "            if False:\n",
     ),
 
-    # The renderers each receive one complete immutable answer and make no
-    # second Resolver query of the raw evidence they render.
+    # The renderers each receive one complete immutable answer and do not make
+    # a second Resolver query of the raw evidence they render.
     (
         "mail-consumes-one-complete-answer",
         "    answer = RESOLVER.mail_answer(selector)\n",

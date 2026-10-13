@@ -40,28 +40,29 @@ through exec, so the environment the record names is the one the tool ran with,
 after the shell script(1) starts added its own variables. It writes a value
 only for a name on SHOWN, matched exactly, which is probe.py's SHOWN_VALUES,
 the lead's list for every run record of this work, and names every other
-variable with no value, no length and no digest, because a rule on names would
+variable without a value, a length or a digest, because a rule on names would
 let a secret through under a name it does not match. Whether each variable the
 audit handed to script(1) was the same in every tier is compared in memory, and
 the audit names the ones that were not.
 
 Before the tiers it makes one refusal on purpose on each path a refusal takes
 to the record: it runs the tool's selftest with one unit of its own, which
-reads pid 1, outside every run, once before the unit runs, outside any unit,
-once in the unit, and once in a tool run the unit starts. The run builds its
-fence from the record variable as a tier does, and the tool run installs its
-unit's fence as main does first. The audit reads those three lines back before
-it runs a tier and leaves them out of the count, so an empty count is evidence
-that nothing was refused on any of those paths, and not a record that no
-refusal could reach. It judges each tier by its exit status and by its refusal
-rows, the tool's TIER_PROCS, as well as by the record, so a refusal that went
-elsewhere still counts. A refusal row also fails on a fault of the fence
-itself, such as a walk that did not settle, which the row's detail in the
-tier's kept output names. The tool is loaded as a module once, as the control
-loads it, for those row ids and the names of its record and unit variables, so
-the audit holds no copy of either. The directories it makes for the control
-and the tiers are removed after each run, and one it could not remove is
-named; the record and the outputs beside it are kept.
+reads pid 1, outside the selftest run and its tool run, once before the unit
+runs, outside any unit, once in the unit, and once in a tool run the unit
+starts. The run builds its fence from the record variable as a tier does, and
+the tool run installs its unit's fence as main does first. The audit reads
+those three lines back before it runs a tier and leaves them out of the count,
+so an empty count is evidence that the fence did not refuse a read on any of
+those paths, and not a record that refusals could not reach. It judges each
+tier by its exit status and by its refusal rows, the tool's TIER_PROCS, as well
+as by the record, so a refusal that went elsewhere still counts. A refusal row
+also fails on a fault of the fence itself, such as a walk that did not settle,
+which the row's detail in the tier's kept output names. The tool is loaded as a
+module once, as the control loads it, for those row ids and the names of its
+record and unit variables, so the audit does not hold a copy of either. The
+directories it makes for the control and the tiers are removed after each run,
+and one it could not remove is named; the record and the outputs beside it are
+kept.
 
 Exit status: 0 when every tier exited 0 and passed its refusal rows and the
 record holds only the control's refusals; 1 when the record holds any other
@@ -70,7 +71,8 @@ record as it should, a tier could not run, ran out of time, did not state a
 refusal row or exited nonzero for another reason, such as a failing check of
 another kind, or a line of the record does not parse as a JSON object. When
 both 1 and 2 apply, the status is 1, the audit's finding, and the sentences
-printed name every fault either way.
+printed name each refusal in the record, each failed refusal row and each
+problem that kept a tier from being judged, either way.
 """
 import argparse
 import collections
@@ -128,7 +130,7 @@ def private_root():
             continue
         (root / "c").mkdir(mode=0o700)
         return root
-    raise SystemExit("no free 11-character directory under /tmp after 1000 tries")
+    raise SystemExit("could not find a free 11-character directory under /tmp after 1000 tries")
 
 
 def removed(root, label):
@@ -171,7 +173,8 @@ def read_record(record):
 
 
 # A tool run a unit starts: its fence goes in from the unit variable, as main's
-# does first, and it reads pid 1, which is outside every run.
+# does first, and it reads pid 1, which is outside the tool run and the run
+# that started it.
 TOOL_RUN = ("import importlib.machinery, importlib.util, sys\n"
             "loader = importlib.machinery.SourceFileLoader('audited_tool_run', sys.argv[1])\n"
             "tool = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, "
@@ -330,7 +333,7 @@ def run_tier(tool, loaded, label, live, args, record, environments):
             wrong.append(("refused", f"{label}: {row} failed; its detail in {kept} names each "
                                      "refusal and fault"))
         elif row not in stated:
-            wrong.append(("unjudged", f"{label}: its output has no {row} row"))
+            wrong.append(("unjudged", f"{label}: its output does not have a {row} row"))
     others = sorted(check_id for check_id, verdict in stated.items()
                     if verdict == "FAIL" and check_id not in rows)
     refused = any(kind == "refused" for kind, _sentence in wrong)

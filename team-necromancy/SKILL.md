@@ -96,8 +96,8 @@ runtime labels. Its session UUID and title occupy separate rows. Lead identity,
 operative team, polling, common delivery failure, and common remedies print once
 in the team report. Dossiers retain the member's conversation, parent, seat,
 recipient-specific ledger evidence, and member-specific actions. `--no-color`
-changes no spacing. The team verdict remains the command's exit status. The
-empty-hand sweep stays at team-summary level.
+does not change the spacing. The team verdict remains the command's exit status.
+The empty-hand sweep stays at team-summary level.
 
 The selector may sit anywhere among the flags. The forwarded flags are an
 allowlist that records which of them take a value, so a bare token is either
@@ -152,7 +152,7 @@ only the inner human text in the promoted record. Both variants record the edit
 in the transcript's schema-version-1 conversion receipt, so demotion restores
 the original side transcript bytes. `visible_human_wrapper_edits` stores UUID
 intervals; unwrapped intervals reference the original wrapper payloads needed for
-the inverse, while complete-wrapper intervals copy no payload text. When
+the inverse, while complete-wrapper intervals do not copy payload text. When
 promotion applies the exact inverse recorded by a carried demote receipt and
 `--unwrap` is omitted, it preserves that receipt's recorded mode; an exact inverse
 replays only the recorded intervals. `side_meta_b64` and `side_meta_mode` store the
@@ -168,7 +168,7 @@ A member promotion stamps its own root with the assigned name and team so plain
 Claude Code resume restores member identity. The receipt records the root's prior
 field presence and values for exact demotion. Lead promotion does not apply the
 member-root edit. A fork-reference promotion keeps its copied parent prefix as
-model context, but those UUIDs contribute neither transcript identity nor spawn,
+model context, but those UUIDs do not contribute transcript identity or spawn,
 lead, or roster-recovery actions.
 
 Demotion derives its parent from the latest promotion receipt. When parent

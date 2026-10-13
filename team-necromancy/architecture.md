@@ -41,16 +41,16 @@ private Resolver methods.
 The summary uses the existing PID, identity, and title renderer. That renderer
 clips each roster title to the terminal space left on its row; the full title
 remains available to the dossier. ANSI is inserted around the identity after
-plain-text layout, so `--no-color` changes no spacing. Dossier headers carry
-explicit requested, membership, and runtime labels. Session UUID and title use
-separate labeled rows, followed by parent and live seat. Lead identity, operative
-team, polling, common delivery failure, and common remedies print once in the
-team report. Recipient-specific ledger evidence and member-specific remedies stay
-in the matching dossier. A named diagnosis resolves the deeper parent, delivery,
-and ledger evidence; the empty-hand sweep omits that work. Direct diagnosis uses
-the ordinary selector and immutable target, but does not infer a launch
-destination. The team verdict still measures whether a live lead reads the team,
-and remains the command's exit status.
+plain-text layout, so `--no-color` does not change the spacing. Dossier headers
+carry explicit requested, membership, and runtime labels. Session UUID and title
+use separate labeled rows, followed by parent and live seat. Lead identity,
+operative team, polling, common delivery failure, and common remedies print once
+in the team report. Recipient-specific ledger evidence and member-specific
+remedies stay in the matching dossier. A named diagnosis resolves the deeper
+parent, delivery, and ledger evidence; the empty-hand sweep omits that work.
+Direct diagnosis uses the ordinary selector and immutable target, but does not
+infer a launch destination. The team verdict still measures whether a live lead
+reads the team, and remains the command's exit status.
 
 The unnamed Agent tool runs its query loop inside the leader and writes a
 sidechain transcript. Its work therefore resumes through an internal query
@@ -95,8 +95,8 @@ key file:
 
 The JSON key record contains `peerToken` and may contain `procStart` and
 `procStartFt`. Key files have mode `0600`; `~/.claude/sessions` and the socket
-directory have mode `0700`. The child token has no key file. It is passed to
-child processes as `CLAUDE_CODE_MESSAGING_TOKEN`.
+directory have mode `0700`. The child token does not have a key file. It is
+passed to child processes as `CLAUDE_CODE_MESSAGING_TOKEN`.
 
 The first authenticated frame is `{"type":"auth","token":"..."}` followed by a
 newline. A matching token is classified as either `peer` or `child`. Required
@@ -131,9 +131,9 @@ newline can still exceed it before splitting.
 A raw client optionally writes the auth frame, writes one JSON frame plus a
 newline, then ends the connection. Its five-second operation resolves when the
 connection closes, not when the receiver approves, queues, or processes the
-prompt. The server sends no general positive acknowledgement. Consequently a
-successful raw send or `SendMessage` result means only that the sender did not
-observe a transport error before close.
+prompt. The server does not send a general positive acknowledgement.
+Consequently a successful raw send or `SendMessage` result means only that the
+sender did not observe a transport error before close.
 
 A normal raw user frame has this form:
 
@@ -153,7 +153,7 @@ nonempty string. `session_id` is optional but, when present, must equal the
 receiver's session ID. `priority` accepts `now`, `next`, or `later` and otherwise
 defaults to `next`; `uuid`, `file_attachments`, `from`, and `msg_id` are optional.
 The server gives an absent `from` the value `unknown`, makes a prompt UUID when
-none was supplied, and retains a syntactically valid `msg_id` in peer-origin
+one was not supplied, and retains a syntactically valid `msg_id` in peer-origin
 metadata. Accepted frames become prompt-queue items with `mode: "prompt"`,
 `skipSlashCommands: true`, and `isMeta: true`.
 
@@ -230,26 +230,27 @@ capacity and receipt timeout are unknown.
 
 Every status is sent over a new UDS control connection. Statuses are therefore
 best-effort lifecycle notices, not universal acknowledgements: immediate
-acceptance sends no `delivered` receipt, immediate refusal may send no receipt,
-and an unsafe reply address or an untracked ID prevents a status from reaching
-the sender. The receiver tracks up to 200 outbound IDs; `held` moves a matching
-ID to an awaiting-terminal set, while a later terminal status removes it.
+acceptance does not send a `delivered` receipt, immediate refusal might not send
+a receipt, and an unsafe reply address or an untracked ID prevents a status from
+reaching the sender. The receiver tracks up to 200 outbound IDs; `held` moves a
+matching ID to an awaiting-terminal set, while a later terminal status removes
+it.
 
 The observed status **Cross-session message held for approval** means the receiver
 accepted the transport frame but withheld the prompt because the permission modes
 differ. The recipient user must approve it before Claude sees it. **Cross-session
 message released after approval** means that approval occurred and the receiver
 released the prompt to the recipient session. The session's prompt queue still
-controls when Claude takes it. Neither status is an ordinary positive
-acknowledgement, proof that the prompt ran, or proof of model consumption.
+controls when Claude takes it. The two statuses are not ordinary positive
+acknowledgements, proof that the prompt ran, or proof of model consumption.
 
-1. **Transport write success** means the sender saw no local connection error
-   before close.
+1. **Transport write success** means the sender did not see a local connection
+   error before close.
 2. **Held status** means the receiver parked the prompt for approval.
 3. **Delivered status** means an earlier held prompt was released into the prompt
    queue.
 4. **Model consumption** happens only when the receiving session later takes the
-   queued prompt. No UDS acknowledgement proves it happened.
+   queued prompt. UDS acknowledgements do not prove it happened.
 
 Ordinary inbound work enters a processing chain. Control frames and
 attachment-free `priority: "now"` user frames can bypass it, so the protocol does
@@ -346,14 +347,14 @@ unparsable now, which may have loaded and been removed since. A config created
 after the start is a new one, and an earlier config of the team may have been
 there at the mount: when this tool's reap receipt for the team shows it retired
 the team after the process started, the answer is unknown rather than no. A
-process with no argv team, and no stamped team that loaded when it started,
-takes an implicit team created within `TEAM_MINT_WINDOW_MS` before it started,
-when it is the only process that started that soon after the team was created
-and the team is the only one it could have created in that time. These answers
-are inferred. When the evidence does not decide, the answer leaves the team
-unknown and lists the teams still open. The start time comes from the kernel,
-read from `/proc/<pid>/stat` and `/proc/uptime`, with the session registry's
-`startedAt` as the fallback.
+process without an argv team, and without a stamped team that loaded when it
+started, takes an implicit team created within `TEAM_MINT_WINDOW_MS` before it
+started, when it is the only process that started that soon after the team was
+created and the team is the only one it could have created in that time. These
+answers are inferred. When the evidence does not decide, the answer leaves the
+team unknown and lists the teams still open. The start time comes from the
+kernel, read from `/proc/<pid>/stat` and `/proc/uptime`, with the session
+registry's `startedAt` as the fallback.
 
 A launch that has not started yet is a different question. `restore_answer`
 says whether its window start's team loads in the census the launch was planned
@@ -361,9 +362,9 @@ with, so that team takes over from argv. Launch answers do not store it:
 `enforce_restore` asks at the action boundary and `run_one` asks when it
 reports the launch. In a team run that census holds every change the run makes
 to its teams, because the run makes them all before its first member, a
-rebuild or one retirement, and no member's step creates, rebuilds or retires a
-team (`in_team_run`). A launch that moved is not asked: the retirement or
-restamp it went through decides what it comes back as.
+rebuild or one retirement, and the members' steps do not create, rebuild or
+retire a team (`in_team_run`). A launch that moved is not asked: the retirement
+or restamp it went through decides what it comes back as.
 
 ## Implicit-team cleanup
 
@@ -532,15 +533,16 @@ structured answers from Resolver.
 
 ### Public methods and private readers
 
-Resolver has exactly 36 public methods and no public instance attributes. Its
-answers use read-only records. The retained observation types and config
-constructors establish ownership of their nested values; a read-only outer
-mapping alone does not copy a caller's referenced objects. In particular, rebuild
-rejection retains the exact launch supplied by its caller. `refresh_transcript_evidence`
-is the one notification: transcript writers use it to discard cached evidence
-after a mutation attempt. The AST checks compare this method and caller table
-exactly, reject public aliases and component access, reject module calls to
-private Resolver methods, and require an empty `PUBLIC_RESOLVER_ATTRIBUTES` map.
+Resolver has exactly 36 public methods and does not have public instance
+attributes. Its answers use read-only records. The retained observation types
+and config constructors establish ownership of their nested values; a read-only
+outer mapping alone does not copy a caller's referenced objects. In particular,
+rebuild rejection retains the exact launch supplied by its caller.
+`refresh_transcript_evidence` is the one notification: transcript writers use it
+to discard cached evidence after a mutation attempt. The AST checks compare this
+method and caller table exactly, reject public aliases and component access,
+reject module calls to private Resolver methods, and require an empty
+`PUBLIC_RESOLVER_ATTRIBUTES` map.
 
 | Public method | Module caller or callers |
 |---|---|
@@ -601,7 +603,7 @@ root-stamp conversion fixture checks four cases through operation answers.
 and the descriptor's permission bits masked to `0o777`. `_file_observation`
 reads bytes and mode from the same open descriptor and compares its device,
 inode, size, and nanosecond modification time with the named path. A mode of `0`
-is retained; `None` means there was no physical mode to observe.
+is retained; `None` means the reader did not have a physical mode to observe.
 `_file_generation` projects the generation for readers that still require a tuple.
 
 A physical generation is `(dev, ino, size, mtime_ns, raw_bytes)`. The reader also
@@ -609,8 +611,8 @@ preserves `("absent",)` and the diagnostic
 `("changed-during-read", descriptor_signature, named_signature, raw)` result.
 The existing reader treats every `OSError` as absent, including permission
 failures. Census skips those records. An absent lookup therefore does not prove
-that no file exists. An unstable read refuses census selection instead of being
-parsed or treated as absent.
+that the file is absent. An unstable read refuses census selection instead of
+being parsed or treated as absent.
 
 `Resolver.RosterSnapshot` owns the complete roster interpretation. It retains a
 file observation, config data, and any parse problem. State, operative team name,
@@ -669,17 +671,18 @@ Subsequent readers reconstruct evidence through their existing loaders.
 | Transcript | `_stamps`, `_carried`, `_carried_scope`, `_receipts`, `_spawns`, `_spawn_log`, `_by_agent`, `_by_team`, `_team_assignments`, `_transcript_facts`, `_transcript_snapshots`, `_copied_prefixes` |
 | Process | `_procs`, `_seat_table`, `_seats`, `_registry` |
 | Either | `_runtime_table`, `_runtime_snapshot`, `_team_member_answers`, `_team_descriptions`, `_operating_answers` |
-| Neither | `_terminal`, `_boot_time` |
+| Never | `_terminal`, `_boot_time` |
 
 The active `_process_table(refresh=True)` uses this registry. Transcript writers
-call `refresh_transcript_evidence`. Neither event resets configured directories,
-`_needs`, `_exercised`, the cache-free rewriter, or previously selected answers.
-This responds to this command's writes, not arbitrary external transcript edits.
+call `refresh_transcript_evidence`. The two events do not reset configured
+directories, `_needs`, `_exercised`, the cache-free rewriter, or previously
+selected answers. This responds to this command's writes, not arbitrary external
+transcript edits.
 
 `apply_restamp` refreshes immediately after atomic replacement succeeds, before
 member or lead completion can refuse. Atomic writers capture and validate the
 observation and close the descriptor before `os.replace`; successful replacement
-returns immediately, with no intervening metadata read. A failure before
+returns immediately, without an intervening metadata read. A failure before
 installation preserves the earlier evidence.
 
 Every exclusive creation in `materialize` and `embed` refreshes in its own
@@ -738,20 +741,20 @@ Both selected and reported config values pass through `RosterSnapshot` before
 their owned data is compared. Its expected type and value errors become
 objections. The selected config's identity association and the reported config's
 value comparison remain different checks. Supported list and tuple arrays are
-normalized by the existing constructor; completion adds no serialization or
-special equality rules for config leaves. The selected candidate is retained
-for publication after every effect passes.
+normalized by the existing constructor; completion does not add serialization or
+special equality rules for config leaves. The selected candidate is retained for
+publication after every effect passes.
 
 Incorrect or incomplete effects return exactly `launch`, `written_roster`, and
-`objections`, with the original launch object and no written roster. This also
-preserves an ordinary dictionary supplied as launch; it does not detach or deeply
-freeze that caller's graph. Successful output contains exactly `launch`,
+`objections`, with the original launch object and without a written roster. This
+also preserves an ordinary dictionary supplied as launch; it does not detach or
+deeply freeze that caller's graph. Successful output contains exactly `launch`,
 `written_roster`, `original_generation`, `replacement_generation`, and
 `objections`. The generation values come from the retained original and accepted
-file observation. Neither result copies raw plan fields or returns the `Applied`
-input: only that input's outer dataclass is frozen, and freezing it does not
-establish ownership of its nested data. Executors and effect tests can retain
-that input separately.
+file observation. The two results do not copy raw plan fields or return the
+`Applied` input: only that input's outer dataclass is frozen, and freezing it
+does not establish ownership of its nested data. Executors and effect tests can
+retain that input separately.
 
 Only complete acceptance publishes the owned candidate as both the completed
 destination and the census entry. Creation inserts it into an empty census as
@@ -772,7 +775,7 @@ source and destination modes. Successful backup history is passed to Resolver
 as an immutable set of config paths. The first backup in an invocation may
 replace an older invocation's `.bak-agent-resume`; later writes leave it alone.
 This differs from rebuild, which requires an absent invalid-roster backup path.
-There is no transaction-wide rollback across several membership writes: a late
+Several membership writes are not rolled back as one transaction: a late
 refusal may follow an inbox change or a completed write to the first roster.
 The existing lock publication procedure is unchanged.
 
@@ -802,31 +805,32 @@ is one decision per run, made before any member launches by the private
 `_team_redirect`. A team run makes it in `team_run_plan` for every member it
 starts; a run of one member makes it inside `member_redirect_plan`. The decision
 names the destination and its selected lead session, whether a person must
-confirm (an inferred destination), and the retirement: reap the source team when
-no process that sends or reads as it is left, restamp each moving member's own
+confirm (an inferred destination), and the retirement: reap the source team once
+the processes that send or read as it are gone, restamp each moving member's own
 conversation under `--force`, or blocked. `run_team` carries out the team-wide
 part once in `apply_team_redirect`, in the order a single member's move keeps:
 the one question, then every stop (`settle_stops`), then at most one reap, or
-instead one decline. Each running member a move restarts is asked about in
-turn before any process is ended; a declined stop, or one that cannot be asked
-about because there is no terminal and `--yes` was not passed, refuses the whole
-move with nothing stopped, retired or started. The processes are then ended, the
-plan is revalidated with them gone, and only then is the team retired. Each
-member's plan receives the decision and the run's answer to it in
+instead one decline. Each running member a move restarts is asked about in turn
+before any process is ended; a declined stop, or one that cannot be asked about
+because stdin is not a terminal and `--yes` was not passed, refuses the whole
+move without stopping, retiring or starting anything. The processes are then
+ended, the plan is revalidated with them gone, and only then is the team
+retired. Each member's plan receives the decision and the run's answer to it in
 `MemberRedirectRequest.team` and `team_answer`, skips the stops the run settled,
 and carries the rest out without deciding again. The decision is the only
 authority over which team directories exist while the run lasts: `run_team`
 rebuilds a missing roster before the first member only when the members stay,
-and no member's step creates, rebuilds or retires a team, so no roster is
-rebuilt for a team the members leave. A restamp touches one transcript, so a
-live process holding that transcript is its only conflict. A reap counts each
-moving member's other holders as ended, since the run ends them first. A moving
-member held by this run's own process or one of its ancestors cannot be ended,
-so the decision refuses the move before anything changes, with `--force` or
-without. A running member has already moved when all its live processes operate
-as the destination, whatever roster still lists it: the decision marks it
-`arrived`, and its step reports it running there and registers it in the
-destination's roster, without starting, stopping or rebuilding anything.
+and the members' steps do not create, rebuild or retire a team, so the run does
+not rebuild a roster for a team the members leave. A restamp touches one
+transcript, so a live process holding that transcript is its only conflict. A
+reap counts each moving member's other holders as ended, since the run ends them
+first. A moving member held by this run's own process or one of its ancestors
+cannot be ended, so the decision refuses the move before anything changes, with
+`--force` or without. A running member has already moved when all its live
+processes operate as the destination, whatever roster still lists it: the
+decision marks it `arrived`, and its step reports it running there and registers
+it in the destination's roster, without starting, stopping or rebuilding
+anything.
 
 Whether a member can be moved onto a team comes from one private answer,
 `_destination_answer`: the team needs a valid roster and a selected lead session
@@ -847,12 +851,12 @@ the team come from `_team_moves`: the team run with `--all`, which starts the
 stopped members on the lead's team, and the run with `--into-team live --all`,
 which restarts the running ones too, each judged on the members `team_run_plan`
 would start. So the doctor names `--with-mail` when only waiting mail keeps the
-team from being retired, offers no automatic move when the lead is not known
-exactly or running members stay behind, offers stopping the processes that run
-as the team when they alone stand in the way, and always names `--keep-team`.
-A lead move's crew report asks `_crew_move` the same about moving the crew onto
-the lead's destination, in the world the lead move leaves: the processes it
-ends gone, and the source roster gone when it retires that team.
+team from being retired, does not offer an automatic move when the lead is not
+known exactly or running members stay behind, offers stopping the processes that
+run as the team when they alone stand in the way, and always names
+`--keep-team`. A lead move's crew report asks `_crew_move` the same about moving
+the crew onto the lead's destination, in the world the lead move leaves: the
+processes it ends gone, and the source roster gone when it retires that team.
 
 A member redirect's revalidation compares the facts its plan used: the
 destination roster observation, the parent transcript's identity (device and
@@ -884,16 +888,16 @@ contains `operation` and `plan`. `run_one` is the only caller of
 `lead_migration_plan(request)`. `lead_rebind` is the only caller of
 `revalidate_lead_migration(plan)` and `complete_lead_migration(applied)`.
 `_retarget_launch` and generic rebind helpers are private to Resolver plan and
-completion builders, with no module callers. API tests accept lead route selection,
-revalidation, exact caller ownership, the absence of generic or raw module calls,
-and matching dry completion. A non-mutating live check correctly reports that the
-selected effects were not applied. The applied lead-migration test verifies the
-selected route and retained crew facts after the migration. Module code does not
-call `lead_session_for` or `roster_census` to finish either routing operation. The
-team-run entrypoint test reuses the exact destination and inbox generations from
-`team_run_plan` and refuses generation drift. The attach entrypoint test verifies
-that `run_agents` uses `attach_decision` without reading fresh terminal or server
-state.
+completion builders, without module callers. API tests accept lead route
+selection, revalidation, exact caller ownership, the absence of generic or raw
+module calls, and matching dry completion. A non-mutating live check correctly
+reports that the selected effects were not applied. The applied lead-migration
+test verifies the selected route and retained crew facts after the migration.
+Module code does not call `lead_session_for` or `roster_census` to finish either
+routing operation. The team-run entrypoint test reuses the exact destination and
+inbox generations from `team_run_plan` and refuses generation drift. The attach
+entrypoint test verifies that `run_agents` uses `attach_decision` without
+reading fresh terminal or server state.
 
 Renderers and executors do not call process-table, runtime-index, PID-liveness,
 tmux socket or pane, roster-path, mailbox-path, receipt, transcript-selection,
@@ -932,14 +936,14 @@ team run and is not read again while rendering or attaching.
 A `SocketLiveness` is what one connection attempt found at a tmux socket path:
 `alive`, `absent`, or `unknown` with a reason worded for the user. A path of
 `SOCKET_PATH_LIMIT` (108) bytes or more is unknown without an attempt, since
-neither the probe nor tmux can connect through it. An unknown socket counts as
-neither live nor dead: cleanup keeps it, `_newest_live_socket` and the seat index
-pass it over, `--poison` and `--unpoison` stop, and attach is not offered. For a
-launch destination on an unknown socket, `_tmux_launch_action` selects `refuse`,
-and `launch` raises `LaunchFailed` with the reason before any tmux command runs.
-A `RosterPaneReference` for a pane recorded on that socket has the state
-`unknown`, and the plan reports the pane as not checked. A launch that runs in
-the current pane does not read the server and is not refused. A
+the probe cannot connect through it and tmux cannot either. An unknown socket
+counts as neither live nor dead: cleanup keeps it, `_newest_live_socket` and the
+seat index pass it over, `--poison` and `--unpoison` stop, and attach is not
+offered. For a launch destination on an unknown socket, `_tmux_launch_action`
+selects `refuse`, and `launch` raises `LaunchFailed` with the reason before any
+tmux command runs. A `RosterPaneReference` for a pane recorded on that socket
+has the state `unknown`, and the plan reports the pane as not checked. A launch
+that runs in the current pane does not read the server and is not refused. A
 `SocketLiveness` raises `TypeError` when read as a truth value, so a caller
 compares its state.
 
@@ -1014,11 +1018,12 @@ questions and carry separate evidence.
 Conversion receipts are versioned, tool-written evidence carried by the
 converted transcript. Resolver reads them to recover team membership, copied
 parent-record ownership, and the intentional identity assigned by promotion.
-The corpus census retains the main transcript paths it examined, so a path with
-no matching receipt is a known absence until transcript evidence is invalidated.
-A new path or one outside that census still receives direct receipt validation.
-Ordinary later stamps and roster observations do not silently replace the assigned identity. An
-explicit complete identity or an intentional move can replace it.
+The corpus census retains the main transcript paths it examined, so a path
+without a matching receipt is a known absence until transcript evidence is
+invalidated. A new path or one outside that census still receives direct receipt
+validation. Ordinary later stamps and roster observations do not silently
+replace the assigned identity. An explicit complete identity or an intentional
+move can replace it.
 
 Resolution produces one immutable target containing the exact session, canonical
 transcript fact and path, resolved cwd, effective identity and role, provenance,
@@ -1086,22 +1091,22 @@ server fact) ask a process fence before reading, in the selftest process and in
 every tool run one of its units starts. The fence's root is the selftest process
 that runs the units: a read-only run, a serial live run, one batch of a split
 run (a batch of live-tier test jobs, which one worker runs), or a live run's
-read-only child. A unit not declared with `machine=True` sees the root and the
-processes under it, and nothing else: `_process_table` narrows the `/proc`
-listing to them before it reads any pid, the session registry is empty, and a
-reader refuses every other pid. A unit declares `machine=True` when its engines,
-or the tool runs it starts, must read on purpose, through the engine's process
-inputs (`_FakeTmux.PROCESS_INPUTS`), processes outside that tree or the real
-session registry, and says why beside the declaration. The declaration decides
-what those inputs answer and nothing else: a declared unit's table lists the
-whole machine and its registry is the real one. The selftest's own process
-readers on `_ProcessFence` read the same either way. In both worlds a reader may
-read any pid from `PID_CEILING` (1 << 22) up, which no process can hold and from
-which fixtures number the processes they invent. Every other pid the run admits,
-whether a declared unit's table or registry named it, Popen started it or a walk
-found it under the root, is under one rule: it is read while its start time is
-the one recorded when the run learned of it, or once no process holds its
-number, and refused while another process holds it. A pid that a process under
+read-only child. A unit not declared with `machine=True` sees only the root and
+the processes under it: `_process_table` narrows the `/proc` listing to them
+before it reads any pid, the session registry is empty, and a reader refuses
+every other pid. A unit declares `machine=True` when its engines, or the tool
+runs it starts, must read on purpose, through the engine's process inputs
+(`_FakeTmux.PROCESS_INPUTS`), processes outside that tree or the real session
+registry, and says why beside the declaration. The declaration decides only what
+those inputs answer: a declared unit's table lists the whole machine and its
+registry is the real one. The selftest's own process readers on `_ProcessFence`
+read the same either way. In both worlds a reader may read any pid from
+`PID_CEILING` (1 << 22) up, which a process cannot hold and from which fixtures
+number the processes they invent. Every other pid the run admits, whether a
+declared unit's table or registry named it, Popen started it or a walk found it
+under the root, is under one rule: it is read while its start time is the one
+recorded when the run learned of it, or once its number is not held by any
+process, and refused while another process holds it. A pid that a process under
 the root holds now is admitted as well, since the walk that finds it there is
 how the run learns it. A value that is not a whole number above zero is refused.
 A refused read is answered as a process that does not exist and is written down
@@ -1117,9 +1122,9 @@ of the fence itself.
 the declaration and the unit's name. `main` installs that fence before anything
 else, so a tool run's root is the selftest process that runs its unit, never the
 tool run itself. It checks the root's start time before walking the root's
-children, so a root that has gone leaves it no processes, and it writes its
-refusals to the file `AGENT_RESUME_SELFTEST_FENCE` names, which the tier's row
-reads once the tool run has exited. The pids the run knows are kept in one
+children, so a root that has gone leaves it without any processes, and it writes
+its refusals to the file `AGENT_RESUME_SELFTEST_FENCE` names, which the tier's
+row reads once the tool run has exited. The pids the run knows are kept in one
 record for the whole run, a file beside the refusal record: each of the run's
 fences adds the pids it learns there, and reads what the others added before it
 counts a pid as unknown, so a tool run admits a pid the selftest process learned
@@ -1128,22 +1133,23 @@ refusal record cannot take a refusal, the record of known pids cannot take a pid
 or cannot be read, the refusal record cannot be read for the row, or a walk has
 not settled (below). In the selftest process each fault is kept for the tier's
 row, which fails naming it; a refusal the record could not take is kept there as
-the refusal it is. A tool run has no row of its own, so there a fault ends the
-run: `fence_fault` names it on stderr and raises `FenceFault`, which `answered`
-turns into exit status 70. `FenceFault` is not a `Refusal`, so the product's own
-handlers, which catch a refusal to bring up the rest of a team in `run_agents`
-or to print a roster warning in a rollback, let it through, and no code between
-the read and `answered` absorbs it. A tool run ends with a fence fault before
-anything else runs when its `AGENT_RESUME_SELFTEST_UNIT` does not parse. A tool
-run that is a selftest itself roots its own units at itself. `ran_unit` drops
-RESOLVER's process caches as each unit starts and again in its `finally`, so a
-table a declared unit read reaches no other unit. `proc_reader_audit.py` runs
-the tiers with a record file of its own and lists every refusal by unit, reader
-and pid, those of the tool runs included. A `claude` that records its arguments
-and fails sits first on `PATH` beside the tmux one for the whole run, so a unit
-or tool run that launches an agent reaches it instead of the machine's claude,
-and the tier's `read-only-tier-runs-no-claude` or `live-tier-runs-no-claude` row
-says whether anything did.
+the refusal it is. A tool run does not have a row of its own, so there a fault
+ends the run: `fence_fault` names it on stderr and raises `FenceFault`, which
+`answered` turns into exit status 70. `FenceFault` is not a `Refusal`, so the
+product's own handlers, which catch a refusal to bring up the rest of a team in
+`run_agents` or to print a roster warning in a rollback, let it through, and the
+code between the read and `answered` does not absorb it. A tool run ends with a
+fence fault before anything else runs when its `AGENT_RESUME_SELFTEST_UNIT` does
+not parse. A tool run that is a selftest itself roots its own units at itself.
+`ran_unit` drops RESOLVER's process caches as each unit starts and again in its
+`finally`, so a table a declared unit read does not reach another unit.
+`proc_reader_audit.py` runs the tiers with a record file of its own and lists
+every refusal by unit, reader and pid, those of the tool runs included. A
+`claude` that records its arguments and fails sits first on `PATH` beside the
+tmux one for the whole run, so a unit or tool run that launches an agent reaches
+it instead of the machine's claude, and the tier's
+`read-only-tier-does-not-run-claude` or `live-tier-does-not-run-claude` row says
+whether anything did.
 
 The selftest ends the processes it starts through readers of its own on
 `_ProcessFence`, which do not ask the fence and are limited instead by how they
@@ -1155,54 +1161,56 @@ neither switches adoption on nor ends what is left. The tier's
 `read-only-tier-adopts-orphans` or `live-tier-adopts-orphans` row checks
 adoption by what happens: an orphan made on purpose before the first unit, and
 another after the last, must each have the run as its parent. The tier's
-`read-only-tier-leaves-nothing-running` or `live-tier-leaves-nothing-running`
-row states what `finish_run` found once the units were done, so a leak no unit
-caught fails the run. The run that merges the batches of a split live run adds
-what its own two orphans showed, what its own `finish_run` ended, and its own
-fence's refusals and faults to the rows it folds from the batches. A unit that
-finds a process a tool run left behind ends it there, through `end_processes` as
-`finish_run` does, so no later unit has it in view. `run_processes` walks down
-from the run by the `children` files of each process's threads and reads the
-stat file of each process it finds. Each process's parent is the process with
-the `children` file that listed it in the walk's settled pass, not the parent
-its stat file names, so `subtree`, which `end_process_tree` and
-`end_left_behind` ask, and, under a fence, the engine's process table, which
-`started_here` asks through `_descendants_of`, take the walk's answer.
-`identity` reads one pid's stat file only when that pid is the run itself or the
-same walk finds it under the run, so a pid the run knows that has left the run's
-tree and still runs is refused there, though `admit` admits it. A pass of the
-walk reads those files one after another, so when a process's parent exits
-meanwhile, the process can move to a subreaper inside the run between two of
-them and be in neither. The subreaper is the run or under it, so the pass reads
-its file too, and misses the process when it read that file before the process
-got there. After each pass the walk reads every children file the pass read once
-more, and passes again, up to four passes (`WALK_PASSES`), while one of them
-lists a pid the pass did not find. A walk that still finds one after its last
-pass has not settled, and the reader reports that as a fault of the fence rather
-than judge from it. `run_processes`, `identity` and the fence's `admit` all walk
-that way. `ancestors` reads the stat files up the chain of parents from the
-run's parent, so that the run never signals one of them. Any other pid is
-reported as not running, without being read; a refused pid that a process holds,
-and a value that is not a whole number, are written down as the fence writes its
-refusals, in a unit or outside one, and a pid `pidfd_open` cannot judge is
-written down with the error, so the tier's row names it and
-`proc_reader_audit.py` counts it. `end_processes` and the functions built on it
-signal each process through a pidfd opened while its start time still matched,
-and never signal pid 1, the run, an ancestor, a process named systemd, or a
-process that did not start after the run. The smoke check's stand-alone process
-is outside the run on purpose, and the cleanup never reads it: the stand-alone
-process holds the only write end of a pipe, the run keeps the pipe's read end,
-its exit pipe, and the run ends the stand-alone process through a pidfd opened
-while that pipe had not yet reached end of file.
+`read-only-tier-does-not-leave-a-process-running` or
+`live-tier-does-not-leave-a-process-running` row states what `finish_run` found
+once the units were done, so a leak that the units did not catch fails the run.
+The run that merges the batches of a split live run adds what its own two
+orphans showed, what its own `finish_run` ended, and its own fence's refusals
+and faults to the rows it folds from the batches. A unit that finds a process a
+tool run left behind ends it there, through `end_processes` as `finish_run`
+does, so the later units do not have it in view. `run_processes` walks down from
+the run by the `children` files of each process's threads and reads the stat
+file of each process it finds. Each process's parent is the process with the
+`children` file that listed it in the walk's settled pass, not the parent its
+stat file names, so `subtree`, which `end_process_tree` and `end_left_behind`
+ask, and, under a fence, the engine's process table, which `started_here` asks
+through `_descendants_of`, take the walk's answer. `identity` reads one pid's
+stat file only when that pid is the run itself or the same walk finds it under
+the run, so a pid the run knows that has left the run's tree and still runs is
+refused there, though `admit` admits it. A pass of the walk reads those files
+one after another, so when a process's parent exits meanwhile, the process can
+move to a subreaper inside the run between two of them and be missing from both.
+The subreaper is the run or under it, so the pass reads its file too, and misses
+the process when it read that file before the process got there. After each pass
+the walk reads every children file the pass read once more, and passes again, up
+to four passes (`WALK_PASSES`), while one of them lists a pid the pass did not
+find. A walk that still finds one after its last pass has not settled, and the
+reader reports that as a fault of the fence rather than judge from it.
+`run_processes`, `identity` and the fence's `admit` all walk that way.
+`ancestors` reads the stat files up the chain of parents from the run's parent,
+so that the run never signals one of them. Any other pid is reported as not
+running, without being read; a refused pid that a process holds, and a value
+that is not a whole number, are written down as the fence writes its refusals,
+in a unit or outside one, and a pid `pidfd_open` cannot judge is written down
+with the error, so the tier's row names it and `proc_reader_audit.py` counts it.
+`end_processes` and the functions built on it signal each process through a
+pidfd opened while its start time still matched, and never signal pid 1, the
+run, an ancestor, a process named systemd, or a process that did not start after
+the run. The smoke check's stand-alone process is outside the run on purpose,
+and the cleanup never reads it: the stand-alone process holds the only write end
+of a pipe, the run keeps the pipe's read end, its exit pipe, and the run ends
+the stand-alone process through a pidfd opened while that pipe had not yet
+reached end of file.
 
 Mutation scripts import `probe` and call `probe.expect(...)`. The function runs
 one clean suite and isolated mutants, then raises `ProbeFailure` if the clean run
-fails, a mutant crashes, no check bites, or the expected check does not bite.
-The probe has no command-line interface, so no exit status can be separated from
-its report by redirection or a surrounding shell command. A positive operation
-fixture reports an unexpected refusal or missing result as a failed named check,
-including the exception type and message. It restores patched globals before
-later checks run; the runner still rejects an aborted unit.
+fails, a mutant crashes, a mutant passes every check, or the expected check does
+not bite. The probe does not have a command-line interface, so an exit status
+cannot be separated from its report by redirection or a surrounding shell
+command. A positive operation fixture reports an unexpected refusal or missing
+result as a failed named check, including the exception type and message. It
+restores patched globals before later checks run; the runner still rejects an
+aborted unit.
 
 Cache dependency checks compare actual readers before and after transcript
 operations, with a cold Resolver as a control. The registry test establishes that
