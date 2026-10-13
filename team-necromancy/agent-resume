@@ -1399,17 +1399,10 @@ def abort_agents(plan, assume_yes=False, dry=False):
         print(fill(f"  a dry run does not end a process, so "
                    f"{'it is' if len(running) == 1 else 'they are'} still running"))
         return 0
-    if not assume_yes:
-        if not sys.stdin.isatty():
-            print("left alone  (stdin is not a terminal; y/N defaults to no)")
-            return 0
-        try:
-            answer = input("abort these? [y/N] ").strip().lower()
-        except EOFError:
-            answer = ""
-        if answer != "y":
-            print("left alone")
-            return 0
+    if not assume_yes and not ask_default_no(
+            "abort these?", left_alone="the run did not stop the listed processes"):
+        print("left alone")
+        return 0
     killed = 0
     for target in plan["targets"]:
         pid, label = target["process"]["pid"], target["label"]
@@ -12553,7 +12546,7 @@ def require_selected_write(selection, observed):
         die(f"written file {selection['path']} does not match its selected bytes and permissions")
 
 
-def apply_rebuild_plan(plan, dry, assume_yes=False):
+def apply_rebuild_plan(plan, dry):
     """Apply a rebuild and retain each phase's complete descriptor observations."""
     if plan["objections"]:
         die("; ".join(plan["objections"]))
@@ -12564,8 +12557,11 @@ def apply_rebuild_plan(plan, dry, assume_yes=False):
         verb = "replace invalid" if plan["action"] == "replace-invalid" else "rebuild"
         step(True, f"would {verb} {cfg} ({plan['note']}) and seed every inbox", "")
         return plan["launch"], plan["config"]
-    if (plan["action"] == "replace-invalid" and not assume_yes
-            and not ask_default_yes(f"replace unreadable roster {cfg}")):
+    # --yes does not answer this. It answers the questions about ending a
+    # process, and a run without a terminal takes this one's default anyway.
+    if plan["action"] == "replace-invalid" and not ask_default_yes(
+            f"replace unreadable roster {cfg}",
+            left_alone=f"the run did not replace {cfg}"):
         die(f"left unreadable roster {cfg} unchanged")
     expected = {item.path: item for item in plan["observations"]}
 
@@ -12664,10 +12660,9 @@ def apply_rebuild_plan(plan, dry, assume_yes=False):
     return completed["launch"], completed["written_roster"].data
 
 
-def rebuild_team(ctx, dry, assume_yes=False):
+def rebuild_team(ctx, dry):
     """Build and apply the reconstruction answer for one launch."""
-    return apply_rebuild_plan(
-        RESOLVER.rebuild_plan(ctx), dry, assume_yes=assume_yes)
+    return apply_rebuild_plan(RESOLVER.rebuild_plan(ctx), dry)
 
 
 # Roster writes wait for proper-lockfile's 10-second stale interval. Claude Code
@@ -13092,10 +13087,13 @@ def redirect_subject(plan):
     return ctx["identity"]["agentId"]
 
 
-def confirm_redirect(plan, prefix=""):
+def confirm_redirect(plan, prefix="", dry_run=False):
     """Apply confirmation policy to one already-corroborated redirect plan.
 
     A team run asks this once for every member it starts, before the first.
+    A pending redirect rests on an inference about the team its lead runs
+    as, so it is offered Y/n, a run without a terminal does not take it, and
+    a dry run reports that it would.
     """
     who = redirect_subject(plan)
     pid = plan["lead"]["pid"]
@@ -13103,17 +13101,10 @@ def confirm_redirect(plan, prefix=""):
     if plan["confirmation"] != "pending":
         return True
     basis = plan["lead"].get("runs_as_basis")
-    if not sys.stdin.isatty():
-        warn(f"pid {pid}, the lead of {source}, runs as {dest} only by inference; "
-             f"stdin is not a terminal to ask on, so {who} stays on {source}")
-        return False
     print(fill(f"{prefix}pid {pid}, the lead of {source}, runs as {dest}"
                + (f" ({basis})" if basis else "")))
-    try:
-        answer = input(f"redirect {who} onto {dest}? [Y/n] ").strip().lower()
-    except EOFError:
-        answer = ""
-    if answer.startswith("n"):
+    if not ask_default_yes(f"redirect {who} onto {dest}?", unattended=False,
+                           dry_run=dry_run, left_alone=f"the run did not move {who}"):
         print(f"{prefix}staying on {source}")
         return False
     return True
@@ -13126,25 +13117,23 @@ def decline_unreachable(plan, args, prefix=""):
     process, and being reachable is what a member's resume is for, so the safe
     answer is not to start them. --keep-team asks for the unreachable launch
     without the question; when stdin is not a terminal to ask at, the run
-    stops, since silence is not consent. Returns only when the launch on the
-    source team is agreed to. A team run asks this once, before its first
-    member.
+    stops, since silence is not consent, and a dry run reports that refusal
+    without asking. Returns only when the launch on the source team is agreed
+    to. A team run asks this once, before its first member.
     """
     who = redirect_subject(plan)
     source, dest = plan["source"], plan["destination"]
     if getattr(args, "keep_team", False):
         return
-    if not sys.stdin.isatty():
+    possessive = "their" if "moving" in plan else "its"
+    answer = ask_default_no(
+        f"start {who} on {source} anyway, where its lead will not read {possessive} mail?",
+        dry_run=args.dry_run, left_alone=f"the run did not start {who} on {source}")
+    if answer is None:
         die(f"so {who} can only start on {source}, and its lead (running as {dest}) "
             f"does not read {source}'s mail, and stdin is not a terminal to ask on. "
             "Clear the blockers above, or pass --keep-team")
-    try:
-        possessive = "their" if "moving" in plan else "its"
-        answer = input(f"start {who} on {source} anyway, where its lead "
-                       f"will not read {possessive} mail? [y/N] ").strip().lower()
-    except EOFError:
-        answer = ""
-    if not answer.startswith("y"):
+    if not answer:
         die("stopped; clear the blockers above, or pass --keep-team")
 
 
@@ -13166,13 +13155,7 @@ def agree_to_end(said, args):
     """
     if args.dry_run or getattr(args, "yes", False):
         return True
-    if not sys.stdin.isatty():
-        return None
-    try:
-        answer = input(f"kill {said}? [y/N] ").strip().lower()
-    except EOFError:
-        answer = ""
-    return answer.startswith("y")
+    return ask_default_no(f"kill {said}?", left_alone=f"the run did not end {said}")
 
 
 def end_holder(process, said, args, indent="  "):
@@ -13304,7 +13287,7 @@ def auto_redirect(ctx, args, prefix=""):
              f"{plan['proposed_destination']}:\n" + "\n".join(redirect_blockers(plan)))
         decline_unreachable(plan, args, prefix)
         return plan["declined_launch"]
-    confirmed = confirm_redirect(plan, prefix)
+    confirmed = confirm_redirect(plan, prefix, dry_run=args.dry_run)
     if not confirmed:
         return plan["launch"]
     print(f"{prefix}redirect the lead now runs as {plan['destination']}, not "
@@ -13677,7 +13660,7 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
         # roster before exec, using the explicit destination after migration;
         # in a team run the run already did, before its first step.
         if not in_team_run(args):
-            ctx, _rebuilt = rebuild_team(ctx, args.dry_run, assume_yes=args.yes)
+            ctx, _rebuilt = rebuild_team(ctx, args.dry_run)
         # Members launch before the lead. The foreground process then becomes the
         # interactive lead from the resolved cwd so --resume finds its transcript.
         if sys.stdout.isatty() and not args.dry_run:
@@ -13718,7 +13701,7 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
     # decided which team directories exist before its first step, so its steps
     # do not rebuild one.
     if not (args.to_team or ctx["route"]["member_moving"] or in_team_run(args)):
-        ctx, _rebuilt = rebuild_team(ctx, args.dry_run, assume_yes=args.yes)
+        ctx, _rebuilt = rebuild_team(ctx, args.dry_run)
 
     agent_id = ctx["identity"]["agentId"]
     if args.explain:
@@ -14903,34 +14886,95 @@ def rebind_reap(plan, args, prefix="", fatal=True, members=None):
     return "reaped"
 
 
-def ask_default_yes(question):
-    """Ask one helpful Y/n question; an unattended run takes the default."""
-    if not sys.stdin.isatty():
+# The answers each question reads, so one way of answering works for every
+# question. Case and the space around an answer do not matter, an empty
+# answer or the end of input takes the default the prompt spells, and any
+# other answer is asked again.
+YES_ANSWERS = ("y", "yes")
+NO_ANSWERS = ("n", "no")
+
+
+class QuestionInterrupted(KeyboardInterrupt):
+    """A Ctrl-C at a question, which ends the run before the asked action.
+
+    It is a KeyboardInterrupt, so code that lets an interrupt through lets
+    this through as well. answered() turns it into exit status 130 and says
+    `said`: the question, and what the run did not do because of it.
+    """
+
+    def __init__(self, said):
+        super().__init__(said)
+        self.said = said
+
+
+def read_answer(question, default, left_alone):
+    """One answer to `question` from the person at the terminal.
+
+    The prompt spells `default`: [Y/n] for yes, [y/N] for no. An empty answer
+    or the end of input takes it, YES_ANSWERS and NO_ANSWERS answer, and any
+    other answer is asked again, naming the answers this reads. A Ctrl-C ends
+    the run before the asked action, with a QuestionInterrupted that names
+    the question and `left_alone`, what the run did not do.
+    """
+    spelled = "[Y/n]" if default else "[y/N]"
+    while True:
+        try:
+            answer = input(f"{question} {spelled} ").strip().lower()
+        except EOFError:
+            print()
+            return default
+        except KeyboardInterrupt:
+            raise QuestionInterrupted(
+                f'interrupted at "{question}"; {left_alone}') from None
+        if not answer:
+            return default
+        if answer in YES_ANSWERS:
+            return True
+        if answer in NO_ANSWERS:
+            return False
+        print(f"answer y, yes, n or no; Enter means {'yes' if default else 'no'}")
+
+
+def ask_default_yes(question, *, left_alone, unattended=True, dry_run=False):
+    """Ask one Y/n question: the run goes ahead unless a person answers no.
+
+    A dry run does not ask; it reports and takes the default, yes. A run
+    without a terminal takes `unattended`, which is yes unless the caller
+    passes False for an offer that rests on an inference a person has to
+    confirm, as the redirect onto a team its lead runs as only by inference
+    does. `left_alone` is what the run did not do when a Ctrl-C ends it at
+    the question.
+    """
+    if dry_run:
+        print("choice   yes  (dry run; Y/n defaults to yes)")
         return True
-    try:
-        answer = input(question + " [Y/n] ").strip().lower()
-    except EOFError:
-        answer = ""
-    except KeyboardInterrupt:
-        print()
-        return False
-    return not answer.startswith("n")
+    if not sys.stdin.isatty():
+        if unattended:
+            print("choice   yes  (stdin is not a terminal; Y/n defaults to yes)")
+        else:
+            print("choice   no  (stdin is not a terminal, and this offer is taken "
+                  "only when a person answers yes)")
+        return unattended
+    return read_answer(question, True, left_alone)
 
 
-def ask_default_no(question, dry_run=False):
-    """Ask one y/N question. A preview or input-less run takes the default."""
+def ask_default_no(question, *, left_alone, dry_run=False):
+    """Ask one y/N question: the run goes ahead only when a person answers yes.
+
+    A dry run does not ask; it reports and takes the default, no, and returns
+    False. Without a terminal it reports the same and returns None, the
+    answer for a question that could not be asked, so the caller can refuse
+    in its own words and name what lets an unattended run through: --yes, or
+    the question's own flag. `left_alone` is what the run did not do when a
+    Ctrl-C ends it at the question.
+    """
     if dry_run:
         print("choice   no  (dry run; y/N defaults to no)")
         return False
     if not sys.stdin.isatty():
         print("choice   no  (stdin is not a terminal; y/N defaults to no)")
-        return False
-    try:
-        answer = input(question + " [y/N] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return False
-    return answer in ("y", "yes")
+        return None
+    return read_answer(question, False, left_alone)
 
 
 def promotion_identity(plan, args):
@@ -14944,7 +14988,8 @@ def promotion_identity(plan, args):
         print(fill(f"current  this side transcript now belongs to parent "
                    f"{entry['parent']}, with the deduced team "
                    f"{plan['identity']['team']} ({plan['identity_source']})"))
-        if ask_default_no("cleanly undo that demote instead", args.dry_run):
+        if ask_default_no("cleanly undo that demote instead", dry_run=args.dry_run,
+                          left_alone="the run did not promote the side transcript"):
             selected = types.MappingProxyType({
                 **plan,
                 "identity": undo["identity"],
@@ -15011,10 +15056,8 @@ def authorize_demotion_parent(selection, mate_team, args):
     print(fill(f"candidate the transcript currently belongs to {mate_team}; its lead "
                f"session is {parent} ({selection['source']})"))
     question = f"demote it under team {mate_team}'s lead session {parent}"
-    if args.dry_run or not sys.stdin.isatty():
-        ask_default_no(question, dry_run=args.dry_run)
-        die(f"left unchanged; {selection['remedy']}")
-    if not ask_default_no(question):
+    if not ask_default_no(question, dry_run=args.dry_run,
+                          left_alone="the run did not demote the transcript"):
         die(f"left unchanged; {selection['remedy']}")
     return selection
 
@@ -15662,8 +15705,7 @@ def rebuild_roster(team, args, passthrough, table, selected=None, census=None):
     print(f"team     {team} does not have a roster; rebuilding from {path.stem[:8]} "
           f"({plan['lead_claim']['why']})")
     enforce_ctx(plan["launch"], args)
-    _launch, config = apply_rebuild_plan(
-        plan, args.dry_run, assume_yes=args.yes)
+    _launch, config = apply_rebuild_plan(plan, args.dry_run)
     if not config:
         die(f"could not rebuild a roster for {team}")
     return config
@@ -15716,7 +15758,7 @@ def apply_team_redirect(plan, args, prefix=""):
              + "\n".join(redirect_blockers(selection)))
         decline_unreachable(selection, args, prefix)
         return "declined", ()
-    if not confirm_redirect(selection, prefix):
+    if not confirm_redirect(selection, prefix, dry_run=args.dry_run):
         return "stay", ()
     ended = settle_stops(selection, args, prefix)
     if ended:
@@ -22578,6 +22620,7 @@ def _suite_context():
     s.resolver_public_methods = resolver_public_methods
     s.dupes = dupes
     s.indexed_function_faults = indexed_function_faults
+    s.production_functions = production_functions
     s.funcs = funcs
     s.source = source
     s.src_of = src_of
@@ -23438,11 +23481,12 @@ def _check_member_redirect_operation(s):
                 globals()["RESOLVER"] = types.SimpleNamespace(
                     member_redirect_plan=lambda launch, request: (
                         planner_calls.append((launch, request)) or automatic_selected))
-                globals()["confirm_redirect"] = lambda _plan, _prefix="": True
+                globals()["confirm_redirect"] = lambda _plan, _prefix="", dry_run=False: True
                 globals()["apply_member_migration"] = (
                     lambda route, _args, prefix="", confirmation=True: (
                         applied_routes.append((route, confirmation)) or "selected-launch"))
-                args = types.SimpleNamespace(force=False, with_mail=False, keep_team=False)
+                args = types.SimpleNamespace(force=False, with_mail=False, keep_team=False,
+                                             dry_run=False)
                 with capturing("out"), capturing("err"):
                     automatic_result = auto_redirect(automatic.launch, args)
             finally:
@@ -30618,7 +30662,8 @@ def _check_redirect_decision(s):
         automatic = eng.member_redirect_plan(
             launch, MemberRedirectRequest(kind="automatic"))
         asked, outcomes = [], {}
-        args = types.SimpleNamespace(force=False, with_mail=False, keep_team=False)
+        args = types.SimpleNamespace(force=False, with_mail=False, keep_team=False,
+                                     dry_run=False)
         try:
             for label, terminal, reply in (("not a terminal", False, None),
                                            ("agreed", True, "y"), ("refused", True, "n")):
@@ -30696,6 +30741,28 @@ def _check_redirect_decision(s):
     return checked
 
 
+def agent_started_on_spawn(fake, engine):
+    """`fake` as a tmux under which a spawn that works starts its agent.
+
+    The pane a spawn opens gets a process launched with the agent id the
+    command named, and the transcripts under `engine` are touched, as the
+    agent's first write would. Pass it to installed(..., through=).
+    """
+    def watched(socket, *args):
+        res = fake(socket, *args)
+        if (args and args[0] in ("split-window", "new-window", "new-session")
+                and res.returncode == 0):
+            pane = res.stdout.strip()
+            pid = next(row["pid"] for row in fake.panes if row["pane"] == pane)
+            id_flag = re.search(r"--agent-id (\S+)", " ".join(args))
+            fake.processes.append((pid, 1, (FAKE_AGENT_BIN, "--resume", "x",
+                                            "--agent-id", id_flag.group(1).strip("'"))))
+            for jsonl in engine._projects_dir.rglob("*.jsonl"):
+                jsonl.touch()
+        return res
+    return watched
+
+
 def team_move_run(start, held_here=False, extra=(), reply="y", terminal=True):
     """Run `--team OLDCREW --into-team NEWCREW` for real against a synthetic world.
 
@@ -30742,19 +30809,7 @@ def team_move_run(start, held_here=False, extra=(), reply="y", terminal=True):
             f.fake.processes[:] = [row for row in f.fake.processes if row[0] != pid]
             return True, ""
 
-        def watched(socket, *args):
-            """A spawn that works starts its agent and writes its transcript."""
-            res = f.fake(socket, *args)
-            if (args and args[0] in ("split-window", "new-window", "new-session")
-                    and res.returncode == 0):
-                pane = res.stdout.strip()
-                pid = next(row["pid"] for row in f.fake.panes if row["pane"] == pane)
-                id_flag = re.search(r"--agent-id (\S+)", " ".join(args))
-                f.fake.processes.append((pid, 1, (FAKE_AGENT_BIN, "--resume", "x",
-                                                  "--agent-id", id_flag.group(1).strip("'"))))
-                for jsonl in eng._projects_dir.rglob("*.jsonl"):
-                    jsonl.touch()
-            return res
+        watched = agent_started_on_spawn(f.fake, eng)
 
         real_stopped, real_stdin = globals()["stopped"], sys.stdin
         real_input, real_plan = globals().get("input"), eng.team_run_plan
@@ -30911,19 +30966,7 @@ def retired_team_stays_retired(start):
         f.fake.next_pid = 4309700
         eng._pid_alive = lambda _pid, procstart=None: True
 
-        def watched(socket, *args):
-            """A spawn that works starts its agent and writes its transcript."""
-            res = f.fake(socket, *args)
-            if (args and args[0] in ("split-window", "new-window", "new-session")
-                    and res.returncode == 0):
-                pane = res.stdout.strip()
-                pid = next(row["pid"] for row in f.fake.panes if row["pane"] == pane)
-                id_flag = re.search(r"--agent-id (\S+)", " ".join(args))
-                f.fake.processes.append((pid, 1, (FAKE_AGENT_BIN, "--resume", "x",
-                                                  "--agent-id", id_flag.group(1).strip("'"))))
-                for jsonl in eng._projects_dir.rglob("*.jsonl"):
-                    jsonl.touch()
-            return res
+        watched = agent_started_on_spawn(f.fake, eng)
 
         prompts, out = [], io.StringIO()
         real_stdin, real_input = sys.stdin, globals().get("input")
@@ -30976,8 +31019,8 @@ def retired_team_stays_retired(start):
 
 @unit(
     ('team-run-decides-redirect-once',
-     'a team run decides where its members go, asks, and retires their team once, '
-     'before its first member'),
+     'a team run decides where its members go once, before its first member, and '
+     'retires their team at most once'),
     ('team-run-leaves-a-team-it-moves-from-unrebuilt',
      'a team run does not rebuild a roster for a team its members follow their lead away from'),
     ('member-follows-its-lead-without-rebuilding-its-team',
@@ -31004,13 +31047,14 @@ def _check_team_run_decides_once(s):
 
     start = int(time.time() * 1000) - 3_600_000
 
-    def team_run(f, team, reply="y"):
-        """Run the team verb as a dry run.
+    def team_run(f, team, reply="y", flags=(), dry=True):
+        """Run the team verb, as a dry run unless `dry` is False.
 
         Returns (code, output, prompts, plans, events): `events` lists, in the
         order they happened, the run's decision ("decide"), each question
         ("ask"), each retirement ("retire") and each member's launch step
-        ("member").
+        ("member"). A real run starts its members through the fixture's fake
+        tmux, where a spawn that works starts its agent.
         """
         eng, plans, prompts, events = f.engine, [], [], []
         real_plan, real_reap, real_step = eng.team_run_plan, rebind_reap, run_one
@@ -31035,14 +31079,18 @@ def _check_team_run_decides_once(s):
             events.append("ask"), prompts.append(prompt), reply)[2]
         globals().update(rebind_reap=retiring, run_one=member_step)
         said, code = io.StringIO(), None
+        argv = ["--team", team, "--no-lead", "--all", "--no-attach", *flags]
+        if dry:
+            argv.append("--dry-run")
         try:
-            with capturing("out", into=said), capturing("err", into=said):
-                code = run_team(build_parser().parse_args([
-                    "--team", team, "--no-lead", "--all", "--dry-run", "--no-attach"]), [])
+            with f.fake.installed(eng, through=agent_started_on_spawn(f.fake, eng)), \
+                    capturing("out", into=said), capturing("err", into=said):
+                code = run_team(build_parser().parse_args(argv), [])
         except Refusal as exc:
             code = f"refused: {exc}"
         finally:
             sys.stdin = real_stdin
+            eng.team_run_plan = real_plan
             globals().update(rebind_reap=real_reap, run_one=real_step)
             if real_input is not None:
                 globals()["input"] = real_input
@@ -31059,7 +31107,8 @@ def _check_team_run_decides_once(s):
 
     # The lead started within TEAM_MINT_WINDOW_MS after session-1ead2222 was
     # created, the fresh team its conversation named at boot, so where the crew
-    # goes is inferred and asked.
+    # goes is inferred: a dry run reports the offer as taken, and a real run
+    # asks it.
     lead_conv, dest, source = ("1ead2222-0000-4000-8000-000000000002",
                                "session-1ead2222", "CREWTEAM")
     with _roster_test_fixture() as f:
@@ -31079,20 +31128,31 @@ def _check_team_run_decides_once(s):
         f.engine._pid_alive = lambda _pid, procstart=None: True
         code, told, prompts, plans, events = team_run(f, source)
         decision = plans[0]["redirect"] if plans else None
-    asked_once = (
+        # The same run for real, answered y at a terminal stand-in: its one
+        # question comes before its first member and is not asked again for
+        # each member.
+        real_code, real_told, real_prompts, _real_plans, real_events = team_run(
+            f, source, dry=False)
+    previewed_once = (
         code == 0 and len(plans) == 1 and decision["action"] == "redirect"
         and decision["confirmation"] == "pending"
-        and len(prompts) == 1 and "[Y/n]" in prompts[0]
+        and not prompts and told.count("choice yes (dry run; Y/n defaults to yes)") == 1
         and told.count(f"would reap {source}") == 1
         and told.count("launched") >= 2 and "refused" not in told
         and decided_first(events) and events.count("retire") == 1)
+    asked_once = (
+        real_code == 0 and len(real_prompts) == 1 and "[Y/n]" in real_prompts[0]
+        and real_events.count("ask") == 1 and real_events.count("retire") == 1
+        and decided_first(real_events) and real_told.count("launched") >= 2)
     detail = (f"code {code}, plans {len(plans)}, prompts {prompts}, in order {events}, "
-              f"said {told[-700:]}")
+              f"said {told[-700:]}; for real: code {real_code}, prompts {real_prompts}, "
+              f"in order {real_events}, said {real_told[-700:]}")
 
     # A running member was launched with an agent id in the crew's team, so
-    # that team cannot be retired: the run asks once whether to start the
-    # stopped one where its lead does not read its mail, and does not reap a
-    # team.
+    # that team cannot be retired, and the run's one question is whether to
+    # start the stopped one where its lead does not read its mail. A dry run
+    # reports the refusal a run without a terminal meets, and with
+    # --keep-team starts the stopped one on its own team. Neither reaps a team.
     lead_conv, dest, source = ("1ead4444-0000-4000-8000-000000000004",
                                "DESTTWO", "BLOCKTEAM")
     with _roster_test_fixture() as f:
@@ -31114,14 +31174,20 @@ def _check_team_run_decides_once(s):
         f.fake.started.update({4309303: start, 4309304: start})
         code, told, prompts, plans, events = team_run(f, source)
         decision = plans[0]["redirect"] if plans else None
+        kept_code, kept_told, kept_prompts, _kept_plans, kept_events = team_run(
+            f, source, flags=("--keep-team",))
     declined_once = (
-        code == 0 and len(plans) == 1 and decision["action"] == "blocked"
-        and len(prompts) == 1 and "[y/N]" in prompts[0]
-        and "would reap" not in told and "m6 launched" in told
-        and decided_first(events) and "retire" not in events)
-    check('team-run-decides-redirect-once', asked_once and declined_once,
+        str(code).startswith("refused:") and "--keep-team" in str(code)
+        and len(plans) == 1 and decision["action"] == "blocked"
+        and not prompts and told.count("choice no (dry run; y/N defaults to no)") == 1
+        and "would reap" not in told and "m6 launched" not in told
+        and "member" not in events and "retire" not in events
+        and kept_code == 0 and not kept_prompts and "m6 launched" in kept_told
+        and "would reap" not in kept_told and "retire" not in kept_events)
+    check('team-run-decides-redirect-once', previewed_once and asked_once and declined_once,
           f"{detail}; blocked: code {code}, plans {len(plans)}, prompts {prompts}, "
-          f"in order {events}, said {told[-700:]}")
+          f"in order {events}, said {told[-700:]}; with --keep-team: code {kept_code}, "
+          f"prompts {kept_prompts}, said {kept_told[-400:]}")
 
     # The crew's team does not have a roster left, and its lead now runs as
     # DESTTEAM by a spawn it made after it started; the members follow without
@@ -38400,11 +38466,17 @@ def _check_redirect_offered_not_silent(s):
         with capturing("out") as quiet:
             asks["an accepted route is not offered again"] = (
                 confirm_redirect(accepted_plan) is True and quiet.getvalue() == "")
+        # Answered y, so a redirect that asked anyway would be taken and show.
         sys.stdin = types.SimpleNamespace(isatty=lambda: False)
+        prompts = []
+        globals()["input"] = lambda prompt="": prompts.append(prompt) or "y"
         with capturing("out") as quiet, \
                 capturing("err"):
-            asks["when stdin is not a terminal it does not ask"] = (
-                confirm_redirect(redirect_plan) is False and quiet.getvalue() == "")
+            stays = confirm_redirect(redirect_plan)
+        told = quiet.getvalue()
+        asks["when stdin is not a terminal it does not ask, and says it stays"] = (
+            stays is False and not prompts
+            and "stdin is not a terminal" in told and "staying on src" in told)
     finally:
         sys.stdin = real_stdin
         if real_input is not None:
@@ -45531,6 +45603,49 @@ def _check_team_description_generations(s):
     return checked
 
 
+# Every question this tool asks, one row a site: the check id and description
+# for the site, the function that asks, the asker it asks through, the
+# question as written, and the keywords it passes. ask_default_yes asks the
+# HELPFUL questions and ask_default_no the NASTY ones. The keywords differ by
+# site: dry_run where a dry run reaches the question and the asker reports the
+# answer it takes, unattended where a run without a terminal does not take
+# the helpful default, and left_alone at each site, for the message a Ctrl-C
+# at the question ends the run with.
+QUESTIONS = (
+    ("abort-asks-through-the-default-no-asker",
+     "the --stop question asks through ask_default_no",
+     "abort_agents", "ask_default_no", "'abort these?'",
+     frozenset({"left_alone"})),
+    ("redirect-asks-through-the-default-yes-asker",
+     "the inferred redirect asks through ask_default_yes and is declined when stdin is "
+     "not a terminal",
+     "confirm_redirect", "ask_default_yes", "f'redirect {who} onto {dest}?'",
+     frozenset({"unattended", "dry_run", "left_alone"})),
+    ("unreachable-start-asks-through-the-default-no-asker",
+     "starting members where their lead does not read their mail asks through "
+     "ask_default_no",
+     "decline_unreachable", "ask_default_no",
+     "f'start {who} on {source} anyway, where its lead will not read {possessive} mail?'",
+     frozenset({"dry_run", "left_alone"})),
+    ("kill-asks-through-the-default-no-asker",
+     "the kill a move needs asks through ask_default_no",
+     "agree_to_end", "ask_default_no", "f'kill {said}?'",
+     frozenset({"left_alone"})),
+    ("roster-replacement-asks-through-the-default-yes-asker",
+     "replacing an unreadable roster asks through ask_default_yes",
+     "apply_rebuild_plan", "ask_default_yes", "f'replace unreadable roster {cfg}'",
+     frozenset({"left_alone"})),
+    ("promotion-undo-asks-through-the-default-no-asker",
+     "the clean undo a promotion offers asks through ask_default_no",
+     "promotion_identity", "ask_default_no", "'cleanly undo that demote instead'",
+     frozenset({"dry_run", "left_alone"})),
+    ("demotion-parent-asks-through-the-default-no-asker",
+     "the inferred demotion parent asks through ask_default_no",
+     "authorize_demotion_parent", "ask_default_no", "question",
+     frozenset({"dry_run", "left_alone"})),
+)
+
+
 @unit(('confirmation-taxonomy-classifies-every-question',
        'every question this tool asks belongs to one named kind'),
       ('confirmation-defaults-match-what-enter-does',
@@ -45541,18 +45656,20 @@ def _check_confirmation_taxonomy(s):
     """One table for every question, so a new one cannot invent its own manners.
 
     Two kinds ask. HELPFUL spells [Y/n] and only refuses when told no, because
-    what it does can be undone or was already lost. NASTY spells [y/N] and only
-    proceeds when told yes, because what it does cannot be undone. Two kinds do
+    what it does can be undone or was already lost; ask_default_yes asks it.
+    NASTY spells [y/N] and only proceeds when told yes, because the run should
+    not do it unless a person says so; ask_default_no asks it. Two kinds do
     not ask: AUTO, where a flag or the absence of anything to decide has
     already settled it, and PREVIEW, where the run does not do anything, so a
-    question is not worth asking. DIRECT is a question put straight to the
-    operator by the command they ran; SPECIAL is one that carries its own
-    refusal wording rather than the shared one. A question that does not fit
-    any of these is the finding.
+    dry run reports the answer instead of asking. DIRECT is a question the
+    command the operator ran has already answered; SPECIAL is the attach
+    prompt, which has three answers rather than two. QUESTIONS names each
+    site that asks and its asker, and a question asked anywhere else is the
+    finding.
 
-    The spelled default and the answer test have to agree. `[Y/n]` next to a
-    test that only proceeds on "y" is a prompt that lies about its default, and
-    the person reading it finds out by pressing Enter.
+    The spelled default and the answer Enter gives have to agree. `[Y/n]`
+    beside an answer that only proceeds on "y" is a prompt that lies about
+    its default, and the person reading it finds out by pressing Enter.
     """
     checked = []
 
@@ -45560,82 +45677,73 @@ def _check_confirmation_taxonomy(s):
         checked.append((cid, name, ok, detail))
 
     ast = s.ast
-    HELPFUL, NASTY = "[Y/n]", "[y/N]"
+    production = s.production_functions
+    empty = ast.Module(body=[], type_ignores=[])
 
-    def asking_sites(tree):
-        """Every function that puts a question to a person, and how."""
-        sites = {}
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for part in ast.walk(node):
-                if not (isinstance(part, ast.Call)
-                        and isinstance(part.func, ast.Name)
-                        and part.func.id == "input"):
-                    continue
-                spelled = {mark for mark in (HELPFUL, NASTY)
-                           for text in ast.walk(part)
-                           if isinstance(text, ast.Constant)
-                           and isinstance(text.value, str) and mark in text.value}
-                body = ast.unparse(node)
-                # The three spellings this tool actually uses to read an
-                # answer. A site written some fourth way is reported as one the
-                # taxonomy does not recognise rather than as one that is wrong.
-                refuses_on_n = "startswith('n')" in body
-                proceeds_on_y = any(form in body for form in (
-                    "startswith('y')", "answer != 'y'", "answer in ('y', 'yes')"))
-                sites.setdefault(node.name, {
-                    "spelled": spelled,
-                    # An explicit branch, so it can say why it took the default.
-                    # Letting input() raise EOFError reaches the same answer
-                    # without ever saying a terminal was what was missing.
-                    "says_why_without_a_terminal": "isatty" in body,
-                    "refuses_on_n": refuses_on_n,
-                    "proceeds_on_y": proceeds_on_y,
-                    "reads_the_answer": refuses_on_n or proceeds_on_y,
-                    "body": body,
-                })
-        return sites
+    def calls(node, names):
+        return [part for part in ast.walk(node)
+                if isinstance(part, ast.Call) and isinstance(part.func, ast.Name)
+                and part.func.id in names]
 
-    sites = asking_sites(s.tree)
-    # The shared asker is the SPECIAL case: it takes its question as an
-    # argument, so its own source does not carry a prompt of its own.
-    shared = {"ask"}
-    unclassified = sorted(
-        name for name, site in sites.items()
-        if name not in shared and len(site["spelled"]) != 1)
-    unguarded = sorted(name for name, site in sites.items()
-                       if not site["says_why_without_a_terminal"])
-    unread = sorted(name for name, site in sites.items()
-                    if not site["reads_the_answer"])
+    prompting = sorted(name for name, node in production.items() if calls(node, {"input"}))
+    reading = sorted(name for name, node in production.items()
+                     if calls(node, {"read_answer"}))
+    asking = sorted((name, call.func.id) for name, node in production.items()
+                    for call in calls(node, {"ask_default_yes", "ask_default_no"}))
+    listed = sorted((site, asker) for _cid, _said, site, asker, *_rest in QUESTIONS)
+    unguarded = sorted(name for name in ("ask_default_yes", "ask_default_no")
+                       if "isatty" not in ast.unparse(production.get(name) or empty))
     classified = {
-        "every question spells exactly one default": not unclassified,
-        "every answer is read a way this table knows": not unread,
-        "and every one of them says why when stdin is not a terminal": not unguarded,
+        "one function puts a question to the terminal": prompting == ["read_answer"],
+        "and only the two askers read an answer through it":
+            reading == ["ask_default_no", "ask_default_yes"],
+        "each site that asks is listed once with its asker": asking == listed,
+        "and both askers say why when stdin is not a terminal": not unguarded,
     }
     faults = sorted(name for name, ok in classified.items() if not ok)
+    unlisted = sorted(set(asking) - set(listed))
+    missing = sorted(set(listed) - set(asking))
     check("confirmation-taxonomy-classifies-every-question",
           "every question this tool asks belongs to one named kind", not faults,
-          ", ".join(faults) + f"; {len(sites)} asking site(s)"
-          + (f", unclassified {unclassified}" if unclassified else "")
-          + (f", unguarded {unguarded}" if unguarded else ""))
+          ", ".join(faults) + f"; input() in {prompting}, read_answer in {reading}"
+          + (f", unlisted {unlisted}" if unlisted else "")
+          + (f", listed but not asking {missing}" if missing else ""))
 
-    # A prompt spelling [Y/n] beside a test that only proceeds on "y" is a
-    # prompt with a default other than the one it advertises.
-    lying = []
-    for name, site in sites.items():
-        if name in shared or len(site["spelled"]) != 1:
-            continue
-        mark = next(iter(site["spelled"]))
-        if mark == HELPFUL and not site["refuses_on_n"]:
-            lying.append(f"{name} spells Y/n but does not refuse on n")
-        if mark == NASTY and not site["proceeds_on_y"]:
-            lying.append(f"{name} spells y/N but does not proceed on y")
-        if mark == NASTY and site["refuses_on_n"] and not site["proceeds_on_y"]:
-            lying.append(f"{name} spells y/N and takes anything but n")
+    # Enter, and the end of input, at each asker on a terminal stand-in.
+    real_input, real_stdin = globals().get("input"), sys.stdin
+    prompts = []
+
+    def enter(prompt=""):
+        prompts.append(prompt)
+        return ""
+
+    def ended(prompt=""):
+        prompts.append(prompt)
+        raise EOFError
+
+    defaults = {}
+    sys.stdin = types.SimpleNamespace(isatty=lambda: True)
+    try:
+        with capturing("out"):
+            for reply, how in ((enter, "Enter"), (ended, "the end of input")):
+                globals()["input"] = reply
+                del prompts[:]
+                said_yes = ask_default_yes("go on?", left_alone="the run did not go on")
+                spelled_yes = prompts[-1] if prompts else ""
+                said_no = ask_default_no("go on?", left_alone="the run did not go on")
+                spelled_no = prompts[-1] if prompts else ""
+                defaults[f"{how} at [Y/n] is yes"] = said_yes is True and "[Y/n]" in spelled_yes
+                defaults[f"{how} at [y/N] is no"] = said_no is False and "[y/N]" in spelled_no
+    finally:
+        sys.stdin = real_stdin
+        if real_input is None:
+            globals().pop("input", None)
+        else:
+            globals()["input"] = real_input
+    lying = sorted(name for name, ok in defaults.items() if not ok)
     check("confirmation-defaults-match-what-enter-does",
           "the default a prompt spells is the answer Enter gives", not lying,
-          "; ".join(sorted(lying)[:3]))
+          "; ".join(lying))
 
     # Ending a conversation is its own decision. Whatever settled the move it
     # happens inside must not also settle this, so the only things that skip it
@@ -45644,14 +45752,13 @@ def _check_confirmation_taxonomy(s):
     # move ask it.
     asker = s.funcs.get("agree_to_end")
     asked = ast.unparse(asker) if asker else ""
-    guard = next((ast.unparse(part.test) for part in ast.walk(
-                      asker or ast.Module(body=[], type_ignores=[]))
+    guard = next((ast.unparse(part.test) for part in ast.walk(asker or empty)
                   if isinstance(part, ast.If)
                   and any(isinstance(line, ast.Return) and isinstance(line.value, ast.Constant)
                           and line.value.value is True for line in part.body)), "")
     askers = s.callers_of("agree_to_end") - s.suite_fns
     independent = {
-        "the kill has a question of its own": "input(" in asked,
+        "the kill has a question of its own": "ask_default_no(" in asked,
         "skipped only by what this run was told":
             bool(guard) and "dry_run" in guard and "yes" in guard,
         "and never by the surrounding decision":
@@ -45663,6 +45770,315 @@ def _check_confirmation_taxonomy(s):
     check("confirmation-nested-kill-decides-on-its-own",
           "the kill inside a move is not answered by having said yes to the move",
           not faults, ", ".join(faults) + f"; guard {guard[:80]!r}")
+    return checked
+
+
+@unit(*[(cid, said) for cid, said, *_rest in QUESTIONS])
+def _check_questions_ask_through_two_askers(s):
+    """Each question site asks through its asker once, in its own words.
+
+    A site that puts a prompt of its own, tests the terminal itself or passes
+    keywords its row does not name has started to decide for itself what the
+    two askers decide in one place.
+    """
+    checked = []
+    ast = s.ast
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    empty = ast.Module(body=[], type_ignores=[])
+    for cid, said, site, asker, question, keywords in QUESTIONS:
+        node = s.production_functions.get(site) or empty
+        calls = [part for part in ast.walk(node)
+                 if isinstance(part, ast.Call) and isinstance(part.func, ast.Name)
+                 and part.func.id == asker]
+        one = calls[0] if len(calls) == 1 else None
+        own = [part.func.id for part in ast.walk(node)
+               if isinstance(part, ast.Call) and isinstance(part.func, ast.Name)
+               and part.func.id in ("input", "read_answer")]
+        faults = {
+            "it asks through its asker exactly once": len(calls) == 1,
+            "with the question it is specified to ask":
+                bool(one) and bool(one.args) and ast.unparse(one.args[0]) == question,
+            "and passes exactly the keywords its row names":
+                bool(one) and {word.arg for word in one.keywords} == set(keywords),
+            "and does not put a prompt of its own": not own,
+            "and does not test the terminal itself":
+                not any(isinstance(part, ast.Attribute) and part.attr == "isatty"
+                        for part in ast.walk(node)),
+        }
+        if "unattended" in keywords:
+            faults["and declines when stdin is not a terminal"] = bool(one) and any(
+                word.arg == "unattended" and isinstance(word.value, ast.Constant)
+                and word.value.value is False for word in one.keywords)
+        wrong = sorted(name for name, ok in faults.items() if not ok)
+        check(cid, said, not wrong, ", ".join(wrong))
+    return checked
+
+
+@unit(('question-answers-are-read-one-way',
+       'each question takes y, yes, n and no in any case, and asks again on any other answer'))
+def _check_question_answers_are_read_one_way(s):
+    """The answers a person can give, the same at each question.
+
+    Read at the two askers, which each question site asks through (the
+    QUESTIONS rows). A terminal stand-in makes them ask, and the replies are
+    given in turn; EOFError among them stands for the end of input.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    real_input, real_stdin = globals().get("input"), sys.stdin
+
+    def answering(asker, *replies):
+        """What `asker` answered to `replies`, the prompts it put, and what it printed."""
+        prompts, pending = [], list(replies)
+
+        def reply(prompt=""):
+            # Past the last reply, the end of input: an asker that asks more
+            # often than the replies allow gets its default, and the case
+            # fails on that answer rather than ending the unit.
+            prompts.append(prompt)
+            given = pending.pop(0) if pending else EOFError
+            if given is EOFError:
+                raise EOFError
+            return given
+
+        globals()["input"] = reply
+        sys.stdin = types.SimpleNamespace(isatty=lambda: True)
+        try:
+            with capturing("out") as said:
+                answer = asker("go on?", left_alone="the run did not go on")
+        finally:
+            sys.stdin = real_stdin
+            if real_input is None:
+                globals().pop("input", None)
+            else:
+                globals()["input"] = real_input
+        return answer, prompts, said.getvalue()
+
+    again, prompts, told = answering(ask_default_no, "sure", "yes")
+    read = {
+        "[y/N] takes y": answering(ask_default_no, "y")[0] is True,
+        "and yes in any case, with space around it":
+            answering(ask_default_no, "  YES ")[0] is True,
+        "and takes n and no as no": (answering(ask_default_no, "n")[0] is False
+                                     and answering(ask_default_no, "No")[0] is False),
+        "[Y/n] takes n and no": (answering(ask_default_yes, " N")[0] is False
+                                 and answering(ask_default_yes, "no")[0] is False),
+        "and takes y and yes as yes": (answering(ask_default_yes, "y")[0] is True
+                                       and answering(ask_default_yes, "Yes")[0] is True),
+        "the end of input takes the spelled default":
+            answering(ask_default_no, EOFError)[0] is False
+            and answering(ask_default_yes, EOFError)[0] is True,
+        "any other answer is asked again": again is True and len(prompts) == 2,
+        "naming the answers it takes": "y, yes, n or no" in told,
+    }
+    wrong = sorted(name for name, ok in read.items() if not ok)
+    check("question-answers-are-read-one-way",
+          "each question takes y, yes, n and no in any case, and asks again on any other answer",
+          not wrong, ", ".join(wrong) + (f"; asked {prompts}, said {told!r}" if wrong else ""))
+    return checked
+
+
+@unit(('question-interrupt-ends-the-run',
+       'a Ctrl-C at a question ends the run with status 130, naming the question and what '
+       'the run did not do'))
+def _check_question_interrupt_ends_the_run(s):
+    """A Ctrl-C at a question is a request to stop, not an answer.
+
+    Taking it as no would let the run go on another way: a declined redirect
+    starts the member on its old team, and a declined undo goes on with a
+    fresh promotion. So the interrupt ends the run before the asked action,
+    through answered() like an interrupt anywhere else, and says which
+    question it came at.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    real_input, real_stdin = globals().get("input"), sys.stdin
+
+    def interrupt(prompt=""):
+        raise KeyboardInterrupt
+
+    raised, codes, told = {}, {}, {}
+    globals()["input"] = interrupt
+    sys.stdin = types.SimpleNamespace(isatty=lambda: True)
+    try:
+        for asker in (ask_default_no, ask_default_yes):
+            question = f"go on through {asker.__name__}?"
+            with capturing("out"):
+                try:
+                    asker(question, left_alone="the run did not go on")
+                    raised[asker.__name__] = False
+                except KeyboardInterrupt:
+                    raised[asker.__name__] = True
+            with capturing("out"), capturing("err") as said:
+                codes[asker.__name__] = answered(
+                    lambda: asker(question, left_alone="the run did not go on"))
+            told[asker.__name__] = said.getvalue()
+    finally:
+        sys.stdin = real_stdin
+        if real_input is None:
+            globals().pop("input", None)
+        else:
+            globals()["input"] = real_input
+
+    ended = {
+        "the two askers let the interrupt through rather than answer it": all(raised.values()),
+        "the run ends with status 130": all(code == 130 for code in codes.values()),
+        "naming the question": all(f'interrupted at "go on through {name}?"' in said
+                                   for name, said in told.items()),
+        "and what the run did not do": all("the run did not go on" in said
+                                           for said in told.values()),
+    }
+    wrong = sorted(name for name, ok in ended.items() if not ok)
+    check("question-interrupt-ends-the-run",
+          "a Ctrl-C at a question ends the run with status 130, naming the question and what "
+          "the run did not do",
+          not wrong, ", ".join(wrong) + (f"; exits {codes}, said {told}" if wrong else ""))
+    return checked
+
+
+@unit(('dry-run-reports-each-answer-without-asking',
+       'a dry run does not ask: it reports the default of a Y/n question and the refusal a '
+       'y/N question meets'))
+def _check_dry_run_reports_each_answer_without_asking(s):
+    """What a dry run says at each question it reaches.
+
+    A dry run reaches the inferred redirect and the unreachable start through
+    auto_redirect and apply_team_redirect, and the inferred demotion parent
+    through run_demote. It asks none of them. The redirect, a Y/n question, is
+    reported as taken, and the two y/N questions as refused, the way a run
+    without a terminal meets them unless --yes or the question's own flag
+    answers. The kill a move needs is agreed without a question, since a dry
+    run does not end a process.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    real_input, real_stdin = globals().get("input"), sys.stdin
+    prompts = []
+    # Answered y, so a dry run that asked would take the action, and the
+    # regression would show as more than a counted prompt.
+    globals()["input"] = lambda prompt="": prompts.append(prompt) or "y"
+    sys.stdin = types.SimpleNamespace(isatty=lambda: True)
+    launch = fixture_target("dry", identity={"agentId": "a@src", "agentName": "a",
+                                             "teamName": "src"})
+    plan = immutable({"launch": launch, "lead": {"pid": PID_CEILING + 1},
+                      "source": "src", "destination": "dest", "confirmation": "pending"})
+    dry = types.SimpleNamespace(dry_run=True, keep_team=False, yes=False)
+    selection = immutable({"objection": None, "confirmation_required": True,
+                           "parent": "PARENT", "source": "team lead of T",
+                           "remedy": "pass --into-session PARENT explicitly"})
+    unreachable = parent = None
+    try:
+        with capturing("out") as said, capturing("err"):
+            redirected = confirm_redirect(plan, dry_run=True)
+            try:
+                decline_unreachable(plan, dry)
+            except Refusal as refused:
+                unreachable = refused.said
+            agreed = agree_to_end("pid 9, which holds this transcript", dry)
+            try:
+                authorize_demotion_parent(selection, "T", dry)
+            except Refusal as refused:
+                parent = refused.said
+    finally:
+        sys.stdin = real_stdin
+        if real_input is None:
+            globals().pop("input", None)
+        else:
+            globals()["input"] = real_input
+    out = said.getvalue()
+    reported = {
+        "it did not ask": not prompts,
+        "the redirect is reported as taken":
+            redirected is True and "choice   yes  (dry run" in out,
+        "the unreachable start is refused, naming the flag that lets it through":
+            unreachable is not None and "--keep-team" in unreachable,
+        "the inferred demotion parent is refused":
+            parent is not None and "left unchanged" in parent,
+        "and the two y/N questions say they took the default":
+            out.count("choice   no  (dry run") == 2,
+        "the kill is agreed without a question": agreed is True,
+    }
+    wrong = sorted(name for name, ok in reported.items() if not ok)
+    check("dry-run-reports-each-answer-without-asking",
+          "a dry run does not ask: it reports the default of a Y/n question and the refusal a "
+          "y/N question meets",
+          not wrong, ", ".join(wrong) + (f"; asked {prompts}, said {out!r}" if wrong else ""))
+    return checked
+
+
+@unit(('unreachable-start-asks-unless-keep-team',
+       'starting members where their lead does not read their mail asks y/N, refuses without '
+       'a terminal, and --keep-team starts them without the question'))
+def _check_unreachable_start_asks_unless_keep_team(s):
+    """decline_unreachable, the one question between a blocked move and a start.
+
+    Members whose lead runs as another team can only start on their own team,
+    where their mail is not read. That is not done by default: a person agrees
+    with y, a run without a terminal stops, and --keep-team is the flag that
+    asks for the start in advance.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    real_input, real_stdin = globals().get("input"), sys.stdin
+    launch = fixture_target("unreachable", identity={"agentId": "a@src", "agentName": "a",
+                                                     "teamName": "src"})
+    plan = immutable({"launch": launch, "source": "src", "destination": "dest"})
+
+    def starting(reply, tty=True, keep_team=False):
+        """What decline_unreachable refused with, or None, and the prompts it put."""
+        prompts = []
+        globals()["input"] = lambda prompt="": prompts.append(prompt) or reply
+        sys.stdin = types.SimpleNamespace(isatty=lambda: tty)
+        args = types.SimpleNamespace(dry_run=False, keep_team=keep_team)
+        try:
+            with capturing("out"), capturing("err"):
+                decline_unreachable(plan, args)
+            return None, prompts
+        except Refusal as refused:
+            return refused.said, prompts
+        finally:
+            sys.stdin = real_stdin
+            if real_input is None:
+                globals().pop("input", None)
+            else:
+                globals()["input"] = real_input
+
+    agreed, agreed_prompts = starting("y")
+    declined, _declined_prompts = starting("n")
+    headless, headless_prompts = starting("y", tty=False)
+    kept, kept_prompts = starting("n", keep_team=True)
+    spelled = agreed_prompts[0] if agreed_prompts else ""
+    asks = {
+        "a yes starts them": agreed is None and len(agreed_prompts) == 1,
+        "asked y/N, naming the member and its team":
+            "[y/N]" in spelled and "a@src" in spelled and " on src " in spelled,
+        "a no stops the run, naming --keep-team":
+            declined is not None and "--keep-team" in declined,
+        "without a terminal the run stops without asking":
+            headless is not None and not headless_prompts and "--keep-team" in headless,
+        "and --keep-team starts them without the question":
+            kept is None and not kept_prompts,
+    }
+    wrong = sorted(name for name, ok in asks.items() if not ok)
+    check("unreachable-start-asks-unless-keep-team",
+          "starting members where their lead does not read their mail asks y/N, refuses "
+          "without a terminal, and --keep-team starts them without the question",
+          not wrong, ", ".join(wrong))
     return checked
 
 
@@ -46268,8 +46684,11 @@ def _check_selected_rebuild_effects(s):
 
             try:
                 with mock.patch.object(eng, "rebuild_plan", capture), mock.patch.object(json, "dumps", forbidden):
-                    with capturing("out"), capturing("err"):
-                        result, config = apply_rebuild_plan(plan, False, assume_yes=True)
+                    # A run without a terminal, which takes the replacement
+                    # question's default, yes.
+                    with capturing("out"), capturing("err"), mock.patch.object(
+                            sys, "stdin", types.SimpleNamespace(isatty=lambda: False)):
+                        result, config = apply_rebuild_plan(plan, False)
             except (AssertionError, Refusal, OSError) as exc:
                 check('rebuild-consumes-selected-bytes', False, f"invalid={invalid}: {exc}")
                 continue
@@ -46465,8 +46884,9 @@ def _check_selected_rebuild_effects(s):
 
             with mock.patch.object(os, "fsync", change_mode), mock.patch.object(f.engine, "rebuild_plan", capture):
                 try:
-                    with capturing("out"), capturing("err"):
-                        apply_rebuild_plan(plan, False, assume_yes=True)
+                    with capturing("out"), capturing("err"), mock.patch.object(
+                            sys, "stdin", types.SimpleNamespace(isatty=lambda: False)):
+                        apply_rebuild_plan(plan, False)
                     refused = False
                 except Refusal:
                     refused = True
@@ -46873,8 +47293,9 @@ def _check_rebuild_observation_phases(s):
                 with mock.patch.object(f.engine, "revalidate_rebuild", revalidate), \
                         mock.patch.dict(globals(), seed_selected_inbox=seed):
                     try:
-                        with capturing("out"), capturing("err"):
-                            apply_rebuild_plan(plan, False, assume_yes=True)
+                        with capturing("out"), capturing("err"), mock.patch.object(
+                                sys, "stdin", types.SimpleNamespace(isatty=lambda: False)):
+                            apply_rebuild_plan(plan, False)
                         refused = False
                     except Refusal:
                         refused = True
@@ -46893,8 +47314,9 @@ def _check_rebuild_observation_phases(s):
             original = plan["original"].observation
             with mock.patch.dict(globals(), seed_selected_inbox=mock.Mock(side_effect=OSError("seed failure"))):
                 try:
-                    with capturing("out"), capturing("err"):
-                        apply_rebuild_plan(plan, False, assume_yes=True)
+                    with capturing("out"), capturing("err"), mock.patch.object(
+                            sys, "stdin", types.SimpleNamespace(isatty=lambda: False)):
+                        apply_rebuild_plan(plan, False)
                     raised = False
                 except OSError as exc:
                     raised = str(exc) == "seed failure"
@@ -47912,7 +48334,10 @@ def _check_rebuild_evidence(s):
       ('replace-invalid-without-a-terminal-takes-the-helpful-default',
        'when stdin is not a terminal to ask on, replacing an unreadable roster still proceeds'),
       ('replace-invalid-dry-run-does-not-prompt-or-write',
-       'a previewed replacement does not prompt or write a file'))
+       'a previewed replacement does not prompt or write a file'),
+      ('replace-invalid-is-not-answered-by-yes',
+       '--yes does not answer the roster replacement question, and a run without a '
+       'terminal still takes its default'))
 def _check_replace_invalid_confirmation(s):
     """Replacing an unparsable roster, and what it asks first.
 
@@ -48041,6 +48466,50 @@ def _check_replace_invalid_confirmation(s):
     check("replace-invalid-dry-run-does-not-prompt-or-write",
           "a previewed replacement does not prompt or write a file",
           not faults, ", ".join(faults) + f"; asked {preview['asked']}")
+
+    def team_run(answer="", tty=True):
+        """A --team run with --yes reaching the replacement, and what it did."""
+        base, eng = staged()
+        cfg = base / "teams" / TEAM / "config.json"
+        asked, refused = [], None
+        was_resolver, was_stdin = globals()["RESOLVER"], sys.stdin
+        globals()["RESOLVER"] = eng
+        sys.stdin = types.SimpleNamespace(isatty=lambda: tty)
+        globals()["input"] = lambda prompt="": (asked.append(prompt), answer)[1]
+        args = types.SimpleNamespace(dry_run=False, yes=True, force=False, to_team=None)
+        try:
+            with capturing("out"), capturing("err"):
+                try:
+                    rebuild_roster(TEAM, args, [], (), census=eng._roster_census())
+                except Refusal as stopped:
+                    refused = str(stopped)
+        finally:
+            globals()["RESOLVER"] = was_resolver
+            sys.stdin = was_stdin
+            globals().pop("input", None)
+            after = cfg.read_bytes() if cfg.exists() else None
+            shutil.rmtree(base, ignore_errors=True)
+        return {"asked": asked, "refused": refused, "unchanged": after == BROKEN}
+
+    # Answered no on a terminal: if --yes answered the question, the roster
+    # would be replaced without a prompt.
+    told_yes = team_run(answer="n")
+    scripted = team_run(tty=False)
+    scoped = {
+        "with --yes on a terminal it still asks": len(told_yes["asked"]) == 1,
+        "and the no leaves the roster as it was":
+            told_yes["unchanged"] and told_yes["refused"] is not None,
+        "with --yes and without a terminal it takes the default":
+            not scripted["asked"] and not scripted["unchanged"]
+            and scripted["refused"] is None,
+    }
+    faults = sorted(name for name, ok in scoped.items() if not ok)
+    check("replace-invalid-is-not-answered-by-yes",
+          "--yes does not answer the roster replacement question, and a run without a "
+          "terminal still takes its default",
+          not faults, ", ".join(faults)
+          + f"; asked {told_yes['asked']}, refused {told_yes['refused']!r}, "
+            f"scripted refused {scripted['refused']!r}")
     return checked
 
 
@@ -50808,9 +51277,13 @@ def answered(entry):
     """
     try:
         return entry()
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as interrupt:
         print()
-        warn("interrupted; anything already launched is still running "
+        # A Ctrl-C at a question says which question it was and what the run
+        # did not do (QuestionInterrupted); one anywhere else, only that it
+        # came.
+        said = getattr(interrupt, "said", "interrupted")
+        warn(f"{said}; anything already launched is still running "
              "(--doctor <team> shows what)")
         return 130
     except Refusal as refused:

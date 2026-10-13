@@ -1000,6 +1000,21 @@ that runs in the current pane does not read the server and is not refused. A
 `SocketLiveness` raises `TypeError` when read as a truth value, so a caller
 compares its state.
 
+Each question the tool asks goes through one of two askers. `ask_default_yes`
+asks a `Y/n` question, and a run without a terminal takes its default unless the
+caller passes `unattended=False`, as the redirect onto an inferred destination
+does. `ask_default_no` asks a `y/N` question; without a terminal it returns
+`None`, and the caller refuses in its own words and names what lets an
+unattended run through: `--yes` for ending a process, `--keep-team` for starting
+members where their lead does not read their mail. `--yes` answers only the
+questions about ending a process. A dry run does not ask: it reports the default
+of a `Y/n` question and the refusal a `y/N` question meets. Both askers read an
+answer through `read_answer`: `y`, `yes`, `n` and `no` in any case, Enter or the
+end of input for the default the prompt spells, and any other answer asks again.
+A Ctrl-C at a question raises `QuestionInterrupted`, and `answered` ends the run
+with status 130, naming the question and what the run did not do. The attach
+prompt has three answers and keeps its own keys.
+
 A transcript title is a `TitleFact`, not a string. It contains the selected title
 text, the event kind, transcript path, timestamp, and source record UUID. Every
 reporting answer carries that one object, so a title's text and the event that

@@ -250,11 +250,17 @@ only addresses it. Members launch first because mailbox directories accept
 messages before the lead process starts.
 
 `--dry-run` is read-only and previews every verb, including `--stop`, `--install`,
-and `--poison`. `--explain` reports the source of each launch fact. `--selftest`
-runs read-only invariant checks suitable for a hook, while `--selftest --live`
-adds checks that create temporary processes, terminals, and directories and
-then remove them. Resumed-session flags use an allowlist, so misspellings are
-reported by `agent-resume`.
+and `--poison`. A dry run does not ask a question either: it reports the answer
+the run would take, the default of a `Y/n` question and the refusal a `y/N`
+question meets without `--yes` or the question's own flag. Each question takes
+`y`, `yes`, `n` or `no` in any case, and Enter takes the default the prompt
+spells; Ctrl-C at a question ends the run before the asked action, with exit
+status 130. `--yes` answers only the questions about ending a process.
+`--explain` reports the source of each launch fact. `--selftest` runs read-only
+invariant checks suitable for a hook, while `--selftest --live` adds checks that
+create temporary processes, terminals, and directories and then remove them.
+Resumed-session flags use an allowlist, so misspellings are reported by
+`agent-resume`.
 
 After launch, the tool attaches from an available user terminal outside tmux
 when it becomes the watching client. `--attach` and `--no-attach` select
