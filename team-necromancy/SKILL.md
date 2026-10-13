@@ -451,7 +451,7 @@ therefore blocks the placeholder before the request reaches the API.
 ```bash
 agent-resume --poison            # newest live swarm socket; or --socket claude-swarm-<pid>
 # equivalent by hand:
-SOCK=$(ls -t /tmp/tmux-1000/claude-swarm-* | head -1)
+SOCK=$(ls -t "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"/claude-swarm-* | head -1)
 tmux -S $SOCK set-environment -g ANTHROPIC_BASE_URL http://127.0.0.1:9
 ```
 
@@ -510,7 +510,7 @@ the resumed process and add a roster entry that names its pane. It avoids the
 placeholder request and process replacement.
 
 ```bash
-SOCK=$(ls -t /tmp/tmux-1000/claude-swarm-* | head -1)
+SOCK=$(ls -t "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"/claude-swarm-* | head -1)
 PANE=$(tmux -S $SOCK split-window -d -P -F '#{pane_id}' -c /tmp \
   "env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 CLAUDE_CODE_ENTRYPOINT=cli \
    claude --resume <session-id> --agent-id NAME@<team> --agent-name NAME \

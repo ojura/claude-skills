@@ -43,6 +43,7 @@ import re
 import shlex
 import shutil
 import socket as socketlib
+import stat as statlib
 import subprocess
 import sys
 import tempfile
@@ -7257,8 +7258,30 @@ class Resolver:
         })
 
     def _socket_dir(self):
-        """Where tmux keeps its socket files. A path question, like roster_path."""
-        return Path(os.environ.get("TMUX_TMPDIR") or f"/tmp/tmux-{os.getuid()}")
+        """The directory tmux keeps the sockets it names with -L in. A path
+        question, like roster_path."""
+        return self._tmux_socket_dir(os.environ.get("TMUX_TMPDIR"))
+
+    @staticmethod
+    def _tmux_socket_dir(tmpdir):
+        """The directory tmux keeps this user's -L sockets in when TMUX_TMPDIR is tmpdir.
+
+        tmux 3.4 takes the realpath of TMUX_TMPDIR, or of /tmp when
+        TMUX_TMPDIR is unset or empty or realpath fails on it, as it does for
+        a path that does not exist, and keeps the sockets of each user in
+        tmux-UID below it. The one place that rule is written: the engine
+        asks it of the environment, and the suite of the root it set.
+        """
+        base = None
+        if tmpdir:
+            with contextlib.suppress(OSError):
+                base = os.path.realpath(tmpdir, strict=True)
+        return Resolver._tmux_user_dir(base or os.path.realpath("/tmp"))
+
+    @staticmethod
+    def _tmux_user_dir(base):
+        """The directory below base where tmux keeps this user's sockets."""
+        return Path(base) / f"tmux-{os.getuid()}"
 
     def _socket_alive(self, socket):
         """Ask whether a tmux server accepts a connection on this socket.
@@ -15707,16 +15730,29 @@ BATCH_SUMMARY_ROWS = (RUNNER_CHECKS[0], *(pair[True] for pair in TIER_ROWS
 # before it is stopped and reported as not having finished.
 SELFTEST_CHILD_BOUND = 900
 
-# The bytes a socket file name gets under a run's socket root: the longest name
-# the suite's fixtures build, SOCKET_PREFIX and the member redirect fixture's
-# session-member-destination-roster-destination, is 58. tmux cannot start a
-# server at a path of SOCKET_PATH_LIMIT bytes or more, and _socket_alive answers
-# unknown for one, so a fixture there would not read the server it set up.
-SOCKET_NAME_ROOM = 58
+# The bytes a socket file name gets in the directory tmux keeps a run's sockets
+# in, tmux-UID below the run's socket root. It is the room for a name that a
+# check asks the real probe about, and the tier's two socket-name rows hold
+# each such name to it; the longest asked, SOCKET_PREFIX and
+# session-rollback-existing, is 38. A name that only _FakeTmux answers does not
+# become a path, so it does not need room. tmux cannot start a server at a path of
+# SOCKET_PATH_LIMIT bytes or more, and _socket_alive answers unknown for one, so
+# a fixture there would not read the server it set up. With the deepest socket
+# root two roots below TMPDIR, 46 fits under a TMPDIR of up to 24 bytes and a
+# uid of 10 digits.
+SOCKET_NAME_ROOM = 46
 
-# The name of the socket root a worker makes in its TMPDIR: run_selftest's
-# prefix and the eight characters mkdtemp adds.
-WORKER_SOCKET_ROOT = "s" + "x" * 8
+# The name of a socket root as owned_directory makes it: run_selftest's prefix
+# and the eight characters mkdtemp adds, shown as x.
+SOCKET_ROOT_NAME = "s" + "x" * 8
+
+# The socket root of the outermost run of a selftest run tree, handed down in
+# the environment to the runs it starts, in its own process and in its workers.
+# A run that finds it makes its own socket root directly inside it, so a socket
+# path is as long at any depth of nesting as one root below the outermost one,
+# and the outermost run's removal of its root at the end also removes the root
+# of a nested run that ended before its own cleanup.
+SOCKET_BASE_VAR = f"{TOOL.upper().replace('-', '_')}_SELFTEST_SOCKETS"
 
 # The prctl options that make a process, and ask whether it is, the parent of
 # last resort for every process under it that outlives its own parent, from
@@ -15725,23 +15761,14 @@ PR_SET_CHILD_SUBREAPER = 36
 PR_GET_CHILD_SUBREAPER = 37
 
 
-class WorkerDirectoryRefused(Exception):
-    """A split run's workers cannot be given TMPDIRs in its worker directory,
-    so the run did not start them.
-
-    The worker directory is the one directory a split live run makes to hold
-    each worker's TMPDIR, as <worker directory>/<at>, and removes after.
-    """
-
-
 def owner_record(directory):
     """Write down, inside a directory a run made, which run made it.
 
     The run's socket root and a split run's worker directory are named by one
     letter and mkdtemp's eight characters, without a pid, because a socket path
-    does not have bytes to spare at the depth a split inside a batch reaches. A
-    directory a killed run left behind names that run through this file
-    instead: the pid, its start time and the command. Returns what it wrote.
+    does not have bytes to spare. A directory a killed run left behind names
+    that run through this file instead: the pid, its start time and the
+    command. Returns what it wrote.
     """
     said = {"pid": os.getpid(),
             "started": Resolver(needs=Needs(maybe=set(NEED)))._proc_start(os.getpid()),
@@ -15750,15 +15777,16 @@ def owner_record(directory):
     return said
 
 
-def owned_directory(prefix):
-    """A directory of this run's own under TMPDIR, already holding its owner record.
+def owned_directory(prefix, parent=None):
+    """A directory of this run's own, already holding its owner record.
 
-    Named by prefix and mkdtemp's eight characters. The run's socket root and
-    a split run's worker directory are both made here, so a directory of either
-    kind holds the record from the moment it exists; a record that cannot be
-    written takes the directory away with it.
+    Made in parent, or under TMPDIR when parent is None, and named by prefix
+    and mkdtemp's eight characters. The run's socket root and a split run's
+    worker directory are both made here, so a directory of either kind holds
+    the record from the moment it exists; a record that cannot be written takes
+    the directory away with it.
     """
-    made = Path(tempfile.mkdtemp(prefix=prefix))
+    made = Path(tempfile.mkdtemp(prefix=prefix, dir=parent))
     try:
         owner_record(made)
     except BaseException:
@@ -15767,82 +15795,49 @@ def owned_directory(prefix):
     return made
 
 
-def worker_directory_faults(worker_dir, roots):
-    """What is wrong with the TMPDIRs a split run would give its workers, as sentences.
+def deepest_socket_root():
+    """The deepest socket root a run started now makes, mkdtemp's characters shown as x.
 
-    roots holds each worker's TMPDIR in start order, None for a worker without
-    a TMPDIR. Each has to be a directory of its own inside worker_dir, the
-    worker directory, which is the one directory the run removes, and short
-    enough that the socket root a worker makes in it leaves room for the
-    suite's longest socket name. An empty list means the directories can be
-    used.
+    Every run of one selftest run tree makes its socket root directly inside
+    the outermost run's root (SOCKET_BASE_VAR), whatever its tier, its jobs and
+    its nesting, so a run that was handed that root asks about a root inside
+    it. The outermost run, which was not handed one, makes its root under
+    TMPDIR, and the roots of the runs below it sit one root further down.
+    Checking this path against the byte budget once, before anything is made,
+    refuses a TMPDIR the run cannot use instead of failing later.
     """
-    faults, seen = [], {}
-    for at, root in enumerate(roots):
-        if not root:
-            faults.append(f"worker {at} does not have a TMPDIR")
-            continue
-        root = Path(root)
-        if Path(worker_dir) not in root.parents:
-            faults.append(f"worker {at}'s TMPDIR {root} is not inside the worker directory "
-                          f"{worker_dir}")
-        if root in seen:
-            faults.append(f"workers {seen[root]} and {at} share the TMPDIR {root}")
-        seen.setdefault(root, at)
-        if socket_room_fault(root / WORKER_SOCKET_ROOT):
-            used = len(os.fsencode(str(root / WORKER_SOCKET_ROOT))) + 1
-            faults.append(f"worker {at}'s TMPDIR {root} leaves {SOCKET_PATH_LIMIT - 1 - used} "
-                          f"bytes for a socket name in the socket root a worker makes there, "
-                          f"where the suite builds names of up to {SOCKET_NAME_ROOM}")
-    return faults
+    handed = os.environ.get(SOCKET_BASE_VAR)
+    if handed:
+        return Path(handed) / SOCKET_ROOT_NAME
+    return Path(tempfile.gettempdir()) / SOCKET_ROOT_NAME / SOCKET_ROOT_NAME
 
 
-# The units declared with worker_directories=True, by function name: each makes
-# a worker directory under the TMPDIR of the process it runs in, with each
-# worker's socket root a level below that process's own, by running run_batches
-# or by splitting a copy of this tool with --jobs (unit()).
-WORKER_DIRECTORY_UNITS = set()
+def socket_name_room(root):
+    """The bytes a socket name has below a run's socket root.
 
-
-def deepest_socket_root(base, live, jobs, batch=None, units=None):
-    """The deepest socket root a run under base makes, mkdtemp's characters shown as x.
-
-    A run's own socket root is base/s and mkdtemp's eight characters. A split
-    live run gives each worker <worker directory>/<at> as its TMPDIR, one level
-    of nesting, with the worker directory named by one letter and mkdtemp's
-    characters, and the worker makes its socket root there. A unit declared
-    with worker_directories=True makes one more level below the process it runs
-    in: a read-only run runs the read-only units, and a live run that does not
-    split and each batch run the live ones, and a split run's batches make
-    theirs a level below the run. units is UNITS unless given, so the fault
-    fixture's copy, which runs its own units and not these, does not add a
-    level for them. Checking this path against the byte budget once, before
-    anything is made, refuses a TMPDIR the run cannot use instead of failing at
-    the depth that first runs out of bytes.
+    tmux keeps the sockets in tmux-UID below the root
+    (Resolver._tmux_user_dir), so a socket path is that directory, a slash and
+    the name, and it must be shorter than SOCKET_PATH_LIMIT. The root is taken
+    as written, since it is asked of before the root is made.
     """
-    makes_worker_dirs = any(entry[0] in WORKER_DIRECTORY_UNITS and bool(entry[3]) == bool(live)
-                            for entry in (UNITS if units is None else units))
-    levels = int(live and jobs > 1 and batch is None) + int(makes_worker_dirs)
-    at = str(max(jobs, 2) - 1)
-    path = Path(base)
-    for _level in range(levels):
-        path = path / ("w" + "x" * 8) / at
-    return path / WORKER_SOCKET_ROOT
+    directory = len(os.fsencode(str(Resolver._tmux_user_dir(root))))
+    return SOCKET_PATH_LIMIT - 1 - (directory + 1)
 
 
 def socket_room_fault(root):
     """Why socket paths under this root could be too long, or None when they fit.
 
     Asked before a run puts any socket question to the root, with the root's
-    actual path, mkdtemp suffix included, and the room the suite's longest
-    socket name needs.
+    actual path, mkdtemp suffix included, and the room SOCKET_NAME_ROOM gives a
+    name.
     """
-    used = len(os.fsencode(str(root))) + 1
-    if used + SOCKET_NAME_ROOM < SOCKET_PATH_LIMIT:
+    room = socket_name_room(root)
+    if room >= SOCKET_NAME_ROOM:
         return None
-    return (f"the socket root {root} takes {used} bytes of every socket path, which leaves "
-            f"{SOCKET_PATH_LIMIT - 1 - used} for a name where the suite builds names of up to "
-            f"{SOCKET_NAME_ROOM}")
+    directory = Resolver._tmux_user_dir(root)
+    return (f"the socket directory {directory} takes {SOCKET_PATH_LIMIT - 1 - room} bytes of "
+            f"each socket path in it, which leaves {room} for a name where the checks ask "
+            f"about names of up to {SOCKET_NAME_ROOM}")
 
 
 def never_signalled(pid):
@@ -17215,7 +17210,7 @@ def tier_rows(units, s, register, live, diagnostics=None):
     register(*UNIT_ENDED[live], not ended, ended)
 
 
-def unit(*ids, live=False, machine=False, worker_directories=False):
+def unit(*ids, live=False, machine=False):
     """Register one unit of the suite under the ids it produces.
 
     machine=True declares a unit with engines, or tool runs it starts, that
@@ -17228,19 +17223,11 @@ def unit(*ids, live=False, machine=False, worker_directories=False):
     the same whether a unit is declared or not, so a unit that reads processes
     only through them does not need a declaration. Each declaration says beside
     it why the unit needs one.
-
-    worker_directories=True declares a unit that makes a worker directory
-    under the TMPDIR of the process it runs in, by running run_batches or by
-    splitting a copy of this tool with --jobs. deepest_socket_root counts a
-    level of nesting for it, so a run refuses a TMPDIR too long for the socket
-    paths at that depth before anything is made.
     """
     def take(run):
         UNITS.append((run.__name__, ids, run, live))
         if machine:
             MACHINE_UNITS.add(run.__name__)
-        if worker_directories:
-            WORKER_DIRECTORY_UNITS.add(run.__name__)
         return run
     return take
 
@@ -17696,7 +17683,7 @@ UNITS[:] = [
        "and a raising unit's traceback is not counted with it"),
       ("raising-batch-stops-alone",
        "a batch stops at a unit that raised, while the other batches finish and report"),
-      live=True, worker_directories=True)
+      live=True)
 def _check_runner_paths_on_a_fault_fixture(s):
     """The runner's own paths, end to end, on a copy of this tool with fixture units.
 
@@ -19873,6 +19860,19 @@ def tree_state(root):
     return state
 
 
+def run_socket_dir():
+    """The directory tmux keeps this run's sockets in.
+
+    It is tmux-UID below the socket root that TMUX_TMPDIR names, by the rule
+    the engine's _socket_dir asks of the environment
+    (Resolver._tmux_socket_dir), so the leak check reads the directory the
+    engine and tmux use. TMUX_TMPDIR is read without a default on purpose: the
+    runner sets it for the length of a run, so a call from anywhere else
+    raises rather than quietly answering with the wrong directory.
+    """
+    return Resolver._tmux_socket_dir(os.environ["TMUX_TMPDIR"])
+
+
 def end_left_behind(names):
     """End what started_here found a tool run left; returns the pids still running after.
 
@@ -19881,8 +19881,8 @@ def end_left_behind(names):
     finishes. The unit that found it ends it instead, the way finish_run does,
     through end_processes: each process named here with what runs under it,
     signalled only through a pidfd opened while the start time it picked still
-    held. A socket node is removed from the directory this run pointed tmux at,
-    where started_here found it.
+    held. A socket node is removed from the directory tmux keeps this run's
+    sockets in (run_socket_dir), where started_here found it.
     """
     pids = {int(name) for name in names if str(name).isdigit()}
     found = set(pids)
@@ -19901,7 +19901,7 @@ def end_left_behind(names):
     for name in names:
         if not str(name).isdigit():
             with contextlib.suppress(OSError):
-                (Path(os.environ["TMUX_TMPDIR"]) / name).unlink()
+                (run_socket_dir() / name).unlink()
     return left
 
 
@@ -19916,15 +19916,7 @@ def started_here():
     launched with a fixture agent id, since real agents run here too, and then
     to processes descending from this run. This run does not count another
     run's fixture, since counting it would report a leak that this run did not
-    make.
-
-    The sockets are read straight out of the directory this run pointed tmux
-    at, kept to nodes named for this pid and to nodes that really are sockets.
-    Asking the engine for the swarm sockets would answer with the machine's
-    directory, and would put a production discovery call inside a test's leak
-    check. TMUX_TMPDIR is read without a default on purpose: the suite runner
-    sets it for the length of a run, so a call from anywhere else raises
-    rather than quietly reporting zero leaks from the wrong directory.
+    make. The sockets come from sockets_named_here.
 
     One function rather than one per caller, so the check that this narrowing
     holds asks the same question the tier asks rather than a copy of it.
@@ -19933,8 +19925,22 @@ def started_here():
     mine = RESOLVER._descendants_of(os.getpid(), table)
     return ({str(pid) for pid, _ppid, cmd in table
              if pid in mine and fixture_agent_id(cmd)}
-            | {node.name for node in Path(os.environ["TMUX_TMPDIR"]).iterdir()
-               if node.name.endswith(f"-{os.getpid()}") and node.is_socket()})
+            | sockets_named_here())
+
+
+def sockets_named_here():
+    """The tmux sockets named for this run, by name, for started_here.
+
+    They are read straight out of the directory tmux keeps this run's sockets
+    in (run_socket_dir), kept to nodes named for this pid and to nodes that
+    really are sockets. Asking the engine for the swarm sockets would put a
+    production discovery call inside a test's leak check, and the check would
+    then follow the engine if the engine looked in the wrong directory. A
+    function of its own, so a read-only unit can ask it without reading the
+    machine's process table.
+    """
+    return {node.name for node in run_socket_dir().iterdir()
+            if node.name.endswith(f"-{os.getpid()}") and node.is_socket()}
 
 
 def hand_down(quiet, where):
@@ -19994,21 +20000,15 @@ def _live_in_parallel(jobs, diagnostics=None, settle=None):
     out, register = check_rows()
     for row in s.inherited:
         register(*row)
-    # The worker directory, named by one letter and mkdtemp's eight characters,
-    # because every worker's socket root is made inside it, at the depth a
-    # split inside a batch reaches too, and a socket path has to stay under
-    # 108 bytes. Which run made it is written inside it.
+    # The worker directory holds each worker's TMPDIR. Which run made it is
+    # written inside it. A worker makes its socket root in the outermost run's
+    # root (SOCKET_BASE_VAR), not here.
     worker_dir = owned_directory("w")
     try:
         inherit = hand_down(s.quiet, worker_dir / "read-only.json")
         finished = run_batches([[sys.executable, str(Path(__file__).resolve()),
                                 "--selftest", "--live", "--batch", f"{at}/{jobs}",
                                 "--inherit", str(inherit)] for at in range(jobs)], worker_dir)
-    except WorkerDirectoryRefused as refused:
-        # The workers did not start, so every batch reads as one that never
-        # did, and the reason goes to the operator whole.
-        write_diagnostic(f"the split run did not start any worker: {refused}", diagnostics)
-        finished = []
     finally:
         shutil.rmtree(worker_dir, ignore_errors=True)
     return out, register, fold_batches(finished, jobs, register, settle() if settle else None)
@@ -20034,19 +20034,14 @@ def run_batches(argvs, worker_dir, start=subprocess.Popen, bound=SELFTEST_CHILD_
 
     Whatever ends this, the cleanup ends and reaps every worker still running
     and removes every worker's TMPDIR, by the paths and identities read here.
-    A worker that died before its own cleanup ran leaves its directories to
-    this one. inspect, when given, is called with the worker roots once every
-    worker has ended and before the cleanup, for a check that has to see what
-    a worker left.
+    A worker that died before its own cleanup ran leaves its TMPDIR to this
+    one, and its socket root to the outermost run, which removes its own root
+    with the roots inside it (SOCKET_BASE_VAR). inspect, when given, is called
+    with the worker roots once every worker has ended and before the cleanup,
+    for a check that has to see what a worker left.
 
-    Returns the finished processes in order, as collected returns them. Raises
-    WorkerDirectoryRefused, without starting a worker, when
-    worker_directory_faults finds the directories unusable.
+    Returns the finished processes in order, as collected returns them.
     """
-    refused = worker_directory_faults(worker_dir,
-                                      [Path(worker_dir) / str(at) for at in range(len(argvs))])
-    if refused:
-        raise WorkerDirectoryRefused("; ".join(refused))
     workers, roots, finished = [], [], []
 
     def ending(worker, started):
@@ -20156,19 +20151,14 @@ def fold_batches(finished, jobs, register, own=None):
 
 @unit(("live-workers-share-one-removable-tempdir",
        "each worker of a split live run gets its own TMPDIR inside one worker directory, "
-       "left empty after the workers so that removing it removes every file the workers made, with "
-       "room left for its socket paths, and a missing, shared, outside or overlong TMPDIR is "
-       "refused before any worker starts"), worker_directories=True)
+       "left empty after the workers so that removing it removes every file the workers made, "
+       "and is handed the outermost run's socket root to make its own inside"))
 def _check_live_workers_share_one_removable_tempdir(s):
-    """run_batches and worker_directory_faults on stand-in workers that do not
-    start a process.
+    """run_batches on stand-in workers that do not start a process.
 
     What run_batches hands its workers is read off a start that records each
     worker's environment and does not start a process, so this asks about the
-    directories and not about a batch's work. The four ways a directory can be
-    wrong are each put to worker_directory_faults on their own, and the
-    overlong one to run_batches as well, which has to refuse it before its
-    first start.
+    directories and not about a batch's work.
     """
     checked = []
 
@@ -20201,10 +20191,11 @@ def _check_live_workers_share_one_removable_tempdir(s):
             return 0
 
     worker_dir = Path(tempfile.mkdtemp(prefix="w"))
-    given, present = [], []
+    given, handed, present = [], [], []
     try:
         def start(argv, **kwargs):
             given.append(kwargs.get("env", {}).get("TMPDIR"))
+            handed.append(kwargs.get("env", {}).get(SOCKET_BASE_VAR))
             return Recorded(argv, **kwargs)
 
         run_batches([["one"], ["two"], ["three"]], worker_dir, start=start,
@@ -20212,23 +20203,6 @@ def _check_live_workers_share_one_removable_tempdir(s):
         left = sorted(entry.name for entry in worker_dir.iterdir())
     finally:
         shutil.rmtree(worker_dir, ignore_errors=True)
-    long_worker_dir = Path("/" + "r" * 60)
-    cases = {
-        "missing": worker_directory_faults(worker_dir, [worker_dir / "0", None]),
-        "shared": worker_directory_faults(worker_dir, [worker_dir / "0", worker_dir / "0"]),
-        "outside": worker_directory_faults(worker_dir,
-                                           [worker_dir / "0", worker_dir.parent / "elsewhere"]),
-        "overlong": worker_directory_faults(long_worker_dir, [long_worker_dir / "0"]),
-    }
-    started = []
-    try:
-        run_batches([["one"]], long_worker_dir, start=lambda argv, **kwargs: started.append(argv))
-        refused = False
-    except WorkerDirectoryRefused:
-        refused = True
-    except OSError:
-        # It went on to make the worker's directory, which does not exist.
-        refused = False
     # Cleanup removes the directories run_batches recorded, by path, so the
     # code that starts and cleans up after workers does not glob a worker's
     # files.
@@ -20237,36 +20211,26 @@ def _check_live_workers_share_one_removable_tempdir(s):
                       if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                       and node.func.attr in ("glob", "rglob"))
     given_roots = [Path(root) for root in given if root]
+    base = os.environ.get(SOCKET_BASE_VAR)
     claims = {
         "every worker is given a TMPDIR": len(given) == 3 and all(given),
         "each is inside the worker directory":
             all(worker_dir in root.parents for root in given_roots),
         "each worker has its own TMPDIR": len(set(given_roots)) == len(given_roots),
-        "each leaves room for its socket paths":
-            not worker_directory_faults(worker_dir, given_roots),
+        "each worker is handed the outermost run's socket root":
+            base is not None and handed == [base] * 3,
         "each existed while the workers ran": present == [True, True, True],
         "the worker directory is empty after, so removing it removes every file the workers made":
             left == [],
-        "a worker without a TMPDIR is refused":
-            cases["missing"] == ["worker 1 does not have a TMPDIR"],
-        "two workers given one are refused": cases["shared"] == [
-            f"workers 0 and 1 share the TMPDIR {worker_dir / '0'}"],
-        "a TMPDIR outside the worker directory is refused": cases["outside"] == [
-            f"worker 1's TMPDIR {worker_dir.parent / 'elsewhere'} is not inside the worker "
-            f"directory {worker_dir}"],
-        "a TMPDIR too long for a socket path is refused":
-            len(cases["overlong"]) == 1 and "bytes for a socket name" in cases["overlong"][0],
-        "run_batches refuses it before its first start": refused and not started,
         "the code does not glob a worker's files": not globbing,
     }
     wrong = sorted(claim for claim, ok in claims.items() if not ok)
     check("live-workers-share-one-removable-tempdir",
           "each worker of a split live run gets its own TMPDIR inside one worker directory, "
           "left empty after the workers so that removing it removes every file the workers made, "
-          "with room left for its socket paths, and a missing, shared, outside or overlong TMPDIR "
-          "is refused before any worker starts",
-          not wrong, ", ".join(wrong) + (f"; given {given}, cases {cases}, glob in {globbing}"
-                                         if wrong else ""))
+          "and is handed the outermost run's socket root to make its own inside",
+          not wrong, ", ".join(wrong) + (f"; given {given}, handed {handed} for the root "
+                                         f"{base}, glob in {globbing}" if wrong else ""))
     return checked
 
 
@@ -20274,12 +20238,15 @@ def _check_live_workers_share_one_removable_tempdir(s):
        "a run refuses before it makes anything when its TMPDIR leaves too little room for a "
        "socket name at the deepest socket root it makes"))
 def _check_run_refuses_a_tmpdir_too_long_for_its_sockets(s):
-    """deepest_socket_root's levels, where run_selftest asks it, and one real refusal.
+    """deepest_socket_root for an outermost run and a nested one, where
+    run_selftest asks it, and one real refusal.
 
-    The levels are read from the function for each kind of run. That the
-    question comes before anything is made is read from run_selftest's own
-    order, and shown once on a run of this tool given a TMPDIR too long for
-    any level: it has to refuse with status 2 and leave that TMPDIR empty.
+    The deepest root is read from the function with SOCKET_BASE_VAR unset and
+    set. That the question comes before anything is made is read from
+    run_selftest's own order, and shown once on a run of this tool given a
+    TMPDIR too long for its socket root: started without SOCKET_BASE_VAR, it is
+    an outermost run, and it has to refuse with status 2 and leave that TMPDIR
+    empty.
     """
     checked = []
 
@@ -20288,35 +20255,29 @@ def _check_run_refuses_a_tmpdir_too_long_for_its_sockets(s):
 
     ast = s.ast
 
-    def makers(tree):
-        """The registered units that call run_batches or build an argv list holding --jobs, found by reading their code as a syntax tree."""
-        registered = {name for name, _ids, _run, _live in UNITS}
-        return {node.name for node in tree.body
-                if isinstance(node, ast.FunctionDef) and node.name in registered
-                and any((isinstance(part, ast.Call)
-                         and getattr(part.func, "id", None) == "run_batches")
-                        or (isinstance(part, ast.List)
-                            and any(isinstance(item, ast.Constant) and item.value == "--jobs"
-                                    for item in part.elts))
-                        for part in ast.walk(node))}
+    def deepest_handed(root):
+        """deepest_socket_root with SOCKET_BASE_VAR set to root, or unset for None."""
+        was = os.environ.get(SOCKET_BASE_VAR)
+        try:
+            if root is None:
+                os.environ.pop(SOCKET_BASE_VAR, None)
+            else:
+                os.environ[SOCKET_BASE_VAR] = root
+            return deepest_socket_root()
+        finally:
+            if was is None:
+                os.environ.pop(SOCKET_BASE_VAR, None)
+            else:
+                os.environ[SOCKET_BASE_VAR] = was
 
-    one = Path("/r") / ("w" + "x" * 8) / "1" / WORKER_SOCKET_ROOT
-    without_worker_dirs = [entry for entry in UNITS if entry[0] not in WORKER_DIRECTORY_UNITS]
-    two = Path("/r") / ("w" + "x" * 8) / "1" / ("w" + "x" * 8) / "1" / WORKER_SOCKET_ROOT
+    two_roots = Path(tempfile.gettempdir()) / SOCKET_ROOT_NAME / SOCKET_ROOT_NAME
     levels = {
-        "a read-only run nests one level": deepest_socket_root("/r", False, 1) == one,
-        "a live run that does not split nests one level": deepest_socket_root("/r", True, 1) == one,
-        "a split live run nests two levels": deepest_socket_root("/r", True, 2) == two,
-        "a split live run nests one level when its units do not make worker directories":
-            deepest_socket_root("/r", True, 2, units=without_worker_dirs) == one,
-        "a batch's socket root is not nested when its units do not make worker directories":
-            deepest_socket_root("/r", True, 2, batch="0/2", units=without_worker_dirs)
-            == Path("/r") / WORKER_SOCKET_ROOT,
-        "the units that run run_batches or split a copy with --jobs are the ones declared "
-        "to make worker directories": makers(s.tree) == WORKER_DIRECTORY_UNITS,
-        "a batch of a split run nests one level":
-            deepest_socket_root("/r", True, 2, batch="0/2") == one,
-        "a short TMPDIR fits": socket_room_fault(deepest_socket_root("/tmp", True, 4)) is None,
+        "an outermost run's deepest socket root is one root inside the root it makes "
+        "under TMPDIR": deepest_handed(None) == two_roots,
+        "a run handed the outermost root asks about a root directly inside it":
+            deepest_handed("/r/s") == Path("/r/s") / SOCKET_ROOT_NAME,
+        "a short TMPDIR fits":
+            socket_room_fault(Path("/tmp") / SOCKET_ROOT_NAME / SOCKET_ROOT_NAME) is None,
     }
     # In run_selftest, whether the socket names fit is asked before the socket
     # root is made.
@@ -20329,8 +20290,10 @@ def _check_run_refuses_a_tmpdir_too_long_for_its_sockets(s):
     try:
         long_tmpdir = base / ("t" * max(1, SOCKET_PATH_LIMIT - len(str(base))))
         long_tmpdir.mkdir()
+        outermost = {name: value for name, value in os.environ.items()
+                     if name != SOCKET_BASE_VAR}
         run = start_copy_run([sys.executable, str(Path(__file__).resolve()), "--selftest"],
-                             dict(os.environ, TMPDIR=str(long_tmpdir), NO_COLOR="1"))
+                             dict(outermost, TMPDIR=str(long_tmpdir), NO_COLOR="1"))
         with owned_group(run) as stop:
             finished = collected(run, 30, stop)
         left = sorted(entry.name for entry in long_tmpdir.iterdir())
@@ -20880,7 +20843,7 @@ finally:
        "pipe the run kept; the run exits 143 and names on its diagnostic stream each process "
        "under it that it ended; and it adopts again after making the stand-alone process and "
        "after a raise inside the block that stops it adopting"),
-      live=True, worker_directories=True)
+      live=True)
 def _check_batches_cleanup_owner(s):
     """run_batches, owned_group and collected ending what they own, on processes started here.
 
@@ -25353,7 +25316,7 @@ def _check_poisoned_path_does_not_catch_a_tmux_call(s):
                      "exit 1\n")
     decoy.chmod(0o755)
 
-    sockets = Path(os.environ["TMUX_TMPDIR"])
+    sockets = run_socket_dir()
     before = set(sockets.glob("*"))
     was_path = os.environ.get("PATH", "")
     control, resolved = [], None
@@ -25393,10 +25356,14 @@ def _check_poisoned_path_does_not_catch_a_tmux_call(s):
     check("poisoned-path-does-not-catch-a-tmux-call",
           "a synthetic run does not execute tmux, with a tmux on PATH that would say so",
           not asked, f"{len(asked)} call(s): {asked[:3]}")
+    # The directory watched has to be the one the engine and tmux use, or a
+    # socket a synthetic run made would appear somewhere this does not look.
+    engine_dir = Resolver(needs=Needs(maybe=set(NEED)))._socket_dir()
     check("synthetic-run-leaves-the-socket-directory-empty",
           "a synthetic run does not add anything to the run's socket directory",
-          after == before,
-          f"appeared: {sorted(p.name for p in after - before)}")
+          after == before and sockets == engine_dir,
+          f"appeared: {sorted(p.name for p in after - before)}, watched {sockets}, "
+          f"the engine's socket directory {engine_dir}")
     return checked
 
 
@@ -25475,12 +25442,12 @@ def _check_fixture_does_not_leave_a_socket_file(s):
     # The fixtures no longer bind one: _FakeTmux answers discovery and
     # liveness, so the stronger claim is available and it is the one asked
     # here. A node that is never created cannot be left behind by a run that
-    # dies. The directory this run pointed tmux at, read from the environment
-    # the runner set rather than from the engine. Asking the engine would put a
-    # production discovery call inside a test measuring what the tests leave
-    # behind, and the two would agree even if the engine started answering
-    # with the machine's directory again.
-    where = Path(os.environ["TMUX_TMPDIR"])
+    # dies. The directory tmux keeps this run's sockets in (run_socket_dir),
+    # worked out from the root the runner set rather than asked of the engine.
+    # Asking the engine would put a production discovery call inside a test
+    # measuring what the tests leave behind, and the two would agree even if
+    # the engine started answering with the machine's directory again.
+    where = run_socket_dir()
     before = set(where.glob("*")) if where.exists() else set()
 
     resume_run("willow@session-corpus-alpha", listed=False)
@@ -25512,6 +25479,8 @@ def _check_fixture_does_not_leave_a_socket_file(s):
         "a run that finishes does not leave a socket node": settled == before,
         "a run that breaks part-way does not leave a socket node either": after == before,
         "the suite never binds a socket": not binding,
+        "the directory watched is the one the engine and tmux use":
+            where == Resolver(needs=Needs(maybe=set(NEED)))._socket_dir(),
     }
     wrong = sorted(name for name, ok in facts.items() if not ok)
     check("fixture-does-not-leave-a-socket-file",
@@ -28183,6 +28152,197 @@ def _check_socket_control_probes(s):
           "the socket control answer probes each socket it looks at once, and its "
           "state line and liveness come from that probe",
           not wrong, "; ".join(wrong + ([f"probed and read {shown}"] if wrong else [])))
+    return checked
+
+
+@unit(('socket-directory-follows-tmux',
+       'the socket directory is tmux-UID below the realpath of TMUX_TMPDIR, or below /tmp '
+       'when TMUX_TMPDIR is unset, empty or does not resolve'),
+      ('leak-check-reads-the-engines-socket-directory',
+       "the leak check lists and clears the socket directory the engine answers with, which "
+       'the runner made with the mode tmux gives it'),
+      ('socket-room-counts-the-tmux-directory',
+       'the socket name budget counts the tmux-UID directory below a socket root'),
+      ('nested-run-makes-its-socket-root-inside-the-outermost-root',
+       "a run handed the outermost run's socket root makes its own directly inside it, and a "
+       "run that was not handed one makes its own under TMPDIR and hands it down"))
+def _check_socket_directory(s):
+    """_socket_dir against what tmux 3.4 did with TMUX_TMPDIR, the leak check's
+    directory against the engine's, the socket name budget against a socket
+    path, and where a nested run makes its socket root.
+
+    The expected directories are what `tmux -L NAME ls` reported on tmux 3.4
+    for each TMUX_TMPDIR: tmux-UID below /tmp when TMUX_TMPDIR is unset, empty
+    or names a path that does not exist; below the directory it names, with a
+    trailing slash dropped and a symlink resolved; and below a regular file it
+    names, where tmux then fails to make the directory. The suite does not run
+    tmux, so those answers are written here rather than asked of tmux.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    user = f"tmux-{os.getuid()}"
+    engine = Resolver(needs=Needs(maybe=set(NEED)))
+
+    # The run's own directory first, while TMUX_TMPDIR still names the root
+    # the runner set. A socket node made with mknod is a socket to is_socket
+    # without anything binding it: one in the run's socket directory, and one
+    # in the root above it, which a leak check reading the root would list in
+    # its place.
+    run_dir, engine_dir = run_socket_dir(), engine._socket_dir()
+    root = Path(os.path.realpath(os.environ["TMUX_TMPDIR"]))
+    made = run_dir.stat() if run_dir.is_dir() else None
+    planted = run_dir / f"{SOCKET_PREFIX}planted-{os.getpid()}"
+    above = root / f"{SOCKET_PREFIX}above-{os.getpid()}"
+    listed, cleared = set(), False
+    try:
+        os.mknod(planted, statlib.S_IFSOCK | 0o600)
+        os.mknod(above, statlib.S_IFSOCK | 0o600)
+        listed = sockets_named_here()
+        end_left_behind([planted.name])
+        cleared = not planted.exists()
+    finally:
+        planted.unlink(missing_ok=True)
+        above.unlink(missing_ok=True)
+    leak = {
+        "the leak check's directory is the engine's socket directory": run_dir == engine_dir,
+        "it is tmux-UID below the run's socket root": run_dir == root / user,
+        "the runner made it with the mode tmux gives it":
+            made is not None and made.st_mode & 0o777 == 0o700,
+        "a socket node named for this run there is listed": planted.name in listed,
+        "a socket node named for this run in the root above it is not listed":
+            above.name not in listed,
+        "end_left_behind removes a listed socket node from it": cleared,
+    }
+    wrong = sorted(name for name, ok in leak.items() if not ok)
+    check("leak-check-reads-the-engines-socket-directory",
+          "the leak check lists and clears the socket directory the engine answers with, "
+          "which the runner made with the mode tmux gives it",
+          not wrong, "; ".join(wrong + ([f"run {run_dir}, engine {engine_dir}, listed "
+                                         f"{sorted(listed)}"] if wrong else [])))
+
+    tmp = Path(os.path.realpath("/tmp")) / user
+    base = Path(tempfile.mkdtemp(prefix=own(f"{TOOL}-selftest-sockdir")))
+    real, link, plain = base / "real", base / "link", base / "plain"
+    below_real = Path(os.path.realpath(base)) / "real" / user
+    given = {
+        "with TMUX_TMPDIR unset it is below /tmp": (None, tmp),
+        "with TMUX_TMPDIR empty it is below /tmp": ("", tmp),
+        "with TMUX_TMPDIR naming a path that does not exist it is below /tmp":
+            (str(base / "missing"), tmp),
+        "with TMUX_TMPDIR naming a directory it is below that directory":
+            (str(real), below_real),
+        "a trailing slash is dropped": (f"{real}/", below_real),
+        "a symlink to the directory is resolved": (str(link), below_real),
+        "with TMUX_TMPDIR naming a regular file it is below the file":
+            (str(plain), Path(os.path.realpath(base)) / "plain" / user),
+    }
+    was = os.environ.get("TMUX_TMPDIR")
+    answers = {}
+    try:
+        real.mkdir()
+        link.symlink_to(real)
+        plain.write_bytes(b"")
+        for fact, (value, want) in given.items():
+            if value is None:
+                os.environ.pop("TMUX_TMPDIR", None)
+            else:
+                os.environ["TMUX_TMPDIR"] = value
+            answers[fact] = (engine._socket_dir(), want)
+    finally:
+        if was is None:
+            os.environ.pop("TMUX_TMPDIR", None)
+        else:
+            os.environ["TMUX_TMPDIR"] = was
+        shutil.rmtree(base, ignore_errors=True)
+    wrong = sorted(fact for fact, (got, want) in answers.items() if got != want)
+    check("socket-directory-follows-tmux",
+          "the socket directory is tmux-UID below the realpath of TMUX_TMPDIR, or below /tmp "
+          "when TMUX_TMPDIR is unset, empty or does not resolve",
+          not wrong and len(answers) == len(given),
+          "; ".join(f"{fact}: answered {answers[fact][0]}" for fact in wrong))
+
+    # A root with room for the longest name only while the tmux-UID directory
+    # is left out, and one with room for it with that directory counted.
+    tight = Path("/" + "r" * (SOCKET_PATH_LIMIT - 3 - SOCKET_NAME_ROOM))
+    roomy = Path("/" + "r" * (SOCKET_PATH_LIMIT - 4 - SOCKET_NAME_ROOM - len(user)))
+    fault = socket_room_fault(tight)
+    budget = {
+        "a root with room for the name only without the tmux directory is refused":
+            fault is not None,
+        "the refusal names the socket directory below it":
+            fault is not None and str(tight / user) in fault,
+        "the room it gives counts that directory":
+            socket_name_room(tight) == SOCKET_PATH_LIMIT - 3 - len(str(tight)) - len(user),
+        "a root with room for the name with the tmux directory counted fits":
+            socket_room_fault(roomy) is None,
+    }
+    wrong = sorted(name for name, ok in budget.items() if not ok)
+    check("socket-room-counts-the-tmux-directory",
+          "the socket name budget counts the tmux-UID directory below a socket root",
+          not wrong, "; ".join(wrong + ([f"refusal {fault!r}"] if wrong else [])))
+
+    # A run inside this one, as a unit's fixture makes one, with a stand-in for
+    # its live tier that reads the socket variables while it runs: once handed
+    # this run's outermost root, and once with that root taken away, as the
+    # outermost run of a tree of its own.
+    real_live_checks = globals()["live_checks"]
+    seen, after = [], {}
+
+    def reading_live_checks(_batch=None, _child=None, _diagnostics=None):
+        rows, register = check_rows()
+        made = run_socket_dir()
+        seen.append({"root": os.environ.get("TMUX_TMPDIR"),
+                     "handed": os.environ.get(SOCKET_BASE_VAR),
+                     "mode": made.stat().st_mode & 0o777 if made.is_dir() else None})
+        return rows, register
+
+    outer_base, outer_root = os.environ.get(SOCKET_BASE_VAR), os.environ.get("TMUX_TMPDIR")
+    try:
+        globals()["live_checks"] = reading_live_checks
+        for handed in (True, False):
+            if not handed:
+                os.environ.pop(SOCKET_BASE_VAR, None)
+            try:
+                with capturing("out"), capturing("err"):
+                    run_selftest(live=True, failed_only=True, diagnostics=io.StringIO())
+            finally:
+                after[handed] = (os.environ.get(SOCKET_BASE_VAR), os.environ.get("TMUX_TMPDIR"))
+                if outer_base is not None:
+                    os.environ[SOCKET_BASE_VAR] = outer_base
+    finally:
+        globals()["live_checks"] = real_live_checks
+    nested, alone = (seen + [{}, {}])[:2]
+    nesting = {
+        "a run handed the outermost root makes its own directly inside it":
+            outer_base is not None and nested.get("root") is not None
+            and Path(nested["root"]).parent == Path(outer_base),
+        "and leaves the same root to the runs it starts": nested.get("handed") == outer_base,
+        "a run that was not handed a root makes its own under TMPDIR":
+            alone.get("root") is not None
+            and Path(alone["root"]).parent == Path(tempfile.gettempdir()),
+        "and hands that root down": alone.get("handed") == alone.get("root"),
+        "each made its socket directory with the mode tmux gives it":
+            nested.get("mode") == 0o700 and alone.get("mode") == 0o700,
+        "after each, TMUX_TMPDIR names this run's root again":
+            [after.get(True, (None, None))[1], after.get(False, (None, None))[1]]
+            == [outer_root, outer_root],
+        "after the one handed a root, the handed root is still this run's":
+            after.get(True, (None, None))[0] == outer_base,
+        "after the one that was not handed a root, the variable is unset again":
+            False in after and after[False][0] is None,
+        "each removed its root when it ended":
+            all(entry.get("root") and not Path(entry["root"]).exists()
+                for entry in (nested, alone)),
+    }
+    wrong = sorted(name for name, ok in nesting.items() if not ok)
+    check("nested-run-makes-its-socket-root-inside-the-outermost-root",
+          "a run handed the outermost run's socket root makes its own directly inside it, and a "
+          "run that was not handed one makes its own under TMPDIR and hands it down",
+          not wrong, "; ".join(wrong + ([f"outer {outer_base}, seen {seen}, after {after}"]
+                                        if wrong else [])))
     return checked
 
 
@@ -48202,18 +48362,18 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, batch=N
         return 2
 
     # The root's name is one letter and mkdtemp's eight characters, without a
-    # pid in it: every socket path a fixture probes is this root and a name, a
-    # batch's root sits two levels inside its parent's worker directory, and
-    # inside a batch the fault fixture splits once more. With a pid in each
-    # name the suite's longest socket name does not fit in 108 bytes at that
-    # depth. Which run made the root is written inside it instead, for a root a
-    # killed run leaves behind. Whether the longest name fits is asked once,
-    # before anything is made, of the deepest socket root the run will make,
-    # since a root that fits here can still be too long two levels down.
-    too_long = socket_room_fault(deepest_socket_root(tempfile.gettempdir(), live, jobs, batch))
+    # pid in it: every socket path a fixture probes is the directory tmux keeps
+    # sockets in below a socket root and a name, and the root of each run below
+    # the outermost one sits inside the outermost run's root, two roots below
+    # TMPDIR, at any depth of nesting. With a pid in each name the suite's
+    # longest socket name would not fit in 108 bytes there. Which run made the
+    # root is written inside it instead, for a root a killed run leaves behind.
+    # Whether the longest name fits is asked once, before anything is made, of
+    # the deepest socket root this run and the runs below it make.
+    too_long = socket_room_fault(deepest_socket_root())
     if too_long:
-        warn(f"{too_long}. That is the deepest socket root this run makes, mkdtemp's "
-             "characters shown as x; run the suite with a shorter TMPDIR")
+        warn(f"{too_long}. That is the deepest socket root this run and the runs it starts "
+             "make, mkdtemp's characters shown as x; run the suite with a shorter TMPDIR")
         return 2
     # The code below changes this process, and the finally undoes each change
     # this call made, whatever ends the run. The outermost run_selftest call in
@@ -48227,6 +48387,7 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, batch=N
     was_fence, was_handed = PROCESS_FENCE, os.environ.get(FENCE_UNIT_VAR)
     was_record = os.environ.get(FENCE_RECORD_VAR)
     was_tmpdir, was_path = os.environ.get("TMUX_TMPDIR"), os.environ.get("PATH")
+    was_base = os.environ.get(SOCKET_BASE_VAR)
     probe_socket = Resolver._socket_alive
     record_dir = sockets = canary = adopted = restore_sigterm = None
     try:
@@ -48247,14 +48408,22 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, batch=N
             record_dir = owned_directory("f")
             fence.record = str(record_dir / "refused.jsonl")
             os.environ[FENCE_RECORD_VAR] = fence.record
-        # Every socket question in a run lands where TMUX_TMPDIR points: the
+        # Every socket question in a run lands in the directory tmux keeps
+        # sockets in below the root TMUX_TMPDIR names (run_socket_dir): the
         # engine's directory answer, anything the suite starts that inherits
         # this environment, and the leak check in started_here. Pointed at an
         # empty directory that other processes do not write to, every socket in
-        # it is one this run made. Put back exactly, including having been
-        # unset.
-        sockets = owned_directory("s")
+        # it is one this run made. A run handed the outermost run's root
+        # (SOCKET_BASE_VAR) makes its own root inside it, and the outermost run
+        # hands its own root down. The socket directory is made here with the
+        # mode tmux gives it, so the leak check can list it before any socket
+        # question is asked. Both variables are put back exactly, including
+        # having been unset.
+        sockets = owned_directory("s", parent=was_base)
         os.environ["TMUX_TMPDIR"] = str(sockets)
+        if was_base is None:
+            os.environ[SOCKET_BASE_VAR] = str(sockets)
+        run_socket_dir().mkdir(mode=0o700)
 
         # A tmux of this run's own, first on PATH, that records what it is
         # asked and fails. Every unit and every process they start inherits
@@ -48485,6 +48654,10 @@ def run_selftest(live=False, failed_only=False, list_only=False, jobs=1, batch=N
             os.environ.pop("TMUX_TMPDIR", None)
         else:
             os.environ["TMUX_TMPDIR"] = was_tmpdir
+        if was_base is None:
+            os.environ.pop(SOCKET_BASE_VAR, None)
+        else:
+            os.environ[SOCKET_BASE_VAR] = was_base
         if was_path is None:
             os.environ.pop("PATH", None)
         else:
