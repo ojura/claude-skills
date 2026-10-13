@@ -244,13 +244,6 @@ INDEX_CHUNK = 8 * 1024
 # and does not change which lines it yields.
 SCAN_BLOCK = 256 * 1024
 
-# The literal searches read transcript files and leave out the sidechain
-# transcripts under subagents/ directories, which are never evidence
-# candidates. _searcher passes both rules to ripgrep and grep, and
-# _search_scope applies them when a search does not complete.
-SEARCH_SUFFIX = ".jsonl"
-SEARCH_SKIPPED_DIR = "subagents"
-
 # Bytes the file arguments of one literal search may take, counting each path
 # with its terminating NUL and its argv pointer. Linux refuses to start a
 # program with more argument and environment bytes than ARG_MAX, 2 MiB with
@@ -699,6 +692,11 @@ def _lines_backward(handle, size):
         yield from reversed(parts[1:-1])
         pending = [parts[0]]
     yield b"".join(reversed(pending))
+
+
+def _unopenable_key(info):
+    """The fields of a stat that a chmod, a chown, a write or a replacement changes."""
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_ctime_ns)
 
 
 def _argv_batches(paths, budget):
@@ -2152,6 +2150,12 @@ class Resolver:
     # only files that changed.
     _census = Cache({"transcript"}, dict)
     _record_reads = Cache(set(), dict)
+    # The files a literal search could not open and the directories
+    # _main_transcripts could not list, each with _unopenable_key of its stat
+    # at the time, kept across refreshes. A search leaves such a file out, and
+    # the listing such a directory, while that key stays the same, and tries it
+    # again once a chmod, a chown, a write or a replacement changes it.
+    _unopenable = Cache(set(), dict)
     _spawns = Cache({"transcript"}, dict)
     _spawn_log = Cache({"transcript"}, dict)
     _by_agent = Cache({"transcript"})
@@ -2233,48 +2237,79 @@ class Resolver:
         """Discard discovery evidence after this command attempts transcript changes."""
         self._invalidate("transcript")
 
-    def _literal_search(self, kind, needle, scope, recursive):
-        """A literal search's answer, or its whole scope where the search did not complete.
+    def _literal_search(self, kind, needle, files):
+        """A literal search's answer over `files`, or the whole run where the search did not complete.
 
         kind "files" answers the files that contain `needle`, and kind "lines"
-        answers (file, line) for each line that contains it. The scope is
-        searched in runs that fit SEARCH_ARGV_BUDGET. A search completes when
-        it exits with 0, after finding the literal, or with 1, after not
-        finding it. When it cannot start, exits with another code, such as 2
-        after a file it could not read, or is ended by a signal, the output it
-        printed can be incomplete, so the answer covers the whole scope of
-        that run instead: each file in it for "files", and for "lines" each
-        line holding `needle` in each file, read here. A warning names the
+        answers (file, line) for each line that contains it, with the line
+        decoded as UTF-8 and an invalid byte read as U+FFFD. Both kinds answer
+        in the order of `files`, and the lines of one file in their order in
+        it, whichever order the searcher prints its files in, so a completed
+        search and the fallback below give one answer in one order. Both searchers
+        read each file as text, so they also print a line with a byte that is
+        not valid UTF-8, or with a NUL. A file in `files` that this Resolver
+        could not open before, with the same stat since, is left out, and the
+        rest are searched in runs that fit SEARCH_ARGV_BUDGET.
+
+        A search completes when it exits with 0, after finding the literal, or
+        with 1, after not finding it. ripgrep and grep exit with 2 after a file
+        they could not open and still search the others, so then each file of
+        the run is opened here: the ones that cannot be opened are recorded,
+        reported once and left out, and the rest of the run is searched again.
+        When a search still does not complete, cannot start or is ended by a
+        signal, the output it printed can be incomplete, so the answer covers
+        the whole run instead: each file in it for "files", and for "lines"
+        each line holding `needle` in each file, read here. A warning names the
         search that did not complete. The Resolver runs each literal search
-        through this method, so a reader does not take an incomplete search
-        as an empty one.
+        through this method, so a reader does not take an incomplete search as
+        an empty one.
         """
-        found = []
-        for batch in _argv_batches(scope, SEARCH_ARGV_BUDGET):
+        def search(batch):
+            """(answer, failure, exit status) of one search; failure is None when it completed."""
             try:
-                result = self._search(kind, needle, batch, recursive)
+                result = self._search(kind, needle, batch)
             except OSError as err:
-                failure = f"it could not start: {err}"
-            else:
-                if result.returncode in (0, 1):
-                    lines = [line for line in result.stdout.split("\n") if line]
-                    if kind == "files":
-                        found.extend(Path(line) for line in lines)
-                    else:
-                        found.extend((Path(where), text) for where, _, text
-                                     in (line.partition(":") for line in lines))
-                    continue
-                failure = (result.stderr.strip()
-                           or (f"ended by signal {-result.returncode}" if result.returncode < 0
-                               else f"exit status {result.returncode}"))
-            files = self._search_scope(batch, recursive)
-            warn(f"the search for {needle} did not complete ({failure}); reading the "
-                 f"{len(files)} files it covers instead")
+                return [], f"it could not start: {err}", None
+            if result.returncode not in (0, 1):
+                said = result.stderr.decode("utf-8", "replace").strip()
+                return [], said or (f"ended by signal {-result.returncode}"
+                                    if result.returncode < 0
+                                    else f"exit status {result.returncode}"), result.returncode
+            lines = [line for line in result.stdout.split(b"\n") if line]
+            # ripgrep prints the files of a run in the order its threads
+            # finish them; the stable sort puts them in list order and keeps
+            # the lines of each file in the order it printed them.
+            place = {path: at for at, path in enumerate(batch)}
             if kind == "files":
-                found.extend(files)
+                answer = [Path(os.fsdecode(line)) for line in lines]
+                answer.sort(key=lambda path: place.get(path, len(batch)))
+                return answer, None, result.returncode
+            answer = []
+            for line in lines:
+                where, _, text = line.partition(b":")
+                answer.append((Path(os.fsdecode(where)), text.decode("utf-8", "replace")))
+            answer.sort(key=lambda item: place.get(item[0], len(batch)))
+            return answer, None, result.returncode
+
+        found = []
+        searchable = [Path(path) for path in files if not self._cannot_open(path)]
+        for batch in _argv_batches(searchable, SEARCH_ARGV_BUDGET):
+            answer, failure, status = search(batch)
+            if status == 2:
+                kept = self._openable(batch)
+                if len(kept) < len(batch):
+                    batch = kept
+                    answer, failure, status = search(batch) if batch else ([], None, 1)
+            if failure is None:
+                found.extend(answer)
+                continue
+            warn(f"the search for {needle} did not complete ({failure}); reading the "
+                 f"{len(batch)} files it covers instead")
+            if kind == "files":
+                found.extend(batch)
                 continue
             marker = needle.encode()
-            for path in files:
+            for path in batch:
                 try:
                     with open(path, "rb") as handle:
                         found.extend((path, raw.rstrip(b"\n").decode("utf-8", "replace"))
@@ -2283,52 +2318,81 @@ class Resolver:
                     continue
         return found
 
-    @staticmethod
-    def _search_scope(scope, recursive):
-        """The files a literal search over `scope` covers.
+    def _openable(self, files):
+        """The files of `files` that open for reading.
 
-        A recursive search covers the SEARCH_SUFFIX files under each directory
-        in the scope, outside SEARCH_SKIPPED_DIR directories, as _searcher tells
-        ripgrep and grep; any other entry is a file it covers as given.
-        ripgrep also leaves out hidden files and directories, and grep and this
-        method do not.
+        A file that was removed since the search is left out quietly. One
+        warning names each other file that cannot be opened. When the file's
+        stat can be read, the file is also recorded in _unopenable with it, so
+        later searches leave it out without opening it. When the stat cannot be
+        read either, as for a file in a directory this run may list but not
+        search, the file cannot be recorded, so each search that meets it
+        opens it again and names it again.
         """
-        files = []
-        for entry in map(Path, scope):
-            if not (recursive and entry.is_dir()):
-                files.append(entry)
+        kept, refused = [], []
+        for path in files:
+            try:
+                with open(path, "rb"):
+                    pass
+            except FileNotFoundError:
                 continue
-            for root, dirs, names in os.walk(entry):
-                dirs[:] = sorted(name for name in dirs if name != SEARCH_SKIPPED_DIR)
-                files.extend(Path(root) / name for name in sorted(names)
-                             if name.endswith(SEARCH_SUFFIX))
-        return files
+            except OSError as err:
+                try:
+                    self._unopenable[Path(path)] = _unopenable_key(os.stat(path))
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    pass
+                refused.append(f"{path} ({err.strerror or err})")
+                continue
+            kept.append(path)
+        if refused:
+            warn(f"could not open {len(refused)} transcript(s), which the searches leave "
+                 f"out: {some_of(refused)}")
+        return kept
 
-    def _search(self, kind, needle, paths, recursive):
-        """Run a literal search with command-owned options.
+    def _cannot_open(self, path):
+        """Whether `path` is recorded in _unopenable with the stat it has now.
+
+        A recorded path with another stat, or one that is gone, is forgotten,
+        so it is tried again.
+        """
+        path = Path(path)
+        recorded = self._unopenable.get(path)
+        if recorded is None:
+            return False
+        try:
+            if _unopenable_key(os.stat(path)) == recorded:
+                return True
+        except OSError:
+            pass
+        del self._unopenable[path]
+        return False
+
+    def _search(self, kind, needle, paths):
+        """Run one literal search over the files `paths`, with command-owned options.
 
         Removing RIPGREP_CONFIG_PATH keeps user options such as
-        `--max-filesize=1` and `--max-depth=0` from narrowing the transcript
-        corpus. The grep fallback uses the same explicit search bounds.
+        `--max-count=0` from narrowing the transcript corpus. The output is
+        bytes, since a transcript line can hold bytes that are not valid UTF-8.
         """
         env = {name: value for name, value in os.environ.items()
                if name != "RIPGREP_CONFIG_PATH"}
-        return subprocess.run(self._searcher(kind, needle, paths, recursive),
-                              capture_output=True, text=True, env=env)
+        return subprocess.run(self._searcher(kind, needle, paths), capture_output=True, env=env)
 
-    def _searcher(self, kind, needle, paths, recursive):
-        """Build literal-search argv, preferring ripgrep for parallel traversal."""
-        files = [str(p) for p in paths]
+    def _searcher(self, kind, needle, paths):
+        """Build the argv of a literal search over these files, preferring ripgrep.
+
+        Both searchers get the same explicit file list, so they search the same
+        files, and both read each file as text, ripgrep with --text and grep
+        with -a, so a NUL or an invalid UTF-8 byte does not turn a file's lines
+        into a "binary file matches" message.
+        """
+        files = [os.fsdecode(path) for path in paths]
         if shutil.which("rg"):
-            argv = ["rg", "--no-ignore", "-F", needle]
-            argv += ["-l"] if kind == "files" else ["-N", "-H"]
-            if recursive:
-                argv += ["--glob", f"*{SEARCH_SUFFIX}", "--glob", f"!**/{SEARCH_SKIPPED_DIR}/**"]
-            return argv + files
-        argv = ["grep", "-F", needle, "-l" if kind == "files" else "-H"]
-        if recursive:
-            argv += ["-r", f"--include=*{SEARCH_SUFFIX}", f"--exclude-dir={SEARCH_SKIPPED_DIR}"]
-        return argv + files
+            return ["rg", "--no-ignore", "--text", "-F", needle,
+                    *(["-l"] if kind == "files" else ["-N", "-H"]), *files]
+        return ["grep", "-a", "-F", needle, "-l" if kind == "files" else "-H", *files]
 
     def _stamped_candidates(self, name, team=None, verify=True):
         """Return the newest transcripts with current lines that carry these stamps.
@@ -2369,9 +2433,9 @@ class Resolver:
             # The index can both miss (stamps only mid-history) and mislead (a stamp
             # quoted inside message content). Either way the answer is not yet "no",
             # so re-ask over whole files before saying so.
-            deep = self._literal_search("files", '"agentName"', [self._projects_dir], True)
+            deep = self._literal_search("files", '"agentName"', self._main_transcripts())
             if team and deep:
-                deep = self._literal_search("files", '"teamName"', deep, False)
+                deep = self._literal_search("files", '"teamName"', deep)
             seen = set(files)
             found = confirm(p for p in deep if p not in seen)
         return found
@@ -2390,7 +2454,7 @@ class Resolver:
             self._spawns[path.stem], self._spawn_log[path.stem] = {}, []
         if not paths:
             return
-        for where, text in self._literal_search("lines", SPAWN_MARKER, paths, False):
+        for where, text in self._literal_search("lines", SPAWN_MARKER, paths):
             stem = where.stem
             if stem not in self._spawns:
                 continue
@@ -2683,7 +2747,7 @@ class Resolver:
         if self._by_team is not None:
             return self._by_team
         self._by_team = {}
-        leads = self._literal_search("files", SPAWN_MARKER, [self._projects_dir], True)
+        leads = self._literal_search("files", SPAWN_MARKER, self._main_transcripts())
         self._ingest_spawn_lines(leads)
         for path in leads:
             newest = {}
@@ -3406,18 +3470,110 @@ class Resolver:
         dated.sort(key=lambda item: item[0], reverse=True)
         return [path for _mtime, path in dated]
 
-    def _transcripts_by_mtime(self):
-        """The transcripts in the project directories, newest first.
+    def _main_transcripts(self, name=None):
+        """The main transcripts, in path order.
 
-        A transcript removed between the glob and its stat is left out.
+        A main transcript is a regular file with a name ending in .jsonl in a
+        project directory, a directory directly under the projects directory.
+        Claude Code writes each conversation there, as a regular file named by
+        its session id, and names each project directory after a cwd with each
+        character outside [a-zA-Z0-9] turned into "-", so the name starts with
+        "-". So the list leaves out:
+
+        - files further down, such as the sidechain transcripts under
+          <session>/subagents/;
+        - names that start with ".", hidden files and directories, which Claude
+          Code does not write there;
+        - symbolic links, to files and to project directories. Claude Code
+          writes regular files, and a link would show one conversation under a
+          second path, or lead outside the projects directory to a file that
+          can block a read.
+
+        `name` narrows the list to the files with that name, looked up in each
+        project directory without listing it. A directory that cannot be
+        listed is reported once while its stat stays the same, and its files
+        are left out. A projects directory that does not exist gives an empty
+        list.
+
+        An entry's type comes from its directory entry, and a file system that
+        does not record entry types, such as XFS without ftype or some network
+        file systems, makes DirEntry stat the entry instead. When an entry's
+        type cannot be read that way, or a looked-up name cannot be stat'ed,
+        as in a directory this run may list but not search, the entry is named
+        in a warning and left out.
         """
-        return self._newest_first(self._projects_dir.glob("*/*.jsonl"))
+        found, untyped = [], []
+
+        def typed(entry, regular):
+            """Whether `entry` is a regular file, or with `regular` False a directory, not as a link."""
+            try:
+                if regular:
+                    return entry.is_file(follow_symlinks=False)
+                return entry.is_dir(follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            except OSError as err:
+                untyped.append(f"{entry.path} ({err.strerror or err})")
+                return False
+
+        if name is not None and (name.startswith(".") or not name.endswith(".jsonl")):
+            return found
+        for project in self._listed(self._projects_dir):
+            if project.name.startswith(".") or not typed(project, False):
+                continue
+            if name is not None:
+                path = Path(project.path) / name
+                try:
+                    if statlib.S_ISREG(os.lstat(path).st_mode):
+                        found.append(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as err:
+                    untyped.append(f"{path} ({err.strerror or err})")
+                continue
+            found.extend(Path(entry.path) for entry in self._listed(Path(project.path))
+                         if entry.name.endswith(".jsonl") and not entry.name.startswith(".")
+                         and typed(entry, True))
+        if untyped:
+            warn(f"could not read the type of {len(untyped)} entr(ies) under "
+                 f"{self._projects_dir}, which the listing leaves out: {some_of(untyped)}")
+        return found
+
+    def _listed(self, directory):
+        """The entries of `directory` in name order, or an empty list when it cannot be listed.
+
+        A directory that does not exist gives an empty list quietly. One that
+        cannot be listed for another reason is recorded in _unopenable and
+        reported once while its stat stays the same.
+        """
+        if self._cannot_open(directory):
+            return []
+        try:
+            with os.scandir(directory) as entries:
+                return sorted(entries, key=lambda entry: entry.name)
+        except FileNotFoundError:
+            return []
+        except OSError as err:
+            try:
+                self._unopenable[Path(directory)] = _unopenable_key(os.stat(directory))
+            except OSError:
+                return []
+            warn(f"could not list {directory} ({err.strerror or err}); the transcripts "
+                 "in it are left out")
+            return []
+
+    def _transcripts_by_mtime(self):
+        """The main transcripts, newest first.
+
+        A transcript removed between the listing and its stat is left out.
+        """
+        return self._newest_first(self._main_transcripts())
 
     def _transcripts_starting(self, block):
-        """Transcripts with a uuid that opens with this block. A path question,
-        so it belongs to whoever owns the tree rather than to a caller globbing
-        it."""
-        return list(self._projects_dir.glob(f"*/{block}-*.jsonl"))
+        """The main transcripts with a uuid that opens with this block. A path
+        question, so it belongs to whoever owns the tree rather than to a
+        caller globbing it."""
+        return [path for path in self._main_transcripts() if path.name.startswith(f"{block}-")]
 
     def _resolution(self, path=None, fields=None, last_ts=0, via="", strength=0,
                     others=(), reason="", runtime=None, evidence=None):
@@ -8437,7 +8593,7 @@ class Resolver:
         if self._by_agent is not None:
             return self._by_agent
         self._by_agent = {}
-        leads = self._literal_search("files", SPAWN_MARKER, [self._projects_dir], True)
+        leads = self._literal_search("files", SPAWN_MARKER, self._main_transcripts())
         self._ingest_spawn_lines(leads)
         for path in leads:
             for _, payload in self._log(path.stem):
@@ -8506,7 +8662,7 @@ class Resolver:
             return self._stamps
         index = {}
         carried = self._carried_receipts()
-        for path in self._projects_dir.glob("*/*.jsonl"):
+        for path in self._main_transcripts():
             copied = frozenset((carried.get(path) or {}).get("prefix_uuids") or ())
             if copied:
                 fields, _last = self._scan_transcript(path)
@@ -8594,14 +8750,17 @@ class Resolver:
         - `records`: each transcript holding such a record, mapped to it;
         - `scope`: the transcripts the census examined, so a path in scope
           and not in `records` does not hold such a record;
-        - `unreadable`: the transcripts that could not be read. They are not
-          in scope, because whether they hold a record is unknown.
+        - `unreadable`: the transcripts that could not be read, that the
+          search could not open, or that stat could not read, as in a
+          directory this run may list but not search. They are not in scope,
+          because whether they hold a record is unknown.
 
-        A literal search for the compact `"type":"<record type>"` decides
-        which files are read: a file the search does not list does not hold
-        such a record, and it is in scope without being read. When the search
-        does not complete, _literal_search answers each file it was given, so
-        the census reads each file it examines.
+        The census examines the main transcripts. A literal search for the
+        compact `"type":"<record type>"` decides which files are read: a file
+        the search does not list does not hold such a record, and it is in
+        scope without being read. When the search does not complete,
+        _literal_search answers each file it was given, so the census reads
+        each file it examines.
 
         Callers share one answer until refresh_transcript_evidence discards
         it, so asking about a known absence again does not read the file. Each
@@ -8616,20 +8775,25 @@ class Resolver:
         if record_type in self._census:
             return self._census[record_type]
         known = self._record_reads.setdefault(record_type, {})
-        listed = {}
-        for path in self._projects_dir.glob("*/*.jsonl"):
+        listed, unreadable = {}, []
+        for path in self._main_transcripts():
             try:
                 listed[path] = self._snapshot_signature(path.stat())
-            except OSError:
+            except FileNotFoundError:
                 continue
+            except OSError:
+                unreadable.append(path)
         for gone in set(known) - set(listed):
             del known[gone]
         examine = [path for path, generation in listed.items()
                    if path not in known or known[path][0] != generation]
         candidates = (set(self._literal_search(
-            "files", _record_type_literal(record_type), examine, False)) if examine else set())
-        unreadable = []
+            "files", _record_type_literal(record_type), examine)) if examine else set())
         for path in examine:
+            if self._cannot_open(path):
+                known.pop(path, None)
+                unreadable.append(path)
+                continue
             record = None
             if path in candidates:
                 try:
@@ -9353,8 +9517,8 @@ class Resolver:
         return [team for _, team in mine]
 
     def _transcript_paths(self, session_uuid):
-        """Every file carrying one session UUID, in stable path order."""
-        return tuple(sorted(self._projects_dir.glob(f"*/{session_uuid}.jsonl")))
+        """The main transcripts named by one session UUID, in path order."""
+        return tuple(self._main_transcripts(name=f"{session_uuid}.jsonl"))
 
     def _transcript_path(self, session_uuid):
         """The sole file carrying one session UUID, or None when not unique."""
@@ -37305,7 +37469,7 @@ def _check_completion_conversion_census_boundary(s):
             fallback = Resolver(needs=Needs(hard={NEED.CONVERSION_CENSUS}))
             fallback._projects_dir = projects
             fallback._search = lambda *args: subprocess.CompletedProcess(
-                ["rg"], 2, "", "synthetic search failure")
+                ["rg"], 2, b"", b"synthetic search failure")
             fallback_parsed = []
             fallback_original = fallback._receipt_in_file
             fallback._receipt_in_file = lambda path: (
@@ -37342,7 +37506,7 @@ def _check_completion_conversion_census_boundary(s):
             zero = Resolver(needs=Needs(hard={NEED.CONVERSION_CENSUS}))
             zero._projects_dir = projects
             # A search that completes without a match.
-            zero._search = lambda *args: subprocess.CompletedProcess(["rg"], 1, "", "")
+            zero._search = lambda *args: subprocess.CompletedProcess(["rg"], 1, b"", b"")
             zero_parsed = []
             zero_original = zero._receipt_in_file
             zero._receipt_in_file = lambda path: (
@@ -37550,8 +37714,9 @@ def _check_census_narrowing_finds_what_the_writers_emit(s):
                 # The census searches the files it examines by name, as here.
                 # The search itself is asked: _literal_search would answer each
                 # file it was given if the search did not complete.
-                searched = eng._search("files", literal, [carrier], False)
-                if searched.returncode != 0 or str(carrier) not in searched.stdout.split("\n"):
+                searched = eng._search("files", literal, [carrier])
+                if (searched.returncode != 0
+                        or os.fsencode(carrier) not in searched.stdout.split(b"\n")):
                     told.append(f"the census search does not list a file holding {name}'s "
                                 "writer output")
     told += [f"{name} is censused, and this check does not have writer output for it"
@@ -37707,12 +37872,12 @@ def _check_census_record_selection(s):
 
         def failing(eng):
             return mock.patch.object(eng, "_search", lambda *args: subprocess.CompletedProcess(
-                ["rg"], 2, "", "synthetic search failure"))
+                ["rg"], 2, b"", b"synthetic search failure"))
 
         def signalled(eng):
             # SIGTERM ended this search after it printed one file of its list.
             return mock.patch.object(eng, "_search", lambda *args: subprocess.CompletedProcess(
-                ["rg"], -15, f"{layered}\n", ""))
+                ["rg"], -15, os.fsencode(f"{layered}\n"), b""))
 
         outcomes = {"ripgrep": (normal, normal_read)}
         for label, prepare in (("grep", without_rg), ("searcher missing", without_searcher),
@@ -37788,8 +37953,9 @@ def _check_census_generations(s):
             "the fixture made one file unreadable": blocked,
             "the first census read each file listed by the search":
                 first_read == ["changed", "cut", "removed", "unchanged", "unreadable"],
-            "the second census read only the changed, unreadable and added files":
-                second_read == ["added", "changed", "unreadable"],
+            "the second census read only the changed and added files, after its search left "
+            "out the one it could not open":
+                second_read == ["added", "changed"],
             "an unchanged file keeps its record object":
                 second["records"].get(stems["unchanged"]) is first_records.get(stems["unchanged"])
                 is not None,
@@ -37855,7 +38021,7 @@ def _check_census_narrowing_keeps_completion_rows(s):
                     # Each search this engine runs fails, so each reader reads its
                     # whole scope.
                     eng._search = lambda *args: subprocess.CompletedProcess(
-                        ["rg"], 2, "", "synthetic search failure")
+                        ["rg"], 2, b"", b"synthetic search failure")
                 globals()["RESOLVER"] = eng
                 printed = []
                 for topic in ("teams", "names"):
@@ -37893,10 +38059,10 @@ def _check_literal_search_fallbacks(s):
     checked = []
 
     def failed(*_args):
-        return subprocess.CompletedProcess(["rg"], 2, "", "synthetic search failure")
+        return subprocess.CompletedProcess(["rg"], 2, b"", b"synthetic search failure")
 
     def signalled(*_args):
-        return subprocess.CompletedProcess(["rg"], -15, "", "")
+        return subprocess.CompletedProcess(["rg"], -15, b"", b"")
 
     def unstartable(*_args):
         raise FileNotFoundError("synthetic missing searcher")
@@ -37926,7 +38092,7 @@ def _check_literal_search_fallbacks(s):
         f.transcript("lead", "team-lead", "T", (spawn("lead", "worker"),))
         f.transcript("plain", "steady", "T")
         # A spawn record in a sidechain transcript: only the path keeps it out.
-        side = f.project / "lead" / SEARCH_SKIPPED_DIR / "agent-side.jsonl"
+        side = f.project / "lead" / "subagents" / "agent-side.jsonl"
         side.parent.mkdir(parents=True)
         side.write_text(fixture_line(spawn("lead", "ghost")) + "\n")
 
@@ -38016,16 +38182,16 @@ def _check_literal_search_fallbacks(s):
         def run(small, ask):
             eng, runs, read = engine(), [], []
             real_search, real_read = eng._search, eng._restamp_in_file
-            eng._search = lambda kind, needle, paths, recursive: (
-                runs.append(list(paths)), real_search(kind, needle, paths, recursive))[1]
+            eng._search = lambda kind, needle, paths: (
+                runs.append(list(paths)), real_search(kind, needle, paths))[1]
             eng._restamp_in_file = lambda path: read.append(Path(path)) or real_read(path)
             with mock.patch.dict(globals(), {"SEARCH_ARGV_BUDGET": budget} if small else {}):
                 answer = ask(eng)
             return answer, runs, sorted(read)
 
-        whole = {kind: run(False, lambda eng, kind=kind: eng._literal_search(kind, literal, files, False))
+        whole = {kind: run(False, lambda eng, kind=kind: eng._literal_search(kind, literal, files))
                  for kind in ("files", "lines")}
-        split = {kind: run(True, lambda eng, kind=kind: eng._literal_search(kind, literal, files, False))
+        split = {kind: run(True, lambda eng, kind=kind: eng._literal_search(kind, literal, files))
                  for kind in ("files", "lines")}
         census = [run(small, lambda eng: eng._record_census(RESTAMP_RECORD, eng._restamp_in_file))
                   for small in (False, True)]
@@ -38049,6 +38215,384 @@ def _check_literal_search_fallbacks(s):
         wrong = sorted(fact for fact, ok in facts.items() if not ok)
         checked.append(_check_verdict('literal-search-splits-long-file-lists', not wrong,
                                       "; ".join(wrong) + f"; runs={[len(r) for r in runs]}"))
+    return checked
+
+
+@unit(('main-transcripts-are-regular-files-one-level-down',
+       'the main transcripts are the regular .jsonl files directly in project directories, '
+       'without hidden names, symbolic links or files further down'),
+      ('main-transcripts-report-a-directory-they-cannot-list',
+       'a project directory that cannot be listed is reported once, and its transcripts are '
+       'left out until its stat changes'),
+      ('main-transcripts-name-an-entry-of-unknown-type',
+       'an entry the listing cannot read the type of, as on a file system without entry types, '
+       'and a looked-up name it cannot stat are named in a warning and left out, and the other '
+       'entries are listed'))
+def _check_main_transcript_listing(s):
+    """Which files are the main transcripts: the one listing that the census, the spawn
+    readers, the stamp lookup and the session lookups use.
+
+    Each case catches its own exception, so a case that raises fails alone.
+    """
+    checked = []
+
+    def check(cid, ok, detail=""):
+        checked.append(_check_verdict(cid, bool(ok), detail))
+
+    def case(cid, block):
+        try:
+            ok, detail = block()
+        except (Exception, Refusal) as exc:
+            ok, detail = False, f"raised {type(exc).__name__}: {exc}"
+        check(cid, ok, detail)
+
+    def judged(facts, detail=""):
+        wrong = sorted(fact for fact, ok in facts.items() if not ok)
+        return not wrong, ("wrong: " + ", ".join(wrong) + detail) if wrong else ""
+
+    with tempfile.TemporaryDirectory(prefix=f"{TOOL}-main-transcripts-") as td:
+        projects = Path(td) / "projects"
+
+        def write(relative):
+            path = projects / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}\n")
+            return path
+
+        def engine():
+            eng = Resolver(needs=Needs(maybe=set(NEED)))
+            eng._projects_dir = projects
+            return eng
+
+        def rules():
+            listed = [write("-p/a.jsonl"), write("-q/d.jsonl")]
+            for left_out in ("-p/.hidden.jsonl", ".hidden/b.jsonl", "-p/session/c.jsonl",
+                             "-p/session/subagents/agent-x.jsonl", "-p/notes.txt", "top.jsonl"):
+                write(left_out)
+            (projects / "-p" / "link.jsonl").symlink_to(projects / "-p" / "a.jsonl")
+            (projects / "-linked").symlink_to(projects / "-q", target_is_directory=True)
+            eng = engine()
+            found = eng._main_transcripts()
+            return judged({
+                "the listing": found == listed,
+                "a name looked up": eng._main_transcripts(name="a.jsonl") == listed[:1],
+                "a linked name looked up": eng._main_transcripts(name="link.jsonl") == [],
+                "a hidden name looked up": eng._main_transcripts(name=".hidden.jsonl") == [],
+                "a session's paths": eng._transcript_paths("a") == (listed[0],),
+                "the newest-first listing": set(eng._transcripts_by_mtime()) == set(listed),
+            }, f"; listed {[str(path.relative_to(projects)) for path in found]}")
+
+        def unlistable():
+            closed = write("-r/e.jsonl").parent
+            eng = engine()
+            closed.chmod(0)
+            try:
+                try:
+                    os.listdir(closed)
+                    blocked = False
+                except OSError:
+                    blocked = True
+                with capturing("err") as first_said:
+                    first = eng._main_transcripts()
+                with capturing("err") as second_said:
+                    second = eng._main_transcripts()
+            finally:
+                closed.chmod(0o700)
+            with capturing("err") as third_said:
+                third = eng._main_transcripts()
+            return judged({
+                "the fixture made the directory unlistable": blocked,
+                "its transcript is left out": closed / "e.jsonl" not in first + second,
+                "the first listing names the directory": str(closed) in first_said.getvalue(),
+                "the second listing does not report it again": second_said.getvalue() == "",
+                "after its mode changes it is listed": (closed / "e.jsonl" in third
+                                                        and third_said.getvalue() == ""),
+            })
+
+        def untyped():
+            from unittest import mock
+            root = Path(td) / "untyped"
+            kept = root / "-p" / "a.jsonl"
+            unknown_file, unknown_dir = root / "-p" / "b.jsonl", root / "-q"
+            held = root / "-closed" / "held.jsonl"
+            for path in (kept, unknown_file, unknown_dir / "d.jsonl", held):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n")
+            eng = Resolver(needs=Needs(maybe=set(NEED)))
+            eng._projects_dir = root
+
+            class Untyped:
+                """A directory entry on a file system without entry types, where
+                reading the type takes a stat that this run is refused."""
+
+                def __init__(self, entry):
+                    self.name, self.path = entry.name, entry.path
+
+                def is_dir(self, follow_symlinks=True):
+                    raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), self.path)
+
+                is_file = is_dir
+
+            real_scandir = os.scandir
+
+            @contextlib.contextmanager
+            def scandir(directory):
+                with real_scandir(directory) as entries:
+                    yield [Untyped(entry) if entry.path in (str(unknown_file), str(unknown_dir))
+                           else entry for entry in entries]
+
+            with mock.patch.object(os, "scandir", scandir), capturing("err") as said:
+                listed = eng._main_transcripts()
+            held.parent.chmod(0o600)
+            try:
+                with capturing("err") as lookup_said:
+                    looked_up = eng._main_transcripts(name="held.jsonl")
+            finally:
+                held.parent.chmod(0o700)
+            warned = said.getvalue()
+            return judged({
+                "the listing holds the typed entries": listed == [held, kept],
+                "it names the untyped file and directory": (str(unknown_file) in warned
+                                                            and str(unknown_dir) in warned),
+                "a name it cannot stat is named and left out": (looked_up == []
+                                                                and str(held) in lookup_said.getvalue()),
+            }, f"; listed {[str(path.relative_to(root)) for path in listed]}")
+
+        case("main-transcripts-are-regular-files-one-level-down", rules)
+        case("main-transcripts-report-a-directory-they-cannot-list", unlistable)
+        case("main-transcripts-name-an-entry-of-unknown-type", untyped)
+    return checked
+
+
+@unit(('search-leaves-out-a-transcript-it-cannot-open',
+       'a transcript the search cannot open is left out and reported, the other files keep the '
+       'answer a completed search gives, and later searches leave it out without opening it '
+       'until its stat changes, or name it again when its stat cannot be read'),
+      ('census-reports-a-transcript-the-search-cannot-open',
+       'the census lists a transcript that it cannot stat, or that its search cannot open, as '
+       'unreadable and outside its scope, and reads only the files its search lists'),
+      ('search-reads-an-invalid-byte-as-the-fallback-does',
+       'a line holding a byte that is not valid UTF-8, or a NUL, is listed by ripgrep and by '
+       'grep and read as the fallback reads it'),
+      ('search-answers-in-file-list-order',
+       'a completed search answers its files, and the lines of each file, in the order of its '
+       'file list, as the fallback does, whatever order the searcher prints them in'))
+def _check_search_reads_what_it_can_open(s):
+    """What a literal search answers about files it cannot open and lines that are not UTF-8.
+
+    ripgrep and grep exit with 2 after a file they cannot open, which made each
+    search with such a file in scope answer its whole scope, and a cold census
+    read each transcript. A completed search's output is bytes, and a line
+    with a byte that is not valid UTF-8 has to read the way the fallback reads
+    it.
+
+    Each case catches its own exception, so a case that raises fails alone.
+    """
+    from unittest import mock
+    checked = []
+
+    def check(cid, ok, detail=""):
+        checked.append(_check_verdict(cid, bool(ok), detail))
+
+    def case(cid, block):
+        try:
+            ok, detail = block()
+        except (Exception, Refusal) as exc:
+            ok, detail = False, f"raised {type(exc).__name__}: {exc}"
+        check(cid, ok, detail)
+
+    def judged(facts, detail=""):
+        wrong = sorted(fact for fact, ok in facts.items() if not ok)
+        return not wrong, ("wrong: " + ", ".join(wrong) + detail) if wrong else ""
+
+    mark = "a-literal-to-find"
+
+    def write(path, data):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(data, bytes):
+            path.write_bytes(data)
+        else:
+            path.write_text(data)
+        return path
+
+    def engine(projects):
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
+        eng._projects_dir = projects
+        return eng
+
+    def opens(path):
+        try:
+            open(path, "rb").close()
+            return True
+        except OSError:
+            return False
+
+    def stats(path):
+        try:
+            os.stat(path)
+            return True
+        except OSError:
+            return False
+
+    with tempfile.TemporaryDirectory(prefix=f"{TOOL}-search-opens-") as td:
+        base = Path(td)
+
+        def leaves_out():
+            projects = base / "leaves"
+            a, b, c = (write(projects / "-p" / f"{name}.jsonl", f'{{"m":"{mark}"}}\n')
+                       for name in "abc")
+            eng = engine(projects)
+            opened, real = [], eng._openable
+            eng._openable = lambda files: opened.append(list(files)) or real(files)
+            b.chmod(0)
+            try:
+                blocked = not opens(b)
+                with capturing("err") as first_said:
+                    first = eng._literal_search("files", mark, eng._main_transcripts())
+                    first_lines = eng._literal_search("lines", mark, eng._main_transcripts())
+                with capturing("err") as second_said:
+                    second = eng._literal_search("files", mark, eng._main_transcripts())
+            finally:
+                b.chmod(0o600)
+            with capturing("err") as third_said:
+                third = eng._literal_search("files", mark, eng._main_transcripts())
+            # A project directory this run may list and not search: its file is
+            # listed, and neither open nor stat can reach it, so it cannot be
+            # recorded and each search names it again.
+            elsewhere = base / "unsearchable"
+            kept = write(elsewhere / "-open" / "kept.jsonl", f'{{"m":"{mark}"}}\n')
+            held = write(elsewhere / "-closed" / "held.jsonl", f'{{"m":"{mark}"}}\n')
+            other = engine(elsewhere)
+            held.parent.chmod(0o600)
+            try:
+                unsearchable = not stats(held)
+                listed = other._main_transcripts()
+                with capturing("err") as held_first_said:
+                    held_first = other._literal_search("files", mark, listed)
+                with capturing("err") as held_second_said:
+                    held_second = other._literal_search("files", mark, other._main_transcripts())
+            finally:
+                held.parent.chmod(0o700)
+            return judged({
+                "the fixture made a directory listable and not searchable": (unsearchable
+                                                                             and held in listed),
+                "the other directory's file keeps its answer": (held_first == [kept]
+                                                                and held_second == [kept]),
+                "each search names the file it could not stat": (
+                    str(held) in held_first_said.getvalue()
+                    and str(held) in held_second_said.getvalue()),
+                "the fixture made one transcript unopenable": blocked,
+                "the first search answers the files it could open": sorted(first) == [a, c],
+                "the line search answers their lines": sorted(p for p, _ in first_lines) == [a, c],
+                "the first search names the file once": first_said.getvalue().count(str(b)) == 1,
+                "the first search did not fall back": "did not complete" not in first_said.getvalue(),
+                "the later searches do not open it again": len(opened) == 1,
+                "the second search is silent": (sorted(second) == [a, c]
+                                                and second_said.getvalue() == ""),
+                "after its mode changes it is searched again": (sorted(third) == [a, b, c]
+                                                                and third_said.getvalue() == ""),
+            })
+
+        def census():
+            projects = base / "census"
+            carrier = write(projects / "-p" / "carrier.jsonl",
+                            _census_fixture_line("mover", "T", "D") + "\n")
+            plain = write(projects / "-p" / "plain.jsonl",
+                          fixture_line({"type": "user", "uuid": "plain"}) + "\n")
+            closed = write(projects / "-p" / "closed.jsonl",
+                           _census_fixture_line("closed", "T", "D") + "\n")
+            held = write(projects / "-closed" / "held.jsonl",
+                         _census_fixture_line("held", "T", "D") + "\n")
+            eng = engine(projects)
+            read, real_read = [], eng._restamp_in_file
+            closed.chmod(0)
+            held.parent.chmod(0o600)
+            try:
+                blocked = not opens(closed) and not stats(held)
+                with capturing("err") as said:
+                    answer = eng._record_census(
+                        RESTAMP_RECORD, lambda path: read.append(Path(path)) or real_read(path))
+            finally:
+                closed.chmod(0o600)
+                held.parent.chmod(0o700)
+            return judged({
+                "the fixture made one transcript unopenable and one directory unsearchable":
+                    blocked,
+                "both are unreadable": answer["unreadable"] == frozenset({closed, held}),
+                "it is outside the scope": answer["scope"] == frozenset({carrier, plain}),
+                "the census read only the file its search listed": read == [carrier],
+                "the record is the carrier's": set(answer["records"]) == {carrier},
+                "the search did not fall back": "did not complete" not in said.getvalue(),
+            }, f"; read {[path.name for path in read]}")
+
+        def invalid_byte():
+            path = base / "bytes" / "-p" / "odd.jsonl"
+            lines = [b'{"a":"x\xffy","m":"' + mark.encode() + b'"}',
+                     b'{"n":"a\x00b","m":"' + mark.encode() + b'"}',
+                     b'{"m":"' + mark.encode() + b' plain"}']
+            write(path, b"\n".join(lines) + b"\n")
+            expected = [(path, line.decode("utf-8", "replace")) for line in lines]
+            real_which = shutil.which
+            answers = {}
+            for label, hidden in (("ripgrep", None), ("grep", "rg")):
+                eng = engine(path.parent.parent)
+                with mock.patch.object(shutil, "which", lambda name, *rest, **kw: (
+                        None if name == hidden else real_which(name, *rest, **kw))):
+                    answers[label] = (eng._literal_search("lines", mark, [path]),
+                                      eng._literal_search("files", mark, [path]))
+            failing = engine(path.parent.parent)
+            failing._search = lambda *args: subprocess.CompletedProcess(
+                ["rg"], 2, b"", b"synthetic search failure")
+            with capturing("err"):
+                answers["fallback"] = (failing._literal_search("lines", mark, [path]), [path])
+            wrong = sorted(label for label, (found, files) in answers.items()
+                           if found != expected or files != [path])
+            return not wrong, (f"wrong for {', '.join(wrong)}; ripgrep "
+                               f"{'found' if real_which('rg') else 'not found'}, answers "
+                               f"{ {label: found for label, (found, _f) in answers.items()} }"
+                               if wrong else "")
+
+        def in_list_order():
+            folder = base / "order" / "-p"
+            texts = {"a": ['{"m":"%s","n":"a"}'],
+                     "b": ['{"m":"%s","n":"b1"}', '{"m":"%s","n":"b2"}'],
+                     "c": ['{"m":"%s","n":"c"}']}
+            files = [write(folder / f"{name}.jsonl", "".join(line % mark + "\n" for line in lines))
+                     for name, lines in texts.items()]
+            # The searcher prints the files backward, each file's lines in order.
+            backward = list(zip(files, texts.values()))[::-1]
+            printed = {"files": b"".join(os.fsencode(path) + b"\n" for path, _lines in backward),
+                       "lines": b"".join(os.fsencode(path) + b":" + (line % mark).encode() + b"\n"
+                                         for path, lines in backward for line in lines)}
+            expected = {"files": files,
+                        "lines": [(path, line % mark) for path, lines in zip(files, texts.values())
+                                  for line in lines]}
+
+            def names(kind, answer):
+                return [(item[0] if kind == "lines" else item).name for item in answer]
+
+            answers = {}
+            for kind in ("files", "lines"):
+                stubbed = engine(base / "order")
+                stubbed._search = lambda *args, out=printed[kind]: subprocess.CompletedProcess(
+                    ["rg"], 0, out, b"")
+                failing = engine(base / "order")
+                failing._search = lambda *args: subprocess.CompletedProcess(
+                    ["rg"], 2, b"", b"synthetic search failure")
+                with capturing("err"):
+                    answers[kind] = (stubbed._literal_search(kind, mark, files),
+                                     failing._literal_search(kind, mark, files))
+            wrong = sorted(f"{kind} {label}" for kind, (completed, fallback) in answers.items()
+                           for label, answer in (("completed", completed), ("fallback", fallback))
+                           if answer != expected[kind])
+            return not wrong, (f"wrong order for {', '.join(wrong)}; the completed searches "
+                               f"answered { {kind: names(kind, pair[0]) for kind, pair in answers.items()} }"
+                               if wrong else "")
+
+        case("search-leaves-out-a-transcript-it-cannot-open", leaves_out)
+        case("census-reports-a-transcript-the-search-cannot-open", census)
+        case("search-reads-an-invalid-byte-as-the-fallback-does", invalid_byte)
+        case("search-answers-in-file-list-order", in_list_order)
     return checked
 
 
@@ -39837,9 +40381,10 @@ def _check_sidechain_not_evidence(s):
         deep = Path(td) / "proj" / "subagents"
         deep.mkdir(parents=True)
         (deep / "agent-x.jsonl").write_text(json.dumps(side) + "\n")
-        hits = RESOLVER._literal_search("files", SPAWN_MARKER, [Path(td)], True)
-        if any("subagents" in p.parts for p in hits):
-            leaks.append("the recursive searcher")
+        lister = Resolver(needs=Needs(maybe=set(NEED)))
+        lister._projects_dir = Path(td)
+        if any("subagents" in p.parts for p in lister._main_transcripts()):
+            leaks.append("the main transcript listing")
 
         project = Path(td) / "project"
         project.mkdir()
@@ -39890,13 +40435,16 @@ def _check_search_ignores_rg_config(s):
         for name in ("one", "two"):
             (Path(td) / f"{name}.jsonl").write_text(
                 json.dumps({"status": SPAWN_MARKER}) + "\n")
+        # --max-count=0 stops ripgrep before the first match in each file
+        # it is given; --max-filesize, for one, leaves out only files found
+        # while walking a directory, and the search names its files.
         poison = Path(td) / "rg.conf"
-        poison.write_text("--max-filesize=1\n")
+        poison.write_text("--max-count=0\n")
         was = os.environ.get("RIPGREP_CONFIG_PATH")
         os.environ["RIPGREP_CONFIG_PATH"] = str(poison)
         try:
-            found = sorted(p.name for p in
-                           RESOLVER._literal_search("files", SPAWN_MARKER, [Path(td)], True))
+            found = sorted(p.name for p in RESOLVER._literal_search(
+                "files", SPAWN_MARKER, [Path(td) / "one.jsonl", Path(td) / "two.jsonl"]))
         finally:
             if was is None:
                 os.environ.pop("RIPGREP_CONFIG_PATH", None)
@@ -39904,7 +40452,7 @@ def _check_search_ignores_rg_config(s):
                 os.environ["RIPGREP_CONFIG_PATH"] = was
     check("search-ignores-rg-config", "a search finds the same files whatever rg is configured to do",
           found == ["one.jsonl", "two.jsonl"],
-          f"with a config excluding two.jsonl, the search found {found or 'zero files'}")
+          f"with --max-count=0 in the configuration, the search found {found or 'zero files'}")
 
     s.name = name
     return checked

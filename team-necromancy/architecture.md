@@ -1128,11 +1128,25 @@ Restamp records are the evidence of an intentional move. Ordinary later stamps
 and roster observations do not silently replace the assigned identity. An
 explicit complete identity or an intentional move can replace it.
 
+The main transcripts are the regular files ending in `.jsonl` directly in a
+project directory, a directory directly under the projects directory.
+`_main_transcripts` lists them, and the censuses, the spawn readers, the stamp
+index and lookup, and the session lookups use that list. Claude Code writes each
+conversation there as a regular file named by its session id, and names each
+project directory after a cwd with each character outside `[a-zA-Z0-9]` turned
+into `-`. So the list leaves out files further down, such as the sidechain
+transcripts under `subagents/`, names that start with `.`, and symbolic links. A
+directory the listing cannot read is reported, and its files are left out. A
+lookup by name learns the type of the name with lstat, and so does the listing
+on a file system that does not record entry types, such as XFS without ftype. A
+name either one cannot lstat, as in a directory this run may list but not
+search, is reported and left out too.
+
 Resolver keeps one census for each of the two record types, receipts and restamp
-records, over the main transcripts (`*/*.jsonl` under the projects directory). A
-census answer maps each transcript that carries the record to its current
-record, lists the transcripts it examined as its scope, and lists apart the ones
-it could not read, which are outside its scope. A transcript in scope without a
+records, over the main transcripts. A census answer maps each transcript that
+carries the record to its current record, lists the transcripts it examined as
+its scope, and lists apart the ones that it or its search could not read, which
+are outside its scope. A transcript in scope without a
 record is a known absence until transcript evidence is invalidated. The
 per-transcript results outlive that invalidation together with the file
 generation they were read at, so the next census reads only transcripts that are
@@ -1143,17 +1157,24 @@ census, such as a side transcript or one written since, is read directly, once
 per file generation.
 
 The Resolver runs each literal search through `_literal_search`, with ripgrep
-when `shutil.which` finds it and with grep otherwise. It passes the files in
-runs that fit `SEARCH_ARGV_BUDGET`, so a long file list stays below the kernel's
-limit on argument bytes. A search completes when it exits with 0 or 1. When it
-cannot start, exits with another code, or is ended by a signal, its output can
+when `shutil.which` finds it and with grep otherwise, over an explicit file
+list, so both search the same files. It passes the files in runs that fit
+`SEARCH_ARGV_BUDGET`, so a long file list stays below the kernel's limit on
+argument bytes. Both read each file as text, and their output is read as bytes:
+a line is decoded as UTF-8, with an invalid byte read as U+FFFD. A search
+answers in the order of its file list, and the lines of one file in their order
+in it, whichever order the searcher prints them in. A search completes when it
+exits with 0 or 1. ripgrep and grep exit with 2 after a file they cannot open,
+and `_literal_search` then opens each file of the run, records the ones it
+cannot open with their stat, reports them once and searches the rest again;
+later searches leave those files out until their stat changes. When a search
+still does not complete, cannot start, or is ended by a signal, its output can
 be incomplete, and `_literal_search` answers the whole scope of that run
 instead, with a warning: each file in it, or for a line search each line that
 holds the literal, read directly. So the census reads each transcript it
 examines, the spawn readers read each transcript for spawn records, and the
 stamp lookup keeps the candidates of its first search when its team filter does
-not complete. A recursive search covers the `.jsonl` files under its directories
-and leaves out `subagents/` directories, which hold sidechain transcripts.
+not complete.
 
 The current record of a type is the last line that parses as a JSON object
 with that `type` at the top level and an object in its payload field
