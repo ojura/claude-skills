@@ -124,8 +124,8 @@ SIDE_GRAMMARS = frozenset((SIDE_GRAMMAR_FORK_REFERENCE, SIDE_GRAMMAR_REGULAR))
 SIDE_CLASS_UNCLASSIFIABLE = "unclassifiable"
 SIDE_CLASSIFICATIONS = SIDE_GRAMMARS | {SIDE_CLASS_UNCLASSIFIABLE}
 SIDE_GRAMMAR_OPTIONS = " or ".join(repr(value) for value in sorted(SIDE_GRAMMARS))
-# Rendered from a fixed, sorted key list. Parameters a later process needs for
-# the inverse ride in the line, including the UUIDs of a fork-reference
+# Rendered from a fixed, sorted key list. The line carries the parameters a
+# later process needs for the inverse, including the UUIDs of a fork-reference
 # sidechain's copied prefix, the known human wrappers made visible, and the
 # exact fields or trailers a demote inserted or removed.
 RECEIPT_REQUIRED = frozenset({
@@ -3800,10 +3800,10 @@ class Resolver:
 
         `to` is the caller's declared need. A named recipient narrows the
         join to sends addressed to it, with identical states to the full
-        ledger's rows for it: every transcript stamped with this team is still
-        opened, because a send to it can originate in any of them, but only its
-        own file pays the delivery side, and the other transcripts parse only
-        their send lines.
+        ledger's rows for it: one transcript for each name stamped with this
+        team, and the lead's transcript, are still opened, because a send to it
+        can originate in any of them, but only its own file pays the delivery
+        side, and the other transcripts parse only their send lines.
         """
         self._exercise(NEED.MAIL)
         table = self._process_table() if table is None else table
@@ -3825,10 +3825,11 @@ class Resolver:
         sends, boxes, wrappers, last_write = [], {}, {}, {}
         for name, path in people.items():
             # The caller's declared need bounds the walk: sends to the named
-            # recipient can originate in any transcript stamped with this team,
-            # so every one of them is opened, but only the recipient's own file
-            # pays the delivery side (wrappers, last write, inbox), and the
-            # other transcripts parse only their sends.
+            # recipient can originate in any transcript this loop walks, one
+            # for each name stamped with this team and the lead's, so each of
+            # them is opened, but only the recipient's own file pays the
+            # delivery side (wrappers, last write, inbox), and the other
+            # transcripts parse only their sends.
             wants_delivery = to is None or name == to
             if wants_delivery:
                 snapshot = self._transcript_snapshot(path, include_mail=True)
@@ -5162,7 +5163,7 @@ class Resolver:
             })
         if applied.dry_run:
             # A preview claims the move only when the durable step it previewed
-            # came back as selected; otherwise the restore gate judges the launch.
+            # came back as selected; enforce_restore judges any other launch.
             nested = plan["rebind"]
             moved = applied.durable_action == (nested["action"] if nested else None)
             selected = plan["redirected_launch"]
@@ -15150,7 +15151,7 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix="", terminal=
     `jobs` is (label, args) pairs; a None args is a member that was skipped.
     `table` is the process snapshot selected before the first job. After a job
     runs, the next job asks Resolver for a current snapshot that includes the
-    processes started earlier in this batch. `socket` pins the whole run to one
+    processes started earlier in this batch. `socket` keeps the whole run on one
     server when the caller already knows it, as a team does; otherwise the first
     agent to reach one decides.
     """
@@ -20114,7 +20115,7 @@ def _check_live_workers_share_one_removable_tempdir(s):
         "every worker is given a TMPDIR": len(given) == 3 and all(given),
         "each is inside the worker directory":
             all(worker_dir in root.parents for root in given_roots),
-        "each worker has its own": len(set(given_roots)) == len(given_roots),
+        "each worker has its own TMPDIR": len(set(given_roots)) == len(given_roots),
         "each leaves room for its socket paths":
             not worker_directory_faults(worker_dir, given_roots),
         "each existed while the workers ran": present == [True, True, True],
@@ -21056,7 +21057,7 @@ def _check_batches_cleanup_owner(s):
         terminated = {
             "the driver, its terminal child and the stubborn process were running": was_running,
             "the run took the signal through its cleanup and exited 143": outer.returncode == 143,
-            "the three processes have ended after":
+            "the three processes have ended once the run exited":
                 alive([driver_id, child_id, stubborn_id]) == [False, False, False],
             "the sleeper the stubborn process started while asked to stop was ended too":
                 bool(late_id[1]) and alive([late_id]) == [False],
@@ -21213,7 +21214,7 @@ def _check_batches_cleanup_owner(s):
                 placed == {kind: kind != "standalone" for kind in expected_kinds},
             "the run took the signal through its cleanup and exited 143":
                 own_run.returncode == 143,
-            "each kind has ended after": not any(after.values()),
+            "each kind has ended once the run exited": not any(after.values()),
             "the run adopted again once the stand-alone process was made":
                 adopting_again == "True",
             "and again after a raise inside the block that stops it adopting":
@@ -21396,12 +21397,12 @@ def live_checks(batch=None, child=None, diagnostics=None):
               diagnostics)
     return out, register
 
-# What one TAB does, pinned by structure rather than by a clock because a timing
-# assertion on someone else's machine is a coin toss. zsh reruns completion once
-# per matcher-list specification until one produces matches, and oh-my-zsh sets
-# three. Those runs did not keep anything between them, so a word without a
-# completion match read the corpus three times. The first check keeps one
-# emitter call per topic.
+# What one TAB does, checked by what it calls and answers rather than by a
+# clock, because a timing assertion on someone else's machine is a coin toss.
+# zsh reruns completion once per matcher-list specification until one produces
+# matches, and oh-my-zsh sets three. Those runs did not keep anything between
+# them, so a word without a completion match read the corpus three times. The
+# first check keeps one emitter call per topic.
 #
 # The second check keeps the answer complete. LISTMAX is set to zero in this
 # isolated terminal so zsh renders the entire synthetic corpus without asking
@@ -22310,11 +22311,12 @@ def _check_suite_function_classification(s):
 
 
 @unit(
-    ('engine-primitives-once', 'engine primitives defined exactly once'),
+    ('resolver-evidence-readers-defined-once',
+     'nine resolver evidence readers are each defined once, not counting forwarders to RESOLVER'),
     ('function-index-keys-resolve-once',
      'every literal embedded function-index key names exactly one current definition'),
 )
-def _check_engine_primitives_once(s):
+def _check_resolver_evidence_readers_defined_once(s):
     checked = []
 
     def check(cid, name, ok, detail=""):
@@ -22322,7 +22324,10 @@ def _check_engine_primitives_once(s):
 
     dupes = s.dupes
 
-    check("engine-primitives-once", "engine primitives defined exactly once", not dupes, ", ".join(dupes))
+    check("resolver-evidence-readers-defined-once",
+          "nine resolver evidence readers are each defined once, not counting "
+          "forwarders to RESOLVER",
+          not dupes, ", ".join(dupes))
     faults = s.indexed_function_faults
     check("function-index-keys-resolve-once",
           "every literal embedded function-index key names exactly one current definition",
@@ -26302,9 +26307,9 @@ def _check_claim_precedes_spawn_and_is_given_back(s):
         "it does not hold a pane yet at that moment":
             at_spawn is not None and not at_spawn.get("tmuxPaneId"),
         # A server that will not open a pane ends the run in a refusal, not a
-        # reported launch and not a silent success. Pinned to the exact
-        # outcome, so a change from refusing to quietly carrying on is a
-        # failure here rather than something this check shrugs at.
+        # reported launch and not a silent success. The check compares the
+        # exact outcome, so a change from refusing to quietly carrying on fails
+        # here instead of passing.
         "a spawn that cannot open a pane comes back refused":
             failed == "refused",
         "the claim is given back when it does": after_failure is None,
@@ -26853,7 +26858,8 @@ def _check_member_redirect_through_cli(s):
         # Deliberately not "the source roster loses it". The redirect leaves the
         # old entry in place and one claim policy decides which roster owns an
         # agent, which roster-claim-one-policy is the check for. Asserting
-        # removal here would pin a behaviour the design does not promise.
+        # removal here would make the check depend on a behaviour the design
+        # does not promise.
         "the transcript comes back as the destination team": after.get("stamp") == dest,
         "it says so in a receipt naming both teams":
             len(receipts) == 1
@@ -27038,8 +27044,9 @@ def _check_mail_ledger_joins_a_send_to_its_delivery(s):
 
         eng = Resolver(needs=Needs(maybe=set(NEED)))
         eng._projects_dir, eng._teams_dir = base / "projects", teams
-        # Pinned, because the summary column is whatever the terminal leaves
-        # and a suite run in another terminal would measure a different table.
+        # COLUMNS is set to 100, because the summary column is whatever the
+        # terminal leaves and a suite run in another terminal would measure a
+        # different table.
         os.environ["COLUMNS"] = "100"
         told = ""
         try:
@@ -28830,7 +28837,7 @@ def _check_session_row_is_a_uuid_not_a_path(s):
     return checked
 
 
-@unit(('lead-rebind-crew-report', 'a lead move names the crew it leaves behind'), ('lead-rebind-guards', "a live-membered team still blocks a lead's reap"), ('lead-rebind-kill-gate', 'a lead move ends the holder only after it is agreed to'), ('lead-address-spelling-leaves-the-lead-in-place', 'a team named inside an agent id addresses a lead without moving it'), ('lead-routing-one-operation', 'lead routing uses one complete operation instead of generic rebind helpers'), ('lead-move-crew-remedies-match-the-planner', "a lead move's crew report offers moving the crew only as the planner would make that move, with the flags it needs, and names --keep-team"))
+@unit(('lead-rebind-crew-report', 'a lead move names the crew it leaves behind'), ('lead-rebind-guards', "a live-membered team still blocks a lead's reap"), ('lead-rebind-ends-the-holder-only-when-agreed', 'a lead move ends the holder only after it is agreed to'), ('lead-address-spelling-leaves-the-lead-in-place', 'a team named inside an agent id addresses a lead without moving it'), ('lead-routing-one-operation', 'lead routing uses one complete operation instead of generic rebind helpers'), ('lead-move-crew-remedies-match-the-planner', "a lead move's crew report offers moving the crew only as the planner would make that move, with the flags it needs, and names --keep-team"))
 def _check_lead_rebind_crew_report(s):
     checked = []
 
@@ -28970,8 +28977,10 @@ def _check_lead_rebind_crew_report(s):
         check("lead-rebind-guards", "a live-membered team still blocks a lead's reap",
               not held, ", ".join(held[:3]))
 
-        # The kill gate: a live holder of the lead's own conversation, and the
-        # three answers it can get. Each of them leaves the holder running.
+        # Ending the holder needs agreement. A live process holds the lead's
+        # own conversation, and the move runs three ways that do not agree to
+        # ending it: answered no, as a dry run, and with stdin that is not a
+        # terminal. Each of them leaves the holder running.
         holder = [(GHOST, 1, (FAKE_AGENT_BIN, "--resume", LEAD_STAMPED))]
 
         def moved_onto_holder(**over):
@@ -28980,7 +28989,7 @@ def _check_lead_rebind_crew_report(s):
                 to_team="session-corpus-crew", table=holder, **over)
             return " ".join(out.split())
 
-        gate = []
+        agreement_faults = []
         sys.stdin = types.SimpleNamespace(isatty=lambda: True)
         globals()["input"] = lambda prompt="": "n"
         answered_no = moved_onto_holder()
@@ -28990,15 +28999,16 @@ def _check_lead_rebind_crew_report(s):
         globals().pop("input", None)
         unasked = moved_onto_holder()
         if f"would kill pid {GHOST}" not in previewed:
-            gate.append("a dry run does not say what it would kill")
+            agreement_faults.append("a dry run does not say what it would kill")
         if "dry run does not end a process" not in previewed:
-            gate.append("a dry run does not say the rest is measured with it alive")
+            agreement_faults.append("a dry run does not say the rest is measured with it alive")
         if f"killing pid {GHOST}" in answered_no or "left alone" not in answered_no:
-            gate.append("no did not stop it")
+            agreement_faults.append("no did not stop it")
         if f"killing pid {GHOST}" in unasked or "pass --yes" not in unasked:
-            gate.append("when stdin was not a terminal to ask at, it killed anyway")
-        check("lead-rebind-kill-gate", "a lead move ends the holder only after it is agreed to",
-              not gate, ", ".join(gate[:3]))
+            agreement_faults.append("when stdin was not a terminal to ask at, it killed anyway")
+        check("lead-rebind-ends-the-holder-only-when-agreed",
+              "a lead move ends the holder only after it is agreed to",
+              not agreement_faults, ", ".join(agreement_faults[:3]))
 
         # The other spelling. A team named inside an agent id says which agent
         # this is, not where to put it, so the run refuses the contradiction,
@@ -29022,10 +29032,11 @@ def _check_lead_rebind_crew_report(s):
             "team-lead@session-corpus-crew", resume=LEAD_STAMPED, prepare=dated_crew)
         told = " ".join(addressed_said.split())
         # The same launch with something holding the conversation, because the
-        # kill gate is the first thing a move reaches and this is the only run
-        # where a kill would have anything to end. The pid it names is read off
-        # the table after the point a move would have killed it, so the guard
-        # saying it is live is this fixture's witness that the row survived.
+        # question before a kill is the first thing a move reaches and this is
+        # the only run where a kill would have anything to end. The pid it
+        # names is read off the table after the point a move would have killed
+        # it, so the guard saying it is live is this fixture's witness that the
+        # row survived.
         _held, _e, _s, held_said = resume_run(
             "team-lead@session-corpus-crew", resume=LEAD_STAMPED, table=holder,
             dry_run=True, yes=True, prepare=dated_crew)
@@ -29135,20 +29146,21 @@ def _check_member_rebind_preview_launches(s):
             if retired.exists():
                 previews.append(f"a blocked {tense} retired the team anyway")
 
-        # A move that did not happen, and the gate that catches it. The member
-        # path stops the run on a blocker rather than carrying on, so the only
-        # way to reach the gate with the move untaken is to hand the run a
-        # rebind that declines: the launch must then meet the refusal, which is
-        # also what makes this check fail if the gate's body ever goes.
+        # A move that did not happen, and enforce_restore, which catches it.
+        # The member path stops the run on a blocker rather than carrying on,
+        # so the only way to reach enforce_restore with the move untaken is to
+        # hand the run a rebind that declines: the launch must then meet the
+        # refusal, which is also what makes this check fail if
+        # enforce_restore's body ever goes.
         globals()["rebind_reap"] = lambda *a, **k: False
         try:
-            ungated, _e, _s, ungated_said = member_move(dry_run=True)
+            unmoved, _e, _s, unmoved_said = member_move(dry_run=True)
         finally:
             globals()["rebind_reap"] = real_reap
-        if ungated != "refused":
-            previews.append(f"a launch that never moved was not refused ({ungated})")
+        if unmoved != "refused":
+            previews.append(f"a launch that never moved was not refused ({unmoved})")
         if ("restores as willow@session-corpus-alpha, not willow@session-corpus-crew"
-                not in " ".join(without_wrap_arrows(ungated_said).split())):
+                not in " ".join(without_wrap_arrows(unmoved_said).split())):
             previews.append("a launch that never moved lost the refusal")
 
         # And the real run, unchanged: it retires the team and reaches its
@@ -32225,8 +32237,9 @@ def _check_verb_table_matches_dispatch(s):
                             for n in ast.walk(node.test))]
     dispatched = {n.attr for node in dispatch for n in ast.walk(node.test)
                   if isinstance(n, ast.Attribute) and getattr(n.value, "id", None) == "args"}
-    # The help gate's test names the selectors beside --help, and a selector
-    # says which agents a run is about rather than what the run does.
+    # The branch that prints help for a run without a selector tests the
+    # selectors, and a selector says which agents a run is about rather than
+    # what the run does.
     dispatched -= {"agent_id", "resume", "team"}
     by_first = {opts[0]: tuple(opts) for opts, _on in declared}
     asked = [node.lineno for node in ast.walk(funcs["main"])
@@ -32380,7 +32393,7 @@ def _check_sides_sweep_folds(s):
         "newest few shown, rest counted": "side2" in sweep_text
             and "side3" not in sweep_text
             and "...and 2 more  (--sides aaaa1111 lists them)" in sweep_text,
-        "counts ride the header": "(5 fork-reference)" in sweep_text
+        "the header carries the counts": "(5 fork-reference)" in sweep_text
             and "(1 regular)" in sweep_text,
         "a named parent lists in full": all(f"side{n}" in listed_text
                                            for n in range(5))
@@ -35762,10 +35775,10 @@ def _check_swarm_offer_fallback(s):
         globals()["maybe_attach"] = lambda decision: asked.append(decision["socket"])
         offers = {}
         for label, status in (("a lead already up", "noop"), ("a lead handed over", "manual")):
-            # A launched member rides along in both runs, so the attach path is
-            # reachable either way and only the lead's outcome decides. Without
-            # it the manual case would pass because a lone manual run never
-            # reaches the offer at all, which would not test the offer.
+            # Each of the two runs also launches a member, so the attach path
+            # is reachable either way and only the lead's outcome decides.
+            # Without it the manual case would pass because a lone manual run
+            # never reaches the offer at all, which would not test the offer.
             def stub(*a, _s=status, _seen=[], **k):
                 _seen.append(1)
                 return (Outcome(_s, "sock", True, None) if len(_seen) == 1
@@ -36970,7 +36983,8 @@ def _check_conversion_proves_inverse(s):
                     faults.append("promote left the consumed demote receipt behind")
         # The promoted file carries its own undo. Demoted without a record of
         # its origin stored anywhere else, it still knows where it came from,
-        # which is the whole point of the record riding the bytes it describes.
+        # which is the whole point of storing the record in the bytes it
+        # describes.
         carried = Path(td) / "proj" / "cv-root.jsonl"
         carried.write_text("\n".join(plan["lines"]) + "\n")
         alone = convert(carried, "demote")
@@ -38080,7 +38094,8 @@ def _check_demote_cannot_embed_self(s):
 
         # A teammate that really does demote, so the cases that the refusals do
         # not stop show the demote going through rather than meeting some later
-        # refusal that would make a broken gate look the same as a working one.
+        # refusal, which would make either refusal under test look the same
+        # whether it works or not.
         (proj / "MATEHELD.jsonl").write_text(
             fixture_line({"parentUuid": None, "sessionId": "MATEHELD", "agentName": "heldy",
                      "teamName": "TEAMH", "type": "user", "uuid": "mh-root"}) + "\n" +
@@ -38113,7 +38128,7 @@ def _check_demote_cannot_embed_self(s):
             refusals do not stop names its destination on stdout. A demote that
             stopped refusing returns rather than exiting, so the cases read
             what it said instead of the suite ending on it. dry_run throughout:
-            the cases that get past both gates plan and print, and the code
+            the cases that get past both refusals plan and print, and the code
             here does not write a file.
             """
             real_table = RESOLVER._process_table
@@ -38809,9 +38824,9 @@ def _check_ledger_detail_once_per_addressee(s):
         eng6 = Resolver(needs=Needs(maybe=set(NEED)))
         eng6._projects_dir, eng6._teams_dir = Path(td), Path(td) / "teams"
         fx_rows = eng6._mail_ledger(fx_team)
-        # The design width, pinned: the summary column is what the terminal
-        # leaves, so a suite run in some other terminal would measure a
-        # different table. Restored the way the launch report's check does.
+        # The design width, set to 100 columns: the summary column is what the
+        # terminal leaves, so a suite run in some other terminal would measure
+        # a different table. Restored the way the launch report's check does.
         real_resolver, real_columns = globals()["RESOLVER"], os.environ.get("COLUMNS")
         globals()["RESOLVER"], os.environ["COLUMNS"] = eng6, "100"
         try:
@@ -39404,16 +39419,16 @@ def _check_rebind_retires_if_unnoticed(s):
         me = os.getpid()
         alive_table = [(me, 0,
                         ("claude", "--resume", "MATE-A", "--agent-id", "mate@TEAMA"))]
-        gates = []
+        faults = []
         said = [r["said"] for r in eng6._reap_objections("TEAMA", alive_table)]
         if not any(f"pid {me} runs as it (mate@TEAMA)" in o for o in said):
-            gates.append("a live process launched with an agent id in the team did not "
-                         "object")
+            faults.append("a live process launched with an agent id in the team did not "
+                          "object")
         said = [r["said"] for r in eng6._reap_objections("TEAMA", [])]
         if not any("unread for mate" in o for o in said):
-            gates.append("unread mail did not object")
+            faults.append("unread mail did not object")
         if eng6._reap_objections("TEAMA", [], archive_mail=True):
-            gates.append("archiving did not clear the mail objection")
+            faults.append("archiving did not clear the mail objection")
         real_resolver, real_receipts = RESOLVER, RECEIPTS_DIR
         globals()["RESOLVER"] = eng6
         globals()["RECEIPTS_DIR"] = Path(td) / "receipts"
@@ -39424,11 +39439,11 @@ def _check_rebind_retires_if_unnoticed(s):
                 reap_team(plan)
             stored = fixture_reap_receipt("TEAMA")
             if not stored or stored.get("config") != '{"name": "TEAMA", "members": []}':
-                gates.append("the roster did not ride the receipt verbatim")
+                faults.append("the receipt did not carry the roster verbatim")
             if (stored or {}).get("mail", {}).get("mate.json") is None:
-                gates.append("the mail bytes did not ride the receipt")
+                faults.append("the receipt did not carry the mail bytes")
             if eng6._roster_path("TEAMA").exists():
-                gates.append("the roster survived the reap")
+                faults.append("the roster survived the reap")
         finally:
             globals()["RESOLVER"] = real_resolver
             globals()["RECEIPTS_DIR"] = real_receipts
@@ -39446,11 +39461,11 @@ def _check_rebind_retires_if_unnoticed(s):
             and migration_lines and call.lineno > migration_lines[0])
         if (len(migration_lines) != 2 or len(enforce_lines) != 2
                 or not all(move < act for move, act in zip(migration_lines, enforce_lines))):
-            gates.append("the member migration does not precede each action boundary")
+            faults.append("the member migration does not precede each action boundary")
         check("rebind-retires-if-unnoticed",
               "a rebind retires the stamped team only when the retirement would not be "
               "noticed by any process",
-              not gates, ", ".join(gates))
+              not faults, ", ".join(faults))
     return checked
 
 
@@ -39673,7 +39688,7 @@ def _check_reap_keeps_what_it_did_not_make(s):
         if (tdir / "config.json").exists():
             swept.append("the roster outlived the reap, so the reap did not retire the team")
         if not archived or archived.get("config") != roster:
-            swept.append("the roster did not ride the receipt")
+            swept.append("the receipt did not carry the roster")
         if (tdir / "inboxes").exists() or (tdir / "config.json.lock").exists():
             swept.append("scaffolding this tool wrote was left behind")
         if list(teams.glob("TEAMSTRAY" + STAGING + "*")):
@@ -40461,7 +40476,7 @@ def _check_address_locates_evidence_places(s):
     with capturing("err"):
         placed["as addressed with a stale team"] = eng._place(res, stale)[0] == serving
         placed["addressed with the live team"] = eng._place(res, serving)[0] == serving
-        placed["--keep-team pins what was typed"] = (
+        placed["--keep-team keeps the team that was typed"] = (
             eng._place(res, stale, keep_team=True)[0] == stale)
         placed["a spoken destination wins"] = (
             eng._place(res, stale, for_team="session-elsewhere")[0] == "session-elsewhere")
@@ -41355,7 +41370,7 @@ def _check_doctor_agent_dossiers(s):
         eng._agent_runtime = was_agent_runtime
 
     # Building the canonical answer reads each member once. Counted per member,
-    # so the count does not pin the corpus size or the call site.
+    # so the count does not depend on the corpus size or the call site.
     fresh = corpus_engine()
     fresh._session_registry = lambda: []
     fresh._process_table = lambda refresh=False: []
@@ -42164,8 +42179,9 @@ def _check_rung_stamps(s):
     return checked
 
 
-@unit(('identity-gate-refuses-mismatch', 'identity gate refuses a mismatch'))
-def _check_identity_gate_refuses_mismatch(s):
+@unit(('name-mismatch-refused-without-force',
+       "a name that differs from the transcript's agentName stamp is refused without --force"))
+def _check_name_mismatch_refused_without_force(s):
     checked = []
 
     def check(cid, name, ok, detail=""):
@@ -42181,9 +42197,15 @@ def _check_identity_gate_refuses_mismatch(s):
             objections = eng._objections(res, "definitely-not-" + name, team)
             enforce_identity(fixture_target(res.path.stem, res.path, objections=objections),
                              objections, allow_team_change=False, force=False)
-        check("identity-gate-refuses-mismatch", "identity gate refuses a mismatch", False, "it allowed one")
+        check("name-mismatch-refused-without-force",
+              "a name that differs from the transcript's agentName stamp is "
+              "refused without --force",
+              False, "it allowed one")
     except Refusal:
-        check("identity-gate-refuses-mismatch", "identity gate refuses a mismatch", True)
+        check("name-mismatch-refused-without-force",
+              "a name that differs from the transcript's agentName stamp is "
+              "refused without --force",
+              True)
     return checked
 
 
@@ -47663,7 +47685,8 @@ def verb_needs(args, selector):
         return Needs(maybe=set(NEED))
     if args.doctor:
         # A direct target prints member dossiers and therefore joins mail for
-        # each one. The empty-hand sweep reads mailbox counts without that join.
+        # each one. The sweep for a run without a selector reads mailbox counts
+        # without that join.
         hard = {NEED.PROCS, NEED.REGISTRY, NEED.SEATS,
                 NEED.STAMPS, NEED.SPAWNS, NEED.CONVERSION_CENSUS}
         maybe = {NEED.TITLES}
@@ -47698,7 +47721,7 @@ def verb_needs(args, selector):
     if args.install or args.poison or args.unpoison:
         return Needs()
     if not (selector or args.agent_id or args.resume or args.team):
-        return Needs()  # the help gate answers this run
+        return Needs()  # main prints help for a run without a selector
     if args.stop:
         # the stamps only when a bare selector has to be found through them,
         # payloads only when a target has to be found by parentage; pointed at
@@ -47859,12 +47882,12 @@ def build_parser():
                               help="convert a side transcript into a resumable teammate "
                                    "(moves it; its in-file receipt holds the way back)"),
            row='convert a subagent side transcript into a resumable teammate', completes='sides')
-    # dest pinned here and on --into-session and --into-team: the option string
-    # is what a person types, the attribute is what the rest of the file reads,
-    # and renaming one must not rename the other. as_ started out as a way
-    # around "as" being a Python keyword; --as-agent would derive a usable
-    # as_agent, so the explicit dest is now only here to keep args.as_ the same
-    # while the option string changes.
+    # dest set explicitly here and on --into-session and --into-team: the
+    # option string is what a person types, the attribute is what the rest of
+    # the file reads, and renaming one must not rename the other. as_ started
+    # out as a way around "as" being a Python keyword; --as-agent would derive
+    # a usable as_agent, so the explicit dest is now only here to keep args.as_
+    # the same while the option string changes.
     offers(verbs.add_argument("--as-agent", dest="as_", metavar="NAME@TEAM",
                               help="override the name and/or deduced parent team a promoted "
                                    "teammate joins as"),
@@ -48054,9 +48077,10 @@ def main():
         die("--live extends --selftest; it does not do anything on its own")
 
     if args.doctor:
-        # Before empty-hand help handling because a sweep does not need a
-        # selector. A named run uses the main selector interpreter before the
-        # doctor reads the resolved agent, session, or team fields.
+        # Before the branch that prints help for a run without a selector,
+        # because a sweep does not need a selector. A named run uses the main
+        # selector interpreter before the doctor reads the resolved agent,
+        # session, or team fields.
         apply_resume_title(args)
         if selector:
             apply_selector(selector, args)
@@ -48067,10 +48091,10 @@ def main():
         return run_census()
 
     if args.sides:
-        # Like the doctor: before the help gate because a bare sweep does not
-        # need a selector, and resolving its own target because args.team is
-        # not set yet; a named session must not be silently swept into the
-        # machine.
+        # Like the doctor: before the branch that prints help for a run without
+        # a selector, because a bare sweep does not need a selector, and
+        # resolving its own target because args.team is not set yet; a named
+        # session must not be silently swept into the machine.
         return run_sides(selector)
 
     if args.promote:
@@ -48079,7 +48103,8 @@ def main():
         return run_demote(args)
 
     if args.mail_ledger:
-        # Before the help gate, resolving its own target: the --sides pattern.
+        # Before the branch that prints help for a run without a selector,
+        # resolving its own target: the --sides pattern.
         return run_mail_ledger(selector)
 
     if args.cleanup:

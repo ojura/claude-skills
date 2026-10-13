@@ -97,7 +97,7 @@ operative team, polling, common delivery failure, and common remedies print once
 in the team report. Dossiers retain the member's conversation, parent, seat,
 recipient-specific ledger evidence, and member-specific actions. `--no-color`
 does not change the spacing. The team verdict remains the command's exit status.
-The empty-hand sweep stays at team-summary level.
+Without a selector, the sweep stays at team-summary level.
 
 The selector may sit anywhere among the flags. The forwarded flags are an
 allowlist that records which of them take a value, so a bare token is either
@@ -146,23 +146,22 @@ exact inverse, promotion offers that inverse as `Y/n`; declining uses the curren
 parent's team. Explicit `--as-agent` suppresses the offer. Completion inserts
 `name@`, then lists teams with the current parent's team first.
 
-Promotion also makes known `origin.kind: human` persistence records visible.
-The default keeps Claude Code's complete wrapper text. `--unwrap` instead stores
+Promotion also makes known `origin.kind: human` persistence records visible. The
+default keeps Claude Code's complete wrapper text. `--unwrap` instead stores
 only the inner human text in the promoted record. Both variants record the edit
 in the transcript's schema-version-1 conversion receipt, so demotion restores
 the original side transcript bytes. `visible_human_wrapper_edits` stores UUID
-intervals; unwrapped intervals reference the original wrapper payloads needed for
-the inverse, while complete-wrapper intervals do not copy payload text. When
+intervals; unwrapped intervals reference the original wrapper payloads needed
+for the inverse, while complete-wrapper intervals do not copy payload text. When
 promotion applies the exact inverse recorded by a carried demote receipt and
-`--unwrap` is omitted, it preserves that receipt's recorded mode; an exact inverse
-replays only the recorded intervals. `side_meta_b64` and `side_meta_mode` store the
-original `.meta.json` bytes and file mode when promotion removes that sidecar, so
-demotion
-restores them exactly. Missing receipt fields and unsupported schema versions are
-refused rather than inferred. Unknown wrappers and coordinator, peer,
-task-notification, hook, image, and tool-result records remain unchanged. The
-generated `last-prompt` uses the latest human message's inner text in either
-variant.
+`--unwrap` is omitted, it preserves that receipt's recorded mode; an exact
+inverse replays only the recorded intervals. `side_meta_b64` and
+`side_meta_mode` store the original `.meta.json` bytes and file mode when
+promotion removes that `.meta.json` file, so demotion restores them exactly.
+Missing receipt fields and unsupported schema versions are refused rather than
+inferred. Unknown wrappers and coordinator, peer, task-notification, hook,
+image, and tool-result records remain unchanged. The generated `last-prompt`
+uses the latest human message's inner text in either variant.
 
 A member promotion stamps its own root with the assigned name and team so plain
 Claude Code resume restores member identity. The receipt records the root's prior

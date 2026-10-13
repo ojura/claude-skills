@@ -47,10 +47,10 @@ use separate labeled rows, followed by parent and live seat. Lead identity,
 operative team, polling, common delivery failure, and common remedies print once
 in the team report. Recipient-specific ledger evidence and member-specific
 remedies stay in the matching dossier. A named diagnosis resolves the deeper
-parent, delivery, and ledger evidence; the empty-hand sweep omits that work.
-Direct diagnosis uses the ordinary selector and immutable target, but does not
-infer a launch destination. The team verdict still measures whether a live lead
-reads the team, and remains the command's exit status.
+parent, delivery, and ledger evidence; the sweep without a selector omits that
+work. Direct diagnosis uses the ordinary selector and immutable target, but does
+not infer a launch destination. The team verdict still measures whether a live
+lead reads the team, and remains the command's exit status.
 
 The unnamed Agent tool runs its query loop inside the leader and writes a
 sidechain transcript. Its work therefore resumes through an internal query
@@ -603,7 +603,7 @@ root-stamp conversion fixture checks four cases through operation answers.
 and the descriptor's permission bits masked to `0o777`. `_file_observation`
 reads bytes and mode from the same open descriptor and compares its device,
 inode, size, and nanosecond modification time with the named path. A mode of `0`
-is retained; `None` means the reader did not have a physical mode to observe.
+is retained; `None` means a physical mode was not observed.
 `_file_generation` projects the generation for readers that still require a tuple.
 
 A physical generation is `(dev, ino, size, mtime_ns, raw_bytes)`. The reader also

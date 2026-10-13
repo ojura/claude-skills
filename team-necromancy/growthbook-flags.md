@@ -36,8 +36,8 @@ A flag read is `k("name", default)` in the 2.1.296 bundle, `tt` in 2.1.234 and
 the flag cannot be read. `cj("name")` is the async boolean form, default false.
 `Vue("name", default, validator)` reads a config object. To see what a flag
 does, find its read site and follow the value, never the name. The names are
-deliberately opaque (`tengu_thrifty_sonic`, `tengu_hover_rest`), so a guess from
-the name is worth nothing. Record only what a read site proves.
+deliberately opaque (`tengu_thrifty_sonic`, `tengu_hover_rest`), so the name
+does not tell what the flag does. Record only what a read site proves.
 
 ## Two ways to turn one on
 
@@ -45,17 +45,17 @@ Some flags also read a `CLAUDE_CODE_*` environment variable and honour it over
 the cache. Where one exists, the env var in the `env` block of
 `~/.claude/settings.json` is the better switch: it is visible in a short file
 rather than buried in the large `~/.claude.json`, it survives any future cache
-refresh, and it needs no hand edit of the cache. Prefer it. Fall back to a cache
-edit only for a flag that has no env override.
+refresh, and it does not need a hand edit of the cache. Prefer it. Fall back to
+a cache edit only for a flag without an env override.
 
 In 2.1.226 the env override reads as
 `nt("flag",default) || Boolean(te.CLAUDE_CODE_X)`, so setting the env var to `1`
 forces the feature on regardless of the cached value. In 2.1.296 two of them
 read the other way: when `CLAUDE_CODE_HARBOR_KITE` or
 `CLAUDE_CODE_LOOP_KEEPALIVE` is set, its value decides and the flag is not
-read, so `0` turns the feature off; when it is unset, the flag decides. Not
-every flag has an env override; most are cache-only. The pairs the binary
-actually reads, from 2.1.226 unless a row says otherwise:
+read, so `0` turns the feature off; when it is unset, the flag decides. Most
+flags do not have an env override and are read from the cache only. The pairs
+the binary actually reads, from 2.1.226 unless a row says otherwise:
 
 | env var (settings.json `env`) | flag it overrides |
 |---|---|
@@ -70,9 +70,9 @@ actually reads, from 2.1.226 unless a row says otherwise:
 | `CLAUDE_CODE_ARTIFACT_DIRECT_UPLOAD` | `tengu_cobalt_plinth_direct` |
 | `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK` | `tengu_disable_streaming_to_non_streaming_fallback` |
 | `CLAUDE_CODE_ENABLE_TODO_TOOLS` | `tengu_rosy_wren` (task tools; both new in 2.1.234) |
-| `CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT` | `tengu_splendid_horizon` (2.1.296, only the `enabled` field: a true value turns the auto-deny timer off; no variable sets the timer's length) |
+| `CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT` | `tengu_splendid_horizon` (2.1.296, only the `enabled` field: a true value turns the auto-deny timer off; an env variable cannot set the timer's length) |
 
-These are only the `flag-OR-env` overrides. Env vars that gate behaviour on
+These are only the `flag-OR-env` overrides. Env vars that control behaviour on
 their own without a matching flag (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`,
 `CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF`, `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`,
 `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`, `DISABLE_GROWTHBOOK`, and many more)
@@ -88,8 +88,8 @@ A cache edit has effect only in processes that read the disk cache, which with
 telemetry off means processes launched with
 `CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF` in their environment.
 
-Textual single-occurrence replace, never a full JSON rewrite, so nothing else
-in that file moves:
+Replace the one occurrence as text instead of rewriting the whole JSON, so the
+rest of that file stays unchanged:
 
 1. back up `~/.claude.json` to `/tmp` first, 0600
 2. confirm the exact `"flag": value` string occurs exactly once
@@ -104,10 +104,10 @@ which checks in this order:
 
 1. Overrides (source `override`). Public builds stub both override sources:
    `getEnvironmentOverrides()` returns `null` and `readConfigOverrides()`
-   returns nothing, so this step never applies. The client is given a
+   returns `undefined`, so this step never applies. The client is given a
    `readEnvironmentOverrides` dependency that returns
-   `CLAUDE_INTERNAL_FC_OVERRIDES`, but nothing calls it, so that variable has
-   no effect.
+   `CLAUDE_INTERNAL_FC_OVERRIDES`, but it is never called, so that variable does
+   not have an effect.
 2. If GrowthBook is disabled and the disk cache is not readable while disabled,
    the default (source `disabled`).
 3. The value in a payload this process fetched (source `payload`).
@@ -120,7 +120,7 @@ GrowthBook is enabled (`mg()`) only when all of these hold:
 
 - `DISABLE_GROWTHBOOK` is not true;
 - the provider is `firstParty`, or `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` is true;
-- no host gateway credential is present;
+- a host gateway credential is not present;
 - the telemetry level is `default`: `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`
   and `DISABLE_TELEMETRY` are unset (any non-empty value counts, `0` included)
   and `DO_NOT_TRACK` is not true;
@@ -130,8 +130,8 @@ The disk cache is readable while GrowthBook is disabled (`nB()`) only when
 `CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF` is true, `DISABLE_GROWTHBOOK` is
 not true, the telemetry level is not `default`, and the provider is
 `firstParty`.
-`ANTHROPIC_BASE_URL` takes no part in either check, so a session routed through
-a proxy reads flags the same way as a direct one.
+`ANTHROPIC_BASE_URL` does not take part in either check, so a session routed
+through a proxy reads flags the same way as a direct one.
 
 ### Since 2.1.293 the disk-cache variable must be in the launch environment
 
@@ -157,18 +157,18 @@ were present or absent together.
 | 2.1.295 | absent | not run |
 | 2.1.296 | absent | present |
 
-Each run used a separate `CLAUDE_CONFIG_DIR` whose `.claude.json` cache held
-`tengu_amber_sentinel` and `tengu_kairos_push_notifications` as `true` and
-whose `settings.json` set `DISABLE_TELEMETRY=1` and
-`CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF=1`. The launch environment had
-neither variable, except in the last column, where it had both. Every run also
-had `ANTHROPIC_BASE_URL=http://127.0.0.1:9` (a closed port, so no request left
-the machine; the base URL takes no part in the checks above),
+Each run used a separate `CLAUDE_CONFIG_DIR`. Its `.claude.json` cache held
+`tengu_amber_sentinel` and `tengu_kairos_push_notifications` as `true`, and its
+`settings.json` set `DISABLE_TELEMETRY=1` and
+`CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF=1`. The launch environment did
+not have either variable, except in the last column, where it had both. Every
+run also had `ANTHROPIC_BASE_URL=http://127.0.0.1:9` (a closed port, so requests
+did not leave the machine; the base URL does not take part in the checks above),
 `--settings '{"disableAllHooks":true}'`, `--strict-mcp-config` and
 `--no-session-persistence`, and was killed after the `init` event. Print mode
-runs as entrypoint `sdk-cli`, which the `SendFeedback` and `EndConversation`
-gates exclude, so those two cannot be seen this way. `Monitor` and
-`PushNotification` have no entrypoint condition, so their presence shows
+runs as entrypoint `sdk-cli`, which `SendFeedback` and `EndConversation` exclude
+in their `isEnabled` checks, so those two cannot be seen this way. `Monitor` and
+`PushNotification` do not have an entrypoint condition, so their presence shows
 whether the process reads the disk cache.
 
 To keep disk reads, set `CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF=1` in the
@@ -206,8 +206,8 @@ The public build supports `HTTPS_PROXY`/`HTTP_PROXY` and `NODE_EXTRA_CA_CERTS`.
 A TLS-intercepting local proxy could answer the fixed GrowthBook origin with
 local data. This requires proxy routing and a certificate trusted by the client;
 it is not a direct localhost endpoint setting. Redirecting DNS or operating-system
-traffic would also need trusted TLS and can affect other applications. Neither
-approach changes the pre-fetch `mg()` check.
+traffic would also need trusted TLS and can affect other applications. The
+pre-fetch `mg()` check still applies under both approaches.
 
 GrowthBook fetching requires the application's telemetry level to be `default`.
 `DISABLE_TELEMETRY` must be unset or empty, rather than set to the nonempty strings
@@ -271,7 +271,7 @@ application was not run with feature fetching enabled.
 
 | flag | default | what it does |
 |---|---|---|
-| `tengu_harbor_kite` | false | Master gate for cross-session messaging. `YE()` returns `nt("tengu_harbor_kite",false) or CLAUDE_CODE_HARBOR_KITE`, and every messaging entry point checks `YE()`: the `ListAgents` and `SendMessage` tools' `isEnabled`, the uds/bridge send paths, and the socket startup at boot. This one flag turns the whole feature on; `CLAUDE_CODE_HARBOR_KITE=1` forces it on. In 2.1.296 the gate is `xi()`: `Qh().messagingBeyondOwnAgentsDisabled` turns messaging off first, then a set `CLAUDE_CODE_HARBOR_KITE` decides on its own, then on Windows `tengu_harbor_kite_win` (default true) must hold, and last `k("tengu_harbor_kite", true)` decides, so the default is true. |
+| `tengu_harbor_kite` | false | Controls cross-session messaging. `YE()` returns `nt("tengu_harbor_kite",false) or CLAUDE_CODE_HARBOR_KITE`, and every messaging entry point checks `YE()`: the `ListAgents` and `SendMessage` tools' `isEnabled`, the uds/bridge send paths, and the socket startup at boot. This one flag turns the whole feature on; `CLAUDE_CODE_HARBOR_KITE=1` forces it on. In 2.1.296 the check is `xi()`: `Qh().messagingBeyondOwnAgentsDisabled` turns messaging off first, then a set `CLAUDE_CODE_HARBOR_KITE` decides on its own, then on Windows `tengu_harbor_kite_win` (default true) must hold, and last `k("tengu_harbor_kite", true)` decides, so the default is true. |
 | `tengu_rosy_wren` | false | Turns on `TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`, which are otherwise absent on Opus 4.8+, Sonnet 5+, Fable 5+ and Mythos 5+. `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` forces it on. Details below. |
 | `tengu_fancy_wand` | false | Controls native `/restart` and its `/update` alias. In 2.1.296 it requires a fetched true value; the offline cache alone cannot enable the command. Teammates and background sessions are excluded. Details below. |
 | `tengu_fancy_wand_copy` | `{}` | Replaces the update notice's restart text when `offer` is a nonempty string. It does not enable `/restart`. |
@@ -287,7 +287,7 @@ application was not run with feature fetching enabled.
 ## Native restart: `tengu_fancy_wand` (2.1.296)
 
 The flag controls native `/restart` and its `/update` alias. Both names refer to
-the command whose `isEnabled` is `kjt()` and whose `isHidden` returns `!kjt()`.
+one command: its `isEnabled` is `kjt()` and its `isHidden` returns `!kjt()`.
 The command is disabled when the flag is missing or is not boolean `true`.
 
 The checks in `/tmp/claude-2.1.296.js:12302`, formatted for reading:
@@ -385,12 +385,12 @@ Each of these tools is absent whenever its flag reads the default.
 - `DISABLE_FEEDBACK_COMMAND` and `DISABLE_BUG_COMMAND` are not true, and
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is unset;
 - the policy `allow_product_feedback` allows it. The policy applies only to
-  credentials that `K5()` treats as policy-eligible. OAuth credentials whose
-  subscription type is set and is neither `team` nor `enterprise` are not
+  credentials that `K5()` treats as policy-eligible. OAuth credentials with a
+  subscription type set to a value other than `team` or `enterprise` are not
   eligible, so the policy never blocks them. An API key, or OAuth credentials
   without a subscription type, are eligible, and for them
-  `allow_product_feedback` is denied whenever no policy is loaded, neither
-  fetched in this session nor read from `~/.claude/policy-limits.json`
+  `allow_product_feedback` is denied whenever the session has not fetched a
+  policy and has not read one from `~/.claude/policy-limits.json`
   (`onCacheMiss: "deny"`; it is also denied under HIPAA and ZDR). With
   `CLAUDE_CODE_OAUTH_TOKEN`, the subscription type comes from
   `CLAUDE_CODE_SUBSCRIPTION_TYPE`;
@@ -413,11 +413,11 @@ one-line hint section, `endconv_deferred_hint`, added only while the session's
 tool list contains `EndConversation`.
 
 The flag is the only way to turn the tool off. Permission settings cannot,
-because `Lre()` is true for `EndConversation` and for no other tool, and every
-place that consults it exempts the tool:
+because `Lre()` is true only for `EndConversation`, and every place that
+consults it exempts the tool:
 
-- the deny and allow rule lookups (`Go()`, `y4e()`, `lc()`) return no rule for
-  it, so a `permissions.deny` entry does not remove it. `--disallowedTools`
+- the deny and allow rule lookups (`Go()`, `y4e()`, `lc()`) do not return a rule
+  for it, so a `permissions.deny` entry does not remove it. `--disallowedTools`
   adds deny rules to the same lookups, so by the code it does not either
   (not tested);
 - the `--tools` launch list never withholds it (`dAt()`);
@@ -468,7 +468,7 @@ the tool results, and the model is called recursively with the combined history.
 Commands that arrive after the snapshot wait for a later opportunity or for the
 outer queue drain.
 
-A response with no `tool_use` never reaches this code. Claude Code runs Stop
+A response without a `tool_use` never reaches this code. Claude Code runs Stop
 hooks and completes the turn before checking the queue. A message typed while
 final prose is streaming, after the last tool-boundary snapshot, or while Stop
 hooks run cannot change that response; it becomes a new top-level user turn.
@@ -477,7 +477,8 @@ others appear one turn later.
 
 Removal happens after each attachment has already been yielded to the transcript:
 
-- If selected commands produce no `queued_command` attachment, they remain queued.
+- If selected commands do not produce a `queued_command` attachment, they remain
+  queued.
 - A partial emission logs an error but removes the whole selected batch.
 - If the outer abort signal is observed after the yield and before removal, the
   commands remain queued. The attachment may already be in the aborted
@@ -498,7 +499,7 @@ With `tengu_chair_sermon=false` (the default):
   is a string, and every new attachment block is text, the text is appended to
   the `tool_result.content` string, separated by blank lines.
 - Otherwise the attachment blocks remain separate blocks in the same user
-  message, or separate user messages if there is no preceding user carrier.
+  message, or separate user messages when a user carrier does not precede them.
 
 So false does **not** mean "never fold steering into a tool result". On this
 non-promoted path, plain-text steering next to an ordinary string-valued tool
@@ -518,11 +519,12 @@ The broader merge has deliberate exclusions and lossy cases:
 
 - A tool result containing a `tool_reference` block refuses the relocation.
 - For an error tool result, non-text attachment blocks are discarded before
-  merging; if no text remains, the original error result is retained.
+  merging; if the remaining blocks do not contain any text, the original error
+  result is retained.
 - Text blocks are trimmed and adjacent text is coalesced. Mixed media can
   therefore have different placement from the false path.
 
-### Why this flag often has no effect on current steering
+### Why this flag often does not affect current steering
 
 Before the chair-sermon branch, the normalizer checks whether the selected
 model supports Anthropic's mid-conversation system messages. If support is on
@@ -588,8 +590,8 @@ When mid-conversation-system promotion is unavailable, the fallback
 user/tool-result rules matter. With the flag false, all-text input following a
 string-valued tool result is already appended to `function_call_output`. With
 the flag true, the broader merge and final sweep place more mixed-content
-reminders there. Neither form produces a separate steering item once the text
-has entered the tool result.
+reminders there. The two forms do not produce a separate steering item once the
+text has entered the tool result.
 
 CLIProxyAPI's message-level-system helper always adds an outer reminder wrapper.
 Sonnet 5's special already-wrapped system content would therefore acquire nested
@@ -607,14 +609,14 @@ broader tool-output merge only on fallback and mixed-content paths.
 ## Task tools: `tengu_rosy_wren`
 
 Traced in 2.1.234. Both the flag and its env override are new in that build:
-neither string occurs in 2.1.232. The flag reader is `tt("name", default)` in
-2.1.234, the same function this file calls `nt` at 2.1.226 under a different
-minified name.
+the two strings do not occur in 2.1.232. The flag reader is
+`tt("name", default)` in 2.1.234, the same function this file calls `nt` at
+2.1.226 under a different minified name.
 
 The flag decides whether `TaskCreate`, `TaskGet`, `TaskList` and `TaskUpdate`
-exist at all on Opus 4.8+, Sonnet 5+, Fable 5+ and Mythos 5+. When the flag
-reads its `false` default, because neither a payload nor the disk cache supplies
-it, the four tools are missing on those models. The env override turns them on
+exist at all on Opus 4.8+, Sonnet 5+, Fable 5+ and Mythos 5+. When a payload
+and the disk cache both lack the flag, it reads its `false` default, and the
+four tools are missing on those models. The env override turns them on
 without the flag.
 
 The read site, deminified:
@@ -640,7 +642,7 @@ Voi = [TodoWrite, TaskCreate, TaskGet, TaskUpdate, TaskList];
 or above that family's entry in `xuv`. So the flag is only ever consulted on
 Opus 4.8+, Sonnet 5+, Fable 5+ and Mythos 5+. A family absent from `xuv`, such
 as Haiku, makes `LLr` false, `aJ` returns true two lines earlier, and the tools
-are present with nothing set.
+are present by default.
 
 Four things satisfy `aJ()`, only three of them local:
 
@@ -656,13 +658,13 @@ Four things satisfy `aJ()`, only three of them local:
 `CLAUDE_CODE_ENABLE_TODO_TOOLS` decides whether a checklist tool exists.
 `CLAUDE_CODE_ENABLE_TASKS` decides which one, and the two `isEnabled` bodies are
 complements on it: the task tools are `gW() && aJ()`, TodoWrite is
-`!gW() && aJ()`. You never get both, and `ENABLE_TASKS=false` on its own gives
-neither, because `aJ()` is still unsatisfied. Verified by diffing the `tools`
-array in the stream-json init event:
+`!gW() && aJ()`. You never get both, and `ENABLE_TASKS=false` on its own does
+not give either, because `aJ()` is still unsatisfied. Verified by diffing the
+`tools` array in the stream-json init event:
 
 | env | tools present |
 |---|---|
-| neither | none |
+| both unset | none |
 | `ENABLE_TODO_TOOLS=1` | TaskCreate, TaskGet, TaskList, TaskUpdate |
 | `ENABLE_TASKS=false` | none |
 | `ENABLE_TASKS=false` + `ENABLE_TODO_TOOLS=1` | TodoWrite |
@@ -670,8 +672,8 @@ array in the stream-json init event:
 
 `CLAUDE_CODE_ENABLE_TASKS` is an off-switch only. `Ve.triBool()` parses `true`,
 `false` and `undefined`, but `gW` tests `=== false` alone, so `true` and unset
-take the identical branch. No env var means "tasks on"; the on-switch is
-`ENABLE_TODO_TOOLS`, despite the name.
+take the identical branch. An unset `CLAUDE_CODE_ENABLE_TASKS` means "tasks on";
+the on-switch is `ENABLE_TODO_TOOLS`, despite the name.
 
 ### Why this matters to this tool
 
@@ -681,24 +683,24 @@ is a file at `~/.claude/tasks/<listId>/<taskId>.json` carrying `status`,
 hooks, and a hook exiting 2 deletes the just-written task and throws. The list
 id is `CLAUDE_CODE_TASK_LIST_ID`, else the team name, else the session id, so a
 team shares one list and `owner` is how work is assigned across it. TodoWrite
-has no ids, dependencies, owners or hooks, replaces the whole list on every
-call, and stores `[]` once every item is completed.
+does not have ids, dependencies, owners or hooks, replaces the whole list on
+each call, and stores `[]` once every item is completed.
 
 ## Dangerous-rm prompt timer: `tengu_splendid_horizon`
 
 Traced in 2.1.296 and checked live.
 
-The Bash permission check flags an `rm` or `rmdir` whose target can remove far
-more than intended: a shell variable that leaves `/`, `/*` or a top-level path
-when it is empty, the output of a command substitution, a relative glob after
-`cd`, or a system, home or workspace directory. The decision reason it returns
-has `circuitBreaker: "dangerousRemoval"`, and that entry in the table of
+The Bash permission check flags an `rm` or `rmdir` with a target that can remove
+far more than intended: a shell variable that leaves `/`, `/*` or a top-level
+path when it is empty, the output of a command substitution, a relative glob
+after `cd`, or a system, home or workspace directory. The decision reason it
+returns has `circuitBreaker: "dangerousRemoval"`, and that entry in the table of
 circuit breakers has `bypassImmune: true`. So the call asks for permission even
-in bypass mode, and no allow rule can approve it.
+in bypass mode, and an allow rule cannot approve it.
 
 In bypass mode and in auto mode, the prompt gets an auto-deny timer, configured
-by this flag, but only when `Mpn()` holds: the context can request a dialog, no
-SDK dialog host is active, prompts are not suppressed
+by this flag, but only when `Mpn()` holds: the context can request a dialog, an
+SDK dialog host is not active, prompts are not suppressed
 (`shouldAvoidPermissionPrompts`), and `TZt()` is false; `TZt()` is true for a
 teammate and for a background (async) agent. `q9()` reads it
 with `Fn("tengu_splendid_horizon", {})`, which returns the value together with
@@ -709,7 +711,7 @@ its source, and checks each field separately:
 | `enabled` | true | a fetched payload only; a cache value is ignored. A true `CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT` makes it false | false removes the timer, so the prompt waits for an answer |
 | `showDialog` | true | any source | false denies the call at once, without a prompt |
 | `timeoutMs` | 120000 | any source; a value outside 5000 to 3600000 is replaced by the default | how long the prompt stays open before the call is denied |
-| `maxDialogTimeouts` | 3 | any source; an integer from 0 to 100 | after this many prompts in one process have timed out, later flagged removals are denied without a prompt; 0 means no limit |
+| `maxDialogTimeouts` | 3 | any source; an integer from 0 to 100 | after this many prompts in one process have timed out, later flagged removals are denied without a prompt; 0 means unlimited |
 
 The other three fields apply only while `enabled` is true. The count for
 `maxDialogTimeouts` goes back to zero whenever someone answers one of these
@@ -726,12 +728,13 @@ ends with the check's own text, which usually suggests a rewrite such as
 Any keyboard or mouse input except wheel scrolling cancels the timer, and so
 does opening the transcript view while the prompt is open: both emit
 `autoDenyPresence`. The prompt then stays open until someone answers it. The
-timer therefore only denies when nobody touches the terminal.
+timer therefore denies the request only if the terminal stays untouched for the
+whole countdown.
 
 Without the timer, what happens depends on the caller. Headless `claude -p`
 denies the call at once, and the tool result is the check's own text with its
 rewrite hint, without the preamble above. A background subagent of an
-interactive session gets no denial at all: in bypass mode, `_pn()` passes the
+interactive session is not denied at all: in bypass mode, `_pn()` passes the
 ask on unchanged when `shouldAvoidPermissionPrompts` is false, as it is for
 such an agent. The parent session shows the prompt, marked with the agent's
 type ("from the general-purpose agent"), without a countdown, and the prompt
@@ -755,9 +758,9 @@ started made the Bash call:
 |---|---|---|---|
 | interactive | `{"timeoutMs": 15000}` | none | denied 15.1 s after the Bash call |
 | interactive | none | none | denied 120.1 s after the Bash call |
-| interactive | `{"timeoutMs": 15000}` | one Down arrow, 2.5 s after the Bash call | none after 142 s; the countdown line disappeared at the keypress and the prompt stayed open |
-| `claude -p` | none | no prompt was shown | denied 0.03 s after the Bash call, with the check's text alone |
-| background subagent of an interactive session | none | none | none after 167 s; the prompt in the parent had no countdown |
+| interactive | `{"timeoutMs": 15000}` | one Down arrow, 2.5 s after the Bash call | still pending after 142 s; the countdown line disappeared at the keypress and the prompt stayed open |
+| `claude -p` | none | the prompt was not shown | denied 0.03 s after the Bash call, with the check's text alone |
+| background subagent of an interactive session | none | none | still pending after 167 s; the prompt in the parent did not have a countdown |
 
 In the same setup, `rm -f "$CC_RM_UNSET"/name` ran without a prompt, so a test
 needs a target such as `$A/$B`. Auto mode was not tested.
@@ -785,10 +788,10 @@ The remaining `*_harbor` / `*_kite` flags (`tengu_slate_harbor_experiment`,
 `tengu_gypsum_kite`, `tengu_quill_harbor`, `tengu_harbor_willow`) have not been
 traced. Add a row when a read site is read, not before.
 
-## New gates in 2.1.226, not traced
+## New flags in 2.1.226, not traced
 
 These are the flags that appear as `nt(...)` reads in 2.1.226 and not in
-2.1.220, minus the cluster above. Each is a real gate with a default, but the
+2.1.220, minus the cluster above. Each is a real flag with a default, but the
 behaviour behind it has not been followed to a read site yet. Listed so the
 next pass has a worklist; do not annotate one until its value is followed.
 
@@ -804,4 +807,4 @@ next pass has a worklist; do not annotate one until its value is followed.
 `tengu_umber_lattice`, `tengu_violin_wood` (async bool).
 
 62 further new names in 2.1.226 are event names passed to the telemetry
-emitter, not flags read for a value. They are not gates and are not listed.
+emitter, not flags read for a value, so they are not listed.
