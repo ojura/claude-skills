@@ -240,7 +240,15 @@ route there. `@main` serves background subagents; pane teammates
 use the team mailbox.
 
 The automation launches tmux panes and warns when `teammateMode` selects another
-execution mode. Recipe 2 covers explicit bg recovery.
+execution mode. A member launches on its team's tmux server. When the terminal
+running the command is inside tmux and that launch would start a tmux server,
+add the swarm session to one, or stop, the tool first offers to run the member
+in this pane, the way `--here` does: `Y/n`, and a run without a terminal does
+not take it. When the member goes to a pane on another server than the one the
+terminal is in, the tool says so and names both. A typed `--socket` chose the
+server, so a run with it does not get the offer or the note, and `--here`, a
+team run and a run a Claude Code tool drives do not get the offer. Recipe 2
+covers explicit bg recovery.
 
 Lead recovery executes in the current terminal because the resumed lead is the
 interactive session the user drives. Under `--team`, `--dry-run`, or a non-tty,

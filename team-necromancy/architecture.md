@@ -983,8 +983,21 @@ supplied it, and an observed crew seat can select a destination without
 authorizing reuse of that occupied pane. `CrewPlacement` records all observed
 crew seats, their per-socket grouping, whether they are split, and the selected
 destination with its evidence. `TerminalContext` records the current terminal's
-seat, or a tmux socket without its pane ID; it is captured once for a launch or
-team run and is not read again while rendering or attaching.
+seat, or a tmux socket without its pane ID, and `tool_driving`, whether
+CLAUDECODE is set; it is captured once for a launch or team run and is not read
+again while rendering or attaching. When a member's launch would take
+`new-session` or `refuse` as its `launch_action`, or a socket was not found, and
+the terminal is inside tmux, `here_offer` words the offer of this pane and
+`confirm_here` asks it through `ask_default_yes` with `unattended=False`; a yes
+takes the `--here` route's last steps in `exec_in_this_terminal`, which lists
+the member without a pane. The offer is not made in a team run, while a Claude
+Code tool drives the run, or for a typed `--socket`, and the automatic path that
+runs a member in the pane it is already in comes first. When the launch goes on
+to a server other than the terminal's, `elsewhere_warning` names both servers.
+It does not advise `--socket`: the roster records a member's pane ID without its
+server, and pane IDs are numbered per server, so the next launch resolves a
+recorded pane on the team's server, where that ID names a different pane or is
+not in use.
 
 A `SocketLiveness` is what one connection attempt found at a tmux socket path:
 `alive`, `absent`, or `unknown` with a reason worded for the user. A path of

@@ -990,10 +990,16 @@ class RosterPaneReference:
 
 @dataclasses.dataclass(frozen=True)
 class TerminalContext:
-    """Parsed current-terminal evidence without a duplicate socket field."""
+    """Parsed current-terminal evidence without a duplicate socket field.
+
+    `tool_driving` says CLAUDECODE is set: a Claude Code tool runs this command
+    from its own shell, so a launch does not exec in that shell's pane and a
+    run does not attach from it.
+    """
 
     seat: object = None
     socket_without_pane: object = None
+    tool_driving: bool = False
 
     @property
     def inside_tmux(self):
@@ -7868,7 +7874,7 @@ class Resolver:
         })
 
     def attach_decision(self, socket, terminal=None, no_attach=False, attach=False,
-                        tool_driving=False, is_tty=False):
+                        is_tty=False):
         """Return one immutable decision about attaching to a launched swarm."""
         terminal = self._terminal_context() if terminal is None else terminal
         liveness = self._socket_alive(socket) if socket else None
@@ -7881,7 +7887,7 @@ class Resolver:
             reason = "no server"
         elif liveness.state == "unknown":
             reason = f"the state of its server is unknown: {liveness.reason}"
-        elif tool_driving:
+        elif terminal.tool_driving:
             reason = "a Claude Code tool is driving"
         elif not is_tty:
             reason = "not a terminal"
@@ -8391,7 +8397,8 @@ class Resolver:
         socket = Path(tmux_value.split(",")[0]).name if tmux_value else None
         seat = Seat(socket, pane) if socket and pane else None
         self._terminal = TerminalContext(
-            seat=seat, socket_without_pane=socket if socket and not pane else None)
+            seat=seat, socket_without_pane=socket if socket and not pane else None,
+            tool_driving=bool(os.environ.get("CLAUDECODE")))
         return self._terminal
 
     def _crew_placement(self, team, table):
@@ -12522,6 +12529,85 @@ def unplaced_note(records):
                    for record in records if record["placement"].state == "unknown")
 
 
+def elsewhere_warning(terminal, socket, socket_typed):
+    """Say so when the terminal is in one tmux server and the launch uses another.
+
+    A member launches on its team's server, and the terminal running this
+    command can be in another one, where the member's pane does not appear.
+    The note names both servers.
+
+    It checks whether the terminal is inside tmux at all rather than whether
+    it has a seat: with $TMUX set and $TMUX_PANE unset the terminal does not
+    have a seat, so the automatic path that runs in the pane you are already
+    in cannot run, and the launch goes to the other server all the same.
+
+    It does not advise --socket. The roster records a member's pane id without
+    its server, and pane ids are numbered per server, so the pane of a member
+    placed on a server other than its team's is looked up on the team's server
+    afterwards: the next launch resolves the recorded id there, where that id
+    names a different pane or is not in use.
+
+    Returns None outside tmux, on the server this launch uses, and for a
+    --socket the operator typed, which chose the server.
+    """
+    here = terminal.seat.socket if terminal.seat else terminal.socket_without_pane
+    if socket_typed or not here or here == socket:
+        return None
+    blind = ("" if terminal.seat else
+             "; $TMUX_PANE is unset, so which pane you are in is unknown")
+    return f"you are in tmux on {here}, and this launch uses {socket}{blind}"
+
+
+def here_offer(agent_id, terminal, launch_action, *, in_team, socket_typed):
+    """This terminal offered to the agent, as one sentence, or None.
+
+    Offered inside tmux when the launch would otherwise start a tmux server,
+    add the swarm session to a server, or stop: in each case the agent would
+    not appear in the server the operator is in. It reads the action the launch
+    selected, `launch_action["action"]`, rather than the prose of the
+    destination's provenance; `launch_action` is None exactly when the run
+    could not determine a tmux socket.
+
+    It returns None in a team run, which would end at its first member if this
+    terminal became that member; while a Claude Code tool drives the run, since
+    exec would take that tool's shell; outside tmux, where the run can attach
+    this terminal to the server after the launch; for a --socket the operator
+    typed, which chose the server; and when the launch splits a pane or adds a
+    window on a live swarm session. An explicit --here does not reach it.
+    """
+    here = terminal.seat.socket if terminal.seat else terminal.socket_without_pane
+    if in_team or terminal.tool_driving or socket_typed or not here:
+        return None
+    if launch_action is None:
+        instead = "this run stops: it could not determine a tmux socket"
+    elif launch_action["action"] == "refuse":
+        instead = (f"this run stops: the state of the tmux server on "
+                   f"{launch_action['destination'].socket} is unknown")
+    elif launch_action["action"] == "new-session":
+        socket = launch_action["destination"].socket
+        instead = (f"this adds the swarm session to the tmux server on {socket}"
+                   if launch_action["server"]["liveness"].state == "alive" else
+                   f"this starts a new tmux server on {socket}")
+    else:
+        return None
+    where = (f"this pane, {terminal.seat.pane} on {here}" if terminal.seat
+             else f"this pane on {here} (pane id unavailable)")
+    return f"{agent_id} can run in {where}; otherwise {instead}"
+
+
+def confirm_here(agent_id, offer, prefix, dry_run):
+    """Ask whether this terminal takes the agent the offer names; True to run it here.
+
+    The offer rests on an inference about where the operator wants the agent,
+    so it is asked Y/n, a run without a terminal does not take it, and a dry
+    run reports that it would. --yes does not answer it: --yes answers the
+    questions about ending a process.
+    """
+    print(fill(f"{prefix}offer    {offer}"))
+    return ask_default_yes("run it here?", unattended=False, dry_run=dry_run,
+                           left_alone=f"the run did not start {agent_id}")
+
+
 def terminal_note(terminal):
     """Render one immutable TerminalContext without reading the environment."""
     if terminal.seat:
@@ -13744,6 +13830,35 @@ def lead_rebind(migration, args, prefix=""):
     return completed["launch"]
 
 
+def exec_in_this_terminal(ctx, args, command, prefix):
+    """Turn this run into the agent in this terminal, listed without a pane.
+
+    The last steps of the --here route, which an accepted offer of this
+    terminal takes too. The pane this terminal is in is not recorded: a pane id
+    is numbered per tmux server, the roster records it without the server, and
+    this terminal can be in a server other than the team's. A later team run
+    places the member in a pane like any other.
+    """
+    agent_id = ctx["identity"]["agentId"]
+    # Check what is about to run before writing anything, the same order the
+    # lead path takes: writing the roster first and finding the binary
+    # unusable second lists a member for a launch that never happened, and a
+    # refusal here does not take that write back.
+    if not args.dry_run and not shutil.which(command[0]):
+        die(f"cannot exec {command[0]}: not found or not executable")
+    # Listed without a pane: a member that is running and reachable. What that
+    # write found is kept, because the code from here on is not certain to
+    # start the agent.
+    undo = record_membership(ctx, args, None)
+    # One line, both tenses, so the preview cannot drift from the act.
+    print(f"{prefix}exec     this terminal "
+          f"{'would become' if args.dry_run else 'becomes'} {agent_id}")
+    if args.dry_run:
+        return Outcome("manual", None, False, None)
+    inherit_credentials(ctx)
+    become_agent(ctx, command, prefix, undo=undo)
+
+
 def in_team_run(args):
     """Whether this step belongs to a team run, which carries the run's decision.
 
@@ -13905,7 +14020,19 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
     if args.explain:
         explain(ctx)
 
-    if args.here:
+    # A --socket typed for this run, or for the team run this step is part of,
+    # chose the server, so the run does not offer this terminal or note
+    # another server.
+    socket_typed = args.socket_typed if getattr(args, "in_team", False) else bool(args.socket)
+    run_here = args.here
+    if not run_here and not ctx["destination"]:
+        # Without a tmux socket the pane launch below stops. Inside tmux this
+        # terminal is offered first, and a yes takes the --here route.
+        offer = here_offer(agent_id, ctx["terminal"], ctx["launch_action"],
+                           in_team=getattr(args, "in_team", False),
+                           socket_typed=socket_typed)
+        run_here = bool(offer) and confirm_here(agent_id, offer, prefix, args.dry_run)
+    if run_here:
         # A member given this terminal takes the lead's route: exec, so the
         # process becomes the agent. A seat is not resolved because it is not
         # used, and the rest of the run does not happen.
@@ -13926,24 +14053,7 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
         if running:
             return noop_outcome(ctx, args, prefix, why=running[0], report=running[1])
         enforce_ctx(ctx, args)
-        # Check what we are about to run before writing anything, the same order
-        # the lead path takes: writing the roster first and finding the binary
-        # unusable second lists a member for a launch that never happened, and
-        # this exit is not one the rollback below can reach.
-        if not args.dry_run and not shutil.which(command[0]):
-            die(f"cannot exec {command[0]}: not found or not executable")
-        # Listed without a pane: a member that is running and reachable, which
-        # a later team run places in a pane like any other. What that write
-        # found is kept, because the code from here on is not certain to start
-        # the agent.
-        undo = record_membership(ctx, args, None)
-        # One line, both tenses, so the preview cannot drift from the act.
-        print(f"{prefix}exec     this terminal "
-              f"{'would become' if args.dry_run else 'becomes'} {agent_id}")
-        if args.dry_run:
-            return Outcome("manual", None, False, None)
-        inherit_credentials(ctx)
-        become_agent(ctx, command, prefix, undo=undo)
+        return exec_in_this_terminal(ctx, args, command, prefix)
 
     for warning in ctx["destination_warnings"]:
         warn(warning)
@@ -14023,7 +14133,7 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
     # --team (the loop would end), and never when a live holder has to be killed
     # first: exec cannot respawn the pane, so that case belongs to launch().
     if (in_socket == socket and in_pane and not replace_pane
-            and not getattr(args, "in_team", False) and not os.environ.get("CLAUDECODE")):
+            and not getattr(args, "in_team", False) and not ctx["terminal"].tool_driving):
         if in_pane == want_pane or pane_reference.state != "present":
             print(f"{prefix}exec     you are in {in_pane} on {socket}; running here rather than splitting")
             # The same roster write every other launch makes, through the one
@@ -14040,6 +14150,18 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
                 tint_pane(socket, in_pane, ctx["settings"].get("color"), ctx["identity"]["agentName"], False)
             inherit_credentials(ctx)
             become_agent(ctx, command, prefix, undo=undo)
+
+    # The launch is about to start a tmux server, add the swarm session to one,
+    # or stop at a server in an unknown state, and the automatic path above did
+    # not take this pane. Inside tmux this terminal is offered first, and a yes
+    # takes the --here route's last steps.
+    offer = here_offer(agent_id, ctx["terminal"], ctx["launch_action"],
+                       in_team=getattr(args, "in_team", False), socket_typed=socket_typed)
+    if offer and confirm_here(agent_id, offer, prefix, args.dry_run):
+        return exec_in_this_terminal(ctx, args, command, prefix)
+    elsewhere = elsewhere_warning(ctx["terminal"], socket, socket_typed)
+    if elsewhere:
+        warn(elsewhere)
 
     try:
         launched_at = ctx["transcript"]["path"].stat().st_mtime
@@ -15876,7 +15998,6 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix="", terminal=
             and any(s in ("launched", "noop") for _, s in results)):
         decision = RESOLVER.attach_decision(
             socket, terminal, no_attach=args.no_attach, attach=args.attach,
-            tool_driving=bool(os.environ.get("CLAUDECODE")),
             is_tty=sys.stdout.isatty())
         if decision["liveness"] is not None and decision["liveness"].state == "alive":
             print()
@@ -16039,6 +16160,7 @@ def run_team(args, passthrough):
         one = copy.copy(args)
         one.agent_id, one.resume, one.team, one.socket = agent_id, None, None, socket
         one.socket_reason = "team socket" if not args.socket else "--socket"
+        one.socket_typed = bool(args.socket)
         one.roster_census = selection["census_after"] if following else plan["census"]
         one.team_selection, one.team_answer = selection, answer
         one.in_team = True
@@ -27080,14 +27202,19 @@ def _check_refused_teardown_reports(s):
                                  if isinstance(sub, ast.Call)}:
             told.append("the poison is not asked about where the strip is loud")
 
-        callers = [sub for sub in ast.walk(funcs["run_one"])
+        # run_one execs the lead and the member already standing in its pane;
+        # exec_in_this_terminal execs a member in this terminal, for --here and
+        # for the accepted offer of this terminal.
+        empty = ast.Module(body=[], type_ignores=[])
+        callers = [sub for name in ("run_one", "exec_in_this_terminal")
+                   for sub in ast.walk(funcs.get(name) or empty)
                    if isinstance(sub, ast.Call)
                    and getattr(sub.func, "id", "") == "become_agent"]
         carrying = [c for c in callers
                     if any(kw.arg == "undo" for kw in c.keywords)]
         if len(callers) != 3 or len(carrying) != 2:
-            told.append(f"run_one reaches it {len(callers)} time(s), "
-                        f"{len(carrying)} with a roster write to take back; "
+            told.append(f"run_one and exec_in_this_terminal reach it {len(callers)} "
+                        f"time(s), {len(carrying)} with a roster write to take back; "
                         "the routes are two members with an undo and a lead without")
         outside = s.callers_of("enter_agent_cwd") - s.suite_fns
         if outside != {"become_agent"}:
@@ -27622,7 +27749,7 @@ class _Run:
 
 def resume_run(agent_id, *, listed=True, server=None, table=(), registry=(),
                watch=None, prepare=None, inspect=None, observe_launch_action=None,
-               observe_outcome=None, terminal=None, **flags):
+               observe_outcome=None, terminal=None, socket="claude-swarm-test", **flags):
     """Run the real resume path against a writable copy of the corpus.
 
     Only the world outside the process is faked: one tmux server and the
@@ -27639,7 +27766,8 @@ def resume_run(agent_id, *, listed=True, server=None, table=(), registry=(),
     recorded about its launch rather than how the launch went. `terminal` is
     the TerminalContext the run is started from; without it the run reads the
     environment, which this runner clears of TMUX and TMUX_PANE, so it starts
-    outside tmux.
+    outside tmux. `socket` is the --socket the run is given; None leaves the
+    run to find its server the way a run without --socket does.
 
     Returns (outcome, roster entry afterwards, the fake server, printed
     output), or ("refused", ...) when the run died on a refusal.
@@ -27737,7 +27865,7 @@ def resume_run(agent_id, *, listed=True, server=None, table=(), registry=(),
     try:
         with capturing("out", into=said), capturing("err", into=said):
             try:
-                out = run_one(_Run(agent_id=agent_id, socket="claude-swarm-test",
+                out = run_one(_Run(agent_id=agent_id, socket=socket,
                                    **flags), [], fake.process_rows(), terminal=terminal)
                 status = out.status
                 if observe_outcome:
@@ -31884,11 +32012,13 @@ def _check_here_reports_real_terminal(s):
     def check(cid, name, ok, detail=""):
         checked.append((cid, name, ok, detail))
 
-    names = ("TMUX", "TMUX_PANE")
+    # CLAUDECODE is set when the suite runs from a Claude Code tool shell, so it
+    # is cleared here with the tmux names for facts that leave it out.
+    names = ("TMUX", "TMUX_PANE", "CLAUDECODE")
     saved = {name: os.environ.get(name) for name in names}
     try:
-        os.environ.pop("TMUX", None)
-        os.environ.pop("TMUX_PANE", None)
+        for name in names:
+            os.environ.pop(name, None)
         outside_fact = Resolver()._terminal_context()
         outside = terminal_note(outside_fact)
 
@@ -31936,6 +32066,312 @@ def _check_here_reports_real_terminal(s):
     check("here-reports-real-terminal", "--here says whether this terminal is a tmux pane",
           actual == expected and routed and facts,
           f"expected {expected}, got {actual}; terminal facts {facts}; run_one uses answer: {routed}")
+    return checked
+
+
+@unit(('launch-says-when-it-uses-another-server',
+       'a launch onto a different tmux server than yours says so, naming both'),
+      ('launch-warns-without-a-pane-id',
+       'the note is still given when $TMUX_PANE is unset'))
+def _check_launch_says_when_it_uses_another_server(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    # Synthetic TerminalContext values only. A tmux server, socket or client is
+    # not created and the environment is not read: elsewhere_warning takes the
+    # context as an argument, so this drives it as a pure function.
+    seated = TerminalContext(seat=Seat("sock-mine", "%3"))
+    blind = TerminalContext(socket_without_pane="sock-mine")
+    outside = TerminalContext()
+
+    away = elsewhere_warning(seated, "sock-theirs", False)
+    unpaned = elsewhere_warning(blind, "sock-theirs", False)
+    said = {
+        "it notes a launch on another server": bool(away),
+        "it names the server you are in": bool(away) and "sock-mine" in away,
+        "it names the server the launch uses": bool(away) and "sock-theirs" in away,
+        # The pane of a member placed on a server other than its team's is
+        # looked up on the team's server afterwards, so the note does not
+        # advise --socket.
+        "it does not advise --socket": bool(away) and "--socket" not in away,
+        "it does not note a launch on the server you are in":
+            elsewhere_warning(seated, "sock-mine", False) is None,
+        "it does not give the note outside tmux":
+            elsewhere_warning(outside, "sock-theirs", False) is None,
+        "it does not give the note for a --socket you typed":
+            elsewhere_warning(seated, "sock-theirs", True) is None,
+    }
+    wrong = sorted(k for k, ok in said.items() if not ok)
+    check("launch-says-when-it-uses-another-server",
+          "a launch onto a different tmux server than yours says so, naming both",
+          not wrong, ", ".join(wrong) + (f"; said {away!r}" if wrong else ""))
+
+    # Without a pane id the terminal does not have a seat, so the automatic
+    # path that runs in the pane you are already in cannot run, and a note
+    # that required a seat would be silent in exactly the case that needs it.
+    blindly = {
+        "it notes the launch when the pane id is unavailable": bool(unpaned),
+        "it names both servers":
+            bool(unpaned) and "sock-mine" in unpaned and "sock-theirs" in unpaned,
+        "it says the pane you are in is unknown, and why":
+            bool(unpaned) and "unknown" in unpaned and "TMUX_PANE" in unpaned,
+        "it does not note a launch on the server you are in":
+            elsewhere_warning(blind, "sock-mine", False) is None,
+    }
+    wrong = sorted(k for k, ok in blindly.items() if not ok)
+    check("launch-warns-without-a-pane-id",
+          "the note is still given when $TMUX_PANE is unset",
+          not wrong, ", ".join(wrong) + (f"; said {unpaned!r}" if wrong else ""))
+    return checked
+
+
+@unit(('launch-offers-this-pane-instead-of-a-new-server',
+       'inside tmux, a launch that would start a tmux server, add the swarm session to one, '
+       'or stop offers this pane first'),
+      ('launch-does-not-offer-a-pane-it-must-not-take',
+       'the offer is not made in a team run, a run a Claude Code tool drives, a run outside '
+       'tmux, a run with a typed --socket, or a launch that splits a pane or adds a window '
+       'on a live swarm session'))
+def _check_launch_offers_this_pane(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    # Synthetic values only. here_offer takes the terminal, the launch action
+    # and the run's circumstances as arguments, so a tmux server, socket or
+    # client is not created and the environment is not read.
+    seated = TerminalContext(seat=Seat("sock-mine", "%3"))
+    blind = TerminalContext(socket_without_pane="sock-mine")
+    driven = TerminalContext(seat=Seat("sock-mine", "%3"), tool_driving=True)
+    outside = TerminalContext()
+    absent, alive = SocketLiveness("absent"), SocketLiveness("alive")
+    unknown = SocketLiveness("unknown", "fixture: the probe could not tell")
+
+    def action(name, liveness=absent):
+        """One launch action on sock-theirs, or None for a run without a socket."""
+        return None if name is None else immutable({
+            "action": name, "destination": LaunchDestination("sock-theirs"),
+            "server": immutable({"liveness": liveness})})
+
+    def offer(terminal, act, **over):
+        return here_offer("petrel@team", terminal, act,
+                          **{"in_team": False, "socket_typed": False, **over})
+
+    fresh = offer(seated, action("new-session"))
+    joined = offer(seated, action("new-session", alive))
+    unpaned = offer(blind, action("new-session"))
+    socketless = offer(seated, None)
+    unsure = offer(seated, action("refuse", unknown))
+    said = {
+        "it offers this pane when a new server would start": bool(fresh),
+        "it names the agent": bool(fresh) and "petrel@team" in fresh,
+        "it names the pane and the server you are in":
+            bool(fresh) and "%3 on sock-mine" in fresh,
+        "it says the launch starts a new tmux server, and names it":
+            bool(fresh) and "starts a new tmux server on sock-theirs" in fresh,
+        "it says the launch adds the swarm session to a server that is up":
+            bool(joined) and "adds the swarm session to the tmux server on sock-theirs" in joined
+            and "new tmux server" not in joined,
+        "it offers when the pane id is unavailable, and says so":
+            bool(unpaned) and "pane id unavailable" in unpaned,
+        "it offers when a socket was not found, and says the run stops":
+            bool(socketless) and "this run stops" in socketless
+            and "tmux server on" not in socketless,
+        "it offers when the state of the server is unknown, and says the run stops":
+            bool(unsure) and "this run stops" in unsure
+            and "server on sock-theirs is unknown" in unsure,
+    }
+    wrong = sorted(k for k, ok in said.items() if not ok)
+    check("launch-offers-this-pane-instead-of-a-new-server",
+          "inside tmux, a launch that would start a tmux server, add the swarm session to "
+          "one, or stop offers this pane first",
+          not wrong, ", ".join(wrong) + (f"; offered {fresh!r}" if wrong else ""))
+
+    # Each of these fails when its guard is removed. With the team guard gone a
+    # team run would end at its first member, and with the tool guard gone exec
+    # would take the shell of the tool driving the run.
+    away = {
+        "it does not offer when the launch splits a pane on a live swarm session":
+            offer(seated, action("split", alive)) is None,
+        "it does not offer when the launch adds a window to a live swarm session":
+            offer(seated, action("new-window", alive)) is None,
+        "it does not offer outside tmux": offer(outside, action("new-session")) is None,
+        "it does not offer in a team run":
+            offer(seated, action("new-session"), in_team=True) is None,
+        "it does not offer while a Claude Code tool drives the run":
+            offer(driven, action("new-session")) is None,
+        "it does not offer for a --socket you typed":
+            offer(seated, action("new-session"), socket_typed=True) is None,
+    }
+    wrong = sorted(k for k, ok in away.items() if not ok)
+    check("launch-does-not-offer-a-pane-it-must-not-take",
+          "the offer is not made in a team run, a run a Claude Code tool drives, a run outside "
+          "tmux, a run with a typed --socket, or a launch that splits a pane or adds a window "
+          "on a live swarm session",
+          not wrong, ", ".join(wrong))
+    return checked
+
+
+@unit(('here-offer-takes-this-terminal-on-yes',
+       'a dry run inside tmux takes the offer of this terminal, previews the --here route '
+       'and does not start a server'),
+      ('here-offer-declined-launches-in-a-pane',
+       'a no, or a run without a terminal, launches in a pane on the team server and notes '
+       'that it is not yours; --here and a typed --socket go ahead without the offer'))
+def _check_here_offer_reaches_the_run(s):
+    """The offer of this terminal and the note, through the real resume path.
+
+    willow's team, session-corpus-alpha, does not have a live lead in an empty
+    process table, so its launch stands up that team's own server,
+    claude-swarm-session-corpus-alpha, which the fake tmux does not list: a
+    new-session on an absent server. Each run starts from pane %3 of
+    claude-swarm-mine, another server, with a terminal stand-in for stdin and
+    the given reply to every question.
+    """
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    seated = TerminalContext(seat=Seat("claude-swarm-mine", "%3"))
+    agent_id, team_server = "willow@session-corpus-alpha", "claude-swarm-session-corpus-alpha"
+    real_input, real_stdin = globals().get("input"), sys.stdin
+
+    def run(reply="", tty=True, socket=None, **flags):
+        """One resume of willow; (status, roster entry, spawning commands, output, prompts)."""
+        prompts = []
+        globals()["input"] = lambda prompt="": prompts.append(prompt) or reply
+        sys.stdin = types.SimpleNamespace(isatty=lambda: tty)
+        try:
+            status, entry, server, said = resume_run(
+                agent_id, socket=socket, terminal=seated, **flags)
+        finally:
+            sys.stdin = real_stdin
+            if real_input is None:
+                globals().pop("input", None)
+            else:
+                globals()["input"] = real_input
+        spawned = [ran[0] for ran in server.ran
+                   if ran and ran[0] in ("new-session", "split-window", "new-window")]
+        return status, entry, spawned, " ".join(without_wrap_arrows(said).split()), prompts
+
+    offered = (f"offer {agent_id} can run in this pane, %3 on claude-swarm-mine; otherwise "
+               f"this starts a new tmux server on {team_server}")
+    noted = f"you are in tmux on claude-swarm-mine, and this launch uses {team_server}"
+
+    previewed = run(dry_run=True)
+    status, _entry, spawned, told, prompts = previewed
+    taken = {
+        "it offered this pane": offered in told,
+        "a dry run did not ask": not prompts,
+        "and took the offer's default, yes": "choice yes (dry run; Y/n defaults to yes)" in told,
+        "it previews the --here route": f"exec this terminal would become {agent_id}" in told,
+        "and ends as the --here route does": status == "manual",
+        "it did not start a server": not spawned,
+    }
+    wrong = sorted(name for name, ok in taken.items() if not ok)
+    check("here-offer-takes-this-terminal-on-yes",
+          "a dry run inside tmux takes the offer of this terminal, previews the --here route "
+          "and does not start a server",
+          not wrong, ", ".join(wrong) + (f"; {status}, asked {prompts}, said {told[-700:]}"
+                                         if wrong else ""))
+
+    declined = run(reply="n")
+    unattended = run(tty=False)
+    explicit = run(dry_run=True, here=True)
+    typed = run(dry_run=True, socket="claude-swarm-elsewhere")
+    went = {
+        "a no was asked once, Y/n":
+            declined[4] == ["run it here? [Y/n] "] and offered in declined[3],
+        "and the launch went on in a pane on the team server":
+            declined[0] == "launched" and declined[2] == ["new-session"]
+            and bool((declined[1] or {}).get("tmuxPaneId")),
+        "and noted that it is not your server": noted in declined[3],
+        "a run without a terminal did not ask, and said why":
+            not unattended[4] and "choice no (stdin is not a terminal, and this offer is "
+            "taken only when a person answers yes)" in unattended[3],
+        "and launched in a pane on the team server, noting it":
+            unattended[0] == "launched" and unattended[2] == ["new-session"]
+            and noted in unattended[3],
+        "--here went ahead without the offer":
+            explicit[0] == "manual" and f"offer {agent_id}" not in explicit[3]
+            and f"exec this terminal would become {agent_id}" in explicit[3],
+        "a typed --socket went ahead without the offer or the note":
+            f"offer {agent_id}" not in typed[3] and "you are in tmux on" not in typed[3]
+            and typed[0] == "launched",
+    }
+    wrong = sorted(name for name, ok in went.items() if not ok)
+    check("here-offer-declined-launches-in-a-pane",
+          "a no, or a run without a terminal, launches in a pane on the team server and notes "
+          "that it is not yours; --here and a typed --socket go ahead without the offer",
+          not wrong, ", ".join(wrong) + (
+              f"; no: {declined[0]}, asked {declined[4]}, spawned {declined[2]}, said "
+              f"{declined[3][-500:]}; unattended: {unattended[0]}, said {unattended[3][-400:]}; "
+              f"--here: {explicit[0]}; --socket: {typed[0]}, said {typed[3][-300:]}"
+              if wrong else ""))
+    return checked
+
+
+@contextlib.contextmanager
+def _caller_values(**values):
+    """This process's environment with INHERIT_ENV, ANTHROPIC_BASE_URL and the names given set as given.
+
+    A name given None is removed. The previous values come back on the way out.
+    """
+    names = {*INHERIT_ENV, "ANTHROPIC_BASE_URL", *values}
+    saved = {name: os.environ.get(name) for name in names}
+    try:
+        for name in names:
+            os.environ.pop(name, None)
+        for name, value in values.items():
+            if value is not None:
+                os.environ[name] = value
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@unit(('tool-driving-is-one-terminal-fact',
+       'CLAUDECODE is read once, into the terminal context, and the attach and current-pane '
+       'choices read it there'))
+def _check_tool_driving_is_one_terminal_fact(s):
+    checked = []
+    with _caller_values(CLAUDECODE="1", TMUX=None, TMUX_PANE=None):
+        driven = Resolver()._terminal_context()
+    with _caller_values(CLAUDECODE=None, TMUX=None, TMUX_PANE=None):
+        free = Resolver()._terminal_context()
+    eng = Resolver(needs=Needs(maybe=set(NEED)))
+    fake = _FakeTmux(sockets=["claude-swarm-env"])
+    with fake.installed(eng):
+        decision = eng.attach_decision("claude-swarm-env", driven, attach=True, is_tty=True)
+    ast = s.ast
+    boundary = next(node.lineno for node in s.tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == "fixture_line")
+    production = [node for node in ast.walk(s.tree)
+                  if isinstance(node, ast.FunctionDef) and node.lineno < boundary]
+    readers = sorted({
+        node.name for node in production
+        if any(isinstance(sub, ast.Constant) and sub.value == "CLAUDECODE"
+               for sub in ast.walk(node))})
+    current_pane = [sub for sub in ast.walk(s.funcs["run_one"])
+                    if isinstance(sub, ast.Attribute) and sub.attr == "tool_driving"]
+    facts = {
+        "CLAUDECODE sets tool_driving": driven.tool_driving and not free.tool_driving,
+        "attach reads it from the terminal":
+            decision["reason"] == "a Claude Code tool is driving",
+        "only the terminal reader names CLAUDECODE": readers == ["_terminal_context"],
+        "the current-pane choice reads the terminal fact": bool(current_pane),
+    }
+    wrong = sorted(fact for fact, ok in facts.items() if not ok)
+    checked.append(_check_verdict('tool-driving-is-one-terminal-fact', not wrong,
+                                  "; ".join(wrong) + f"; readers={readers}"))
     return checked
 
 
@@ -46273,6 +46709,11 @@ QUESTIONS = (
      "the inferred demotion parent asks through ask_default_no",
      "authorize_demotion_parent", "ask_default_no", "question",
      frozenset({"dry_run", "left_alone"})),
+    ("here-offer-asks-through-the-default-yes-asker",
+     "the offer of this terminal asks through ask_default_yes and is declined when stdin is "
+     "not a terminal",
+     "confirm_here", "ask_default_yes", "'run it here?'",
+     frozenset({"unattended", "dry_run", "left_alone"})),
 )
 
 
