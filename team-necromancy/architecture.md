@@ -929,6 +929,20 @@ destination with its evidence. `TerminalContext` records the current terminal's
 seat, or a tmux socket without its pane ID; it is captured once for a launch or
 team run and is not read again while rendering or attaching.
 
+A `SocketLiveness` is what one connection attempt found at a tmux socket path:
+`alive`, `absent`, or `unknown` with a reason worded for the user. A path of
+`SOCKET_PATH_LIMIT` (108) bytes or more is unknown without an attempt, since
+neither the probe nor tmux can connect through it. An unknown socket counts as
+neither live nor dead: cleanup keeps it, `_newest_live_socket` and the seat index
+pass it over, `--poison` and `--unpoison` stop, and attach is not offered. For a
+launch destination on an unknown socket, `_tmux_launch_action` selects `refuse`,
+and `launch` raises `LaunchFailed` with the reason before any tmux command runs.
+A `RosterPaneReference` for a pane recorded on that socket has the state
+`unknown`, and the plan reports the pane as not checked. A launch that runs in
+the current pane does not read the server and is not refused. A
+`SocketLiveness` raises `TypeError` when read as a truth value, so a caller
+compares its state.
+
 A transcript title is a `TitleFact`, not a string. It contains the selected title
 text, the event kind, transcript path, timestamp, and source record UUID. Every
 reporting answer carries that one object, so a title's text and the event that

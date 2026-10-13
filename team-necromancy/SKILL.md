@@ -284,8 +284,10 @@ Unset the style or set it to `true` to enable caching.
 
 The cleanup hook removes dead `claude-swarm-*` sockets and empty team
 directories. Socket cleanup uses a `connect()` probe and gives new sockets 60
-seconds to finish binding. Team-directory removal requires every condition
-below:
+seconds to finish binding. A socket the probe cannot classify, such as one with
+a path of 108 bytes or more or a server that does not take the connection, is
+kept, and a launch that needs its server refuses with the reason.
+Team-directory removal requires every condition below:
 
 - process evidence classifies the team as stopped
 - Resolver's transcript search returns an empty result for the lead and every

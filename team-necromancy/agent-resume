@@ -30,6 +30,7 @@ import binascii
 import difflib
 import argparse
 import enum
+import errno
 import collections
 import contextlib
 import copy
@@ -152,6 +153,12 @@ TMUX_WINDOW = "swarm-view"
 # to 80x24.
 SWARM_COLS, SWARM_ROWS = 220, 50
 SOCKET_PREFIX = "claude-swarm-"
+# A unix socket path must be shorter than this many bytes. Linux holds the path
+# in a sun_path of 108 bytes, and Python refuses a path of 108 bytes or more
+# before any system call. tmux refuses such a path too, so a tool run cannot
+# reach a server there, and _socket_alive answers unknown for it without
+# connecting.
+SOCKET_PATH_LIMIT = 108
 
 # No process on Linux can hold a pid at or above this. It is PID_MAX_LIMIT, the
 # largest value pid_max can take on a 64-bit kernel, so no running process can
@@ -604,6 +611,36 @@ class Seat:
 
 
 @dataclasses.dataclass(frozen=True)
+class SocketLiveness:
+    """What one connection attempt found at a tmux socket path.
+
+    alive: a server accepted the connection. absent: the path does not exist,
+    or a server does not listen there and the connection was refused.
+    unknown: the attempt could not tell, and reason says why, in words a user
+    can act on. An unknown socket counts as neither live nor dead: cleanup
+    keeps it, a launch that needs its server refuses, --poison stops, and
+    attach is not offered.
+
+    It cannot be read as a truth value. A caller that tested it with if would
+    take absent and unknown for live, so callers compare its state.
+    """
+
+    state: str
+    reason: str = ""
+
+    STATES = ("alive", "absent", "unknown")
+
+    def __post_init__(self):
+        if self.state not in self.STATES:
+            raise ValueError(f"unknown socket liveness state {self.state!r}")
+        if (self.state == "unknown") != bool(self.reason):
+            raise ValueError("an unknown socket liveness carries its reason, and only it does")
+
+    def __bool__(self):
+        raise TypeError("a socket liveness has three states; compare its state")
+
+
+@dataclasses.dataclass(frozen=True)
 class LaunchDestination:
     """A tmux server and optional pane reference chosen before launch."""
 
@@ -619,7 +656,12 @@ class LaunchDestination:
 
 @dataclasses.dataclass(frozen=True)
 class RosterPaneReference:
-    """Structured evidence for applying a roster pane ID to one socket."""
+    """Structured evidence for applying a roster pane ID to one socket.
+
+    state is present or gone for a recorded pane the server's panes include or
+    lack, absent when the roster does not record a pane, and unknown when the state
+    of the server is unknown, so its panes were not read.
+    """
 
     recorded: object
     state: str
@@ -2016,9 +2058,8 @@ class Resolver:
         block = implicit_team_block(team)
         if not block:
             return []
-        return sorted((path for path in self._transcripts_starting(block)
-                       if self._session_names_team(path.stem, team)),
-                      key=lambda path: path.stat().st_mtime, reverse=True)
+        return self._newest_first(path for path in self._transcripts_starting(block)
+                                  if self._session_names_team(path.stem, team))
 
     def _registry_entries_naming(self, team, snapshot):
         """Every session registry entry with a session id that names this team.
@@ -2937,19 +2978,30 @@ class Resolver:
                           "mtime_ns": facts.st_mtime_ns, "ino": facts.st_ino}
         return reads
 
-    def _transcripts_by_mtime(self):
-        """The transcripts in the project directories, newest first.
+    @staticmethod
+    def _newest_first(paths):
+        """The paths a listing gave, newest modification first.
 
-        A transcript removed between the glob and its stat is left out.
+        An entry removed between the listing and its stat is left out, as is
+        any other entry stat cannot read, so a listing taken while files come
+        and go answers instead of raising. Entries with the same modification
+        time keep the listing's order.
         """
         dated = []
-        for path in self._projects_dir.glob("*/*.jsonl"):
+        for path in paths:
             try:
                 dated.append((path.stat().st_mtime, path))
             except OSError:
                 continue
         dated.sort(key=lambda item: item[0], reverse=True)
         return [path for _mtime, path in dated]
+
+    def _transcripts_by_mtime(self):
+        """The transcripts in the project directories, newest first.
+
+        A transcript removed between the glob and its stat is left out.
+        """
+        return self._newest_first(self._projects_dir.glob("*/*.jsonl"))
 
     def _transcripts_starting(self, block):
         """Transcripts with a uuid that opens with this block. A path question,
@@ -6490,7 +6542,8 @@ class Resolver:
                 stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
         except OSError:
             socket_generation = ("absent",)
-        alive = self._socket_alive(socket)
+        liveness = self._socket_alive(socket)
+        alive = liveness.state == "alive"
         server_pid = None
         if alive:
             shown = tmux(socket, "display-message", "-p", "#{pid}")
@@ -6525,20 +6578,17 @@ class Resolver:
             if shown.returncode == 0:
                 base_url = shown.stdout.strip().partition("=")[2]
         clients = self._attached_clients(socket) if session_live else 0
-        state = ("no server" if not alive else
-                 f"server up, no {TMUX_SESSION} session" if not session_live else
-                 f"live, {clients} client{'' if clients == 1 else 's'} attached")
         return immutable({
             "socket": socket,
             "path": path,
             "socket_generation": socket_generation,
-            "alive": alive,
+            "liveness": liveness,
             "server": server_process,
             "session_live": session_live,
             "panes": tuple(panes),
             "base_url": base_url,
             "clients": clients,
-            "state": state,
+            "state": self._socket_state_line(liveness, session_live, clients),
         })
 
     @staticmethod
@@ -6549,12 +6599,19 @@ class Resolver:
                            if process else None)
         return (
             server["socket_generation"], server_identity,
-            server["alive"], server["session_live"], server["base_url"],
+            server["liveness"], server["session_live"], server["base_url"],
             action, target, wanted_present,
         )
 
     def _tmux_launch_action(self, destination, server=None):
-        """Select one tmux action from one retained server observation."""
+        """Select one tmux action from one retained server observation.
+
+        When the probe could not tell whether a server is there, the action is
+        refuse. Each of the other actions acts on that server: new-session
+        starts a server on the socket or adds the swarm session to the one
+        there, and split and new-window run on the server. The server's
+        liveness carries the reason, and launch reports it.
+        """
         if destination is None:
             return None
         server = server or self._tmux_server_fact(destination.socket)
@@ -6563,7 +6620,9 @@ class Resolver:
             if pane["session"] == TMUX_SESSION)
         wanted = next(
             (pane for pane in panes if pane["pane"] == destination.pane), None)
-        if not server["session_live"]:
+        if server["liveness"].state == "unknown":
+            action, target = "refuse", None
+        elif not server["session_live"]:
             action, target = "new-session", None
         elif wanted:
             action, target = "split", wanted["pane"]
@@ -6675,7 +6734,11 @@ class Resolver:
         if socket:
             server = self._tmux_server_fact(socket)
             present = {row["pane"] for row in server["panes"]}
-            if recorded and recorded in present:
+            # The panes of a server in an unknown state were not read, so the
+            # recorded pane is not known to be there or gone.
+            if recorded and server["liveness"].state == "unknown":
+                state, pane = "unknown", None
+            elif recorded and recorded in present:
                 state, pane = "present", recorded
             elif recorded:
                 state, pane = "gone", None
@@ -7157,35 +7220,61 @@ class Resolver:
         return Path(os.environ.get("TMUX_TMPDIR") or f"/tmp/tmux-{os.getuid()}")
 
     def _socket_alive(self, socket):
-        """Return whether a tmux server accepts a connection on this socket.
+        """Ask whether a tmux server accepts a connection on this socket.
 
-        The AF_UNIX probe takes microseconds and supplies one liveness answer to
-        cleanup and launch code.
+        The AF_UNIX probe takes microseconds and supplies one SocketLiveness to
+        cleanup and launch code. A path too long for a unix socket is answered
+        unknown before any connection is tried: neither this probe nor tmux can
+        reach a server there, and a server bound through a shorter relative
+        path could still be listening.
         """
         path = socket if isinstance(socket, Path) else self._socket_dir() / socket
+        size = len(os.fsencode(str(path)))
+        if size >= SOCKET_PATH_LIMIT:
+            return SocketLiveness(
+                "unknown", f"its path {path} is {size} bytes, and a unix socket path "
+                           f"must be shorter than {SOCKET_PATH_LIMIT}")
         probe = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
         probe.settimeout(0.2)
         try:
             probe.connect(str(path))
-            return True
+            return SocketLiveness("alive")
         except (ConnectionRefusedError, FileNotFoundError):
-            return False
-        except OSError:
-            return True  # ambiguous: assume live rather than reap or clobber
+            return SocketLiveness("absent")
+        except (BlockingIOError, TimeoutError) as error:
+            # A server that listens on the path but has a full queue of
+            # connections waiting to be accepted does not take this one: Linux
+            # answers EAGAIN at once, and a probe that waited would time out.
+            return SocketLiveness(
+                "unknown", f"the server did not take the connection "
+                           f"({error.strerror or error}); it may be busy, and "
+                           "trying again can succeed")
+        except OSError as error:
+            return SocketLiveness(
+                "unknown", f"connecting to it failed: {error.strerror or error}")
         finally:
             probe.close()
 
     def _swarm_sockets(self):
-        """Swarm socket files, newest first. The one place that directory is listed."""
-        return sorted(self._socket_dir().glob(f"{SOCKET_PREFIX}*"),
-                      key=lambda p: p.stat().st_mtime, reverse=True)
+        """Swarm socket files, newest first. The one place that directory is listed.
+
+        A socket removed between the glob and its stat is absent, so it is
+        left out.
+        """
+        return self._newest_first(self._socket_dir().glob(f"{SOCKET_PREFIX}*"))
 
     def _newest_live_socket(self):
-        """The most recently touched swarm socket with a server behind it."""
+        """The most recently touched swarm socket with a server behind it.
+
+        Returns its name and the answer of the probe that selected it, so a
+        caller does not probe the selected socket again, or (None, None) when
+        the probe answers absent or unknown for each swarm socket.
+        """
         for path in self._swarm_sockets():
-            if self._socket_alive(path):
-                return path.name
-        return None
+            liveness = self._socket_alive(path)
+            if liveness.state == "alive":
+                return path.name, liveness
+        return None, None
 
     def _dead_sockets(self):
         """Swarm socket files with no server behind them, and old enough to say so.
@@ -7193,7 +7282,8 @@ class Resolver:
         A socket younger than the grace is not evidence of anything: a server
         mid-bind has a file and no listener yet, and reaping it takes the
         server's name out from under it. Age is the whole of the difference,
-        so it is judged here rather than by whoever does the unlinking.
+        so it is judged here rather than by whoever does the unlinking. Only an
+        absent answer selects a socket, so an unknown one is kept.
         """
         stale = []
         now = time.time()
@@ -7203,14 +7293,19 @@ class Resolver:
                     continue
             except OSError:
                 continue
-            if not self._socket_alive(path):
+            if self._socket_alive(path).state == "absent":
                 stale.append(path)
         return stale
 
-    def _swarm_session_live(self, socket):
+    def _swarm_session_live(self, socket, liveness):
         """Is the swarm session actually up on this socket? Server plus session:
-        a live server with no claude-swarm session still needs one created."""
-        return bool(socket) and self._socket_alive(socket) and tmux(
+        a live server without a claude-swarm session still needs one created.
+
+        liveness is the caller's probe answer for this socket. tmux is asked
+        for the session only when that answer is alive, and the socket is not
+        probed again.
+        """
+        return bool(socket) and liveness.state == "alive" and tmux(
             socket, "has-session", "-t", TMUX_SESSION).returncode == 0
 
     def _attached_clients(self, socket):
@@ -7218,47 +7313,73 @@ class Resolver:
         result = tmux(socket, "list-clients", "-t", TMUX_SESSION)
         return len([line for line in result.stdout.splitlines() if line]) if result.returncode == 0 else 0
 
-    def _socket_state(self, socket):
+    @staticmethod
+    def _socket_state_line(liveness, session_live=False, clients=0):
+        """The state line for one socket, from what was observed of it.
+
+        The one place the line is worded, for a socket looked at now
+        (_socket_state) and for a retained server observation
+        (_tmux_server_fact) alike.
+        """
+        if liveness.state == "absent":
+            return "no server"
+        if liveness.state == "unknown":
+            return f"unknown: {liveness.reason}"
+        if not session_live:
+            return f"server up, no {TMUX_SESSION} session"
+        return f"live, {clients} client{'' if clients == 1 else 's'} attached"
+
+    def _socket_state(self, socket, liveness=None):
         """What is actually true of this socket right now.
 
         The `how` label a caller carries only says where the name came from.
         Printed alone, a derived name reads as a running server that may
-        already be gone.
+        already be gone. A caller that has just probed the socket passes the
+        answer as liveness, so the state and the answer it holds agree.
         """
         if not socket:
             return "unresolved"
         # The state, not a promise: the launch decides whether anything gets
         # created, and a run that noops creates nothing.
-        if not self._socket_alive(socket):
-            return "no server"
-        if not self._swarm_session_live(socket):
-            return f"server up, no {TMUX_SESSION} session"
-        clients = self._attached_clients(socket)
-        return f"live, {clients} client{'' if clients == 1 else 's'} attached"
+        liveness = self._socket_alive(socket) if liveness is None else liveness
+        session_live = self._swarm_session_live(socket, liveness)
+        clients = self._attached_clients(socket) if session_live else 0
+        return self._socket_state_line(liveness, session_live, clients)
 
     def socket_control_answer(self, requested=None):
-        """Return the selected swarm socket and its current control state."""
-        socket = requested or self._newest_live_socket()
+        """Return the selected swarm socket and its current control state.
+
+        Each socket it looks at is probed once. The probe that reads the
+        requested socket, or that selects the newest live one, also gives the
+        state line and the liveness in the answer.
+        """
+        if requested:
+            socket, liveness = requested, self._socket_alive(requested)
+        else:
+            socket, liveness = self._newest_live_socket()
         return immutable({
             "socket": socket,
-            "state": self._socket_state(socket),
+            "state": self._socket_state(socket, liveness),
             "reason": "--socket" if requested else
                       "newest live swarm socket" if socket else
                       "no live swarm socket",
-            "alive": self._socket_alive(socket) if socket else False,
+            "liveness": liveness,
         })
 
     def attach_decision(self, socket, terminal=None, no_attach=False, attach=False,
                         tool_driving=False, is_tty=False):
         """Return one immutable decision about attaching to a launched swarm."""
         terminal = self._terminal_context() if terminal is None else terminal
-        alive = bool(socket) and self._socket_alive(socket)
+        liveness = self._socket_alive(socket) if socket else None
+        alive = liveness is not None and liveness.state == "alive"
         reason = None
         action = "skip"
         if not socket or no_attach:
             reason = "disabled" if no_attach else "no socket"
-        elif not alive:
+        elif liveness.state == "absent":
             reason = "no server"
+        elif liveness.state == "unknown":
+            reason = f"the state of its server is unknown: {liveness.reason}"
         elif tool_driving:
             reason = "a Claude Code tool is driving"
         elif not is_tty:
@@ -7276,7 +7397,7 @@ class Resolver:
         return immutable({
             "socket": socket,
             "terminal": terminal,
-            "alive": alive,
+            "liveness": liveness,
             "action": action,
             "reason": reason,
             "command": command,
@@ -7397,7 +7518,7 @@ class Resolver:
         seats = {}
         for path in self._swarm_sockets():
             socket = path.name if isinstance(path, Path) else Path(path).name
-            if not self._socket_alive(socket):
+            if self._socket_alive(socket).state != "alive":
                 continue
             for pane in self._list_panes(socket):
                 seat = Seat(socket, pane["pane"])
@@ -8868,9 +8989,11 @@ class Resolver:
                     mtime = int(path.stat().st_mtime * 1000)
                 except OSError:
                     continue
+                state = self._socket_alive(path).state
                 entries.append(immutable({
                     "socket": path.name,
-                    "state": "live" if self._socket_alive(path) else "dead",
+                    "state": ("live" if state == "alive" else
+                              "dead" if state == "absent" else "unknown"),
                     "mtime": mtime,
                 }))
             return immutable({"topic": dynamic, "entries": tuple(entries)})
@@ -9226,7 +9349,7 @@ class Resolver:
         changed = []
         for socket in plan["dead_sockets"]:
             if (self._path_generation(socket["path"]) != socket["generation"]
-                    or self._socket_alive(socket["path"])):
+                    or self._socket_alive(socket["path"]).state != "absent"):
                 changed.append(f"socket {socket['path'].name}")
         for action in plan["team_actions"]:
             if self._directory_generation(action["team_dir"]) != action["generation"]:
@@ -11844,6 +11967,9 @@ def roster_pane_note(reference):
     if reference.state == "gone":
         return (f"(none: recorded {reference.recorded} is gone from "
                 f"{reference.destination.socket})")
+    if reference.state == "unknown":
+        return (f"(recorded {reference.recorded}, not checked: the state of the server "
+                f"on {reference.destination.socket} is unknown)")
     return "(none recorded)"
 
 
@@ -11924,23 +12050,32 @@ def tint_pane(socket, pane, colour, name, dry):
 
 
 class LaunchFailed(Exception):
-    """tmux refused to place this agent.
+    """This agent could not be placed: tmux refused, or the plan refused because
+    the state of the tmux server is unknown.
 
     It ends this member's launch, and the run goes on with the other members.
     """
 
 
 def launch(plan, cwd, command, dry, replace_pane=None):
-    """Apply one preselected tmux launch action without choosing another one."""
+    """Apply one preselected tmux launch action without choosing another one.
+
+    A refused action raises before any tmux command runs, in a dry run too, so
+    the preview reports the refusal the launch would meet.
+    """
     if not plan or not isinstance(plan.get("destination"), LaunchDestination):
         raise TypeError("launch needs an immutable tmux launch action")
     destination = plan["destination"]
     socket = destination.socket
     server = plan["server"]
+    if plan["action"] == "refuse":
+        raise LaunchFailed(f"the state of the tmux server on {socket} is unknown: "
+                           f"{server['liveness'].reason}")
     session_live = server["session_live"]
-    value = (server["base_url"] if server["alive"]
+    alive = server["liveness"].state == "alive"
+    value = (server["base_url"] if alive
              else os.environ.get("ANTHROPIC_BASE_URL", ""))
-    carrier = socket if server["alive"] else "this shell"
+    carrier = socket if alive else "this shell"
     scrub = "-u ANTHROPIC_BASE_URL " if poison_said(value, carrier) else ""
     quoted = (
         "exec env " + scrub
@@ -11962,7 +12097,7 @@ def launch(plan, cwd, command, dry, replace_pane=None):
     if action == "respawn":
         argv = ["respawn-pane", "-k", "-t", replace_pane]
     elif action == "new-session":
-        warn(f"socket {socket} is down, reestablishing" if not server["alive"]
+        warn(f"socket {socket} is down, reestablishing" if not alive
              else f"session {TMUX_SESSION} missing on {socket}, recreating")
         argv = ["new-session", "-d", "-s", TMUX_SESSION, "-n", TMUX_WINDOW,
                 "-x", str(SWARM_COLS), "-y", str(SWARM_ROWS),
@@ -14874,7 +15009,11 @@ def run_poison(args):
     sock = control["socket"]
     if not sock:
         die("no live swarm socket; pass --socket claude-swarm-<pid>")
-    if not control["alive"]:
+    liveness = control["liveness"]
+    if liveness.state == "unknown":
+        die(f"the state of the tmux server on {sock} is unknown: {liveness.reason}. "
+            "Poison lives in server env, so it is set only on a server that answers")
+    if liveness.state == "absent":
         die(f"socket {sock} has no live tmux server; poison lives in server env, so there "
             "is no environment to set it in")
 
@@ -15021,16 +15160,17 @@ def run_agents(args, passthrough, table, jobs, socket=None, prefix="", terminal=
     # run: a lead that was already up leaves this shell with nothing to look
     # at, so the swarm is the only thing left to offer.
     handover = any(o.is_lead and o.status == "manual" for o in outcomes)
-    # Offered only where a server exists to attach to: after a launch one
+    # Offered only where a server answered the probe: after a launch one
     # does, and a noop on a dead socket must not promise a keypress that can
-    # only end in "nothing to attach to".
+    # only end in "nothing to attach to". An unknown socket is not offered
+    # either, since attaching runs tmux against its server.
     if (not handover and not args.dry_run and socket
             and any(s in ("launched", "noop") for _, s in results)):
         decision = RESOLVER.attach_decision(
             socket, terminal, no_attach=args.no_attach, attach=args.attach,
             tool_driving=bool(os.environ.get("CLAUDECODE")),
             is_tty=sys.stdout.isatty())
-        if decision["alive"]:
+        if decision["liveness"] is not None and decision["liveness"].state == "alive":
             print()
             started = tuple(o.started_in for o in outcomes if o.started_in)
             if decision["action"] != "attach" or confirm_attach(started, socket):
@@ -15389,13 +15529,11 @@ BATCH_SUMMARY_ROWS = (RUNNER_CHECKS[0], *(pair[True] for pair in TIER_ROWS
 # before it is stopped and reported as not having finished.
 SELFTEST_CHILD_BOUND = 900
 
-# An AF_UNIX path must be shorter than this many bytes. Python refuses a longer
-# one before any system call, and _socket_alive answers that refusal as a live
-# server, so a fixture that expects no server at a socket would read a live one.
-SOCKET_PATH_LIMIT = 108
 # The bytes a socket file name gets under a run's socket root: the longest name
 # the suite's fixtures build, SOCKET_PREFIX and the member redirect fixture's
-# session-member-destination-roster-destination, is 58.
+# session-member-destination-roster-destination, is 58. tmux cannot start a
+# server at a path of SOCKET_PATH_LIMIT bytes or more, and _socket_alive answers
+# unknown for one, so a fixture there would not read the server it set up.
 SOCKET_NAME_ROOM = 58
 
 # The name of the socket root a worker makes in its TMPDIR: run_selftest's
@@ -17194,7 +17332,7 @@ def _suite_functions():
     """Classify registered units and designated helpers when a context is built."""
     return ({run.__name__ for _n, _i, run, _l in UNITS}
             | {"_suite_context", "_live_context", "run_selftest", "live_checks", "unit", "resume_run",
-               "wait_for_command_line",
+               "wait_for_command_line", "_stand_in_connect",
                "_roster_test_fixture", "_rebuild_test_plan", "_restamp_test_plan", "_roster_cold_engine",
                "_retained_transcript_answers", "_conversion_test_plan"})
 
@@ -17641,14 +17779,14 @@ def _check_launch_baseurl_carriers(s):
         # the five outcomes above are readings of one answer rather than five
         # unrelated observations of printed text.
         "the action says the server was live and holding the url":
-            server_of(on_server).get("alive") is True
+            server_of(on_server).get("liveness") == SocketLiveness("alive")
             and server_of(on_server).get("base_url") == real,
         "the action says a poisoned server held the poison":
             server_of(poisoned_server).get("base_url") == POISON_URL,
         "the action says there was no server to carry one":
-            server_of(no_server_poison).get("alive") is False
+            server_of(no_server_poison).get("liveness") == SocketLiveness("absent")
             and server_of(no_server_poison).get("base_url") == ""
-            and server_of(no_server_real).get("alive") is False,
+            and server_of(no_server_real).get("liveness") == SocketLiveness("absent"),
         "every case selected exactly one action": all(
             action is not None for action in
             (on_server, poisoned_shell, poisoned_server, no_server_poison, no_server_real)),
@@ -17731,7 +17869,7 @@ def _check_team_launch_actions_use_distinct_seats_and_commands(s):
             isinstance(plan["destination"], LaunchDestination)
             and plan["destination"].socket == socket for plan in plans.values()),
         "each plan carries the server facts launch reads": all(
-            {"session_live", "alive", "base_url"} <= set(plan["server"])
+            {"session_live", "liveness", "base_url"} <= set(plan["server"])
             for plan in plans.values()),
         "each plan carries the action it was launched by": all(
             plan["action"] for plan in plans.values()),
@@ -18149,7 +18287,7 @@ def _check_team_batch_revalidation(s):
 
     stable_server = {
         "socket": "claude-swarm-test", "path": Path("/fixture/socket"),
-        "socket_generation": (1, 2, 3, 4), "alive": True,
+        "socket_generation": (1, 2, 3, 4), "liveness": SocketLiveness("alive"),
         "server": {"pid": PID_CEILING + 7000, "ppid": 1, "proc_start": "start",
                    "argv": ("tmux",), "state": "R"},
         "session_live": True,
@@ -22626,7 +22764,7 @@ def _check_membership_inbox_and_operation_ownership(s):
                       and getattr(node.func.value, "id", None) == "RESOLVER"
                       and node.func.attr == "attach_decision"]
     selected_decision = immutable({
-        "socket": "fixture-socket", "alive": True, "action": "skip",
+        "socket": "fixture-socket", "liveness": SocketLiveness("alive"), "action": "skip",
         "reason": "disabled", "command": (),
     })
     decisions, applied = [], []
@@ -22750,7 +22888,7 @@ def _check_member_redirect_operation(s):
             return immutable({
                 "socket": socket, "path": Path("/tmp") / socket,
                 "socket_generation": versions.get(socket, ("fixture", socket)),
-                "alive": False, "server": None, "session_live": False,
+                "liveness": SocketLiveness("absent"), "server": None, "session_live": False,
                 "panes": (), "base_url": "", "clients": 0, "state": "no server",
             })
 
@@ -23136,7 +23274,7 @@ def _check_lead_migration_operation(s):
             eng._tmux_server_fact = lambda socket: immutable({
                 "socket": socket, "path": Path("/tmp") / socket,
                 "socket_generation": versions.get(socket, ("fixture", socket)),
-                "alive": False, "server": None, "session_live": False,
+                "liveness": SocketLiveness("absent"), "server": None, "session_live": False,
                 "panes": (), "base_url": "", "clients": 0, "state": "no server",
             })
             table = ((PID_CEILING + 525252, 1, (FAKE_AGENT_BIN, "--resume", source_session,
@@ -26116,10 +26254,16 @@ class _FakeTmux:
         self.env, self.ran, self.fail = {}, [], set()
         self.next_pane = 1 + max([int(p["pane"][1:]) for p in self.panes] or [-1])
         self.next_pid = 1 + max([int(p["pid"]) for p in self.panes] or [PID_CEILING + 4241])
-        # Named sockets this fixture claims exist and answer. A directory that
-        # is never read: the fixture answers both the listing and the liveness
-        # probe, so no code stats or connects to this path.
-        self.sockets = list(sockets)
+        # Named sockets this fixture claims exist, newest first, with what the
+        # liveness probe answers for each: a sequence of names gives each one a
+        # server, and a mapping gives each name its SocketLiveness. A name the
+        # fixture does not hold answers absent. A directory that is never read:
+        # the fixture answers both the listing and the liveness probe, so the
+        # code under test does not stat or connect to this path.
+        self.sockets = (dict(sockets) if isinstance(sockets, Mapping)
+                        else dict.fromkeys(sockets, SocketLiveness("alive")))
+        if not all(isinstance(answer, SocketLiveness) for answer in self.sockets.values()):
+            raise TypeError("a fixture socket answers with a SocketLiveness")
         self.socket_dir = Path(f"/nonexistent/{TOOL}-selftest/sockets")
 
     def process_rows(self, refresh=False):
@@ -26174,10 +26318,10 @@ class _FakeTmux:
         """The swarm sockets this fixture claims, newest first as the real one."""
         return [self.socket_dir / name for name in self.sockets]
 
-    def socket_is_alive(self, socket):
-        """Whether one of this fixture's sockets has a server behind it."""
+    def socket_liveness(self, socket):
+        """What the liveness probe answers for a socket of this fixture."""
         name = socket.name if isinstance(socket, Path) else socket
-        return name in self.sockets
+        return self.sockets.get(name, SocketLiveness("absent"))
 
     # The engine's inputs that read processes: the process table, the session
     # registry and the readers that answer for one process.
@@ -26221,7 +26365,7 @@ class _FakeTmux:
                     or getattr(current, "world_reader", False)):
                 setattr(engine, name, self._world_reader(answer, own.__get__(engine)))
         engine._swarm_sockets = self.socket_paths
-        engine._socket_alive = self.socket_is_alive
+        engine._socket_alive = self.socket_liveness
         if self.attached_at is None:
             self.attached_at = int(time.time() * 1000)
         return engine
@@ -26286,8 +26430,7 @@ class _FakeTmux:
             self.next_pid += 1
             if cmd == "new-session":
                 name = socket.name if isinstance(socket, Path) else socket
-                if name not in self.sockets:
-                    self.sockets.append(name)
+                self.sockets[name] = SocketLiveness("alive")
             self.sessions.add(TMUX_SESSION)
             self.panes.append({"session": TMUX_SESSION, "window": "@0",
                                "pane": pane, "pid": pid})
@@ -26310,7 +26453,7 @@ class _Run:
 
 def resume_run(agent_id, *, listed=True, server=None, table=(), registry=(),
                watch=None, prepare=None, inspect=None, observe_launch_action=None,
-               observe_outcome=None, **flags):
+               observe_outcome=None, terminal=None, **flags):
     """Run the real resume path against a writable copy of the corpus.
 
     Only the world outside the process is faked: one tmux server and the
@@ -26324,7 +26467,10 @@ def resume_run(agent_id, *, listed=True, server=None, table=(), registry=(),
     deleted, for the results that live in the tree rather than in the
     return value: another team's roster, an inbox, a restamped transcript.
     `observe_outcome` is handed the Outcome run_one returned, for what the run
-    recorded about its launch rather than how the launch went.
+    recorded about its launch rather than how the launch went. `terminal` is
+    the TerminalContext the run is started from; without it the run reads the
+    environment, which this runner clears of TMUX and TMUX_PANE, so it starts
+    outside tmux.
 
     Returns (outcome, roster entry afterwards, the fake server, printed
     output), or ("refused", ...) when the run died on a refusal.
@@ -26423,7 +26569,7 @@ def resume_run(agent_id, *, listed=True, server=None, table=(), registry=(),
         with capturing("out", into=said), capturing("err", into=said):
             try:
                 out = run_one(_Run(agent_id=agent_id, socket="claude-swarm-test",
-                                   **flags), [], fake.process_rows())
+                                   **flags), [], fake.process_rows(), terminal=terminal)
                 status = out.status
                 if observe_outcome:
                     observe_outcome(out)
@@ -26851,10 +26997,10 @@ def _check_synthetic_sockets_do_not_couple_engines(s):
             [p.name for p in mine._swarm_sockets()] == ["claude-swarm-ours"]
             and [p.name for p in yours._swarm_sockets()] == ["claude-swarm-theirs"],
         "each engine calls only its own socket live":
-            mine._socket_alive("claude-swarm-ours")
-            and not mine._socket_alive("claude-swarm-theirs")
-            and yours._socket_alive("claude-swarm-theirs")
-            and not yours._socket_alive("claude-swarm-ours"),
+            mine._socket_alive("claude-swarm-ours") == SocketLiveness("alive")
+            and mine._socket_alive("claude-swarm-theirs") == SocketLiveness("absent")
+            and yours._socket_alive("claude-swarm-theirs") == SocketLiveness("alive")
+            and yours._socket_alive("claude-swarm-ours") == SocketLiveness("absent"),
         # attach replaces an input on one engine. If it ever reached further,
         # the process-wide resolver would start answering with a fixture's
         # sockets and no unit here would be the one to fail.
@@ -26876,7 +27022,7 @@ def _check_synthetic_sockets_do_not_couple_engines(s):
     replaced = {
         "an empty fixture still lists the sockets": bare._swarm_sockets() == [],
         "an empty fixture still answers liveness":
-            bare._socket_alive("claude-swarm-anything") is False,
+            bare._socket_alive("claude-swarm-anything") == SocketLiveness("absent"),
         "neither answer still comes from the engine's own method":
             getattr(bare._swarm_sockets, "__func__", None)
             is not Resolver._swarm_sockets
@@ -26909,7 +27055,7 @@ def _check_synthetic_sockets_do_not_couple_engines(s):
                and target.value.id == "engine"}
     replaced["both answers are assigned from this fixture, with no branch"] = (
         {("_swarm_sockets", "socket_paths"),
-         ("_socket_alive", "socket_is_alive")} <= plainly)
+         ("_socket_alive", "socket_liveness")} <= plainly)
 
     # Canaries where a delegation would land: an engine with socket answers of
     # its own that record being called and then refuse. attach replaces both,
@@ -26931,7 +27077,7 @@ def _check_synthetic_sockets_do_not_couple_engines(s):
     canary._swarm_sockets, canary._socket_alive = refuse_listing, refuse_liveness
     _FakeTmux(sockets=["claude-swarm-canary"]).attach(canary)
     try:
-        newest = canary._newest_live_socket()
+        newest = canary._newest_live_socket()[0]
     except AssertionError as refused:
         newest = str(refused)
     replaced["the engine's own socket question reaches neither"] = (
@@ -26940,6 +27086,559 @@ def _check_synthetic_sockets_do_not_couple_engines(s):
     check("synthetic-sockets-never-delegate",
           "every fixture answers socket discovery, empty or not",
           not missing, ", ".join(missing) + f"; assigned {sorted(plainly)}")
+    return checked
+
+
+@contextlib.contextmanager
+def _stand_in_connect(meets, attempts):
+    """Give the liveness probe a stand-in socket for the length of the block.
+
+    The suite does not bind a socket, so it does not have a server that takes a
+    connection or one with a full queue of connections waiting to be accepted.
+    The stand-in takes the place of the socket _socket_alive makes: connect
+    appends the address it is given to attempts, raises the exception meets
+    holds for the path's name, and returns when meets holds None or does not
+    hold the name. _socket_alive itself runs unchanged, since the answer it
+    gives for each outcome of connect is what is under test.
+    """
+    class StandIn:
+        def __init__(self, *_args):
+            pass
+
+        def settimeout(self, _seconds):
+            pass
+
+        def connect(self, address):
+            attempts.append(address)
+            met = meets.get(Path(address).name)
+            if met is not None:
+                raise met
+
+        def close(self):
+            pass
+
+    real = socketlib.socket
+    socketlib.socket = StandIn
+    try:
+        yield
+    finally:
+        socketlib.socket = real
+
+
+@unit(('socket-probe-answers-by-what-it-met',
+       'the socket probe answers alive, absent or unknown by what its connection met'),
+      ('socket-probe-overlong-path-is-unknown',
+       'a socket path too long for a unix socket is unknown with its length and the limit, '
+       'and the probe does not connect'),
+      ('socket-liveness-is-not-a-truth-value',
+       'a socket liveness refuses to be read as true or false'))
+def _check_socket_probe_answers(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    eng = Resolver(needs=Needs(maybe=set(NEED)))
+    base = Path(tempfile.mkdtemp(prefix=f"{TOOL}-probe-"))
+
+    def sized(size):
+        """A path of exactly size bytes under base, which does not exist."""
+        name = f"{SOCKET_PREFIX}edge"
+        room = size - len(os.fsencode(str(base))) - 2 - len(name)
+        return base / ("d" * room) / name
+
+    accepts, busy, slow = (f"{SOCKET_PREFIX}accepts", f"{SOCKET_PREFIX}busy",
+                           f"{SOCKET_PREFIX}slow")
+    meets = {accepts: None,
+             busy: BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN)),
+             slow: TimeoutError("timed out")}
+    attempts = []
+    try:
+        plain = base / f"{SOCKET_PREFIX}plain"
+        plain.write_bytes(b"")
+        under, at = sized(SOCKET_PATH_LIMIT - 1), sized(SOCKET_PATH_LIMIT)
+        # What the kernel answers for the paths that do not need a server: a
+        # path that does not exist, a plain file that a server does not listen
+        # on, a path that runs through a file, and the two sides of the length
+        # limit.
+        kernel = {
+            "missing": eng._socket_alive(base / f"{SOCKET_PREFIX}missing"),
+            "plain": eng._socket_alive(plain),
+            "through a file": eng._socket_alive(plain / f"{SOCKET_PREFIX}inner"),
+            "under": eng._socket_alive(under),
+            "at": eng._socket_alive(at),
+        }
+        with _stand_in_connect(meets, attempts):
+            stood_in = {name: eng._socket_alive(base / name) for name in meets}
+            eng._socket_alive(under)
+            eng._socket_alive(at)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+    said = {name: answer.reason for name, answer in {**kernel, **stood_in}.items()}
+    answers = {
+        "a path that does not exist is absent": kernel["missing"] == SocketLiveness("absent"),
+        "a plain file that a server does not listen on is absent": kernel["plain"] == SocketLiveness("absent"),
+        "a path through a file is unknown and names the error":
+            kernel["through a file"].state == "unknown"
+            and os.strerror(errno.ENOTDIR) in kernel["through a file"].reason,
+        "a connection the server takes is alive": stood_in[accepts] == SocketLiveness("alive"),
+        # Linux answers EAGAIN at once when a server listens with a full queue,
+        # and a timeout is the same refusal seen by a probe that waited. Both
+        # say what the user can do about it.
+        "a connection a busy server does not take is unknown, and trying again can succeed":
+            stood_in[busy].state == "unknown"
+            and os.strerror(errno.EAGAIN) in stood_in[busy].reason
+            and "trying again can succeed" in stood_in[busy].reason,
+        "a connection that times out is unknown, and trying again can succeed":
+            stood_in[slow].state == "unknown"
+            and "timed out" in stood_in[slow].reason
+            and "trying again can succeed" in stood_in[slow].reason,
+    }
+    wrong = sorted(name for name, ok in answers.items() if not ok)
+    check("socket-probe-answers-by-what-it-met",
+          "the socket probe answers alive, absent or unknown by what its connection met",
+          not wrong, "; ".join(wrong + ([f"answers {kernel | stood_in}"] if wrong else [])))
+
+    # Python refuses an AF_UNIX path at the limit with an error of its own, and
+    # the probe would answer that as unknown too, so the reason and the
+    # recorded attempts are what show the length was judged first.
+    overlong = {
+        "a path one byte under the limit is connected to and is absent":
+            kernel["under"] == SocketLiveness("absent") and str(under) in attempts,
+        "a path at the limit is unknown": kernel["at"].state == "unknown",
+        "its reason names the path, its length and the limit":
+            str(at) in kernel["at"].reason
+            and f"is {SOCKET_PATH_LIMIT} bytes" in kernel["at"].reason
+            and f"shorter than {SOCKET_PATH_LIMIT}" in kernel["at"].reason,
+        "the probe does not connect to it": str(at) not in attempts,
+    }
+    wrong = sorted(name for name, ok in overlong.items() if not ok)
+    check("socket-probe-overlong-path-is-unknown",
+          "a socket path too long for a unix socket is unknown with its length and the limit, "
+          "and the probe does not connect",
+          not wrong, "; ".join(wrong + ([f"said {said}, attempts {attempts}"] if wrong else [])))
+
+    def refused(make, error):
+        try:
+            make()
+        except error:
+            return True
+        return False
+
+    typed = {
+        f"an {state} answer cannot be read as true or false":
+            refused(lambda state=state: bool(SocketLiveness(
+                state, "a reason" if state == "unknown" else "")), TypeError)
+        for state in SocketLiveness.STATES
+    }
+    typed.update({
+        "an unknown answer without a reason is refused":
+            refused(lambda: SocketLiveness("unknown"), ValueError),
+        "an alive answer with a reason is refused":
+            refused(lambda: SocketLiveness("alive", "a reason"), ValueError),
+        "a state outside the three is refused":
+            refused(lambda: SocketLiveness("dead"), ValueError),
+    })
+    wrong = sorted(name for name, ok in typed.items() if not ok)
+    check("socket-liveness-is-not-a-truth-value",
+          "a socket liveness refuses to be read as true or false",
+          not wrong, "; ".join(wrong))
+    return checked
+
+
+@unit(('cleanup-selects-only-absent-sockets',
+       'cleanup selects an aged socket without a server and keeps live, young and unknown ones'),
+      ('cleanup-revalidation-reports-a-socket-not-absent',
+       'a socket selected for cleanup that now answers alive or unknown is reported changed'),
+      ('socket-listing-leaves-out-a-vanished-socket',
+       'a socket removed between the glob and its stat is left out of the listing'),
+      ('completion-sockets-says-live-dead-or-unknown',
+       'socket completion labels each socket live, dead or unknown'))
+def _check_socket_cleanup_selection(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    # A socket directory of a length that leaves a name of 14 bytes inside the
+    # limit and puts one of 15 at it, so one listing holds both kinds.
+    LIVE, DEAD, YOUNG = (f"{SOCKET_PREFIX}L", f"{SOCKET_PREFIX}D", f"{SOCKET_PREFIX}Y")
+    BUSY, LONG, GONE = (f"{SOCKET_PREFIX}B", f"{SOCKET_PREFIX}OO", f"{SOCKET_PREFIX}G")
+    meets = {LIVE: None,
+             DEAD: ConnectionRefusedError(errno.ECONNREFUSED, os.strerror(errno.ECONNREFUSED)),
+             YOUNG: ConnectionRefusedError(errno.ECONNREFUSED, os.strerror(errno.ECONNREFUSED)),
+             BUSY: BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN))}
+    attempts = []
+    base = Path(tempfile.mkdtemp(prefix=f"{TOOL}-sockets-"))
+    room = SOCKET_PATH_LIMIT - 2 - len(os.fsencode(LIVE)) - len(os.fsencode(str(base))) - 1
+    sockets = base / ("d" * room)
+    try:
+        sockets.mkdir()
+        aged = time.time() - SOCKET_GRACE_S * 2
+        for name in (LIVE, DEAD, BUSY, LONG, YOUNG):
+            (sockets / name).write_bytes(b"")
+            if name != YOUNG:
+                os.utime(sockets / name, (aged, aged))
+        # Listed by the glob and refused by stat, as a socket removed between
+        # the two is: a link to a file that does not exist.
+        (sockets / GONE).symlink_to(sockets / "no-such-socket")
+        sizes = {name: len(os.fsencode(str(sockets / name))) for name in (LIVE, LONG)}
+
+        eng = Resolver(needs=Needs(maybe=set(NEED)))
+        eng._socket_dir = lambda: sockets
+        eng._process_table = lambda refresh=False: ()
+        eng._session_registry = lambda: []
+        eng._seat_index = lambda _table: {}
+
+        def answered(question):
+            """What a question answered, or what it raised, as a string.
+
+            The listing raising is the failure a vanished socket causes. The
+            socket listing, cleanup's selection, socket completion and cleanup's
+            revalidation, through the runtime's seat index, each list the
+            directory, so each is asked on its own and a raise fails the checks
+            that read it.
+            """
+            try:
+                return question()
+            except OSError as error:
+                return f"raised {error!r}"
+
+        with _stand_in_connect(meets, attempts):
+            listed = answered(lambda: [path.name for path in eng._swarm_sockets()])
+            selected = answered(lambda: [path.name for path in eng._dead_sockets()])
+            offered = answered(lambda: {
+                entry["socket"]: entry["state"]
+                for entry in eng._completion_answer("sockets")["entries"]})
+            by_hand = tuple(immutable({
+                "path": sockets / name,
+                "generation": eng._path_generation(sockets / name),
+            }) for name in (DEAD, LIVE, BUSY, LONG))
+            verdict = answered(lambda: eng.revalidate_cleanup(immutable({
+                "dead_sockets": by_hand,
+                "team_actions": (),
+                "process_generation": eng._runtime_generation(
+                    eng._runtime(()), agent_ids=(), sessions=(), teams=()),
+                "process_agents": (), "process_sessions": (), "process_teams": (),
+            })))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+    chosen = selected if isinstance(selected, list) else None
+    selection = {
+        "the directory puts a 14-byte name inside the limit and a 15-byte one at it":
+            sizes == {LIVE: SOCKET_PATH_LIMIT - 1, LONG: SOCKET_PATH_LIMIT},
+        "cleanup answers": chosen is not None,
+        "the aged socket without a server is selected": chosen is not None and DEAD in chosen,
+        "the live socket is kept": chosen is not None and LIVE not in chosen,
+        "a socket inside the grace is kept": chosen is not None and YOUNG not in chosen,
+        "a socket a busy server did not answer on is kept":
+            chosen is not None and BUSY not in chosen,
+        "a socket with a path too long to probe is kept":
+            chosen is not None and LONG not in chosen,
+        "exactly the aged socket without a server is selected": chosen == [DEAD],
+    }
+    wrong = sorted(name for name, ok in selection.items() if not ok)
+    check("cleanup-selects-only-absent-sockets",
+          "cleanup selects an aged socket without a server and keeps live, young and unknown ones",
+          not wrong, "; ".join(wrong + ([f"selected {selected}, listed {listed}"]
+                                        if wrong else [])))
+
+    changed = set(verdict["changed"]) if isinstance(verdict, Mapping) else None
+    revalidated = {
+        "revalidation answers": changed is not None,
+        "the socket that is still absent is not reported":
+            changed is not None and f"socket {DEAD}" not in changed,
+        "a live one is reported": changed is not None and f"socket {LIVE}" in changed,
+        "a busy one is reported": changed is not None and f"socket {BUSY}" in changed,
+        "one with a path too long to probe is reported":
+            changed is not None and f"socket {LONG}" in changed,
+        "the selection does not match":
+            isinstance(verdict, Mapping) and not verdict["matches"],
+    }
+    wrong = sorted(name for name, ok in revalidated.items() if not ok)
+    check("cleanup-revalidation-reports-a-socket-not-absent",
+          "a socket selected for cleanup that now answers alive or unknown is reported changed",
+          not wrong, "; ".join(wrong + ([f"verdict {verdict}"] if wrong else [])))
+
+    vanished = {
+        "the listing answers": isinstance(listed, list),
+        "the vanished socket is left out": isinstance(listed, list) and GONE not in listed,
+        # Newest first, and the young socket is the newest by far.
+        "the live, aged, young, busy and overlong sockets are listed, newest first":
+            isinstance(listed, list) and listed[:1] == [YOUNG]
+            and sorted(listed) == sorted((LIVE, DEAD, YOUNG, BUSY, LONG)),
+    }
+    wrong = sorted(name for name, ok in vanished.items() if not ok)
+    check("socket-listing-leaves-out-a-vanished-socket",
+          "a socket removed between the glob and its stat is left out of the listing",
+          not wrong, "; ".join(wrong + ([f"listed {listed}"] if wrong else [])))
+
+    shown = offered if isinstance(offered, dict) else None
+    labels = {
+        "completion answers": shown is not None,
+        "a live socket is offered as live": shown is not None and shown.get(LIVE) == "live",
+        "a socket without a server is offered as dead":
+            shown is not None and shown.get(DEAD) == "dead" and shown.get(YOUNG) == "dead",
+        "an unknown socket is offered as unknown":
+            shown is not None and shown.get(BUSY) == "unknown"
+            and shown.get(LONG) == "unknown",
+    }
+    wrong = sorted(name for name, ok in labels.items() if not ok)
+    check("completion-sockets-says-live-dead-or-unknown",
+          "socket completion labels each socket live, dead or unknown",
+          not wrong, "; ".join(wrong + ([f"offered {offered}"] if wrong else [])))
+    return checked
+
+
+@unit(('unknown-socket-is-never-live',
+       'an unknown socket is not the newest live socket, and its panes and '
+       'session are not asked for'),
+      ('unknown-socket-state-gives-the-reason',
+       'the state line of an unknown socket reads unknown with the reason'),
+      ('poison-refuses-an-unknown-socket',
+       '--poison on an unknown socket stops with the reason and leaves the server environment as it was'),
+      ('attach-skips-an-unknown-socket',
+       'the attach decision on an unknown socket skips it and gives the reason'))
+def _check_unknown_socket_callers(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    # Newest first, so the unknown socket is the newest one.
+    unknown_socket, up, gone = (f"{SOCKET_PREFIX}unknown", f"{SOCKET_PREFIX}up",
+                                f"{SOCKET_PREFIX}gone")
+    reason = "the fixture's probe could not tell"
+    server = _FakeTmux(
+        panes=[{"session": TMUX_SESSION, "window": "@0", "pane": "%0",
+                "pid": PID_CEILING + 9100}],
+        sockets={unknown_socket: SocketLiveness("unknown", reason), up: SocketLiveness("alive"),
+                 gone: SocketLiveness("absent")})
+    asked = []
+
+    def recorded(socket, *args):
+        asked.append((socket.name if isinstance(socket, Path) else socket, args))
+        return server(socket, *args)
+
+    engine = Resolver(needs=Needs(maybe=set(NEED)))
+    with server.installed(engine, through=recorded):
+        newest = engine._newest_live_socket()[0]
+        # The seat index is read through the runtime, its one caller.
+        engine._runtime(())
+        session = engine._swarm_session_live(unknown_socket, engine._socket_alive(unknown_socket))
+        states = {name: engine._socket_state(name) for name in (unknown_socket, up, gone)}
+        fact = engine._tmux_server_fact(unknown_socket)
+        before, probing = dict(server.env), len(asked)
+        poisoned = {}
+        for flags in ({"poison": True, "dry_run": False}, {"poison": False, "dry_run": True}):
+            try:
+                with capturing("out"), capturing("err"):
+                    run_poison(types.SimpleNamespace(socket=unknown_socket, **flags))
+                poisoned[flags["poison"]] = "returned"
+            except Refusal as refusal:
+                poisoned[flags["poison"]] = refusal.said
+        poisoning = len(asked)
+        decision = engine.attach_decision(unknown_socket, TerminalContext(), attach=True, is_tty=True)
+    on_unknown_socket = [args for socket, args in asked[:probing] if socket == unknown_socket]
+    poisoned_unknown_socket = [args for socket, args in asked[probing:poisoning] if socket == unknown_socket]
+
+    never = {
+        "the newest live socket is the older one with a server": newest == up,
+        "the seat index asks for the panes of the live socket only":
+            [socket for socket, args in asked if args[:1] == ("list-panes",)] == [up],
+        "the swarm session check does not count its session as live": session is False,
+        "tmux is not run against it": not on_unknown_socket,
+    }
+    wrong = sorted(name for name, ok in never.items() if not ok)
+    check("unknown-socket-is-never-live",
+          "an unknown socket is not the newest live socket, and its panes and "
+          "session are not asked for",
+          not wrong, "; ".join(wrong + ([f"newest {newest}, asked {asked}"] if wrong else [])))
+
+    stated = {
+        "the state line reads unknown with the reason": states[unknown_socket] == f"unknown: {reason}",
+        'a socket without a server still reads "no server"': states[gone] == "no server",
+        "a live socket still reads live": states[up].startswith("live, "),
+        "the server observation carries the answer and the same line":
+            fact["liveness"] == SocketLiveness("unknown", reason)
+            and fact["state"] == f"unknown: {reason}",
+        "the observation does not read the server's pid, panes or environment":
+            fact["server"] is None and fact["panes"] == () and fact["base_url"] == "",
+    }
+    wrong = sorted(name for name, ok in stated.items() if not ok)
+    check("unknown-socket-state-gives-the-reason",
+          "the state line of an unknown socket reads unknown with the reason",
+          not wrong, "; ".join(wrong + ([f"states {states}"] if wrong else [])))
+
+    refusal = f"the state of the tmux server on {unknown_socket} is unknown: {reason}"
+    poison = {
+        "--poison stops with the reason": refusal in str(poisoned.get(True)),
+        "--unpoison --dry-run stops with it too": refusal in str(poisoned.get(False)),
+        "the server's environment is as it was": dict(server.env) == before,
+        "tmux is not run against the socket": not poisoned_unknown_socket,
+    }
+    wrong = sorted(name for name, ok in poison.items() if not ok)
+    check("poison-refuses-an-unknown-socket",
+          "--poison on an unknown socket stops with the reason and leaves the server environment as it was",
+          not wrong, "; ".join(wrong + ([f"said {poisoned}"] if wrong else [])))
+
+    attach = {
+        "it is skipped, not attached and not refused": decision["action"] == "skip",
+        "the reason gives the probe's reason": reason in (decision["reason"] or ""),
+        "the decision carries the answer": decision["liveness"] == SocketLiveness("unknown", reason),
+    }
+    wrong = sorted(name for name, ok in attach.items() if not ok)
+    check("attach-skips-an-unknown-socket",
+          "the attach decision on an unknown socket skips it and gives the reason",
+          not wrong, "; ".join(wrong + ([f"decision {dict(decision)}"] if wrong else [])))
+    return checked
+
+
+@unit(('socket-control-answer-probes-each-socket-once',
+       'the socket control answer probes each socket it looks at once, and its '
+       'state line and liveness come from that probe'))
+def _check_socket_control_probes(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    # Newest first, so selecting the newest live socket probes the unknown
+    # socket and then the live one.
+    unknown_socket, up, gone = (f"{SOCKET_PREFIX}unknown", f"{SOCKET_PREFIX}up",
+                                f"{SOCKET_PREFIX}gone")
+    reason = "the fixture's probe could not tell"
+    server = _FakeTmux(sockets={unknown_socket: SocketLiveness("unknown", reason),
+                                up: SocketLiveness("alive"), gone: SocketLiveness("absent")})
+    probed, answers = [], {}
+    engine = Resolver(needs=Needs(maybe=set(NEED)))
+    with server.installed(engine):
+        # installed() puts the engine's own probe back on the way out, so the
+        # counting wrapper ends with this block.
+        fixture_probe = engine._socket_alive
+
+        def counted(socket):
+            probed.append(socket.name if isinstance(socket, Path) else socket)
+            return fixture_probe(socket)
+
+        engine._socket_alive = counted
+        for requested in (None, up, unknown_socket, gone):
+            before = len(probed)
+            answer = engine.socket_control_answer(requested)
+            answers[requested] = (answer, probed[before:])
+
+    live = "live, 0 clients attached"
+    selected, selecting = answers[None]
+    facts = {
+        "selecting the newest live socket probes each socket up to it once":
+            selecting == [unknown_socket, up] and selected["socket"] == up,
+        "and the selecting probe gives the answer's liveness and state line":
+            selected["liveness"] == SocketLiveness("alive") and selected["state"] == live,
+        "a requested live socket is probed once and reads live":
+            answers[up][1] == [up] and answers[up][0]["state"] == live,
+        "a requested unknown socket is probed once and reads unknown with the reason":
+            answers[unknown_socket][1] == [unknown_socket]
+            and answers[unknown_socket][0]["state"] == f"unknown: {reason}",
+        'a requested socket without a server is probed once and reads "no server"':
+            answers[gone][1] == [gone] and answers[gone][0]["state"] == "no server",
+    }
+    wrong = sorted(name for name, ok in facts.items() if not ok)
+    shown = {requested or "newest": (asked, answer["state"])
+             for requested, (answer, asked) in answers.items()}
+    check("socket-control-answer-probes-each-socket-once",
+          "the socket control answer probes each socket it looks at once, and its "
+          "state line and liveness come from that probe",
+          not wrong, "; ".join(wrong + ([f"probed and read {shown}"] if wrong else [])))
+    return checked
+
+
+@unit(('launch-refuses-an-unknown-socket',
+       'a launch on an unknown socket refuses before any tmux command and '
+       'gives back its roster claim'),
+      ('launch-refusal-in-a-dry-run',
+       'a dry run on an unknown socket reports the same refusal'),
+      ('in-pane-launch-runs-beside-an-unknown-socket',
+       'a launch that runs in the current pane does not refuse over its socket'))
+def _check_launch_refuses_unknown_socket(s):
+    checked = []
+
+    def check(cid, name, ok, detail=""):
+        checked.append((cid, name, ok, detail))
+
+    socket, reason = "claude-swarm-test", "the fixture's probe could not tell"
+    refusal = f"did not launch: the state of the tmux server on {socket} is unknown: {reason}"
+
+    def recorded_pane(corpus):
+        """willow's roster entry records a pane, which the run cannot check."""
+        path = corpus / "teams" / "session-corpus-alpha" / "config.json"
+        roster = json.loads(path.read_text())
+        for member in roster["members"]:
+            if member.get("name") == "willow":
+                member["tmuxPaneId"] = "%3"
+        path.write_text(json.dumps(roster))
+
+    def run(**flags):
+        plans = []
+        server = _FakeTmux(sockets={socket: SocketLiveness("unknown", reason)})
+        status, entry, server, said = resume_run(
+            "willow@session-corpus-alpha", server=server, prepare=recorded_pane,
+            observe_launch_action=plans.append, **flags)
+        # Flattened, since the report wraps a long line at the terminal's width.
+        return types.SimpleNamespace(status=status, entry=entry, ran=server.ran,
+                                     said=" ".join(without_wrap_arrows(said).split()),
+                                     actions=[plan["action"] for plan in plans])
+
+    launched, previewed = run(), run(dry_run=True)
+    # Only when a tool does not drive the run: a run under one never runs in its pane.
+    driving = os.environ.pop("CLAUDECODE", None)
+    try:
+        in_pane = run(dry_run=True, terminal=TerminalContext(seat=Seat(socket, "%3")))
+    finally:
+        if driving is not None:
+            os.environ["CLAUDECODE"] = driving
+    unchecked = f"(recorded %3, not checked: the state of the server on {socket} is unknown)"
+    left = {"agentId": "willow@session-corpus-alpha", "name": "willow", "tmuxPaneId": "%3"}
+
+    refused = {
+        "the plan selects a refusal": launched.actions == ["refuse"],
+        "the run fails rather than launching": launched.status == "failed",
+        "it says why": refusal in launched.said,
+        "tmux is not run": launched.ran == [],
+        "the roster entry is as it was before the claim": launched.entry == left,
+        "the recorded pane is reported as not checked": unchecked in launched.said,
+    }
+    wrong = sorted(name for name, ok in refused.items() if not ok)
+    check("launch-refuses-an-unknown-socket",
+          "a launch on an unknown socket refuses before any tmux command and "
+          "gives back its roster claim",
+          not wrong, "; ".join(wrong + ([f"{launched.status}, ran {launched.ran}, "
+                                         f"entry {launched.entry}"] if wrong else [])))
+
+    dry = {
+        "the preview selects the same refusal": previewed.actions == ["refuse"],
+        "it reports the refusal": refusal in previewed.said,
+        "it fails as the launch would": previewed.status == "failed",
+        "it does not run tmux": previewed.ran == [],
+    }
+    wrong = sorted(name for name, ok in dry.items() if not ok)
+    check("launch-refusal-in-a-dry-run",
+          "a dry run on an unknown socket reports the same refusal",
+          not wrong, "; ".join(wrong + ([f"{previewed.status}, said {previewed.said[-300:]}"]
+                                        if wrong else [])))
+
+    here = {
+        "it runs in the pane": "running here rather than splitting" in in_pane.said,
+        "it does not refuse": "did not launch" not in in_pane.said,
+        "it launches": in_pane.status == "launched",
+        "it does not reach the tmux launch": in_pane.actions == [],
+    }
+    wrong = sorted(name for name, ok in here.items() if not ok)
+    check("in-pane-launch-runs-beside-an-unknown-socket",
+          "a launch that runs in the current pane does not refuse over its socket",
+          not wrong, "; ".join(wrong + ([f"{in_pane.status}, said {in_pane.said[-300:]}"]
+                                        if wrong else [])))
     return checked
 
 
@@ -32500,9 +33199,15 @@ def _check_attach_only_if_server(s):
     real_attach = globals()["maybe_attach"]
     real_one_fn = globals()["run_one"]
     offered_at = []
+    # A server may be listening on sock-unknown, and the offer is still
+    # withheld, since attaching would run tmux against a server that did not
+    # answer.
+    answers = {"sock-dead": SocketLiveness("absent"),
+               "sock-unknown": SocketLiveness("unknown", "the fixture says so"),
+               "sock-live": SocketLiveness("alive")}
     try:
         RESOLVER.attach_decision = lambda socket, *_args, **_kwargs: immutable({
-            "socket": socket, "alive": socket == "sock-live", "action": "skip",
+            "socket": socket, "liveness": answers[socket], "action": "skip",
         })
         globals()["maybe_attach"] = lambda decision: offered_at.append(decision["socket"])
         globals()["run_one"] = (
@@ -32512,7 +33217,7 @@ def _check_attach_only_if_server(s):
         class _AttachJob:
             dry_run, no_attach, attach, agent_id = False, False, False, None
         with capturing("out"):
-            for sock in ("sock-dead", "sock-live"):
+            for sock in answers:
                 job = _AttachJob()
                 job.socket = sock
                 run_agents(job, [], {}, [(None, job)], socket=sock)
@@ -34840,7 +35545,7 @@ def _check_ctrl_x_covers_only_what_the_run_started(s):
             lambda started, socket: handed.append((started, socket)) and False)
         globals()["maybe_attach"] = lambda decision: None
         RESOLVER.attach_decision = lambda socket, *_args, **_kwargs: immutable({
-            "socket": socket, "alive": True, "action": "attach"})
+            "socket": socket, "liveness": SocketLiveness("alive"), "action": "attach"})
         jobs = [(job, _Run(job=job)) for job in
                 ("team-lead", "running", "fresh", "slow", "refused")]
         with capturing("out"), capturing("err"):
@@ -34911,7 +35616,7 @@ def _check_swarm_offer_fallback(s):
     asked = []
     try:
         RESOLVER.attach_decision = lambda socket, *_args, **_kwargs: immutable({
-            "socket": socket, "alive": True, "action": "skip",
+            "socket": socket, "liveness": SocketLiveness("alive"), "action": "skip",
         })
         globals()["maybe_attach"] = lambda decision: asked.append(decision["socket"])
         offers = {}
@@ -39672,7 +40377,7 @@ def _check_live_seat_walks_pane_children(s):
     queried, registries = [], []
     eng._session_registry = lambda: registries.append("read") or []
     eng._swarm_sockets = lambda: sockets
-    eng._socket_alive = lambda socket: True
+    eng._socket_alive = lambda socket: SocketLiveness("alive")
     eng._list_panes = lambda socket: (queried.append(socket), panes.get(socket, []))[1]
 
     agent = eng._agent_runtime(agent_id, table)
@@ -41551,7 +42256,7 @@ def _check_completion_parses_leads(s):
     fake = _FakeTmux(sockets=["claude-swarm-completion"])
     with tempfile.TemporaryDirectory() as td, fake.installed(s.corpus_engine()):
         fake.socket_dir = Path(td)
-        (fake.socket_dir / fake.sockets[0]).touch()
+        (fake.socket_dir / next(iter(fake.sockets))).touch()
         for topic in ("names", "teams", "leads", "sockets", "sessions", "sides"):
             buffer = io.StringIO()
             with capturing("out", into=buffer):
