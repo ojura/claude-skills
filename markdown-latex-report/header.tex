@@ -260,6 +260,44 @@
 \setlength{\LTpre}{6pt}
 \setlength{\LTpost}{6pt}
 
+% ---- longtable on a page that already holds floats ----
+% \@colroom is the height left for text on the current page after the floats
+% in its top and bottom areas. Each time LaTeX's output routine runs, for a
+% float, a marginal note or a page break, it sets \vsize, the height at which
+% TeX breaks the page, to \@colroom. longtable's \LT@start sets \@colroom to
+% the full column height \@colht when a table starts (longtable 4.19, in TeX
+% Live 2023, and 4.27 of 2026-01-28 both do). When a figure already sits at
+% the top or bottom of that page and another figure follows the table on the
+% same page, the text therefore gets the full page height and the figures
+% already placed are added to it: the page overflows by their height
+% ("Overfull \vbox ... has occurred while \output is active"), and its last
+% lines and footnotes print below the edge of the paper. Only floating
+% figures or tables trigger this, for example after
+% \floatplacement{figure}{tbp} in the YAML include-before; with the default
+% [H] set below, figures are set in the text flow and never enter those areas.
+% The patch removes the reset from \LT@start, so the page on which a table
+% starts keeps the room its floats take, and sets the full height, less the
+% table's foot, only after the page breaks that longtable makes itself,
+% because the page that follows such a break starts without floats. A
+% \FloatBarrier before the table would not help: it acts on floats that are
+% still waiting for a page, and a figure already placed at the top of the
+% current page is not one of them. If a later longtable changes this code,
+% \patchcmd leaves the macro as it is and the log shows the warning below.
+\makeatletter
+\def\report@LTfullcolroom{\global\@colroom\@colht
+  \ifvoid\LT@foot\else\global\advance\@colroom-\ht\LT@foot\fi}
+\def\report@LTnotpatched#1{\PackageWarningNoLine{markdown-latex-report}%
+  {longtable not patched (part #1); a page that holds\MessageBreak
+   floats can overflow at a longtable}}
+\patchcmd{\LT@start}{\global\@colroom\@colht}{}{}{\report@LTnotpatched{1}}
+\patchcmd{\LT@output}{\@outputpage\global\vsize\@colroom}%
+  {\@outputpage\report@LTfullcolroom\global\vsize\@colroom}{}%
+  {\report@LTnotpatched{2}}
+\patchcmd{\LT@output}{\@outputpage\global\vsize\@colroom}%
+  {\@outputpage\report@LTfullcolroom\global\vsize\@colroom}{}%
+  {\report@LTnotpatched{3}}
+\makeatother
+
 % ---- Graphics extension priority: prefer PDF over PNG ----
 % (allows extensionless image refs in markdown, or works alongside
 %  the report's explicit `.pdf` refs.)
