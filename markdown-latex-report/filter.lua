@@ -5,7 +5,9 @@
 --         * auto-sized column widths (weight = 2 * longest_unbreakable_token
 --           + sqrt(max_content_length); short cols don't get over-allocated,
 --           long-text cols don't starve neighbours);
---         * raggedright p{...} columns (no mid-word hyphenation);
+--         * p{...} columns aligned as the Markdown marks them (left by
+--           default, "---:" right, ":-:" centre), without mid-word
+--           hyphenation;
 --         * faint \hline between body rows (color set in header.tex);
 --         * single-bold-cell rows rendered as \multicolumn section labels.
 --
@@ -100,7 +102,10 @@ end
 --                              lives inside \texttt{}).
 --   penalty 9999 (LONG_RUN)    last-resort letter-by-letter split (below).
 -- (*real interword spaces are glue, not penalty nodes, but rank with 0.)
-local WORD_BREAK = "\\penalty 250 "
+-- The braces end the penalty's number, so a space that follows in the
+-- source ("a - b") stays a space; a bare "\penalty 250 " would take that
+-- space as the end of the number and print "a -b".
+local WORD_BREAK = "{\\penalty 250}"
 
 -- Last-resort: insert a high-penalty break opportunity between letters
 -- in any alphabetic run of >=14 chars with no internal separator.
@@ -594,15 +599,21 @@ function Table(t)
 
   local col_spec = {}
   for i = 1, n_cols do
-    -- \raggedright + \sloppy + finite emergencystretch: the line-breaker is
-    -- told both that ragged-right lines are fine AND that it has slack to
+    -- Alignment from the Markdown markers: "---:" right (numeric columns, so
+    -- that their digits line up), ":-:" centre, anything else left.
+    local a = t.colspecs and t.colspecs[i] and t.colspecs[i][1]
+    local align = "\\raggedright"
+    if a == "AlignRight" then align = "\\raggedleft"
+    elseif a == "AlignCenter" then align = "\\centering" end
+    -- Ragged alignment + \sloppy + finite emergencystretch: the line-breaker
+    -- is told both that ragged lines are fine AND that it has slack to
     -- avoid overshooting. Without \sloppy + emergencystretch, TeX can
     -- still prefer a high-penalty mid-identifier break over a short, well-
     -- behaved /-break, because the badness model under just \raggedright
     -- doesn't fully neutralise short-line cost in <texttt> cells.
     col_spec[i] = string.format(
-      ">{\\raggedright\\sloppy\\emergencystretch=3em\\arraybackslash}p{%.4f\\textwidth}",
-      widths[i])
+      ">{%s\\sloppy\\emergencystretch=3em\\arraybackslash}p{%.4f\\textwidth}",
+      align, widths[i])
   end
   local spec = "@{}" .. table.concat(col_spec, " ") .. "@{}"
 
@@ -712,7 +723,10 @@ end
 -- tt_insert_breaks before re-wrapping in \texttt{}.
 local function latex_escape(s)
   s = s:gsub("\\", "\\textbackslash{}")
-  s = s:gsub("([&%%#%${}_^])", "\\%1")
+  s = s:gsub("([&%%#%${}_])", "\\%1")
+  -- "^" escaped as "\^" would be the circumflex accent on the next
+  -- character; \textasciicircum prints the caret itself.
+  s = s:gsub("%^", "\\textasciicircum{}")
   s = s:gsub("\\textbackslash{}", "\\textbackslash{}")  -- restore
   s = s:gsub("<", "\\textless{}")
   s = s:gsub(">", "\\textgreater{}")

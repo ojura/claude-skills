@@ -95,28 +95,36 @@
             allbordercolors={1 1 1}]{hyperref}
 
 % ---- Heading styles via plain \makeatletter overrides (no titlesec) ----
-% Orphaned-heading control: LaTeX's \@afterheading nobreak only protects the
-% heading from a break before a normal PARAGRAPH; blocks that open with their
-% own breakable glue (longtable's \LTpre, fancyvrb frames, [H] floats) let the
-% page break right after a heading, stranding it at the page bottom. needspace
-% (bundled locally, see Makefile) reserves room ahead of each heading: enough
-% for the heading itself plus what can follow it: a stacked subordinate
-% heading (deepest observed stack is 2) INCLUDING that child's own needspace
-% reserve (else the child's break orphans the parent), or a longtable's
-% caption+header+first-row chunk. Sized cascade-proof (12/9/6 baselines: each level covers its possible child's own reserve):
-% headings low on a page look poor even when technically non-orphaned, and
-% the only cost is a page occasionally ending a few lines early.
+% Space reserve before headings. LaTeX's \@afterheading keeps a heading with
+% a following PARAGRAPH only; blocks that open with their own breakable glue
+% (longtable's \LTpre, fancyvrb frames, [H] figures) let the page break right
+% after a heading and leave the heading alone at the bottom of the page. So
+% each heading first reserves room for itself and what can follow it: a
+% subordinate heading together with that heading's own reserve, or a
+% longtable's caption, header and first row. The reserves are 12, 9 and 6
+% baselines for levels 1, 2 and 3; each covers the reserve of the level below.
+% \Needspace* (from the bundled needspace.sty) breaks the page only when the
+% remaining space is shorter than the reserve. The plain \needspace is not
+% used because its stretchable glue and penalty -100 make a break before the
+% heading cost less than the breaks in the material that follows, so TeX
+% takes it: a heading that directly follows another heading then stays alone
+% at the bottom of the page, the space before a heading followed by a table
+% or an [H] figure stays empty, and when the break is taken after a longtable
+% has started, the table's continuation header prints above the heading.
+% \if@nobreak is true directly after a heading; a heading that follows
+% another one skips its own reserve, which the heading above already covers.
 \usepackage{needspace}
 \makeatletter
-\renewcommand\section{\needspace{12\baselineskip}\@startsection{section}{1}{\z@}%
+\newcommand\headingreserve[1]{\if@nobreak\else\Needspace*{#1}\fi}
+\renewcommand\section{\headingreserve{12\baselineskip}\@startsection{section}{1}{\z@}%
   {-3.5ex plus -1ex minus -.2ex}%
   {2.0ex plus .2ex}%
   {\normalfont\Large\bfseries\color{accent}}}
-\renewcommand\subsection{\needspace{9\baselineskip}\@startsection{subsection}{2}{\z@}%
+\renewcommand\subsection{\headingreserve{9\baselineskip}\@startsection{subsection}{2}{\z@}%
   {-2.5ex plus -1ex minus -.2ex}%
   {1.2ex plus .2ex}%
   {\normalfont\large\bfseries\color{accent}}}
-\renewcommand\subsubsection{\needspace{6\baselineskip}\@startsection{subsubsection}{3}{\z@}%
+\renewcommand\subsubsection{\headingreserve{6\baselineskip}\@startsection{subsubsection}{3}{\z@}%
   {-2.0ex plus -.7ex minus -.2ex}%
   {.8ex plus .2ex}%
   {\normalfont\normalsize\bfseries\color{accent!75!black}}}
@@ -211,8 +219,14 @@
 \usepackage{fancyhdr}
 \pagestyle{fancy}
 \fancyhf{}
-% Running header text. Set \runninghead in your document (or via pandoc
-% header-includes) to put a label top-left; defaults to empty.
+% Running header text: \runninghead, printed top left, empty by default. A
+% document sets it through the YAML field include-before, which pandoc places
+% right after \begin{document}, for example
+%   include-before: |
+%     \renewcommand{\runninghead}{\nouppercase{\leftmark}}
+% for the current section title, or a fixed short title. A YAML
+% header-includes value does not reach the preamble, because the Makefile's
+% --include-in-header replaces it.
 \providecommand{\runninghead}{}
 \fancyhead[L]{\small\color{ruleline}\runninghead}
 \fancyhead[R]{\small\color{ruleline}\thepage}

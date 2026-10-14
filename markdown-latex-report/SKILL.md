@@ -22,7 +22,8 @@ table of contents, running headers, and no widows or orphans.
 - `filter.lua` - the pandoc Lua filter doing the heavy lifting:
   1. renders every Markdown table as a raw-LaTeX longtable with column widths
      computed from content (long-text columns dampened, short columns floored,
-     any single column capped), raggedright cells, no mid-word hyphenation;
+     any single column capped), cells aligned as the Markdown marks them
+     (left by default, `---:` right, `:-:` centre), no mid-word hyphenation;
   2. inserts break opportunities inside inline code and link text at identifier
      boundaries, with last-resort letter breaks for very long alphabetic runs;
   3. discourages breaks inside bracketed groups.
