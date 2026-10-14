@@ -11,13 +11,19 @@ What it appends (validated empirically 2026-08-03):
      from the file's final last-prompt line, not from the last chain entry.
      Without it the new entry is silently ignored.
 
-The default leaf is the file's LAST conversation entry, not the trailing
-last-prompt's leafUuid. A last-prompt is written only when the operator
-submits a prompt, so turns driven by teammate messages append entries
-without one and that pointer falls behind. Grafting onto the stale pointer
-orphans every turn after it, since they stop being ancestors of the new
-boundary and no logicalParentUuid walk can reach them again. When the two
-disagree the tool says so and grafts at the real tip.
+The default leaf is the end of the chain that continues from the file's last
+user or assistant entry, not the trailing last-prompt's leafUuid. A
+last-prompt is written only when the operator submits a prompt, so turns
+driven by teammate messages append entries without one and that pointer
+falls behind. Grafting onto the stale pointer would leave every turn after it
+out of the new boundary's ancestry, where no logicalParentUuid walk can reach
+them again. The records that follow the last turn (its turn_duration, a
+local command and its output, a queued message nobody answered) are its
+descendants, so the default leaf follows them and they stay ancestors of the
+boundary. It follows parent links, not file order, because the harness can
+write a record above its parent. When the last-prompt names a different
+entry the tool says so, with that entry's type, line and distance from the
+leaf.
 
 Optionally trims a dead tail first (--leaf): keeps everything up to and
 including the target entry, plus an immediately-following last-prompt line
@@ -131,6 +137,15 @@ def load(path):
     return entries, glued
 
 
+def kind(d):
+    """An entry's type with its subtype or attachment type, as in
+    system/local_command or attachment/queued_command."""
+    sub = d.get("subtype")
+    if not sub and isinstance(d.get("attachment"), dict):
+        sub = d["attachment"].get("type")
+    return f"{d.get('type')}/{sub}" if sub else str(d.get("type"))
+
+
 def ref_check(entries):
     """Return (field, uuid) refs that do not resolve in-file.
     Pre-existing danglers are legal (cross-file logicalParentUuid from
@@ -199,38 +214,75 @@ def main():
     else:
         kept = entries
         trimmed = []
-        # The graft leaf is the file's last conversation entry, NOT the trailing
-        # last-prompt's leafUuid. A last-prompt is written only when the operator
-        # submits a prompt, so on a session whose final turns were driven by
-        # teammate messages (which append entries but no last-prompt) that pointer
-        # lags behind the real tip. Grafting onto it orphans every turn after it:
-        # they stop being ancestors of the new boundary, so no walk that follows
-        # logicalParentUuid can reach them again, and they are silently gone.
-        chain = [d for _, d, _ in kept
-                 if d.get("uuid") and d.get("type") in ("user", "assistant")
-                 and not d.get("isSidechain")]
-        if not chain:
+        # The graft leaf is the end of the chain that continues from the file's
+        # last user or assistant entry, NOT the trailing last-prompt's leafUuid.
+        # A last-prompt is written only when the operator submits a prompt, so on
+        # a session whose final turns were driven by teammate messages (which
+        # append entries but no last-prompt) that pointer lags behind the real
+        # tip. Grafting onto it would leave every turn after it out of the new
+        # boundary's ancestry, where no walk that follows logicalParentUuid
+        # reaches them.
+        main_entries = [(n, d) for n, d, _ in kept
+                if d.get("uuid") and not d.get("isSidechain")]
+        turns = [t for t in main_entries if t[1].get("type") in ("user", "assistant")]
+        if not turns:
             die("no conversation entry with a uuid found; nothing to hang the leaf on")
-        leaf_uuid = chain[-1]["uuid"]
+        # The records that follow the last turn (turn_duration, a local command
+        # and its output, a queued message nobody answered) are its descendants;
+        # follow them so they stay on the boundary's ancestry. Follow the links,
+        # not the file order: the harness can write a record before its parent
+        # (a turn_duration one line above the reply it times, a "Not logged in"
+        # reply above the prompt it answers). File order only picks among
+        # siblings, taking the branch written last.
+        children = {}
+        for t in main_entries:
+            children.setdefault(t[1].get("parentUuid"), []).append(t)
+        last_turn = tip = turns[-1]
+        steps, seen = 0, {tip[1]["uuid"]}
+        while children.get(tip[1]["uuid"]):
+            nxt = children[tip[1]["uuid"]][-1]
+            if nxt[1]["uuid"] in seen:
+                print(f"note: the parent links after {last_turn[1]['uuid']} loop back to "
+                      f"{nxt[1]['uuid']} (line {nxt[0]}); stopping at the entry before it")
+                break
+            seen.add(nxt[1]["uuid"])
+            tip = nxt
+            steps += 1
+        leaf_uuid = tip[1]["uuid"]
         last_prompts = [d for _, d, _ in kept
                         if d.get("type") == "last-prompt" and d.get("leafUuid")]
         if last_prompts and last_prompts[-1]["leafUuid"] != leaf_uuid:
             cand = last_prompts[-1]["leafUuid"]
-            idx = next((i for i, d in enumerate(chain) if d.get("uuid") == cand), None)
-            if idx is None:
-                print(f"note: the trailing last-prompt names {cand}, which is not a "
-                      "conversation entry in this file; grafting at the last entry instead")
+            anywhere = {d["uuid"]: (n, d) for n, d, _ in kept if d.get("uuid")}
+            by_uuid = {t[1]["uuid"]: t for t in main_entries}
+            # the leaf's ancestors, newest first, until cand or the root
+            ancestors, cur, seen = [], tip, set()
+            while cur is not None and cur[1]["uuid"] != cand and cur[1]["uuid"] not in seen:
+                seen.add(cur[1]["uuid"])
+                ancestors.append(cur)
+                cur = by_uuid.get(cur[1].get("parentUuid"))
+            if cand not in anywhere:
+                print(f"note: the trailing last-prompt names {cand}, which is not an "
+                      "entry in this file; grafting at the leaf below instead")
+            elif cur is None or cur[1]["uuid"] != cand:
+                n, d = anywhere[cand]
+                print(f"note: the trailing last-prompt names {cand} ({kind(d)}, line {n}), "
+                      "which is not an ancestor of the leaf below; grafting at the leaf instead")
             else:
-                n = len(chain) - 1 - idx
-                print(f"note: the trailing last-prompt names {cand}, which is {n} "
-                      f"conversation entr{'y' if n == 1 else 'ies'} short of the end "
-                      f"of the file; grafting at the last entry instead so those {n} "
-                      "are not orphaned")
+                n, d = anywhere[cand]
+                k = len(ancestors)
+                c = sum(1 for t in ancestors if t[1].get("type") in ("user", "assistant"))
+                where = ("the leaf below is the next entry on its chain. Grafting at the "
+                         "leaf keeps that entry" if k == 1 else
+                         f"the leaf below is {k} entries further along its chain, {c} of "
+                         "them user or assistant entries. Grafting at the leaf keeps them")
+                print(f"note: the trailing last-prompt names {cand} ({kind(d)}, line {n}); "
+                      f"{where} on the boundary's ancestry")
 
-    leaf_entries = [d for _, d, _ in kept if d.get("uuid") == leaf_uuid]
+    leaf_entries = [(n, d) for n, d, _ in kept if d.get("uuid") == leaf_uuid]
     if not leaf_entries:
         die(f"leaf {leaf_uuid} is not among the kept lines")
-    donor = leaf_entries[-1]
+    leaf_line, donor = leaf_entries[-1]
 
     # --- build the two appended lines ---------------------------------------
     new_uuid = str(uuidlib.uuid4())
@@ -274,8 +326,11 @@ def main():
             print(f"                   ... and {len(trimmed) - 8} more")
     else:
         print("trim:            nothing (appending at current leaf)")
-    print(f"logical parent:  {leaf_uuid} ({donor.get('type')}"
-          f"{'/' + donor['subtype'] if donor.get('subtype') else ''})")
+    print(f"logical parent:  {leaf_uuid} ({kind(donor)}, line {leaf_line})")
+    if not args.leaf and steps:
+        print(f"                   {steps} entr{'y' if steps == 1 else 'ies'} further along the "
+              f"chain from {last_turn[1]['uuid']} ({kind(last_turn[1])}, line {last_turn[0]}), "
+              "the last user or assistant entry in the file")
     print(f"new leaf uuid:   {new_uuid}")
 
     procs = live_processes(donor.get("sessionId"))
