@@ -73,6 +73,11 @@ finished in one pass instead of after a reviewer's second.
 - `chartstyle.py`: the house style for matplotlib charts: figure width, font
   sizes that print readably, one palette, and a `save` that writes the PNG and
   the PDF. See "Charts".
+- `tools/sample.py`, `docs/`, `hooks/pre-commit`: the showcase. `docs/` holds
+  the fixture's PDF and three preview pages, which the README links; `make
+  sample` writes them from a fresh build, `make check` on the fixture fails
+  while they differ from one, and the hook refuses a commit that changes the
+  pipeline while they differ. See "The showcase and the commit routine".
 - `templates/report.md`: a starter document with the front matter that works,
   the structure of a review (verdict first, findings, recommendations,
   evidence, limits, an evidence index and a terms appendix), and the
@@ -94,6 +99,8 @@ make check REPORT=mydoc.md CHARTS_DIR=path/to/charts   # build with the log kept
 make rebuild              # force a clean rebuild (also redraws charts)
 make clean                # remove PDF + LaTeX temp files + chart sentinel
 make venv                 # ~/.venvs/mlr with matplotlib, numpy and PyMuPDF
+make sample               # rewrite docs/sample-report.pdf and docs/preview/ from the fixture
+make hooks                # install hooks/pre-commit through core.hooksPath
 ```
 
 A document without charts does not need a plot script: when `PLOT` does not exist,
@@ -339,6 +346,10 @@ with the LaTeX log kept, renders every page at 60 dpi into
   directory) that do not exist or are untracked in git, images that are
   missing or lack a `.pdf` sibling, captions longer than three sentences.
 
+For the fixture (the default `REPORT`) the check also compares the committed
+showcase under `docs/` with the fresh build and fails while they differ; a
+check of another document does not run that comparison.
+
 Pass extra options with `CHECK_ARGS="--root path/to/evidence --render 100"`.
 The check exits 1 when the PDF has lost or garbled content: an overfull
 vertical box (text below the page edge), a missing character, an undefined
@@ -355,6 +366,34 @@ clause; those need a reader.
 A one-shot report: write it on the template, draw the charts with
 `chartstyle.py`, run the prose check and fix what it lists, `make check`, fix
 the pages it names, look at the renders, and only then call it finished.
+
+## The showcase and the commit routine
+
+`docs/sample-report.pdf` and the three previews in `docs/preview/` are the
+fixture built at the committed pipeline, and the README links them as the
+showcase. `make sample` builds the fixture and writes them: the PDF is a copy
+of the build, and the previews are the title page with the contents, the
+first page with a code listing that wraps a line, and the first page that
+holds a figure and a table, rendered at 220 dpi. The pages are chosen by
+content, so they follow the fixture when its pagination changes. The files
+are never edited by hand.
+
+`make check` on the fixture compares the committed showcase with the fresh
+build: the page count, the text of every page, the pages rendered at 60 dpi
+and the three previews. It fails with `sample report is stale: run make
+sample` while they differ.
+
+A change to the pipeline (the Makefile, `header.tex`, `filter.lua`, the
+`.sty` files, `bblopts.cfg`, `hyph-en-gb.tex`, `chartstyle.py`, the fixture
+under `test/`) therefore goes with `make sample` and the regenerated `docs/`
+in the same commit; until then `make check` fails. `make hooks` installs
+`hooks/pre-commit` through `core.hooksPath` of the repository that holds the
+skill. The hook runs the comparison when a staged path touches the pipeline
+and refuses the commit while the showcase is stale. It reads the working
+tree, not the index, so stage the regenerated `docs/` with the change. A
+commit made with `git commit-tree` (the private-index routine) bypasses
+hooks, so the check target is the guard that counts: run `make check` before
+such a commit.
 
 ## Test fixture
 

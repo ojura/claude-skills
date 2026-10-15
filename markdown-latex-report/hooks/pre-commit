@@ -1,0 +1,26 @@
+#!/bin/sh
+# pre-commit hook of markdown-latex-report, installed by `make hooks` through
+# core.hooksPath. When a staged path touches the pipeline (the Makefile,
+# header.tex, filter.lua, bblopts.cfg, hyph-en-gb.tex, the .sty files,
+# chartstyle.py, the fixture under test/), the committed showcase
+# docs/sample-report.pdf and docs/preview/*.png must match a fresh build of
+# the fixture; the commit is refused while they differ. The comparison reads
+# the working tree, not the index, so stage the regenerated docs/ together
+# with the change. A commit made with git commit-tree bypasses hooks;
+# `make check` is the guard that counts.
+set -e
+hook_dir=$(cd "$(dirname "$0")" && pwd)
+skill_dir=$(dirname "$hook_dir")
+root=$(git rev-parse --show-toplevel)
+if [ "$skill_dir" = "$root" ]; then
+  prefix=""
+else
+  prefix="${skill_dir#"$root"/}/"
+fi
+staged=$(git diff --cached --name-only --diff-filter=ACMRD -- "${prefix:-.}" | sed "s#^$prefix##")
+[ -n "$staged" ] || exit 0
+pipeline=$(printf '%s\n' "$staged" | grep -E '^(Makefile|header\.tex|filter\.lua|bblopts\.cfg|hyph-en-gb\.tex|chartstyle\.py|[^/]+\.sty|test/.*)$' || true)
+[ -n "$pipeline" ] || exit 0
+echo "pre-commit: the staged change touches the pipeline ($(printf '%s' "$pipeline" | tr '\n' ' ')); comparing the showcase with a fresh build of the fixture"
+cd "$skill_dir"
+make --no-print-directory sample-check

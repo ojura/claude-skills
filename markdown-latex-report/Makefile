@@ -18,8 +18,16 @@
 # The report is CHECK_DIR/check.md and the pages are rendered into
 # CHECK_DIR/render. The checker needs PyMuPDF (pip install pymupdf); PYTHON
 # defaults to ~/.venvs/mlr/bin/python3 when that venv exists.
+#
+# docs/sample-report.pdf and docs/preview/*.png, the showcase the README links,
+# are the fixture built at the committed pipeline. `make sample` rewrites them
+# from a fresh build; `make check` on the fixture fails while they differ from
+# one; `make hooks` installs a pre-commit hook that refuses a commit touching
+# the pipeline while they differ.
 
 REPORT      ?= test/REPORT.md
+FIXTURE     := test/REPORT.md
+SAMPLE_DIR  := docs
 CHARTS_DIR  ?= test/charts
 PLOT        ?= $(CHARTS_DIR)/plot_findings.py
 PYTHON      ?= $(if $(wildcard $(HOME)/.venvs/mlr/bin/python3),$(HOME)/.venvs/mlr/bin/python3,python3)
@@ -54,7 +62,7 @@ PANDOC_FLAGS := --from markdown+raw_tex+raw_attribute-smart \
 LOCAL_STYS := fvextra.sty upquote.sty widows-and-orphans.sty needspace.sty
 CHARTS_STAMP := $(CHARTS_DIR)/.stamp
 
-.PHONY: all charts clean rebuild check venv
+.PHONY: all charts clean rebuild check venv sample sample-check hooks
 all: $(OUT)
 	@echo "==> built $(OUT)"
 
@@ -72,7 +80,7 @@ charts: $(CHARTS_STAMP)
 
 # A report without charts does not need a plot script: when PLOT does not
 # exist, the stamp is made without running anything.
-$(CHARTS_STAMP): $(wildcard $(PLOT))
+$(CHARTS_STAMP): $(wildcard $(PLOT)) chartstyle.py
 	$(if $(wildcard $(PLOT)),$(PYTHON) $(PLOT),@echo "no plot script $(PLOT); no charts drawn")
 	@mkdir -p $(dir $@) && touch $@
 
@@ -90,8 +98,9 @@ $(OUT): $(REPORT) header.tex filter.lua bblopts.cfg hyph-en-gb.tex $(LOCAL_STYS)
 # A second build with the log kept: pandoc writes the .tex, lualatex runs up to
 # three times in CHECK_DIR (the skill directory is on TEXINPUTS for the
 # preamble, the packages, the patterns and the figures), and the checker reads
-# the log, the PDF, the .toc and the Markdown.
-check: $(CHARTS_STAMP) $(FIGS)
+# the log, the PDF, the .toc and the Markdown. For the fixture the showcase
+# under docs/ is compared with the fresh build as well.
+check: $(CHARTS_STAMP) $(FIGS) $(if $(filter $(FIXTURE),$(REPORT)),$(OUT))
 	@rm -rf "$(CHECK_DIR)" && mkdir -p "$(CHECK_DIR)"
 	@echo "==> building $(REPORT) with the log kept in $(CHECK_DIR)"
 	@TEXINPUTS=.:$$TEXINPUTS pandoc $(REPORT) $(PANDOC_FLAGS) -s -t latex -o "$(CHECK_DIR)/$(BASE).tex"
@@ -103,6 +112,30 @@ check: $(CHARTS_STAMP) $(FIGS)
 	@$(PYTHON) tools/check_report.py --md $(REPORT) --tex "$(CHECK_DIR)/$(BASE).tex" \
 		--log "$(CHECK_DIR)/$(BASE).log" --pdf "$(CHECK_DIR)/$(BASE).pdf" \
 		--out "$(CHECK_DIR)" --charts $(CHARTS_DIR) $(CHECK_ARGS)
+	@if [ "$(REPORT)" = "$(FIXTURE)" ]; then $(PYTHON) tools/sample.py compare --pdf $(OUT) --docs $(SAMPLE_DIR); fi
+
+# ---- sample ----
+# The showcase is a build product, never made by hand: the PDF is a copy of the
+# fixture build and the previews are three of its pages (the title with the
+# contents, the first code listing, the first page with a figure and a table)
+# rendered at 220 dpi by tools/sample.py.
+sample: $(OUT)
+	@test "$(REPORT)" = "$(FIXTURE)" || { echo "make sample builds the showcase from the fixture only; run it without REPORT"; exit 1; }
+	$(PYTHON) tools/sample.py write --pdf $(OUT) --docs $(SAMPLE_DIR)
+
+sample-check: $(OUT)
+	@test "$(REPORT)" = "$(FIXTURE)" || { echo "the showcase comparison applies to the fixture only; run it without REPORT"; exit 1; }
+	@$(PYTHON) tools/sample.py compare --pdf $(OUT) --docs $(SAMPLE_DIR)
+
+# ---- hooks ----
+# hooks/pre-commit runs the showcase comparison when a staged path touches the
+# pipeline. Installed through core.hooksPath of the repository that holds the
+# skill; an existing core.hooksPath is left alone and reported.
+hooks:
+	@hp=$$(git config core.hooksPath || true); \
+	if [ -z "$$hp" ]; then git config core.hooksPath "$(abspath hooks)" && echo "==> core.hooksPath set to $(abspath hooks)"; \
+	elif [ "$$hp" = "$(abspath hooks)" ]; then echo "==> hooks already installed: $$hp"; \
+	else echo "core.hooksPath is already $$hp; call $(abspath hooks)/pre-commit from the pre-commit hook there"; exit 1; fi
 
 clean:
 	rm -f $(OUT) *.aux *.log *.toc *.out $(CHARTS_STAMP)

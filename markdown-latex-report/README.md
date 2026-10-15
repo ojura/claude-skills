@@ -16,7 +16,11 @@ skill is the accumulated fix for all of that, packaged as a reusable build.
 These pages are from the bundled test fixture, rendered by the pipeline. The full
 PDF ships with the skill at [`docs/sample-report.pdf`](docs/sample-report.pdf)
 (GitHub opens it in its PDF viewer), so the skill is self-contained: the demo
-travels with it. Click any page to open the full PDF.
+travels with it. Click any page to open the full PDF. The sample and the
+previews are products of `make sample`, never edited by hand: `make check`
+compares them with a fresh build of the fixture and fails while they differ,
+and `make hooks` installs a pre-commit hook that refuses a change to the
+pipeline while they are stale.
 
 **Title block and table of contents**
 
@@ -64,6 +68,9 @@ and customization (fonts, chart directory, manual table overrides).
 - `tools/check_report.py`: the checker that `make check` runs on the log, the
   PDF and the Markdown; `tools/prose_check.py`: the prose scan.
 - `chartstyle.py`: the house style for matplotlib charts.
+- `docs/`, `tools/sample.py`, `hooks/pre-commit`: the showcase, written by
+  `make sample` from the fixture and kept current by `make check` and the
+  pre-commit hook.
 - `templates/report.md`: a starter document with the conventions as comments.
 - `*.sty`: LaTeX packages bundled locally (LPPL) so you do not need a full
   texlive install.
