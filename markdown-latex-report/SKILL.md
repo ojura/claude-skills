@@ -18,14 +18,33 @@ table of contents, running headers, and no widows or orphans.
   to a PDF. Override the source: `make REPORT=path/to/doc.md`.
 - `header.tex` - the LaTeX preamble: fonts (TeX Gyre Pagella body, configurable),
   table styling (booktabs + faint row rules), link colors, code-listing setup,
-  running header (`\runninghead`), widow/orphan penalties.
+  running header (`\runninghead`), widow/orphan penalties, the space a heading
+  reserves before it (7, 6 and 5 baselines for levels 1 to 3), and a patch to
+  longtable that moves a heading to the next page together with a table that
+  directly follows it when the table cannot start on the heading's page.
+- `bblopts.cfg`, `hyph-en-gb.tex` - British hyphenation for documents with
+  `lang: en-GB` on a TeX installation without the package hyphen-english. babel
+  reads `bblopts.cfg` while it loads; the file registers the language
+  `ukenglish` with the patterns in `hyph-en-gb.tex` (from hyph-utf8, MIT
+  licence), which babel then loads. Without them TeX hyphenates nothing in such
+  a document. An installation that has `ukenglish` keeps its own patterns.
 - `filter.lua` - the pandoc Lua filter doing the heavy lifting:
   1. renders every Markdown table as a raw-LaTeX longtable with column widths
      computed from content (long-text columns dampened, short columns floored,
-     any single column capped), cells aligned as the Markdown marks them
-     (left by default, `---:` right, `:-:` centre), no mid-word hyphenation;
+     any single column capped), or taken from the separator dashes for a table
+     inside a `::: {.widths-from-dashes}` div, cells aligned as the Markdown
+     marks them (left by default, `---:` right, `:-:` centre), no mid-word
+     hyphenation; a continuation page repeats the header under a
+     "Table N (continued)" line, and the rule between two rows stays under the
+     last row of a page;
   2. inserts break opportunities inside inline code and link text at identifier
-     boundaries, with last-resort letter breaks for very long alphabetic runs;
+     boundaries, ranked by penalty: a break at a "/" or a space is preferred
+     to one after a "_", which is preferred to one before a "(" and to one
+     after a "-" or inside a camelCase name; very long alphabetic runs get
+     last-resort letter breaks. A decimal number stays whole, a leading "/"
+     stays with the name after it, and a file name never splits before its
+     extension and splits at its other dots, as a line range at its "-",
+     only when nothing else fits;
   3. discourages breaks inside bracketed groups.
 - `md_table_to_latex.py` - standalone helper to convert one specific pipe table
   to a fixed-width LaTeX longtable by anchor text and explicit column widths.
@@ -91,7 +110,10 @@ figures live elsewhere, `make rebuild` after regenerating them.
 - Title block: pandoc's `% Title` / `% Author` / `% Date` three-line form at the
   top, or a `---` YAML metadata block.
 - Tables: standard pipe tables. The filter sizes columns automatically; you do
-  not write LaTeX.
+  not write LaTeX. To fix the relative widths of one table, put it inside a
+  `::: {.widths-from-dashes}` ... `:::` div and draw the separator dashes in
+  the proportions you want (`|--|------|` for 1:3). Pandoc reads the dashes
+  only when a line of the table is longer than 72 characters.
 - Code: fenced blocks with a language tag. Long lines wrap automatically.
 - Images: `![caption](charts/NAME.png){width=90%}`. Resolved against the
   Markdown file's directory and the charts directory.
@@ -102,7 +124,9 @@ figures live elsewhere, `make rebuild` after regenerating them.
 fixture (a fictional toaster-firmware performance report) that exercises every
 feature: a wide multi-column speedup table, multi-page pagination, fenced code
 listings with long wrapping lines, identifier-heavy inline code, six embedded
-charts, deep headings, and a table of contents. `make` with no arguments builds
+charts, deep headings, and a table of contents. It sets `lang: en-GB`, so it
+also tests the British hyphenation, and its notation table (Appendix C) uses
+the widths-from-dashes div. `make` with no arguments builds
 it, which doubles as the pipeline smoke test. The content is fiction and shares
 nothing with any real report.
 

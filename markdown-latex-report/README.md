@@ -61,6 +61,10 @@ and customization (fonts, chart directory, manual table overrides).
 - `Makefile`, `header.tex`, `filter.lua`, `md_table_to_latex.py` - the pipeline.
 - `*.sty` - LaTeX packages bundled locally (LPPL) so you do not need a full
   texlive install.
+- `bblopts.cfg`, `hyph-en-gb.tex` - British hyphenation for documents with
+  `lang: en-GB` on installations without the package hyphen-english:
+  `bblopts.cfg` makes babel load the patterns in `hyph-en-gb.tex` (hyph-utf8,
+  MIT licence).
 - `test/` - a self-contained fixture (a fictional toaster-firmware performance
   report) that exercises every feature and serves as the smoke test. Building
   it is how you confirm the pipeline works.

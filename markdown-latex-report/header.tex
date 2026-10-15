@@ -95,39 +95,46 @@
             allbordercolors={1 1 1}]{hyperref}
 
 % ---- Heading styles via plain \makeatletter overrides (no titlesec) ----
-% Space reserve before headings. LaTeX's \@afterheading keeps a heading with
-% a following PARAGRAPH only; blocks that open with their own breakable glue
-% (longtable's \LTpre, fancyvrb frames, [H] figures) let the page break right
-% after a heading and leave the heading alone at the bottom of the page. So
-% each heading first reserves room for itself and what can follow it: a
-% subordinate heading together with that heading's own reserve, or a
-% longtable's caption, header and first row. The reserves are 12, 9 and 6
-% baselines for levels 1, 2 and 3; each covers the reserve of the level below.
-% \Needspace* (from the bundled needspace.sty) breaks the page only when the
-% remaining space is shorter than the reserve. The plain \needspace is not
-% used because its stretchable glue and penalty -100 make a break before the
-% heading cost less than the breaks in the material that follows, so TeX
-% takes it: a heading that directly follows another heading then stays alone
-% at the bottom of the page, the space before a heading followed by a table
-% or an [H] figure stays empty, and when the break is taken after a longtable
-% has started, the table's continuation header prints above the heading.
-% \if@nobreak is true directly after a heading; a heading that follows
-% another one skips its own reserve, which the heading above already covers.
+% Space reserve before headings. Before a heading, \Needspace* (from the
+% bundled needspace.sty) breaks the page when less than the heading's reserve
+% is left on it: 7, 6 and 5 baselines for levels 1, 2 and 3, the heading with
+% its space above and at least two lines of what follows. The space left on
+% the page stays empty when the heading moves to the next one, so a larger
+% reserve leaves more pages short at the foot. A longtable directly after a
+% heading usually needs more room than the reserve before its first row; the
+% longtable patch further down moves the heading to the next page with the
+% table when the table cannot start on the heading's page.
+% The plain \needspace is not used because its stretchable glue and penalty
+% -100 make a break before the heading cost less than the breaks in the
+% material that follows, so TeX takes it: a heading that directly follows
+% another heading then stays alone at the bottom of the page, the space
+% before a heading followed by a table or an [H] figure stays empty, and when
+% the break is taken after a longtable has started, the table's continuation
+% header prints above the heading.
+% \if@nobreak is true directly after a heading, so a heading that directly
+% follows another one skips its own reserve. Each heading sets its colour
+% after \noindent, inside its own paragraph: \color in vertical mode adds a
+% colour node before the paragraph, and the \parskip glue after that node is
+% a place where the page can break, between the two headings. Without that
+% place the two headings stay together with what follows them, and when they
+% do not fit, the page breaks before the first one.
 \usepackage{needspace}
 \makeatletter
-\newcommand\headingreserve[1]{\if@nobreak\else\Needspace*{#1}\fi}
-\renewcommand\section{\headingreserve{12\baselineskip}\@startsection{section}{1}{\z@}%
+\newdimen\report@headpagetotal
+\newcommand\headingreserve[1]{\if@nobreak\else\Needspace*{#1}%
+  \global\report@headpagetotal\pagetotal\fi}
+\renewcommand\section{\headingreserve{7\baselineskip}\@startsection{section}{1}{\z@}%
   {-3.5ex plus -1ex minus -.2ex}%
   {2.0ex plus .2ex}%
-  {\normalfont\Large\bfseries\color{accent}}}
-\renewcommand\subsection{\headingreserve{9\baselineskip}\@startsection{subsection}{2}{\z@}%
+  {\normalfont\Large\bfseries\noindent\color{accent}}}
+\renewcommand\subsection{\headingreserve{6\baselineskip}\@startsection{subsection}{2}{\z@}%
   {-2.5ex plus -1ex minus -.2ex}%
   {1.2ex plus .2ex}%
-  {\normalfont\large\bfseries\color{accent}}}
-\renewcommand\subsubsection{\headingreserve{6\baselineskip}\@startsection{subsubsection}{3}{\z@}%
+  {\normalfont\large\bfseries\noindent\color{accent}}}
+\renewcommand\subsubsection{\headingreserve{5\baselineskip}\@startsection{subsubsection}{3}{\z@}%
   {-2.0ex plus -.7ex minus -.2ex}%
   {.8ex plus .2ex}%
-  {\normalfont\normalsize\bfseries\color{accent!75!black}}}
+  {\normalfont\normalsize\bfseries\noindent\color{accent!75!black}}}
 \makeatother
 
 % ---- Code (verbatim and inline) ----
@@ -170,10 +177,10 @@
 % Why a naive `\nobreak\vspace{-X}` isn't enough:
 %   fancyvrb's @i (the first-line dispatcher) wraps line-processing in an
 %   extra `\hbox{}`, so the trailing \FV@bgcoloroverlap runs in restricted
-%   HMODE. In hmode, `\vspace{-X}` expands to `\vadjust{\vskip-X\vskip 0pt}`
-%   -- the \vskip nodes get queued for emission into the OUTER vlist AFTER
+%   HMODE. In hmode, `\vspace{-X}` expands to `\vadjust{\vskip-X\vskip 0pt}`:
+%   the \vskip nodes get queued for emission into the OUTER vlist AFTER
 %   the line's hbox is shipped. A preceding `\nobreak` in hmode emits a
-%   penalty INSIDE the hbox -- which the page-breaker can't see (penalties
+%   penalty INSIDE the hbox, which the page-breaker can't see (penalties
 %   inside hboxes don't affect page-breaking). Net result: the \vskip
 %   lands in the outer vlist unprotected, and the page-breaker still sees
 %   a p=0 candidate immediately after the first verbatim line.
@@ -259,6 +266,21 @@
 % ---- longtable spacing ----
 \setlength{\LTpre}{6pt}
 \setlength{\LTpost}{6pt}
+% Rule between two body rows of a longtable (filter.lua emits it). longtable's
+% \hline, also in colortbl's version, draws its rule twice with a page-break
+% opportunity between the two copies, so with \hline a page break between two
+% rows prints the rule under the last row of the page and again under the
+% header that the next page repeats. \LTrowrule draws one rule in the table's
+% rule colour and allows the page break only after it: the page keeps the
+% rule under its last row, and the next page starts with the repeated header
+% alone. \LT@cols is longtable's column count and \CT@arc@ colortbl's rule
+% colour; the rule row is built as longtable builds the rows of \hline.
+\makeatletter
+\newcommand\LTrowrule{%
+  \noalign{\penalty\@M}%
+  \multispan\LT@cols{\CT@arc@\leaders\hrule\@height\arrayrulewidth\hfill}\cr
+  \noalign{\penalty\z@}}
+\makeatother
 
 % ---- longtable on a page that already holds floats ----
 % \@colroom is the height left for text on the current page after the floats
@@ -296,6 +318,47 @@
 \patchcmd{\LT@output}{\@outputpage\global\vsize\@colroom}%
   {\@outputpage\report@LTfullcolroom\global\vsize\@colroom}{}%
   {\report@LTnotpatched{3}}
+\makeatother
+
+% ---- a heading stays with a longtable that directly follows it ----
+% \LT@start adds \penalty0 before \LTpre, a place where the page can break,
+% and when the table's caption, header and first row do not fit on the page,
+% it ends the page at that place. Directly after a heading this leaves the
+% heading as the last line of its page: the heading reserves above cover the
+% heading and two lines, and a table with a caption usually needs more before
+% its first row. \if@nobreak is true directly after a heading until \longtable
+% clears it, so the first patch records it. For a table that directly follows
+% a heading, \LT@start then adds \nobreak instead of \penalty0, and when the
+% caption, header and first row do not fit, \report@LTkeepheading adds a kern
+% that overfills the page and a \penalty0. TeX then ends the page at its best
+% break before the heading, the heading moves to the next page with the
+% table, and a second kern there cancels the first. A heading at the top of
+% its page has no break before it, so the kern would overfill that page:
+% \headingreserve records \pagetotal after its \Needspace*, and when that was
+% zero, the heading starts its page and the macro keeps longtable's own break.
+\makeatletter
+\newif\ifreport@LTafterheading
+\newdimen\report@LTkeepdim
+\def\report@LTkeepheading{%
+  \ifdim\report@headpagetotal>\z@
+    \report@LTkeepdim\pagegoal \advance\report@LTkeepdim-\pagetotal
+    \advance\report@LTkeepdim\pageshrink \advance\report@LTkeepdim\p@
+    \kern\report@LTkeepdim\penalty\z@\kern-\report@LTkeepdim
+  \else
+    \vfil\break
+  \fi}
+\def\report@LTkeepnotpatched#1{\PackageWarningNoLine{markdown-latex-report}%
+  {longtable not patched (part #1); a heading can end\MessageBreak
+   a page above a longtable that directly follows it}}
+\pretocmd{\longtable}%
+  {\if@nobreak\report@LTafterheadingtrue\else\report@LTafterheadingfalse\fi}{}%
+  {\report@LTkeepnotpatched{1}}
+\patchcmd{\LT@start}{\endgraf\penalty\z@\vskip\LTpre}%
+  {\endgraf\ifreport@LTafterheading\nobreak\else\penalty\z@\fi\vskip\LTpre}{}%
+  {\report@LTkeepnotpatched{2}}
+\patchcmd{\LT@start}{\vfil\break}%
+  {\ifreport@LTafterheading\report@LTkeepheading\else\vfil\break\fi}{}%
+  {\report@LTkeepnotpatched{3}}
 \makeatother
 
 % ---- Graphics extension priority: prefer PDF over PNG ----

@@ -38,7 +38,7 @@ $(CHARTS_STAMP): $(PLOT)
 # by filter.lua; regenerating a figure must trigger a re-embed
 FIGS := $(wildcard $(dir $(REPORT))img/*)
 
-$(OUT): $(REPORT) header.tex filter.lua $(LOCAL_STYS) $(CHARTS_STAMP) $(FIGS)
+$(OUT): $(REPORT) header.tex filter.lua bblopts.cfg hyph-en-gb.tex $(LOCAL_STYS) $(CHARTS_STAMP) $(FIGS)
 	TEXINPUTS=.:$$TEXINPUTS pandoc $(REPORT) \
 		--from markdown+raw_tex+raw_attribute-smart \
 		--pdf-engine=lualatex \

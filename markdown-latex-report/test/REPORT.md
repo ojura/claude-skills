@@ -2,6 +2,13 @@
 % Dr. Reginald Q. Butterworth III, Senior Principal Toaster Architect; Fenwick Oats, Performance Research Lead
 % 25 May 2026
 
+<!-- The language makes babel load the British hyphenation patterns through bblopts.cfg and
+hyph-en-gb.tex; the log line "Hyphen rules for 'british' set to \l@ukenglish" shows it. -->
+
+---
+lang: en-GB
+---
+
 ---
 
 # Executive Summary
@@ -995,6 +1002,11 @@ informative.
 
 The following table defines notation used throughout this report.
 
+<!-- The div gives the table the widths of its separator dashes, about one quarter and three
+quarters, instead of widths computed from its content. -->
+
+::: {.widths-from-dashes}
+
 | Symbol / Abbreviation | Meaning                                                        |
 |-----------------------|----------------------------------------------------------------|
 | BEADS                 | Bread Evaluation And Delivery Suite (benchmark framework)      |
@@ -1014,6 +1026,8 @@ The following table defines notation used throughout this report.
 | darkness score        | Normalised [0.0, 1.0] measure of bread surface colour          |
 | thermal soak          | Time for heat to penetrate bread to target internal temperature |
 | the cliff             | Performance discontinuity at 38.5% bread moisture content      |
+
+:::
 
 ---
 
@@ -1594,6 +1608,47 @@ beads check-acceptance \
 
 echo "Acceptance check passed. Firmware is ready for merge."
 ```
+
+### Failure Reports
+
+<!-- The three paragraphs under this heading exercise the break rules that filter.lua applies to
+inline code. At this fixture's text width each case sits at the right margin: with the rules the
+citation breaks after a comma, `118.2` stays whole and `rack_units: 4` stays on one line; without
+the comma, decimal and colon rules the three split as `212-`/`219`, `118.`/`2` and
+`rack_units:`/`4`. -->
+
+A failure report cites the critical-path lines that the failing commit changed, as a file path
+followed by line ranges. The report on the most recent failure cites
+`darkness_control/sample_darkness_lookup_table.cpp:212-219,301-305,388-391`, where the commit
+moved the interpolation step inside the polling loop.
+
+For the failing commit the runner printed a geometric mean pop-time of `121.3` on white bread,
+against `118.2` for the baseline, and a 99th percentile of `129.6` against `127.9`, so only the
+mean criterion failed. The runner prints pop-times in milliseconds, to one decimal place.
+
+The dashboard records the settings of each run as `key: value` pairs. The failing run used the
+baseline settings, among them `bread_corpus: beads-v2.1`, `ambient_target_c: 20`,
+`trials_per_type: 200` and `rack_units: 4`, so the regression is not an artefact of the rack.
+
+### Runner Observations
+
+<!-- The three paragraphs under this heading exercise the break rules that filter.lua applies to
+a leading "/", an opening parenthesis and a line range in inline code. At this fixture's text
+width each code span sits at the right margin. With the rules the topic moves to the next line
+whole, the function name keeps its parenthesis (the line breaks after `slot_` instead) and the
+line range stays whole; without them the three split as `/`|`crispmaster/pop_events`,
+`catchAndRetry`|`(slot_id, ...)` and `88-`|`104`. -->
+
+The units in the humidity chamber run the overnight soak tests at high humidity and publish each
+ejection on `/crispmaster/pop_events` so that the chamber logger records the same events as the
+runner.
+
+When a slice overshoots the catch guide at ejection, the firmware calls
+`latch_mechanism::catchAndRetry(slot_id, retry_budget)` and the runner counts the call as a
+separate ejection.
+
+The commit that failed the overnight regression run only changed
+`darkness_control/reheat_cycle.cpp:88-104`, the loop of the reheat function.
 
 ## K.4 Expected Ongoing Maintenance Cost
 
