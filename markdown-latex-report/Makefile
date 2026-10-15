@@ -18,6 +18,9 @@ OUT         := $(basename $(notdir $(REPORT))).pdf
 PANDOC_MAINFONT ?= TeX Gyre Pagella
 PANDOC_SANSFONT ?= TeX Gyre Heros
 PANDOC_MONOFONT ?= DejaVu Sans Mono
+# The font for $...$ and $$...$$, which pandoc passes to unicode-math. Without it the
+# formulas print in Latin Modern Math beside the Pagella text.
+PANDOC_MATHFONT ?= TeX Gyre Pagella Math
 
 LOCAL_STYS := fvextra.sty upquote.sty widows-and-orphans.sty needspace.sty
 CHARTS_STAMP := $(CHARTS_DIR)/.stamp
@@ -51,6 +54,7 @@ $(OUT): $(REPORT) header.tex filter.lua bblopts.cfg hyph-en-gb.tex $(LOCAL_STYS)
 		-V sansfont="$(PANDOC_SANSFONT)" \
 		-V sansfontoptions:RawFeature=-tlig \
 		-V monofont="$(PANDOC_MONOFONT)" \
+		-V mathfont="$(PANDOC_MATHFONT)" \
 		-V documentclass=article \
 		-V fontsize=10pt \
 		-V linkcolor=accent \

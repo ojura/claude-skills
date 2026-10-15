@@ -117,6 +117,44 @@ figures live elsewhere, `make rebuild` after regenerating them.
 - Code: fenced blocks with a language tag. Long lines wrap automatically.
 - Images: `![caption](charts/NAME.png){width=90%}`. Resolved against the
   Markdown file's directory and the charts directory.
+- Mathematics: `$...$` inline and `$$...$$` for a display; see Mathematics
+  below.
+
+## Mathematics
+
+Write formulas as mathematics, `$...$` inline and `$$...$$` on a line of its
+own for a display, not as inline code; keep inline code for text quoted from
+source code or configuration. Pandoc passes the formulas to LuaLaTeX, and
+unicode-math sets them in the font that `PANDOC_MATHFONT` names, TeX Gyre
+Pagella Math by default, which matches the Pagella text. Without a math font
+the formulas would print in Latin Modern Math. To use another math font, set
+`PANDOC_MATHFONT` (`make PANDOC_MATHFONT="Latin Modern Math"`); a `mathfont`
+field in the document's metadata does not override the Makefile's value.
+
+- Put a formula that does not fit on its line on a line of its own as display
+  mathematics. TeX breaks inline mathematics only after a relation such as `=`
+  or a binary operator such as `+`, so a long inline formula breaks at an
+  awkward place or leaves the line before it stretched.
+- Write exponents in mathematics, as in `$10^{-5}$` and `$2^{31}$`. TeX Gyre
+  Pagella has the superscript digits ¹, ² and ³ but not ⁰, ⁴ to ⁹, the
+  superscript minus or ᵀ, so a number written as 10⁻⁵ prints with missing
+  characters, and pandoc reports each one as a `[WARNING] Missing character`
+  line. A unit in running text such as m² keeps its Unicode superscript.
+- Keep a unit that follows a formula outside the mathematics, after a no-break
+  space: `$t = 1$\ s`. In pandoc Markdown a backslash before a space makes it a
+  no-break space; the character U+00A0 works too. Inside a formula, write the
+  unit upright after a thin space: `$u + 22\,\mathrm{ms}$`. Write microseconds
+  as `\mathrm{µs}` with the micro sign, because `\mu` is the italic Greek
+  letter and slants the unit.
+- The filter sets table header cells in bold, but mathematics in a header cell
+  prints in normal weight, because TeX Gyre Pagella Math does not have a bold
+  version. `\boldsymbol` and `\boldmath` do not change that and add font
+  warnings to the log. The unicode-math commands `\symbfit` and `\symbfup`
+  print bold letters in the PDF, but KaTeX does not support them.
+- GitLab renders `$...$` and `$$...$$` in a Markdown file with KaTeX. If the
+  Markdown is also read there, use commands that KaTeX supports: its support
+  table does not list the unicode-math commands `\symbfit`, `\symbfup` and
+  `\upmu`, which work only in the PDF.
 
 ## Test fixture
 
@@ -126,15 +164,20 @@ feature: a wide multi-column speedup table, multi-page pagination, fenced code
 listings with long wrapping lines, identifier-heavy inline code, six embedded
 charts, deep headings, and a table of contents. It sets `lang: en-GB`, so it
 also tests the British hyphenation, and its notation table (Appendix C) uses
-the widths-from-dashes div. `make` with no arguments builds
+the widths-from-dashes div. Appendices A.3, F.1 and I.1 hold inline formulas,
+a table header cell with mathematics and a display equation, which test the
+math font. `make` without arguments builds
 it, which doubles as the pipeline smoke test. The content is fiction and shares
 nothing with any real report.
 
 ## Dependencies
 
-- `pandoc`, a LuaLaTeX engine (`lualatex` from texlive), and the TeX Gyre fonts
-  (falls back gracefully if a font is missing; override via `PANDOC_MAINFONT`
-  etc.).
+- `pandoc`, a LuaLaTeX engine (`lualatex` from texlive), the TeX Gyre fonts and
+  TeX Gyre Pagella Math (the Debian and Ubuntu packages `fonts-texgyre` and
+  `fonts-texgyre-math`), and DejaVu Sans Mono. A font that is not installed
+  stops the build with the fontspec error `The font "..." cannot be found`;
+  install it, or set `PANDOC_MAINFONT`, `PANDOC_SANSFONT`, `PANDOC_MONOFONT`
+  or `PANDOC_MATHFONT` to an installed font.
 - `python3` with `matplotlib` and `numpy` for the charts.
 
 ## Notes
@@ -142,4 +185,5 @@ nothing with any real report.
 - The bundled `.sty` files mean you do not need the full texlive-extra packages
   for fvextra/needspace/etc.
 - Fonts are set via pandoc variables in the Makefile; change `PANDOC_MAINFONT`,
-  `PANDOC_SANSFONT`, `PANDOC_MONOFONT` to retarget.
+  `PANDOC_SANSFONT`, `PANDOC_MONOFONT` or `PANDOC_MATHFONT` to retarget. These
+  values take precedence over font fields in the document's metadata.

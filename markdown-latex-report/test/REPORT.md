@@ -957,10 +957,12 @@ that much of it was distributed to colleagues, which improved team morale if not
 
 ## A.3 Statistical Methods
 
-All reported speedups are geometric means over the trial population for the given condition.
+All reported speedups are geometric means over the trial population for the given condition: for
+$n$ trials with baseline pop-times $b_i$ and optimised pop-times $o_i$, the speedup is
+$S = (\prod_{i=1}^{n} b_i / o_i)^{1/n}$.
 Confidence intervals are 95% bootstrap intervals computed over 10,000 resamples. Standard
 deviations are sample standard deviations (Bessel-corrected). Where the distribution of pop-times
-is not approximately normal (as assessed by a Shapiro-Wilk test at p < 0.05), the geometric mean
+is not approximately normal (as assessed by a Shapiro-Wilk test at $p < 0.05$), the geometric mean
 and the 90th percentile are both reported; the arithmetic mean is not.
 
 The BEADS v2.1 analysis scripts are available at
@@ -1156,7 +1158,7 @@ from the 240-unit test fleet, and to identify which parameters the speedup is mo
 
 The following parameters were varied in the sensitivity analysis:
 
-| Parameter                     | Nominal Value | Low Value | High Value | Sensitivity (ms/unit) |
+| Parameter                     | Nominal Value | Low Value | High Value | $\partial t_{\mathrm{pop}} / \partial x$ (ms/unit) |
 |-------------------------------|---------------|-----------|------------|------------------------|
 | Coil resistance (ohms)        | 10.4          | 10.0      | 10.8       | 1.8                    |
 | Mains voltage (V RMS)         | 230           | 218       | 242        | 0.6                    |
@@ -1166,10 +1168,11 @@ The following parameters were varied in the sensitivity analysis:
 | Slot wall contact area (cm^2) | 18.4          | 16.0      | 20.8       | 1.4                    |
 | Crumb load (g)                | 4             | 0         | 32         | 0.3                    |
 
-Sensitivity is expressed as milliseconds of pop-time per unit change in the parameter, evaluated
-at the nominal value. The most sensitive parameters are bread moisture and coil resistance. Both are
-outside firmware control, but both are addressable at the hardware level (moisture via a bread
-conditioning drawer, coil resistance via tighter manufacturing tolerances).
+The sensitivity $\partial t_{\mathrm{pop}} / \partial x$ is the change in pop-time $t_{\mathrm{pop}}$, in
+milliseconds, per unit change in the parameter $x$, evaluated at the nominal value. The most
+sensitive parameters are bread moisture and coil resistance. Both are outside firmware control, but
+both are addressable at the hardware level (moisture via a bread conditioning drawer, coil
+resistance via tighter manufacturing tolerances).
 
 ## F.2 Worst-Case Speedup
 
@@ -1309,9 +1312,12 @@ here for reproducibility and for use in validating future optimisations.
 
 The model treats the bread slice as a homogeneous slab with uniform thermal conductivity, heated
 from both faces by the slot walls. The coil is modelled as an ideal resistive heater with
-instantaneous response (no thermal mass of its own). The darkness score is modelled as a linear
-function of the mean bread surface temperature. The pop event fires when the darkness score
-reaches the user-selected target.
+instantaneous response (without thermal mass of its own). The darkness score $D$ is modelled as a
+linear function of the mean bread surface temperature $\bar{T}_{\mathrm{s}}$,
+$$D(t) = k_D\,\bigl(\bar{T}_{\mathrm{s}}(t) - T_0\bigr),$$
+where $k_D = 1.3 \times 10^{-2}$ per kelvin is the browning rate and $T_0 = 105$\ °C the surface
+temperature at which browning starts. The model advances in steps of $\Delta t = 500\,\mathrm{µs}$,
+and the pop event fires when $D$ reaches the user-selected target.
 
 This is, of course, a gross simplification. Real bread is heterogeneous, the coil has thermal
 mass, and the darkness response is non-linear. Nevertheless, the model's theoretical minimum
