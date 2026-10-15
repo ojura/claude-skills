@@ -226,15 +226,26 @@
 \usepackage{fancyhdr}
 \pagestyle{fancy}
 \fancyhf{}
-% Running header text: \runninghead, printed top left, empty by default. A
-% document sets it through the YAML field include-before, which pandoc places
-% right after \begin{document}, for example
+% Running head text: \runninghead, printed top left. By default it names the
+% first section that starts on the page, or the section in force when none
+% starts there: \firstmark is the first mark on the page or, when the page
+% sets none, the mark in force at its top. The subsection marks are disabled
+% so that the first mark on a page is always a section mark; LaTeX's own
+% \leftmark gives the last section on the page instead, which names the next
+% section on a page where one section ends and another starts, and the kernel's
+% \FirstMark{2e-left} is not updated on pages that longtable fills.
+% A document changes the head through the YAML field include-before, which
+% pandoc places right after \begin{document}, for example
 %   include-before: |
-%     \renewcommand{\runninghead}{\nouppercase{\leftmark}}
-% for the current section title, or a fixed short title. A YAML
+%     \renewcommand{\runninghead}{Short title}
+% for a fixed title, or \renewcommand{\runninghead}{} for none. A YAML
 % header-includes value does not reach the preamble, because the Makefile's
 % --include-in-header replaces it.
-\providecommand{\runninghead}{}
+\makeatletter
+\providecommand{\runninghead}{\nouppercase{\expandafter\@leftmark\firstmark\@empty\@empty}}
+\renewcommand{\subsectionmark}[1]{}
+\renewcommand{\subsubsectionmark}[1]{}
+\makeatother
 \fancyhead[L]{\small\color{ruleline}\runninghead}
 \fancyhead[R]{\small\color{ruleline}\thepage}
 \fancyfoot[C]{}
@@ -242,10 +253,12 @@
 \renewcommand{\footrulewidth}{0pt}
 \setlength{\headheight}{14pt}
 \setlength{\headsep}{18pt}
+% The title page uses the plain style: no head, no rule, no page number.
+\fancypagestyle{plain}{\fancyhf{}\renewcommand{\headrulewidth}{0pt}}
 
 % ---- Pandoc-friendly tightlist ----
-% Pandoc emits \tightlist for any list whose items lack blank lines between
-% them. Default zeros itemsep + parskip; we leave a small itemsep so even
+% Pandoc emits \tightlist for a list without blank lines between its items.
+% Default zeros itemsep + parskip; we leave a small itemsep so even
 % "tight" lists with multi-sentence items breathe a little.
 \providecommand{\tightlist}{\setlength{\itemsep}{0.35em}\setlength{\parskip}{0pt}}
 
@@ -372,9 +385,28 @@
 % the right margin.
 \setkeys{Gin}{width=\linewidth,keepaspectratio}
 
-% ---- Pandoc passes `figure`-floats through; let them break across pages ----
+% ---- Figure placement ----
+% A figure floats to the top or the bottom of the current or the next page,
+% or to a page of its own; text fills the rest of the page. LaTeX's defaults
+% send every figure taller than half the text height to a page of its own,
+% vertically centred, which leaves the page half empty. The fractions below
+% let such a figure sit at the top of a text page, and a figure that still
+% needs a page of its own starts at the top of it. A document that wants each
+% figure exactly where it is in the text sets
+%   include-before: |
+%     \floatplacement{figure}{H}
+% and accepts the empty space at the foot of a page when a figure does not fit.
 \usepackage{float}
-\floatplacement{figure}{H}
+\floatplacement{figure}{tbp}
+\renewcommand{\topfraction}{0.85}
+\renewcommand{\bottomfraction}{0.6}
+\renewcommand{\textfraction}{0.15}
+\renewcommand{\floatpagefraction}{0.8}
+\makeatletter
+\setlength{\@fptop}{0pt}
+% PDF bookmarks carry the section numbers and go three levels deep.
+\@ifpackageloaded{bookmark}{\bookmarksetup{numbered,depth=3}}{}
+\makeatother
 
 % ---- A "softnote" for cross-reference paragraphs ----
 \providecommand{\softnote}[1]{\par\medskip\noindent{\itshape\color{ruleline}#1}\par\medskip}

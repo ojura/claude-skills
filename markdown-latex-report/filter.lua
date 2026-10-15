@@ -34,6 +34,12 @@
 --       LaTeX prefers the break-before-opener we already provide. Same
 --       bracket vocabulary as (2); the rules are wired together.
 --
+--   (4) Document conveniences (see the "Document conveniences" section):
+--       a no-break space between a number and its unit; a level-1 heading
+--       with the class appendix starts the lettered appendices; a table
+--       caption ending in {#tbl:slug} gets a \label; the metadata field
+--       hyphenation lists hyphenation exceptions.
+--
 -- Loaded via: pandoc --lua-filter=filter.lua
 
 local TOTAL_WIDTH = 0.95   -- fraction of \textwidth available for columns
@@ -546,7 +552,7 @@ local function blocks_to_latex(blocks)
   return s
 end
 
--- ----- helpers: detect a row whose only non-empty cell is a bold inline -----
+-- ----- helpers: detect a row with one non-empty cell that holds a bold inline -----
 
 local function row_section_label(cells)
   local non_empty = {}
@@ -556,7 +562,7 @@ local function row_section_label(cells)
   end
   if #non_empty ~= 1 then return nil end
   local cell = non_empty[1].cell
-  -- The cell must contain a single Para or Plain whose only inline is a Strong.
+  -- The cell must contain a single Para or Plain holding one inline, a Strong.
   local blks = cell.contents
   if not blks or #blks ~= 1 then return nil end
   local blk = blks[1]
@@ -761,12 +767,32 @@ function Table(t)
                  and widths_from_colspecs(t.colspecs, n_cols)
                  or compute_widths(hcells, brows, n_cols)
 
-  -- caption: prefer the long caption Inline list
+  -- caption: prefer the long caption Inline list. A caption that ends in
+  -- {#tbl:slug} gives the table a \label (pandoc 3.1 leaves that text in
+  -- the caption instead of reading it as an attribute); so does an
+  -- identifier on the table itself.
   local caption_tex = ""
+  local label = t.identifier ~= "" and t.identifier or nil
   if t.caption and t.caption.long and #t.caption.long > 0 then
-    local doc = pandoc.Pandoc(t.caption.long)
+    local long = t.caption.long
+    local last = long[#long]
+    if last and (last.t == "Plain" or last.t == "Para") and #last.content > 0 then
+      local tail = last.content[#last.content]
+      if tail.t == "Str" then
+        local id = tail.text:match("^{#([^}%s]+)}$")
+        if id then
+          label = label or id
+          last.content:remove(#last.content)
+          while #last.content > 0 and last.content[#last.content].t == "Space" do
+            last.content:remove(#last.content)
+          end
+        end
+      end
+    end
+    local doc = pandoc.Pandoc(long)
     caption_tex = pandoc.write(doc, "latex"):gsub("\n+$", "")
   end
+  local label_tex = label and ("\\label{" .. label .. "}") or ""
 
   local col_spec = {}
   for i = 1, n_cols do
@@ -794,7 +820,7 @@ function Table(t)
   -- Always emit \caption so longtable gets a "Table N." prefix; if the
   -- markdown had no caption text, the prefix stands alone (clean look
   -- with labelsep=period set in header.tex).
-  table.insert(out, "\\caption{" .. caption_tex .. "}\\\\")
+  table.insert(out, "\\caption{" .. caption_tex .. "}" .. label_tex .. "\\\\")
   table.insert(out, "\\toprule")
   -- header row. If the cell content already typesets as Strong, don't wrap
   -- in another \textbf{}; just use it as-is.
@@ -932,7 +958,7 @@ end
 -- Vector-figure promotion. Chart scripts write each plot twice with the same
 -- basename: a raster .png (what the Markdown references, so plain-Markdown
 -- preview keeps working) and a vector .pdf sibling. For the LaTeX build only,
--- an image whose .png source has a .pdf sibling on disk is promoted to the
+-- an image with a .png source and a .pdf sibling on disk is promoted to the
 -- vector file. Images without a sibling (photos, renders, screenshots) pass
 -- through untouched, so the rule applies itself only to plots that opted in.
 local function file_exists(path)
@@ -974,12 +1000,108 @@ function Image(img)
   return nil
 end
 
--- Two passes: the first marks the tables inside a widths-from-dashes div, the
--- second is the filter described at the top of this file. pandoc visits a
--- table before the div around it, so a single pass could not tell the Table
--- function about the div.
+-- ---------------------------------------------------------------------------
+-- Document conveniences.
+
+-- Options read from the metadata by the first pass:
+--   nbsp-units: false   turns off the no-break space between a number and
+--                       its unit (default true);
+--   hyphenation: [look-ahead, lo-cal-iza-tion]   hyphenation exceptions for
+--                       words that the patterns break badly; a string with
+--                       spaces between the words works too.
+local OPTS = { nbsp_units = true, hyphenation = {} }
+
+local function read_options(meta)
+  if meta["nbsp-units"] ~= nil then
+    local v = meta["nbsp-units"]
+    if type(v) == "boolean" then OPTS.nbsp_units = v
+    else OPTS.nbsp_units = pandoc.utils.stringify(v) ~= "false" end
+  end
+  if meta.hyphenation ~= nil then
+    local v = meta.hyphenation
+    if pandoc.utils.type(v) == "List" then
+      for _, item in ipairs(v) do
+        OPTS.hyphenation[#OPTS.hyphenation + 1] = pandoc.utils.stringify(item)
+      end
+    else
+      for w in pandoc.utils.stringify(v):gmatch("%S+") do
+        OPTS.hyphenation[#OPTS.hyphenation + 1] = w
+      end
+    end
+  end
+  return nil
+end
+
+-- A number followed by a space and a unit, as in "28 ms", "1,000 mm" or
+-- "5 percent", keeps the two on one line: the space becomes U+00A0, which
+-- the LaTeX writer prints as a tie. The unit may carry trailing punctuation
+-- ("ms," "s)."), and the number a leading bracket or a minus sign.
+local UNITS = {}
+for u in ([[ms µs us ns s min h Hz kHz MHz GHz mHz mm cm m km mm/s m/s km/h
+  rad rad/s mrad deg ° °/s °C mdeg cdeg percent % pt px dpi bit bits kbit Mbit
+  B kB MB GB TB KiB MiB GiB V mV A mA W kW mW g kg mg N Nm Pa kPa bar fps rpm
+  dB K]]):gmatch("%S+") do UNITS[u] = true end
+local NBSP = "\194\160"   -- U+00A0 as UTF-8 bytes
+
+local function is_number(s)
+  s = s:gsub("^[%(%[]", "")
+  s = s:gsub("^\226\136\146", "-")   -- U+2212 minus
+  return s:match("^%-?%d[%d,]*%.?%d*$") ~= nil or s:match("^%-?%.%d+$") ~= nil
+end
+
+local function is_unit(s)
+  s = s:gsub("[%.,;:%)%]]+$", "")
+  return UNITS[s] == true
+end
+
+function Inlines(inlines)
+  if not OPTS.nbsp_units or not FORMAT:match("latex") then return nil end
+  local changed = false
+  for i = 2, #inlines - 1 do
+    local sp, a, b = inlines[i], inlines[i - 1], inlines[i + 1]
+    if sp.t == "Space" and a.t == "Str" and b.t == "Str"
+       and is_number(a.text) and is_unit(b.text) then
+      inlines[i] = pandoc.Str(NBSP)
+      changed = true
+    end
+  end
+  return changed and inlines or nil
+end
+
+-- A level-1 heading with the class appendix starts the appendices: the
+-- headings from there on are lettered, and figures and tables are numbered
+-- within them (A.1, B.2). The class is removed from the heading.
+local appendix_started = false
+
+function Header(h)
+  if not FORMAT:match("latex") then return nil end
+  if h.level ~= 1 or not h.classes:includes("appendix") then return nil end
+  h.classes = h.classes:filter(function(c) return c ~= "appendix" end)
+  if appendix_started then return h end
+  appendix_started = true
+  return {
+    pandoc.RawBlock("latex", "\\appendix\n\\counterwithin{figure}{section}\n\\counterwithin{table}{section}"),
+    h,
+  }
+end
+
+-- The hyphenation exceptions go at the start of the body, where LaTeX accepts
+-- \hyphenation and the words are set in the text font.
+local function add_hyphenation(doc)
+  if #OPTS.hyphenation == 0 or not FORMAT:match("latex") then return nil end
+  local raw = pandoc.RawBlock("latex", "\\hyphenation{" .. table.concat(OPTS.hyphenation, " ") .. "}")
+  doc.blocks:insert(1, raw)
+  return doc
+end
+
+-- Three passes: the first reads the options and marks the tables inside a
+-- widths-from-dashes div (pandoc visits a table before the div around it, so
+-- a single pass could not tell the Table function about the div); the second
+-- is the filter described at the top of this file; the third adds the
+-- hyphenation exceptions.
 return {
-  { Div = mark_widths_from_dashes },
+  { Meta = read_options, Div = mark_widths_from_dashes },
   { Table = Table, Str = Str, Code = Code, RawBlock = RawBlock,
-    RawInline = RawInline, Image = Image },
+    RawInline = RawInline, Image = Image, Inlines = Inlines, Header = Header },
+  { Pandoc = add_hyphenation },
 }

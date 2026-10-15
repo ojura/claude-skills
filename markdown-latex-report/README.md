@@ -26,7 +26,7 @@ travels with it. Click any page to open the full PDF.
 
 [![code listing with line wrapping](docs/preview/02-code-wrapping.png)](docs/sample-report.pdf)
 
-**A generated chart, and a table whose columns auto-size to fit: long `.cpp` paths break at the slashes, and a C++ template in the prose column breaks inside the angle brackets**
+**A generated chart, and a table with columns sized to fit: long `.cpp` paths break at the slashes, and a C++ template in the prose column breaks inside the angle brackets**
 
 [![chart and a content-rich table](docs/preview/03-chart-and-table.png)](docs/sample-report.pdf)
 
@@ -47,6 +47,8 @@ travels with it. Click any page to open the full PDF.
 ```bash
 make                    # builds the bundled test fixture to REPORT.pdf
 make REPORT=mydoc.md    # build your own Markdown file
+make check REPORT=mydoc.md CHARTS_DIR=charts   # build with the log kept, check the PDF and the Markdown
+make venv               # ~/.venvs/mlr with matplotlib, numpy and PyMuPDF for the charts and the checker
 ```
 
 Write standard Markdown: pipe tables, fenced code blocks with a language tag,
@@ -58,28 +60,32 @@ and customization (fonts, chart directory, manual table overrides).
 
 ## What is in here
 
-- `Makefile`, `header.tex`, `filter.lua`, `md_table_to_latex.py` - the pipeline.
-- `*.sty` - LaTeX packages bundled locally (LPPL) so you do not need a full
+- `Makefile`, `header.tex`, `filter.lua`, `md_table_to_latex.py`: the pipeline.
+- `tools/check_report.py`: the checker that `make check` runs on the log, the
+  PDF and the Markdown; `tools/prose_check.py`: the prose scan.
+- `chartstyle.py`: the house style for matplotlib charts.
+- `templates/report.md`: a starter document with the conventions as comments.
+- `*.sty`: LaTeX packages bundled locally (LPPL) so you do not need a full
   texlive install.
-- `bblopts.cfg`, `hyph-en-gb.tex` - British hyphenation for documents with
+- `bblopts.cfg`, `hyph-en-gb.tex`: British hyphenation for documents with
   `lang: en-GB` on installations without the package hyphen-english:
   `bblopts.cfg` makes babel load the patterns in `hyph-en-gb.tex` (hyph-utf8,
   MIT licence).
-- `test/` - a self-contained fixture (a fictional toaster-firmware performance
-  report) that exercises every feature and serves as the smoke test. Building
+- `test/`: a self-contained fixture (a fictional toaster-firmware performance
+  report) that exercises the pipeline's features and serves as the smoke test. Building
   it is how you confirm the pipeline works.
 
-## Figures: vector for the PDF, raster for the Markdown
+## Vector figures
 
 Plot scripts write every chart **twice with the same basename in the same
 directory**: a raster `.png` and a vector `.pdf`
 (`fig.savefig("charts/foo.png", dpi=150)` then `fig.savefig("charts/foo.pdf")`).
 The Markdown references only the `.png`, so plain-Markdown preview (GitHub,
 editors) keeps working. At LaTeX time `filter.lua`'s `Image` handler promotes
-any `.png` image whose `.pdf` sibling exists on the resource path to the
+any `.png` image with a `.pdf` sibling on the resource path to the
 vector file, so the shipped PDF gets sharp, zoomable, searchable plots
 instead of re-rasterized bitmaps. Photographs, renders and screenshots stay
-raster by simply not shipping a sibling; the rule only touches plots that
+raster by not shipping a sibling; the rule only touches plots that
 opted in. Why: raster plots blur at print zoom and bloat at high dpi; vector
 axis text stays crisp at any size and usually weighs less. (Raster payloads
 inside a vector figure, e.g. an imshow heatmap, correctly remain raster while
@@ -98,10 +104,10 @@ matplotlib >= 3.8 (a venv is fine) and always render one PDF page
 vector figures are unaffected; only embedded raster payloads shear.
 
 **Stale embeds.** Images are embedded at pandoc time, and the `all` target
-echoes "built" even when the PDF was up to date, so regenerating only a
-figure and re-running `make` used to keep the old embed silently. The
-Makefile now lists `img/*` next to the report as dependencies; if your
-figures live elsewhere, `make rebuild` after regenerating them.
+echoes "built" even when the PDF was up to date, so a regenerated figure
+reaches the PDF only when the PDF is rebuilt. The Makefile lists `img/*` next
+to the report as dependencies; if your figures live elsewhere, `make rebuild`
+after regenerating them.
 
 ## Dependencies
 

@@ -3,8 +3,13 @@
 Toaster Pop-Time Performance Study: Chart Generation
 All data is fabricated for benchmarking purposes. Any resemblance
 to real toaster firmware is purely coincidental.
+
+The charts use the skill's house style (chartstyle.py two directories up):
+every figure is drawn 6.3 in wide, text at 9 and 9.5 pt, one palette, and
+each chart is written as a PNG for the Markdown and a PDF for the report.
 """
 import os
+import sys
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -12,32 +17,23 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 OUT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.normpath(os.path.join(OUT, '..', '..')))
+import chartstyle as cs  # noqa: E402
 
-# ---------------------------------------------------------------------------
-# Shared style
-# ---------------------------------------------------------------------------
-plt.rcParams.update({
-    'font.family': 'DejaVu Sans',
-    'font.size': 10,
-    'axes.titlesize': 12,
-    'axes.titleweight': 'bold',
-    'axes.spines.top': False,
-    'axes.spines.right': False,
-    'figure.dpi': 150,
-})
-
-COLORS = ['#2e86ab', '#e84855', '#f4a261', '#2a9d8f', '#8338ec', '#fb8500']
+cs.apply()
+COLORS = cs.PALETTE
 
 
 def save(fig, name):
     """Save as both PNG (150 dpi) and PDF."""
-    png_path = os.path.join(OUT, name + '.png')
-    pdf_path = os.path.join(OUT, name + '.pdf')
-    fig.savefig(png_path, dpi=150, bbox_inches='tight')
-    fig.savefig(pdf_path, bbox_inches='tight')
+    png_path, pdf_path = cs.save(fig, name, OUT)
     print(f'  Wrote {png_path}')
     print(f'  Wrote {pdf_path}')
-    plt.close(fig)
+
+
+def figure(height):
+    fig, ax = cs.figure(height=height)
+    return fig, ax
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +52,7 @@ def plot_headline_speedups():
     ]
     speedups = [3.81, 2.94, 2.47, 1.98, 1.72, 1.55, 1.31, 1.14]
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = figure(3.9)
     bars = ax.barh(labels, speedups, color=COLORS[:len(labels)], edgecolor='white', linewidth=0.5)
     ax.axvline(1.0, color='black', linewidth=0.8, linestyle='--', label='Baseline (1.0x)')
     ax.set_xlabel('Speedup (x) relative to stock firmware')
@@ -64,7 +60,7 @@ def plot_headline_speedups():
     ax.legend(loc='lower right')
     for bar, val in zip(bars, speedups):
         ax.text(val + 0.03, bar.get_y() + bar.get_height() / 2,
-                f'{val:.2f}x', va='center', fontsize=9)
+                f'{val:.2f}x', va='center', fontsize=cs.FONT)
     ax.set_xlim(0, 4.5)
     fig.tight_layout()
     save(fig, 'headline_speedups')
@@ -88,7 +84,7 @@ def plot_throughput_scaling():
     # Coil pre-energisation + LUT: near-linear to 8 slots
     full_opt = np.array([4.0, 8.0, 16.0, 23.5, 30.8, 36.1, 39.9, 42.3])
 
-    fig, ax = plt.subplots(figsize=(7, 5))
+    fig, ax = figure(4.2)
     ax.plot(slots, linear, 'k--', linewidth=1, label='Linear ideal', alpha=0.4)
     ax.plot(slots, stock, 'o-', color=COLORS[1], label='Stock firmware')
     ax.plot(slots, optimised, 's-', color=COLORS[0], label='Tier 1 optimisations')
@@ -113,7 +109,7 @@ def plot_latency_histogram():
     stock_counts    = [2, 18, 34, 29, 12, 5]
     optimised_counts = [5, 41, 38, 12, 3,  1]
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = figure(3.9)
     ax.bar(x - width/2, stock_counts,    width, label='Stock firmware', color=COLORS[1], alpha=0.85)
     ax.bar(x + width/2, optimised_counts, width, label='Tier 1 optimised', color=COLORS[0], alpha=0.85)
     ax.set_xticks(x)
@@ -140,11 +136,11 @@ def plot_before_after():
     x = np.arange(len(bread_types))
     width = 0.38
 
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = figure(3.6)
     ax.bar(x - width/2, before_ms, width, label='Before (stock)', color=COLORS[1], alpha=0.85)
     ax.bar(x + width/2, after_ms,  width, label='After (Tier 1+2)', color=COLORS[3], alpha=0.85)
     ax.set_xticks(x)
-    ax.set_xticklabels(bread_types, rotation=25, ha='right', fontsize=9)
+    ax.set_xticklabels(bread_types, rotation=25, ha='right', fontsize=cs.FONT)
     ax.set_ylabel('Mean pop-time (ms)')
     ax.set_title('Before / After Mean Pop-Time by Bread Type')
     ax.legend()
@@ -162,7 +158,7 @@ def plot_cost_breakdown():
     optimised_ms = [ 3,  11, 36,  5,  7,  3]
 
     x = np.arange(len(phases))
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = figure(3.9)
 
     bottom_s = np.zeros(len(phases))
     bottom_o = np.zeros(len(phases))
@@ -207,12 +203,12 @@ def plot_the_cliff():
     pt_stock = pop_time(moisture_pct) + rng.standard_normal(len(moisture_pct)) * 4
     pt_patched = 95 + 0.38 * moisture_pct + rng.standard_normal(len(moisture_pct)) * 3
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = figure(3.9)
     ax.plot(moisture_pct, pt_stock,   color=COLORS[1], linewidth=1.5, label='Stock firmware')
     ax.plot(moisture_pct, pt_patched, color=COLORS[3], linewidth=1.5, label='ADC range patch (Ch. 5)')
     ax.axvline(38.5, color='black', linestyle=':', linewidth=1.2, label='Cliff at 38.5% moisture')
     ax.annotate('ADC overflow\nwatchdog fires', xy=(38.5, 520), xytext=(45, 480),
-                arrowprops=dict(arrowstyle='->', color='black'), fontsize=9)
+                arrowprops=dict(arrowstyle='->', color='black'), fontsize=cs.FONT)
     ax.set_xlabel('Bread moisture content (%)')
     ax.set_ylabel('Pop-time (ms)')
     ax.set_title('The Cliff: Pop-Time vs Bread Moisture (stock vs patched)')
