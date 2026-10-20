@@ -66,7 +66,7 @@ finished in one pass instead of after a reviewer's second.
   paths that are missing or untracked, images that are missing or raster, and
   captions longer than three sentences. See "Checking the report".
 - `tools/prose_check.py`: the prose scan: dashes, "whose" clauses, negation
-  on a noun, blanket quantifiers, headings that are not plain labels, long
+  on a noun, headings that are not plain labels, long
   sentences and paragraphs, number and spelling conventions, identifiers in
   plain text, coined compounds, banned and process vocabulary, terminology
   drift against a terms file. See "Writing the report".
@@ -307,8 +307,7 @@ counted; `templates/report.md` is laid out on them.
   beam", not "drain the scans whose last beam the buffer covers").
 - Negate the verb, not the noun ("the script does not write bytecode", not
   "the script writes no bytecode"; "every commit is kept", not "no commit is
-  lost"). Name the set a quantifier covers ("every cited path", not
-  "everything").
+  lost").
 - Do not decorate: "surface", "stranded", "gated", "load-bearing", "blast
   radius", "carve-out", "seam" and "landed" add tone without information, and a
   cost word ("cheap", "pragmatic", "good enough", "for now") stands in for a

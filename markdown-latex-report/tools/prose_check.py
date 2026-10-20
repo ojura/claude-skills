@@ -14,7 +14,6 @@ Checks, each a section of the output:
   whose       every "whose" clause (state the fact directly instead).
   negation    negation moved onto a noun: "no X", "nothing", "none", "neither"
               (negate the verb: "does not", "every X is kept").
-  quantifiers all, every, always, never, whole, entire: name the set.
   headings    headings with a comma, a colon or a question mark, or a stock
               phrase (headings are plain labels).
   length      sentences over 60 words, paragraphs over 200 words, captions over
@@ -186,14 +185,6 @@ def main():
                 continue
             items.append("line %d: '%s' %s" % (i, m.group(0), ctx(l, m.start(), m.end(), 50)))
     section("negation", items, "Negate the verb instead ('does not write', 'every commit is kept'); a quoted protocol phrase such as 'no data available' is fine.")
-
-    # ---- quantifiers ----
-    items = []
-    for i, l in body:
-        s = prose(l)
-        for m in re.finditer(r"\b(all|every|everything|always|never|whole|entire(ly)?|completely|fully)\b", s, re.I):
-            items.append("line %d: '%s' %s" % (i, m.group(0), ctx(l, m.start(), m.end(), 50)))
-    section("quantifiers", items, "Each must name its set ('every cited path', not 'everything').")
 
     # ---- headings ----
     items = []
