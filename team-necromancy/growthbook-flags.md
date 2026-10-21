@@ -295,6 +295,12 @@ application was not run with feature fetching enabled.
 | `tengu_sequential_cloud` | false | 2.1.304, unchanged from 2.1.296: the settings of Claude Code's own renewal of the main thread's 1-hour cache. `Y3()` in `chunk-rncrmfyt.js` reads `k("tengu_sequential_cloud", false)`. A value that is not an object, or an object that fails the schema `Nio`, reads as off, so `false` is off. The schema: `enabled` must be `true` (`z.literal(true)`); `touchIntervalSeconds` 10 to 120, default 30; `activityWindowMinutes` 1 to 1440, default 60; `inFlightWindowMinutes` 1 to 1440, optional and new in 2.1.304, used in place of the activity window while a turn or a subagent runs when it is the larger; `resumeTouches`, default false. While the flag is on, a main-loop request whose TTL decision is the 1-hour subscriber default, and for which `RTt()` holds (at the first request of a chain, also outside usage overage and with `KD()`, not traced, false), carries the beta header `anthropic-cache-keepalive`, decided per chain of main requests in `ATt()`. The engine then posts `/v1/messages/cache_touch` every `touchIntervalSeconds` while the latest activity (a main request, prompt input, work starting or ending, waiting for the user starting or ending) lies within the window. `RTt()` has the same ten terms as 2.1.296's `jst()`, among them an unset `ANTHROPIC_UNIX_SOCKET`, `kt()` (not traced; `zbe()` gives 5 minutes when it is false, which matches a subscriber check) and the permission `allow_cache_keepalive`. `~/src/cc-env-overrides/docs/cc-cache.md`, section "Claude Code's TTL and its own renewal", gives the rules as traced in 2.1.294. Juraj's cache held `false` on 2026-10-20, so the renewal is off here. |
 | `tengu_prompt_cache_1h_config` | `{"allowlist": ["repl_main_thread*", "sdk", "auto_mode", "memdir_relevance"]}` | 2.1.304, unchanged from 2.1.296 (`npe()` there): read in the TTL decision `zbe()` in `chunk-rncrmfyt.js`. It applies after the explicit rules (`FORCE_PROMPT_CACHING_5M`, `CLAUDE_CODE_PROMPT_CACHE_TTL` or `CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL`, the settings key `promptCacheTtl` or `subagentPromptCacheTtl`, an agent's frontmatter TTL, of which a 1-hour one is skipped in usage overage, and `ENABLE_PROMPT_CACHING_1H`), and only while `kt()` holds (not traced; read as the subscriber check) and the account is not in usage overage: a request whose query source matches an entry (a trailing `*` matches any source that starts with the rest) gets 1-hour cache, any other 5 minutes. The engine stores the first allowlist it reads in the host's `requestLatches` (`C5o()`, `R5o()`) and uses that one from then on; what resets the store was not traced. Juraj's cache held the allowlist `repl_main_thread*`, `sdk`, `auto_mode`, `rolling_compact`, `memdir_relevance`, `agent_classifier`, `prompt_suggestion`, `away_summary`, `extract_memories` on 2026-10-20. |
 | `tengu_tidy_frost` | false | 2.1.304, unchanged from 2.1.296: read last in `zbe()`, only when the caller passes the main thread's model and the main thread's latest request asked for 5-minute cache and is still live for that model (`N4o()`). A request that would otherwise get the 1-hour subscriber default then gets 5 minutes, reason `live_5m_cache`. The callers that pass the model were not followed. Absent from Juraj's cache on 2026-10-20, so it reads false. |
+| `tengu_saffron_lattice` | `{}` | 2.1.305: the Fable billing config. `rg()` in `chunk-4msg6xg9.js` parses it; `fGe(model)` returns the `enabled` of a `perModel` entry for the model when there is one, false when `enabled` is false, and otherwise `overageConsentRequired === true \|\| planLimitsEndDate !== undefined`. Where `fGe()` is true the usage-credits consent dialog opens before a Fable request; see [Usage-credits consent dialog](#usage-credits-consent-dialog-21305). Juraj's cache held `{"enabled": false}` on 2026-10-21, so it did not open the dialog then. |
+| `tengu_saffron_credits_only_tiers` | `["enterprise"]` | 2.1.305: `HUt()` is true for a subscription tier in this list, and for `enterprise` unless `upn()` (not traced). The consent check then reports `admin_billed` and the consent dialog does not open. |
+| `tengu_calm_seal` | `null` | 2.1.305: the families besides Fable that `Y4()` treats as usage-credits models, so the consent check covers them too. Juraj's cache held `["Mythos"]` on 2026-10-21. |
+| `tengu-model-error-overrides` | `{}` | 2.1.305, read with `JR()`, not `k()`: a non-empty `block` string for a model makes `Y5n()` true, and the consent dialog does not open for that model. What the request does then was not traced. |
+| `tengu_ember_latch` | false | 2.1.305: one term of `k5t()`, which decides whether the consent dialog offers to buy usage credits in Claude Code ("Yes, buy usage credits") instead of sending the person to claude.ai or to an admin. |
+| `tengu_saffron_ladder` | false | 2.1.305: `J2s()` is `Wle() && flag` (`Wle()` not traced); with it the Fable consent dialog offers "Upgrade to Max". |
 
 Reading a flag from a mod: 2.1.304 has a `flag.value` operation
 (`$.flag.value(name, fallback)` in the engine's interface builder), but the
@@ -303,6 +309,44 @@ out (`xE()` is false for it), and the plugin API's types (`claude-code.d.ts`)
 do not declare `$.flag`. Whether a mod's call is refused was not tested.
 cc-env-overrides reads `cachedGrowthBookFeatures` from `~/.claude.json`
 instead (`remoteFeatures()` in its `overrides.js`).
+
+## Usage-credits consent dialog (2.1.305)
+
+The dialog titled "You've reached your Fable limit", or "Fable 5.1 now uses usage credits", with the
+choices "Continue with Fable 5.1" and "Not now", is the prompt `fable_overage_consent_prompt`. The engine
+(`chunk-ntt9607d.js`) opens it before a request to Fable when `HUe(model)` holds: `Jke(model)`, no
+`tengu-model-error-overrides` block for the model, and a session that can show the dialog. `Jke()` is
+true when `Pcn(model)` in `chunk-4msg6xg9.js` returns `needs_consent` or `needs_credits`:
+
+1. `Y4(model)` gives the family: Fable, or a family in `tengu_calm_seal`; any other model is
+   `included_in_plan`.
+2. `LW()` gives `pay_per_request`; it is true outside the first-party provider, when `wt()` is false,
+   and for two other terms not traced.
+3. `HUt()` (`tengu_saffron_credits_only_tiers`) gives `admin_billed`.
+4. `ONr(model)` must be true, otherwise `included_in_plan`. It is `fGe(model)`
+   (`tengu_saffron_lattice`) or `F5o()`, the latch `host.accountCreditLatches.usageCreditsRequired`.
+5. No consent for the current organization (or account) in the config key `fableOverageConsentV2`,
+   nor for this session, gives `needs_consent`.
+6. `KMe()` false, read from the config key `cachedExtraUsageDisabledReason`, gives `needs_credits`;
+   `out_of_credits` there gives `out_of_credits`, which does not open the dialog.
+
+The latch is not a flag. Two places set it to true, and nothing in 2.1.305 sets it back except
+`reset()` of its class, for which no caller was found; it lasts for the life of the process:
+
+- the rate-limit tracker (`chunk-p2eb1prj.js`), when a response's headers report overage in use for a
+  usage-credits model and the current organization has not consented, with further terms;
+- the 429 handler (`chunk-pc3bqzpw.js`), for an error with code `credits_required` and without a
+  rate-limit type.
+
+The title is "You've reached your Fable limit" when `fGe()` is false, that is when the latch opened
+the dialog, and "Fable 5.1 now uses usage credits" when the flag did.
+
+A token switch inside a running session does not clear the latch, and the consent in step 5 is kept per
+organization. So after one account hit its weekly Fable limit, the latch stays set after a switch to
+another account's token; if that account's organization has no recorded consent, the dialog opens before
+every Fable request, although the new account has Fable usage left. Starting a new Claude Code process
+clears the latch. Whether the organization that step 5 reads follows an in-session token switch was not
+traced.
 
 ## Native restart: `tengu_fancy_wand` (2.1.296)
 
