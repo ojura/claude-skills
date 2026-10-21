@@ -325,8 +325,16 @@ true when `Pcn(model)` in `chunk-4msg6xg9.js` returns `needs_consent` or `needs_
 3. `HUt()` (`tengu_saffron_credits_only_tiers`) gives `admin_billed`.
 4. `ONr(model)` must be true, otherwise `included_in_plan`. It is `fGe(model)`
    (`tengu_saffron_lattice`) or `F5o()`, the latch `host.accountCreditLatches.usageCreditsRequired`.
-5. No consent for the current organization (or account) in the config key `fableOverageConsentV2`,
-   nor for this session, gives `needs_consent`.
+5. No consent for the current organization (or account) in the config key `fableOverageConsentV2`
+   (`{"<organization uuid>": true}`, or `"acct:<account uuid>"` without an organization; other families
+   in `usageCreditsOnlyModelConsent.<family>`), nor for this session, gives `needs_consent`. The current
+   organization is the one `oauthAccount` in the global config names, the stored /login account
+   (`pn()`), and only while `Qa()` holds: no API key, `apiKeyHelper` or `ANTHROPIC_AUTH_TOKEN` in use,
+   among other terms (`Gn()`, `ac()`, `e1()`, `av()` and `Rhe()` were not traced).
+   `CLAUDE_CODE_OAUTH_TOKEN` is not one of those terms, so a cc-token override is checked against the
+   stored login's organization, not the token's. With `ANTHROPIC_AUTH_TOKEN` set, as by the cc-token
+   proxy, `Qa()` is false unless `av()` or `Rhe()` hold, and then only a consent given in the running
+   process counts, which a write to the config file cannot supply.
 6. `KMe()` false, read from the config key `cachedExtraUsageDisabledReason`, gives `needs_credits`;
    `out_of_credits` there gives `out_of_credits`, which does not open the dialog.
 
@@ -341,12 +349,11 @@ The latch is not a flag. Two places set it to true, and nothing in 2.1.305 sets 
 The title is "You've reached your Fable limit" when `fGe()` is false, that is when the latch opened
 the dialog, and "Fable 5.1 now uses usage credits" when the flag did.
 
-A token switch inside a running session does not clear the latch, and the consent in step 5 is kept per
-organization. So after one account hit its weekly Fable limit, the latch stays set after a switch to
-another account's token; if that account's organization has no recorded consent, the dialog opens before
-every Fable request, although the new account has Fable usage left. Starting a new Claude Code process
-clears the latch. Whether the organization that step 5 reads follows an in-session token switch was not
-traced.
+A token switch inside a running session does not clear the latch. So after one account hit its weekly
+Fable limit, the latch stays set after a switch to another account's token, and the dialog opens before
+every Fable request whenever step 5 or step 6 fails: under the cc-token proxy because of step 5, and
+otherwise because of step 6 when the cached reason does not count as enabled, although the new account
+has Fable usage left. Starting a new Claude Code process clears the latch.
 
 ## Native restart: `tengu_fancy_wand` (2.1.296)
 
