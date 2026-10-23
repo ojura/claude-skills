@@ -17,8 +17,9 @@ its pagination changes:
 `compare` checks the committed files against a fresh build: the page count,
 the text of every page, the pages rendered at CHECK_DPI, and the previews. It
 exits 1 with the message STALE when they differ. `make sample` runs `write`,
-`make check` on the fixture runs `compare`, and hooks/pre-commit runs it when
-a staged path touches the pipeline.
+`make check` on the fixture runs `compare` on the PDF it has just built in
+CHECK_DIR. `make sample-check` compares the fixture build without the other
+report checks.
 """
 import argparse
 import os

@@ -73,11 +73,10 @@ finished in one pass instead of after a reviewer's second.
 - `chartstyle.py`: the house style for matplotlib charts: figure width, font
   sizes that print readably, one palette, and a `save` that writes the PNG and
   the PDF. See "Charts".
-- `tools/sample.py`, `docs/`, `hooks/pre-commit`: the showcase. `docs/` holds
-  the fixture's PDF and three preview pages, which the README links; `make
-  sample` writes them from a fresh build, `make check` on the fixture fails
-  while they differ from one, and the hook refuses a commit that changes the
-  pipeline while they differ. See "The showcase and the commit routine".
+- `tools/sample.py`, `docs/`: the sample PDF and three preview pages linked
+  from the README. `make sample` writes them from a build of the fixture.
+  `make check` compares them with the freshly checked PDF and fails while
+  they differ. See "Sample output checks".
 - `templates/report.md`: a starter document with the front matter that works,
   the structure of a review (verdict first, findings, recommendations,
   evidence, limits, an evidence index and a terms appendix), and the
@@ -100,7 +99,7 @@ make rebuild              # force a clean rebuild (also redraws charts)
 make clean                # remove PDF + LaTeX temp files + chart sentinel
 make venv                 # ~/.venvs/mlr with matplotlib, numpy and PyMuPDF
 make sample               # rewrite docs/sample-report.pdf and docs/preview/ from the fixture
-make hooks                # install hooks/pre-commit through core.hooksPath
+make sample-check         # compare the fixture build with the sample PDF and previews
 ```
 
 A document without charts does not need a plot script: when `PLOT` does not exist,
@@ -366,7 +365,7 @@ A one-shot report: write it on the template, draw the charts with
 `chartstyle.py`, run the prose check and fix what it lists, `make check`, fix
 the pages it names, look at the renders, and only then call it finished.
 
-## The showcase and the commit routine
+## Sample output checks
 
 `docs/sample-report.pdf` and the three previews in `docs/preview/` are the
 fixture built at the committed pipeline, and the README links them as the
@@ -382,17 +381,12 @@ build: the page count, the text of every page, the pages rendered at 60 dpi
 and the three previews. It fails with `sample report is stale: run make
 sample` while they differ.
 
-A change to the pipeline (the Makefile, `header.tex`, `filter.lua`, the
-`.sty` files, `bblopts.cfg`, `hyph-en-gb.tex`, `chartstyle.py`, the fixture
-under `test/`) therefore goes with `make sample` and the regenerated `docs/`
-in the same commit; until then `make check` fails. `make hooks` installs
-`hooks/pre-commit` through `core.hooksPath` of the repository that holds the
-skill. The hook runs the comparison when a staged path touches the pipeline
-and refuses the commit while the showcase is stale. It reads the working
-tree, not the index, so stage the regenerated `docs/` with the change. A
-commit made with `git commit-tree` (the private-index routine) bypasses
-hooks, so the check target is the guard that counts: run `make check` before
-such a commit.
+Run `make check` after changes to the Makefile, `header.tex`, `filter.lua`,
+the `.sty` files, `bblopts.cfg`, `hyph-en-gb.tex`, `chartstyle.py`, or the
+fixture under `test/`. The comparison uses the PDF built in `CHECK_DIR`
+during that check, independently of any existing `REPORT.pdf`. If the output
+changes as intended, run `make sample`, run `make check` again, and commit
+the regenerated `docs/` files with the source changes.
 
 ## Test fixture
 

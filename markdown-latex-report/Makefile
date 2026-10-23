@@ -9,7 +9,7 @@
 #   make REPORT=path/to/doc.md
 # The default builds the fabricated test fixture under test/.
 #
-# `make check` builds the report a second time with the LaTeX log kept, then
+# `make check` builds the report with the LaTeX log kept, then
 # runs tools/check_report.py on the log, the PDF and the Markdown: it names
 # every page and source line with a stretched or overfull line, a wrong running
 # head, a page that holds only a figure or ends early, a heading at a page foot,
@@ -21,9 +21,8 @@
 #
 # docs/sample-report.pdf and docs/preview/*.png, the showcase the README links,
 # are the fixture built at the committed pipeline. `make sample` rewrites them
-# from a fresh build; `make check` on the fixture fails while they differ from
-# one; `make hooks` installs a pre-commit hook that refuses a commit touching
-# the pipeline while they differ.
+# from a fresh build; `make check` on the fixture compares them with the PDF
+# built in CHECK_DIR and fails while they differ.
 
 REPORT      ?= test/REPORT.md
 FIXTURE     := test/REPORT.md
@@ -62,7 +61,7 @@ PANDOC_FLAGS := --from markdown+raw_tex+raw_attribute-smart \
 LOCAL_STYS := fvextra.sty upquote.sty widows-and-orphans.sty needspace.sty
 CHARTS_STAMP := $(CHARTS_DIR)/.stamp
 
-.PHONY: all charts clean rebuild check venv sample sample-check hooks
+.PHONY: all charts clean rebuild check venv sample sample-check
 all: $(OUT)
 	@echo "==> built $(OUT)"
 
@@ -89,18 +88,18 @@ $(CHARTS_STAMP): $(wildcard $(PLOT)) chartstyle.py
 # by filter.lua; regenerating a figure must trigger a re-embed
 FIGS := $(wildcard $(dir $(REPORT))img/*)
 
-$(OUT): $(REPORT) header.tex filter.lua bblopts.cfg hyph-en-gb.tex $(LOCAL_STYS) $(CHARTS_STAMP) $(FIGS)
+$(OUT): Makefile $(REPORT) header.tex filter.lua bblopts.cfg hyph-en-gb.tex $(LOCAL_STYS) $(CHARTS_STAMP) $(FIGS)
 	TEXINPUTS=.:$$TEXINPUTS pandoc $(REPORT) $(PANDOC_FLAGS) \
 		--pdf-engine=lualatex \
 		-o $(OUT)
 
 # ---- check ----
-# A second build with the log kept: pandoc writes the .tex, lualatex runs up to
+# A fresh build with the log kept: pandoc writes the .tex, lualatex runs up to
 # three times in CHECK_DIR (the skill directory is on TEXINPUTS for the
 # preamble, the packages, the patterns and the figures), and the checker reads
 # the log, the PDF, the .toc and the Markdown. For the fixture the showcase
 # under docs/ is compared with the fresh build as well.
-check: $(CHARTS_STAMP) $(FIGS) $(if $(filter $(FIXTURE),$(REPORT)),$(OUT))
+check: $(CHARTS_STAMP) $(FIGS)
 	@rm -rf "$(CHECK_DIR)" && mkdir -p "$(CHECK_DIR)"
 	@echo "==> building $(REPORT) with the log kept in $(CHECK_DIR)"
 	@TEXINPUTS=.:$$TEXINPUTS pandoc $(REPORT) $(PANDOC_FLAGS) -s -t latex -o "$(CHECK_DIR)/$(BASE).tex"
@@ -112,7 +111,7 @@ check: $(CHARTS_STAMP) $(FIGS) $(if $(filter $(FIXTURE),$(REPORT)),$(OUT))
 	@$(PYTHON) tools/check_report.py --md $(REPORT) --tex "$(CHECK_DIR)/$(BASE).tex" \
 		--log "$(CHECK_DIR)/$(BASE).log" --pdf "$(CHECK_DIR)/$(BASE).pdf" \
 		--out "$(CHECK_DIR)" --charts $(CHARTS_DIR) $(CHECK_ARGS)
-	@if [ "$(REPORT)" = "$(FIXTURE)" ]; then $(PYTHON) tools/sample.py compare --pdf $(OUT) --docs $(SAMPLE_DIR); fi
+	@if [ "$(REPORT)" = "$(FIXTURE)" ]; then $(PYTHON) tools/sample.py compare --pdf "$(CHECK_DIR)/$(BASE).pdf" --docs "$(SAMPLE_DIR)"; fi
 
 # ---- sample ----
 # The showcase is a build product, never made by hand: the PDF is a copy of the
@@ -126,16 +125,6 @@ sample: $(OUT)
 sample-check: $(OUT)
 	@test "$(REPORT)" = "$(FIXTURE)" || { echo "the showcase comparison applies to the fixture only; run it without REPORT"; exit 1; }
 	@$(PYTHON) tools/sample.py compare --pdf $(OUT) --docs $(SAMPLE_DIR)
-
-# ---- hooks ----
-# hooks/pre-commit runs the showcase comparison when a staged path touches the
-# pipeline. Installed through core.hooksPath of the repository that holds the
-# skill; an existing core.hooksPath is left alone and reported.
-hooks:
-	@hp=$$(git config core.hooksPath || true); \
-	if [ -z "$$hp" ]; then git config core.hooksPath "$(abspath hooks)" && echo "==> core.hooksPath set to $(abspath hooks)"; \
-	elif [ "$$hp" = "$(abspath hooks)" ]; then echo "==> hooks already installed: $$hp"; \
-	else echo "core.hooksPath is already $$hp; call $(abspath hooks)/pre-commit from the pre-commit hook there"; exit 1; fi
 
 clean:
 	rm -f $(OUT) *.aux *.log *.toc *.out $(CHARTS_STAMP)
