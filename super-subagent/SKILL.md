@@ -71,13 +71,16 @@ When the caller is a worker, `prepare`:
 3. keeps parent alias records and recovers completed parallel tool calls and results;
 4. removes the active helper response and earlier interrupted tool responses while retaining later completed turns;
 5. rewires parent links around removed records;
-6. copies the completed records into the new transcript;
-7. remaps `uuid`, `promptId`, `parentUuid`, local `logicalParentUuid`, `sourceToolAssistantUUID`, and compact-metadata UUID references;
-8. leaves the source transcript unchanged.
+6. orders completed blocks of each assistant response by `apiBlockIndex`, places their tool results in call order, and links reordered history as one sequence;
+7. copies the completed records into the new transcript;
+8. remaps `uuid`, `promptId`, `parentUuid`, local `logicalParentUuid`, `sourceToolAssistantUUID`, and compact-metadata UUID references;
+9. leaves the source transcript unchanged.
 
 A general-purpose or specialized worker without `fork-context-ref` receives the copied local history plus a new fork-instruction message. A compacted sidechain is accepted when its local parent and compact-metadata UUID references can all be resolved. Missing ancestors or omitted referenced records stop creation rather than producing incomplete history. Content that the running model has not written to the transcript cannot be copied.
 
 `--parent-last-uuid UUID` selects an earlier complete boundary when the source is the main conversation. It is invalid when the source is a worker.
+
+Ordering uses only records with the same assistant message ID and unique nonnegative integer block indices. When indices are absent, invalid or duplicated, it keeps the recovered order. Unrelated messages are not moved. Tool-result contents and call IDs stay associated; mixed user content or result batches that cannot follow call order without splitting a message also keep their recovered order. Compaction boundaries and their UUID references are preserved.
 
 ## Model selection
 

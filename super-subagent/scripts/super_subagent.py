@@ -956,6 +956,123 @@ def recover_parallel_tool_results(
     return expanded
 
 
+def order_completed_responses(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    # A parentUuid chain can follow one parallel result while later blocks
+    # arrive on another branch. Recovery alone does not restore API block order.
+    assistants: dict[str, list[int]] = {}
+    tool_owners: dict[str, set[str]] = {}
+    for index, record in enumerate(records):
+        message = record.get("message")
+        if record.get("type") != "assistant" or not isinstance(message, dict):
+            continue
+        response_id = message.get("id")
+        if not isinstance(response_id, str) or not response_id:
+            continue
+        assistants.setdefault(response_id, []).append(index)
+        for tool_id in message_tool_use_ids(record):
+            tool_owners.setdefault(tool_id, set()).add(response_id)
+
+    results: dict[str, list[int]] = {}
+    ambiguous: set[str] = set()
+    for index, record in enumerate(records):
+        if record.get("type") != "user":
+            continue
+        tool_ids = message_tool_result_ids(record)
+        owners = set().union(*(tool_owners.get(tool_id, set()) for tool_id in tool_ids))
+        if not owners:
+            continue
+        content = record["message"]["content"]
+        if len(owners) != 1 or not all(
+            isinstance(block, dict)
+            and block.get("type") == "tool_result"
+            and isinstance(block.get("tool_use_id"), str)
+            and tool_owners.get(block["tool_use_id"]) == owners
+            for block in content
+        ):
+            ambiguous.update(owners)
+            continue
+        results.setdefault(next(iter(owners)), []).append(index)
+
+    ordered = list(records)
+    changed = False
+    for response_id, assistant_slots in assistants.items():
+        indices = [records[index].get("apiBlockIndex") for index in assistant_slots]
+        if (
+            response_id in ambiguous
+            or any(type(index) is not int or index < 0 for index in indices)
+            or len(set(indices)) != len(indices)
+        ):
+            continue
+        response = sorted(
+            (records[index] for index in assistant_slots),
+            key=lambda record: record["apiBlockIndex"],
+        )
+        if any(not isinstance(record["message"].get("content"), list) for record in response):
+            continue
+        call_ids = [
+            block.get("id") for record in response
+            for block in record["message"]["content"]
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        ]
+        if (
+            any(not isinstance(tool_id, str) or not tool_id for tool_id in call_ids)
+            or len(set(call_ids)) != len(call_ids)
+        ):
+            continue
+        call_order = {tool_id: index for index, tool_id in enumerate(call_ids)}
+        response_results = []
+        for index in results.get(response_id, []):
+            record = records[index]
+            message = record["message"]
+            blocks = sorted(
+                message["content"], key=lambda block: call_order[block["tool_use_id"]]
+            )
+            response_results.append(dict(record, message=dict(message, content=blocks)))
+        response_results.sort(
+            key=lambda record: call_order[record["message"]["content"][0]["tool_use_id"]]
+        )
+        result_order = [
+            call_order[block["tool_use_id"]] for record in response_results
+            for block in record["message"]["content"]
+        ]
+        # Keep ambiguous batches intact rather than split messages or move their
+        # other metadata onto a different tool result.
+        if result_order != sorted(set(result_order)):
+            continue
+        slots = sorted(assistant_slots + results.get(response_id, []))
+        selected = set(slots)
+        if any(
+            index not in selected and records[index].get("type") != "progress"
+            for index in range(slots[0], slots[-1] + 1)
+        ):
+            continue
+        for index, record in zip(slots, response + response_results):
+            if record != records[index]:
+                changed = True
+            ordered[index] = record
+
+    if not changed:
+        return records
+    # The copied history is one sequence, not the original result branches.
+    # Link it in its new order so following parents cannot restore the old
+    # branch order or reference a record that now comes later in the file.
+    linked = []
+    previous_uuid = None
+    for record in ordered:
+        clone = dict(record)
+        if not (
+            record.get("type") == "system"
+            and record.get("subtype") == "compact_boundary"
+            and record.get("parentUuid") is None
+        ):
+            clone["parentUuid"] = previous_uuid
+        linked.append(clone)
+        previous_uuid = clone["uuid"]
+    return linked
+
+
 def record_timestamp(record: dict[str, Any]) -> float:
     value = record.get("timestamp")
     if isinstance(value, (int, float)):
@@ -1170,7 +1287,7 @@ def active_sidechain_chain(
             f"source agent {source_id} still has unmatched tool_use records after trimming"
         )
     dropped = len(chain) - len(completed)
-    return reference, completed, dropped, sorted(removed_tool_ids | active_tool_ids)
+    return reference, order_completed_responses(completed), dropped, sorted(removed_tool_ids | active_tool_ids)
 
 
 def remap_compact_metadata(

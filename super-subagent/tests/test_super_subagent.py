@@ -575,6 +575,207 @@ class SuperSubagentTest(unittest.TestCase):
             },
         ]
 
+    def completed_parallel_worker_records(self, source_id):
+        records = self.source_fork_records(source_id)
+        prefix = records[:2]
+        prefix.append({
+            "type": "assistant", "uuid": "parallel-prefix",
+            "parentUuid": "source-user-1", "isSidechain": True,
+            "agentId": source_id, "apiBlockIndex": 0,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {
+                "id": "completed-parallel", "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "fixture", "signature": "keep"}],
+                "stop_reason": None,
+            },
+        })
+        calls, results = {}, {}
+        for number, parent in enumerate(
+            ("parallel-prefix", "parallel-call-1", "parallel-result-1", "parallel-result-2"), 1
+        ):
+            calls[number] = {
+                "type": "assistant", "uuid": f"parallel-call-{number}",
+                "parentUuid": parent, "isSidechain": True, "agentId": source_id,
+                "apiBlockIndex": number, "timestamp": float(number),
+                "message": {
+                    "id": "completed-parallel", "role": "assistant",
+                    "content": [{"type": "tool_use", "id": f"call_{number}",
+                                 "name": "Read", "input": {"file_path": f"/fixture/{number}"}}],
+                    "stop_reason": "tool_use",
+                },
+            }
+            results[number] = {
+                "type": "user", "uuid": f"parallel-result-{number}",
+                "parentUuid": f"parallel-call-{number}", "isSidechain": True,
+                "agentId": source_id, "timestamp": float(number) + 0.5,
+                "sourceToolAssistantUUID": f"parallel-call-{number}",
+                "message": {"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": f"call_{number}",
+                    "content": f"result {number}",
+                }]},
+            }
+        prefix.extend((calls[1], calls[2], results[1], calls[3], results[2],
+                       calls[4], results[3], results[4]))
+        prefix.append({
+            "type": "assistant", "uuid": "after-parallel", "parentUuid": "parallel-result-4",
+            "isSidechain": True, "agentId": source_id, "apiBlockIndex": 0,
+            "message": {"id": "another-response", "role": "assistant",
+                        "content": [{"type": "text", "text": "after parallel calls"}],
+                        "stop_reason": "end_turn"},
+        })
+        records[-2]["parentUuid"] = "after-parallel"
+        return prefix + records[-2:]
+
+    def assert_parallel_call_order(self, records):
+        calls = [
+            block["id"] for record in records
+            for block in record.get("message", {}).get("content", [])
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        ]
+        results = [
+            block["tool_use_id"] for record in records
+            for block in record.get("message", {}).get("content", [])
+            if isinstance(block, dict) and block.get("type") == "tool_result"
+        ]
+        self.assertEqual(calls, ["call_1", "call_2", "call_3", "call_4"])
+        self.assertEqual(results, calls)
+
+    def test_prepare_worker_preserves_completed_parallel_response_order(self):
+        self.write_parent([{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}])
+        source_id = "asource-fork-0123456789abcdef"
+        source = self.write_source_agent(source_id, self.completed_parallel_worker_records(source_id))
+        before = source.read_bytes()
+
+        result = super_subagent.prepare_agent(self.worker_prepare_args())
+        copied = [json.loads(line) for line in Path(result["jsonl"]).read_text().splitlines()][1:]
+        self.assert_parallel_call_order(copied)
+        self.assertEqual(source.read_bytes(), before)
+        assistants = {
+            block["id"]: record["uuid"] for record in copied
+            for block in record.get("message", {}).get("content", [])
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        }
+        previous = None
+        for record in copied:
+            self.assertEqual(record["parentUuid"], previous)
+            previous = record["uuid"]
+            for block in record.get("message", {}).get("content", []):
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    self.assertEqual(record["sourceToolAssistantUUID"], assistants[block["tool_use_id"]])
+        signature = next(record for record in copied if record.get("apiBlockIndex") == 0)
+        self.assertEqual(signature["message"]["content"][0]["signature"], "keep")
+
+        second = super_subagent.prepare_agent(self.worker_prepare_args(
+            from_agent_id=result["agent_id"], agent_id="athird-worker-0123456789abcdef"
+        ))
+        recopied = [json.loads(line) for line in Path(second["jsonl"]).read_text().splitlines()][1:]
+        self.assert_parallel_call_order(recopied)
+
+    def parallel_order_fixture(self):
+        records = self.completed_parallel_worker_records("asource-fork-0123456789abcdef")[2:-3]
+        by_uuid = {record["uuid"]: record for record in records}
+        return [by_uuid[name] for name in (
+            "parallel-prefix", "parallel-call-1", "parallel-call-2",
+            "parallel-result-2", "parallel-call-4", "parallel-result-1",
+            "parallel-call-3", "parallel-result-3", "parallel-result-4",
+        )]
+
+    def test_parallel_order_requires_unique_valid_block_indices(self):
+        for invalid in (None, True, -1, 1.5, "3", 2):
+            with self.subTest(index=invalid):
+                records = self.parallel_order_fixture()
+                records[6]["apiBlockIndex"] = invalid
+                self.assertEqual(super_subagent.order_completed_responses(records), records)
+        records = self.parallel_order_fixture()
+        del records[6]["apiBlockIndex"]
+        self.assertEqual(super_subagent.order_completed_responses(records), records)
+
+    def test_parallel_order_does_not_cross_unrelated_messages(self):
+        for message in (
+            {"type": "user", "message": {"role": "user", "content": "unrelated"}},
+            {"type": "assistant", "apiBlockIndex": 0,
+             "message": {"id": "other-response", "role": "assistant", "content": [
+                 {"type": "thinking", "thinking": "other", "signature": "unchanged"}]}},
+            {"type": "system", "subtype": "compact_boundary", "parentUuid": None},
+        ):
+            with self.subTest(type=message["type"]):
+                records = self.parallel_order_fixture()
+                records.insert(4, dict(message, uuid="unrelated"))
+                self.assertEqual(super_subagent.order_completed_responses(records), records)
+
+    def test_parallel_order_keeps_progress_and_compaction_metadata(self):
+        records = self.parallel_order_fixture()
+        progress = {"type": "progress", "uuid": "progress", "parentUuid": "parallel-call-2"}
+        records.insert(3, progress)
+        compact = {"type": "system", "subtype": "compact_boundary", "uuid": "compact",
+                   "parentUuid": None, "logicalParentUuid": "parallel-result-4",
+                   "compactMetadata": {"preservedMessages": {"uuids": ["parallel-call-3"]}}}
+        records.append(compact)
+        before = json.dumps(records, sort_keys=True)
+        ordered = super_subagent.order_completed_responses(records)
+        self.assert_parallel_call_order(ordered)
+        self.assertEqual(ordered[3]["uuid"], "progress")
+        self.assertEqual(ordered[-1], compact)
+        self.assertEqual(json.dumps(records, sort_keys=True), before)
+
+    def test_parallel_order_sorts_batched_results_without_changing_associations(self):
+        records = self.parallel_order_fixture()
+        results = {record["uuid"]: record for record in records if record["type"] == "user"}
+        first = results["parallel-result-1"]
+        second = results["parallel-result-3"]
+        first["message"]["content"] = [results["parallel-result-2"]["message"]["content"][0],
+                                        first["message"]["content"][0]]
+        second["message"]["content"] = [results["parallel-result-4"]["message"]["content"][0],
+                                         second["message"]["content"][0]]
+        records = [record for record in records if record["type"] == "assistant"] + [second, first]
+        ordered = super_subagent.order_completed_responses(records)
+        self.assert_parallel_call_order(ordered)
+        self.assertEqual(
+            [block["content"] for record in ordered if record["type"] == "user"
+             for block in record["message"]["content"]],
+            ["result 1", "result 2", "result 3", "result 4"],
+        )
+
+    def test_parallel_order_keeps_responses_separate(self):
+        first = self.parallel_order_fixture()
+        second = json.loads(json.dumps(first).replace("parallel", "second").replace("call_", "other_"))
+        original = first + second
+        ordered = super_subagent.order_completed_responses(original)
+        self.assert_parallel_call_order(ordered[:len(first)])
+        self.assertEqual(
+            [block["id"] for record in ordered[len(first):]
+             for block in record.get("message", {}).get("content", [])
+             if block.get("type") == "tool_use"],
+            ["other_1", "other_2", "other_3", "other_4"],
+        )
+        self.assertEqual(
+            {record["uuid"] for record in ordered[:len(first)]},
+            {record["uuid"] for record in first},
+        )
+
+    def test_parallel_order_keeps_invalid_call_metadata(self):
+        for invalid in (None, [], "", "call_1"):
+            with self.subTest(id=invalid):
+                records = self.parallel_order_fixture()
+                records[2]["message"]["content"][0]["id"] = invalid
+                self.assertEqual(super_subagent.order_completed_responses(records), records)
+
+    def test_parallel_order_preserves_ambiguous_result_records(self):
+        for ambiguity in ("mixed-text", "unknown-call", "duplicate-result", "overlapping-batches"):
+            with self.subTest(ambiguity=ambiguity):
+                records = self.parallel_order_fixture()
+                first = records[5]["message"]["content"]
+                if ambiguity == "mixed-text":
+                    first.append({"type": "text", "text": "keep with this result"})
+                elif ambiguity == "unknown-call":
+                    first.append({"type": "tool_result", "tool_use_id": "unrelated", "content": "keep"})
+                elif ambiguity == "duplicate-result":
+                    first.append(dict(first[0]))
+                else:
+                    first.append(records[7]["message"]["content"][0])
+                    del records[7]
+                self.assertEqual(super_subagent.order_completed_responses(records), records)
+
     def test_prepare_from_worker_copies_completed_chain_and_preserves_source(self):
         self.write_parent(
             [{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}]
