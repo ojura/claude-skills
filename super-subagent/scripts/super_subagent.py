@@ -190,21 +190,7 @@ def read_parent_reference(
     entries: list[dict[str, Any]] = []
     by_uuid: dict[str, dict[str, Any]] = {}
 
-    with parent_jsonl.open("r", encoding="utf-8", errors="replace") as handle:
-        lines = handle.readlines()
-    for line_number, line in enumerate(lines, 1):
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError as error:
-            # A live writer can leave its final line incomplete for a moment. A malformed
-            # earlier line means the parent cannot be read reliably.
-            if line_number == len(lines) and not line.endswith("\n"):
-                continue
-            raise UsageError(
-                f"invalid JSON in {parent_jsonl} at line {line_number}: {error}"
-            ) from error
-        if not isinstance(entry, dict):
-            continue
+    for entry in read_transcript_records(parent_jsonl):
         entry_uuid = entry.get("uuid")
         if not isinstance(entry_uuid, str) or entry.get("isSidechain") is True:
             continue
@@ -529,14 +515,19 @@ def prepare_main_agent(
     }
 
 
-def read_agent_records(path: Path) -> list[dict[str, Any]]:
+def read_transcript_records(path: Path) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         lines = handle.readlines()
     records: list[dict[str, Any]] = []
     for line_number, line in enumerate(lines, 1):
+        # The loader ignores empty rows and NUL/JSON-whitespace padding.
+        # Do not strip these characters from a row that contains JSON.
+        if not line.strip("\x00 \t\r\n"):
+            continue
         try:
             record = json.loads(line)
         except json.JSONDecodeError as error:
+            # A final row without a newline may still be being written.
             if line_number == len(lines) and not line.endswith("\n"):
                 continue
             raise UsageError(
@@ -645,10 +636,7 @@ def active_prepare_invocations(
     description: str,
     invocation_id: str | None = None,
 ) -> list[PrepareInvocation]:
-    try:
-        records = read_agent_records(path)
-    except (OSError, UsageError):
-        return []
+    records = read_transcript_records(path)
     completed = {
         tool_id
         for record in records
@@ -861,7 +849,7 @@ def discover_prepare_caller(
         if invocation is not None:
             snapshot = invocation.worker_snapshot
         else:
-            records = read_agent_records(source_path)
+            records = read_transcript_records(source_path)
             last_message = next(
                 (record for record in reversed(records)
                  if record.get("type") in {"user", "assistant"}
@@ -884,19 +872,27 @@ def discover_prepare_caller(
         )
     deadline = time.monotonic() + timeout
     started_wall = time.time()
+    read_errors: dict[Path, str] = {}
+
+    def scan_transcript(path: Path, source_id: str | None) -> list[PrepareInvocation]:
+        try:
+            found = active_prepare_invocations(path, source_id, args.description, invocation_id)
+        except (OSError, UsageError) as error:
+            read_errors[path] = (
+                str(error) if isinstance(error, UsageError)
+                else f"could not read transcript {path}: {error}"
+            )
+            return []
+        read_errors.pop(path, None)
+        return found
+
     invocations: list[PrepareInvocation] = []
     stable_signature: tuple[tuple[str, str], ...] | None = None
     stable_since: float | None = None
     while True:
-        found = active_prepare_invocations(
-            parent_jsonl, None, args.description, invocation_id
-        )
+        found = scan_transcript(parent_jsonl, None)
         for source_id, transcript in agent_transcript_candidates(subagents_directory):
-            found.extend(
-                active_prepare_invocations(
-                    transcript, source_id, args.description, invocation_id
-                )
-            )
+            found.extend(scan_transcript(transcript, source_id))
         invocations = [
             invocation
             for invocation in found
@@ -930,6 +926,11 @@ def discover_prepare_caller(
         # assistant tool_use that identifies its caller.
         time.sleep(min(CALLER_DISCOVERY_POLL_INTERVAL_SECONDS, remaining))
 
+    if not invocations and read_errors:
+        raise UsageError(
+            "could not identify the caller; transcript read failures:\n"
+            + "\n".join(read_errors.values())
+        )
     if len(invocations) != 1:
         labels = [invocation.source_id or "main" for invocation in invocations]
         rendered = ", ".join(labels) if labels else "none"
@@ -1159,7 +1160,7 @@ def source_agent_ids(source_directory: Path) -> list[str]:
 def main_transcript_uuids(parent_jsonl: Path) -> set[str]:
     return {
         str(record["uuid"])
-        for record in read_agent_records(parent_jsonl)
+        for record in read_transcript_records(parent_jsonl)
         if isinstance(record.get("uuid"), str)
         and record.get("isSidechain") is not True
     }
@@ -1182,7 +1183,7 @@ def validate_workflow_agent(
     if not isinstance(metadata, dict):
         raise UsageError(f"workflow metadata is not a JSON object: {metadata_path}")
 
-    records = read_agent_records(transcript_path)
+    records = read_transcript_records(transcript_path)
     sidechain_records = [
         record
         for record in records

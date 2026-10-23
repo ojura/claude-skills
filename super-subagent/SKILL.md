@@ -32,6 +32,8 @@ The helper never edits the parent or source transcript. New files use mode `0600
 
 The helper identifies the caller from the exact active assistant response containing the unresolved Bash invocation. It parses shell command positions rather than matching arbitrary argument text, checks the main transcript, top-level workers, and workflow workers, and requires the invocation ID from the helper's environment assignment to match the recorded command. A recent interrupted call therefore cannot be selected while the current tool call is still being written. Automatic selection also requires a parseable timestamp written no more than ten seconds before this helper process started. It waits up to five seconds by default for Claude Code to publish the current tool call, then requires exactly one caller.
 
+Both main and worker transcripts use the same reader. It ignores empty rows and rows containing only NUL bytes or JSON whitespace, as the installed loader does. Valid records keep their order, contents and references. A malformed historical JSON row still fails with its file and physical row number; an unfinished final row without a newline is left for a later read. If automatic discovery ends without a caller and a transcript read failed, its diagnostic includes that failure.
+
 Use an explicit source when automatic detection is unavailable or ambiguous:
 
 ```text

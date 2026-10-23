@@ -128,6 +128,152 @@ class SuperSubagentTest(unittest.TestCase):
         )
         return transcript
 
+    def padding_history(self):
+        return [
+            {"type": "user", "uuid": "before", "parentUuid": None,
+             "promptId": "keep-this-prompt", "message": {"role": "user", "content": "keep \u0000 and \t"}},
+            {"type": "assistant", "uuid": "after", "parentUuid": "before",
+             "message": {"id": "kept-response", "role": "assistant", "stop_reason": "end_turn",
+                         "content": [{"type": "text", "text": "after padding"}]}},
+        ]
+
+    def main_prepare_record(self, command):
+        return {
+            "type": "assistant", "uuid": "prepare-call", "parentUuid": "before",
+            "isSidechain": False, "timestamp": time.time(),
+            "message": {"id": "prepare-response", "role": "assistant", "stop_reason": "tool_use",
+                        "content": [{"type": "tool_use", "id": "call_prepare", "name": "Bash",
+                                     "input": {"command": command}}]},
+        }
+
+    def test_shared_reader_ignores_only_padding_rows(self):
+        records = self.padding_history()
+        for padding in (b"\x00" * 1683 + b"\n", b"\n", b" \t\r\n", b"\x00 \t\x00\r\n"):
+            with self.subTest(padding_bytes=len(padding)):
+                raw = super_subagent.json_line(records[0]) + padding + super_subagent.json_line(records[1])
+                self.parent.write_bytes(raw)
+                self.assertEqual(super_subagent.read_transcript_records(self.parent), records)
+                self.assertEqual(super_subagent.read_parent_reference(self.parent, None), ("after", 2, records[1]))
+                self.assertEqual(self.parent.read_bytes(), raw)
+
+    def test_prepare_main_ignores_nul_padding(self):
+        records = self.padding_history()
+        raw = super_subagent.json_line(records[0]) + b"\x00" * 1683 + b"\n" + super_subagent.json_line(records[1])
+        self.parent.write_bytes(raw)
+        result = super_subagent.prepare_agent(self.prepare_args())
+        reference = json.loads(Path(result["jsonl"]).read_text().splitlines()[0])
+        self.assertEqual(reference["parentLastUuid"], "after")
+        self.assertEqual(reference["contextLength"], 2)
+        self.assertEqual(self.parent.read_bytes(), raw)
+
+    def test_detects_both_nonce_segments_after_padding_with_python_flags(self):
+        descriptions = ["First padded child", "Second padded child"]
+        nonces = [TEST_CALLER_INVOCATION_ID, TEST_STALE_INVOCATION_ID]
+        command = " && ".join(
+            invocation_command(f"python3 -I -B {SCRIPT} prepare '{description}'", nonce)
+            for description, nonce in zip(descriptions, nonces)
+        )
+        raw = (super_subagent.json_line(self.padding_history()[0]) + b"\x00" * 1683 + b"\n"
+               + super_subagent.json_line(self.main_prepare_record(command)))
+        self.parent.write_bytes(raw)
+        for number, (description, nonce) in enumerate(zip(descriptions, nonces)):
+            with self.subTest(segment=number):
+                with self.caller_environment(nonce):
+                    result = super_subagent.prepare_agent(self.prepare_args(
+                        description=description, from_main=False, model="inherit", fork_another_model=False,
+                        agent_id=f"apadded-main-{number:016x}",
+                    ))
+                reference = json.loads(Path(result["jsonl"]).read_text().splitlines()[0])
+                self.assertEqual(reference["parentLastUuid"], "before")
+                self.assertEqual(reference["contextLength"], 1)
+        self.assertEqual(self.parent.read_bytes(), raw)
+
+    def test_worker_copy_preserves_valid_history_around_padding(self):
+        self.write_parent([{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}])
+        source_id = "asource-fork-0123456789abcdef"
+        records = self.completed_parallel_worker_records(source_id)
+        source = self.write_source_agent(source_id, records)
+        lines = [super_subagent.json_line(record) for record in records]
+        raw = b"".join(lines[:2]) + b"\x00" * 1683 + b"\n \t\r\n" + b"".join(lines[2:])
+        source.write_bytes(raw)
+        with self.caller_environment(source_id=source_id):
+            result = super_subagent.prepare_agent(self.worker_prepare_args(from_agent_id=None))
+        copied = [json.loads(line) for line in Path(result["jsonl"]).read_text().splitlines()]
+        self.assert_copied_history(records[:-2], copied, source_id, result["agent_id"])
+        self.assertEqual(source.read_bytes(), raw)
+
+    def test_shared_reader_reports_actual_malformed_json_at_its_physical_row(self):
+        records = self.padding_history()
+        for malformed in (b'{"broken":}\n', b'not-json\n', b'\x00{"type":"user"}\n', b'{"content":"a\x00b"}\n'):
+            with self.subTest(malformed=repr(malformed)):
+                raw = (super_subagent.json_line(records[0]) + b"\n" + b"\x00" * 1683 + b"\n"
+                       + malformed + super_subagent.json_line(records[1]))
+                self.parent.write_bytes(raw)
+                for reader in (lambda: super_subagent.read_transcript_records(self.parent),
+                               lambda: super_subagent.read_parent_reference(self.parent, None)):
+                    with self.assertRaises(super_subagent.UsageError) as raised:
+                        reader()
+                    self.assertIn(str(self.parent), str(raised.exception))
+                    self.assertIn("at line 4:", str(raised.exception))
+                    self.assertIn("invalid JSON", str(raised.exception))
+                self.assertEqual(self.parent.read_bytes(), raw)
+
+    def test_shared_reader_retains_incomplete_final_write_handling(self):
+        records = self.padding_history()
+        prefix = super_subagent.json_line(records[0]) + b"\x00" * 1683 + b"\n" + super_subagent.json_line(records[1])
+        self.parent.write_bytes(prefix + b'{"type":')
+        self.assertEqual(super_subagent.read_transcript_records(self.parent), records)
+        self.assertEqual(super_subagent.read_parent_reference(self.parent, None), ("after", 2, records[1]))
+        self.parent.write_bytes(prefix + b'{"type":\n')
+        for reader in (lambda: super_subagent.read_transcript_records(self.parent),
+                       lambda: super_subagent.read_parent_reference(self.parent, None)):
+            with self.assertRaisesRegex(super_subagent.UsageError, "at line 4:"):
+                reader()
+        self.parent.write_bytes(prefix.rstrip(b"\n"))
+        self.assertEqual(super_subagent.read_transcript_records(self.parent), records)
+
+    def test_automatic_discovery_reports_read_failure_instead_of_missing_caller(self):
+        description = "Unreadable parent"
+        command = invocation_command(f"python3 -I -B {SCRIPT} prepare '{description}'")
+        raw = (super_subagent.json_line(self.padding_history()[0]) + b'{"broken":}\n'
+               + super_subagent.json_line(self.main_prepare_record(command)))
+        self.parent.write_bytes(raw)
+        with self.caller_environment():
+            with self.assertRaises(super_subagent.UsageError) as raised:
+                super_subagent.prepare_agent(self.prepare_args(
+                    description=description, from_main=False, caller_discovery_timeout=0.02,
+                ))
+        diagnostic = str(raised.exception)
+        self.assertIn("transcript read failures", diagnostic)
+        self.assertIn(str(self.parent), diagnostic)
+        self.assertIn("at line 2:", diagnostic)
+        self.assertEqual(self.parent.read_bytes(), raw)
+
+    def test_automatic_discovery_reports_io_failure_with_the_path(self):
+        self.write_parent(self.padding_history())
+        error = PermissionError(13, "Permission denied", str(self.parent))
+        with self.caller_environment():
+            with mock.patch.object(super_subagent, "read_transcript_records", side_effect=error):
+                with self.assertRaises(super_subagent.UsageError) as raised:
+                    super_subagent.prepare_agent(self.prepare_args(
+                        from_main=False, caller_discovery_timeout=0.02,
+                    ))
+        diagnostic = str(raised.exception)
+        self.assertIn("transcript read failures", diagnostic)
+        self.assertIn(str(self.parent), diagnostic)
+        self.assertIn("Permission denied", diagnostic)
+
+    def test_unreadable_other_worker_does_not_hide_a_valid_caller(self):
+        description = "Readable main"
+        command = invocation_command(f"python3 -I -B {SCRIPT} prepare '{description}'")
+        self.write_parent([self.padding_history()[0], self.main_prepare_record(command)])
+        other = self.write_source_agent("aunreadable-worker-0123456789abcdef", [])
+        other.write_bytes(b'{"broken":}\n')
+        with self.caller_environment():
+            result = super_subagent.prepare_agent(self.prepare_args(description=description, from_main=False))
+        reference = json.loads(Path(result["jsonl"]).read_text().splitlines()[0])
+        self.assertEqual(reference["parentLastUuid"], "before")
+
     def test_description_slug_uses_readable_words(self):
         self.assertEqual(
             super_subagent.description_slug("Write a skill named /super-subagent, with a helper"),
@@ -786,7 +932,7 @@ class SuperSubagentTest(unittest.TestCase):
         records = self.completed_parallel_worker_records(source_id)
         source = self.write_source_agent(source_id, records)
         discover = super_subagent.discover_prepare_caller
-        read = super_subagent.read_agent_records
+        read = super_subagent.read_transcript_records
         resolved = False
 
         def read_before_discovery_only(*args):
@@ -806,7 +952,7 @@ class SuperSubagentTest(unittest.TestCase):
                 }) + "\n")
             return selection
 
-        with mock.patch.object(super_subagent, "read_agent_records", side_effect=read_before_discovery_only):
+        with mock.patch.object(super_subagent, "read_transcript_records", side_effect=read_before_discovery_only):
             with mock.patch.object(super_subagent, "discover_prepare_caller", side_effect=discover_then_append):
                 result = super_subagent.prepare_agent(self.worker_prepare_args())
         copied = [json.loads(line) for line in Path(result["jsonl"]).read_text().splitlines()]
