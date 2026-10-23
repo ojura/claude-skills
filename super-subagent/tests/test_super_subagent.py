@@ -626,157 +626,194 @@ class SuperSubagentTest(unittest.TestCase):
         records[-2]["parentUuid"] = "after-parallel"
         return prefix + records[-2:]
 
-    def assert_parallel_call_order(self, records):
-        calls = [
-            block["id"] for record in records
-            for block in record.get("message", {}).get("content", [])
-            if isinstance(block, dict) and block.get("type") == "tool_use"
-        ]
-        results = [
-            block["tool_use_id"] for record in records
-            for block in record.get("message", {}).get("content", [])
-            if isinstance(block, dict) and block.get("type") == "tool_result"
-        ]
-        self.assertEqual(calls, ["call_1", "call_2", "call_3", "call_4"])
-        self.assertEqual(results, calls)
+    def assert_copied_history(self, source_records, copied_records, source_id, target_id):
+        expected = json.loads(json.dumps(source_records))
+        for record in expected:
+            if record.get("agentId") == source_id:
+                record["agentId"] = target_id
+        self.assertEqual(copied_records[:len(expected)], expected)
 
-    def test_prepare_worker_preserves_completed_parallel_response_order(self):
+    def prepare_history_fixture(self, records, **changes):
         self.write_parent([{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}])
         source_id = "asource-fork-0123456789abcdef"
-        source = self.write_source_agent(source_id, self.completed_parallel_worker_records(source_id))
+        source = self.write_source_agent(source_id, records)
         before = source.read_bytes()
-
-        result = super_subagent.prepare_agent(self.worker_prepare_args())
-        copied = [json.loads(line) for line in Path(result["jsonl"]).read_text().splitlines()][1:]
-        self.assert_parallel_call_order(copied)
+        result = super_subagent.prepare_agent(self.worker_prepare_args(**changes))
+        copied = [json.loads(line) for line in Path(result["jsonl"]).read_text().splitlines()]
         self.assertEqual(source.read_bytes(), before)
-        assistants = {
-            block["id"]: record["uuid"] for record in copied
-            for block in record.get("message", {}).get("content", [])
-            if isinstance(block, dict) and block.get("type") == "tool_use"
-        }
-        previous = None
-        for record in copied:
-            self.assertEqual(record["parentUuid"], previous)
-            previous = record["uuid"]
-            for block in record.get("message", {}).get("content", []):
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    self.assertEqual(record["sourceToolAssistantUUID"], assistants[block["tool_use_id"]])
-        signature = next(record for record in copied if record.get("apiBlockIndex") == 0)
-        self.assertEqual(signature["message"]["content"][0]["signature"], "keep")
+        return result, copied
+
+    def test_prepare_worker_preserves_branched_completed_history(self):
+        source_id = "asource-fork-0123456789abcdef"
+        records = self.completed_parallel_worker_records(source_id)
+        result, copied = self.prepare_history_fixture(records)
+        expected = records[:-2]
+        self.assertEqual(
+            [record.get("message") for record in copied[:len(expected)]],
+            [record.get("message") for record in expected],
+        )
+        self.assert_copied_history(expected, copied, source_id, result["agent_id"])
+        if len(copied) > len(expected):
+            self.assertEqual(copied[len(expected)]["parentUuid"], "after-parallel")
 
         second = super_subagent.prepare_agent(self.worker_prepare_args(
             from_agent_id=result["agent_id"], agent_id="athird-worker-0123456789abcdef"
         ))
-        recopied = [json.loads(line) for line in Path(second["jsonl"]).read_text().splitlines()][1:]
-        self.assert_parallel_call_order(recopied)
+        recopied = [json.loads(line) for line in Path(second["jsonl"]).read_text().splitlines()]
+        self.assert_copied_history(copied, recopied, result["agent_id"], second["agent_id"])
 
-    def parallel_order_fixture(self):
-        records = self.completed_parallel_worker_records("asource-fork-0123456789abcdef")[2:-3]
-        by_uuid = {record["uuid"]: record for record in records}
-        return [by_uuid[name] for name in (
+    def test_prepare_worker_preserves_existing_noncanonical_history(self):
+        source_id = "asource-fork-0123456789abcdef"
+        records = self.completed_parallel_worker_records(source_id)
+        by_uuid = {record.get("uuid"): record for record in records}
+        records[2:-3] = [by_uuid[name] for name in (
             "parallel-prefix", "parallel-call-1", "parallel-call-2",
             "parallel-result-2", "parallel-call-4", "parallel-result-1",
             "parallel-call-3", "parallel-result-3", "parallel-result-4",
         )]
+        result, copied = self.prepare_history_fixture(records)
+        self.assert_copied_history(records[:-2], copied, source_id, result["agent_id"])
 
-    def test_parallel_order_requires_unique_valid_block_indices(self):
-        for invalid in (None, True, -1, 1.5, "3", 2):
-            with self.subTest(index=invalid):
-                records = self.parallel_order_fixture()
-                records[6]["apiBlockIndex"] = invalid
-                self.assertEqual(super_subagent.order_completed_responses(records), records)
-        records = self.parallel_order_fixture()
-        del records[6]["apiBlockIndex"]
-        self.assertEqual(super_subagent.order_completed_responses(records), records)
+    def test_prepare_worker_preserves_block_metadata_without_interpreting_it(self):
+        source_id = "asource-fork-0123456789abcdef"
+        for number, index in enumerate((None, True, -1, 1.5, "3", 2)):
+            with self.subTest(index=index):
+                records = self.completed_parallel_worker_records(source_id)
+                record = next(record for record in records if record.get("uuid") == "parallel-call-3")
+                record["apiBlockIndex"] = index
+                result, copied = self.prepare_history_fixture(
+                    records, agent_id=f"aindices-{number:016x}"
+                )
+                self.assert_copied_history(records[:-2], copied, source_id, result["agent_id"])
 
-    def test_parallel_order_does_not_cross_unrelated_messages(self):
-        for message in (
-            {"type": "user", "message": {"role": "user", "content": "unrelated"}},
-            {"type": "assistant", "apiBlockIndex": 0,
-             "message": {"id": "other-response", "role": "assistant", "content": [
-                 {"type": "thinking", "thinking": "other", "signature": "unchanged"}]}},
-            {"type": "system", "subtype": "compact_boundary", "parentUuid": None},
-        ):
-            with self.subTest(type=message["type"]):
-                records = self.parallel_order_fixture()
-                records.insert(4, dict(message, uuid="unrelated"))
-                self.assertEqual(super_subagent.order_completed_responses(records), records)
+    def test_prepare_worker_preserves_nonmessage_records_and_identifiers(self):
+        source_id = "asource-fork-0123456789abcdef"
+        records = self.completed_parallel_worker_records(source_id)
+        records[1]["promptId"] = "original-prompt-id"
+        records[1]["message"]["content"] = f"The source is {source_id}"
+        records.insert(2, {
+            "type": "content-replacement", "agentId": source_id,
+            "messageId": "source-user-1", "replacement": "fixture replacement",
+        })
+        records.insert(3, {"type": "atis-latch", "atis": "fixture"})
+        records.insert(-2, {
+            "type": "api-request-blob", "agentId": source_id,
+            "hash": "fixture-hash", "blob": {"agentId": source_id},
+        })
+        result, copied = self.prepare_history_fixture(records)
+        self.assert_copied_history(records[:-2], copied, source_id, result["agent_id"])
+        if len(copied) > len(records) - 2:
+            self.assertEqual(copied[len(records) - 2]["parentUuid"], "after-parallel")
 
-    def test_parallel_order_keeps_progress_and_compaction_metadata(self):
-        records = self.parallel_order_fixture()
-        progress = {"type": "progress", "uuid": "progress", "parentUuid": "parallel-call-2"}
-        records.insert(3, progress)
-        compact = {"type": "system", "subtype": "compact_boundary", "uuid": "compact",
-                   "parentUuid": None, "logicalParentUuid": "parallel-result-4",
-                   "compactMetadata": {"preservedMessages": {"uuids": ["parallel-call-3"]}}}
-        records.append(compact)
-        before = json.dumps(records, sort_keys=True)
-        ordered = super_subagent.order_completed_responses(records)
-        self.assert_parallel_call_order(ordered)
-        self.assertEqual(ordered[3]["uuid"], "progress")
-        self.assertEqual(ordered[-1], compact)
-        self.assertEqual(json.dumps(records, sort_keys=True), before)
+    def test_prepare_worker_preserves_repeated_records(self):
+        source_id = "asource-fork-0123456789abcdef"
+        records = self.completed_parallel_worker_records(source_id)
+        records.insert(-2, json.loads(json.dumps(records[1])))
+        result, copied = self.prepare_history_fixture(records)
+        self.assert_copied_history(records[:-2], copied, source_id, result["agent_id"])
 
-    def test_parallel_order_sorts_batched_results_without_changing_associations(self):
-        records = self.parallel_order_fixture()
-        results = {record["uuid"]: record for record in records if record["type"] == "user"}
-        first = results["parallel-result-1"]
-        second = results["parallel-result-3"]
-        first["message"]["content"] = [results["parallel-result-2"]["message"]["content"][0],
-                                        first["message"]["content"][0]]
-        second["message"]["content"] = [results["parallel-result-4"]["message"]["content"][0],
-                                         second["message"]["content"][0]]
-        records = [record for record in records if record["type"] == "assistant"] + [second, first]
-        ordered = super_subagent.order_completed_responses(records)
-        self.assert_parallel_call_order(ordered)
-        self.assertEqual(
-            [block["content"] for record in ordered if record["type"] == "user"
-             for block in record["message"]["content"]],
-            ["result 1", "result 2", "result 3", "result 4"],
-        )
+    def test_prepare_worker_explicit_source_keeps_an_unfinished_nonhelper_exchange(self):
+        source_id = "asource-fork-0123456789abcdef"
+        records = self.completed_parallel_worker_records(source_id)
+        # An explicit source without a matched prepare invocation is copied
+        # through EOF. The helper does not repair its pending tool calls.
+        current = records[-1]
+        current["message"]["content"] = [
+            {"type": "tool_use", "id": "terminal-one", "name": "Read", "input": {}},
+            {"type": "tool_use", "id": "terminal-two", "name": "Read", "input": {}},
+        ]
+        records.append({
+            "type": "user", "uuid": "terminal-result", "parentUuid": current["uuid"],
+            "agentId": source_id, "isSidechain": True, "timestamp": time.time() + 1,
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "terminal-one", "content": "one"}
+            ]},
+        })
+        result, copied = self.prepare_history_fixture(records)
+        self.assert_copied_history(records, copied, source_id, result["agent_id"])
+        self.assertEqual(result["dropped_unmatched_tool_use_ids"], [])
+        self.assertEqual(result["dropped_active_records"], 0)
 
-    def test_parallel_order_keeps_responses_separate(self):
-        first = self.parallel_order_fixture()
-        second = json.loads(json.dumps(first).replace("parallel", "second").replace("call_", "other_"))
-        original = first + second
-        ordered = super_subagent.order_completed_responses(original)
-        self.assert_parallel_call_order(ordered[:len(first)])
-        self.assertEqual(
-            [block["id"] for record in ordered[len(first):]
-             for block in record.get("message", {}).get("content", [])
-             if block.get("type") == "tool_use"],
-            ["other_1", "other_2", "other_3", "other_4"],
-        )
-        self.assertEqual(
-            {record["uuid"] for record in ordered[:len(first)]},
-            {record["uuid"] for record in first},
-        )
+    def test_prepare_worker_copies_a_completed_file_with_older_unfinished_turns(self):
+        source_id = "asource-fork-0123456789abcdef"
+        records = self.source_fork_records(source_id)
+        records.append({
+            "type": "user", "uuid": "new-user-turn", "parentUuid": records[-1]["uuid"],
+            "isSidechain": True, "agentId": source_id,
+            "timestamp": time.time() + 1,
+            "message": {"role": "user", "content": "A later instruction"},
+        })
+        result, copied = self.prepare_history_fixture(records)
+        self.assert_copied_history(records, copied, source_id, result["agent_id"])
+        self.assertEqual(result["dropped_active_records"], 0)
+        self.assertEqual(copied[-1]["parentUuid"], "new-user-turn")
 
-    def test_parallel_order_keeps_invalid_call_metadata(self):
-        for invalid in (None, [], "", "call_1"):
-            with self.subTest(id=invalid):
-                records = self.parallel_order_fixture()
-                records[2]["message"]["content"][0]["id"] = invalid
-                self.assertEqual(super_subagent.order_completed_responses(records), records)
+    def test_prepare_worker_explicit_source_preserves_every_record_through_eof(self):
+        source_id = "asource-fork-0123456789abcdef"
+        records = self.source_fork_records(source_id)[:2]
+        records.extend([
+            {"type": "assistant", "uuid": "completed", "parentUuid": "source-user-1",
+             "agentId": source_id, "isSidechain": True, "timestamp": "2026-01-01T00:00:03Z",
+             "message": {"id": "completed", "role": "assistant", "stop_reason": "end_turn",
+                         "content": [{"type": "text", "text": "completed"}]}},
+            {"type": "assistant", "uuid": "older-branch", "parentUuid": "source-user-1",
+             "agentId": source_id, "isSidechain": True, "timestamp": "2026-01-01T00:00:02Z",
+             "message": {"id": "older-branch", "role": "assistant", "stop_reason": None,
+                         "content": [{"type": "text", "text": "unfinished"}]}},
+        ])
+        result, copied = self.prepare_history_fixture(records)
+        self.assert_copied_history(records, copied, source_id, result["agent_id"])
+        if len(copied) > len(records):
+            self.assertEqual(copied[len(records)]["parentUuid"], "older-branch")
+        self.assertEqual(result["dropped_active_records"], 0)
 
-    def test_parallel_order_preserves_ambiguous_result_records(self):
-        for ambiguity in ("mixed-text", "unknown-call", "duplicate-result", "overlapping-batches"):
-            with self.subTest(ambiguity=ambiguity):
-                records = self.parallel_order_fixture()
-                first = records[5]["message"]["content"]
-                if ambiguity == "mixed-text":
-                    first.append({"type": "text", "text": "keep with this result"})
-                elif ambiguity == "unknown-call":
-                    first.append({"type": "tool_result", "tool_use_id": "unrelated", "content": "keep"})
-                elif ambiguity == "duplicate-result":
-                    first.append(dict(first[0]))
-                else:
-                    first.append(records[7]["message"]["content"][0])
-                    del records[7]
-                self.assertEqual(super_subagent.order_completed_responses(records), records)
+    def test_prepare_worker_keeps_the_active_invocation_boundary_after_new_input(self):
+        source_id = "asource-fork-0123456789abcdef"
+        records = self.source_fork_records(source_id)
+        records.append({
+            "type": "user", "uuid": "input-after-helper", "parentUuid": records[-1]["uuid"],
+            "agentId": source_id, "isSidechain": True, "timestamp": time.time() + 1,
+            "message": {"role": "user", "content": "Input arriving after the helper started"},
+        })
+        with self.caller_environment():
+            result, copied = self.prepare_history_fixture(records, from_agent_id=None)
+        self.assert_copied_history(records[:-3], copied, source_id, result["agent_id"])
+        self.assertEqual(result["dropped_active_records"], 3)
 
-    def test_prepare_from_worker_copies_completed_chain_and_preserves_source(self):
+    def test_worker_copy_uses_the_history_already_resolved_by_discovery(self):
+        self.write_parent([{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}])
+        source_id = "asource-fork-0123456789abcdef"
+        records = self.completed_parallel_worker_records(source_id)
+        source = self.write_source_agent(source_id, records)
+        discover = super_subagent.discover_prepare_caller
+        read = super_subagent.read_agent_records
+        resolved = False
+
+        def read_before_discovery_only(*args):
+            self.assertFalse(resolved, "the copier reread a resolved source")
+            return read(*args)
+
+        def discover_then_append(*args):
+            nonlocal resolved
+            selection = discover(*args)
+            resolved = True
+            with source.open("a") as handle:
+                handle.write(json.dumps({
+                    "type": "user", "uuid": "arrived-after-discovery",
+                    "agentId": source_id, "isSidechain": True,
+                    "parentUuid": records[-1]["uuid"],
+                    "message": {"role": "user", "content": "later input"},
+                }) + "\n")
+            return selection
+
+        with mock.patch.object(super_subagent, "read_agent_records", side_effect=read_before_discovery_only):
+            with mock.patch.object(super_subagent, "discover_prepare_caller", side_effect=discover_then_append):
+                result = super_subagent.prepare_agent(self.worker_prepare_args())
+        copied = [json.loads(line) for line in Path(result["jsonl"]).read_text().splitlines()]
+        self.assert_copied_history(records[:-2], copied, source_id, result["agent_id"])
+        self.assertNotIn("arrived-after-discovery", Path(result["jsonl"]).read_text())
+
+    def test_prepare_from_worker_copies_history_and_preserves_source(self):
         self.write_parent(
             [{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}]
         )
@@ -820,7 +857,11 @@ class SuperSubagentTest(unittest.TestCase):
             if "uuid" in record
         }
         target_uuids = {record["uuid"] for record in target_sidechain}
-        self.assertTrue(source_uuids.isdisjoint(target_uuids))
+        copied_history = target_records[:1 + result["copied_sidechain_records"]]
+        self.assert_copied_history(
+            self.source_fork_records(source_id)[:-2], copied_history, source_id, result["agent_id"]
+        )
+        self.assertNotIn(target_sidechain[-1]["uuid"], source_uuids)
         copied_tool_references = [
             record["sourceToolAssistantUUID"]
             for record in target_sidechain
@@ -828,7 +869,7 @@ class SuperSubagentTest(unittest.TestCase):
         ]
         self.assertEqual(len(copied_tool_references), 1)
         self.assertTrue(set(copied_tool_references) <= target_uuids)
-        self.assertTrue(set(copied_tool_references).isdisjoint(source_uuids))
+        self.assertEqual(copied_tool_references, ["source-assistant-tool-1"])
         rendered = Path(result["jsonl"]).read_text()
         self.assertIn("sidechain-only-orchid-915", rendered)
         self.assertNotIn("call_active", rendered)
@@ -1246,11 +1287,12 @@ class SuperSubagentTest(unittest.TestCase):
         ]
         rendered = json.dumps(copied)
         self.assertIn("later completed turn", rendered)
-        self.assertNotIn("call_old", rendered)
+        self.assertIn("call_old", rendered)
         self.assertNotIn("call_current", rendered)
         later = next(record for record in copied if record.get("message", {}).get("content") == "later completed turn")
-        first = next(record for record in copied if record.get("message", {}).get("content") == "before")
-        self.assertEqual(later["parentUuid"], first["uuid"])
+        self.assertEqual(later["parentUuid"], "old-tool")
+        self.assert_copied_history(records[1:-1], copied, source_id, result["agent_id"])
+        self.assertEqual(result["dropped_unmatched_tool_use_ids"], ["call_current"])
 
     def test_prepare_worker_preserves_progress_alias_ancestry(self):
         self.write_parent(
@@ -1351,11 +1393,12 @@ class SuperSubagentTest(unittest.TestCase):
         ]
         progress = next(record for record in copied if record.get("type") == "progress")
         tool_result = next(record for record in copied if record.get("uuid") != progress["uuid"] and record.get("type") == "user" and super_subagent.message_tool_result_ids(record))
-        self.assertEqual(progress["agentId"], result["agent_id"])
-        self.assertIs(progress["isSidechain"], True)
+        self.assertNotIn("agentId", progress)
+        self.assertNotIn("isSidechain", progress)
+        self.assert_copied_history(records[1:-1], copied, source_id, result["agent_id"])
         self.assertEqual(tool_result["parentUuid"], progress["uuid"])
 
-    def test_prepare_worker_remaps_compact_metadata_uuids(self):
+    def test_prepare_worker_preserves_compact_metadata_uuids(self):
         self.write_parent(
             [{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}]
         )
@@ -1474,7 +1517,8 @@ class SuperSubagentTest(unittest.TestCase):
             *compact["preservedMessages"]["allUuids"],
         ]
         self.assertTrue(set(nested) <= target_uuids)
-        self.assertTrue(set(nested).isdisjoint(source_uuids))
+        self.assertTrue(set(nested) <= source_uuids)
+        self.assert_copied_history(records[1:-1], copied, source_id, result["agent_id"])
 
     def test_prepare_general_worker_without_fork_reference(self):
         self.write_parent(

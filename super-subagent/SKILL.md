@@ -28,7 +28,7 @@ The helper never edits the parent or source transcript. New files use mode `0600
 `prepare` selects its source automatically:
 
 - From the main conversation, it writes `fork-context-ref` plus a seed sidechain message. Claude Code loads the main prefix from the session JSONL.
-- From an existing worker, it copies the completed local sidechain and assigns new UUIDs and prompt IDs. It retains the root `fork-context-ref` when one exists. General-purpose and specialized workers without that record are also supported.
+- From an existing worker, it copies the recorded history up to the current boundary and retargets its `agentId` fields. It retains the original UUIDs, prompt IDs and root `fork-context-ref` when one exists. General-purpose and specialized workers without that record are also supported.
 
 The helper identifies the caller from the exact active assistant response containing the unresolved Bash invocation. It parses shell command positions rather than matching arbitrary argument text, checks the main transcript, top-level workers, and workflow workers, and requires the invocation ID from the helper's environment assignment to match the recorded command. A recent interrupted call therefore cannot be selected while the current tool call is still being written. Automatic selection also requires a parseable timestamp written no more than ten seconds before this helper process started. It waits up to five seconds by default for Claude Code to publish the current tool call, then requires exactly one caller.
 
@@ -52,7 +52,7 @@ python3 /home/juraj/claude-skills/super-subagent/scripts/super_subagent.py prepa
   --from-agent-id aSOURCE_AGENT_ID
 ```
 
-Use `--from-agent-name NAME` instead when the name identifies exactly one worker. The source may be a top-level or workflow worker in the current session. The helper reads the source transcript, writes a remapped copy into the new child's files, and does not modify the source.
+Use `--from-agent-name NAME` instead when the name identifies exactly one worker. The source may be a top-level or workflow worker in the current session. The helper reads the source transcript, writes the history into the new child's files with the child's agent ID, and does not modify the source.
 
 Change the discovery wait with:
 
@@ -64,23 +64,15 @@ The value must be greater than zero and no more than 60 seconds.
 
 ## Worker context copying
 
-When the caller is a worker, `prepare`:
+When the caller is a worker, `prepare` copies its recorded history in file order. The only historical field it changes is a top-level `agentId` that names the source worker: it replaces that value with the child's ID. This includes `fork-context-ref` and content-replacement records.
 
-1. retains its `fork-context-ref` when one exists;
-2. follows the parent links of the exact active helper response;
-3. keeps parent alias records and recovers completed parallel tool calls and results;
-4. removes the active helper response and earlier interrupted tool responses while retaining later completed turns;
-5. rewires parent links around removed records;
-6. orders completed blocks of each assistant response by `apiBlockIndex`, places their tool results in call order, and links reordered history as one sequence;
-7. copies the completed records into the new transcript;
-8. remaps `uuid`, `promptId`, `parentUuid`, local `logicalParentUuid`, `sourceToolAssistantUUID`, and compact-metadata UUID references;
-9. leaves the source transcript unchanged.
+The loader reads each agent file separately and selects messages and fork references by `agentId`. The copy therefore keeps the original `uuid`, `promptId`, `parentUuid`, `logicalParentUuid`, `sourceToolAssistantUUID`, and compaction references. It also keeps non-message records, repeated records, historical interrupted exchanges, and the recorded order of blocks and results. It does not sort, repair, or relink historical turns.
 
-A general-purpose or specialized worker without `fork-context-ref` receives the copied local history plus a new fork-instruction message. A compacted sidechain is accepted when its local parent and compact-metadata UUID references can all be resolved. Missing ancestors or omitted referenced records stop creation rather than producing incomplete history. Content that the running model has not written to the transcript cannot be copied.
+The helper excludes the response containing its active invocation and anything recorded after that boundary. An explicitly selected source without a matched helper invocation is copied through the end of the file, and the child's instruction attaches to its last recorded user or assistant message. With a matched invocation, it attaches to the parent boundary already recorded during caller discovery. The helper does not independently select a leaf; the source file stays unchanged.
+
+A general-purpose or specialized worker without `fork-context-ref` receives the copied local history plus a new fork-instruction message. Historical parent links and compaction references are left for the Claude Code loader to interpret. Content that the running model has not written to the transcript cannot be copied.
 
 `--parent-last-uuid UUID` selects an earlier complete boundary when the source is the main conversation. It is invalid when the source is a worker.
-
-Ordering uses only records with the same assistant message ID and unique nonnegative integer block indices. When indices are absent, invalid or duplicated, it keeps the recovered order. Unrelated messages are not moved. Tool-result contents and call IDs stay associated; mixed user content or result batches that cannot follow call order without splitting a message also keep their recovered order. Compaction boundaries and their UUID references are preserved.
 
 ## Model selection
 

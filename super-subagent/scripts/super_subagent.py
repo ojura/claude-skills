@@ -62,6 +62,14 @@ class UsageError(RuntimeError):
     pass
 
 
+class WorkerSnapshot(NamedTuple):
+    records: list[dict[str, Any]]
+    boundary_uuid: str | None
+    template_record: dict[str, Any]
+    dropped_records: int
+    dropped_tool_ids: list[str]
+
+
 class PrepareInvocation(NamedTuple):
     source_id: str | None
     transcript: Path
@@ -70,12 +78,14 @@ class PrepareInvocation(NamedTuple):
     tool_use_id: str
     boundary_uuid: str | None
     recorded_at: float | None
+    worker_snapshot: WorkerSnapshot | None = None
 
 
 class CallerSelection(NamedTuple):
     source_id: str | None
     transcript: Path
     invocation: PrepareInvocation | None
+    worker_snapshot: WorkerSnapshot | None = None
 
 
 def description_slug(description: str) -> str:
@@ -685,7 +695,13 @@ def active_prepare_invocations(
             and candidate.get("message", {}).get("stop_reason") is not None
             for candidate in records[group_end + 1 :]
         )
-        if later_completed_response:
+        later_user_turn = any(
+            candidate.get("type") == "user"
+            and belongs_to_caller(candidate)
+            and not message_tool_result_ids(candidate)
+            for candidate in records[group_end + 1 :]
+        )
+        if later_completed_response or (invocation_id is None and later_user_turn):
             continue
         boundary_uuid = records[group_start].get("parentUuid")
         if boundary_uuid is not None and not isinstance(boundary_uuid, str):
@@ -704,6 +720,18 @@ def active_prepare_invocations(
                 and command_invokes_prepare(command, description, invocation_id)
             ):
                 timestamp = record_timestamp(record)
+                snapshot = None
+                if source_id is not None:
+                    prefix = records[:group_start]
+                    template = next(
+                        (entry for entry in reversed(prefix) if entry.get("uuid") == boundary_uuid),
+                        record,
+                    )
+                    snapshot = WorkerSnapshot(
+                        prefix, boundary_uuid, template, len(records) - group_start,
+                        sorted({tool_id for entry in records[group_start:]
+                                for tool_id in message_tool_use_ids(entry)}),
+                    )
                 invocations.append(
                     PrepareInvocation(
                         source_id=source_id,
@@ -715,6 +743,7 @@ def active_prepare_invocations(
                         recorded_at=(
                             None if timestamp == float("-inf") else timestamp
                         ),
+                        worker_snapshot=snapshot,
                     )
                 )
     return invocations
@@ -829,7 +858,22 @@ def discover_prepare_caller(
             source_path, source_id, args.description, invocation_id
         )
         invocation = invocations[-1] if invocations else None
-        return CallerSelection(source_id, source_path, invocation)
+        if invocation is not None:
+            snapshot = invocation.worker_snapshot
+        else:
+            records = read_agent_records(source_path)
+            last_message = next(
+                (record for record in reversed(records)
+                 if record.get("type") in {"user", "assistant"}
+                 and isinstance(record.get("uuid"), str)
+                 and record.get("agentId") == source_id
+                 and record.get("isSidechain") is True),
+                None,
+            )
+            if last_message is None:
+                raise UsageError(f"source agent {source_id} has no sidechain messages")
+            snapshot = WorkerSnapshot(records, last_message["uuid"], last_message, 0, [])
+        return CallerSelection(source_id, source_path, invocation, snapshot)
 
     invocation_id = caller_invocation_id(required=True)
     timeout = float(args.caller_discovery_timeout)
@@ -894,183 +938,9 @@ def discover_prepare_caller(
             f"(candidates: {rendered}); pass --from-main or --from-agent-id"
         )
     invocation = invocations[0]
-    return CallerSelection(invocation.source_id, invocation.transcript, invocation)
-
-
-def entry_tool_use_ids(entry: dict[str, Any]) -> set[str]:
-    return message_tool_use_ids(entry)
-
-
-def recover_parallel_tool_results(
-    sidechain: list[dict[str, Any]],
-    base_chain: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    visited = {str(record["uuid"]) for record in base_chain}
-    response_order: list[str] = []
-    response_anchor: dict[str, str] = {}
-    assistants_by_response: dict[str, list[dict[str, Any]]] = {}
-    results_by_parent: dict[str, list[dict[str, Any]]] = {}
-
-    for record in sidechain:
-        if record.get("type") == "assistant":
-            response_id = record.get("message", {}).get("id")
-            if isinstance(response_id, str):
-                assistants_by_response.setdefault(response_id, []).append(record)
-        elif record.get("type") == "user" and message_tool_result_ids(record):
-            parent_uuid = record.get("parentUuid")
-            if isinstance(parent_uuid, str):
-                results_by_parent.setdefault(parent_uuid, []).append(record)
-
-    for record in base_chain:
-        if record.get("type") != "assistant":
-            continue
-        response_id = record.get("message", {}).get("id")
-        if not isinstance(response_id, str):
-            continue
-        if response_id not in response_anchor:
-            response_order.append(response_id)
-        response_anchor[response_id] = str(record["uuid"])
-
-    additions: dict[str, list[dict[str, Any]]] = {}
-    for response_id in response_order:
-        missing_assistants = [
-            record
-            for record in assistants_by_response.get(response_id, [])
-            if str(record["uuid"]) not in visited
-        ]
-        missing_results: list[dict[str, Any]] = []
-        for assistant in assistants_by_response.get(response_id, []):
-            for result in results_by_parent.get(str(assistant["uuid"]), []):
-                if str(result["uuid"]) not in visited:
-                    missing_results.append(result)
-        recovered = missing_assistants + missing_results
-        recovered.sort(key=record_timestamp)
-        if recovered:
-            additions[response_anchor[response_id]] = recovered
-            visited.update(str(record["uuid"]) for record in recovered)
-
-    expanded: list[dict[str, Any]] = []
-    for record in base_chain:
-        expanded.append(record)
-        expanded.extend(additions.get(str(record["uuid"]), []))
-    return expanded
-
-
-def order_completed_responses(
-    records: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    # A parentUuid chain can follow one parallel result while later blocks
-    # arrive on another branch. Recovery alone does not restore API block order.
-    assistants: dict[str, list[int]] = {}
-    tool_owners: dict[str, set[str]] = {}
-    for index, record in enumerate(records):
-        message = record.get("message")
-        if record.get("type") != "assistant" or not isinstance(message, dict):
-            continue
-        response_id = message.get("id")
-        if not isinstance(response_id, str) or not response_id:
-            continue
-        assistants.setdefault(response_id, []).append(index)
-        for tool_id in message_tool_use_ids(record):
-            tool_owners.setdefault(tool_id, set()).add(response_id)
-
-    results: dict[str, list[int]] = {}
-    ambiguous: set[str] = set()
-    for index, record in enumerate(records):
-        if record.get("type") != "user":
-            continue
-        tool_ids = message_tool_result_ids(record)
-        owners = set().union(*(tool_owners.get(tool_id, set()) for tool_id in tool_ids))
-        if not owners:
-            continue
-        content = record["message"]["content"]
-        if len(owners) != 1 or not all(
-            isinstance(block, dict)
-            and block.get("type") == "tool_result"
-            and isinstance(block.get("tool_use_id"), str)
-            and tool_owners.get(block["tool_use_id"]) == owners
-            for block in content
-        ):
-            ambiguous.update(owners)
-            continue
-        results.setdefault(next(iter(owners)), []).append(index)
-
-    ordered = list(records)
-    changed = False
-    for response_id, assistant_slots in assistants.items():
-        indices = [records[index].get("apiBlockIndex") for index in assistant_slots]
-        if (
-            response_id in ambiguous
-            or any(type(index) is not int or index < 0 for index in indices)
-            or len(set(indices)) != len(indices)
-        ):
-            continue
-        response = sorted(
-            (records[index] for index in assistant_slots),
-            key=lambda record: record["apiBlockIndex"],
-        )
-        if any(not isinstance(record["message"].get("content"), list) for record in response):
-            continue
-        call_ids = [
-            block.get("id") for record in response
-            for block in record["message"]["content"]
-            if isinstance(block, dict) and block.get("type") == "tool_use"
-        ]
-        if (
-            any(not isinstance(tool_id, str) or not tool_id for tool_id in call_ids)
-            or len(set(call_ids)) != len(call_ids)
-        ):
-            continue
-        call_order = {tool_id: index for index, tool_id in enumerate(call_ids)}
-        response_results = []
-        for index in results.get(response_id, []):
-            record = records[index]
-            message = record["message"]
-            blocks = sorted(
-                message["content"], key=lambda block: call_order[block["tool_use_id"]]
-            )
-            response_results.append(dict(record, message=dict(message, content=blocks)))
-        response_results.sort(
-            key=lambda record: call_order[record["message"]["content"][0]["tool_use_id"]]
-        )
-        result_order = [
-            call_order[block["tool_use_id"]] for record in response_results
-            for block in record["message"]["content"]
-        ]
-        # Keep ambiguous batches intact rather than split messages or move their
-        # other metadata onto a different tool result.
-        if result_order != sorted(set(result_order)):
-            continue
-        slots = sorted(assistant_slots + results.get(response_id, []))
-        selected = set(slots)
-        if any(
-            index not in selected and records[index].get("type") != "progress"
-            for index in range(slots[0], slots[-1] + 1)
-        ):
-            continue
-        for index, record in zip(slots, response + response_results):
-            if record != records[index]:
-                changed = True
-            ordered[index] = record
-
-    if not changed:
-        return records
-    # The copied history is one sequence, not the original result branches.
-    # Link it in its new order so following parents cannot restore the old
-    # branch order or reference a record that now comes later in the file.
-    linked = []
-    previous_uuid = None
-    for record in ordered:
-        clone = dict(record)
-        if not (
-            record.get("type") == "system"
-            and record.get("subtype") == "compact_boundary"
-            and record.get("parentUuid") is None
-        ):
-            clone["parentUuid"] = previous_uuid
-        linked.append(clone)
-        previous_uuid = clone["uuid"]
-    return linked
+    return CallerSelection(
+        invocation.source_id, invocation.transcript, invocation, invocation.worker_snapshot
+    )
 
 
 def record_timestamp(record: dict[str, Any]) -> float:
@@ -1085,292 +955,21 @@ def record_timestamp(record: dict[str, Any]) -> float:
     return float("-inf")
 
 
-def response_group_key(record: dict[str, Any]) -> str:
-    message = record.get("message")
-    if isinstance(message, dict) and isinstance(message.get("id"), str):
-        return f"response:{message['id']}"
-    return f"record:{record.get('uuid')}"
-
-
-def active_sidechain_chain(
-    records: list[dict[str, Any]],
-    source_id: str,
-    invocation: PrepareInvocation | None,
-) -> tuple[dict[str, Any] | None, list[dict[str, Any]], int, list[str]]:
-    references = [
-        record
-        for record in records
-        if record.get("type") == "fork-context-ref"
-        and record.get("agentId") == source_id
-    ]
-    reference = references[-1] if references else None
-
-    records_with_uuid = [
-        record for record in records if isinstance(record.get("uuid"), str)
-    ]
-    owned_records = [
-        record
-        for record in records_with_uuid
-        if record.get("agentId") == source_id
-        and record.get("isSidechain") is True
-    ]
-    if not owned_records:
-        raise UsageError(f"source agent {source_id} has no sidechain messages")
-
-    by_uuid = {str(record["uuid"]): record for record in records_with_uuid}
-    if invocation is not None:
-        leaf = by_uuid.get(invocation.assistant_uuid)
-        if leaf is None:
-            raise UsageError(
-                f"active prepare invocation {invocation.assistant_uuid!r} is missing "
-                f"from source agent {source_id}"
-            )
-    else:
-        parent_uuids = {
-            str(record["parentUuid"])
-            for record in records_with_uuid
-            if isinstance(record.get("parentUuid"), str)
-        }
-        leaves = [
-            record
-            for record in owned_records
-            if record["uuid"] not in parent_uuids
-            and not (
-                record.get("type") == "system"
-                and record.get("subtype") == "compact_boundary"
-            )
-        ]
-        if not leaves:
-            raise UsageError(f"source agent {source_id} has no sidechain leaf")
-        positions = {
-            str(record["uuid"]): index for index, record in enumerate(records_with_uuid)
-        }
-        leaf = max(leaves, key=lambda record: positions[str(record["uuid"])])
-
-    reverse_chain: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    current: dict[str, Any] | None = leaf
-    while current is not None:
-        current_uuid = str(current["uuid"])
-        if current_uuid in seen:
-            raise UsageError(f"source agent {source_id} has a parentUuid cycle")
-        seen.add(current_uuid)
-        reverse_chain.append(current)
-        parent_uuid = current.get("parentUuid")
-        if parent_uuid is None:
-            logical_parent = current.get("logicalParentUuid")
-            if (
-                current.get("type") == "system"
-                and current.get("subtype") == "compact_boundary"
-                and isinstance(logical_parent, str)
-            ):
-                if logical_parent not in by_uuid:
-                    raise UsageError(
-                        f"source agent {source_id} compacted across a missing "
-                        f"logicalParentUuid {logical_parent!r}"
-                    )
-                current = by_uuid[logical_parent]
-                continue
-            break
-        if not isinstance(parent_uuid, str) or parent_uuid not in by_uuid:
-            raise UsageError(
-                f"source agent {source_id} has a missing parentUuid {parent_uuid!r}"
-            )
-        current = by_uuid[parent_uuid]
-    base_chain = list(reversed(reverse_chain))
-    chain = recover_parallel_tool_results(records_with_uuid, base_chain)
-
-    cut_index = len(chain)
-    active_tool_ids: set[str] = set()
-    if invocation is not None:
-        matching = [
-            index
-            for index, record in enumerate(chain)
-            if record.get("type") == "assistant"
-            and (
-                record.get("message", {}).get("id") == invocation.response_id
-                if invocation.response_id is not None
-                else record.get("uuid") == invocation.assistant_uuid
-            )
-        ]
-        if not matching:
-            raise UsageError("the active prepare response is absent from its sidechain")
-        cut_index = min(matching)
-        active_tool_ids = {
-            tool_id
-            for record in chain[cut_index:]
-            if record.get("type") == "assistant"
-            and (
-                record.get("message", {}).get("id") == invocation.response_id
-                if invocation.response_id is not None
-                else record.get("uuid") == invocation.assistant_uuid
-            )
-            for tool_id in entry_tool_use_ids(record)
-        }
-    elif chain[-1].get("type") == "assistant" and chain[-1].get(
-        "message", {}
-    ).get("stop_reason") is None:
-        active_key = response_group_key(chain[-1])
-        cut_index = next(
-            index
-            for index, record in enumerate(chain)
-            if response_group_key(record) == active_key
-        )
-
-    prefix = chain[:cut_index]
-    if not prefix:
-        raise UsageError(f"source agent {source_id} has no completed sidechain prefix")
-
-    tool_results = {
-        tool_id
-        for record in prefix
-        for tool_id in message_tool_result_ids(record)
-    }
-    groups: dict[str, list[dict[str, Any]]] = {}
-    for record in prefix:
-        if record.get("type") == "assistant":
-            groups.setdefault(response_group_key(record), []).append(record)
-    removed_uuids: set[str] = set()
-    removed_tool_ids: set[str] = set()
-    for group in groups.values():
-        group_tools = {
-            tool_id for record in group for tool_id in entry_tool_use_ids(record)
-        }
-        if group_tools - tool_results:
-            removed_tool_ids.update(group_tools)
-            removed_uuids.update(str(record["uuid"]) for record in group)
-    for record in prefix:
-        if message_tool_result_ids(record) & removed_tool_ids:
-            removed_uuids.add(str(record["uuid"]))
-        source_assistant = record.get("sourceToolAssistantUUID")
-        if isinstance(source_assistant, str) and source_assistant in removed_uuids:
-            removed_uuids.add(str(record["uuid"]))
-
-    def retained_parent(parent_uuid: Any) -> str | None:
-        visited: set[str] = set()
-        while isinstance(parent_uuid, str) and parent_uuid in removed_uuids:
-            if parent_uuid in visited:
-                raise UsageError(f"source agent {source_id} has a removed-parent cycle")
-            visited.add(parent_uuid)
-            parent_uuid = by_uuid[parent_uuid].get("parentUuid")
-        return parent_uuid if isinstance(parent_uuid, str) else None
-
-    completed: list[dict[str, Any]] = []
-    for record in prefix:
-        if str(record["uuid"]) in removed_uuids:
-            continue
-        clone = copy.deepcopy(record)
-        clone["parentUuid"] = retained_parent(record.get("parentUuid"))
-        logical_parent = record.get("logicalParentUuid")
-        if isinstance(logical_parent, str) and logical_parent in removed_uuids:
-            replacement = retained_parent(logical_parent)
-            if replacement is None:
-                clone.pop("logicalParentUuid", None)
-            else:
-                clone["logicalParentUuid"] = replacement
-        completed.append(clone)
-
-    if not completed:
-        raise UsageError(f"source agent {source_id} has no completed sidechain prefix")
-    remaining_uses = {
-        tool_id
-        for record in completed
-        for tool_id in entry_tool_use_ids(record)
-    }
-    remaining_results = {
-        tool_id
-        for record in completed
-        for tool_id in message_tool_result_ids(record)
-    }
-    if remaining_uses - remaining_results:
-        raise UsageError(
-            f"source agent {source_id} still has unmatched tool_use records after trimming"
-        )
-    dropped = len(chain) - len(completed)
-    return reference, order_completed_responses(completed), dropped, sorted(removed_tool_ids | active_tool_ids)
-
-
-def remap_compact_metadata(
-    clone: dict[str, Any],
-    uuid_map: dict[str, str],
-    source_uuids: set[str],
-) -> None:
-    compact = clone.get("compactMetadata")
-    if not isinstance(compact, dict):
-        return
-
-    def remap_value(container: dict[str, Any], key: str) -> None:
-        value = container.get(key)
-        if not isinstance(value, str):
-            return
-        if value in uuid_map:
-            container[key] = uuid_map[value]
-        elif value in source_uuids:
-            raise UsageError(
-                f"compactMetadata.{key} references an omitted source UUID {value!r}"
-            )
-
-    segment = compact.get("preservedSegment")
-    if isinstance(segment, dict):
-        for key in ("headUuid", "anchorUuid", "tailUuid"):
-            remap_value(segment, key)
-
-    messages = compact.get("preservedMessages")
-    if isinstance(messages, dict):
-        remap_value(messages, "anchorUuid")
-        for key in ("uuids", "allUuids"):
-            values = messages.get(key)
-            if not isinstance(values, list):
-                continue
-            remapped: list[Any] = []
-            for value in values:
-                if isinstance(value, str) and value in uuid_map:
-                    remapped.append(uuid_map[value])
-                elif isinstance(value, str) and value in source_uuids:
-                    raise UsageError(
-                        f"compactMetadata.{key} references an omitted source UUID "
-                        f"{value!r}"
-                    )
-                else:
-                    remapped.append(value)
-            messages[key] = remapped
-
-
-def remap_sidechain(
-    records: list[dict[str, Any]],
-    target_id: str,
-    source_uuids: set[str],
+def copy_worker_records(
+    records: list[dict[str, Any]], source_id: str, target_id: str,
 ) -> list[dict[str, Any]]:
-    uuid_map = {str(record["uuid"]): str(uuid.uuid4()) for record in records}
-    prompt_map: dict[str, str] = {}
-    remapped: list[dict[str, Any]] = []
-    for record in records:
-        clone = copy.deepcopy(record)
-        old_uuid = str(record["uuid"])
-        clone["uuid"] = uuid_map[old_uuid]
-        parent_uuid = record.get("parentUuid")
-        clone["parentUuid"] = (
-            uuid_map[parent_uuid] if isinstance(parent_uuid, str) else None
-        )
-        logical_parent = record.get("logicalParentUuid")
-        if isinstance(logical_parent, str) and logical_parent in uuid_map:
-            clone["logicalParentUuid"] = uuid_map[logical_parent]
-        source_tool_assistant = record.get("sourceToolAssistantUUID")
-        if isinstance(source_tool_assistant, str) and source_tool_assistant in uuid_map:
-            clone["sourceToolAssistantUUID"] = uuid_map[source_tool_assistant]
-        prompt_id = record.get("promptId")
-        if isinstance(prompt_id, str):
-            clone["promptId"] = prompt_map.setdefault(prompt_id, str(uuid.uuid4()))
-        clone["agentId"] = target_id
-        clone["isSidechain"] = True
-        remap_compact_metadata(clone, uuid_map, source_uuids)
-        remapped.append(clone)
-    return remapped
+    # Agent loading filters by agentId, including fork-context-ref and content
+    # replacements. UUIDs are scoped to that file; retain them and every link.
+    copied = copy.deepcopy(records)
+    for record in copied:
+        if record.get("agentId") == source_id:
+            record["agentId"] = target_id
+    return copied
 
 
 def make_completed_tail_record(
     source_record: dict[str, Any],
-    parent_uuid: str,
+    parent_uuid: str | None,
     target_id: str,
     session_id: str,
 ) -> dict[str, Any]:
@@ -1421,7 +1020,7 @@ def prepare_worker_agent(
     args: argparse.Namespace,
     source_id: str,
     source_path: Path,
-    invocation: PrepareInvocation | None,
+    snapshot: WorkerSnapshot,
 ) -> dict[str, Any]:
     description, agent_name, agent_id = agent_identity(args)
     model, fork_another_model, cache_warning = fork_model_settings(args)
@@ -1435,22 +1034,16 @@ def prepare_worker_agent(
     if source_id == agent_id:
         raise UsageError("source and target agent ids must differ")
 
-    source_records = read_agent_records(source_path)
-    source_reference, completed, dropped_count, unresolved = active_sidechain_chain(
-        source_records, source_id, invocation
+    copied = copy_worker_records(snapshot.records, source_id, agent_id)
+    reference = next(
+        (record for record in reversed(copied)
+         if record.get("type") == "fork-context-ref" and record.get("agentId") == agent_id),
+        None,
     )
-    source_uuids = {
-        str(record["uuid"])
-        for record in source_records
-        if isinstance(record.get("uuid"), str)
-    }
-    copied = remap_sidechain(completed, agent_id, source_uuids)
-    reference = copy.deepcopy(source_reference) if source_reference is not None else None
-    if reference is not None:
-        reference["agentId"] = agent_id
-    last_message = copied[-1].get("message")
+    last_message = snapshot.template_record.get("message")
     has_completed_assistant_tail = (
-        copied[-1].get("type") == "assistant"
+        snapshot.boundary_uuid is not None
+        and snapshot.template_record.get("type") == "assistant"
         and isinstance(last_message, dict)
         and last_message.get("stop_reason") is not None
     )
@@ -1458,7 +1051,7 @@ def prepare_worker_agent(
     if not has_completed_assistant_tail:
         boundary_records.append(
             make_completed_tail_record(
-                completed[-1], str(copied[-1]["uuid"]), agent_id, session_id
+                snapshot.template_record, snapshot.boundary_uuid, agent_id, session_id
             )
         )
     target_records = copied + boundary_records
@@ -1467,14 +1060,11 @@ def prepare_worker_agent(
             make_fork_seed(
                 agent_id,
                 session_id,
-                str(target_records[-1]["uuid"]),
-                completed[-1],
+                boundary_records[-1]["uuid"] if boundary_records else snapshot.boundary_uuid,
+                snapshot.template_record,
             )
         )
-    transcript_bytes = (
-        (json_line(reference) if reference is not None else b"")
-        + b"".join(json_line(record) for record in target_records)
-    )
+    transcript_bytes = b"".join(json_line(record) for record in target_records)
     metadata = {
         "agentType": "general-purpose" if fork_another_model else "fork",
         **({} if fork_another_model else {"isFork": True}),
@@ -1495,10 +1085,10 @@ def prepare_worker_agent(
         "model": model,
         **({"cache_warning": cache_warning} if cache_warning else {}),
         "source_agent_id": source_id,
-        "copied_sidechain_records": len(copied),
+        "copied_sidechain_records": sum(record.get("type") != "fork-context-ref" for record in copied),
         "snapshot_boundary_records": len(boundary_records),
-        "dropped_active_records": dropped_count,
-        "dropped_unmatched_tool_use_ids": unresolved,
+        "dropped_active_records": snapshot.dropped_records,
+        "dropped_unmatched_tool_use_ids": snapshot.dropped_tool_ids,
         "parent_session_id": session_id,
         "parent_last_uuid": (
             reference.get("parentLastUuid") if reference is not None else None
@@ -1522,11 +1112,13 @@ def prepare_agent(args: argparse.Namespace) -> dict[str, Any]:
         return prepare_main_agent(args, selection.invocation)
     if args.parent_last_uuid:
         raise UsageError("--parent-last-uuid is valid only when preparing from main")
+    if selection.worker_snapshot is None:
+        raise UsageError("caller discovery did not provide the worker's history")
     return prepare_worker_agent(
         args,
         selection.source_id,
         selection.transcript,
-        selection.invocation,
+        selection.worker_snapshot,
     )
 
 
