@@ -113,13 +113,16 @@ def _display_values(env):
     theme = env.get("CLAUDE_STATUSLINE_THEME", _default_theme(env)).lower()
     palette = PALETTES.get(theme, PALETTES["dark"])
     mode = env.get("CLAUDE_STATUSLINE_COLOR", "auto").lower()
+    term = env.get("TERM", "").lower()
     enabled = "NO_COLOR" not in env and mode != "never"
+    # tmux accepts RGB input and converts it for each attached terminal even
+    # when COLORTERM was not inherited by the pane.
     values = {
         "THEME": theme, "PALETTE": palette, "COLOR_MODE": mode,
         "COLOR_ENABLED": enabled,
         "TRUECOLOR": enabled and (mode == "always" or
             env.get("COLORTERM", "").lower() in ("truecolor", "24bit") or
-            "direct" in env.get("TERM", "").lower()),
+            "direct" in term or term == "tmux-256color"),
         "COMPACT": _env_flag("CLAUDE_STATUSLINE_COMPACT", env),
     }
     for name, key in (("ALARM_RGB", "alarm"), ("MUTED_RGB", "muted"),

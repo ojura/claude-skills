@@ -44,8 +44,10 @@ The context bar embeds a fixed-width used/total label such as `245k/372k` or
 ### Terminal colors and narrow layouts
 
 `NO_COLOR` disables ANSI styling. `CLAUDE_STATUSLINE_COLOR=always` forces truecolor
-and `CLAUDE_STATUSLINE_COLOR=never` disables it; the default detects `COLORTERM` or a
-`direct` terminfo entry. Set `CLAUDE_STATUSLINE_THEME=light` for the light palette
+and `CLAUDE_STATUSLINE_COLOR=never` disables it; the default recognizes `COLORTERM`,
+`direct` terminal names and `tmux-256color`. Tmux accepts RGB input even when a
+pane does not inherit `COLORTERM`, and converts it for the attached terminal.
+Set `CLAUDE_STATUSLINE_THEME=light` for the light palette
 (the default is dark, or inferred from `COLORFGBG`). Palette entries can be overridden
 with `CLAUDE_STATUSLINE_{ALARM,MUTED,BAR_DIM,BAR_ON_FILL,BAR_ON_DIM}_RGB`, using
 `#rrggbb` or `r,g,b` values.

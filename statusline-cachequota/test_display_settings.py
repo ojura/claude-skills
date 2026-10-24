@@ -76,6 +76,24 @@ class DisplaySettingsTest(unittest.TestCase):
         self.assertIn("viewer", explicit)
         self.assertIn("(1:00:00)", explicit)
 
+    def test_tmux_without_colorterm_keeps_rgb_and_explicit_disable_modes(self):
+        expected = self.show({"TERM": "xterm-256color", "COLORTERM": "truecolor"})
+        for profile in ({"TERM": "tmux-256color"},
+                        {"TERM": "tmux-256color", "COLORTERM": ""}):
+            with self.subTest(profile=profile):
+                line = self.show(profile)
+                self.assertEqual(line, expected)
+                self.assertIn("\033[38;2;", line)
+                self.assertIn(";48;2;", line)
+                for disabled in ({"NO_COLOR": ""}, {"CLAUDE_STATUSLINE_COLOR": "never"}):
+                    self.assertNotIn("\033[", self.show({**profile, **disabled}))
+                self.assertEqual(self.show(profile), expected)
+        # Other 256-colour terminal names do not establish RGB input support.
+        for term in ("xterm-256color", "screen-256color"):
+            with self.subTest(term=term):
+                self.assertNotIn("\033[38;2;", self.show({"TERM": term}))
+        self.assertEqual(self.show({"TERM": "tmux-256color"}), expected)
+
     def test_absent_display_preserves_defaults_after_explicit_request(self):
         inherited = statusline.serve(self.native, self.cache, self.memo)
         self.show({"COLORTERM": "truecolor"})
