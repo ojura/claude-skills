@@ -9,6 +9,15 @@ import threading
 import unittest
 
 
+DISPLAY_KEYS = (
+    "TERM", "COLORTERM", "COLORFGBG", "NO_COLOR",
+    "CLAUDE_STATUSLINE_COLOR", "CLAUDE_STATUSLINE_THEME", "CLAUDE_STATUSLINE_COMPACT",
+    "CLAUDE_STATUSLINE_ALARM_RGB", "CLAUDE_STATUSLINE_MUTED_RGB",
+    "CLAUDE_STATUSLINE_BAR_DIM_RGB", "CLAUDE_STATUSLINE_BAR_ON_FILL_RGB",
+    "CLAUDE_STATUSLINE_BAR_ON_DIM_RGB",
+)
+
+
 class ClientTransportTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -23,11 +32,15 @@ class ClientTransportTest(unittest.TestCase):
         cls.build.cleanup()
 
     def run_client(self, native, view=None, fallback=False, task_metadata=False,
-                   active=None, pid=None, pane=None):
+                   active=None, pid=None, pane=None, display=None):
         with tempfile.TemporaryDirectory(prefix="sl-") as directory:
             env = dict(os.environ, CLAUDE_CONFIG_DIR=directory)
             for key in ("CLAUDE_STATUSLINE_VIEW", "CLAUDE_STATUSLINE_ACTIVE", "CLAUDE_PID", "TMUX_PANE"):
                 env.pop(key, None)
+            for key in DISPLAY_KEYS:
+                env.pop(key, None)
+            if display is not None:
+                env.update(display)
             if view is not None:
                 env["CLAUDE_STATUSLINE_VIEW"] = view
             for key, value in (("CLAUDE_STATUSLINE_ACTIVE", active), ("CLAUDE_PID", pid), ("TMUX_PANE", pane)):
@@ -73,9 +86,10 @@ class ClientTransportTest(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             return json.loads(output.stdout)
 
-    def expected(self, native, view="", active="", process=None, **extra):
+    def expected(self, native, view="", active="", process=None, display=None, **extra):
         return {"statusline_input": native, "statusline_view": view,
-                "statusline_activation": active, "statusline_process": process or {}, **extra}
+                "statusline_activation": active, "statusline_process": process or {},
+                "statusline_display": display or {}, **extra}
 
     def test_unselected_native_frame_is_preserved_for_registration(self):
         data = {"session_id": "main", "model": {"id": "model"}}
@@ -120,6 +134,63 @@ class ClientTransportTest(unittest.TestCase):
             with self.subTest(pid=pid):
                 self.assertEqual(self.run_client({}, pid=pid)["statusline_process"], {})
         self.assertEqual(self.run_client({}, active="x" * 257, pane="x" * 257), self.expected({}))
+
+    def test_display_settings_round_trip_for_socket_fallback_and_tasks(self):
+        display = {
+            "TERM": "tmux-256color", "COLORTERM": "truecolor", "COLORFGBG": "15;0",
+            "NO_COLOR": "1", "CLAUDE_STATUSLINE_COLOR": "always",
+            "CLAUDE_STATUSLINE_THEME": "light", "CLAUDE_STATUSLINE_COMPACT": "yes",
+            "CLAUDE_STATUSLINE_ALARM_RGB": "255,0,0",
+            "CLAUDE_STATUSLINE_MUTED_RGB": "120,120,120",
+            "CLAUDE_STATUSLINE_BAR_DIM_RGB": "20,20,20",
+            "CLAUDE_STATUSLINE_BAR_ON_FILL_RGB": "10,10,10",
+            "CLAUDE_STATUSLINE_BAR_ON_DIM_RGB": "240,240,240",
+        }
+        for fallback in (False, True):
+            for tasks in (False, True):
+                with self.subTest(fallback=fallback, task_metadata=tasks):
+                    extra = {"statusline_task_metadata": True} if tasks else {}
+                    self.assertEqual(self.run_client({}, display=display, fallback=fallback,
+                                                     task_metadata=tasks),
+                                     self.expected({}, display=display, **extra))
+
+    def test_empty_no_color_is_distinct_from_absent(self):
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback):
+                self.assertEqual(self.run_client({}, fallback=fallback)["statusline_display"], {})
+                self.assertEqual(self.run_client({}, display={"NO_COLOR": ""}, fallback=fallback)
+                                 ["statusline_display"], {"NO_COLOR": ""})
+
+    def test_display_values_are_bounded_in_bytes_and_oversized_values_omitted(self):
+        display = {"TERM": "x" * 256, "COLORTERM": "x" * 257,
+                   "COLORFGBG": "Ž" * 128, "NO_COLOR": "x" * 257,
+                   "CLAUDE_STATUSLINE_THEME": "Ž" * 129}
+        expected = {"TERM": "x" * 256, "COLORFGBG": "Ž" * 128}
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback):
+                self.assertEqual(self.run_client({}, display=display, fallback=fallback),
+                                 self.expected({}, display=expected))
+
+    def test_maximum_display_escaping_does_not_overflow_envelope(self):
+        display = {key: "\x01" * 256 for key in DISPLAY_KEYS}
+        display["TERM"] = "\x01" * 249 + 'Ž"\\\n\r\t'
+        self.assertEqual(len(display["TERM"].encode()), 256)
+        view = "\x02" * 8192
+        active = "\x03" * 256
+        pane = "\x04" * 256
+        native = {"padding": "x" * 100_000}
+        expected = self.expected(native, view=view, active=active, process={"pane": pane}, display=display)
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback):
+                self.assertEqual(self.run_client(native, view=view, active=active, pane=pane,
+                                                 display=display, fallback=fallback), expected)
+
+    def test_display_is_an_exact_allowlist_without_credentials_or_general_environment(self):
+        environment = {"TERM": "xterm-direct", "ANTHROPIC_API_KEY": "fixture-secret-key",
+                       "CLAUDE_CODE_OAUTH_TOKEN": "fixture-secret-token", "DISPLAY": ":99",
+                       "CLAUDE_STATUSLINE_OTHER_RGB": "1,2,3"}
+        self.assertEqual(self.run_client({}, display=environment),
+                         self.expected({}, display={"TERM": "xterm-direct"}))
 
     def test_old_owner_mode_is_removed(self):
         result = subprocess.run([str(self.binary), "--view-owner"], input=b"{}",

@@ -69,8 +69,11 @@ class CacheEventLabelsTest(unittest.TestCase):
         event = self.FIRST + 360
         data = self.transcript("5m", event)
         text = self.display(data, event + 720)
-        self.assertIn("cache miss 12m ago", text)
-        self.assertIn("TTL elapsed", text)
+        self.assertIn("miss 12m ago", text)
+        self.assertNotIn("cache miss", text)
+        self.assertIn("recached 1.00x miss 12m ago", text)
+        self.assertIn("(past)", text)
+        self.assertNotIn("TTL elapsed", text)
         self.assertIn("→ ~", text)
         self.assert_no_cause(text)
 
@@ -78,10 +81,10 @@ class CacheEventLabelsTest(unittest.TestCase):
         event = self.FIRST + 4200
         data = self.transcript("1h", event)
         text = self.display(data, event + 60)
-        self.assertIn("cache miss 1m ago", text)
+        self.assertIn("miss 1m ago", text)
         stamp = statusline.time.strftime("%H:%M", statusline.time.localtime(event + 3600))
         self.assertIn("→ ~" + stamp, text)
-        self.assertNotIn("TTL elapsed", text)
+        self.assertNotIn("(past)", text)
         self.assert_no_cause(text)
 
     def test_missing_or_backwards_timestamps_do_not_invent_causes(self):
@@ -91,19 +94,19 @@ class CacheEventLabelsTest(unittest.TestCase):
                 text = self.display(data, self.FIRST + 600)
                 self.assert_no_cause(text)
                 if event is None:
-                    self.assertNotIn("cache miss", text)
+                    self.assertNotIn("miss ", text)
                 else:
                     # The recorded event time still gives an age; an earlier
                     # timestamp provides no basis for a cache-loss diagnosis.
-                    self.assertIn("cache miss 11m ago", text)
+                    self.assertIn("miss 11m ago", text)
 
     def test_unknown_ttl_has_no_guessed_expiry(self):
         event = self.FIRST + 60
         data = self.transcript(None, event)
         text = self.display(data, event + 720)
-        self.assertIn("cache miss 12m ago", text)
+        self.assertIn("miss 12m ago", text)
         self.assertNotIn("→", text)
-        self.assertNotIn("TTL elapsed", text)
+        self.assertNotIn("(past)", text)
         self.assert_no_cause(text)
         # A persisted memo from an older renderer may still contain a guessed
         # five-minute expiry. The visible result must reject that estimate too.
@@ -116,7 +119,8 @@ class CacheEventLabelsTest(unittest.TestCase):
         data = self.transcript("5m+1h", event)
         text = self.display(data, event + 301)
         self.assertIn("cache 5m+1h", text)
-        self.assertIn("(5m TTL elapsed)", text)
+        self.assertIn("(5m past)", text)
+        self.assertNotIn("TTL elapsed", text)
         self.assert_no_cause(text)
 
     def test_event_age_updates_on_an_unchanged_transcript_refresh(self):
@@ -125,9 +129,21 @@ class CacheEventLabelsTest(unittest.TestCase):
         memo = {}
         first = self.display(data, event + 60, memo)
         later = self.display(data, event + 180, memo)
-        self.assertIn("cache miss 1m ago", first)
-        self.assertIn("cache miss 3m ago", later)
-        self.assertNotIn("cache miss 1m ago", later)
+        self.assertIn("miss 1m ago", first)
+        self.assertIn("miss 3m ago", later)
+        self.assertNotIn("miss 1m ago", later)
+
+    def test_expiry_state_remains_visible_when_memo_crosses_boundary(self):
+        event = self.FIRST + 60
+        data = self.transcript("5m", event)
+        memo = {}
+        before = self.display(data, event + 299, memo)
+        after = self.display(data, event + 300, memo)
+        self.assertIn("(0:01)", before)
+        self.assertNotIn("(past)", before)
+        self.assertIn("(past)", after)
+        self.assertNotIn("(0:01)", after)
+        self.assertNotIn("TTL elapsed", after)
 
 
 if __name__ == "__main__":

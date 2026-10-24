@@ -43,9 +43,14 @@ static char *json_string(char *p, const char *value) {
     return p;
 }
 
-static const char *bounded_env(const char *name, size_t maxlen) {
+static const char *optional_env(const char *name, size_t maxlen) {
     const char *value = getenv(name);
-    return value && strlen(value) <= maxlen ? value : "";
+    return value && strnlen(value, maxlen + 1) <= maxlen ? value : NULL;
+}
+
+static const char *bounded_env(const char *name, size_t maxlen) {
+    const char *value = optional_env(name, maxlen);
+    return value ? value : "";
 }
 
 static long native_pid(void) {
@@ -64,7 +69,9 @@ static long native_pid(void) {
  * native frame and its process identity; selection is enabled only by the
  * token injected into this invocation's command by the active native mod.
  * Keep the env values as JSON strings so malformed selection JSON cannot
- * corrupt the native input. Python validates activation and session identity. */
+ * corrupt the native input. Python validates activation and session identity.
+ * Only the explicit display allowlist crosses into the shared daemon; its
+ * startup terminal settings need not match this invocation's terminal. */
 static char *with_view(const char *input, size_t *len, int task_metadata) {
     const char *view = bounded_env("CLAUDE_STATUSLINE_VIEW", 8192);
     const char *active = bounded_env("CLAUDE_STATUSLINE_ACTIVE", 256);
@@ -74,8 +81,26 @@ static char *with_view(const char *input, size_t *len, int task_metadata) {
     static const char view_key[] = ",\"statusline_view\":";
     static const char active_key[] = ",\"statusline_activation\":";
     static const char process_key[] = ",\"statusline_process\":{";
+    static const char display_key[] = ",\"statusline_display\":{";
     static const char task_flag[] = ",\"statusline_task_metadata\":true";
-    size_t cap = *len + (strlen(view) + strlen(active) + strlen(pane)) * 6 + 256;
+    static const char *const display_keys[] = {
+        "TERM", "COLORTERM", "COLORFGBG", "NO_COLOR",
+        "CLAUDE_STATUSLINE_COLOR", "CLAUDE_STATUSLINE_THEME", "CLAUDE_STATUSLINE_COMPACT",
+        "CLAUDE_STATUSLINE_ALARM_RGB", "CLAUDE_STATUSLINE_MUTED_RGB",
+        "CLAUDE_STATUSLINE_BAR_DIM_RGB", "CLAUDE_STATUSLINE_BAR_ON_FILL_RGB",
+        "CLAUDE_STATUSLINE_BAR_ON_DIM_RGB"
+    };
+    const char *display_values[sizeof display_keys / sizeof display_keys[0]];
+    size_t cap = *len + (strlen(view) + strlen(active) + strlen(pane)) * 6
+                 + sizeof display_key + 256;
+    for (size_t i = 0; i < sizeof display_keys / sizeof display_keys[0]; i++) {
+        display_values[i] = optional_env(display_keys[i], 256);
+        if (display_values[i]) {
+            /* Fixed ASCII keys need no escaping. Allow six bytes per value
+             * byte, plus quotes, colon and comma for each present entry. */
+            cap += strlen(display_keys[i]) + strlen(display_values[i]) * 6 + 6;
+        }
+    }
     char *payload = malloc(cap);
     if (!payload)
         return NULL;
@@ -102,6 +127,19 @@ static char *with_view(const char *input, size_t *len, int task_metadata) {
             *p++ = ',';
         memcpy(p, "\"pane\":", 7);
         p = json_string(p + 7, pane);
+    }
+    *p++ = '}';
+    memcpy(p, display_key, sizeof display_key - 1);
+    p += sizeof display_key - 1;
+    int display_count = 0;
+    for (size_t i = 0; i < sizeof display_keys / sizeof display_keys[0]; i++) {
+        if (!display_values[i])
+            continue;
+        if (display_count++)
+            *p++ = ',';
+        p = json_string(p, display_keys[i]);
+        *p++ = ':';
+        p = json_string(p, display_values[i]);
     }
     *p++ = '}';
     if (task_metadata) {

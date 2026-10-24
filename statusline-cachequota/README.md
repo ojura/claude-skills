@@ -15,7 +15,7 @@ The conversation is intact in all three frames. In this recorded example, the ne
 request after an overnight gap missed the cache, costing about $8.40 rather than
 the $0.42 a cache read would have cost. The third frame records that request: the
 health bar empties, and the multiplier records the repeated work. The current
-display says `TTL elapsed` where this older illustration says `cold`.
+display says `(past)` where this older illustration says `cold`.
 
 ## Expiry and renewal times
 
@@ -27,7 +27,7 @@ Putting the clock time first solves a small problem worth mentioning. A status l
 redraws while you are working, so a session you left open an hour ago is still showing
 what it showed then, and any countdown in it is wrong by exactly the time you were away.
 A clock time remains useful after a pause. Once the estimated boundary passes,
-the cache segment says `(TTL elapsed)`. This is a timing estimate, not proof of
+the cache segment says `(past)`, or `(5m past)` for a mixed cache. This is a timing estimate, not proof of
 cache deletion: the TTL starts at request start, while the transcript supplies
 an assistant timestamp. The `~` marks that approximation. Unknown TTLs have no
 expiry estimate; a mixed cache identifies the earliest, five-minute boundary.
@@ -49,6 +49,15 @@ and `CLAUDE_STATUSLINE_COLOR=never` disables it; the default detects `COLORTERM`
 (the default is dark, or inferred from `COLORFGBG`). Palette entries can be overridden
 with `CLAUDE_STATUSLINE_{ALARM,MUTED,BAR_DIM,BAR_ON_FILL,BAR_ON_DIM}_RGB`, using
 `#rrggbb` or `r,g,b` values.
+
+The client sends these display settings with each request. The shared renderer
+uses the requesting terminal's colors, theme and compact mode, including when
+that terminal is viewing a teammate. Starting the server from the installer or
+another terminal does not change later clients' display settings.
+
+Only present, supported settings are sent on the existing socket request. Parsed
+display profiles are reused across clients, so unchanged terminals do not keep
+re-parsing palette overrides.
 
 `CLAUDE_STATUSLINE_COMPACT=1` shortens separators and renewal stamps and omits the
 session id. The embedded context value remains because it carries more information per
@@ -125,7 +134,8 @@ normally use the five-minute cache, so their `5m` badge has a neutral color.
 
 ### What a cache miss means
 
-`cache miss 12m ago` reports the latest substantial drop in cache reuse: more than
+`recached 0.08x miss 12m ago` combines the re-cache factor and miss age in one
+segment. The miss age reports the latest substantial drop in cache reuse: more than
 half of the comparable prior input footprint was not read from cache, after
 ignoring differences below 2,048 tokens. The age is time since that request.
 It does not diagnose a cause. The previous `hot`, `evicted` and `expired` labels
@@ -168,6 +178,13 @@ renderer answers most redraws from memory, since usually the only thing that cha
 the clock. It exits after ten idle minutes and restarts itself whenever you edit
 it. If it cannot be reached at all, the client renders the line the slow way, so the
 line never goes blank.
+
+The shared server keeps bounded caches for display profiles, task metadata and
+rendered views. A teammate's own line and a leader viewing that teammate can both
+reuse their rendered output. Unchanged task metadata does not rewrite SQLite or
+decode the same rows on every refresh; an external database commit invalidates
+that metadata cache. Live process and session checks still run where needed to
+reject stale teammate identities.
 
 Your transcripts are only read, never written. The tool's own state is one small
 database. Transcript state rebuilds from the transcripts; peer frames repopulate
@@ -214,7 +231,8 @@ claude plugin test .
 ```
 
 The Python tests cover the renderer and the compiled client's socket and
-fallback paths, peer identity changes and idle registry reuse. Native mod tests
+fallback paths, peer identity changes, mixed display profiles, idle cache reuse
+and task-metadata invalidation. Native mod tests
 exercise selection races, terminal-surface isolation, teammate identity and the
 effective-command wrapper. Live fixtures additionally exercise separate Claude
 processes and plugin unload/reload.

@@ -10,8 +10,10 @@
 #                                               config dir (CLAUDE_CONFIG_DIR,
 #                                               else ~/.claude)
 #
-# The daemon holds the sqlite connection and per-transcript results in
-# memory, so a steady-state render is one stat() plus string formatting.
+# The daemon holds the sqlite connection, transcript results, and rendered
+# presentations in memory. Unchanged refreshes validate file/process freshness
+# and refill cached time slots; peer views also check current roster/session
+# identity before reusing their metrics.
 # It exits after 10 idle minutes, and after serving a request if this
 # source file changed on disk (the next client spawns a fresh daemon), so
 # edits here take effect without hunting processes. The C client
@@ -43,6 +45,9 @@ import os
 import re
 import sys
 import time
+from collections import OrderedDict
+from copy import deepcopy
+from functools import lru_cache, wraps
 
 HOME = os.path.expanduser("~")
 # Same resolution the harness and install.sh use, so a non-default config dir
@@ -53,17 +58,26 @@ SIDECAR = CLAUDE_DIR + "/statusline-cache-health.state.json"
 SOCK = CLAUDE_DIR + "/statusline.sock"
 IDLE_EXIT_S = 600
 CACHE_MEMO_VERSION = 2
+TASK_METADATA_CACHE_SIZE = 1024
+RENDER_MEMO_SIZE = 512
 AGENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,200}\Z")
 ACTIVATION_RE = re.compile(r"v2_[a-f0-9]{32}\Z")
 TEAM_PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}\Z")
 PANE_RE = re.compile(r"%[0-9]+\Z")
+DISPLAY_ENV_NAMES = (
+    "NO_COLOR", "COLORTERM", "TERM", "COLORFGBG", "CLAUDE_STATUSLINE_COLOR",
+    "CLAUDE_STATUSLINE_THEME", "CLAUDE_STATUSLINE_COMPACT",
+    "CLAUDE_STATUSLINE_ALARM_RGB", "CLAUDE_STATUSLINE_MUTED_RGB",
+    "CLAUDE_STATUSLINE_BAR_DIM_RGB", "CLAUDE_STATUSLINE_BAR_ON_FILL_RGB",
+    "CLAUDE_STATUSLINE_BAR_ON_DIM_RGB",
+)
 
-def _env_flag(name):
-    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
+def _env_flag(name, env):
+    return env.get(name, "").lower() in ("1", "true", "yes", "on")
 
 
-def _rgb_env(name, default):
-    raw = os.environ.get(name, "").strip()
+def _rgb_env(name, default, env):
+    raw = env.get(name, "").strip()
     try:
         if raw.startswith("#") and len(raw) == 7:
             return tuple(int(raw[i:i + 2], 16) for i in (1, 3, 5))
@@ -75,9 +89,9 @@ def _rgb_env(name, default):
     return default
 
 
-def _default_theme():
+def _default_theme(env):
     try:
-        return "light" if int(os.environ.get("COLORFGBG", "").split(";")[-1]) >= 7 else "dark"
+        return "light" if int(env.get("COLORFGBG", "").split(";")[-1]) >= 7 else "dark"
     except (ValueError, IndexError):
         return "dark"
 
@@ -94,19 +108,72 @@ PALETTES = {
         "bar_on_dim": (32, 36, 38),
     },
 }
-THEME = os.environ.get("CLAUDE_STATUSLINE_THEME", _default_theme()).lower()
-PALETTE = PALETTES.get(THEME, PALETTES["dark"])
-ALARM_RGB = _rgb_env("CLAUDE_STATUSLINE_ALARM_RGB", PALETTE["alarm"])
-MUTED_RGB = _rgb_env("CLAUDE_STATUSLINE_MUTED_RGB", PALETTE["muted"])
-BAR_DIM_RGB = _rgb_env("CLAUDE_STATUSLINE_BAR_DIM_RGB", PALETTE["bar_dim"])
-BAR_ON_FILL_RGB = _rgb_env("CLAUDE_STATUSLINE_BAR_ON_FILL_RGB", PALETTE["bar_on_fill"])
-BAR_ON_DIM_RGB = _rgb_env("CLAUDE_STATUSLINE_BAR_ON_DIM_RGB", PALETTE["bar_on_dim"])
-COLOR_MODE = os.environ.get("CLAUDE_STATUSLINE_COLOR", "auto").lower()
-COLOR_ENABLED = "NO_COLOR" not in os.environ and COLOR_MODE != "never"
-TRUECOLOR = COLOR_ENABLED and (COLOR_MODE == "always" or
-    os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit") or
-    "direct" in os.environ.get("TERM", "").lower())
-COMPACT = _env_flag("CLAUDE_STATUSLINE_COMPACT")
+
+def _display_values(env):
+    theme = env.get("CLAUDE_STATUSLINE_THEME", _default_theme(env)).lower()
+    palette = PALETTES.get(theme, PALETTES["dark"])
+    mode = env.get("CLAUDE_STATUSLINE_COLOR", "auto").lower()
+    enabled = "NO_COLOR" not in env and mode != "never"
+    values = {
+        "THEME": theme, "PALETTE": palette, "COLOR_MODE": mode,
+        "COLOR_ENABLED": enabled,
+        "TRUECOLOR": enabled and (mode == "always" or
+            env.get("COLORTERM", "").lower() in ("truecolor", "24bit") or
+            "direct" in env.get("TERM", "").lower()),
+        "COMPACT": _env_flag("CLAUDE_STATUSLINE_COMPACT", env),
+    }
+    for name, key in (("ALARM_RGB", "alarm"), ("MUTED_RGB", "muted"),
+                      ("BAR_DIM_RGB", "bar_dim"), ("BAR_ON_FILL_RGB", "bar_on_fill"),
+                      ("BAR_ON_DIM_RGB", "bar_on_dim")):
+        values[name] = _rgb_env("CLAUDE_STATUSLINE_" + name, palette[key], env)
+    return values
+
+
+# Legacy/direct callers keep the startup environment. New C clients send an
+# explicit snapshot, including {} when no display variables are set, so the
+# installer or first terminal to start the shared daemon cannot choose colors
+# for every later terminal.
+_STARTUP_DISPLAY = _display_values(os.environ)
+globals().update(_STARTUP_DISPLAY)
+
+
+@lru_cache(maxsize=128)
+def _display_profile(snapshot):
+    # Terminals usually keep the same small set of settings. Parse each exact
+    # allowlisted snapshot once, shared across clients, without accumulating
+    # unlimited profiles if a client repeatedly changes its overrides.
+    return _display_values(dict(snapshot))
+
+
+def _request_display(fn):
+    @wraps(fn)
+    def scoped(data, *args, **kwargs):
+        if not isinstance(data, dict) or "statusline_display" not in data:
+            return fn(data, *args, **kwargs)
+        raw = data.get("statusline_display")
+        snapshot = []
+        if isinstance(raw, dict):
+            for name in DISPLAY_ENV_NAMES:
+                value = raw.get(name)
+                if isinstance(value, str) and len(value.encode("utf-8", "replace")) <= 256:
+                    snapshot.append((name, value))
+        # The daemon renders requests serially. Scope the existing paint/slot
+        # helpers together and restore them even on error; legacy callers and
+        # tests that override a default must not inherit another request's style.
+        previous = {name: globals()[name] for name in _STARTUP_DISPLAY}
+        globals().update(_display_profile(tuple(snapshot)))
+        try:
+            return fn(data, *args, **kwargs)
+        finally:
+            globals().update(previous)
+    return scoped
+
+
+def _display_signature():
+    return (COLOR_ENABLED, TRUECOLOR, COMPACT, ALARM_RGB, MUTED_RGB,
+            BAR_DIM_RGB, BAR_ON_FILL_RGB, BAR_ON_DIM_RGB)
+
+
 BAR_WIDTH = 10
 TOKEN_WIDTH = 4
 BAR_LABEL_WIDTH = TOKEN_WIDTH * 2 + 1
@@ -261,16 +328,76 @@ def open_db():
     return db
 
 
-def context_tokens(usage):
+INPUT_TOKEN_FIELDS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+
+
+def _context_usage(usage):
     # Server-side tool loops sum their usage. Their last iteration is the live
     # context, as in Claude's own statusline, rather than all iterations added.
     iterations = usage.get("iterations")
     if isinstance(iterations, list) and iterations:
         last = iterations[-1]
         if isinstance(last, dict) and "input_tokens" in last:
-            usage = last
-    return sum(usage.get(k) or 0 for k in (
-        "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+            return last
+    return usage
+
+
+def context_tokens(usage):
+    usage = _context_usage(usage)
+    return sum(usage.get(k) or 0 for k in INPUT_TOKEN_FIELDS)
+
+
+def _peer_value(value):
+    # Native leaves are JSON scalars. Preserve unexpected containers without
+    # retaining caller-owned mutable data in the unchanged-frame snapshot.
+    return deepcopy(value) if isinstance(value, (dict, list)) else value
+
+
+def _peer_fields(value, fields):
+    return ({name: _peer_value(value[name]) for name in fields if name in value}
+            if isinstance(value, dict) else _peer_value(value))
+
+
+def peer_frame_fields(native):
+    """Project the raw main frame onto the fields a selected peer consumes."""
+    frame = {name: _peer_value(native[name]) for name in ("session_id", "transcript_path")
+             if name in native}
+    for name, fields in (("model", ("id", "display_name")), ("effort", ("level",))):
+        if name in native:
+            frame[name] = _peer_fields(native[name], fields)
+    if "context_window" in native:
+        context = native["context_window"]
+        projected = _peer_fields(context, ("context_window_size", "used_percentage"))
+        if isinstance(context, dict) and "current_usage" in context:
+            usage = context["current_usage"]
+            # A dict, even {}, means known input counters (possibly zero).
+            # Non-dict/absent usage remains unknown. Only the effective last
+            # iteration's input counters are consumed; totals and output/tool
+            # metadata do not contribute to the selected peer's context.
+            projected["current_usage"] = _peer_fields(
+                _context_usage(usage) if isinstance(usage, dict) else usage, INPUT_TOKEN_FIELDS)
+        frame["context_window"] = projected
+    if "rate_limits" in native:
+        limits = native["rate_limits"]
+        frame["rate_limits"] = ({name: _peer_fields(limits[name], ("used_percentage", "resets_at"))
+                                 for name in ("five_hour", "seven_day") if name in limits}
+                                if isinstance(limits, dict) else _peer_value(limits))
+    cost = native.get("cost")
+    if isinstance(cost, dict) and "total_cost_usd" in cost:
+        frame["cost"] = _peer_fields(cost, ("total_cost_usd",))
+    return frame
+
+
+def _same_peer_value(left, right):
+    # Python considers 1 and 1.0 equal, but an effort label renders their
+    # original types differently. Match JSON types as well as field values.
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(_same_peer_value(left[k], right[k]) for k in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(_same_peer_value(a, b) for a, b in zip(left, right))
+    return left == right
 
 
 def cache_engine(tp, db, agent_id=None):
@@ -437,6 +564,9 @@ class Cache:
         self.db = None
         self.processes = {}  # argv identity is immutable for one kernel process
         self.frames = {}  # rendered-field snapshots, unchanged ticks do not write
+        self.task_metadata = OrderedDict()
+        self.task_db = None
+        self.task_data_version = None
         self.pstate_path = None  # resolved proxy-state file, for tick fingerprints
         if persistent:
             try:
@@ -480,9 +610,7 @@ class Cache:
         tasks = data.get("tasks")
         if not session_id or not tp or not isinstance(tasks, list):
             return
-        if self.db is None:
-            self.db = open_db()
-        rows = []
+        updates = {}
         for task in tasks:
             if not isinstance(task, dict):
                 continue
@@ -492,22 +620,69 @@ class Cache:
                 continue
             payload = {k: task.get(k) for k in (
                 "model", "effort", "contextWindowSize", "name")}
-            rows.append((session_id, tp, agent_id, json.dumps(payload)))
-        if rows:
+            updates[(session_id, tp, agent_id)] = payload
+        if not updates:
+            return
+        self._prepare_task_metadata()
+        changed = [(key, payload) for key, payload in updates.items()
+                   if self._read_task_metadata(key) != payload]
+        if not changed:
+            return
+        rows = [key + (json.dumps(payload),) for key, payload in changed]
+        try:
             self.db.executemany("INSERT OR REPLACE INTO task_metadata VALUES(?,?,?,?)", rows)
             self.db.commit()
+        except Exception:
+            # A failed batch may leave earlier rows pending. Do not let an
+            # unrelated later commit persist them behind this connection's
+            # unchanged data_version and cached metadata.
+            try:
+                self.db.rollback()
+            finally:
+                self.task_metadata.clear()
+                self.task_db = None
+                self.task_data_version = None
+            raise
+        for key, payload in changed:
+            self._remember_task_metadata(key, payload)
 
-    def task_info(self, session_id, tp, agent_id):
+    def _prepare_task_metadata(self):
         if self.db is None:
             self.db = open_db()
+        # A daemonless fallback can write through another connection. Its
+        # commit changes data_version; our own commits do not. This small
+        # freshness check keeps cached reads correct without re-reading and
+        # decoding every unchanged task row on each render.
+        version = self.db.execute("PRAGMA data_version").fetchone()[0]
+        if self.task_db is not self.db or self.task_data_version != version:
+            self.task_metadata.clear()
+            self.task_db = self.db
+            self.task_data_version = version
+
+    def _remember_task_metadata(self, key, value):
+        self.task_metadata[key] = value
+        self.task_metadata.move_to_end(key)
+        if len(self.task_metadata) > TASK_METADATA_CACHE_SIZE:
+            self.task_metadata.popitem(last=False)
+
+    def _read_task_metadata(self, key):
+        if key in self.task_metadata:
+            self.task_metadata.move_to_end(key)
+            return self.task_metadata[key]
         row = self.db.execute("SELECT payload FROM task_metadata"
                               " WHERE session_id=? AND path=? AND agent_id=?",
-                              (session_id, tp, agent_id)).fetchone()
+                              key).fetchone()
         try:
             value = json.loads(row[0]) if row else {}
-            return value if isinstance(value, dict) else {}
+            value = value if isinstance(value, dict) else {}
         except (ValueError, TypeError):
-            return {}
+            value = {}
+        self._remember_task_metadata(key, value)
+        return value
+
+    def task_info(self, session_id, tp, agent_id):
+        self._prepare_task_metadata()
+        return dict(self._read_task_metadata((session_id, tp, agent_id)))
 
     def register_frame(self, native, process, origin_pid=None):
         """Save the process's raw main frame, before its own view is applied."""
@@ -528,19 +703,17 @@ class Cache:
         recorded_pane = tmux_pane(record.get("tmux"))
         if pane and recorded_pane and pane != recorded_pane:
             return
-        # Native durations advance on every refresh. Keep the metrics the peer
-        # renderer uses, so dozens of idle sessions do not churn the WAL.
-        frame = {k: native[k] for k in ("session_id", "transcript_path", "model", "effort",
-                                        "context_window", "rate_limits") if k in native}
-        cost = native.get("cost")
-        if isinstance(cost, dict) and "total_cost_usd" in cost:
-            frame["cost"] = {"total_cost_usd": cost["total_cost_usd"]}
-        snapshot = (identity.get("team", ""), identity.get("agent_id", ""),
-                    identity.get("parent_session_id", ""), pane,
-                    json.dumps(frame, sort_keys=True, separators=(",", ":")))
+        # Ignore advancing output/duration metadata at every nested level.
+        # Compare detached metrics before serialization, so unchanged peer
+        # presentations cause neither JSON encoding nor SQLite writes.
+        frame = peer_frame_fields(native)
+        routing = (identity.get("team", ""), identity.get("agent_id", ""),
+                   identity.get("parent_session_id", ""), pane)
         frame_key = (session_id, pid, start)
-        if self.frames.get(frame_key) == snapshot:
+        previous = self.frames.get(frame_key)
+        if previous and previous[:4] == routing and _same_peer_value(previous[4], frame):
             return
+        payload = json.dumps(frame, sort_keys=True, separators=(",", ":"))
         if self.db is None:
             self.db = open_db()
         # /clear can change sessionId without changing pid or start time. A
@@ -548,11 +721,11 @@ class Cache:
         self.db.execute("DELETE FROM peer_frames WHERE pid=? AND"
                         " (session_id<>? OR proc_start<>?)", (pid, session_id, start))
         self.db.execute("INSERT OR REPLACE INTO peer_frames VALUES(?,?,?,?,?,?,?,?,?)",
-                        (session_id, pid, start) + snapshot + (1,))
+                        (session_id, pid, start) + routing + (payload, 1))
         self.db.commit()
         self.frames = {key: value for key, value in self.frames.items()
                        if key[1] != pid or key == frame_key}
-        self.frames[frame_key] = snapshot
+        self.frames[frame_key] = routing + (frame,)
 
     def peer_frame(self, native, process, address):
         """Resolve exactly one live roster member, scoped to this viewer's team."""
@@ -579,7 +752,10 @@ class Cache:
             self.db = open_db()
         qualified = roster.get("leadSessionId") == viewer
         viewer_pid = process.get("pid") if isinstance(process, dict) else None
-        viewer_record = live_session(viewer_pid, viewer, allow_missing=True)
+        # A lead is already qualified by the roster. Its live-session result
+        # is only needed to establish membership for a different viewer.
+        viewer_record = (live_session(viewer_pid, viewer, allow_missing=True)
+                         if not qualified else None)
         if not qualified and viewer_record:
             row = self.db.execute("SELECT agent_id,pane FROM peer_frames WHERE"
                                   " session_id=? AND pid=? AND proc_start=? AND team=? AND origin_verified=1",
@@ -596,8 +772,12 @@ class Cache:
             # the lead's previous session id after resume or /clear.
             if not qualified and parent != viewer:
                 continue
+            # A retired pane cannot be this roster member, regardless of
+            # whether its old process is still alive.
+            if not pane_matches(member, pane):
+                continue
             record = live_session(pid, sid, start, allow_missing=True)
-            if not record or not pane_matches(member, pane):
+            if not record:
                 continue
             current_pane = tmux_pane(record.get("tmux"))
             if current_pane and pane and current_pane != pane:
@@ -925,7 +1105,7 @@ def slot_str(kind, exp):
                 return muted(stamp)
             rem = exp - now
             return muted("%s (%d:%02d)" % (stamp, rem // 60, rem % 60))
-        label = "5m TTL elapsed" if kind == "warm_mixed" else "TTL elapsed"
+        label = "5m past" if kind == "warm_mixed" else "past"
         return "%s %s" % (muted(stamp), muted("(" + label + ")"))
     if kind == "reset_rel":
         # Window renewal within the day: wall clock plus countdown (H:MM:SS).
@@ -955,6 +1135,7 @@ def fill(template, slots):
     return template
 
 
+@_request_display
 def render_core(data, cache, origin_pid=None):
     # Returns (template, slots): the full line is fill(template, slots).
     # Holding the time-dependent fragments in slots lets the daemon serve pure
@@ -1073,14 +1254,14 @@ def render_core(data, cache, origin_pid=None):
         # Cumulative rewrite factor as a colored multiplier: tokens
         # redundantly re-cached over the current context footprint. 0.00x
         # azure = purely additive; 1.00x = re-cached once; can exceed 1.
-        parts.append("recached " + paint("%.2fx" % (rw / 100), fg=ramp_rgb(rw)))
+        seg = "recached " + paint("%.2fx" % (rw / 100), fg=ramp_rgb(rw))
 
         # Last substantial cache miss. The usage counters establish diminished
         # reuse, not eviction or expiry. Keep its age explicit and live.
         if bustts:
-            seg = "cache miss " + SLOT % len(slots) + " ago"
+            seg += " miss " + SLOT % len(slots) + " ago"
             slots.append(("ago", int(bustts)))
-            parts.append(seg)
+        parts.append(seg)
 
     cost = get(["cost", "total_cost_usd"])
     if cost is not None and cost > 0:
@@ -1114,6 +1295,7 @@ def render_core(data, cache, origin_pid=None):
     return sep.join(parts), slots
 
 
+@_request_display
 def render(data, cache, origin_pid=None):
     return fill(*render_core(data, cache, origin_pid))
 
@@ -1152,10 +1334,12 @@ def _fingerprint(data, cache):
            g("rate_limits", "seven_day", "used_percentage"),
            g("rate_limits", "seven_day", "resets_at"), tp,
            g("_selected_agent_id"), g("_selected_agent_name"),
-           g("_selected_missing"), g("_selected_peer"), g("_cache_values"))
+           g("_selected_missing"), g("_selected_peer"), g("_cache_values"),
+           _display_signature())
     return tp, sig, tstat, ps_mt
 
 
+@_request_display
 def serve(data, cache, memo, origin_pid=None):
     # Internally event-driven: a pure clock tick (nothing changed but time)
     # splices a fresh countdown into the cached line; any real change re-renders
@@ -1164,12 +1348,22 @@ def serve(data, cache, memo, origin_pid=None):
     if data is None:
         return ""
     tp, sig, tstat, ps_mt = _fingerprint(data, cache)
-    ent = memo.get(tp)
-    if ent and ent[0] == sig and ent[1] == tstat and ent[2] == ps_mt:
-        return fill(ent[3], ent[4])
-    template, slots = render_core(data, cache)
-    memo[tp] = (sig, tstat, ps_mt, template, slots)
-    return fill(template, slots)
+    # A peer's own pane and another process viewing it share one transcript,
+    # but have different labels and can have different display settings.
+    # Retain each presentation instead of making their idle ticks evict one
+    # another. The full fingerprint still validates metrics and freshness.
+    key = (tp, data.get("_selected_agent_id"), data.get("_selected_agent_name"),
+           bool(data.get("_selected_peer")), _display_signature())
+    ent = memo.pop(key, None)
+    if not (ent and ent[0] == sig and ent[1] == tstat and ent[2] == ps_mt):
+        template, slots = render_core(data, cache)
+        ent = (sig, tstat, ps_mt, template, slots)
+    # Plain dictionaries preserve insertion order; reinsertion refreshes the
+    # LRU position for callers that pass {} as well as for the daemon.
+    memo[key] = ent
+    while len(memo) > RENDER_MEMO_SIZE:
+        memo.pop(next(iter(memo)))
+    return fill(ent[3], ent[4])
 
 
 def read_all(sock):
@@ -1231,7 +1425,7 @@ def daemon_main():
     src = os.path.abspath(__file__)
     src_mtime = os.stat(src).st_mtime_ns
     cache = Cache(persistent=False)
-    memo = {}  # per-transcript (fingerprint, pre, exp, post) for tick splicing
+    memo = {}  # bounded presentation LRU for clock-slot filling
 
     while True:
         try:

@@ -79,7 +79,12 @@ renderer, and process and write costs matter at team scale.
 Before applying selection, register a normal frame's original native metrics in
 the shared server. Task metadata inputs are partial and must not replace it.
 Ignore volatile durations when comparing peer frames; unchanged metrics cause no
-database writes. A peer's own selected subagent must not replace its main frame.
+database writes. Store only the nested model, effort, current input counters,
+context and quota fields that the selected renderer consumes. Compare the
+detached snapshot before JSON serialization; output counters and unused native
+metadata must not cause writes. Preserve the last-iteration input-counter rule
+and the distinction between unknown usage and known zero usage. A peer's own
+selected subagent must not replace its main frame.
 
 Separate-process teammate lookup is currently Linux-based. Validate the submitted
 PID and `/proc/<pid>/stat` start value. For socket requests, derive the client
@@ -179,7 +184,8 @@ conversation has been re-bought more than once over. This is the number that say
 the session wasted. A compaction boundary keeps the redundant-token total and
 starts a fresh cache-health chain.
 
-**`cache miss Nm ago`** reports the latest substantial loss of reuse, using the
+**`miss Nm ago`**, appended to the `recached N.NNx` segment without another
+separator, reports the latest substantial loss of reuse, using the
 same greater-than-half threshold as health and a 2,048-token noise floor. It is
 time since the event, not the idle gap before it. Do not infer eviction or expiry
 from a fixed gap: usage counts do not establish the cause. Omit event age when
@@ -195,7 +201,8 @@ computed against the shorter window, since that is the one that bites first.
 **`→ ~03:41 (57:12)`** estimates the TTL boundary from the last timestamp and known
 TTL. The API starts its TTL at request start; an assistant transcript timestamp
 does not establish that exact instant. After the estimate passes, use
-`(TTL elapsed)`, or `(5m TTL elapsed)` for a mixed cache. That does not prove all
+`(past)`, or `(5m past)` for a mixed cache. Keep this elapsed state visible;
+shorten its text rather than removing it. That does not prove all
 cached content has been removed. Unknown TTL gets no expiry estimate. See the
 [current API documentation](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
 
@@ -228,7 +235,7 @@ harness --stdin JSON--> statusline-client --socket--> daemon (statusline-render.
 
 The client is C because the harness runs it once per second per session, and the whole
 path costs about 3ms per render. The daemon holds the sqlite connection and a
-per-transcript memo. It exits after 10 idle minutes, and **also right after serving a
+bounded per-view memo. It exits after 10 idle minutes, and **also right after serving a
 render whenever `statusline-render.py` changes on disk**, so editing the engine deploys
 it (the next client spawns a fresh daemon). If the socket cannot be reached at all, the
 client execs the one-shot renderer, so the line degrades to slow rather than blank.
@@ -236,6 +243,30 @@ client execs the one-shot renderer, so the line degrades to slow rather than bla
 A render is split around its time-dependent fragments: `render_core` returns a template
 plus a list of slots, and every serve refills the slots. That is how a cached line can
 tick its countdowns each second without re-running the engine.
+
+The C request's `statusline_display` contains only the supported terminal,
+color, palette and compact-mode environment values. Apply it around selection,
+formatting and cached countdown filling, and include the effective display
+values in the render fingerprint. These settings belong to the viewer, including
+when viewing a teammate. An explicit empty object must not inherit the daemon's
+startup environment. Legacy inputs without this field retain startup defaults.
+The daemon serves requests serially; restore the previous display values after
+each request so they cannot leak between clients.
+
+Send only present settings on the existing request, preserving empty values such
+as `NO_COLOR=""`. Cache up to 128 parsed display profiles by their exact allowlisted
+values. Keep up to 512 render memo entries for presentation identities and display
+profiles sharing a transcript, so a teammate's own pane and a leader viewing it
+do not displace each other on every tick. Freshness fingerprints still decide
+when each entry must be rebuilt.
+
+Task metadata has a 1,024-entry LRU keyed by session ID, transcript path and agent
+ID. Compare before serializing or writing; unchanged feeds must not commit.
+Reuse decoded rows for selected-agent reads. Check SQLite `data_version` before
+using this cache and invalidate it on an external commit or connection change,
+so the daemonless fallback cannot leave stale metadata behind. Eviction only
+discards in-memory entries; persisted metadata remains available for finished
+tasks and daemon restarts.
 
 ## Editing it
 
