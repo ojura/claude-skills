@@ -1,11 +1,16 @@
 // Claude Code 2.1.309 provides the selected transcript as AbovePrompt.props.view.
 // The environment belongs to this Claude process; the C client copies it into
 // each request because the Python renderer daemon serves several sessions.
+// A module-instance token in the effective command invalidates stale env when
+// the plugin unloads. This identifies a generation, not a security boundary.
+const activation = "v2_" + Array.from({ length: 4 }, () =>
+  Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, "0")
+).join("");
+const commandPrefix = `export CLAUDE_STATUSLINE_ACTIVE='${activation}'\n`;
 let revision = 0;
 let selected;
 let lastPublished;
 let writes = Promise.resolve();
-let ownerReady;
 const agents = new Map();
 
 async function publish($, selection, rev) {
@@ -19,53 +24,23 @@ async function publish($, selection, rev) {
   return writes;
 }
 
-// The native engine kills a spawned child when this module unloads. Its lock
-// gives the renderer a live ownership signal even if the host retains our env.
-// Nothing wakes periodically: the child blocks and the stream waits for exit.
-async function ownView($, ready, failed) {
-  let announced = false;
-  try {
-    const configured = await $.env.get("CLAUDE_CONFIG_DIR");
-    const home = await $.env.get("HOME");
-    const client = `${configured || `${home}/.claude`}/statusline-client`;
-    const child = $.process.spawn({ argv: [client, "--view-owner"] });
-    let buffer = "";
-    for await (const chunk of child) {
-      if (chunk.stream !== "stdout" || announced) continue;
-      buffer += chunk.text;
-      if (buffer.length > 1024) throw new Error("Invalid statusline owner response");
-      const newline = buffer.indexOf("\n");
-      if (newline < 0) continue;
-      const owner = JSON.parse(buffer.slice(0, newline)).owner;
-      if (typeof owner !== "string" || !/^statusline-view-[A-Za-z0-9]{6}$/.test(owner)) {
-        throw new Error("Invalid statusline owner handle");
-      }
-      announced = true;
-      ready(owner);
-    }
-    if (!announced) failed(new Error("Statusline owner exited before startup"));
-  } catch (error) {
-    if (!announced) failed(error);
-  } finally {
-    ownerReady = undefined;
-    selected = undefined;
-    ++revision;
-    // The released lock invalidates this handle. An old module must not clear
-    // the environment after a replacement module has published a new handle.
-  }
-}
-
-function ensureOwner($) {
-  if (!ownerReady) {
-    let ready;
-    let failed;
-    ownerReady = new Promise((resolve, reject) => { ready = resolve; failed = reject; });
-    void ownView($, ready, failed);
-  }
-  return ownerReady;
-}
-
 export function register(on) {
+  on("settings.read", async ($, e, next) => {
+    // settings.read is a value call: hooks receive and return { value },
+    // while callers of $.settings.read() receive the unwrapped settings.
+    const result = await next(e);
+    const settings = result.value;
+    const line = settings?.statusLine;
+    if (e.source !== undefined || line?.type !== "command" ||
+        typeof line.command !== "string" || line.command.startsWith(commandPrefix)) {
+      return result;
+    }
+    // The engine rebuilds effective settings when plugins load or unload.
+    // Export applies to compound commands and pipelines as well as one exec.
+    return { ...result, value: {
+      ...settings, statusLine: { ...line, command: commandPrefix + line.command },
+    } };
+  });
 
   on("session.start", async ($, e, next) => {
     const rev = ++revision;
@@ -87,16 +62,16 @@ export function register(on) {
       await publish($, undefined, rev);
       return next(e);
     }
-    const owner = await ensureOwner($);
     const sessionId = await $.session.id();
     const known = await $.agent.list();
     if (rev !== revision) return next(e);
     const agent = known.find((item) => item.id === id);
     selected = {
-      version: 1,
+      version: 2,
       session_id: sessionId,
       agent_id: id,
-      owner,
+      activation,
+      ...(agent?.teammateId ? { teammate_id: agent.teammateId } : {}),
       ...(agent?.name ? { name: agent.name } : {}),
       ...agents.get(id),
     };

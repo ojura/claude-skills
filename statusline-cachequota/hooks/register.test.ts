@@ -1,4 +1,5 @@
 import { test, expect, mock } from "claude-code/testing";
+import { register } from "./register.js";
 
 const empty = { type: "Box", props: {}, children: [] };
 
@@ -18,22 +19,18 @@ function world(on, options = {}) {
   on("session.start", async ($, e) => ({ cwd: e.cwd }));
   on("session.end", async ($, e) => ({ sessionId: e.sessionId }));
   on("session.id", async () => ({ value: "main-session" }));
-  on("env.get", async ($, e) => ({ value: e.name === "HOME" ? "/home/test" : "/config" }));
-  on("process.spawn", async function* ($, e, next) {
-    expect(e.argv).toEqual(["/config/statusline-client", "--view-owner"]);
-    yield { stream: "stdout", text: '{"owner":"statusline-view-ABC123"}\n' };
-    await new Promise((resolve) => {
-      state.stopOwner = resolve;
-      if (next.signal.aborted) resolve();
-      else next.signal.addEventListener("abort", resolve, { once: true });
-    });
-    return { code: 0, signal: null };
+  on("settings.read", async ($, e) => ({ value: options.settings ?? {
+    statusLine: { type: "command", command: "~/.claude/statusline-client", refreshInterval: 1 },
+  } }));
+  on("process.spawn", async function* () {
+    throw new Error("The statusline mod must not spawn a helper process");
   });
   on("agent.list", async () => {
     if (options.beforeList) await options.beforeList();
     return { value: [
       { id: "agent-a", name: "Alpha", description: "First", type: "Explore", status: "running" },
       { id: "agent-b", name: "Beta", description: "Second", type: "general-purpose", status: "idle" },
+      { id: "peer@team", teammateId: "peer@team", name: "Peer", description: "Separate process", type: "teammate", status: "idle" },
     ] };
   });
   on("env.set", async ($, e) => {
@@ -56,7 +53,7 @@ test("main, agent A, agent B and main preserve the rendered band", async ($, on)
   expect(state.value).toBe(undefined);
   expect(await $.ui.render(view("agent-a"))).toEqual({ ...empty, part: { plugin: "test" } });
   expect(JSON.parse(state.value)).toEqual({
-    version: 1, session_id: "main-session", agent_id: "agent-a", name: "Alpha", owner: "statusline-view-ABC123",
+    version: 2, session_id: "main-session", agent_id: "agent-a", name: "Alpha", activation: JSON.parse(state.value).activation,
   });
   await $.ui.render(view("agent-b"));
   expect(JSON.parse(state.value).agent_id).toBe("agent-b");
@@ -98,8 +95,8 @@ test("background work updates metadata without changing selection", async ($, on
   expect(result.done).toBe(true);
   expect(result.value.turnId).toBe("turn-a");
   expect(JSON.parse(state.value)).toEqual({
-    version: 1, session_id: "main-session", agent_id: "agent-a", name: "Alpha",
-    model: "claude-opus-test", effort: "max", owner: "statusline-view-ABC123",
+    version: 2, session_id: "main-session", agent_id: "agent-a", name: "Alpha",
+    model: "claude-opus-test", effort: "max", activation: JSON.parse(state.value).activation,
   });
   await $.ui.render(view("agent-b"));
   expect(JSON.parse(state.value).model).toBe("claude-haiku-test");
@@ -174,7 +171,7 @@ test("main selection is published after an in-flight agent write", async ($, on)
 test("an idle selection needs no periodic environment writes", async ($, on) => {
   const state = world(on);
   await $.ui.render(view("agent-a"));
-  expect(JSON.parse(state.value).owner).toBe("statusline-view-ABC123");
+  expect(/^v2_[a-f0-9]{32}$/.test(JSON.parse(state.value).activation)).toBe(true);
   await state.clock.advance(20_000);
   expect(state.writes.length).toBe(1);
   await $.ui.render(view());
@@ -182,4 +179,44 @@ test("an idle selection needs no periodic environment writes", async ($, on) => 
   await state.clock.advance(20_000);
   expect(state.value).toBe(undefined);
   expect(state.writes.length).toBe(count);
+});
+
+
+// The 2.1.309 test Engine has no settings noun. Exercise this pure hook
+// directly; live native runs cover engine command activation and unload.
+function settingsHook() {
+  let hook;
+  register((event, handler) => { if (event === "settings.read") hook = handler; });
+  return hook;
+}
+
+test("effective settings preserve compound commands and source snapshots", async () => {
+  const hook = settingsHook();
+  const command = "printf ready | cat; ~/.claude/statusline-client";
+  const settings = { statusLine: { type: "command", command, refreshInterval: 1 }, model: "sonnet" };
+  const reply = await hook({}, { layers: [] }, async () => ({ value: settings }));
+  const result = reply.value;
+  expect(/^export CLAUDE_STATUSLINE_ACTIVE='v2_[a-f0-9]{32}'\n/.test(result.statusLine.command)).toBe(true);
+  expect(result.statusLine.command.split("\n").slice(1).join("\n")).toBe(command);
+  expect(result.statusLine.refreshInterval).toBe(1);
+  expect(result.model).toBe("sonnet");
+  expect(settings.statusLine.command).toBe(command);
+  expect(await hook({}, { layers: [] }, async () => ({ value: settings }))).toEqual(reply);
+  expect(await hook({}, { layers: [] }, async () => reply)).toEqual(reply);
+  expect(await hook({}, { source: "user", layers: [] }, async () => ({ value: settings }))).toEqual({ value: settings });
+});
+
+test("settings without a command statusline are unchanged", async () => {
+  const hook = settingsHook();
+  const settings = { model: "sonnet" };
+  expect(await hook({}, { layers: [] }, async () => ({ value: settings }))).toEqual({ value: settings });
+});
+
+test("teammate addresses and roster identities are preserved", async ($, on) => {
+  const state = world(on);
+  await $.ui.render(view("peer@team"));
+  const selected = JSON.parse(state.value);
+  expect(selected.agent_id).toBe("peer@team");
+  expect(selected.teammate_id).toBe("peer@team");
+  expect(selected.name).toBe("Peer");
 });

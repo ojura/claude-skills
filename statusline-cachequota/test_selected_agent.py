@@ -11,6 +11,7 @@ SPEC = importlib.util.spec_from_file_location(
     "selected_statusline", Path(__file__).with_name("statusline-render.py"))
 statusline = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(statusline)
+ACTIVATION = "v2_" + "a" * 32
 
 
 def response(uuid, parent, model, read, written, agent=None, mid=None, ttl="5m"):
@@ -79,8 +80,10 @@ class SelectedAgentTest(unittest.TestCase):
                 stream.write(json.dumps(row) + "\n")
 
     def envelope(self, agent="a1", **fields):
-        view = {"version": 1, "session_id": "session-main", "agent_id": agent, **fields}
-        return {"statusline_input": self.native, "statusline_view": json.dumps(view)}
+        view = {"version": 2, "activation": ACTIVATION,
+                "session_id": "session-main", "agent_id": agent, **fields}
+        return {"statusline_input": self.native, "statusline_view": json.dumps(view),
+                "statusline_activation": ACTIVATION}
 
     def show(self, data):
         return statusline.serve(data, self.cache, self.memo)
@@ -228,28 +231,20 @@ class SelectedAgentTest(unittest.TestCase):
         self.assertIn("20k/200k", text)
         self.assertIn("effort:low", text)
 
-    def test_owner_lock_release_returns_to_main_without_data_change(self):
-        import fcntl
-        owner = self.root / "statusline-view-ABC123"
-        fd = os.open(owner, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            envelope = self.envelope(owner=owner.name)
-            self.assertIn("model-a", self.show(envelope))
-        finally:
-            os.close(fd)
+    def test_unload_removes_activation_before_memo_lookup(self):
+        envelope = self.envelope()
+        self.assertIn("model-a", self.show(envelope))
+        envelope.pop("statusline_activation")
         self.assertEqual(self.show(self.native), self.show(envelope))
-        for name in ("../statusline-view-ABC123", "absent", "statusline-view-MISSING"):
-            self.assertEqual(self.show(self.native), self.show(self.envelope(owner=name)))
 
-    def test_expired_lease_returns_to_main_before_memo_lookup(self):
-        with patch.object(statusline.time, "time", return_value=100):
-            envelope = self.envelope(expires_at=100500)
-            self.assertIn("model-a", self.show(envelope))
-        with patch.object(statusline.time, "time", return_value=101):
-            self.assertEqual(self.show(self.native), self.show(envelope))
-        for expiry in (float("nan"), float("inf"), "later", -1, True):
-            self.assertEqual(self.show(self.native), self.show(self.envelope(expires_at=expiry)))
+    def test_reloaded_module_rejects_old_selection_and_old_protocol(self):
+        envelope = self.envelope()
+        self.assertIn("model-a", self.show(envelope))
+        envelope["statusline_activation"] = "v2_" + "b" * 32
+        self.assertEqual(self.show(self.native), self.show(envelope))
+        for activation in (None, "", 42, "v2_\n", "x" * 300):
+            self.assertEqual(self.show(self.native), self.show(self.envelope(activation=activation)))
+        self.assertEqual(self.show(self.native), self.show(self.envelope(version=1)))
 
     def test_names_are_safe_and_visible_in_compact_mode(self):
         with patch.object(statusline, "COMPACT", True):

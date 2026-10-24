@@ -54,40 +54,62 @@ with `CLAUDE_STATUSLINE_{ALARM,MUTED,BAR_DIM,BAR_ON_FILL,BAR_ON_DIM}_RGB`, using
 session id. The embedded context value remains because it carries more information per
 column than the lower-priority fields it replaces.
 
-## Follow the selected subagent
+## Follow the selected agent
 
-On Claude Code 2.1.309, opening a subagent's transcript switches the status line to
-that agent. Returning to the main conversation restores the main status line on
-the next refresh. The selected agent's name or ID remains visible in compact mode.
+On Claude Code 2.1.309, selecting a local subagent or a teammate in the terminal
+switches the status line to that agent. Returning to the main conversation
+restores its status line on the next refresh. The selected agent's name or ID
+remains visible in compact mode.
 
-| Segment | While viewing a subagent |
-| --- | --- |
-| Model | The model recorded in that agent's latest completed response |
-| Effort | The agent's own observed setting, when available |
-| Context | Input, cache-read and cache-written tokens from its latest response |
-| Cache health, expiry and recached factor | Calculated from its own transcript |
-| Cost | The whole session's total, explicitly labeled `session $…` |
-| Organization and 5h/7d usage | The account's shared usage windows |
+| Segment | Local subagent | Teammate in another process |
+| --- | --- | --- |
+| Model | Its latest completed response | Its latest completed response, or its own native frame before a response |
+| Effort | Its observed setting, when available | Its own session's setting when it matches the response model |
+| Context | Input, cache-read and cache-written tokens from its latest response | Its own transcript usage and native context limit |
+| Cache health, expiry and recached factor | Its own transcript | Its own session transcript |
+| Cost | The parent session's total, labeled `session $…` | The teammate session's total, labeled `session $…` |
+| 5h/7d usage | Parent account usage | The teammate's own native quota values and reset times, when available |
+| Organization | Parent account's proxy metadata | Omitted until peer-specific proxy identity is available |
 
-When the agent's context limit is unavailable, the context segment shows the
-token count without a percentage. A missing agent transcript shows that it is
-unavailable. It does not substitute the main conversation's measurements.
+When the context limit is unavailable, the context segment shows tokens without
+a percentage. A missing transcript or unverified peer shows an unavailable
+label. Main-conversation measurements are never substituted for a valid selected
+agent whose data is missing.
 
-The bundled mod observes the terminal's `AbovePrompt.props.view` and passes the
-selection through `CLAUDE_STATUSLINE_VIEW`. The C client copies that value into
-each request to the shared renderer. Selection therefore belongs to the Claude
-process that drew it, and the renderer checks the main session ID before using it.
-Background agents completing work do not change which transcript is selected.
+The mod observes the terminal's `AbovePrompt.props.view` and passes selection
+through `CLAUDE_STATUSLINE_VIEW`. Each C client request includes that value and
+the effective command's activation token. The renderer checks the viewer's
+session ID and activation before using it. Background activity cannot select a
+different transcript.
 
-Selection and cleanup are stateful. A small helper owned by the native mod holds
-a file lock while it is loaded. Unloading the mod or ending its process releases
-the lock, so a leftover environment value is ignored on the next normal redraw.
-The integration adds no recurring timer or heartbeat.
+A `settings.read` hook adds the module's activation token to the effective
+statusline command. Claude rebuilds those settings when the plugin unloads or
+reloads, so the next command rejects any leftover selection from the old module.
+Settings files stay unchanged. There is no persistent helper per Claude process,
+no ownership file, and no heartbeat. The only resident renderer remains the
+existing shared Python server.
+
+For separate-process teammates on Linux, that server registers the original
+native statusline frames received from all sessions in the same
+`CLAUDE_CONFIG_DIR`. It joins a selected roster address to one live process using
+the kernel process start value, the launcher's team identity and the roster's
+current tmux pane. Socket credentials prove that the submitting client descends
+from the claimed Claude process. Claude's session registry is checked when it
+exists; native teammates can legitimately have no registry entry. The running
+peer's parent session takes precedence over an old roster lead ID after resume
+or `/clear`. A teammate viewing its own subagent still contributes its original
+session frame. Ambiguous or stale identities are
+unavailable, and idle duration changes do not rewrite the database.
+
+The peer must run this client in the same config directory and have supplied a
+native frame. Claude's own blank transcript area for a separate process does not
+prevent the statusline from using the peer's transcript and metrics. Local
+subagents continue to use the main session's `subagents` directory.
 
 The plugin's `subagentStatusLine` command silently supplies native per-task model,
-effort and context-limit metadata to the renderer. It leaves the task-row text
-alone. If your own `subagentStatusLine` setting overrides that command, the
-selected transcript still works and unknown context limits show a token count.
+effort and context-limit metadata. It leaves task-row text alone. If your own
+setting overrides that command, selected local transcripts still work and
+unknown context limits show a token count.
 
 ## Cache health
 
@@ -148,10 +170,12 @@ it. If it cannot be reached at all, the client renders the line the slow way, so
 line never goes blank.
 
 Your transcripts are only read, never written. The tool's own state is one small
-database it can rebuild from the transcripts, so if the numbers ever look wrong you can
-delete it and they come back. If you run a local proxy, your OAuth token is read and
+database. Transcript state rebuilds from the transcripts; peer frames repopulate
+on their next native refresh. If you run a local proxy, your OAuth token is read and
 hashed into a filename to find that proxy's usage file; the token is not sent anywhere,
-and without a proxy that path never runs.
+and without a proxy that path never runs. Selected teammates use their own native
+quotas and skip this lookup because the daemon's token may belong to another
+account.
 
 ## Get started
 
@@ -190,8 +214,10 @@ claude plugin test .
 ```
 
 The Python tests cover the renderer and the compiled client's socket and
-fallback paths. The native mod tests exercise selection changes, overlapping
-background events, remote-view isolation and session cleanup without model calls.
+fallback paths, peer identity changes and idle registry reuse. Native mod tests
+exercise selection races, terminal-surface isolation, teammate identity and the
+effective-command wrapper. Live fixtures additionally exercise separate Claude
+processes and plugin unload/reload.
 
 ## Under the hood
 

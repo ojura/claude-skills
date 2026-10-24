@@ -7,7 +7,7 @@ description: >
   renders it, so it can refresh every second for a few milliseconds. Use when the user
   wants to install or change their status line, add cache or quota indicators, diagnose a
   cache miss that silently re-wrote the whole conversation (health collapses, recached
-  jumps), show the subagent currently in view, or work out what forks, subtasks and
+  jumps), show the agent or teammate currently in view, or work out what forks, subtasks and
   teammates cost in cache terms.
 ---
 
@@ -50,39 +50,79 @@ settings block if it is not already configured:
 `refreshInterval: 1` is what makes the countdowns tick. It needs `python3` and a C
 compiler, and nothing else: there are no packages to install and no services to run.
 
-## Selected subagent
+## Selected agent and teammate
 
 Use the native mod in `hooks/register.js`, tested with Claude Code 2.1.309.
-`ui.render` for terminal `AbovePrompt` carries `props.view.agentId`; an absent
-ID means the main conversation. A switch reruns the hook even while the model
-is idle. Keep that selection separate from the agent making a `turn.step` call.
+Terminal `AbovePrompt.props.view.agentId` identifies the selection; absent means
+main. It also carries external teammate addresses such as `worker@session-…`.
+Keep view selection separate from the agent making a `turn.step` call. A local
+teammate can have both a resumable loop ID and a roster address, so preserve
+`AgentInfo.teammateId` separately.
 
-The mod sets the process-local `CLAUDE_STATUSLINE_VIEW` JSON value. The C client
-forwards it as a string in `{statusline_input, statusline_view}` so each request
-has its own selection even though the daemon serves several Claude processes.
-Validate its version, session ID and agent ID before constructing a transcript
-path. For a valid selection, use the selected transcript's model, latest complete
-usage and cache history. Treat a missing transcript as unavailable. Keep quota
-bars account-wide and label the parent cost `session $…`.
+The mod emits version 2 `CLAUDE_STATUSLINE_VIEW` with the viewer's `session_id`,
+`agent_id`, module `activation`, and available name, teammate ID, model and effort.
+Its `settings.read` hook wraps only the effective merged `statusLine.command`
+with an exported `CLAUDE_STATUSLINE_ACTIVE` token. The hook receives and returns
+`{ value: Settings }`; the public `$.settings.read()` call unwraps it.
+Source-specific reads and
+settings files stay unchanged. Export the token before the original command so
+pipelines and compound commands inherit it. The same module always uses the same
+token; a reload creates another. The next command after unload carries none.
 
-The mod starts `statusline-client --view-owner` once, lazily. Claude owns the
-child's lifetime; its exclusive lock on a unique `statusline-view-*` file is
-released on unload or termination. The renderer validates that handle on every
-normal invocation, before memo lookup. Do not replace this lifecycle signal with
-a recurring heartbeat. UI events update selection immediately.
+The C client wraps each native input with `statusline_view`,
+`statusline_activation` and `statusline_process` (`CLAUDE_PID` and optional
+`TMUX_PANE`). Validate activation, protocol and viewer session before memo lookup.
+Reject version 1 owner handles. No `--view-owner` process, file lock, heartbeat or
+extra persistent connection is needed. Do not add one: many sessions share this
+renderer, and process and write costs matter at team scale.
+
+Before applying selection, register a normal frame's original native metrics in
+the shared server. Task metadata inputs are partial and must not replace it.
+Ignore volatile durations when comparing peer frames; unchanged metrics cause no
+database writes. A peer's own selected subagent must not replace its main frame.
+
+Separate-process teammate lookup is currently Linux-based. Validate the submitted
+PID and `/proc/<pid>/stat` start value. For socket requests, derive the client
+PID from `SO_PEERCRED` and verify it descends from the claimed Claude process.
+For one-shot rendering use the renderer's actual PID as the descendant. Never
+accept a transport-origin PID from JSON. Check `<config>/sessions/<pid>.json`
+and its session ID when present; separate-process teammates can have no native
+registry entry. Cache only argv identity by `(pid, start)`: `/clear` can change
+the session without changing the process. Extract the exact launch flags
+`--agent-id`, `--team-name` and `--parent-session-id`. Resolve the roster address
+against the current team's member and pane. Normalize the team directory with
+`re.sub(r"[^a-zA-Z0-9]", "-", team).lower()` but compare roster names and addresses
+exactly. A child's exact `--parent-session-id` can identify its current leader
+when the roster's `leadSessionId` still names a session from before resume or
+`/clear`. Require exactly one matching live process. Never pick whichever
+session or transcript was newest. Missing,
+reused or ambiguous identities show `teammate unavailable`, with no parent model,
+context or cost. All peer processes must use this client and config directory.
+
+Local agents use `<main transcript stem>/subagents/agent-<id>.jsonl`. A selected
+local agent uses its own latest complete response and cache history. A selected
+peer uses its own session transcript and native frame. Latest transcript usage
+wins over a stale native frame; retain a native context limit or effort only when
+its model matches. Unknown context limits show tokens without a percentage.
+Keep a selected peer's native quota values and reset times together. Do not use
+the viewer's quotas or the shared daemon's credential/proxy lookup for that peer;
+omit unavailable account data. Local subagents retain parent account usage.
+Cost is labeled `session $…`: the parent session for
+a local subagent, or the peer's own session for a separate-process teammate.
 
 `settings.json` supplies a silent `subagentStatusLine` metadata command. The
-client's `--task-metadata` mode wraps native task rows with the explicit
-`statusline_task_metadata` flag; ingest them without producing task-row text.
-Context limits from these rows are authoritative for the corresponding agent.
-
-Use an explicitly supplied agent context-window size for a percentage. Matching
-response model names alone do not establish equal context limits. If the limit
-is unknown, display used tokens only. A five-minute cache is normal for an agent.
+client's `--task-metadata` mode marks its native task rows with
+`statusline_task_metadata`; ingest without producing task-row text. Native task
+model, effort and context-window size belong only to that corresponding agent.
+A local subagent's five-minute cache is normal; a teammate retains the main
+session's TTL badge treatment.
 
 Run `python3 -m unittest discover -v`, `claude plugin validate .`, and
-`claude plugin test .` from this directory after changing this integration.
-The native tests exercise real hook dispatch without calling a model.
+`claude plugin test .` after changing this integration. Native tests cover view
+races and command decoration; real terminal fixtures must cover plugin
+unload/reload, separate-process teammates, return to main, and shared-server
+resource use. A test of `desktop`/`mobile` render surfaces does not test a peer
+process.
 
 ## Where things live
 
@@ -99,8 +139,8 @@ The native tests exercise real hook dispatch without calling a model.
 | `~/.claude/statusline-cache-health.state.json` | Memo used only by the one-shot fallback path |
 | `~/.claude/statusline.sock` | Daemon socket, mode 0600 |
 
-The database, the sidecar and the socket are disposable: delete any of them and the next
-render rebuilds what it needs. The compiled client is not, since nothing rebuilds it but
+The database, sidecar and socket are disposable. Transcript state rebuilds on the
+next render; live peer frames repopulate on their next native refresh. The compiled client is not, since nothing rebuilds it but
 `install.sh`.
 
 Everything resolves through `CLAUDE_CONFIG_DIR` when that is set, falling back to
@@ -170,6 +210,8 @@ hash it into the proxy's per-credential filename,
 `org`, `h5` and `d7` from it (the last two are fractions, so 0.5 means 50%). The token
 is never sent anywhere, and when that file does not exist, which is the normal case, the
 segment is simply absent and the quota bars fall back to the stdin values.
+Selected separate-process teammates bypass this lookup because the daemon's
+credential is not established as theirs; use their original native quota fields.
 
 Bars share one azure to red ramp. Health inverts its color sample (`100 - health`) so a
 full bar reads azure and a drained one red, while the fill still tracks the number.

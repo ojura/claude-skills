@@ -18,86 +18,15 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <errno.h>
-#include <sys/file.h>
-#include <signal.h>
-#ifdef __linux__
-#include <sys/prctl.h>
-#endif
+#include <limits.h>
 
 static char sock_path[512];
 static char script_path[512];
-static char owner_path[1024];
 
-static void stop_owner(int signal_number) {
-    (void)signal_number;
-    unlink(owner_path);
-    _exit(0);
-}
-
-/* A native mod owns this child's life. The locked file is a stateful liveness
- * handle: unloading the mod closes it, without a polling timer or lease. */
-static int run_view_owner(void) {
-    const char *slash = strrchr(sock_path, '/');
-    if (!slash)
-        return 1;
-    snprintf(owner_path, sizeof owner_path, "%.*s/statusline-view-XXXXXX",
-             (int)(slash - sock_path), sock_path);
-    int fd = mkstemp(owner_path);
-    if (fd < 0)
-        return 1;
-    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
-        unlink(owner_path);
-        close(fd);
-        return 1;
-    }
-    signal(SIGTERM, stop_owner);
-    signal(SIGINT, stop_owner);
-    signal(SIGHUP, stop_owner);
-#ifdef __linux__
-    pid_t parent = getppid();
-    if (parent == 1 || prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || getppid() != parent)
-        stop_owner(0);
-#endif
-    const char *name = strrchr(owner_path, '/') + 1;
-    if (printf("{\"owner\":\"%s\"}\n", name) < 0 || fflush(stdout) != 0)
-        stop_owner(0);
-    for (;;)
-        pause();
-}
-
-/* Each Claude process owns its selected view. Copy it into this request: the
- * renderer daemon is shared by several sessions and cannot use its own env.
- * Keep the value as a JSON string so a malformed variable never corrupts the
- * native statusline input. Python validates the selection and session id. */
-static char *with_view(const char *input, size_t *len, int task_metadata) {
-    const char *view = getenv("CLAUDE_STATUSLINE_VIEW");
-    if (view && strlen(view) > 8192)
-        view = NULL;
-    if ((!view || !*view) && !task_metadata)
-        return NULL;
-    if (!view)
-        view = "";
-    static const char prefix[] = "{\"statusline_input\":";
-    static const char middle[] = ",\"statusline_view\":\"";
-    static const char task_flag[] = ",\"statusline_task_metadata\":true";
-    size_t cap = sizeof prefix + *len + sizeof middle + strlen(view) * 6 + sizeof task_flag + 4;
-    char *payload = malloc(cap);
-    if (!payload)
-        return NULL;
-    char *p = payload;
-    memcpy(p, prefix, sizeof prefix - 1);
-    p += sizeof prefix - 1;
-    if (*len) {
-        memcpy(p, input, *len);
-        p += *len;
-    } else {
-        memcpy(p, "{}", 2);
-        p += 2;
-    }
-    memcpy(p, middle, sizeof middle - 1);
-    p += sizeof middle - 1;
+static char *json_string(char *p, const char *value) {
+    *p++ = '"';
     static const char hex[] = "0123456789abcdef";
-    for (const unsigned char *s = (const unsigned char *)view; *s; s++) {
+    for (const unsigned char *s = (const unsigned char *)value; *s; s++) {
         if (*s == '"' || *s == '\\') {
             *p++ = '\\';
             *p++ = (char)*s;
@@ -111,6 +40,70 @@ static char *with_view(const char *input, size_t *len, int task_metadata) {
         }
     }
     *p++ = '"';
+    return p;
+}
+
+static const char *bounded_env(const char *name, size_t maxlen) {
+    const char *value = getenv(name);
+    return value && strlen(value) <= maxlen ? value : "";
+}
+
+static long native_pid(void) {
+    const char *raw = bounded_env("CLAUDE_PID", 10);
+    if (!*raw)
+        return 0;
+    for (const char *s = raw; *s; s++)
+        if (*s < '0' || *s > '9')
+            return 0;
+    errno = 0;
+    long pid = strtol(raw, NULL, 10);
+    return !errno && pid > 0 && pid <= INT_MAX ? pid : 0;
+}
+
+/* The daemon serves multiple Claude processes. Every request carries the raw
+ * native frame and its process identity; selection is enabled only by the
+ * token injected into this invocation's command by the active native mod.
+ * Keep the env values as JSON strings so malformed selection JSON cannot
+ * corrupt the native input. Python validates activation and session identity. */
+static char *with_view(const char *input, size_t *len, int task_metadata) {
+    const char *view = bounded_env("CLAUDE_STATUSLINE_VIEW", 8192);
+    const char *active = bounded_env("CLAUDE_STATUSLINE_ACTIVE", 256);
+    const char *pane = bounded_env("TMUX_PANE", 256);
+    long pid = native_pid();
+    static const char prefix[] = "{\"statusline_input\":";
+    static const char view_key[] = ",\"statusline_view\":";
+    static const char active_key[] = ",\"statusline_activation\":";
+    static const char process_key[] = ",\"statusline_process\":{";
+    static const char task_flag[] = ",\"statusline_task_metadata\":true";
+    size_t cap = *len + (strlen(view) + strlen(active) + strlen(pane)) * 6 + 256;
+    char *payload = malloc(cap);
+    if (!payload)
+        return NULL;
+    char *p = payload;
+    memcpy(p, prefix, sizeof prefix - 1);
+    p += sizeof prefix - 1;
+    if (*len) {
+        memcpy(p, input, *len);
+        p += *len;
+    } else {
+        memcpy(p, "{}", 2);
+        p += 2;
+    }
+    memcpy(p, view_key, sizeof view_key - 1);
+    p = json_string(p + sizeof view_key - 1, view);
+    memcpy(p, active_key, sizeof active_key - 1);
+    p = json_string(p + sizeof active_key - 1, active);
+    memcpy(p, process_key, sizeof process_key - 1);
+    p += sizeof process_key - 1;
+    if (pid)
+        p += sprintf(p, "\"pid\":%ld", pid);
+    if (*pane) {
+        if (pid)
+            *p++ = ',';
+        memcpy(p, "\"pane\":", 7);
+        p = json_string(p + 7, pane);
+    }
+    *p++ = '}';
     if (task_metadata) {
         memcpy(p, task_flag, sizeof task_flag - 1);
         p += sizeof task_flag - 1;
@@ -178,6 +171,8 @@ static void spawn_daemon(void) {
 
 int main(int argc, char **argv) {
     int task_metadata = argc == 2 && strcmp(argv[1], "--task-metadata") == 0;
+    if (argc > 1 && !task_metadata)
+        return 2;
     const char *home = getenv("HOME");
     const char *cfg = getenv("CLAUDE_CONFIG_DIR");
     if (!home)
@@ -189,9 +184,6 @@ int main(int argc, char **argv) {
         snprintf(sock_path, sizeof sock_path, "%s/.claude/statusline.sock", home);
         snprintf(script_path, sizeof script_path, "%s/.claude/statusline-render.py", home);
     }
-    if (argc == 2 && strcmp(argv[1], "--view-owner") == 0)
-        return run_view_owner();
-
     /* Read all of stdin first (the payload is a few KB of JSON). */
     static char buf[262144];
     size_t len = 0;

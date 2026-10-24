@@ -54,7 +54,9 @@ SOCK = CLAUDE_DIR + "/statusline.sock"
 IDLE_EXIT_S = 600
 CACHE_MEMO_VERSION = 2
 AGENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,200}\Z")
-OWNER_RE = re.compile(r"statusline-view-[A-Za-z0-9]+\Z")
+ACTIVATION_RE = re.compile(r"v2_[a-f0-9]{32}\Z")
+TEAM_PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}\Z")
+PANE_RE = re.compile(r"%[0-9]+\Z")
 
 def _env_flag(name):
     return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
@@ -246,6 +248,16 @@ def open_db():
     db.execute("CREATE TABLE IF NOT EXISTS task_metadata("
                " session_id TEXT, path TEXT, agent_id TEXT, payload TEXT,"
                " PRIMARY KEY(session_id,path,agent_id))")
+    peer_cols = ["session_id", "pid", "proc_start", "team", "agent_id",
+                 "parent_session_id", "pane", "payload", "origin_verified"]
+    existing_peer_cols = [r[1] for r in db.execute("PRAGMA table_info(peer_frames)")]
+    if existing_peer_cols and existing_peer_cols != peer_cols:
+        db.execute("DROP TABLE peer_frames")
+    db.execute("CREATE TABLE IF NOT EXISTS peer_frames("
+               " session_id TEXT, pid INT, proc_start TEXT, team TEXT, agent_id TEXT,"
+               " parent_session_id TEXT, pane TEXT, payload TEXT, origin_verified INT,"
+               " PRIMARY KEY(session_id,pid,proc_start))")
+    db.execute("CREATE INDEX IF NOT EXISTS peer_identity ON peer_frames(team,agent_id)")
     return db
 
 
@@ -423,6 +435,8 @@ class Cache:
         self.persistent = persistent
         self.mem = {}
         self.db = None
+        self.processes = {}  # argv identity is immutable for one kernel process
+        self.frames = {}  # rendered-field snapshots, unchanged ticks do not write
         self.pstate_path = None  # resolved proxy-state file, for tick fingerprints
         if persistent:
             try:
@@ -473,7 +487,8 @@ class Cache:
             if not isinstance(task, dict):
                 continue
             agent_id = task.get("id")
-            if not isinstance(agent_id, str) or not AGENT_ID_RE.fullmatch(agent_id):
+            if (not isinstance(agent_id, str)
+                    or not (AGENT_ID_RE.fullmatch(agent_id) or teammate_address(agent_id))):
                 continue
             payload = {k: task.get(k) for k in (
                 "model", "effort", "contextWindowSize", "name")}
@@ -493,6 +508,109 @@ class Cache:
             return value if isinstance(value, dict) else {}
         except (ValueError, TypeError):
             return {}
+
+    def register_frame(self, native, process, origin_pid=None):
+        """Save the process's raw main frame, before its own view is applied."""
+        session_id, tp = session_identity(native)
+        pid = process.get("pid") if isinstance(process, dict) else None
+        record = live_session(pid, session_id, allow_missing=True)
+        if not record or not tp:
+            return
+        start = record["procStart"]
+        if not process_descends_from(origin_pid, pid, start):
+            return
+        key = (pid, start)
+        if key not in self.processes:
+            self.processes[key] = process_agent_identity(pid)
+        identity = self.processes[key]
+        pane = process.get("pane") or tmux_pane(record.get("tmux"))
+        pane = pane if isinstance(pane, str) and PANE_RE.fullmatch(pane) else ""
+        recorded_pane = tmux_pane(record.get("tmux"))
+        if pane and recorded_pane and pane != recorded_pane:
+            return
+        # Native durations advance on every refresh. Keep the metrics the peer
+        # renderer uses, so dozens of idle sessions do not churn the WAL.
+        frame = {k: native[k] for k in ("session_id", "transcript_path", "model", "effort",
+                                        "context_window", "rate_limits") if k in native}
+        cost = native.get("cost")
+        if isinstance(cost, dict) and "total_cost_usd" in cost:
+            frame["cost"] = {"total_cost_usd": cost["total_cost_usd"]}
+        snapshot = (identity.get("team", ""), identity.get("agent_id", ""),
+                    identity.get("parent_session_id", ""), pane,
+                    json.dumps(frame, sort_keys=True, separators=(",", ":")))
+        frame_key = (session_id, pid, start)
+        if self.frames.get(frame_key) == snapshot:
+            return
+        if self.db is None:
+            self.db = open_db()
+        # /clear can change sessionId without changing pid or start time. A
+        # reused pid also retires its former frame; neither may resolve later.
+        self.db.execute("DELETE FROM peer_frames WHERE pid=? AND"
+                        " (session_id<>? OR proc_start<>?)", (pid, session_id, start))
+        self.db.execute("INSERT OR REPLACE INTO peer_frames VALUES(?,?,?,?,?,?,?,?,?)",
+                        (session_id, pid, start) + snapshot + (1,))
+        self.db.commit()
+        self.frames = {key: value for key, value in self.frames.items()
+                       if key[1] != pid or key == frame_key}
+        self.frames[frame_key] = snapshot
+
+    def peer_frame(self, native, process, address):
+        """Resolve exactly one live roster member, scoped to this viewer's team."""
+        parts = teammate_address(address)
+        if not parts:
+            return None
+        name, team = parts
+        roster = read_json_object(os.path.join(CLAUDE_DIR, "teams", team_directory(team), "config.json"))
+        if not roster or roster.get("name", team) != team:
+            return None
+        members = roster.get("members")
+        if not isinstance(members, list):
+            return None
+        matching = [m for m in members if isinstance(m, dict) and m.get("agentId") == address]
+        if len(matching) != 1:
+            return None
+        member = matching[0]
+        if member.get("name", name) != name or member.get("backendType") in ("in-process", "in_process"):
+            return None
+        viewer, _ = session_identity(native)
+        if not viewer:
+            return None
+        if self.db is None:
+            self.db = open_db()
+        qualified = roster.get("leadSessionId") == viewer
+        viewer_pid = process.get("pid") if isinstance(process, dict) else None
+        viewer_record = live_session(viewer_pid, viewer, allow_missing=True)
+        if not qualified and viewer_record:
+            row = self.db.execute("SELECT agent_id,pane FROM peer_frames WHERE"
+                                  " session_id=? AND pid=? AND proc_start=? AND team=? AND origin_verified=1",
+                                  (viewer, viewer_pid, viewer_record["procStart"], team)).fetchone()
+            if row:
+                own_members = [m for m in members if isinstance(m, dict) and m.get("agentId") == row[0]]
+                qualified = len(own_members) == 1 and pane_matches(own_members[0], row[1])
+        candidates = []
+        rows = self.db.execute("SELECT session_id,pid,proc_start,parent_session_id,pane,payload"
+                               " FROM peer_frames WHERE team=? AND agent_id=? AND origin_verified=1",
+                               (team, address))
+        for sid, pid, start, parent, pane, payload in rows:
+            # The running child names its parent directly. A roster can retain
+            # the lead's previous session id after resume or /clear.
+            if not qualified and parent != viewer:
+                continue
+            record = live_session(pid, sid, start, allow_missing=True)
+            if not record or not pane_matches(member, pane):
+                continue
+            current_pane = tmux_pane(record.get("tmux"))
+            if current_pane and pane and current_pane != pane:
+                continue
+            try:
+                frame = json.loads(payload)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(frame, dict) and session_identity(frame)[0] == sid:
+                candidates.append(frame)
+        # Names are reused on respawn. Never select by newest timestamp when
+        # two live processes claim the same current roster identity.
+        return candidates[0] if len(candidates) == 1 else None
 
 
 def session_identity(data):
@@ -521,24 +639,139 @@ def positive_number(value):
         return False
 
 
-def view_owner_alive(owner):
-    if not isinstance(owner, str) or not OWNER_RE.fullmatch(owner):
-        return False
-    import fcntl
+def read_json_object(path, limit=262144):
     try:
-        fd = os.open(os.path.join(CLAUDE_DIR, owner), os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
-        return False
+        with open(path) as stream:
+            raw = stream.read(limit + 1)
+        value = json.loads(raw) if len(raw) <= limit else None
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def process_record(pid):
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        except OSError:
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return None
+        with open("/proc/%d/stat" % pid) as stream:
+            raw = stream.read(65536)
+        # The comm field may itself contain spaces and closing parentheses.
+        fields = raw[raw.rfind(")") + 2:].split()
+        return (fields[19], int(fields[1])) if fields[0] not in ("Z", "X") else None
+    except (OSError, ValueError, IndexError, TypeError):
+        return None
+
+
+def process_start(pid):
+    record = process_record(pid)
+    return record[0] if record else None
+
+
+def process_descends_from(origin_pid, claimed_pid, claimed_start):
+    # origin_pid comes from SO_PEERCRED, or this one-shot renderer's own pid.
+    # It is never supplied by the JSON payload or inherited environment.
+    seen = set()
+    pid = origin_pid
+    for _ in range(16):
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or pid in seen:
             return False
-        return False
-    finally:
-        os.close(fd)
+        seen.add(pid)
+        record = process_record(pid)
+        if not record:
+            return False
+        if pid == claimed_pid:
+            return record[0] == claimed_start
+        pid = record[1]
+    return False
+
+
+def live_session(pid, session_id, expected_start=None, allow_missing=False):
+    if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+            or not isinstance(session_id, str) or not session_id):
+        return None
+    start = process_start(pid)
+    if not start or expected_start is not None and start != expected_start:
+        return None
+    path = os.path.join(CLAUDE_DIR, "sessions", "%d.json" % pid)
+    try:
+        with open(path) as stream:
+            raw = stream.read(65537)
+        record = json.loads(raw) if len(raw) <= 65536 else None
+    except FileNotFoundError:
+        # External native teammates do not publish a sessions ledger. Only
+        # ancestry-verified frames may be stored and later use this fallback.
+        return {"pid": pid, "sessionId": session_id, "procStart": start} if allow_missing else None
+    except (OSError, ValueError, TypeError):
+        return None
+    if (not isinstance(record, dict) or record.get("pid") != pid
+            or record.get("sessionId") != session_id or record.get("procStart") != start):
+        return None
+    return record
+
+
+def teammate_address(value):
+    if not isinstance(value, str) or value.count("@") != 1:
+        return None
+    name, team = value.split("@")
+    return (name, team) if TEAM_PART_RE.fullmatch(name) and TEAM_PART_RE.fullmatch(team) else None
+
+
+def team_directory(team):
+    # Native team directories normalize punctuation and case, while roster
+    # names and teammate addresses keep their exact spelling.
+    return re.sub(r"[^a-zA-Z0-9]", "-", team).lower()
+
+
+def process_agent_identity(pid):
+    # Read argv once per (pid, kernel start), never once per statusline client.
+    # Keep only native teammate routing flags; prompt text is discarded.
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as stream:
+            raw = stream.read(1048577)
+        if len(raw) > 1048576:
+            return {}
+        argv = raw.decode("utf-8", "replace").split("\0")[1:]
+    except OSError:
+        return {}
+    flags = {"--agent-id": "agent_id", "--agent-name": "name",
+             "--team-name": "team", "--parent-session-id": "parent_session_id"}
+    found = {}
+    at = 0
+    while at < len(argv):
+        arg = argv[at]
+        if arg == "--":
+            break
+        flag, sep, value = arg.partition("=")
+        if flag in flags:
+            if not sep:
+                at += 1
+                if at >= len(argv) or argv[at].startswith("--"):
+                    return {}
+                value = argv[at]
+            key = flags[flag]
+            if not value or len(value) > 400 or key in found and found[key] != value:
+                return {}
+            found[key] = value
+        at += 1
+    address = teammate_address(found.get("agent_id"))
+    if (not address or found.get("team") != address[1]
+            or found.get("name", address[0]) != address[0]):
+        return {}
+    return found
+
+
+def tmux_pane(value):
+    if not isinstance(value, str):
+        return ""
+    pane = value.rsplit(".", 1)[-1]
+    return pane if PANE_RE.fullmatch(pane) else ""
+
+
+def pane_matches(member, pane):
+    expected = member.get("tmuxPaneId")
+    # A newly reserved address has no pane yet. It must not select the older
+    # process that formerly held that name while the replacement starts.
+    return bool(tmux_pane(expected) and tmux_pane(expected) == pane)
 
 
 def same_model(left, right):
@@ -550,7 +783,7 @@ def same_model(left, right):
     return bool(left and right and strip(left) == strip(right))
 
 
-def selected_input(data, cache):
+def selected_input(data, cache, origin_pid=None):
     if not isinstance(data, dict):
         return {}
     native = data.get("statusline_input")
@@ -559,25 +792,37 @@ def selected_input(data, cache):
     if data.get("statusline_task_metadata") is True:
         cache.ingest_tasks(native)
         return None
+    try:
+        cache.register_frame(native, data.get("statusline_process"), origin_pid)
+    except Exception:
+        pass  # A peer registry problem must not suppress this process's line.
     view = data.get("statusline_view")
     try:
         view = json.loads(view) if isinstance(view, str) else view
     except (ValueError, TypeError):
         return native
     session_id, tp = session_identity(native)
-    if (not isinstance(view, dict) or view.get("version") != 1 or not session_id
+    activation = data.get("statusline_activation")
+    if (not isinstance(activation, str) or not ACTIVATION_RE.fullmatch(activation)
+            or not isinstance(view, dict) or view.get("version") != 2
+            or view.get("activation") != activation or not session_id
             or view.get("session_id") != session_id):
         return native
-    if "expires_at" in view and (not positive_number(view["expires_at"])
-                                 or view["expires_at"] <= time.time() * 1000):
-        return native
-    if "owner" in view and not view_owner_alive(view["owner"]):
-        return native
     agent_id = view.get("agent_id")
-    if (not isinstance(agent_id, str) or not AGENT_ID_RE.fullmatch(agent_id)
-            or not tp or not tp.endswith(".jsonl")):
+    if (not isinstance(agent_id, str)
+            or not (AGENT_ID_RE.fullmatch(agent_id) or teammate_address(agent_id))):
         return native
-    agent_path = os.path.join(tp[:-6], "subagents", "agent-" + agent_id + ".jsonl")
+    agent_path = (os.path.join(tp[:-6], "subagents", "agent-" + agent_id + ".jsonl")
+                  if tp and tp.endswith(".jsonl") and AGENT_ID_RE.fullmatch(agent_id) else None)
+    address = view.get("teammate_id") or agent_id
+    if teammate_address(address) and (not agent_path or not os.path.isfile(agent_path)):
+        try:
+            peer = cache.peer_frame(native, data.get("statusline_process"), address)
+        except Exception:
+            peer = None
+        return selected_peer_input(native, view, peer, cache)
+    if not agent_path:
+        return native
     values = cache.values(agent_path, agent_id)
     try:
         task = cache.task_info(session_id, tp, agent_id)
@@ -608,6 +853,50 @@ def selected_input(data, cache):
             context.update(context_window_size=window,
                            used_percentage=max(0, min(100, values[6] / window * 100)))
         selected["context_window"] = context
+    return selected
+
+
+def selected_peer_input(native, view, peer, cache):
+    # Peer metrics belong to that process's raw main frame even if its own UI
+    # is viewing a subagent. The original session guard was checked above.
+    selected = dict(peer or native)
+    selected["_selected_agent_id"] = view["agent_id"]
+    selected["_selected_agent_name"] = clean_label(view.get("name") or view.get("teammate_id"))
+    selected["_selected_peer"] = True
+    selected["rate_limits"] = peer.get("rate_limits", {}) if peer is not None else {}
+    if peer is None:
+        selected.update(transcript_path=None, model={}, effort={}, context_window={}, cost={})
+        selected["_selected_missing"] = True
+        selected["_cache_values"] = None
+        return selected
+    _, tp = session_identity(peer)
+    values = cache.values(tp) if tp else None
+    selected["_cache_values"] = values
+    selected["_selected_missing"] = not tp or not os.path.isfile(tp)
+    native_context = peer.get("context_window")
+    context = dict(native_context) if isinstance(native_context, dict) else {}
+    usage = context.get("current_usage")
+    used = values[6] if values else context_tokens(usage) if isinstance(usage, dict) else None
+    native_model = peer.get("model")
+    native_model = native_model if isinstance(native_model, dict) else {}
+    if values and not same_model(native_model.get("id"), values[7]):
+        # An unfocused pane can stop refreshing its statusline frame while its
+        # transcript grows or changes model. Never lend the older frame's
+        # model, effort, or context limit to the latest complete response.
+        selected["model"] = {"id": clean_label(values[7])}
+        selected["effort"] = {}
+        context.pop("context_window_size", None)
+        context.pop("used_percentage", None)
+    # total_input_tokens in native frames can be cumulative across turns.
+    # Current usage or the latest complete transcript response supplies fill.
+    if used is not None:
+        context["total_input_tokens"] = used
+        window = context.get("context_window_size")
+        if positive_number(window):
+            context["used_percentage"] = max(0, min(100, used / window * 100))
+    else:
+        context.pop("total_input_tokens", None)
+    selected["context_window"] = context
     return selected
 
 
@@ -666,11 +955,11 @@ def fill(template, slots):
     return template
 
 
-def render_core(data, cache):
+def render_core(data, cache, origin_pid=None):
     # Returns (template, slots): the full line is fill(template, slots).
     # Holding the time-dependent fragments in slots lets the daemon serve pure
     # clock ticks by refilling a cached template instead of re-rendering.
-    data = selected_input(data, cache)
+    data = selected_input(data, cache, origin_pid)
     if data is None:
         return "", []
     def get(path, default=None):
@@ -689,7 +978,8 @@ def render_core(data, cache):
         name = get(["_selected_agent_name"]) or agent_id
         parts.append("agent " + name)
         if get(["_selected_missing"]):
-            parts.append(muted("transcript unavailable"))
+            parts.append(muted("teammate unavailable" if get(["_selected_peer"]) and not get(["transcript_path"])
+                               else "transcript unavailable"))
 
     model = get(["model", "display_name"]) or get(["model", "id"]) or "unknown"
     parts.append(model[7:] if model.startswith("Claude ") else model)
@@ -708,13 +998,18 @@ def render_core(data, cache):
     # The token is read only to hash it into the proxy's per-credential
     # filename. It is never sent anywhere, and nothing happens at all when no
     # proxy-state file exists, which is the normal case.
-    tok = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-    if not tok:
-        try:
-            with open(CLAUDE_DIR + "/.credentials.json") as f:
-                tok = (json.load(f).get("claudeAiOauth") or {}).get("accessToken")
-        except Exception:
-            tok = None
+    # A selected peer may use a different account. Its native frame is the
+    # quota authority; this daemon's token and shared credentials identify no
+    # account for that peer.
+    tok = None
+    if not get(["_selected_peer"]):
+        tok = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        if not tok:
+            try:
+                with open(CLAUDE_DIR + "/.credentials.json") as f:
+                    tok = (json.load(f).get("claudeAiOauth") or {}).get("accessToken")
+            except Exception:
+                tok = None
     if tok:
         import hashlib
         pstate = (CLAUDE_DIR + "/proxy-state/"
@@ -762,7 +1057,7 @@ def render_core(data, cache):
         # "<label> <bar> <pct> → <renewal>", and the renewal goes in a slot so
         # clock ticks rebuild it on its own.
         badge = ""
-        if ttl == "1h" or (agent_id and ttl == "5m"):
+        if ttl == "1h" or (agent_id and not get(["_selected_peer"]) and ttl == "5m"):
             badge = " " + muted(ttl)
         elif ttl and ttl != "?":
             badge = " " + paint(ttl, fg=ALARM_RGB)
@@ -819,8 +1114,8 @@ def render_core(data, cache):
     return sep.join(parts), slots
 
 
-def render(data, cache):
-    return fill(*render_core(data, cache))
+def render(data, cache, origin_pid=None):
+    return fill(*render_core(data, cache, origin_pid))
 
 
 def _fingerprint(data, cache):
@@ -842,7 +1137,7 @@ def _fingerprint(data, cache):
     except (OSError, TypeError):
         tstat = None
     ps_mt = None
-    if cache.pstate_path:
+    if cache.pstate_path and not g("_selected_peer"):
         try:
             ps_mt = os.stat(cache.pstate_path).st_mtime_ns
         except OSError:
@@ -857,15 +1152,15 @@ def _fingerprint(data, cache):
            g("rate_limits", "seven_day", "used_percentage"),
            g("rate_limits", "seven_day", "resets_at"), tp,
            g("_selected_agent_id"), g("_selected_agent_name"),
-           g("_selected_missing"), g("_cache_values"))
+           g("_selected_missing"), g("_selected_peer"), g("_cache_values"))
     return tp, sig, tstat, ps_mt
 
 
-def serve(data, cache, memo):
+def serve(data, cache, memo, origin_pid=None):
     # Internally event-driven: a pure clock tick (nothing changed but time)
     # splices a fresh countdown into the cached line; any real change re-renders
     # and refreshes the memo.
-    data = selected_input(data, cache)
+    data = selected_input(data, cache, origin_pid)
     if data is None:
         return ""
     tp, sig, tstat, ps_mt = _fingerprint(data, cache)
@@ -884,6 +1179,17 @@ def read_all(sock):
         if not b:
             return b"".join(chunks)
         chunks.append(b)
+
+
+def socket_peer_pid(conn):
+    import socket
+    import struct
+    try:
+        pid, uid, _ = struct.unpack("3i", conn.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        return pid if pid > 0 and uid == os.getuid() else None
+    except (AttributeError, OSError, ValueError, struct.error):
+        return None
 
 
 def daemon_main():
@@ -936,13 +1242,14 @@ def daemon_main():
             break
         try:
             conn.settimeout(2.0)
+            origin_pid = socket_peer_pid(conn)
             raw = read_all(conn)
             try:
                 data = json.loads(raw.decode("utf-8", "replace")) if raw.strip() else {}
             except Exception:
                 data = {}
             try:
-                out = serve(data, cache, memo)
+                out = serve(data, cache, memo, origin_pid=origin_pid)
             except Exception:
                 out = ""
             conn.sendall(out.encode())
@@ -974,7 +1281,7 @@ def main():
         data = json.load(sys.stdin)
     except Exception:
         data = {}
-    sys.stdout.write(render(data, Cache(persistent=True)))
+    sys.stdout.write(render(data, Cache(persistent=True), origin_pid=os.getpid()))
 
 
 if __name__ == "__main__":
