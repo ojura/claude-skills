@@ -113,6 +113,44 @@ class PeerSessionTest(unittest.TestCase):
             self.assertNotIn("5h", line)
         self.assertIn("Leader Model", self.show({"statusline_input": self.native}))
 
+    def test_bust_event_follows_main_local_agent_and_peer_main(self):
+        now = 1792843200
+
+        def write_bust(path, model, age, gap, agent=None):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            rows = [response("first", None, model, 0, 100_000, agent),
+                    response("second", "first", model, 0, 100_000, agent)]
+            for row, timestamp in zip(rows, (now - age - gap, now - age)):
+                row["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp))
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+        write_bust(Path(self.native["transcript_path"]), "leader-model", 600, 60)
+        write_bust(self.root / "leader" / "subagents" / "agent-local.jsonl",
+                   "local-model", 1200, 1800, "local")
+        peer = self.peer(register=False)
+        write_bust(Path(peer["statusline_input"]["transcript_path"]), "alpha-model", 1800, 8000)
+        write_bust(self.root / "peer-alpha" / "subagents" / "agent-grandchild.jsonl",
+                   "grandchild-model", 240, 60, "grandchild")
+        peer["statusline_activation"] = ACTIVATION
+        peer["statusline_view"] = json.dumps({"version": 2, "activation": ACTIVATION,
+            "session_id": "peer-alpha", "agent_id": "grandchild", "name": "Grandchild"})
+        local = {"statusline_input": self.native, "statusline_activation": ACTIVATION,
+                 "statusline_view": json.dumps({"version": 2, "activation": ACTIVATION,
+                     "session_id": "leader", "agent_id": "local"})}
+        cases = [(self.native, "bust 10m hot"), (local, "bust 20m evicted"),
+                 (self.selection(), "bust 30m expired")]
+        with patch.object(statusline.time, "time", return_value=now):
+            self.assertIn("bust 4m hot", self.show(peer))
+            for _ in range(2):
+                for envelope, expected in cases:
+                    line = self.show(envelope)
+                    self.assertIn(expected, line)
+                    self.assertNotIn("bust 4m hot", line)
+                    for _, other in cases:
+                        if other != expected:
+                            self.assertNotIn(other, line)
+            self.assertNotIn("bust ", self.show(self.selection("beta")))
+
     def test_unavailable_peer_keeps_selected_label_without_parent_metrics(self):
         line = self.show(self.selection())
         self.assertIn("agent Alpha", line)

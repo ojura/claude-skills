@@ -184,12 +184,16 @@ conversation has been re-bought more than once over. This is the number that say
 the session wasted. A compaction boundary keeps the redundant-token total and
 starts a fresh cache-health chain.
 
-**`miss Nm ago`**, appended to the `recached N.NNx` segment without another
-separator, reports the latest substantial loss of reuse, using the
-same greater-than-half threshold as health and a 2,048-token noise floor. It is
-time since the event, not the idle gap before it. Do not infer eviction or expiry
-from a fixed gap: usage counts do not establish the cause. Omit event age when
-the event has no usable timestamp.
+**`bust Nm hot|evicted|expired`**, shown after `recached N.NNx` with its own middle-dot
+separator, reports the latest substantial loss of reuse, using the same
+greater-than-half threshold as health and a 2,048-token noise floor. Read `Nm` as
+time since the event. Read the fixed marker as the gap before it: `hot` is under
+10 minutes (red), `evicted` is 10 minutes to under 2 hours (normal), and `expired`
+is 2 hours or more (muted). These original bands do not depend on the TTL badge.
+Do not infer a server-side cause from the names: usage counts establish lost
+reuse, not eviction or expiry. Omit the marker for a missing or backwards gap;
+omit the bust indicator when the event has no usable timestamp. Retain the
+separate segment and the red `hot` warning.
 
 **The `1h` / `5m` badge** names which TTL class the last write landed in, read from
 `usage.cache_creation.ephemeral_1h_input_tokens` / `ephemeral_5m_input_tokens`. It is
@@ -200,10 +204,10 @@ computed against the shorter window, since that is the one that bites first.
 
 **`→ ~03:41 (57:12)`** estimates the TTL boundary from the last timestamp and known
 TTL. The API starts its TTL at request start; an assistant transcript timestamp
-does not establish that exact instant. After the estimate passes, use
-`(past)`, or `(5m past)` for a mixed cache. Keep this elapsed state visible;
-shorten its text rather than removing it. That does not prove all
-cached content has been removed. Unknown TTL gets no expiry estimate. See the
+does not establish that exact instant. After the estimate passes, show `(cold)`
+in red. Keep this warning visible. It marks the elapsed estimate, not proof that
+all cached content has been removed; mixed caches use the earliest, five-minute
+boundary. Unknown TTL gets no expiry estimate. See the
 [current API documentation](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
 
 **`5h` / `7d`** come from `used_percentage` and `resets_at` on stdin. The 5h window shows

@@ -9,13 +9,13 @@ All of it is recorded in the session transcript, though. Every API call leaves b
 how many tokens it read from cache and how many it had to write, which is enough to
 reconstruct what the cache has been doing all session and put it on the status line.
 
-![Historical example of an overnight cache miss. The older display called an elapsed TTL cold. The next request rewrites 420k tokens, and the following frame shows 1% health and a 1.00x recached factor.](docs/cold-resume.svg)
+![Historical example of an overnight cache miss. The elapsed TTL is marked cold. The next request rewrites 420k tokens, and the following frame shows 1% health and a 1.00x recached factor.](docs/cold-resume.svg)
 
 The conversation is intact in all three frames. In this recorded example, the next
 request after an overnight gap missed the cache, costing about $8.40 rather than
 the $0.42 a cache read would have cost. The third frame records that request: the
-health bar empties, and the multiplier records the repeated work. The current
-display says `(past)` where this older illustration says `cold`.
+health bar empties, and the multiplier records the repeated work. The red
+`(cold)` label marks the estimated lifetime boundary.
 
 ## Expiry and renewal times
 
@@ -27,7 +27,7 @@ Putting the clock time first solves a small problem worth mentioning. A status l
 redraws while you are working, so a session you left open an hour ago is still showing
 what it showed then, and any countdown in it is wrong by exactly the time you were away.
 A clock time remains useful after a pause. Once the estimated boundary passes,
-the cache segment says `(past)`, or `(5m past)` for a mixed cache. This is a timing estimate, not proof of
+the cache segment shows `(cold)` in red. This is a timing estimate, not proof of
 cache deletion: the TTL starts at request start, while the transcript supplies
 an assistant timestamp. The `~` marks that approximation. Unknown TTLs have no
 expiry estimate; a mixed cache identifies the earliest, five-minute boundary.
@@ -136,13 +136,23 @@ normally use the five-minute cache, so their `5m` badge has a neutral color.
 
 ### What a cache miss means
 
-`recached 0.08x miss 12m ago` combines the re-cache factor and miss age in one
-segment. The miss age reports the latest substantial drop in cache reuse: more than
+`recached 0.08x · bust 12m hot` shows the re-cache factor and a separate bust
+indicator. The bust reports the latest substantial drop in cache reuse: more than
 half of the comparable prior input footprint was not read from cache, after
-ignoring differences below 2,048 tokens. The age is time since that request.
-It does not diagnose a cause. The previous `hot`, `evicted` and `expired` labels
-were based on fixed ten-minute and two-hour gaps, which did not account for the
-actual TTL and could mislabel ordinary expiry.
+ignoring differences below 2,048 tokens. `12m` is the time since that request;
+the following marker describes the gap **before** it:
+
+| Marker | Gap before the bust | Appearance |
+| --- | --- | --- |
+| `hot` | Less than 10 minutes | Red warning |
+| `evicted` | 10 minutes to less than 2 hours | Normal text |
+| `expired` | 2 hours or more | Muted text |
+
+The marker stays fixed while the displayed age increases. A missing or backwards
+gap has no marker; a missing event timestamp omits the bust indicator. These are
+the original timing bands, independent of the TTL badge, not server-reported
+causes. The separate red `(cold)` marker describes the estimated TTL
+boundary.
 
 Cache reuse can change because of elapsed retention time, a changed prefix or
 configuration, or lookup behavior. Usage counters establish the amount reused.

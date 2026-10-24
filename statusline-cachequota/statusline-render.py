@@ -57,7 +57,8 @@ DB_PATH = CLAUDE_DIR + "/statusline-cache-health.db"
 SIDECAR = CLAUDE_DIR + "/statusline-cache-health.state.json"
 SOCK = CLAUDE_DIR + "/statusline.sock"
 IDLE_EXIT_S = 600
-CACHE_MEMO_VERSION = 2
+CACHE_MEMO_VERSION = 3
+CACHE_DB_VERSION = 1
 TASK_METADATA_CACHE_SIZE = 1024
 RENDER_MEMO_SIZE = 512
 AGENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,200}\Z")
@@ -328,6 +329,15 @@ def open_db():
                " parent_session_id TEXT, pane TEXT, payload TEXT, origin_verified INT,"
                " PRIMARY KEY(session_id,pid,proc_start))")
     db.execute("CREATE INDEX IF NOT EXISTS peer_identity ON peer_frames(team,agent_id)")
+    if db.execute("PRAGMA user_version").fetchone()[0] < CACHE_DB_VERSION:
+        # Earlier renderers stored zero instead of the bust's age band. Replay
+        # derived transcript state once; keep peer identity and task metadata.
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("PRAGMA user_version").fetchone()[0] < CACHE_DB_VERSION:
+                db.execute("DELETE FROM nodes")
+                db.execute("DELETE FROM files")
+                db.execute("PRAGMA user_version = %d" % CACHE_DB_VERSION)
     return db
 
 
@@ -516,17 +526,22 @@ def cache_engine(tp, db, agent_id=None):
                         last_ts = call_ts
                     except Exception:
                         pass
-                bustts = p[7]
+                bustts, busthot = p[7], p[8]
                 if bust:
                     # Usage shows a missed prefix, not why it was missed. A
                     # missing event timestamp must not borrow the previous one.
                     bustts = call_ts
+                    # Preserve the familiar gap bands, fixed at the event.
+                    # They are timing labels, not server-reported causes.
+                    gap = call_ts - p[6] if call_ts and p[6] else None
+                    busthot = (-1 if gap is None or gap < 0 else
+                               1 if gap < 600 else 2 if gap < 7200 else 0)
                 b = usage.get("cache_creation") or {}
                 e5 = b.get("ephemeral_5m_input_tokens") or 0
                 e1 = b.get("ephemeral_1h_input_tokens") or 0
                 ttl = "5m+1h" if (e5 and e1) else "5m" if e5 else "1h" if e1 else p[3]
                 new[u] = [total, lastrw, mid, ttl, redsum, cr + cc + it,
-                          call_ts or p[6], bustts, 0,
+                          call_ts or p[6], bustts, busthot,
                           m.get("model") or p[9], context_tokens(usage)]
             else:
                 new[u] = [p[0], p[1], mid or p[2]] + p[3:]
@@ -1108,8 +1123,7 @@ def slot_str(kind, exp):
                 return muted(stamp)
             rem = exp - now
             return muted("%s (%d:%02d)" % (stamp, rem // 60, rem % 60))
-        label = "5m past" if kind == "warm_mixed" else "past"
-        return "%s %s" % (muted(stamp), muted("(" + label + ")"))
+        return "%s %s" % (muted(stamp), paint("(cold)", fg=ALARM_RGB))
     if kind == "reset_rel":
         # Window renewal within the day: wall clock plus countdown (H:MM:SS).
         stamp = "→ %s" % time.strftime("%H:%M", time.localtime(exp))
@@ -1235,6 +1249,7 @@ def render_core(data, cache, origin_pid=None):
         health, ttl, rw, exp = cv[:4]
         # Older memo entries may still be 4-tuples; they have no event time.
         bustts = cv[4] if len(cv) > 4 else 0
+        busthot = cv[5] if len(cv) > 5 else -1
         # The TTL badge sits beside the label, dimmed for the normal 1h and
         # alarm-colored for 5m, which on a main session usually means overage.
         # All three segments that carry a time then read
@@ -1257,14 +1272,18 @@ def render_core(data, cache, origin_pid=None):
         # Cumulative rewrite factor as a colored multiplier: tokens
         # redundantly re-cached over the current context footprint. 0.00x
         # azure = purely additive; 1.00x = re-cached once; can exceed 1.
-        seg = "recached " + paint("%.2fx" % (rw / 100), fg=ramp_rgb(rw))
+        parts.append("recached " + paint("%.2fx" % (rw / 100), fg=ramp_rgb(rw)))
 
-        # Last substantial cache miss. The usage counters establish diminished
-        # reuse, not eviction or expiry. Keep its age explicit and live.
+        # The age is time since the bust; its marker retains the preceding gap
+        # band. Keep the familiar warning colours in their own segment.
         if bustts:
-            seg += " miss " + SLOT % len(slots) + " ago"
+            kind = (paint("hot", fg=ALARM_RGB) if busthot == 1 else
+                    "evicted" if busthot == 2 else muted("expired") if busthot == 0 else "")
+            seg = "bust " + SLOT % len(slots)
+            if kind:
+                seg += " " + kind
             slots.append(("ago", int(bustts)))
-        parts.append(seg)
+            parts.append(seg)
 
     cost = get(["cost", "total_cost_usd"])
     if cost is not None and cost > 0:
