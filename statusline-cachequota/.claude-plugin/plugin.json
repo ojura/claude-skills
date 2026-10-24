@@ -1,0 +1,7 @@
+{
+  "name": "statusline-cachequota",
+  "version": "1.1.0",
+  "description": "Show cache health and context for the subagent currently in view.",
+  "skills": ["./"],
+  "author": { "name": "Juraj Oršulić" }
+}

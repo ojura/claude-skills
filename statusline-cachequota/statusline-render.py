@@ -38,7 +38,9 @@
 # The sqlite state is a disposable cache: schema drift drops + rebuilds.
 
 import json
+import math
 import os
+import re
 import sys
 import time
 
@@ -50,6 +52,9 @@ DB_PATH = CLAUDE_DIR + "/statusline-cache-health.db"
 SIDECAR = CLAUDE_DIR + "/statusline-cache-health.state.json"
 SOCK = CLAUDE_DIR + "/statusline.sock"
 IDLE_EXIT_S = 600
+CACHE_MEMO_VERSION = 2
+AGENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,200}\Z")
+OWNER_RE = re.compile(r"statusline-view-[A-Za-z0-9]+\Z")
 
 def _env_flag(name):
     return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
@@ -225,35 +230,53 @@ def open_db():
     db = sqlite3.connect(DB_PATH, timeout=0.25)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
-    NODE_COLS = ["uuid", "total", "lastrw", "msgid", "ttl", "redsum", "ctx",
-                 "callts", "bustts", "busthot"]
-    FILE_COLS = ["path", "offset", "leaf", "last_ts"]
+    NODE_COLS = ["path", "uuid", "total", "lastrw", "msgid", "ttl", "redsum", "ctx",
+                 "callts", "bustts", "busthot", "model", "input_ctx"]
+    FILE_COLS = ["path", "offset", "leaf", "last_ts", "agent_id", "device", "inode"]
     if ([r[1] for r in db.execute("PRAGMA table_info(nodes)")] != NODE_COLS
             or [r[1] for r in db.execute("PRAGMA table_info(files)")] != FILE_COLS):
         db.execute("DROP TABLE IF EXISTS nodes")
         db.execute("DROP TABLE IF EXISTS files")
-    db.execute("CREATE TABLE IF NOT EXISTS nodes(uuid TEXT PRIMARY KEY,"
+    db.execute("CREATE TABLE IF NOT EXISTS nodes(path TEXT, uuid TEXT,"
                " total INT, lastrw INT, msgid TEXT, ttl TEXT, redsum INT, ctx INT,"
-               " callts INT, bustts INT, busthot INT)")
+               " callts INT, bustts INT, busthot INT, model TEXT, input_ctx INT,"
+               " PRIMARY KEY(path,uuid))")
     db.execute("CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,"
-               " offset INT, leaf TEXT, last_ts INT)")
+               " offset INT, leaf TEXT, last_ts INT, agent_id TEXT, device INT, inode INT)")
+    db.execute("CREATE TABLE IF NOT EXISTS task_metadata("
+               " session_id TEXT, path TEXT, agent_id TEXT, payload TEXT,"
+               " PRIMARY KEY(session_id,path,agent_id))")
     return db
 
 
-def cache_engine(tp, db):
+def context_tokens(usage):
+    # Server-side tool loops sum their usage. Their last iteration is the live
+    # context, as in Claude's own statusline, rather than all iterations added.
+    iterations = usage.get("iterations")
+    if isinstance(iterations, list) and iterations:
+        last = iterations[-1]
+        if isinstance(last, dict) and "input_tokens" in last:
+            usage = last
+    return sum(usage.get(k) or 0 for k in (
+        "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+
+
+def cache_engine(tp, db, agent_id=None):
     # Parses transcript bytes appended since the stored offset into the
     # sqlite state; returns (health, ttl, rw, exp) or None.
     from datetime import datetime
 
-    row = db.execute("SELECT offset, leaf, last_ts FROM files WHERE path=?", (tp,)).fetchone()
-    off, leaf, last_ts = row if row else (0, None, 0)
+    row = db.execute("SELECT offset,leaf,last_ts,agent_id,device,inode"
+                     " FROM files WHERE path=?", (tp,)).fetchone()
+    st = os.stat(tp)
+    off, leaf, last_ts = row[:3] if row else (0, None, 0)
     last_ts = last_ts or 0
-    size = os.path.getsize(tp)
-    if off > size:  # transcript replaced/truncated: reprocess (idempotent by uuid)
-        off, leaf = 0, None
+    if row and (off > st.st_size or row[3:] != (agent_id, st.st_dev, st.st_ino)):
+        db.execute("DELETE FROM nodes WHERE path=?", (tp,))
+        off, leaf, last_ts = 0, None, 0
 
-    # total, lastrw, msgid, ttl, redsum(tok), ctx(tok), callts, bustts, busthot
-    ROOT = [0, 1, "", "", 0, 0, 0, 0, 0]
+    # total, lastrw, msgid, ttl, redsum, ctx, callts, bustts, busthot, model, input_ctx
+    ROOT = [0, 1, "", "", 0, 0, 0, 0, 0, "", 0]
     new = {}
 
     def lookup(u):
@@ -261,8 +284,8 @@ def cache_engine(tp, db):
             return None
         if u in new:
             return new[u]
-        r = db.execute("SELECT total,lastrw,msgid,ttl,redsum,ctx,callts,bustts,busthot"
-                       " FROM nodes WHERE uuid=?", (u,)).fetchone()
+        r = db.execute("SELECT total,lastrw,msgid,ttl,redsum,ctx,callts,bustts,busthot,model,input_ctx"
+                       " FROM nodes WHERE path=? AND uuid=?", (tp, u)).fetchone()
         return list(r) if r else None
 
     with open(tp, "rb") as f:
@@ -279,8 +302,12 @@ def cache_engine(tp, db):
             e = json.loads(raw)
         except Exception:
             continue
+        if not isinstance(e, dict):
+            continue
         u = e.get("uuid")
-        if not u or e.get("isSidechain"):
+        if not u or (agent_id is None and e.get("isSidechain")):
+            continue
+        if agent_id is not None and e.get("agentId") not in (None, agent_id):
             continue
         if e.get("subtype") == "compact_boundary" or e.get("isCompactSummary"):
             # Compaction restarts the conversation (and legitimately rebuilds
@@ -347,41 +374,44 @@ def cache_engine(tp, db):
                         last_ts = call_ts
                     except Exception:
                         pass
-                bustts, busthot = p[7], p[8]
+                bustts = p[7]
                 if bust:
-                    bustts = call_ts or last_ts
-                    # Band by measured survival odds, not a TTL story:
-                    # 1 = hot (<10m, the prefix was just read; always anomalous),
-                    # 2 = evicted (10m-2h; entries this age usually survive),
-                    # 0 = expired (2h+; usually gone at that age anyway).
-                    gap_prev = (call_ts - p[6]) if (p[6] and call_ts) else None
-                    busthot = (1 if gap_prev is not None and gap_prev < 600 else
-                               2 if gap_prev is not None and gap_prev < 7200 else 0)
+                    # Usage shows a missed prefix, not why it was missed. A
+                    # missing event timestamp must not borrow the previous one.
+                    bustts = call_ts
                 b = usage.get("cache_creation") or {}
                 e5 = b.get("ephemeral_5m_input_tokens") or 0
                 e1 = b.get("ephemeral_1h_input_tokens") or 0
                 ttl = "5m+1h" if (e5 and e1) else "5m" if e5 else "1h" if e1 else p[3]
                 new[u] = [total, lastrw, mid, ttl, redsum, cr + cc + it,
-                          call_ts or p[6], bustts, busthot]
+                          call_ts or p[6], bustts, 0,
+                          m.get("model") or p[9], context_tokens(usage)]
             else:
                 new[u] = [p[0], p[1], mid or p[2]] + p[3:]
+                if cr or cc or it:
+                    new[u][9] = m.get("model") or p[9]
+                    new[u][10] = context_tokens(usage)
         else:
             new[u] = p[:]
         leaf = u
 
     if new:
-        db.executemany("INSERT OR REPLACE INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?)",
-                       [(u,) + tuple(v) for u, v in new.items()])
-    db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?)", (tp, new_off, leaf, last_ts))
+        db.executemany("INSERT OR REPLACE INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       [(tp, u) + tuple(v) for u, v in new.items()])
+    db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?)",
+               (tp, new_off, leaf, last_ts, agent_id, st.st_dev, st.st_ino))
     db.commit()
 
     n = lookup(leaf)
     if n and n[0] > 0:
         live = n[0] - n[1] + 1
         rw = n[4] / n[5] * 100.0 if n[5] else 0.0
-        window = 3600 if n[3] == "1h" else 300  # 5m and mixed: conservative window
-        exp = last_ts + window if last_ts else 0
-        return (live / n[0] * 100.0, n[3] or "?", rw, exp, n[7] or 0, n[8] or 0)
+        # Mixed caches reach their first TTL boundary after five minutes.
+        # Unknown TTLs provide no basis for an expiry estimate.
+        window = {"1h": 3600, "5m": 300, "5m+1h": 300}.get(n[3])
+        exp = last_ts + window if last_ts and window else 0
+        return (live / n[0] * 100.0, n[3] or "?", rw, exp, n[7] or 0, n[8] or 0,
+                n[10], n[9])
     return None
 
 
@@ -397,36 +427,188 @@ class Cache:
         if persistent:
             try:
                 with open(SIDECAR) as f:
-                    self.mem = json.load(f)
+                    saved = json.load(f)
+                if saved.get("version") == CACHE_MEMO_VERSION:
+                    self.mem = saved.get("entries") or {}
             except Exception:
                 self.mem = {}
 
-    def values(self, tp):
+    def values(self, tp, agent_id=None):
         try:
             st = os.stat(tp)
         except OSError:
             return None
         ent = self.mem.get(tp)
-        if ent and ent[0] == st.st_size and ent[1] == st.st_mtime_ns:
-            return tuple(ent[2]) if ent[2] else None
+        stamp = [st.st_size, st.st_mtime_ns, st.st_dev, st.st_ino, st.st_ctime_ns, agent_id]
+        if ent and ent[:6] == stamp:
+            return tuple(ent[6]) if ent[6] else None
         if self.db is None:
             self.db = open_db()
         try:
-            result = cache_engine(tp, self.db)
+            result = cache_engine(tp, self.db, agent_id)
         except Exception:
             return None
-        self.mem[tp] = [st.st_size, st.st_mtime_ns, list(result) if result else None]
+        self.mem[tp] = stamp + [list(result) if result else None]
         if self.persistent:
             try:
                 tmp = SIDECAR + ".tmp.%d" % os.getpid()
                 with open(tmp, "w") as f:
-                    json.dump(self.mem, f)
+                    json.dump({"version": CACHE_MEMO_VERSION, "entries": self.mem}, f)
                 os.replace(tmp, SIDECAR)
             except Exception:
                 pass
             self.db.close()
             self.db = None
         return result
+
+    def ingest_tasks(self, data):
+        session_id, tp = session_identity(data)
+        tasks = data.get("tasks")
+        if not session_id or not tp or not isinstance(tasks, list):
+            return
+        if self.db is None:
+            self.db = open_db()
+        rows = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            agent_id = task.get("id")
+            if not isinstance(agent_id, str) or not AGENT_ID_RE.fullmatch(agent_id):
+                continue
+            payload = {k: task.get(k) for k in (
+                "model", "effort", "contextWindowSize", "name")}
+            rows.append((session_id, tp, agent_id, json.dumps(payload)))
+        if rows:
+            self.db.executemany("INSERT OR REPLACE INTO task_metadata VALUES(?,?,?,?)", rows)
+            self.db.commit()
+
+    def task_info(self, session_id, tp, agent_id):
+        if self.db is None:
+            self.db = open_db()
+        row = self.db.execute("SELECT payload FROM task_metadata"
+                              " WHERE session_id=? AND path=? AND agent_id=?",
+                              (session_id, tp, agent_id)).fetchone()
+        try:
+            value = json.loads(row[0]) if row else {}
+            return value if isinstance(value, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+
+
+def session_identity(data):
+    tp = data.get("transcript_path")
+    tp = os.path.abspath(tp) if isinstance(tp, str) and tp else None
+    session_id = data.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        session_id = os.path.basename(tp)[:-6] if tp and tp.endswith(".jsonl") else None
+    return session_id, tp
+
+
+def clean_label(value, limit=80):
+    if not isinstance(value, str):
+        return ""
+    # Keep terminal controls, line breaks and bidi format controls out of names.
+    import unicodedata
+    return " ".join("".join(c for c in value
+        if not unicodedata.category(c).startswith("C")).split())[:limit]
+
+
+def positive_number(value):
+    try:
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and value > 0)
+    except OverflowError:
+        return False
+
+
+def view_owner_alive(owner):
+    if not isinstance(owner, str) or not OWNER_RE.fullmatch(owner):
+        return False
+    import fcntl
+    try:
+        fd = os.open(os.path.join(CLAUDE_DIR, owner), os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        return False
+    finally:
+        os.close(fd)
+
+
+def same_model(left, right):
+    # A native task's explicit window belongs to its request model. The API
+    # response omits the request's context selector, but keeps the model id.
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    strip = lambda value: re.sub(r"\[(?:1m|200k)\]$", "", value)
+    return bool(left and right and strip(left) == strip(right))
+
+
+def selected_input(data, cache):
+    if not isinstance(data, dict):
+        return {}
+    native = data.get("statusline_input")
+    if not isinstance(native, dict):
+        return data
+    if data.get("statusline_task_metadata") is True:
+        cache.ingest_tasks(native)
+        return None
+    view = data.get("statusline_view")
+    try:
+        view = json.loads(view) if isinstance(view, str) else view
+    except (ValueError, TypeError):
+        return native
+    session_id, tp = session_identity(native)
+    if (not isinstance(view, dict) or view.get("version") != 1 or not session_id
+            or view.get("session_id") != session_id):
+        return native
+    if "expires_at" in view and (not positive_number(view["expires_at"])
+                                 or view["expires_at"] <= time.time() * 1000):
+        return native
+    if "owner" in view and not view_owner_alive(view["owner"]):
+        return native
+    agent_id = view.get("agent_id")
+    if (not isinstance(agent_id, str) or not AGENT_ID_RE.fullmatch(agent_id)
+            or not tp or not tp.endswith(".jsonl")):
+        return native
+    agent_path = os.path.join(tp[:-6], "subagents", "agent-" + agent_id + ".jsonl")
+    values = cache.values(agent_path, agent_id)
+    try:
+        task = cache.task_info(session_id, tp, agent_id)
+    except Exception:
+        task = {}
+    model = clean_label(values[7] if values else view.get("model") or task.get("model"))
+    selected = dict(native)
+    selected.update(transcript_path=agent_path, model={"id": model}, effort={}, context_window={})
+    selected["_selected_agent_id"] = agent_id
+    selected["_selected_agent_name"] = clean_label(view.get("name") or task.get("name"))
+    selected["_cache_values"] = values
+    selected["_selected_missing"] = not os.path.isfile(agent_path)
+    effort = view.get("effort") if same_model(view.get("model"), model) else None
+    if effort is None and same_model(task.get("model"), model):
+        effort = task.get("effort")
+    if isinstance(effort, str):
+        effort = clean_label(effort, 20)
+    if effort is not None and isinstance(effort, (str, int, float)) and not isinstance(effort, bool):
+        selected["effort"] = {"level": effort}
+    window = view.get("context_window_size")
+    if not same_model(view.get("model"), model):
+        window = None
+    if not positive_number(window) and same_model(task.get("model"), model):
+        window = task.get("contextWindowSize")
+    if values:
+        context = {"total_input_tokens": values[6]}
+        if positive_number(window):
+            context.update(context_window_size=window,
+                           used_percentage=max(0, min(100, values[6] / window * 100)))
+        selected["context_window"] = context
+    return selected
 
 
 # Time-dependent fragments render into numbered slots instead of being
@@ -442,18 +624,20 @@ HR_DAYS = ["pon", "uto", "sri", "čet", "pet", "sub", "ned"]
 def slot_str(kind, exp):
     # All three renewals read "→ <when>", with a live countdown in parens
     # when one is meaningful. Callers supply the leading space.
-    if kind == "warm":
-        # Cache expiry: wall clock plus countdown (M:SS), or a cold marker.
+    if kind in ("warm", "warm_mixed"):
+        # Transcript timestamps approximate the cache's minimum TTL boundary;
+        # passing it does not establish that the server has removed the cache.
         if not exp or exp <= 0:
             return ""
         now = int(time.time())
-        stamp = "→ %s" % time.strftime("%H:%M", time.localtime(exp))
+        stamp = "→ ~%s" % time.strftime("%H:%M", time.localtime(exp))
         if now < exp:
             if COMPACT:
                 return muted(stamp)
             rem = exp - now
             return muted("%s (%d:%02d)" % (stamp, rem // 60, rem % 60))
-        return "%s %s" % (muted(stamp), paint("(cold)", fg=ALARM_RGB))
+        label = "5m TTL elapsed" if kind == "warm_mixed" else "TTL elapsed"
+        return "%s %s" % (muted(stamp), muted("(" + label + ")"))
     if kind == "reset_rel":
         # Window renewal within the day: wall clock plus countdown (H:MM:SS).
         stamp = "→ %s" % time.strftime("%H:%M", time.localtime(exp))
@@ -486,6 +670,9 @@ def render_core(data, cache):
     # Returns (template, slots): the full line is fill(template, slots).
     # Holding the time-dependent fragments in slots lets the daemon serve pure
     # clock ticks by refilling a cached template instead of re-rendering.
+    data = selected_input(data, cache)
+    if data is None:
+        return "", []
     def get(path, default=None):
         cur = data
         for k in path:
@@ -497,11 +684,18 @@ def render_core(data, cache):
     parts = []
     slots = []
 
+    agent_id = get(["_selected_agent_id"])
+    if agent_id:
+        name = get(["_selected_agent_name"]) or agent_id
+        parts.append("agent " + name)
+        if get(["_selected_missing"]):
+            parts.append(muted("transcript unavailable"))
+
     model = get(["model", "display_name"]) or get(["model", "id"]) or "unknown"
     parts.append(model[7:] if model.startswith("Claude ") else model)
 
     effort = get(["effort", "level"])
-    if effort:
+    if effort or (agent_id and effort == 0):
         parts.append("effort:%s" % effort)
 
     # Org and quota from the anthropic-proxy's state file, which the proxy
@@ -550,32 +744,35 @@ def render_core(data, cache):
                                          format_pct(used_pct)))
         else:
             parts.append("ctx %s %s" % (make_bar(used_pct), format_pct(used_pct)))
+    elif agent_id and used_tokens is not None:
+        parts.append("ctx " + format_tokens(used_tokens).strip())
 
     # Cache health bar: ramp inverted, so a full bar reads azure and a
     # drained one red.
     tp = get(["transcript_path"])
-    cv = cache.values(tp) if tp and os.path.isfile(tp) else None
+    cv = (data.get("_cache_values") if agent_id else
+          cache.values(tp) if tp and os.path.isfile(tp) else None)
     if cv:
         health, ttl, rw, exp = cv[:4]
-        # older memo entries may still be 4-tuples; treat them as bust-free
-        bustts, busthot = (cv[4], cv[5]) if len(cv) > 5 else (0, 0)
+        # Older memo entries may still be 4-tuples; they have no event time.
+        bustts = cv[4] if len(cv) > 4 else 0
         # The TTL badge sits beside the label, dimmed for the normal 1h and
         # alarm-colored for 5m, which on a main session usually means overage.
         # All three segments that carry a time then read
         # "<label> <bar> <pct> → <renewal>", and the renewal goes in a slot so
         # clock ticks rebuild it on its own.
         badge = ""
-        if ttl == "1h":
-            badge = " " + muted("1h")
+        if ttl == "1h" or (agent_id and ttl == "5m"):
+            badge = " " + muted(ttl)
         elif ttl and ttl != "?":
             badge = " " + paint(ttl, fg=ALARM_RGB)
         pct = format_pct(health)
         if health < CACHE_ALARM_PCT:
             pct = paint(pct, fg=ALARM_RGB)
         seg = "cache%s %s %s" % (badge, make_bar(health, 100 - health), pct)
-        if exp:
+        if exp and ttl in ("5m", "1h", "5m+1h"):
             seg += " " + SLOT % len(slots)
-            slots.append(("warm", exp))
+            slots.append(("warm_mixed" if ttl == "5m+1h" else "warm", exp))
         parts.append(seg)
 
         # Cumulative rewrite factor as a colored multiplier: tokens
@@ -583,21 +780,16 @@ def render_core(data, cache):
         # azure = purely additive; 1.00x = re-cached once; can exceed 1.
         parts.append("recached " + paint("%.2fx" % (rw / 100), fg=ramp_rgb(rw)))
 
-        # Last cache bust: when, and what kind of loss. "hot" hit a prefix read
-        # moments earlier; "evicted" lost an entry most sessions keep at that
-        # age (10m-2h survives ~69%/37%); "expired" followed a 2h+ pause where
-        # entries are usually gone anyway. The elapsed time renders through a
-        # slot so it keeps aging between requests like the countdowns do.
+        # Last substantial cache miss. The usage counters establish diminished
+        # reuse, not eviction or expiry. Keep its age explicit and live.
         if bustts:
-            kind = (paint("hot", fg=ALARM_RGB) if busthot == 1 else
-                    "evicted" if busthot == 2 else muted("expired"))
-            seg = "bust " + SLOT % len(slots) + " " + kind
+            seg = "cache miss " + SLOT % len(slots) + " ago"
             slots.append(("ago", int(bustts)))
             parts.append(seg)
 
     cost = get(["cost", "total_cost_usd"])
     if cost is not None and cost > 0:
-        parts.append("$%.2f" % cost)
+        parts.append(("session $%.2f" if agent_id else "$%.2f") % cost)
 
     # Each rate-limit bar carries when its window renews: the 5h window gets
     # wall clock plus a live countdown, the 7d window a dated stamp.
@@ -646,7 +838,7 @@ def _fingerprint(data, cache):
     tp = g("transcript_path")
     try:
         st = os.stat(tp)
-        tstat = (st.st_size, st.st_mtime_ns)
+        tstat = (st.st_size, st.st_mtime_ns, st.st_dev, st.st_ino, st.st_ctime_ns)
     except (OSError, TypeError):
         tstat = None
     ps_mt = None
@@ -663,7 +855,9 @@ def _fingerprint(data, cache):
            g("rate_limits", "five_hour", "used_percentage"),
            g("rate_limits", "five_hour", "resets_at"),
            g("rate_limits", "seven_day", "used_percentage"),
-           g("rate_limits", "seven_day", "resets_at"), tp)
+           g("rate_limits", "seven_day", "resets_at"), tp,
+           g("_selected_agent_id"), g("_selected_agent_name"),
+           g("_selected_missing"), g("_cache_values"))
     return tp, sig, tstat, ps_mt
 
 
@@ -671,6 +865,9 @@ def serve(data, cache, memo):
     # Internally event-driven: a pure clock tick (nothing changed but time)
     # splices a fresh countdown into the cached line; any real change re-renders
     # and refreshes the memo.
+    data = selected_input(data, cache)
+    if data is None:
+        return ""
     tp, sig, tstat, ps_mt = _fingerprint(data, cache)
     ent = memo.get(tp)
     if ent and ent[0] == sig and ent[1] == tstat and ent[2] == ps_mt:

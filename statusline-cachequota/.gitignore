@@ -1,3 +1,5 @@
 # Build artifact: install.sh compiles the client into ~/.claude.
 statusline-client
 *.o
+.claude-plugin/types/
+__pycache__/

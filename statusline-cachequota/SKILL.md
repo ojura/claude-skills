@@ -7,7 +7,8 @@ description: >
   renders it, so it can refresh every second for a few milliseconds. Use when the user
   wants to install or change their status line, add cache or quota indicators, diagnose a
   cache miss that silently re-wrote the whole conversation (health collapses, recached
-  jumps), or work out what forks, subtasks and teammates cost in cache terms.
+  jumps), show the subagent currently in view, or work out what forks, subtasks and
+  teammates cost in cache terms.
 ---
 
 # Status line: cache health and quota
@@ -33,8 +34,10 @@ is missing, so a bare harness renders a short line rather than empty fields.
 ```
 
 That compiles `statusline-client.c` to `~/.claude/statusline-client`, links
-`statusline-render.py` and `statusline-command.sh` into `~/.claude`, and prints the
-settings block if it is not already wired:
+`statusline-render.py` and `statusline-command.sh` into `~/.claude`, and links this
+package into `~/.claude/skills/statusline-cachequota` for native mod discovery.
+Run `/reload-plugins` in an existing Claude session. The installer prints the
+settings block if it is not already configured:
 
 ```json
 "statusLine": {
@@ -47,6 +50,40 @@ settings block if it is not already wired:
 `refreshInterval: 1` is what makes the countdowns tick. It needs `python3` and a C
 compiler, and nothing else: there are no packages to install and no services to run.
 
+## Selected subagent
+
+Use the native mod in `hooks/register.js`, tested with Claude Code 2.1.309.
+`ui.render` for terminal `AbovePrompt` carries `props.view.agentId`; an absent
+ID means the main conversation. A switch reruns the hook even while the model
+is idle. Keep that selection separate from the agent making a `turn.step` call.
+
+The mod sets the process-local `CLAUDE_STATUSLINE_VIEW` JSON value. The C client
+forwards it as a string in `{statusline_input, statusline_view}` so each request
+has its own selection even though the daemon serves several Claude processes.
+Validate its version, session ID and agent ID before constructing a transcript
+path. For a valid selection, use the selected transcript's model, latest complete
+usage and cache history. Treat a missing transcript as unavailable. Keep quota
+bars account-wide and label the parent cost `session $…`.
+
+The mod starts `statusline-client --view-owner` once, lazily. Claude owns the
+child's lifetime; its exclusive lock on a unique `statusline-view-*` file is
+released on unload or termination. The renderer validates that handle on every
+normal invocation, before memo lookup. Do not replace this lifecycle signal with
+a recurring heartbeat. UI events update selection immediately.
+
+`settings.json` supplies a silent `subagentStatusLine` metadata command. The
+client's `--task-metadata` mode wraps native task rows with the explicit
+`statusline_task_metadata` flag; ingest them without producing task-row text.
+Context limits from these rows are authoritative for the corresponding agent.
+
+Use an explicitly supplied agent context-window size for a percentage. Matching
+response model names alone do not establish equal context limits. If the limit
+is unknown, display used tokens only. A five-minute cache is normal for an agent.
+
+Run `python3 -m unittest discover -v`, `claude plugin validate .`, and
+`claude plugin test .` from this directory after changing this integration.
+The native tests exercise real hook dispatch without calling a model.
+
 ## Where things live
 
 | Path | What it is |
@@ -54,6 +91,9 @@ compiler, and nothing else: there are no packages to install and no services to 
 | `statusline-render.py` | The whole renderer: metric engine, formatting, daemon |
 | `statusline-client.c` | Source of the client the harness runs on every refresh |
 | `statusline-command.sh` | Thin wrapper for anyone whose settings still point at the old shell entry point |
+| `hooks/register.js` | Native mod observing selected transcript and per-agent model/effort |
+| `.claude-plugin/plugin.json` | Plugin manifest, including the existing skill |
+| `settings.json` | Native task metadata feed; a user's own setting takes precedence |
 | `~/.claude/statusline-client` | The compiled client (a build artifact, never committed) |
 | `~/.claude/statusline-cache-health.db` | Per-message state in sqlite, rebuildable from the transcripts |
 | `~/.claude/statusline-cache-health.state.json` | Memo used only by the one-shot fallback path |
@@ -96,20 +136,28 @@ links a compacted conversation to what came before it) is deliberately not follo
 **`recached N.NNx`** is cumulative redundancy over the current footprint. Unlike health
 it does not heal: it amortizes as the conversation grows, and passes 1.00x once a
 conversation has been re-bought more than once over. This is the number that says what
-the session wasted. It does reset at a compaction boundary, along with everything else
-about the chain, so it measures waste since the last compaction rather than since the
-session began.
+the session wasted. A compaction boundary keeps the redundant-token total and
+starts a fresh cache-health chain.
+
+**`cache miss Nm ago`** reports the latest substantial loss of reuse, using the
+same greater-than-half threshold as health and a 2,048-token noise floor. It is
+time since the event, not the idle gap before it. Do not infer eviction or expiry
+from a fixed gap: usage counts do not establish the cause. Omit event age when
+the event has no usable timestamp.
 
 **The `1h` / `5m` badge** names which TTL class the last write landed in, read from
 `usage.cache_creation.ephemeral_1h_input_tokens` / `ephemeral_5m_input_tokens`. It is
-dimmed for the normal 1h and alarm-colored for 5m, which on a main session usually means overage.
+dimmed for the normal 1h and alarm-colored for a main session's 5m, which can mean overage.
+A selected subagent's 5m badge is neutral because that TTL is normal there.
 A call that wrote into both buckets reads `5m+1h`, also alarm-colored, and its expiry is
 computed against the shorter window, since that is the one that bites first.
 
-**`→ 03:41 (57:12)`** is the last call plus the TTL window, so it says when this cache
-expires and how long is left. The clock time comes first because an idle session stops re-rendering,
-which would leave a relative countdown showing a stale value, while a clock time stays
-correct on a frozen line. Once lapsed it reads `→ 03:41 (cold)`.
+**`→ ~03:41 (57:12)`** estimates the TTL boundary from the last timestamp and known
+TTL. The API starts its TTL at request start; an assistant transcript timestamp
+does not establish that exact instant. After the estimate passes, use
+`(TTL elapsed)`, or `(5m TTL elapsed)` for a mixed cache. That does not prove all
+cached content has been removed. Unknown TTL gets no expiry estimate. See the
+[current API documentation](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
 
 **`5h` / `7d`** come from `used_percentage` and `resets_at` on stdin. The 5h window shows
 wall clock plus a countdown, and the 7d window shows a weekday and date (Croatian day names, hardcoded
@@ -184,20 +232,17 @@ one.
 All measured from real transcripts, in a session on Claude Fable 5 (input $10/M, so a
 cache read costs $1/M, a 5m write $12.50/M, a 1h write $20/M).
 
-**Reads are found by a bounded walk, not an index.** Each `cache_control` marker probes
-at most 20 content blocks backwards for an existing entry, and a request may carry at
-most 4 markers. A single round trip that appends more than 20 blocks therefore strands
-the previous entry out of reach, and the server rewrites the whole prefix at the write
-rate even though the entry is sitting there valid. Measured: a batch of 10 parallel tool
-calls appended 22 blocks (thinking, text, 10 `tool_use`, 10 `tool_result`), stranding the
-previous entry by two blocks and re-writing 315,884 tokens, about $6.30. The fix is
-client-side and documented by Anthropic (an intermediate breakpoint every ~15 blocks in
-long turns); the harness does not do it, which is why the line reports it.
+**Historical lookup-window experiment.** A measured batch of 10 parallel tool
+calls was followed by 315,884 tokens of repeated work, about $6.30. The original
+explanation counted its 22 individual blocks against the lookup window. Current
+API documentation groups consecutive tool-use and tool-result blocks into one
+position each. Keep the measurement as history; do not treat ten parallel calls
+as proof of a lookup-window miss or infer that cause from the statusline alone.
 
 **The TTL depends on what kind of context it is, not on the model.** A main session
 writes at 1h, and so does a teammate, which is a session with its own mailbox. Plain
 subagents and `/subtask` workers write at 5m, on Haiku and on Fable alike. A parked
-subagent therefore goes cold in five minutes where a parked teammate lasts an hour.
+subagent therefore has a five-minute TTL, while that teammate has a one-hour TTL.
 
 **Forking and subtasking cost very different amounts.** A `/subtask` keeps the parent's prefix
 byte-identical and appends its directive, so it reads the parent's cache (measured: 431k
