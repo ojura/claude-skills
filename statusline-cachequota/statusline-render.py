@@ -1291,7 +1291,7 @@ def render_core(data, cache, origin_pid=None):
             base = base[:-6]
         parts.append(muted(base))
 
-    sep = (" %s " if COMPACT else "  %s  ") % muted("·")
+    sep = " %s " % muted("·")
     return sep.join(parts), slots
 
 

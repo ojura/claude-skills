@@ -59,7 +59,7 @@ Only present, supported settings are sent on the existing socket request. Parsed
 display profiles are reused across clients, so unchanged terminals do not keep
 re-parsing palette overrides.
 
-`CLAUDE_STATUSLINE_COMPACT=1` shortens separators and renewal stamps and omits the
+`CLAUDE_STATUSLINE_COMPACT=1` shortens renewal stamps and omits the
 session id. The embedded context value remains because it carries more information per
 column than the lower-priority fields it replaces.
 
