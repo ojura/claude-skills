@@ -78,7 +78,9 @@ class PrepareInvocation(NamedTuple):
     tool_use_id: str
     boundary_uuid: str | None
     recorded_at: float | None
-    worker_snapshot: WorkerSnapshot | None = None
+    template_record: dict[str, Any] | None = None
+    source_bytes: bytes | None = None
+    response_offset: int = 0
 
 
 class CallerSelection(NamedTuple):
@@ -86,6 +88,7 @@ class CallerSelection(NamedTuple):
     transcript: Path
     invocation: PrepareInvocation | None
     worker_snapshot: WorkerSnapshot | None = None
+    main_reference: tuple[str, dict[str, Any]] | None = None
 
 
 def description_slug(description: str) -> str:
@@ -155,7 +158,10 @@ def find_parent_jsonl(
 def message_tool_use_ids(entry: dict[str, Any]) -> set[str]:
     if entry.get("type") != "assistant":
         return set()
-    content = entry.get("message", {}).get("content")
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return set()
+    content = message.get("content")
     if not isinstance(content, list):
         return set()
     return {
@@ -170,7 +176,10 @@ def message_tool_use_ids(entry: dict[str, Any]) -> set[str]:
 def message_tool_result_ids(entry: dict[str, Any]) -> set[str]:
     if entry.get("type") != "user":
         return set()
-    content = entry.get("message", {}).get("content")
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return set()
+    content = message.get("content")
     if not isinstance(content, list):
         return set()
     return {
@@ -185,68 +194,56 @@ def message_tool_result_ids(entry: dict[str, Any]) -> set[str]:
 def read_parent_reference(
     parent_jsonl: Path,
     explicit_uuid: str | None,
-) -> tuple[str, int, dict[str, Any]]:
-    """Return a usable parent UUID, an informational count, and its record."""
-    entries: list[dict[str, Any]] = []
-    by_uuid: dict[str, dict[str, Any]] = {}
+) -> tuple[str, dict[str, Any]]:
+    """Read the requested boundary, or the last main record for a manual fork."""
+    data = parent_jsonl.read_bytes()
 
-    for entry in read_transcript_records(parent_jsonl):
-        entry_uuid = entry.get("uuid")
-        if not isinstance(entry_uuid, str) or entry.get("isSidechain") is True:
-            continue
-        entries.append(entry)
-        by_uuid[entry_uuid] = entry
+    def find_uuid(value: str) -> tuple[int, dict[str, Any]]:
+        matches = [
+            (offset, record) for offset, record in matching_records(data, value, parent_jsonl)
+            if record.get("uuid") == value and record.get("isSidechain") is not True
+        ]
+        if not matches:
+            raise UsageError(f"parent UUID {value!r} is not in {parent_jsonl}")
+        return matches[-1]
 
-    if not entries:
-        raise UsageError(f"parent transcript contains no UUID records: {parent_jsonl}")
-
-    if explicit_uuid:
-        if explicit_uuid not in by_uuid:
-            raise UsageError(
-                f"parent UUID {explicit_uuid!r} is not in {parent_jsonl}"
-            )
-        selected = by_uuid[explicit_uuid]
+    if explicit_uuid is not None:
+        offset, selected = find_uuid(explicit_uuid)
     else:
-        selected = entries[-1]
+        end = len(data)
+        selected = None
+        while end > 0:
+            start = data.rfind(b"\n", 0, end - 1) + 1
+            line = data[start:end]
+            if b'"uuid"' in line:
+                records = decode_transcript_records(line, parent_jsonl, data.count(b"\n", 0, start) + 1)
+                if records and isinstance(records[0].get("uuid"), str) and records[0].get("isSidechain") is not True:
+                    offset, selected = start, records[0]
+                    break
+            end = start
+        if selected is None:
+            raise UsageError(f"parent transcript contains no UUID records: {parent_jsonl}")
 
-    selected_uuid = str(selected["uuid"])
-    selected_index = next(
-        index for index, entry in enumerate(entries) if entry.get("uuid") == selected_uuid
-    )
-    completed_tool_ids = {
-        tool_id
-        for entry in entries[: selected_index + 1]
-        for tool_id in message_tool_result_ids(entry)
-    }
-    pending = message_tool_use_ids(selected) - completed_tool_ids
-    if pending:
-        if explicit_uuid:
-            raise UsageError(
-                f"parent UUID {explicit_uuid!r} ends at an unfinished tool call"
-            )
-        # The helper normally runs inside this tool call. Referencing the assistant's
-        # unfinished tool_use would leave the new worker with no matching tool_result.
+    def pending(record: dict[str, Any], position: int) -> bool:
+        for tool_id in message_tool_use_ids(record):
+            if not any(
+                result_offset <= position and result.get("isSidechain") is not True
+                and tool_id in message_tool_result_ids(result)
+                for result_offset, result in matching_records(data, tool_id, parent_jsonl)
+            ):
+                return True
+        return False
+
+    if pending(selected, offset):
+        if explicit_uuid is not None:
+            raise UsageError(f"parent UUID {explicit_uuid!r} ends at an unfinished tool call")
         parent_uuid = selected.get("parentUuid")
-        if not isinstance(parent_uuid, str) or parent_uuid not in by_uuid:
-            raise UsageError(
-                "the newest parent entry is an unfinished tool call and has no usable parent"
-            )
-        selected = by_uuid[parent_uuid]
-        selected_uuid = str(selected["uuid"])
-        selected_index = next(
-            index for index, entry in enumerate(entries) if entry.get("uuid") == selected_uuid
-        )
-        completed_tool_ids = {
-            tool_id
-            for entry in entries[: selected_index + 1]
-            for tool_id in message_tool_result_ids(entry)
-        }
-        if message_tool_use_ids(selected) - completed_tool_ids:
-            raise UsageError(
-                "the parent before the newest unfinished tool call is also incomplete"
-            )
-
-    return selected_uuid, selected_index + 1, selected
+        if not isinstance(parent_uuid, str):
+            raise UsageError("the newest parent entry is an unfinished tool call and has no usable parent")
+        offset, selected = find_uuid(parent_uuid)
+        if pending(selected, offset):
+            raise UsageError("the parent before the newest unfinished tool call is also incomplete")
+    return str(selected["uuid"]), selected
 
 
 def write_bytes_exclusive(path: Path, data: bytes, mode: int = 0o600) -> None:
@@ -452,7 +449,7 @@ def make_fork_seed(
 
 
 def prepare_main_agent(
-    args: argparse.Namespace, invocation: PrepareInvocation | None
+    args: argparse.Namespace, selection: CallerSelection
 ) -> dict[str, Any]:
     description, agent_name, agent_id = agent_identity(args)
     model, fork_another_model, cache_warning = fork_model_settings(args)
@@ -463,14 +460,15 @@ def prepare_main_agent(
         session_id=args.session_id,
         projects_root=projects_root,
     )
-    boundary_uuid = args.parent_last_uuid
-    if boundary_uuid is None and invocation is not None:
-        boundary_uuid = invocation.boundary_uuid
-        if boundary_uuid is None:
+    if selection.main_reference is not None:
+        parent_uuid, parent_record = selection.main_reference
+    elif selection.invocation is not None:
+        parent_uuid = selection.invocation.boundary_uuid
+        if parent_uuid is None:
             raise UsageError("the active main prepare invocation has no parent boundary")
-    parent_uuid, context_length, parent_record = read_parent_reference(
-        parent_jsonl, boundary_uuid
-    )
+        parent_record = selection.invocation.template_record or {}
+    else:
+        raise UsageError("caller discovery did not provide the main boundary")
 
     session_directory = parent_jsonl.parent / session_id
     subagents_directory = session_directory / "subagents"
@@ -480,8 +478,6 @@ def prepare_main_agent(
         "agentId": agent_id,
         "parentSessionId": session_id,
         "parentLastUuid": parent_uuid,
-        # Claude Code 2.1.259 records this field but does not read it while hydrating.
-        "contextLength": context_length,
     }
     seed = make_fork_seed(agent_id, session_id, None, parent_record)
 
@@ -515,49 +511,116 @@ def prepare_main_agent(
     }
 
 
-def read_transcript_records(path: Path) -> list[dict[str, Any]]:
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        lines = handle.readlines()
+def decode_transcript_records(
+    data: bytes, path: Path, start_line: int = 1,
+) -> list[dict[str, Any]]:
+    lines = data.decode("utf-8", errors="replace").split("\n")
     records: list[dict[str, Any]] = []
-    for line_number, line in enumerate(lines, 1):
-        # The loader ignores empty rows and NUL/JSON-whitespace padding.
-        # Do not strip these characters from a row that contains JSON.
-        if not line.strip("\x00 \t\r\n"):
+    for index, line in enumerate(lines):
+        if not line.strip("\x00 \t\r"):
             continue
         try:
             record = json.loads(line)
         except json.JSONDecodeError as error:
-            # A final row without a newline may still be being written.
-            if line_number == len(lines) and not line.endswith("\n"):
+            if index == len(lines) - 1 and not data.endswith(b"\n"):
                 continue
             raise UsageError(
-                f"invalid JSON in {path} at line {line_number}: {error}"
+                f"invalid JSON in {path} at line {start_line + index}: {error}"
             ) from error
         if isinstance(record, dict):
             records.append(record)
     return records
 
 
-SHELL_OPERATORS = {";", "&&", "||", "|", "&"}
+def read_transcript_records(path: Path) -> list[dict[str, Any]]:
+    return decode_transcript_records(path.read_bytes(), path)
+
+
+def matching_records(
+    data: bytes, token: str | re.Pattern[bytes], path: Path, start: int = 0,
+) -> Iterable[tuple[int, dict[str, Any]]]:
+    """Decode only rows containing the lookup token; a match is not a caller."""
+    if isinstance(token, str) and not token:
+        raise UsageError(f"empty lookup identifier for {path}")
+    pattern = re.compile(re.escape(token.encode())) if isinstance(token, str) else token
+    position = start
+    while position < len(data) and (match := pattern.search(data, position)):
+        offset = data.rfind(b"\n", 0, match.start()) + 1
+        end = data.find(b"\n", match.end())
+        end = len(data) if end < 0 else end + 1
+        for record in decode_transcript_records(
+            data[offset:end], path, data.count(b"\n", 0, offset) + 1
+        ):
+            yield offset, record
+        position = end
+
+
 SHELL_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 PYTHON_COMMAND_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?")
 
 
 def shell_command_segments(command: str) -> list[list[str]]:
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        words = list(lexer)
-    except ValueError:
-        return []
+    # Keep quotes until command separators and shell assignments are identified.
+    # shlex decodes each word afterwards; quoted operators remain arguments.
     segments: list[list[str]] = [[]]
-    for word in words:
-        if word in SHELL_OPERATORS:
+    word: list[str] = []
+    quote: str | None = None
+    index = 0
+
+    def finish_word() -> None:
+        if word:
+            segments[-1].append("".join(word))
+            word.clear()
+
+    while index < len(command):
+        char = command[index]
+        if char == "\\" and quote != "'":
+            if index + 1 == len(command):
+                return []
+            if command[index + 1] != "\n":
+                word.extend(command[index:index + 2])
+            index += 2
+            continue
+        if quote is not None:
+            word.append(char)
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+            word.append(char)
+        elif char == "#" and not word:
+            newline = command.find("\n", index)
+            index = len(command) if newline < 0 else newline
+            continue
+        elif char in "()`" or command.startswith(("<<", "$("), index):
+            # Compound shell programs are not inferred from text inside them.
+            return []
+        elif char in "<>" or command.startswith("&>", index):
+            finish_word()
+            operator = next(
+                (value for value in ("&>>", "&>", ">&", "<&", ">>", ">|", "<>")
+                 if command.startswith(value, index)), char
+            )
+            segments[-1].append(operator)
+            index += len(operator)
+            continue
+        elif char in ";&|\n":
+            finish_word()
             if segments[-1]:
                 segments.append([])
-            continue
-        segments[-1].append(word)
+        elif char.isspace():
+            finish_word()
+        else:
+            word.append(char)
+        index += 1
+    if quote is not None:
+        return []
+    finish_word()
+    if any(segment and segment[0] in {
+        "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done",
+        "case", "esac", "select", "function", "{", "}",
+    } for segment in segments):
+        return []
     return [segment for segment in segments if segment]
 
 
@@ -566,6 +629,11 @@ def segment_invokes_prepare(
     description: str | None = None,
     invocation_id: str | None = None,
 ) -> bool:
+    raw_words = words
+    try:
+        words = [shlex.split(word, posix=True)[0] for word in raw_words]
+    except (ValueError, IndexError):
+        return False
     assignments: dict[str, str] = {}
 
     def record_assignment(word: str) -> None:
@@ -573,7 +641,7 @@ def segment_invokes_prepare(
         assignments[name] = value
 
     index = 0
-    while index < len(words) and SHELL_ASSIGNMENT_RE.fullmatch(words[index]):
+    while index < len(words) and SHELL_ASSIGNMENT_RE.fullmatch(raw_words[index]):
         record_assignment(words[index])
         index += 1
     while index < len(words):
@@ -630,111 +698,107 @@ def command_invokes_prepare(
     )
 
 
+CONVERSATION_ROW = re.compile(rb'"type"\s*:\s*"(?:user|assistant)"')
+
+
 def active_prepare_invocations(
     path: Path,
     source_id: str | None,
     description: str,
     invocation_id: str | None = None,
+    not_before: float | None = None,
 ) -> list[PrepareInvocation]:
-    records = read_transcript_records(path)
-    completed = {
-        tool_id
-        for record in records
-        for tool_id in message_tool_result_ids(record)
-    }
+    data = path.read_bytes()
 
-    def belongs_to_caller(record: dict[str, Any]) -> bool:
+    def belongs(record: dict[str, Any]) -> bool:
         if source_id is None:
             return record.get("isSidechain") is not True
-        return (
-            record.get("agentId") == source_id
-            and record.get("isSidechain") is True
-        )
+        return record.get("agentId") == source_id and record.get("isSidechain") is True
 
-    invocations: list[PrepareInvocation] = []
-    for record_index, record in enumerate(records):
-        if record.get("type") != "assistant" or not belongs_to_caller(record):
+    invocations = []
+    for offset, record in matching_records(data, invocation_id or "super_subagent.py", path):
+        if record.get("type") != "assistant" or not belongs(record):
             continue
         assistant_uuid = record.get("uuid")
-        if not isinstance(assistant_uuid, str):
+        message = record.get("message")
+        if not isinstance(assistant_uuid, str) or not assistant_uuid or not isinstance(message, dict):
             continue
-        message = record.get("message", {})
-        content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, list):
+        content = message.get("content")
+        if message.get("role") != "assistant" or not isinstance(content, list):
             continue
-        response_id = message.get("id") if isinstance(message.get("id"), str) else None
-        group_indices = [
-            index
-            for index, candidate in enumerate(records)
-            if candidate.get("type") == "assistant"
-            and belongs_to_caller(candidate)
-            and (
-                candidate.get("message", {}).get("id") == response_id
-                if response_id is not None
-                else index == record_index
-            )
-        ]
-        group_start = min(group_indices)
-        group_end = max(group_indices)
-        later_completed_response = any(
-            candidate.get("type") == "assistant"
-            and belongs_to_caller(candidate)
-            and candidate.get("message", {}).get("id") != response_id
-            and candidate.get("message", {}).get("stop_reason") is not None
-            for candidate in records[group_end + 1 :]
-        )
-        later_user_turn = any(
-            candidate.get("type") == "user"
-            and belongs_to_caller(candidate)
-            and not message_tool_result_ids(candidate)
-            for candidate in records[group_end + 1 :]
-        )
-        if later_completed_response or (invocation_id is None and later_user_turn):
-            continue
-        boundary_uuid = records[group_start].get("parentUuid")
-        if boundary_uuid is not None and not isinstance(boundary_uuid, str):
+        timestamp = record_timestamp(record)
+        if not_before is not None and not timestamp >= not_before:
             continue
         for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
+            if not isinstance(block, dict) or block.get("type") != "tool_use" or block.get("name") != "Bash":
                 continue
             tool_id = block.get("id")
             tool_input = block.get("input")
             command = tool_input.get("command") if isinstance(tool_input, dict) else None
-            if (
-                isinstance(tool_id, str)
-                and tool_id not in completed
-                and block.get("name") == "Bash"
-                and isinstance(command, str)
-                and command_invokes_prepare(command, description, invocation_id)
+            if not isinstance(tool_id, str) or not tool_id or not isinstance(command, str):
+                continue
+            if not command_invokes_prepare(command, description, invocation_id):
+                continue
+            if any(
+                belongs(result) and tool_id in message_tool_result_ids(result)
+                for _, result in matching_records(data, tool_id, path)
             ):
-                timestamp = record_timestamp(record)
-                snapshot = None
-                if source_id is not None:
-                    prefix = records[:group_start]
-                    template = next(
-                        (entry for entry in reversed(prefix) if entry.get("uuid") == boundary_uuid),
-                        record,
-                    )
-                    snapshot = WorkerSnapshot(
-                        prefix, boundary_uuid, template, len(records) - group_start,
-                        sorted({tool_id for entry in records[group_start:]
-                                for tool_id in message_tool_use_ids(entry)}),
-                    )
-                invocations.append(
-                    PrepareInvocation(
-                        source_id=source_id,
-                        transcript=path,
-                        assistant_uuid=assistant_uuid,
-                        response_id=response_id,
-                        tool_use_id=tool_id,
-                        boundary_uuid=boundary_uuid,
-                        recorded_at=(
-                            None if timestamp == float("-inf") else timestamp
-                        ),
-                        worker_snapshot=snapshot,
-                    )
+                continue
+            response_id = message.get("id")
+            response_id = response_id if isinstance(response_id, str) and response_id else None
+            group = [
+                (position, member) for position, member in matching_records(data, response_id or assistant_uuid, path)
+                if member.get("type") == "assistant" and belongs(member)
+                and isinstance(member.get("message"), dict) and (
+                    member["message"].get("id") == response_id
+                    if response_id is not None else member.get("uuid") == assistant_uuid
                 )
+            ]
+            if not group:
+                raise UsageError(f"could not locate response {response_id or assistant_uuid!r} in {path}")
+            group_start, first = group[0]
+            group_end = data.find(b"\n", group[-1][0])
+            group_end = len(data) if group_end < 0 else group_end + 1
+            later = [
+                candidate for _, candidate in matching_records(data, CONVERSATION_ROW, path, group_end)
+                if belongs(candidate)
+            ]
+            if any(candidate.get("type") == "assistant"
+                   and isinstance(candidate.get("message"), dict)
+                   and candidate["message"].get("stop_reason") is not None for candidate in later):
+                continue
+            if invocation_id is None and any(
+                candidate.get("type") == "user" and not message_tool_result_ids(candidate) for candidate in later
+            ):
+                continue
+            boundary_uuid = first.get("parentUuid")
+            if boundary_uuid is not None and not isinstance(boundary_uuid, str):
+                continue
+            invocations.append(PrepareInvocation(
+                source_id, path, assistant_uuid, response_id, tool_id, boundary_uuid,
+                None if timestamp == float("-inf") else timestamp,
+                first, data if source_id is not None else None, group_start,
+            ))
     return invocations
+
+
+def resolved_invocation(invocation: PrepareInvocation) -> CallerSelection:
+    snapshot = None
+    if invocation.source_id is not None:
+        assert invocation.source_bytes is not None
+        data = invocation.source_bytes
+        offset = invocation.response_offset
+        prefix = decode_transcript_records(data[:offset], invocation.transcript)
+        tail = decode_transcript_records(data[offset:], invocation.transcript, data.count(b"\n", 0, offset) + 1)
+        template = next(
+            (record for record in reversed(prefix) if record.get("uuid") == invocation.boundary_uuid),
+            invocation.template_record or {},
+        )
+        snapshot = WorkerSnapshot(
+            prefix, invocation.boundary_uuid, template, len(tail),
+            sorted({tool_id for record in tail for tool_id in message_tool_use_ids(record)}),
+        )
+    return CallerSelection(invocation.source_id, invocation.transcript, invocation, snapshot)
 
 
 def agent_id_from_filename(path: Path) -> str:
@@ -834,7 +898,10 @@ def discover_prepare_caller(
     subagents_directory: Path,
 ) -> CallerSelection:
     if args.from_main:
-        return CallerSelection(None, parent_jsonl, None)
+        return CallerSelection(
+            None, parent_jsonl, None,
+            main_reference=read_parent_reference(parent_jsonl, args.parent_last_uuid),
+        )
 
     transcript_candidates = agent_transcript_candidates(subagents_directory)
     selected = source_agent_from_options(args, transcript_candidates)
@@ -843,11 +910,16 @@ def discover_prepare_caller(
         source_is_explicit = bool(args.from_agent_id or args.from_agent_name)
         invocation_id = caller_invocation_id(required=not source_is_explicit)
         invocations = active_prepare_invocations(
-            source_path, source_id, args.description, invocation_id
+            source_path, source_id, args.description, invocation_id,
+            None if source_is_explicit else time.time() - CALLER_INVOCATION_MAX_AGE_SECONDS,
         )
-        invocation = invocations[-1] if invocations else None
+        if not invocations and not source_is_explicit:
+            raise UsageError(f"could not identify the active prepare invocation in {source_path}")
+        if len(invocations) > 1:
+            raise UsageError(f"multiple active prepare invocations in {source_path}")
+        invocation = invocations[0] if invocations else None
         if invocation is not None:
-            snapshot = invocation.worker_snapshot
+            return resolved_invocation(invocation)
         else:
             records = read_transcript_records(source_path)
             last_message = next(
@@ -876,7 +948,10 @@ def discover_prepare_caller(
 
     def scan_transcript(path: Path, source_id: str | None) -> list[PrepareInvocation]:
         try:
-            found = active_prepare_invocations(path, source_id, args.description, invocation_id)
+            found = active_prepare_invocations(
+                path, source_id, args.description, invocation_id,
+                started_wall - CALLER_INVOCATION_MAX_AGE_SECONDS,
+            )
         except (OSError, UsageError) as error:
             read_errors[path] = (
                 str(error) if isinstance(error, UsageError)
@@ -893,13 +968,7 @@ def discover_prepare_caller(
         found = scan_transcript(parent_jsonl, None)
         for source_id, transcript in agent_transcript_candidates(subagents_directory):
             found.extend(scan_transcript(transcript, source_id))
-        invocations = [
-            invocation
-            for invocation in found
-            if invocation.recorded_at is not None
-            and invocation.recorded_at
-            >= started_wall - CALLER_INVOCATION_MAX_AGE_SECONDS
-        ]
+        invocations = found
         now = time.monotonic()
         signature = tuple(
             sorted(
@@ -939,9 +1008,12 @@ def discover_prepare_caller(
             f"(candidates: {rendered}); pass --from-main or --from-agent-id"
         )
     invocation = invocations[0]
-    return CallerSelection(
-        invocation.source_id, invocation.transcript, invocation, invocation.worker_snapshot
-    )
+    if invocation.source_id is None and args.parent_last_uuid is not None:
+        return CallerSelection(
+            None, parent_jsonl, invocation,
+            main_reference=read_parent_reference(parent_jsonl, args.parent_last_uuid),
+        )
+    return resolved_invocation(invocation)
 
 
 def record_timestamp(record: dict[str, Any]) -> float:
@@ -1110,7 +1182,7 @@ def prepare_agent(args: argparse.Namespace) -> dict[str, Any]:
     subagents_directory = parent_jsonl.parent / session_id / "subagents"
     selection = discover_prepare_caller(args, parent_jsonl, subagents_directory)
     if selection.source_id is None:
-        return prepare_main_agent(args, selection.invocation)
+        return prepare_main_agent(args, selection)
     if args.parent_last_uuid:
         raise UsageError("--parent-last-uuid is valid only when preparing from main")
     if selection.worker_snapshot is None:

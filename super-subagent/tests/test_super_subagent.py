@@ -153,7 +153,7 @@ class SuperSubagentTest(unittest.TestCase):
                 raw = super_subagent.json_line(records[0]) + padding + super_subagent.json_line(records[1])
                 self.parent.write_bytes(raw)
                 self.assertEqual(super_subagent.read_transcript_records(self.parent), records)
-                self.assertEqual(super_subagent.read_parent_reference(self.parent, None), ("after", 2, records[1]))
+                self.assertEqual(super_subagent.read_parent_reference(self.parent, None), ("after", records[1]))
                 self.assertEqual(self.parent.read_bytes(), raw)
 
     def test_prepare_main_ignores_nul_padding(self):
@@ -163,7 +163,7 @@ class SuperSubagentTest(unittest.TestCase):
         result = super_subagent.prepare_agent(self.prepare_args())
         reference = json.loads(Path(result["jsonl"]).read_text().splitlines()[0])
         self.assertEqual(reference["parentLastUuid"], "after")
-        self.assertEqual(reference["contextLength"], 2)
+        self.assertNotIn("contextLength", reference)
         self.assertEqual(self.parent.read_bytes(), raw)
 
     def test_detects_both_nonce_segments_after_padding_with_python_flags(self):
@@ -185,7 +185,7 @@ class SuperSubagentTest(unittest.TestCase):
                     ))
                 reference = json.loads(Path(result["jsonl"]).read_text().splitlines()[0])
                 self.assertEqual(reference["parentLastUuid"], "before")
-                self.assertEqual(reference["contextLength"], 1)
+                self.assertNotIn("contextLength", reference)
         self.assertEqual(self.parent.read_bytes(), raw)
 
     def test_worker_copy_preserves_valid_history_around_padding(self):
@@ -209,8 +209,7 @@ class SuperSubagentTest(unittest.TestCase):
                 raw = (super_subagent.json_line(records[0]) + b"\n" + b"\x00" * 1683 + b"\n"
                        + malformed + super_subagent.json_line(records[1]))
                 self.parent.write_bytes(raw)
-                for reader in (lambda: super_subagent.read_transcript_records(self.parent),
-                               lambda: super_subagent.read_parent_reference(self.parent, None)):
+                for reader in (lambda: super_subagent.read_transcript_records(self.parent),):
                     with self.assertRaises(super_subagent.UsageError) as raised:
                         reader()
                     self.assertIn(str(self.parent), str(raised.exception))
@@ -223,37 +222,43 @@ class SuperSubagentTest(unittest.TestCase):
         prefix = super_subagent.json_line(records[0]) + b"\x00" * 1683 + b"\n" + super_subagent.json_line(records[1])
         self.parent.write_bytes(prefix + b'{"type":')
         self.assertEqual(super_subagent.read_transcript_records(self.parent), records)
-        self.assertEqual(super_subagent.read_parent_reference(self.parent, None), ("after", 2, records[1]))
+        self.assertEqual(super_subagent.read_parent_reference(self.parent, None), ("after", records[1]))
         self.parent.write_bytes(prefix + b'{"type":\n')
-        for reader in (lambda: super_subagent.read_transcript_records(self.parent),
-                       lambda: super_subagent.read_parent_reference(self.parent, None)):
+        for reader in (lambda: super_subagent.read_transcript_records(self.parent),):
             with self.assertRaisesRegex(super_subagent.UsageError, "at line 4:"):
                 reader()
         self.parent.write_bytes(prefix.rstrip(b"\n"))
         self.assertEqual(super_subagent.read_transcript_records(self.parent), records)
 
-    def test_automatic_discovery_reports_read_failure_instead_of_missing_caller(self):
+    def test_main_nonce_lookup_ignores_unrelated_malformed_history(self):
         description = "Unreadable parent"
         command = invocation_command(f"python3 -I -B {SCRIPT} prepare '{description}'")
-        raw = (super_subagent.json_line(self.padding_history()[0]) + b'{"broken":}\n'
+        old_record = self.padding_history()[0]
+        old_record["message"]["content"] = "unrelated-history-must-not-be-decoded"
+        raw = (super_subagent.json_line(old_record) + b'{"broken":}\n'
                + super_subagent.json_line(self.main_prepare_record(command)))
         self.parent.write_bytes(raw)
+        loads = json.loads
+
+        def decode_lookup_only(value, *args, **kwargs):
+            self.assertNotIn("unrelated-history-must-not-be-decoded", value)
+            return loads(value, *args, **kwargs)
+
         with self.caller_environment():
-            with self.assertRaises(super_subagent.UsageError) as raised:
-                super_subagent.prepare_agent(self.prepare_args(
-                    description=description, from_main=False, caller_discovery_timeout=0.02,
-                ))
-        diagnostic = str(raised.exception)
-        self.assertIn("transcript read failures", diagnostic)
-        self.assertIn(str(self.parent), diagnostic)
-        self.assertIn("at line 2:", diagnostic)
+            with mock.patch.object(super_subagent, "read_transcript_records", side_effect=AssertionError("full parse")):
+                with mock.patch.object(super_subagent.json, "loads", side_effect=decode_lookup_only):
+                    result = super_subagent.prepare_agent(self.prepare_args(
+                        description=description, from_main=False,
+                    ))
+        reference = json.loads(Path(result["jsonl"]).read_text().splitlines()[0])
+        self.assertEqual(reference["parentLastUuid"], "before")
         self.assertEqual(self.parent.read_bytes(), raw)
 
     def test_automatic_discovery_reports_io_failure_with_the_path(self):
         self.write_parent(self.padding_history())
         error = PermissionError(13, "Permission denied", str(self.parent))
         with self.caller_environment():
-            with mock.patch.object(super_subagent, "read_transcript_records", side_effect=error):
+            with mock.patch.object(Path, "read_bytes", side_effect=error):
                 with self.assertRaises(super_subagent.UsageError) as raised:
                     super_subagent.prepare_agent(self.prepare_args(
                         from_main=False, caller_discovery_timeout=0.02,
@@ -273,6 +278,143 @@ class SuperSubagentTest(unittest.TestCase):
             result = super_subagent.prepare_agent(self.prepare_args(description=description, from_main=False))
         reference = json.loads(Path(result["jsonl"]).read_text().splitlines()[0])
         self.assertEqual(reference["parentLastUuid"], "before")
+
+    def test_explicit_main_uuid_ignores_unrelated_malformed_history(self):
+        before, after = self.padding_history()
+        mention = {"type": "user", "uuid": "quoted-uuid", "parentUuid": "after",
+                   "message": {"role": "user", "content": "The UUID is after"}}
+        raw = (b'{"broken":}\n' + super_subagent.json_line(before) + super_subagent.json_line(after)
+               + super_subagent.json_line(mention) + b'{"irrelevant":}\n')
+        self.parent.write_bytes(raw)
+        with mock.patch.object(super_subagent, "read_transcript_records", side_effect=AssertionError("full parse")):
+            result = super_subagent.prepare_agent(self.prepare_args(parent_last_uuid="after"))
+        reference = json.loads(Path(result["jsonl"]).read_text().splitlines()[0])
+        self.assertEqual(reference["parentLastUuid"], "after")
+        self.assertEqual(self.parent.read_bytes(), raw)
+
+    def test_nonce_mentions_do_not_identify_a_tool_invocation(self):
+        description = "Real call only"
+        command = invocation_command(f"python3 -I -B {SCRIPT} prepare '{description}'")
+        actual = self.main_prepare_record(command)
+        mentions = [
+            {"type": "user", "uuid": "user-mention", "message": {"role": "user", "content": command}},
+            {"type": "assistant", "uuid": "text-mention", "timestamp": time.time(),
+             "message": {"id": "quoted-response", "role": "assistant", "content": [{"type": "text", "text": command}]}},
+            {"type": "user", "uuid": "result-mention", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "unrelated", "content": command}]}},
+            {"type": "api-request-blob", "blob": actual},
+            {"type": "assistant", "uuid": "invalid-assistant", "message": None,
+             "quoted": command + " prepare-response call_prepare"},
+            {"type": "user", "uuid": "invalid-user", "message": None,
+             "quoted": command + " prepare-response call_prepare"},
+        ]
+        for number, fake_command in enumerate((
+            f"printf '%s' '{command}'",
+            f"true # ignored ; {command}",
+            f"printf '%s' '&&' '{super_subagent.CALLER_INVOCATION_ENV}={TEST_CALLER_INVOCATION_ID}' python3 {SCRIPT} prepare '{description}'",
+        )):
+            record = self.main_prepare_record(fake_command)
+            record["uuid"] = f"fake-{number}"
+            record["message"]["id"] = f"fake-response-{number}"
+            mentions.append(record)
+        self.write_parent([self.padding_history()[0], *mentions])
+        found = super_subagent.active_prepare_invocations(self.parent, None, description, TEST_CALLER_INVOCATION_ID)
+        self.assertEqual(found, [])
+        self.write_parent([self.padding_history()[0], *mentions, actual])
+        found = super_subagent.active_prepare_invocations(self.parent, None, description, TEST_CALLER_INVOCATION_ID)
+        self.assertEqual([entry.assistant_uuid for entry in found], [actual["uuid"]])
+
+    def test_command_matching_preserves_quoted_operators_and_comments(self):
+        description = "A child"
+        assignment = f"{super_subagent.CALLER_INVOCATION_ENV}={TEST_CALLER_INVOCATION_ID}"
+        executable = f"python3 -I -B {SCRIPT} prepare '{description}'"
+        valid = (
+            f"{assignment} {executable}",
+            f"# comment\n{assignment} {executable}",
+            assignment + " " + chr(92) + "\n " + executable,
+            f"X='two words' {assignment} {executable}",
+            f"env '{assignment}' {executable}",
+            f"{assignment} {executable} > /tmp/output 2>&1",
+        )
+        invalid = (
+            f"echo ignored # {assignment} {executable}",
+            f"echo ignored # ; {assignment} {executable}",
+            f"printf '%s' '&&' '{assignment}' {executable}",
+            f"'{assignment}' {executable}",
+            f"printf x >& {assignment} {executable}",
+            f"printf x &> {assignment} {executable}",
+            f"printf x >| {assignment} {executable}",
+            f"cat <<'END'\n{assignment} {executable}\nEND",
+        )
+        for command in valid:
+            with self.subTest(valid=command):
+                self.assertTrue(super_subagent.command_invokes_prepare(command, description, TEST_CALLER_INVOCATION_ID))
+        for command in invalid:
+            with self.subTest(invalid=command):
+                self.assertFalse(super_subagent.command_invokes_prepare(command, description, TEST_CALLER_INVOCATION_ID))
+
+    def test_matching_malformed_nonce_record_reports_its_row(self):
+        raw = (super_subagent.json_line(self.padding_history()[0])
+               + b'{"type":"assistant","nonce":"' + TEST_CALLER_INVOCATION_ID.encode() + b'",broken}\n')
+        self.parent.write_bytes(raw)
+        with self.caller_environment():
+            with self.assertRaises(super_subagent.UsageError) as raised:
+                super_subagent.prepare_agent(self.prepare_args(from_main=False, caller_discovery_timeout=0.02))
+        self.assertIn(str(self.parent), str(raised.exception))
+        self.assertIn("at line 2:", str(raised.exception))
+
+    def test_matching_malformed_uuid_record_reports_its_row(self):
+        self.parent.write_bytes(b'{"uuid":"requested",broken}\n')
+        with self.assertRaisesRegex(super_subagent.UsageError, "at line 1:"):
+            super_subagent.prepare_agent(self.prepare_args(parent_last_uuid="requested"))
+        with self.assertRaisesRegex(super_subagent.UsageError, "empty lookup identifier"):
+            super_subagent.prepare_agent(self.prepare_args(parent_last_uuid=""))
+
+    def test_completed_tool_call_is_not_an_active_nonce_match(self):
+        description = "Completed call"
+        command = invocation_command(f"python3 {SCRIPT} prepare '{description}'")
+        call = self.main_prepare_record(command)
+        result = {"type": "user", "uuid": "done", "parentUuid": call["uuid"], "message": {
+            "role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_prepare", "content": "done"}]}}
+        self.write_parent([self.padding_history()[0], call, result])
+        self.assertEqual(super_subagent.active_prepare_invocations(self.parent, None, description, TEST_CALLER_INVOCATION_ID), [])
+
+    def test_nonce_lookup_retains_uniqueness_and_freshness(self):
+        description = "Unique fresh call"
+        command = invocation_command(f"python3 {SCRIPT} prepare '{description}'")
+        first = self.main_prepare_record(command)
+        second = json.loads(json.dumps(first))
+        second["uuid"] = "another-call"
+        second["message"]["content"][0]["id"] = "another-tool"
+        self.write_parent([self.padding_history()[0], first, second])
+        with self.caller_environment():
+            with self.assertRaisesRegex(super_subagent.UsageError, "could not identify one caller"):
+                super_subagent.prepare_agent(self.prepare_args(description=description, from_main=False, caller_discovery_timeout=0.02))
+        for timestamp in (time.time() - 60, None, float("nan")):
+            with self.subTest(timestamp=timestamp):
+                first["timestamp"] = timestamp
+                self.write_parent([self.padding_history()[0], first])
+                with self.caller_environment():
+                    with self.assertRaisesRegex(super_subagent.UsageError, "candidates: none"):
+                        super_subagent.prepare_agent(self.prepare_args(description=description, from_main=False, caller_discovery_timeout=0.02))
+
+    def test_worker_environment_requires_a_verified_fresh_invocation(self):
+        self.write_parent([{"type": "user", "uuid": "parent-root-uuid", "parentUuid": None}])
+        source_id = "asource-fork-0123456789abcdef"
+        for number, kind in enumerate(("expired", "mention")):
+            with self.subTest(kind=kind):
+                records = self.source_fork_records(source_id)
+                if kind == "expired":
+                    records[-1]["timestamp"] = time.time() - 60
+                else:
+                    command = records[-1]["message"]["content"][0]["input"]["command"]
+                    records[-1]["message"]["content"] = [{"type": "text", "text": command}]
+                self.write_source_agent(source_id, records)
+                with self.caller_environment(source_id=source_id):
+                    with self.assertRaisesRegex(super_subagent.UsageError, "could not identify the active prepare invocation"):
+                        super_subagent.prepare_agent(self.worker_prepare_args(
+                            from_agent_id=None, agent_id=f"aworker-nonce-{number:016x}"
+                        ))
 
     def test_description_slug_uses_readable_words(self):
         self.assertEqual(
