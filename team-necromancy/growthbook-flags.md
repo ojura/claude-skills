@@ -820,8 +820,9 @@ its source, and checks each field separately:
 | `showDialog` | true | any source | false denies the call at once, without a prompt |
 | `timeoutMs` | 120000 | any source; a value outside 5000 to 3600000 is replaced by the default | how long the prompt stays open before the call is denied |
 | `maxDialogTimeouts` | 3 | any source; an integer from 0 to 100 | after this many prompts in one process have timed out, later flagged removals are denied without a prompt; 0 means unlimited |
+| `denyOnHostCard` | true | any source; added in 2.1.310 | applies while an SDK dialog host is active (`sdkDialogHostActive`, for example an IDE or the desktop app showing the dialog). True makes Claude Code deny the call, because `zbn()` returns a denial when the session cannot show the dialog itself, and pass that denial to the host's dialog as `refusal`; false leaves the host an ordinary prompt without a timer |
 
-The other three fields apply only while `enabled` is true. The count for
+The other fields apply only while `enabled` is true. The count for
 `maxDialogTimeouts` goes back to zero whenever someone answers one of these
 prompts or cancels its timer.
 
@@ -847,6 +848,13 @@ ask on unchanged when `shouldAvoidPermissionPrompts` is false, as it is for
 such an agent. The parent session shows the prompt, marked with the agent's
 type ("from the general-purpose agent"), without a countdown, and the prompt
 stays open until someone answers it.
+
+A tmux teammate is a separate Claude Code process. In live tests on 2.1.310 in
+bypass mode, a flagged prompt in a tmux teammate stayed in the teammate's
+process, and its PermissionRequest hook ran there. In default mode the
+teammate wrote the prompt into the leader's mailbox instead, and the leader
+showed it without the check's reason and without a countdown. The relay to the
+leader (`gMe()`) is skipped for an ask that has an auto-deny window.
 
 To shorten the timer, add the flag to the disk cache as
 `"tengu_splendid_horizon": {"timeoutMs": 15000}`. The other fields can be left
