@@ -856,6 +856,13 @@ teammate wrote the prompt into the leader's mailbox instead, and the leader
 showed it without the check's reason and without a countdown. The relay to the
 leader (`gMe()`) is skipped for an ask that has an auto-deny window.
 
+In auto mode (live on 2.1.310), the auto-mode branch calls the same timer code,
+and when the session cannot show the dialog itself, it denies the call at once
+instead of prompting. A background subagent's flagged command got the denial
+text above, without a prompt in the parent. In a main session
+the prompt showed the countdown, and a tmux teammate kept the prompt in its own
+process, where its PermissionRequest hook ran.
+
 To shorten the timer, add the flag to the disk cache as
 `"tengu_splendid_horizon": {"timeoutMs": 15000}`. The other fields can be left
 out, because each one that is missing gets its default. The entry only takes
