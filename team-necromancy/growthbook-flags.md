@@ -195,7 +195,15 @@ launch environment:
   used the defaults for every flag.
 - `/restart` gives the new process the values the variables had before a plugin
   wrote them (cc-env-overrides `docs/cc-env.md`, "Read timing"), so a process
-  that started without the variable keeps lacking it.
+  that started without the variable keeps lacking it, unless a launcher adds it.
+- A launcher named in the `processWrapper` setting, or in
+  `CLAUDE_CODE_PROCESS_WRAPPER` in a settings `env` block, runs in front of every
+  process Claude Code starts from its own binary: tmux teammates, `/restart`,
+  background sessions and update relaunches
+  (https://code.claude.com/docs/en/corporate-launcher). What it adds before its
+  `exec` is in the new process's launch environment, so it can supply the
+  variable. User settings may set it; a session started by hand and a tool
+  that runs `claude` itself, such as `agent-resume`, do not go through it.
 
 ## Feature fetching and local responses (2.1.296)
 
