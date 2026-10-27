@@ -796,7 +796,9 @@ each call, and stores `[]` once every item is completed.
 
 ## Dangerous-rm prompt timer: `tengu_splendid_horizon`
 
-Traced in 2.1.296 and checked live.
+Traced in 2.1.296 and checked live, and checked again in 2.1.310. Function
+names are minified and change between versions, so each one is given with its
+version.
 
 The Bash permission check flags an `rm` or `rmdir` with a target that can remove
 far more than intended: a shell variable that leaves `/`, `/*` or a top-level
@@ -807,20 +809,26 @@ circuit breakers has `bypassImmune: true`. So the call asks for permission even
 in bypass mode, and an allow rule cannot approve it.
 
 In bypass mode and in auto mode, the prompt gets an auto-deny timer, configured
-by this flag, but only when `Mpn()` holds: the context can request a dialog, an
-SDK dialog host is not active, prompts are not suppressed
-(`shouldAvoidPermissionPrompts`), and `TZt()` is false; `TZt()` is true for a
-teammate and for a background (async) agent. `q9()` reads it
-with `Fn("tengu_splendid_horizon", {})`, which returns the value together with
-its source, and checks each field separately:
+by this flag, but only when the session can show the dialog itself (`Mpn()` in
+2.1.296, `dwn()` in 2.1.310): the context can request a dialog, an SDK dialog
+host is not active, prompts are not suppressed (`shouldAvoidPermissionPrompts`),
+and `TZt()` (2.1.296) or `nbn()` (2.1.310) is false. In 2.1.310, `nbn()` is true
+for an in-process teammate (agent type `teammate`, which only the in-process
+runner sets), for a background (async) agent and for remote execution. A tmux
+teammate's own prompt is not excluded. Bypass mode calls the timer code
+(`zbn()` in 2.1.310) only when the session can show the dialog, and otherwise
+leaves an ordinary prompt; auto mode calls it in every case, and it denies the
+call at once when the session cannot show the dialog. `q9()` (2.1.296) or
+`C7()` (2.1.310) reads the flag with its source and checks each field
+separately:
 
 | field | default | where it is read from | effect |
 |---|---|---|---|
-| `enabled` | true | a fetched payload only; a cache value is ignored. A true `CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT` makes it false | false removes the timer, so the prompt waits for an answer |
+| `enabled` | true | a fetched payload only; a cache value is ignored. A true `CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT` makes it false | false removes the timer. In bypass mode the prompt then waits for an answer, and a tmux teammate sends it to the leader. In auto mode the auto-mode classifier decides the call, because `dangerousRemoval` has `classifierRouted: true` in the table of circuit breakers (2.1.310) |
 | `showDialog` | true | any source | false denies the call at once, without a prompt |
 | `timeoutMs` | 120000 | any source; a value outside 5000 to 3600000 is replaced by the default | how long the prompt stays open before the call is denied |
 | `maxDialogTimeouts` | 3 | any source; an integer from 0 to 100 | after this many prompts in one process have timed out, later flagged removals are denied without a prompt; 0 means unlimited |
-| `denyOnHostCard` | true | any source; added in 2.1.310 | applies while an SDK dialog host is active (`sdkDialogHostActive`, for example an IDE or the desktop app showing the dialog). True makes Claude Code deny the call, because `zbn()` returns a denial when the session cannot show the dialog itself, and pass that denial to the host's dialog as `refusal`; false leaves the host an ordinary prompt without a timer |
+| `denyOnHostCard` | true | any source; present in 2.1.309 and 2.1.310, not in 2.1.305 (2.1.306 to 2.1.308 not checked) | read only in bypass mode, while an SDK dialog host is active (`sdkDialogHostActive`, for example an IDE or the desktop app showing the dialog). True makes Claude Code run the PermissionRequest hooks and then deny the call unless a hook decided, so the host gets no dialog: `zbn()` returns a denial because the session cannot show the dialog itself, and `VRe()` returns it as the `refusal` (2.1.310). False leaves the host an ordinary prompt without a timer |
 
 The other fields apply only while `enabled` is true. The count for
 `maxDialogTimeouts` goes back to zero whenever someone answers one of these
@@ -843,25 +851,24 @@ whole countdown.
 Without the timer, what happens depends on the caller. Headless `claude -p`
 denies the call at once, and the tool result is the check's own text with its
 rewrite hint, without the preamble above. A background subagent of an
-interactive session is not denied at all: in bypass mode, `_pn()` passes the
-ask on unchanged when `shouldAvoidPermissionPrompts` is false, as it is for
+interactive session is not denied at all: in bypass mode, `_pn()` (2.1.296)
+passes the ask on unchanged when `shouldAvoidPermissionPrompts` is false, as it is for
 such an agent. The parent session shows the prompt, marked with the agent's
 type ("from the general-purpose agent"), without a countdown, and the prompt
 stays open until someone answers it.
 
 A tmux teammate is a separate Claude Code process. In live tests on 2.1.310 in
 bypass mode, a flagged prompt in a tmux teammate stayed in the teammate's
-process, and its PermissionRequest hook ran there. In default mode the
+process, and the rm-check PermissionRequest hook ran there. In default mode the
 teammate wrote the prompt into the leader's mailbox instead, and the leader
 showed it without the check's reason and without a countdown. The relay to the
-leader (`gMe()`) is skipped for an ask that has an auto-deny window.
+leader (`gMe()` in 2.1.310) is skipped for an ask that has an auto-deny
+window.
 
-In auto mode (live on 2.1.310), the auto-mode branch calls the same timer code,
-and when the session cannot show the dialog itself, it denies the call at once
-instead of prompting. A background subagent's flagged command got the denial
-text above, without a prompt in the parent. In a main session
+In auto mode (live on 2.1.310), a background subagent's flagged command got the
+denial text above at once, without a prompt in the parent. In a main session
 the prompt showed the countdown, and a tmux teammate kept the prompt in its own
-process, where its PermissionRequest hook ran.
+process, where the rm-check PermissionRequest hook ran.
 
 To shorten the timer, add the flag to the disk cache as
 `"tengu_splendid_horizon": {"timeoutMs": 15000}`. The other fields can be left
@@ -886,7 +893,7 @@ started made the Bash call:
 | background subagent of an interactive session | none | none | still pending after 167 s; the prompt in the parent did not have a countdown |
 
 In the same setup, `rm -f "$CC_RM_UNSET"/name` ran without a prompt, so a test
-needs a target such as `$A/$B`. Auto mode was not tested.
+needs a target such as `$A/$B`. Auto mode was not tested on 2.1.296.
 
 ## Messaging/teams cluster
 
