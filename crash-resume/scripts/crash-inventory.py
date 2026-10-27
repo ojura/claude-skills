@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """List the Claude Code sessions and teammates a crash ended, with what a restore needs.
 
-A claude process appends a cost-state record to its transcript when it exits normally,
-so after a crash that ended processes through their exit path (a GNOME Shell or
-gnome-terminal-server crash), the transcripts last modified around the crash belong to
-the processes that were running then: select them with --at. A freeze or a failed
-suspend ends processes without that record: select the transcripts of the boot being
-recovered that end without it with --boot. --sessions inspects given sessions.
+A claude process appends cost-state records to its transcript when it exits normally
+and when a resume starts. After a crash that ended processes through their exit path (a
+GNOME Shell or gnome-terminal-server crash), the transcripts last modified around the
+crash belong to the processes that were running then: select them with --at. A freeze or
+a failed suspend ends processes without that record: --boot selects every transcript
+modified during the boot being recovered and says which ones end without it.
+--sessions inspects given sessions.
 
 For each transcript this prints whether it is a lead or plain session or a teammate,
 whether a process runs it now, its entrypoint, launch directory, current model and
@@ -37,10 +38,12 @@ LAUNCH_LOG = os.path.join(os.environ.get('XDG_STATE_HOME') or os.path.join(HOME,
 EFFORT_LEVELS = ('low', 'medium', 'high', 'xhigh', 'max')
 MODEL_COMMAND = re.compile(r'<command-name>/model</command-name>.*?<command-args>(.*?)</command-args>', re.S)
 MODEL_SET = 'local-command-stdout>Set model to'
+MODEL_SET_ID = re.compile(r'local-command-stdout>Set model to `([^`]+)`')
 EFFORT_SET = re.compile(r'local-command-stdout>Set effort level to (\w+)')
 SPAWN_ID = re.compile(r'agent_id: ([\w.-]+)@([\w.-]+)')
 UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 TEAM_OR_PROXY = re.compile(r'CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME|proxy-codex')
+SHELL_SETTING = re.compile(r'\s*(export|unset|source|\.)\s')
 
 
 def local(ts):
@@ -90,25 +93,15 @@ def trailing_nuls(path):
     return len(tail) - len(tail.rstrip(b'\0'))
 
 
-def last_record_type(path):
-    with open(path, 'rb') as fh:
-        fh.seek(max(0, os.path.getsize(path) - 262144))
-        lines = fh.read().rstrip(b'\0').split(b'\n')
-    for raw in reversed(lines):
-        try:
-            return json.loads(raw.strip(b'\0')).get('type')
-        except (ValueError, AttributeError):
-            continue
-    return None
-
-
 def read_transcript(path):
     info = {'agent': None, 'team': None, 'model': None, 'model_from': None, 'effort': None,
             'title': None, 'first_cwd': None, 'cwd': None, 'version': None, 'entrypoint': None,
             'permission_mode': None, 'first_user': None, 'last_typed': None, 'last_ts': None,
-            'replies': 0, 'api_errors': 0, 'spawns': {}, 'task_text': []}
+            'replies': 0, 'api_errors': 0, 'spawns': {}, 'task_text': [], 'last_type': None,
+            'process_start': None}
     agent_calls, task_calls = set(), set()
     model_args = None
+    after_cost_state = False
     with open(path, 'rb') as fh:
         for raw in fh:
             try:
@@ -120,6 +113,13 @@ def read_transcript(path):
             kind = d.get('type')
             ts = d.get('timestamp')
             info['last_ts'] = ts or info['last_ts']
+            info['last_type'] = kind
+            # A process writes cost-state records when it exits and when a resume starts, so the
+            # first timestamped record after the last run of them starts the latest process's work.
+            if kind == 'cost-state':
+                after_cost_state = True
+            elif ts and after_cost_state:
+                info['process_start'], after_cost_state = ts, False
             if kind not in ('agent-name', 'custom-title', 'ai-title'):
                 info['agent'] = d.get('agentName') or info['agent']
                 info['team'] = d.get('teamName') or info['team']
@@ -142,7 +142,7 @@ def read_transcript(path):
                     info['model'], info['model_from'] = model_id, 'model attachment'
             if kind == 'attachment' and attachment.get('type') == 'task_reminder':
                 # The task list Claude Code reminds the session of: the list of the team it runs as.
-                info['task_text'].append(json.dumps(attachment, ensure_ascii=False))
+                info['task_text'].append((ts, json.dumps(attachment, ensure_ascii=False)))
             message = d.get('message') if isinstance(d.get('message'), dict) else {}
             content = message.get('content')
             if kind == 'assistant':
@@ -150,7 +150,9 @@ def read_transcript(path):
                 if d.get('isApiErrorMessage'):
                     info['api_errors'] += 1
                 model = message.get('model')
-                if model and model != '<synthetic>':
+                # A reply names the model without a variant such as [1m]; keep the variant that
+                # the model attachment or /model recorded for the same model.
+                if model and model != '<synthetic>' and (info['model'] or '').split('[')[0] != model:
                     info['model'], info['model_from'] = model, 'last reply'
                 for item in content if isinstance(content, list) else []:
                     if not isinstance(item, dict) or item.get('type') != 'tool_use':
@@ -159,7 +161,7 @@ def read_transcript(path):
                         agent_calls.add(item.get('id'))
                     if str(item.get('name')).startswith('Task'):
                         task_calls.add(item.get('id'))
-                        info['task_text'].append(json.dumps(item.get('input'), ensure_ascii=False))
+                        info['task_text'].append((ts, json.dumps(item.get('input'), ensure_ascii=False)))
             if kind != 'user':
                 continue
             for item in content if isinstance(content, list) else []:
@@ -169,17 +171,23 @@ def read_transcript(path):
                     for name, team in SPAWN_ID.findall(message_text(item.get('content'))):
                         info['spawns'].setdefault(team, {})[name] = ts or ''
                 if item.get('tool_use_id') in task_calls:
-                    info['task_text'].append(message_text(item.get('content')))
+                    info['task_text'].append((ts, message_text(item.get('content'))))
             if not isinstance(content, str) or d.get('isMeta'):
                 continue
             # Slash commands and their output arrive as user records with string content.
             found = MODEL_COMMAND.search(content)
-            if found and found.group(1).strip():
-                model_args = found.group(1).strip()
-            if MODEL_SET in content and model_args:
-                info['model'], info['model_from'] = model_args, '/model'
+            if found:
+                model_args = found.group(1).strip() or None
+            if MODEL_SET in content:
+                set_id = MODEL_SET_ID.search(content)
+                if model_args or set_id:
+                    info['model'] = model_args or set_id.group(1)
+                    info['model_from'] = '/model'
+                else:
+                    info['model_from'] = '/model in the picker, which recorded only a display name; ask'
+                model_args = None
             effort_set = EFFORT_SET.search(content)
-            if effort_set and effort_set.group(1) in EFFORT_LEVELS:
+            if effort_set and effort_set.group(1) in EFFORT_LEVELS + ('auto',):
                 info['effort'] = effort_set.group(1)
             if info['first_user'] is None:
                 info['first_user'] = content
@@ -210,24 +218,27 @@ def history_entries():
     for chunk in ('\n' + raw).split('\n: ')[1:]:
         m = re.match(r'(\d+):(\d+);(.*)', chunk, re.S)
         if m:
-            command = m.group(3).strip().replace('\\\n', ' ')
+            command = m.group(3).strip().replace('\\\n', ' ').rstrip('\\').strip()
             entries.append((int(m.group(1)), int(m.group(2)), command))
     return entries
 
 
-def history_for(session_id, entries):
-    """History lines that mention the session, each with the team and proxy lines of the
-    same shell before it. A shell appends its whole history when it exits, in start-time
-    order, so the block of one shell ends where the start times step backwards."""
+def history_for(session_id, title, entries):
+    """History lines that resume the session by id or by title, each with the export, unset
+    and source lines for the team variable and the proxy that came before it, possibly in the
+    same shell. A shell appends its whole history when it exits, in start-time order and with
+    one command at a time, so the lookback stops where start times step backwards or where an
+    entry starts before the previous one ended."""
     found = []
     for i, (start, duration, command) in enumerate(entries):
-        if session_id not in command:
+        by_title = title and '--resume' in command and title in command
+        if session_id not in command and not by_title:
             continue
         context = []
         for j in range(i - 1, max(-1, i - 200), -1):
-            if entries[j][0] > entries[j + 1][0]:
-                break  # an earlier shell's block
-            if TEAM_OR_PROXY.search(entries[j][2]) and session_id not in entries[j][2]:
+            if entries[j][0] > entries[j + 1][0] or entries[j][0] + entries[j][1] > entries[j + 1][0]:
+                break  # another shell's block
+            if TEAM_OR_PROXY.search(entries[j][2]) and SHELL_SETTING.match(entries[j][2]):
                 context.insert(0, entries[j])
         found.append(((start, duration, command), context))
     return sorted(found, key=lambda item: item[0][0])
@@ -257,7 +268,8 @@ def task_lists():
 
 
 def running_sessions():
-    """Session ids that a live process runs now, from the registry and process command lines."""
+    """Live processes by session id (from the registry and --resume in a command line) and by
+    agent id (from --agent-id, which a teammate that Claude Code spawned has without --resume)."""
     running = {}
     for entry in glob.glob(os.path.join(SESSIONS, '*.json')):
         try:
@@ -274,8 +286,9 @@ def running_sessions():
         if not args or not os.path.basename(args[0].decode('utf-8', 'replace')).startswith('claude'):
             continue
         for i, arg in enumerate(args[:-1]):
-            if arg == b'--resume' and UUID.fullmatch(args[i + 1].decode('utf-8', 'replace')):
-                running.setdefault(args[i + 1].decode(), int(cmdline.split('/')[2]))
+            value = args[i + 1].decode('utf-8', 'replace')
+            if arg == b'--resume' and UUID.fullmatch(value) or arg == b'--agent-id':
+                running.setdefault(value, int(cmdline.split('/')[2]))
     return running
 
 
@@ -292,10 +305,11 @@ def select(args):
     if args.sessions:
         return [p for p in paths if any(os.path.basename(p).startswith(s) for s in args.sessions)], None
     if args.boot is not None:
+        # Both kinds: a transcript without a final cost-state was cut off by the freeze, and one
+        # ending in cost-state either exited or was resumed and stayed idle until the freeze.
         first, last = boot_range(args.boot)
-        chosen = [p for p in paths if first <= os.path.getmtime(p) <= last + args.after
-                  and last_record_type(p) != 'cost-state']
-        return chosen, f'boot {args.boot} ({local(first)} to {local(last)}), ending without an exit record'
+        chosen = [p for p in paths if first <= os.path.getmtime(p) <= last + args.after]
+        return chosen, f'boot {args.boot} ({local(first)} to {local(last)})'
     at = datetime.datetime.strptime(args.at, '%Y-%m-%d %H:%M:%S').timestamp()
     chosen = []
     for p in paths:
@@ -319,9 +333,12 @@ def main():
     args = parser.parse_args()
 
     paths, window = select(args)
+    if not paths and args.sessions:
+        sys.exit(f"No transcript under {PROJECTS} has a name starting with {', '.join(args.sessions)}.")
     if not paths:
-        sys.exit(f'Every transcript was last modified outside {window}. After a freeze or a failed '
-                 f'suspend, try --boot with the index of the boot that froze (journalctl --list-boots).')
+        sys.exit(f'Every transcript was last modified outside {window}. A session resumed since the '
+                 f'crash has moved out of this selection; inspect it with --sessions. After a freeze or a '
+                 f'failed suspend, use --boot with the index of the boot that froze (journalctl --list-boots).')
     if window:
         print(f'transcripts selected: last modified in {window}')
     history = history_entries()
@@ -337,7 +354,8 @@ def main():
         info['mtime'] = os.path.getmtime(path)
         info['nul_tail'] = trailing_nuls(path)
         info['teammate'] = (info['first_user'] or '').startswith('<teammate-message')
-        info['running'] = running.get(info['id'])
+        agent_id = f"{info['agent']}@{info['team']}" if info['teammate'] and info['agent'] else None
+        info['running'] = running.get(info['id']) or running.get(agent_id)
         sessions.append(info)
 
     leads = [s for s in sessions if not s['teammate']]
@@ -346,12 +364,16 @@ def main():
 
     def common(s, indent):
         state = f"RUNNING NOW as pid {s['running']}" if s['running'] else 'not running'
+        ending = ('ends in cost-state: exited, or resumed and idle since' if s['last_type'] == 'cost-state'
+                  else 'ends without an exit record')
         print(f"{indent}{state}; transcript {os.path.relpath(s['path'], PROJECTS)}, last modified "
-              f"{local(s['mtime'])}, NUL bytes at the end: {s['nul_tail']}")
+              f"{local(s['mtime'])}, {ending}, NUL bytes at the end: {s['nul_tail']}")
         print(f"{indent}entrypoint {s['entrypoint']}, launch directory {s['first_cwd']}, last cwd {s['cwd']}, "
               f"version {s['version']}, permission mode {s['permission_mode']}")
-        print(f"{indent}model now: {s['model']} (from the {s['model_from']}), effort: {s['effort']}; "
-              f"{s['replies']} replies, {s['api_errors']} of them API errors; last record {utc_to_local(s['last_ts'])}")
+        model = f"{s['model']} (from the {s['model_from']})" if s['model'] else 'none recorded'
+        print(f"{indent}model now: {model}, effort: {s['effort'] or 'none recorded'}; {s['replies']} replies, "
+              f"{s['api_errors']} of them API errors; last record {utc_to_local(s['last_ts'])}, "
+              f"latest process's first record {utc_to_local(s['process_start'])}")
 
     for s in sorted(leads, key=lambda s: s['mtime']):
         print(f"== {s['id']}  lead or plain session, title {s['title']!r}")
@@ -360,9 +382,9 @@ def main():
               f"while it runs under a team identity)")
         if s['last_typed']:
             print(f"   last typed by the user: {utc_to_local(s['last_typed'][0])} {s['last_typed'][1][:80]!r}")
-        for (start, duration, command), context in history_for(s['id'], history):
+        for (start, duration, command), context in history_for(s['id'], s['title'], history):
             for c_start, _, c_command in context:
-                print(f"   shell history, before it: {local(c_start)} {c_command[:160]}")
+                print(f"   shell history, before it (possibly the same shell): {local(c_start)} {c_command[:160]}")
             print(f"   shell history: {local(start)} {duration}s {command[:200]}")
         for line in launches:
             if s['id'] in line:
@@ -370,11 +392,13 @@ def main():
         for team, names in sorted(s['spawns'].items(), key=lambda kv: max(kv[1].values() or [''])):
             last = max(names.values() or [''])
             print(f"   spawned into {team}: {', '.join(sorted(names))}; last spawn {utc_to_local(last)}")
-        task_text = '\n'.join(s['task_text'])
+        task_text = '\n'.join(text for _, text in s['task_text'])
         counts = {name: sum(1 for subject in subjects if subject in task_text) for name, subjects in lists.items()}
         for name, n in sorted(((k, v) for k, v in counts.items() if v), key=lambda kv: -kv[1])[:3]:
+            last = next((ts for ts, text in reversed(s['task_text'])
+                         if any(subject in text for subject in lists[name])), None)
             print(f"   task list {name}: {n} of its {len(lists[name])} task subjects appear in this "
-                  f"session's task calls and task reminders")
+                  f"session's task calls and task reminders, the latest at {utc_to_local(last)}")
         own = 'session-' + s['id'][:8]
         state = 'exists' if os.path.isdir(os.path.join(TASKS, own)) else 'missing'
         print(f"   its own task list {own}: {state}\n")

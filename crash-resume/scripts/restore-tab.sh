@@ -23,7 +23,11 @@ shift 2
 log=${XDG_STATE_HOME:-$HOME/.local/state}/crash-resume/launches.log
 mkdir -p ${log:h}
 print -r -- "$(date '+%F %T') team=$CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME proxy=${ANTHROPIC_BASE_URL:-none} cwd=$PWD claude ${(j: :)${(q)@}}" >> $log
+# A SIGINT that reaches the process group while claude runs would end this script and close
+# the tab; claude handles Ctrl-C itself.
+trap : INT
 claude "$@"
+trap - INT
 team=$CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME
 unset CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME
 print -r -- "To run it again: CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME=$team claude ${(j: :)${(q)@}}"

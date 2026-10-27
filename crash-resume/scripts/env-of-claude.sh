@@ -3,7 +3,8 @@
 # Runs the command with the launch environment of that claude process (/proc/<pid>/environ):
 # the environment of the shell it was started from. Refuses a process that is not claude, and
 # a claude process that a tool call or a teammate launch started (they add the variables below).
-# Drops TMUX and TMUX_PANE, so a command started from inside tmux does not attach to that server.
+# Drops TMUX and TMUX_PANE, so programs it starts do not take themselves to be inside the tmux
+# session the agent may run in.
 pid=$1; shift
 src=/proc/$pid/environ
 [[ -r $src && $(readlink /proc/$pid/exe) == */claude/versions/* ]] || {
