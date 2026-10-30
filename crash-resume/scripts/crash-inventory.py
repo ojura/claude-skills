@@ -322,6 +322,29 @@ def select(args):
     return chosen, f'{local(at - args.before)} to {local(at + args.after)}'
 
 
+def role(s):
+    if s['teammate']:
+        return f"{s['agent'] or '?'}@{s['team'] or '?'}"
+    if s['agent'] and s['agent'] != 'team-lead' and s['team']:
+        # A side transcript that agent-resume --promote turned into a teammate starts with an
+        # ordinary message, so only its agentName and teamName show what it runs as.
+        return f"converted teammate {s['agent']}@{s['team']}"
+    return 'lead or plain'
+
+
+def print_table(leads, teammates):
+    """One line per session, ahead of the details, sorted by last modification."""
+    print('session   role                                         running   last modified        '
+          'transcript ends   model                     effort  entry  launch directory')
+    for s in sorted(leads, key=lambda s: s['mtime']) + sorted(teammates, key=lambda s: s['mtime']):
+        ending = 'cost-state' if s['last_type'] == 'cost-state' else 'no exit record'
+        running = str(s['running']) if s['running'] else '-'
+        print(f"{s['id'][:8]}  {role(s)[:44]:44} {running:9} {local(s['mtime'])}  {ending:17} "
+              f"{(s['model'] or '-')[:25]:25} {(s['effort'] or '-'):7} {(s['entrypoint'] or '-')[:6]:6} "
+              f"{s['first_cwd']}  {s['title'] or ''}"[:220])
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     group = parser.add_mutually_exclusive_group(required=True)
@@ -361,6 +384,7 @@ def main():
     leads = [s for s in sessions if not s['teammate']]
     teammates = [s for s in sessions if s['teammate']]
     print(f'{len(leads)} lead or plain sessions, {len(teammates)} teammates\n')
+    print_table(leads, teammates)
 
     def common(s, indent):
         state = f"RUNNING NOW as pid {s['running']}" if s['running'] else 'not running'

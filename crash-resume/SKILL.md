@@ -27,8 +27,9 @@ carry over between tool calls, so the commands below spell out that path.
   processes that were running. A freeze or a failed suspend ends them without that
   record, and a transcript can end in NUL bytes: writes that did not reach the disk.
   Leave transcripts as they are.
-- A transcript's modification time is not the time of its last record: a live lead's
-  transcript is touched every hour without new records.
+- A live lead or plain session touches its transcript about once an hour while the
+  machine is awake, without adding records, so a transcript's modification time is not
+  the time of its last record. An idle teammate is not touched this way.
 - What survives depends on the crash. When gnome-terminal-server crashes, the tabs end
   and the tmux swarm servers keep running, because they are children of the systemd user
   manager. When GNOME Shell crashed and the login session ended, the swarm panes ended
@@ -59,25 +60,39 @@ modification time and drops out of the time-based selections.
      `~/.claude/skills/crash-resume/scripts/crash-inventory.py --at "YYYY-MM-DD HH:MM:SS"`
      (local time) lists the transcripts last modified from a minute before to three
      minutes after it, leaving out sessions that started after it.
-   - After a freeze or a failed suspend:
+   - After a freeze, a failed suspend or a battery that died during suspend:
      `~/.claude/skills/crash-resume/scripts/crash-inventory.py --boot <index>` lists every
      transcript modified during that boot. Those that end without an exit record were
-     cut off by the freeze. Those that end in `cost-state` either exited or were resumed
-     and stayed idle until the freeze. To tell them apart, look in the journal of that
-     boot for terminal tabs and tmux panes that started and never stopped:
-     `journalctl --user -b <index> -o short-iso | grep -E 'Started (vte|tmux)-spawn'`,
-     compared with the scopes that report "Consumed"; a pane that never stopped and that
-     started within a second of a transcript's modification time belonged to it.
+     cut off. Those that end in `cost-state` either exited or were resumed and stayed idle
+     until the end. To tell which were running:
+     - Find when the machine was last awake:
+       `journalctl -b <index> -o short-iso | grep -E 'PM: suspend (entry|exit)|Lid (closed|opened)'`.
+       Leads and plain sessions that were running touched their transcripts during the
+       last hour of awake time, which can lie before a long sleep, so they appear in
+       `crash-inventory.py --at "<last suspend entry>" --before <seconds>` with `--before`
+       reaching back over the sleeps to cover that hour, run before anything is resumed.
+     - Idle teammates are not touched. For them, look for tmux panes that started and
+       never stopped: `journalctl --user -b <index> -o short-iso | grep -E 'Started tmux-spawn'`,
+       compared with the scopes that report "Consumed" or "Deactivated". Count only scopes
+       logged by the systemd user manager that ran at the end of the boot (the PID in
+       `systemd[<pid>]` on the last lines): when a terminal server or the user manager
+       crashed earlier in the boot, the stops of its scopes were never logged. A pane that
+       started within a second of a teammate's last modification (its resume) and never
+       stopped was running it.
    - `~/.claude/skills/crash-resume/scripts/crash-inventory.py --sessions <uuid or prefix>...`
      inspects given sessions, including ones already resumed.
 
-   For each session it prints whether a process runs it now (RUNNING NOW, from the
-   registry and from `--resume <uuid>` or `--agent-id <name>@<team>` in process command
-   lines), lead or plain session versus teammate (a teammate's first message is a
-   `<teammate-message>`), how its transcript ends, entrypoint, launch directory, current
-   model and effort, reply and API-error counts, the time of the latest process's first
-   record, the shell history lines and `restore-tab.sh` launch-log lines that resume it,
-   and for a lead the evidence for its team name.
+   It starts with one line per session: its role, the PID that runs it now, last
+   modification, how its transcript ends, model, effort, entrypoint, launch directory and
+   title. Details per session follow: whether a process runs it now (RUNNING NOW, from
+   the registry and from `--resume <uuid>` or `--agent-id <name>@<team>` in process
+   command lines), lead or plain session versus teammate (a teammate's first message is a
+   `<teammate-message>`), reply and API-error counts, the time of the latest process's
+   first record, the shell history lines and `restore-tab.sh` launch-log lines that
+   resume it, and for a lead the evidence for its team name. A *converted teammate* is a
+   side transcript that `agent-resume --promote` turned into a teammate: it starts with an
+   ordinary message, so only its `agentName` and `teamName` show what it runs as. It comes
+   back with agent-resume, like any teammate.
 3. List the tmux swarm servers that survived: `ls /tmp/tmux-$UID/ | grep claude-swarm`,
    then `tmux -L <socket> list-panes -a -F '#{pane_id} #{pane_pid}'` for each, and the
    agent of each pane from `--agent-id` or `--resume` in `/proc/<pane_pid>/cmdline`. Leave
@@ -135,6 +150,9 @@ modification time and drops out of the time-based selections.
   reads only from the launch environment. `env-of-claude.sh` refuses a process that is
   not claude or that a tool call or a teammate launch started, and drops `TMUX` and
   `TMUX_PANE`.
+- Right before the launch, list the running claude processes and the registry again
+  (`pgrep -ax claude`, `~/.claude/sessions/*.json`): the user may have resumed or started
+  sessions while the restore was being prepared.
 - Open all the leads with one gnome-terminal call; a separate call opens a new window or
   puts its tab in whichever window was last active. Run it with the Bash tool's
   background option, because the client can stay alive after it has created every tab:
@@ -201,6 +219,12 @@ under its own identity" or as `agent-resume team-lead@<team>`), and the whole-te
   runs in, and every pane in that server inherits it, so the first teammate on a server
   decides the environment of all of them. When a swarm survived, resume teammates into it
   only after checking its environment (`tmux -L <socket> show-environment -g`).
+- A teammate with a lead that is not coming back (a converted teammate often has one) has
+  no lead environment to take. Use the restoring agent's own, and for a GPT model put
+  `with-proxy.sh` in front of agent-resume, which sources the proxy script first:
+  `~/.claude/skills/crash-resume/scripts/env-of-claude.sh "$CLAUDE_PID" ~/.claude/skills/crash-resume/scripts/with-proxy.sh agent-resume <name>@<team> --no-attach`.
+  agent-resume then starts the team's own server, `claude-swarm-<team>`. Such a teammate
+  does not need a lead spawn first.
 - Resume by agent id rather than with `--team`: `--team` resumes the members and then the
   lead under the team-lead identity unless `--no-lead` is given, and after a restart, when
   `config.json` lists only the lead, it needs `--all`, which also brings back every former
