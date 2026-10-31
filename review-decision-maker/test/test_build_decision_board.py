@@ -512,5 +512,86 @@ class DecisionBoardBuilderTest(unittest.TestCase):
         self.assertIn('id="figure-dialog"', rendered)
 
 
+    OPTION_DECISIONS = ["current:CURRENT", "a:A", "b:B", "discuss:Discuss"]
+
+    def test_options_are_shown_and_limit_the_offered_decisions(self):
+        raw = {
+            "decisions": self.OPTION_DECISIONS,
+            "findings": [
+                {
+                    "id": "F001",
+                    "title": "Gap between boxes",
+                    "options": [
+                        {"value": "current", "text": "One gap <for> all & every box"},
+                        {"value": "a", "text": "A larger gap"},
+                    ],
+                },
+                {
+                    "id": "F002",
+                    "title": "Line spacing",
+                    "options": [
+                        {"value": "current", "text": "14.5 pt"},
+                        {"value": "a", "text": "12 pt"},
+                        {"value": "b", "label": "B (pravopis)", "text": "12 pt in the lists only"},
+                    ],
+                },
+                {"id": "F003", "title": "A finding without options"},
+            ],
+        }
+        payload = builder.normalize_payload(raw, Path("findings.json"), None)
+        rendered = builder.render_board(payload, TEMPLATE_FILE)
+
+        self.assertIn('<dl class="option-list" aria-label="Choices">', rendered)
+        self.assertIn("<dt>CURRENT</dt><dd>One gap &lt;for&gt; all &amp; every box</dd>", rendered)
+        self.assertIn("<dt>B (pravopis)</dt><dd>12 pt in the lists only</dd>", rendered)
+
+        def offered(finding_id):
+            row = re.search(rf'<tr class="finding-row" id="finding-{finding_id}".*?</tr>', rendered, flags=re.DOTALL)
+            return re.findall(rf'name="decision-{finding_id}" value="([a-z]+)"', row.group(0))
+
+        # F001 has no option b, so it does not offer b; Discuss is not an option anywhere.
+        self.assertEqual(offered("F001"), ["undecided", "current", "a", "discuss"])
+        self.assertEqual(offered("F002"), ["undecided", "current", "a", "b", "discuss"])
+        # A finding without options offers every decision.
+        self.assertEqual(offered("F003"), ["undecided", "current", "a", "b", "discuss"])
+        embedded = json.loads(embedded_data(rendered))
+        self.assertEqual(embedded["option_values"], ["a", "b", "current"])
+        self.assertEqual(embedded["findings"][1]["options"][2]["label"], "B (pravopis)")
+
+    def test_options_reject_unknown_duplicate_empty_and_unoffered_decisions(self):
+        bad = [
+            [{"value": "z", "text": "not a decision of the board"}],
+            [{"value": "a", "text": "x"}, {"value": "a", "text": "y"}],
+            [{"value": "a", "text": "  "}],
+            [{"value": "undecided", "text": "x"}],
+        ]
+        for options in bad:
+            with self.subTest(options=options):
+                raw = {"decisions": self.OPTION_DECISIONS,
+                       "findings": [{"id": "F001", "title": "T", "options": options}]}
+                with self.assertRaises(ValueError):
+                    builder.normalize_payload(raw, Path("findings.json"), None)
+        raw = {
+            "decisions": self.OPTION_DECISIONS,
+            "findings": [
+                {"id": "F001", "title": "T", "options": [{"value": "current", "text": "x"}, {"value": "a", "text": "y"}]},
+                {"id": "F002", "title": "U", "options": [{"value": "current", "text": "x"}, {"value": "b", "text": "z"}]},
+                {"id": "F003", "title": "V", "decision": "b",
+                 "options": [{"value": "current", "text": "x"}, {"value": "a", "text": "y"}]},
+            ],
+        }
+        with self.assertRaises(ValueError):
+            builder.normalize_payload(raw, Path("findings.json"), None)
+
+    def test_template_keeps_each_finding_to_its_own_options(self):
+        template = TEMPLATE_FILE.read_text(encoding="utf-8")
+        self.assertIn("const OPTION_VALUES = new Set(DATA.option_values || []);", template)
+        self.assertIn("return finding && offersDecision(finding, value) ? value : 'undecided';", template)
+        self.assertIn("!offersDecision(FINDING_BY_ID.get(candidate.id), candidate.decision)", template)
+        self.assertIn("decision_text: chosenOptionText(finding),", template)
+        self.assertIn("'decision', 'note', 'decision_text']", template)
+        self.assertIn("markChosenOption(rowById.get(id), radio.value);", template)
+
+
 if __name__ == "__main__":
     unittest.main()

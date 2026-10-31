@@ -250,6 +250,35 @@ def normalize_decisions(source: Any) -> list[dict[str, str]]:
     return decisions
 
 
+def normalize_options(record: dict[str, Any], finding_id: str, allowed_decisions: set[str]) -> list[dict[str, str]]:
+    """A finding's own choices: the current state and each suggestion, each tied to
+    one decision of the board (for example current, a, b)."""
+    source = record.get("options", [])
+    if not isinstance(source, list):
+        raise ValueError(f"finding {finding_id} options must be an array")
+    options = []
+    seen: set[str] = set()
+    for index, entry in enumerate(source):
+        if not isinstance(entry, dict):
+            raise ValueError(f"finding {finding_id} option {index + 1} must be an object")
+        value = entry.get("value")
+        if not isinstance(value, str) or value not in allowed_decisions or value == "undecided":
+            raise ValueError(
+                f"finding {finding_id} option {index + 1} value must be one of the board's decisions; got {value!r}"
+            )
+        if value in seen:
+            raise ValueError(f"finding {finding_id} has two options for {value!r}")
+        seen.add(value)
+        text = entry.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"finding {finding_id} option {value!r} needs a non-empty text")
+        label = entry.get("label", "")
+        if not isinstance(label, str):
+            raise ValueError(f"finding {finding_id} option {value!r} label must be a string")
+        options.append({"value": value, "label": label.strip(), "text": text.strip()})
+    return options
+
+
 def normalize_finding(
     record: Any, index: int, allowed_decisions: set[str], base_dir: Path = Path(".")
 ) -> tuple[dict[str, Any], str, str, list[str]]:
@@ -308,6 +337,8 @@ def normalize_finding(
     if not isinstance(note, str):
         raise ValueError(f"finding {finding_id} note must be a string")
 
+    options = normalize_options(record, finding_id, allowed_decisions)
+
     figures_source = record.get("figures", record.get("images", []))
     if isinstance(figures_source, (str, dict)):
         figures_source = [figures_source]
@@ -331,6 +362,8 @@ def normalize_finding(
         "evidence": evidence,
         "proposed_resolution": proposed_resolution,
     }
+    if options:
+        finding["options"] = options
     if figures:
         # Captions and checksums are part of the finding, so a changed image gives a new
         # dataset signature; the image data itself stays out of the embedded JSON.
@@ -382,6 +415,12 @@ def normalize_payload(
         if note:
             initial_notes[finding_id] = note
 
+    option_values = sorted({option["value"] for finding in findings for option in finding.get("options", [])})
+    for finding in findings:
+        seeded = initial_decisions.get(finding["id"])
+        if seeded and seeded not in offered_decisions(finding, decisions, set(option_values)):
+            raise ValueError(f"finding {finding['id']} decision {seeded!r} is not one of its options")
+
     generated_from = string_list(
         source_object.get("generated_from", source_object.get("reviewers")),
         "generated_from",
@@ -423,8 +462,41 @@ def normalize_payload(
         "findings": findings,
         "initial_decisions": initial_decisions,
         "initial_notes": initial_notes,
+        "option_values": option_values,
         "figure_data": figure_data,
     }
+
+
+def offered_decisions(
+    finding: dict[str, Any], decisions: list[dict[str, str]], option_values: set[str]
+) -> list[str]:
+    """The decisions a finding offers. A decision that some finding uses as an option
+    (such as a suggestion "b") is offered only by the findings that have that option;
+    the other decisions (such as Discuss) are offered by every finding."""
+    own = {option["value"] for option in finding.get("options", [])}
+    if not own:
+        return [decision["value"] for decision in decisions]
+    return [
+        decision["value"]
+        for decision in decisions
+        if decision["value"] in own or decision["value"] not in option_values
+    ]
+
+
+def render_options(finding: dict[str, Any], decisions: list[dict[str, str]]) -> str:
+    options = finding.get("options", [])
+    if not options:
+        return ""
+    labels = {decision["value"]: decision["label"] for decision in decisions}
+    rows = []
+    for option in options:
+        value = html.escape(option["value"], quote=True)
+        label = html.escape(option["label"] or labels[option["value"]])
+        rows.append(
+            f'<div class="option-item decision-{value}" data-option="{value}">'
+            f"<dt>{label}</dt><dd>{html.escape(option['text'])}</dd></div>"
+        )
+    return f'\n          <dl class="option-list" aria-label="Choices">{"".join(rows)}</dl>'
 
 
 def render_figures(finding: dict[str, Any], uris: list[str]) -> str:
@@ -462,9 +534,11 @@ def decision_pairs(decisions: list[dict[str, str]]) -> list[tuple[str, str]]:
     ]
 
 
-def render_decisions(finding_id: str, decisions: list[dict[str, str]]) -> str:
+def render_decisions(finding_id: str, decisions: list[dict[str, str]], offered: list[str] | None = None) -> str:
     controls = []
     for value, label in decision_pairs(decisions):
+        if offered is not None and value != "undecided" and value not in offered:
+            continue
         checked = " checked" if value == "undecided" else ""
         controls.append(
             f'<label class="decision-option decision-{value}">'
@@ -529,6 +603,7 @@ def render_row(
     order: int,
     decisions: list[dict[str, str]],
     figure_uris: list[str] | None = None,
+    option_values: set[str] = frozenset(),
 ) -> str:
     finding_id = html.escape(finding["id"], quote=True)
     severity = html.escape(finding["severity"], quote=True)
@@ -537,6 +612,8 @@ def render_row(
     primary_file = html.escape(finding["locations"][0]["file"], quote=True)
     locations = "".join(render_location(item) for item in finding["locations"])
     figures = render_figures(finding, figure_uris or [])
+    options = render_options(finding, decisions)
+    offered = offered_decisions(finding, decisions, set(option_values))
     agent_badges = "".join(
         f'<span class="agent-badge" title="{html.escape(agent, quote=True)}">'
         f'{html.escape(display_name(agent))}</span>'
@@ -557,7 +634,7 @@ def render_row(
           <span class="category-label">{html.escape(category_display_name(finding["category"]))}</span>
         </th>
         <td class="finding-cell">
-          <h2>{html.escape(finding["title"])}</h2>
+          <h2>{html.escape(finding["title"])}</h2>{options}
           <div class="locations" aria-label="Locations">{locations}</div>{figures}
           <details class="finding-details">
             <summary>Full description, evidence, and resolution</summary>
@@ -583,7 +660,7 @@ def render_row(
         <td class="decision-cell">
           <fieldset>
             <legend class="visually-hidden">Decision for {finding_id}</legend>
-            <div class="decision-options">{render_decisions(finding["id"], decisions)}</div>
+            <div class="decision-options">{render_decisions(finding["id"], decisions, offered)}</div>
           </fieldset>
         </td>
         <td class="note-cell">
@@ -631,7 +708,7 @@ def render_board(payload: dict[str, Any], template_file: Path) -> str:
         "@@CATEGORY_OPTIONS@@": option_list(categories, category_display_name),
         "@@AGENT_OPTIONS@@": option_list(reviewers, display_name),
         "@@FINDING_ROWS@@": "\n\n".join(
-            render_row(item, index, decisions, figure_data.get(item["id"]))
+            render_row(item, index, decisions, figure_data.get(item["id"]), set(payload.get("option_values", [])))
             for index, item in enumerate(findings)
         ),
         "@@SOURCE_NAME@@": html.escape(payload["source"]),

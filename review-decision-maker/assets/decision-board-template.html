@@ -612,6 +612,40 @@
       font-size: 0.7rem;
     }
 
+    .option-list {
+      display: grid;
+      gap: 0.3rem;
+      margin: 0.55rem 0 0.2rem;
+    }
+
+    .option-item {
+      display: grid;
+      grid-template-columns: minmax(4.6rem, max-content) 1fr;
+      gap: 0.6rem;
+      align-items: baseline;
+      padding: 0.32rem 0.55rem;
+      border-left: 4px solid var(--row-choice, var(--border-strong));
+      border-radius: 0.35rem;
+      background: var(--surface-raised);
+    }
+
+    .option-item dt {
+      color: var(--row-choice, var(--text-secondary));
+      font-size: 0.76rem;
+      font-weight: 800;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+
+    .option-item dd { margin: 0; font-size: 0.86rem; line-height: 1.4; }
+
+    tr[data-decision] .option-item[data-chosen="true"] {
+      outline: 2px solid var(--row-choice);
+      outline-offset: 1px;
+    }
+
+    body[data-density="compact"] .option-item dd { font-size: 0.8rem; }
+
     .figure-strip {
       display: flex;
       flex-wrap: wrap;
@@ -1206,6 +1240,9 @@
       ? `branch-review-findings-snapshot-v1:${DATASET_SIGNATURE}:${DATA.embedded_snapshot_id}`
       : `branch-review-findings-v1:${DATASET_SIGNATURE}`;
     const DECISION_VALUES = [@@DECISION_VALUES_JS@@];
+    // Decisions that some finding offers as one of its own options (such as a
+    // suggestion "b"); a finding with options offers only its own ones of these.
+    const OPTION_VALUES = new Set(DATA.option_values || []);
     const SEVERITY_RANK = {critical: 0, high: 1, 'medium-high': 2, medium: 3, 'low-medium': 4, low: 5};
     const DECISION_RANK = {@@DECISION_RANK_JS@@};
 
@@ -1345,9 +1382,30 @@
       saveTimer = window.setTimeout(persistNow, 180);
     }
 
+    function offersDecision(finding, value) {
+      if (!DECISION_VALUES.includes(value)) return false;
+      const options = finding.options || [];
+      if (options.length === 0 || value === 'undecided' || !OPTION_VALUES.has(value)) return true;
+      return options.some((option) => option.value === value);
+    }
+
     function currentDecision(id) {
       const value = state.decisions[id];
-      return DECISION_VALUES.includes(value) ? value : 'undecided';
+      const finding = FINDING_BY_ID.get(id);
+      return finding && offersDecision(finding, value) ? value : 'undecided';
+    }
+
+    // The text of the option a decision stands for, when the finding has one.
+    function chosenOptionText(finding) {
+      const decision = currentDecision(finding.id);
+      const option = (finding.options || []).find((candidate) => candidate.value === decision);
+      return option ? option.text : '';
+    }
+
+    function markChosenOption(row, decision) {
+      for (const item of row.querySelectorAll('.option-item')) {
+        item.dataset.chosen = item.dataset.option === decision ? 'true' : 'false';
+      }
     }
 
     function resizeNote(textarea) {
@@ -1372,6 +1430,7 @@
         const row = rowById.get(finding.id);
         const decision = currentDecision(finding.id);
         row.dataset.decision = decision;
+        markChosenOption(row, decision);
         const selected = row.querySelector(`input[type="radio"][value="${decision}"]`);
         if (selected) selected.checked = true;
         const note = row.querySelector('textarea[data-note-id]');
@@ -1395,6 +1454,7 @@
         finding.id, finding.severity, finding.category, finding.title, locations,
         finding.agents.join(' '), finding.description, finding.evidence,
         finding.proposed_resolution, (finding.figures || []).map((figure) => figure.caption).join(' '),
+        (finding.options || []).map((option) => `${option.label} ${option.text}`).join(' '),
         note
       ].join(' '));
     }
@@ -1609,6 +1669,7 @@
           locations: finding.locations,
           agents: finding.agents,
           decision: currentDecision(finding.id),
+          decision_text: chosenOptionText(finding),
           note: state.notes[finding.id] || ''
         }))
       };
@@ -1720,13 +1781,14 @@
     }
 
     function exportCsv() {
-      const header = ['id', 'severity', 'category', 'title', 'locations', 'agents', 'decision', 'note'];
+      const header = ['id', 'severity', 'category', 'title', 'locations', 'agents', 'decision', 'note', 'decision_text'];
       const lines = [header.map(csvCell).join(',')];
       for (const finding of FINDINGS) {
         const locations = finding.locations.map((location) => `${location.file}:${location.line}`).join(' | ');
         lines.push([
           finding.id, finding.severity, finding.category, finding.title, locations,
-          finding.agents.join(' | '), currentDecision(finding.id), state.notes[finding.id] || ''
+          finding.agents.join(' | '), currentDecision(finding.id), state.notes[finding.id] || '',
+          chosenOptionText(finding)
         ].map(csvCell).join(','));
       }
       download(`${DATA.export_basename}-decisions.csv`, `${lines.join('\n')}\n`, 'text/csv;charset=utf-8');
@@ -1762,7 +1824,7 @@
           unmatched.push(candidate);
           continue;
         }
-        if (!DECISION_VALUES.includes(candidate.decision) || typeof candidate.note !== 'string') {
+        if (!offersDecision(FINDING_BY_ID.get(candidate.id), candidate.decision) || typeof candidate.note !== 'string') {
           invalid.push(candidate);
           continue;
         }
@@ -1889,6 +1951,7 @@
       invalidateImportRollback();
       state.decisions[id] = radio.value;
       rowById.get(id).dataset.decision = radio.value;
+      markChosenOption(rowById.get(id), radio.value);
       const decisionFilterWouldHide = controls.decision.value !== 'all' && controls.decision.value !== radio.value;
       const hideDecidedWouldHide = controls.hideDecided.checked && radio.value !== 'undecided';
       if (radio.value !== 'undecided' && (decisionFilterWouldHide || hideDecidedWouldHide)) pinnedFindingId = id;

@@ -77,6 +77,8 @@ Accepted aliases include `summary` for title, `failure_scenario` for evidence, `
 
 An optional `figures` array (alias `images`) shows examples beside a finding, such as screenshots of the place it is about or a before-and-after comparison. Each entry is a path to a PNG, JPEG, GIF or WebP image, relative to the findings file, or an object `{"path": "shots/page-12.webp", "caption": "Page 12 before and after", "alt": "..."}`; `alt` defaults to the caption. The board embeds each image in its row as a data URI, so the HTML stays one self-contained file, shows it under the locations, outside the collapsed details, and enlarges it on click. Captions are searchable. The embedded JSON keeps only each figure's caption, alt text, media type and SHA-256, so a changed image gives a new dataset signature while the image data appears once. SVG is refused, because an SVG image can carry script.
 
+A finding can also list its own choices in `options`, when the decision is between concrete alternatives rather than about a claim: `[{"value": "current", "text": "One gap, \\topsep, for all boxes"}, {"value": "a", "text": "\\topsep plus 12 pt; one page longer"}]`. Each `value` must be one of the board's decisions, and the board's set then names the choices, for example `current:CURRENT,a:A,b:B,c:C,discuss:Discuss,defer:Defer`. An optional `label` overrides the decision's label for that finding. The board shows a finding's options as a list under its title and offers only that finding's own choices among the decisions that any finding uses as an option; the other decisions (here Discuss and Defer) stay available to every finding, and a finding without `options` offers every decision. A seeded or imported decision that a finding does not offer is refused. Exports add `decision_text`, the text of the chosen option.
+
 An optional top-level `decisions` array replaces the default ruling set, either as objects (`{"value": "wipe", "label": "Wipe completely", "slot": "red"}`) or as `"value:Label"` / `"value:Label:slot"` strings. Values are lowercase `[a-z][a-z0-9-]*`, 2 to 7 entries, unique; `undecided` and `all` are reserved. The optional `slot` names a board color: `purple`, `green`, `blue`, `amber`, `red`, `orange`, or `gray`; unset slots are assigned in that order. Seeded `decision` fields are validated against the active set.
 
 Severity values are `critical`, `high`, `medium-high`, `medium`, `low-medium`, and `low`. Missing severity defaults to `medium`. Preserve the reviewer's severity until verification, then change it only with a written reason.
@@ -179,6 +181,7 @@ The HTML is complete on disk and can be opened directly. It provides:
 - review-priority, severity, file, ID, and decision sorting
 - expandable description, evidence, and proposed resolution
 - example images from each finding's `figures`, shown in the row and enlarged on click
+- each finding's `options` (CURRENT, suggestion A, B and so on) listed under its title, with only its own choices offered
 - per-finding Resolved, Fix, Discuss, Defer, Reject, and Undecided choices
 - local persistence keyed by a signature of the finding content
 - import with merge or replace preview and one-step undo, available until the next manual decision or note edit
