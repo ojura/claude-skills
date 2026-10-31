@@ -53,7 +53,7 @@ The preferred JSON shape is:
 }
 ```
 
-A raw findings array also works. See [`SKILL.md`](SKILL.md) for accepted aliases, the complete verification workflow, decision semantics, implementation gates, and the resolution ledger format.
+A finding can also carry `figures`: image paths, or objects with `path`, `caption` and `alt`, which the board shows beside the finding and enlarges on click. A raw findings array also works. See [`SKILL.md`](SKILL.md) for accepted aliases, the complete verification workflow, decision semantics, implementation gates, and the resolution ledger format.
 
 ## Board behavior
 
@@ -68,6 +68,7 @@ A raw findings array also works. See [`SKILL.md`](SKILL.md) for accepted aliases
 - Changing finding content produces a separate state.
 - Exported decision JSON can be imported with merge or replace preview. Undo remains available until the next manual decision or note edit.
 - Seeded `decision` and `note` fields become the board's reset state.
+- Each finding's `figures` appear under its locations as embedded images (PNG, JPEG, GIF or WebP; SVG is refused); a click shows one at full size.
 - **Export HTML** downloads a standalone copy with the current decisions, notes, theme, and density embedded.
 - Each exported HTML snapshot uses its own local-storage namespace, so other board state cannot override its embedded decisions.
 - Source text is escaped both in HTML and in the embedded JSON script block.

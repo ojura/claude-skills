@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import base64
 import importlib.util
 import json
 import re
@@ -19,6 +20,22 @@ spec = importlib.util.spec_from_file_location("build_decision_board", SCRIPT_FIL
 builder = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(builder)
+
+
+# A 1x1 PNG image.
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
+
+def embedded_data(rendered):
+    match = re.search(
+        r'<script id="findings-data" type="application/json">(.*?)</script>',
+        rendered,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+    return match.group(1)
 
 
 class DecisionBoardBuilderTest(unittest.TestCase):
@@ -427,6 +444,72 @@ class DecisionBoardBuilderTest(unittest.TestCase):
             json.loads(embedded_match.group(1))["findings"][0]["title"],
             "Close </script><script>alert(1)</script>",
         )
+
+
+    def test_figures_are_embedded_beside_the_finding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "shots").mkdir()
+            (folder / "shots" / "page.png").write_bytes(PNG_1X1)
+            raw = {
+                "findings": [
+                    {
+                        "id": "F001",
+                        "title": "Gap between boxes",
+                        "figures": [{"path": "shots/page.png", "caption": "Page 12 <before> & after"}],
+                    }
+                ]
+            }
+            payload = builder.normalize_payload(raw, folder / "findings.json", None)
+            rendered = builder.render_board(payload, TEMPLATE_FILE)
+
+        self.assertIn('class="figure-strip"', rendered)
+        self.assertIn('<img src="data:image/png;base64,', rendered)
+        self.assertIn("<figcaption>Page 12 &lt;before&gt; &amp; after</figcaption>", rendered)
+        self.assertIn('alt="Page 12 &lt;before&gt; &amp; after"', rendered)
+        embedded_text = embedded_data(rendered)
+        embedded = json.loads(embedded_text)
+        figure = embedded["findings"][0]["figures"][0]
+        self.assertEqual(figure["media_type"], "image/png")
+        self.assertEqual(figure["caption"], "Page 12 <before> & after")
+        self.assertEqual(len(figure["sha256"]), 64)
+        # The image is in the row only; the JSON that search and export use stays small.
+        self.assertNotIn("figure_data", embedded)
+        self.assertNotIn(base64.b64encode(PNG_1X1).decode("ascii")[:24], embedded_text)
+
+    def test_a_changed_image_gives_a_new_dataset_signature(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            image = folder / "page.png"
+            raw = {"findings": [{"id": "F001", "title": "T", "figures": ["page.png"]}]}
+            image.write_bytes(PNG_1X1)
+            first = builder.normalize_payload(raw, folder / "findings.json", None)["dataset_signature"]
+            again = builder.normalize_payload(raw, folder / "findings.json", None)["dataset_signature"]
+            image.write_bytes(PNG_1X1 + b"\0")
+            changed = builder.normalize_payload(raw, folder / "findings.json", None)["dataset_signature"]
+        self.assertEqual(first, again)
+        self.assertNotEqual(first, changed)
+
+    def test_figures_reject_svg_unreadable_files_and_missing_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "drawing.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+                encoding="utf-8",
+            )
+            for figure in ({"path": "drawing.svg"}, {"path": "absent.png"}, {"caption": "no path"}, 7):
+                with self.subTest(figure=figure):
+                    raw = {"findings": [{"id": "F001", "title": "T", "figures": [figure]}]}
+                    with self.assertRaises(ValueError):
+                        builder.normalize_payload(raw, folder / "findings.json", None)
+
+    def test_findings_without_figures_render_no_strip(self):
+        raw = json.loads(EXAMPLE_FILE.read_text(encoding="utf-8"))
+        payload = builder.normalize_payload(raw, EXAMPLE_FILE, None)
+        rendered = builder.render_board(payload, TEMPLATE_FILE)
+        self.assertNotIn('class="figure-strip"', rendered)
+        self.assertNotIn('"figures"', embedded_data(rendered))
+        self.assertIn('id="figure-dialog"', rendered)
 
 
 if __name__ == "__main__":

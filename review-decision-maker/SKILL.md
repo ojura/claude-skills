@@ -75,6 +75,8 @@ The board builder accepts either a raw JSON array or an object with a non-empty 
 
 Accepted aliases include `summary` for title, `failure_scenario` for evidence, `suggested_fix` for proposed resolution, `reviewers` or `reported_by` for agents, and string locations such as `src/file.cpp:40-52`.
 
+An optional `figures` array (alias `images`) shows examples beside a finding, such as screenshots of the place it is about or a before-and-after comparison. Each entry is a path to a PNG, JPEG, GIF or WebP image, relative to the findings file, or an object `{"path": "shots/page-12.webp", "caption": "Page 12 before and after", "alt": "..."}`; `alt` defaults to the caption. The board embeds each image in its row as a data URI, so the HTML stays one self-contained file, shows it under the locations, outside the collapsed details, and enlarges it on click. Captions are searchable. The embedded JSON keeps only each figure's caption, alt text, media type and SHA-256, so a changed image gives a new dataset signature while the image data appears once. SVG is refused, because an SVG image can carry script.
+
 An optional top-level `decisions` array replaces the default ruling set, either as objects (`{"value": "wipe", "label": "Wipe completely", "slot": "red"}`) or as `"value:Label"` / `"value:Label:slot"` strings. Values are lowercase `[a-z][a-z0-9-]*`, 2 to 7 entries, unique; `undecided` and `all` are reserved. The optional `slot` names a board color: `purple`, `green`, `blue`, `amber`, `red`, `orange`, or `gray`; unset slots are assigned in that order. Seeded `decision` fields are validated against the active set.
 
 Severity values are `critical`, `high`, `medium-high`, `medium`, `low-medium`, and `low`. Missing severity defaults to `medium`. Preserve the reviewer's severity until verification, then change it only with a written reason.
@@ -176,6 +178,7 @@ The HTML is complete on disk and can be opened directly. It provides:
 - full-text search over findings and notes
 - review-priority, severity, file, ID, and decision sorting
 - expandable description, evidence, and proposed resolution
+- example images from each finding's `figures`, shown in the row and enlarged on click
 - per-finding Resolved, Fix, Discuss, Defer, Reject, and Undecided choices
 - local persistence keyed by a signature of the finding content
 - import with merge or replace preview and one-step undo, available until the next manual decision or note edit

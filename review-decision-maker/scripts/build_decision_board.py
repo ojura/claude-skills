@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import html
 import json
@@ -54,6 +55,14 @@ SEVERITY_ALIASES = {
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 LINE_PATTERN = re.compile(r"^(.*):(\d+(?:-\d+)?)$")
 TOKEN_PATTERN = re.compile(r"@@[A-Z0-9_]+@@")
+# Raster formats a browser shows inline, recognized by their first bytes. SVG is not
+# accepted, because an SVG image can carry script.
+FIGURE_SIGNATURES = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
 
 
 def slugify(value: str, fallback: str) -> str:
@@ -121,6 +130,51 @@ def normalize_location(value: Any) -> dict[str, str]:
     if not isinstance(line, (str, int)):
         raise ValueError("location line must be a string or integer")
     return {"file": file_name.strip(), "line": str(line).strip()}
+
+
+def figure_media_type(data: bytes) -> str | None:
+    for signature, media_type in FIGURE_SIGNATURES:
+        if data.startswith(signature):
+            return media_type
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def load_figure(value: Any, base_dir: Path, finding_id: str, index: int) -> tuple[dict[str, str], str]:
+    """Read one figure of a finding; return its metadata and its data URI."""
+    if isinstance(value, str):
+        value = {"path": value}
+    if not isinstance(value, dict):
+        raise ValueError(f"finding {finding_id} figure {index + 1} must be a path or an object")
+    path_value = value.get("path", value.get("file"))
+    if not isinstance(path_value, str) or not path_value.strip():
+        raise ValueError(f"finding {finding_id} figure {index + 1} needs a non-empty path")
+    caption = value.get("caption", "")
+    alt = value.get("alt", "")
+    if not isinstance(caption, str) or not isinstance(alt, str):
+        raise ValueError(f"finding {finding_id} figure {index + 1} caption and alt must be strings")
+    path = Path(path_value.strip())
+    if not path.is_absolute():
+        path = base_dir / path
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"finding {finding_id} figure {index + 1}: cannot read {path}: {error.strerror}") from error
+    media_type = figure_media_type(data)
+    if media_type is None:
+        raise ValueError(
+            f"finding {finding_id} figure {index + 1}: {path} is not a PNG, JPEG, GIF or WebP image"
+        )
+    caption = caption.strip()
+    meta = {
+        "caption": caption,
+        "alt": alt.strip() or caption or f"Figure {index + 1} of {finding_id}",
+        "media_type": media_type,
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    uri = f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}"
+    return meta, uri
 
 
 def normalize_severity(value: Any) -> str:
@@ -197,8 +251,8 @@ def normalize_decisions(source: Any) -> list[dict[str, str]]:
 
 
 def normalize_finding(
-    record: Any, index: int, allowed_decisions: set[str]
-) -> tuple[dict[str, Any], str, str]:
+    record: Any, index: int, allowed_decisions: set[str], base_dir: Path = Path(".")
+) -> tuple[dict[str, Any], str, str, list[str]]:
     if not isinstance(record, dict):
         raise ValueError(f"finding {index + 1} must be an object")
 
@@ -254,6 +308,18 @@ def normalize_finding(
     if not isinstance(note, str):
         raise ValueError(f"finding {finding_id} note must be a string")
 
+    figures_source = record.get("figures", record.get("images", []))
+    if isinstance(figures_source, (str, dict)):
+        figures_source = [figures_source]
+    if not isinstance(figures_source, list):
+        raise ValueError(f"finding {finding_id} figures must be an array")
+    figures = []
+    figure_uris = []
+    for figure_index, item in enumerate(figures_source):
+        meta, uri = load_figure(item, base_dir, finding_id, figure_index)
+        figures.append(meta)
+        figure_uris.append(uri)
+
     finding = {
         "id": finding_id,
         "severity": normalize_severity(record.get("severity")),
@@ -265,7 +331,11 @@ def normalize_finding(
         "evidence": evidence,
         "proposed_resolution": proposed_resolution,
     }
-    return finding, decision, note
+    if figures:
+        # Captions and checksums are part of the finding, so a changed image gives a new
+        # dataset signature; the image data itself stays out of the embedded JSON.
+        finding["figures"] = figures
+    return finding, decision, note, figure_uris
 
 
 def normalize_payload(
@@ -293,14 +363,20 @@ def normalize_payload(
     findings: list[dict[str, Any]] = []
     initial_decisions: dict[str, str] = {}
     initial_notes: dict[str, str] = {}
+    figure_data: dict[str, list[str]] = {}
     seen_ids: set[str] = set()
+    base_dir = input_file.parent
     for index, record in enumerate(raw_findings):
-        finding, decision, note = normalize_finding(record, index, allowed_decisions)
+        finding, decision, note, figure_uris = normalize_finding(
+            record, index, allowed_decisions, base_dir
+        )
         finding_id = finding["id"]
         if finding_id in seen_ids:
             raise ValueError(f"duplicate finding id {finding_id}")
         seen_ids.add(finding_id)
         findings.append(finding)
+        if figure_uris:
+            figure_data[finding_id] = figure_uris
         if decision != "undecided":
             initial_decisions[finding_id] = decision
         if note:
@@ -347,7 +423,26 @@ def normalize_payload(
         "findings": findings,
         "initial_decisions": initial_decisions,
         "initial_notes": initial_notes,
+        "figure_data": figure_data,
     }
+
+
+def render_figures(finding: dict[str, Any], uris: list[str]) -> str:
+    if not uris:
+        return ""
+    items = []
+    for meta, uri in zip(finding.get("figures", []), uris):
+        caption = html.escape(meta["caption"])
+        label = html.escape(f"Enlarge: {meta['caption'] or meta['alt']}", quote=True)
+        items.append(
+            '<figure class="finding-figure">'
+            f'<button class="figure-open" type="button" aria-label="{label}">'
+            f'<img src="{uri}" alt="{html.escape(meta["alt"], quote=True)}" loading="lazy" decoding="async">'
+            "</button>"
+            + (f"<figcaption>{caption}</figcaption>" if caption else "")
+            + "</figure>"
+        )
+    return f'\n          <div class="figure-strip" aria-label="Examples">{"".join(items)}</div>'
 
 
 def render_location(location: dict[str, str]) -> str:
@@ -429,13 +524,19 @@ def render_decision_rank_js(decisions: list[dict[str, str]]) -> str:
     )
 
 
-def render_row(finding: dict[str, Any], order: int, decisions: list[dict[str, str]]) -> str:
+def render_row(
+    finding: dict[str, Any],
+    order: int,
+    decisions: list[dict[str, str]],
+    figure_uris: list[str] | None = None,
+) -> str:
     finding_id = html.escape(finding["id"], quote=True)
     severity = html.escape(finding["severity"], quote=True)
     category = html.escape(finding["category"], quote=True)
     agents_value = html.escape("|".join(finding["agents"]), quote=True)
     primary_file = html.escape(finding["locations"][0]["file"], quote=True)
     locations = "".join(render_location(item) for item in finding["locations"])
+    figures = render_figures(finding, figure_uris or [])
     agent_badges = "".join(
         f'<span class="agent-badge" title="{html.escape(agent, quote=True)}">'
         f'{html.escape(display_name(agent))}</span>'
@@ -457,7 +558,7 @@ def render_row(finding: dict[str, Any], order: int, decisions: list[dict[str, st
         </th>
         <td class="finding-cell">
           <h2>{html.escape(finding["title"])}</h2>
-          <div class="locations" aria-label="Locations">{locations}</div>
+          <div class="locations" aria-label="Locations">{locations}</div>{figures}
           <details class="finding-details">
             <summary>Full description, evidence, and resolution</summary>
             <div class="detail-grid">
@@ -520,6 +621,9 @@ def render_board(payload: dict[str, Any], template_file: Path) -> str:
     reviewer_summary = "one reviewer" if len(reviewers) == 1 else f"{len(reviewers)} reviewers"
 
     decisions = payload["decisions"]
+    figure_data = payload.get("figure_data", {})
+    # The images are in the rows already; the embedded JSON keeps only their metadata.
+    embedded = {key: value for key, value in payload.items() if key != "figure_data"}
     replacements = {
         "@@BOARD_TITLE@@": html.escape(payload["title"]),
         "@@FINDING_COUNT@@": str(len(findings)),
@@ -527,10 +631,11 @@ def render_board(payload: dict[str, Any], template_file: Path) -> str:
         "@@CATEGORY_OPTIONS@@": option_list(categories, category_display_name),
         "@@AGENT_OPTIONS@@": option_list(reviewers, display_name),
         "@@FINDING_ROWS@@": "\n\n".join(
-            render_row(item, index, decisions) for index, item in enumerate(findings)
+            render_row(item, index, decisions, figure_data.get(item["id"]))
+            for index, item in enumerate(findings)
         ),
         "@@SOURCE_NAME@@": html.escape(payload["source"]),
-        "@@FINDINGS_DATA@@": safe_json_for_script(payload),
+        "@@FINDINGS_DATA@@": safe_json_for_script(embedded),
         "@@DECISION_CSS@@": render_decision_css(decisions),
         "@@DECISION_STAT_BUTTONS@@": render_decision_stat_buttons(decisions, len(findings)),
         "@@DECISION_FILTER_OPTIONS@@": render_decision_filter_options(decisions),
