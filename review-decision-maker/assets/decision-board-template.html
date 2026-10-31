@@ -692,15 +692,34 @@
     body[data-density="compact"] .figure-open img { max-height: 11rem; }
     body[data-density="compact"] .finding-figure figcaption { max-width: 22rem; font-size: 0.7rem; }
 
+    .figure-art { position: relative; display: inline-block; line-height: 0; }
+    .aid-layer { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+    .aid-layer rect { fill: none; stroke: #e11d48; stroke-width: 2.5; vector-effect: non-scaling-stroke; }
+    .aid-layer .aid-guide { stroke: #2563eb; stroke-width: 1.6; stroke-dasharray: 8 6; vector-effect: non-scaling-stroke; }
+    body[data-aids="off"] .aid-layer { display: none; }
+    #aids-toggle { inline-size: 11rem; }
+
     .figure-dialog {
-      max-width: 97vw;
-      max-height: 97vh;
+      width: 96vw;
+      height: 94vh;
+      max-width: 96vw;
+      max-height: 94vh;
       padding: 0;
       border: 1px solid var(--border-strong);
       border-radius: 0.6rem;
       background: var(--surface);
       color: var(--text);
     }
+
+    .figure-dialog[open] { display: flex; flex-direction: column; }
+    .viewer-bar { display: flex; flex-wrap: wrap; gap: 0.45rem; align-items: center; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--border); }
+    .viewer-label { flex: 1 1 16rem; font-weight: 750; }
+    .viewer-nav, .viewer-zoom { display: inline-flex; gap: 0.3rem; align-items: center; }
+    .viewer-hint { color: var(--text-secondary); font-size: 0.75rem; }
+    .viewer-stage { flex: 1 1 auto; overflow: auto; background: #64748b; text-align: center; }
+    .viewer-stage canvas { display: inline-block; margin: 12px; background: #fff; box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35); }
+    .viewer-stage .figure-art { margin: 12px; }
+    .viewer-caption { margin: 0; padding: 0.4rem 0.8rem 0.6rem; font-size: 0.86rem; }
 
     .figure-dialog::backdrop { background: rgba(0, 0, 0, 0.74); }
     .figure-dialog figure { margin: 0; }
@@ -716,7 +735,7 @@
     }
 
     .figure-dialog figcaption { max-width: 95vw; padding: 0.6rem 0.9rem 0.8rem; font-size: 0.86rem; }
-    .figure-dialog form { display: flex; justify-content: flex-end; padding: 0.45rem 0.55rem 0.4rem; }
+    .figure-dialog form { display: inline-flex; }
 
     details { border-radius: 0.45rem; }
 
@@ -1038,6 +1057,7 @@
     }
 
     @media print {
+      .aid-layer { display: none; }
       body { padding-bottom: 0; }
       .header-tools, .control-sticky-sentinel, .filter-panel, .bottom-control-panel, .summary-stats, .note-actions, .page-footer { display: none !important; }
       .page-header, main { width: 100%; }
@@ -1063,6 +1083,7 @@
     <div class="header-tools">
       <button class="button" id="theme-toggle" type="button">Theme: Auto</button>
       <button class="button" id="density-toggle" type="button">Density: Comfortable</button>
+      <button class="button" id="aids-toggle" type="button" aria-pressed="true">Visual aids: On</button>
       <span class="save-state" id="save-state" role="status" aria-live="polite">Loading local decisions...</span>
     </div>
   </header>
@@ -1216,13 +1237,30 @@
     </form>
   </dialog>
 
-  <dialog class="figure-dialog" id="figure-dialog" aria-label="Enlarged example">
-    <form method="dialog"><button class="button" type="submit" aria-label="Close the enlarged example">Close</button></form>
-    <figure>
-      <img id="figure-dialog-image" alt="">
-      <figcaption id="figure-dialog-caption"></figcaption>
-    </figure>
+  <dialog class="figure-dialog" id="figure-dialog" aria-label="Enlarged figure">
+    <div class="viewer-bar">
+      <span class="viewer-label" id="viewer-label"></span>
+      <span class="viewer-nav">
+        <button class="button" id="viewer-prev" type="button" aria-label="Previous variant (Left arrow)">&#9664;</button>
+        <span id="viewer-count"></span>
+        <button class="button" id="viewer-next" type="button" aria-label="Next variant (Right arrow)">&#9654;</button>
+      </span>
+      <span class="viewer-zoom">
+        <button class="button" id="viewer-zoom-out" type="button" aria-label="Zoom out (minus)">&minus;</button>
+        <button class="button" id="viewer-fit" type="button" aria-label="Fit to the window (0)">Fit</button>
+        <button class="button" id="viewer-zoom-in" type="button" aria-label="Zoom in (plus)">+</button>
+      </span>
+      <button class="button" id="viewer-aids" type="button" aria-label="Show or hide the visual aids (A)">Visual aids: On</button>
+      <span class="viewer-hint">&#8592; &#8594; variants &middot; + &minus; 0 zoom &middot; A aids</span>
+      <form method="dialog"><button class="button" type="submit">Close</button></form>
+    </div>
+    <div class="viewer-stage" id="viewer-stage">
+      <canvas id="viewer-canvas" hidden></canvas>
+      <span class="figure-art" id="viewer-raster"><img id="figure-dialog-image" alt=""></span>
+    </div>
+    <p class="viewer-caption" id="figure-dialog-caption"></p>
   </dialog>
+  @@EMBEDDED_FILES@@
 
   <footer class="page-footer">
     Source: <code>@@SOURCE_NAME@@</code>. Decisions and notes stay in this browser until exported or reset.
@@ -1269,7 +1307,8 @@
       notes: {...(DATA.initial_notes || {})},
       importRollback: null,
       theme: DATA.initial_theme || 'auto',
-      density: DATA.initial_density || 'comfortable'
+      density: DATA.initial_density || 'comfortable',
+      aids: DATA.initial_aids !== false
     });
 
     let state = defaultState();
@@ -1420,6 +1459,16 @@
       document.getElementById('theme-toggle').textContent = `Theme: ${state.theme[0].toUpperCase()}${state.theme.slice(1)}`;
     }
 
+    function applyAids() {
+      const label = `Visual aids: ${state.aids ? 'On' : 'Off'}`;
+      document.body.dataset.aids = state.aids ? 'on' : 'off';
+      for (const id of ['aids-toggle', 'viewer-aids']) {
+        const button = document.getElementById(id);
+        button.textContent = label;
+        button.setAttribute('aria-pressed', String(state.aids));
+      }
+    }
+
     function applyDensity() {
       document.body.dataset.density = state.density;
       document.getElementById('density-toggle').textContent = `Density: ${state.density[0].toUpperCase()}${state.density.slice(1)}`;
@@ -1441,6 +1490,7 @@
       }
       applyTheme();
       applyDensity();
+      applyAids();
     }
 
     function normalizeSearch(value) {
@@ -1692,6 +1742,7 @@
         ),
         initial_theme: state.theme,
         initial_density: state.density,
+        initial_aids: state.aids,
         embedded_snapshot_id: embeddedAt,
         embedded_snapshot_at: embeddedAt
       };
@@ -2019,24 +2070,202 @@
     });
     document.getElementById('export-html').addEventListener('click', exportHtmlSnapshot);
 
+    document.getElementById('aids-toggle').addEventListener('click', () => {
+      state.aids = !state.aids;
+      applyAids();
+      scheduleSave();
+      if (figureDialog.open) showViewerEntry();
+    });
+
+    // The enlarged view. A figure with a vector version opens as that PDF page, drawn
+    // by the embedded pdf.js at any zoom; its variants (CURRENT, A, B, ...) are pages
+    // of the same file, one after another with the arrow keys. Without pdf.js or a
+    // vector version the view shows the figure's picture.
     const figureDialog = document.getElementById('figure-dialog');
     const figureDialogImage = document.getElementById('figure-dialog-image');
     const figureDialogCaption = document.getElementById('figure-dialog-caption');
+    const viewerCanvas = document.getElementById('viewer-canvas');
+    const viewerRaster = document.getElementById('viewer-raster');
+    const viewerStage = document.getElementById('viewer-stage');
+    const viewer = {findingId: null, figureIndex: 0, entries: [], index: 0, zoom: 1, task: null, token: 0};
+
+    function base64Bytes(text) {
+      return fetch(`data:application/octet-stream;base64,${text.trim()}`).then((response) => response.arrayBuffer());
+    }
+
+    let pdfjsPromise = null;
+    function loadPdfjs() {
+      if (pdfjsPromise) return pdfjsPromise;
+      const moduleElement = document.getElementById('pdfjs-module');
+      const workerElement = document.getElementById('pdfjs-worker');
+      if (!moduleElement || !workerElement) return (pdfjsPromise = Promise.resolve(null));
+      pdfjsPromise = (async () => {
+        const url = async (element) => URL.createObjectURL(
+          new Blob([await base64Bytes(element.textContent)], {type: 'text/javascript'}));
+        const library = await import(await url(moduleElement));
+        library.GlobalWorkerOptions.workerSrc = await url(workerElement);
+        return library;
+      })().catch((error) => {
+        console.warn('pdf.js could not be loaded; figures open as pictures', error);
+        return null;
+      });
+      return pdfjsPromise;
+    }
+
+    const vectorDocuments = new Map();
+    function vectorDocument(file) {
+      if (!vectorDocuments.has(file)) {
+        vectorDocuments.set(file, (async () => {
+          const library = await loadPdfjs();
+          const element = document.getElementById(`vector-file-${file}`);
+          if (!library || !element) return null;
+          return library.getDocument({data: new Uint8Array(await base64Bytes(element.textContent))}).promise;
+        })().catch((error) => {
+          console.warn('The vector figures could not be read', error);
+          return null;
+        }));
+      }
+      return vectorDocuments.get(file);
+    }
+
+    function figureOf(findingId, figureIndex) {
+      const finding = FINDING_BY_ID.get(findingId);
+      return finding && (finding.figures || [])[figureIndex];
+    }
+
+    function entriesOf(figure) {
+      if (figure.variants && figure.variants.length) return figure.variants;
+      return [{label: '', vector: figure.vector || null}];
+    }
+
+    function showRaster(opener) {
+      viewerCanvas.hidden = true;
+      viewerRaster.hidden = false;
+      const image = opener.querySelector('img');
+      figureDialogImage.src = image.src;
+      figureDialogImage.alt = image.alt;
+      for (const old of viewerRaster.querySelectorAll('.aid-layer')) old.remove();
+      const aids = opener.querySelector('.aid-layer');
+      if (aids) viewerRaster.appendChild(aids.cloneNode(true));
+      figureDialogImage.style.width = viewer.zoom === 1 ? '' : `${Math.round(image.naturalWidth * viewer.zoom)}px`;
+      figureDialogImage.style.maxWidth = viewer.zoom === 1 ? '' : 'none';
+      figureDialogImage.style.maxHeight = viewer.zoom === 1 ? '' : 'none';
+    }
+
+    async function showViewerEntry() {
+      const figure = figureOf(viewer.findingId, viewer.figureIndex);
+      if (!figure) return;
+      const opener = document.querySelector(
+        `.figure-open[data-finding-id="${CSS.escape(viewer.findingId)}"][data-figure-index="${viewer.figureIndex}"]`);
+      const entry = viewer.entries[viewer.index];
+      const many = viewer.entries.length > 1;
+      document.getElementById('viewer-label').textContent = entry.label || figure.caption || '';
+      document.getElementById('viewer-count').textContent = many ? `${viewer.index + 1} / ${viewer.entries.length}` : '';
+      document.getElementById('viewer-prev').hidden = !many && !siblingFigure(-1);
+      document.getElementById('viewer-next').hidden = !many && !siblingFigure(1);
+      figureDialogCaption.textContent = figure.caption || '';
+      const token = ++viewer.token;
+      const vector = entry.vector;
+      const pdf = vector ? await vectorDocument(vector.file) : null;
+      if (token !== viewer.token) return;
+      if (!pdf) {
+        showRaster(opener);
+        return;
+      }
+      const page = await pdf.getPage(state.aids ? vector.page : vector.plain_page);
+      if (token !== viewer.token) return;
+      const natural = page.getViewport({scale: 1});
+      const fit = Math.min((viewerStage.clientWidth - 30) / natural.width, (viewerStage.clientHeight - 30) / natural.height);
+      const ratio = window.devicePixelRatio || 1;
+      // Browsers limit a canvas to about 2^28 pixels; past that, draw at the largest scale that fits.
+      const wanted = fit * viewer.zoom * ratio;
+      const scale = Math.min(wanted, Math.sqrt(2.4e8 / (natural.width * natural.height)));
+      const viewport = page.getViewport({scale});
+      viewerCanvas.width = Math.floor(viewport.width);
+      viewerCanvas.height = Math.floor(viewport.height);
+      viewerCanvas.style.width = `${Math.floor(natural.width * fit * viewer.zoom)}px`;
+      viewerCanvas.style.height = `${Math.floor(natural.height * fit * viewer.zoom)}px`;
+      viewerRaster.hidden = true;
+      viewerCanvas.hidden = false;
+      if (viewer.task) viewer.task.cancel();
+      viewer.task = page.render({canvasContext: viewerCanvas.getContext('2d'), viewport});
+      try {
+        await viewer.task.promise;
+      } catch (error) {
+        if (error && error.name !== 'RenderingCancelledException') console.warn('Cannot draw the figure', error);
+      }
+    }
+
+    function siblingFigure(step) {
+      const finding = FINDING_BY_ID.get(viewer.findingId);
+      const next = viewer.figureIndex + step;
+      return finding && next >= 0 && next < (finding.figures || []).length ? next : null;
+    }
+
+    function openViewer(findingId, figureIndex, fromEnd = false) {
+      const figure = figureOf(findingId, figureIndex);
+      if (!figure) return;
+      viewer.findingId = findingId;
+      viewer.figureIndex = figureIndex;
+      viewer.entries = entriesOf(figure);
+      viewer.index = fromEnd ? viewer.entries.length - 1 : 0;
+      viewer.zoom = 1;
+      if (!figureDialog.open) figureDialog.showModal();
+      showViewerEntry();
+    }
+
+    function stepViewer(step) {
+      if (viewer.entries.length > 1) {
+        viewer.index = (viewer.index + step + viewer.entries.length) % viewer.entries.length;
+        showViewerEntry();
+        return;
+      }
+      const next = siblingFigure(step);
+      if (next !== null) openViewer(viewer.findingId, next, step < 0);
+    }
+
+    function zoomViewer(factor) {
+      viewer.zoom = factor === 0 ? 1 : Math.min(12, Math.max(0.25, viewer.zoom * factor));
+      showViewerEntry();
+    }
+
     document.addEventListener('click', (event) => {
       const opener = event.target.closest('.figure-open');
       if (!opener) return;
-      const image = opener.querySelector('img');
-      const caption = opener.closest('.finding-figure').querySelector('figcaption');
-      figureDialogImage.src = image.src;
-      figureDialogImage.alt = image.alt;
-      figureDialogCaption.textContent = caption ? caption.textContent : '';
-      figureDialog.showModal();
+      openViewer(opener.dataset.findingId, Number(opener.dataset.figureIndex));
     });
+    document.getElementById('viewer-prev').addEventListener('click', () => stepViewer(-1));
+    document.getElementById('viewer-next').addEventListener('click', () => stepViewer(1));
+    document.getElementById('viewer-zoom-in').addEventListener('click', () => zoomViewer(1.25));
+    document.getElementById('viewer-zoom-out').addEventListener('click', () => zoomViewer(0.8));
+    document.getElementById('viewer-fit').addEventListener('click', () => zoomViewer(0));
+    document.getElementById('viewer-aids').addEventListener('click', () => document.getElementById('aids-toggle').click());
+    figureDialog.addEventListener('keydown', (event) => {
+      const actions = {
+        ArrowLeft: () => stepViewer(-1), ArrowRight: () => stepViewer(1),
+        '+': () => zoomViewer(1.25), '=': () => zoomViewer(1.25), '-': () => zoomViewer(0.8), '0': () => zoomViewer(0),
+        a: () => document.getElementById('aids-toggle').click(), A: () => document.getElementById('aids-toggle').click()
+      };
+      const action = actions[event.key];
+      if (!action || event.ctrlKey || event.metaKey || event.altKey) return;
+      event.preventDefault();
+      action();
+    });
+    viewerStage.addEventListener('wheel', (event) => {
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      zoomViewer(event.deltaY < 0 ? 1.15 : 1 / 1.15);
+    }, {passive: false});
+    window.addEventListener('resize', () => { if (figureDialog.open) showViewerEntry(); });
     figureDialog.addEventListener('click', (event) => {
-      if (event.target === figureDialog || event.target === figureDialogImage) figureDialog.close();
+      if (event.target === figureDialog) figureDialog.close();
     });
     // An HTML snapshot clones the page, so the enlarged view keeps no second copy of an image.
-    figureDialog.addEventListener('close', () => figureDialogImage.removeAttribute('src'));
+    figureDialog.addEventListener('close', () => {
+      viewer.token++;
+      figureDialogImage.removeAttribute('src');
+      for (const old of viewerRaster.querySelectorAll('.aid-layer')) old.remove();
+    });
     document.getElementById('copy-json').addEventListener('click', copyExportJson);
     document.getElementById('export-csv').addEventListener('click', exportCsv);
 
@@ -2058,7 +2287,7 @@
 
     document.getElementById('reset-decisions').addEventListener('click', () => {
       if (!window.confirm('Reset local review work to this board\'s supplied starting state? Export or copy first if you may need it later.')) return;
-      state = {...defaultState(), theme: state.theme, density: state.density};
+      state = {...defaultState(), theme: state.theme, density: state.density, aids: state.aids};
       refreshAll();
       persistNow();
       setSaveMessage('Local review work reset');

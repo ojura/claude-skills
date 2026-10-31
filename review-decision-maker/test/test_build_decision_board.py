@@ -208,7 +208,10 @@ class DecisionBoardBuilderTest(unittest.TestCase):
         template = TEMPLATE_FILE.read_text(encoding="utf-8")
         declared_ids = set(re.findall(r'\bid="([^"]+)"', template))
         referenced_ids = set(re.findall(r"getElementById\('([^']+)'\)", template))
-        self.assertEqual(referenced_ids - declared_ids, set())
+        # The builder adds these when it embeds pdf.js; the page works without them.
+        builder_ids = {"pdfjs-module", "pdfjs-worker"}
+        self.assertEqual(referenced_ids - declared_ids - builder_ids, set())
+        self.assertIn('id="{element_id}"', SCRIPT_FILE.read_text(encoding="utf-8"))
 
     def test_resolved_is_purple_and_fix_is_green(self):
         template = TEMPLATE_FILE.read_text(encoding="utf-8")
@@ -591,6 +594,85 @@ class DecisionBoardBuilderTest(unittest.TestCase):
         self.assertIn("decision_text: chosenOptionText(finding),", template)
         self.assertIn("'decision', 'note', 'decision_text']", template)
         self.assertIn("markChosenOption(rowById.get(id), radio.value);", template)
+
+
+    def write_pdf(self, folder, name="figures.pdf"):
+        path = Path(folder) / name
+        path.write_bytes(b"%PDF-1.7\n% test\n")
+        return path
+
+    def test_aids_are_drawn_from_numbers_and_can_be_hidden(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "page.png").write_bytes(PNG_1X1)
+            raw = {"findings": [{"id": "F001", "title": "T", "figures": [{
+                "path": "page.png",
+                "aids": {"width": 100, "height": 50, "rects": [[1, 2, 30, 40]], "lines": [[0, 100, 25]]},
+            }]}]}
+            rendered = builder.render_board(builder.normalize_payload(raw, folder / "findings.json", None), TEMPLATE_FILE)
+        self.assertIn('<svg class="aid-layer" viewBox="0 0 100.0 50.0"', rendered)
+        self.assertIn('<rect x="1.0" y="2.0" width="29.0" height="38.0"/>', rendered)
+        self.assertIn('<line class="aid-guide" x1="0.0" y1="25.0" x2="100.0" y2="25.0"/>', rendered)
+        self.assertIn('id="aids-toggle"', rendered)
+        self.assertIn('body[data-aids="off"] .aid-layer { display: none; }', rendered)
+        for bad in ({"width": 1, "height": 1, "rects": [["<script>", 0, 1, 1]]},
+                    {"width": 1, "height": 1, "lines": [[0, 1]]}, {"width": 0, "height": 1}):
+            with self.subTest(aids=bad):
+                raw = {"findings": [{"id": "F001", "title": "T", "figures": [{"path": "page.png", "aids": bad}]}]}
+                with tempfile.TemporaryDirectory() as directory:
+                    (Path(directory) / "page.png").write_bytes(PNG_1X1)
+                    with self.assertRaises(ValueError):
+                        builder.normalize_payload(raw, Path(directory) / "findings.json", None)
+
+    def test_vector_files_are_embedded_once_with_their_variants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "page.png").write_bytes(PNG_1X1)
+            self.write_pdf(folder)
+            pdfjs = folder / "pdfjs"
+            pdfjs.mkdir()
+            (pdfjs / "pdf.min.mjs").write_text("export const x = 1;", encoding="utf-8")
+            (pdfjs / "pdf.worker.min.mjs").write_text("// worker", encoding="utf-8")
+            vector = {"path": "figures.pdf", "page": 1, "plain_page": 2}
+            raw = {"findings": [
+                {"id": "F001", "title": "T", "figures": [{"path": "page.png", "vector": vector,
+                    "variants": [{"label": "CURRENT", "vector": {"path": "figures.pdf", "page": 3}},
+                                 {"label": "A", "vector": {"path": "figures.pdf", "page": 4, "plain_page": 5}}]}]},
+                {"id": "F002", "title": "U", "figures": [{"path": "page.png", "vector": vector}]},
+            ]}
+            payload = builder.normalize_payload(raw, folder / "findings.json", None)
+            rendered = builder.render_board(payload, TEMPLATE_FILE, pdfjs)
+        self.assertEqual(rendered.count('<script type="application/octet-stream" id="vector-file-'), 1)
+        self.assertIn('id="pdfjs-module"', rendered)
+        self.assertIn('id="pdfjs-worker"', rendered)
+        embedded = json.loads(embedded_data(rendered))
+        figure = embedded["findings"][0]["figures"][0]
+        self.assertEqual(figure["vector"], {"file": 0, "page": 1, "plain_page": 2})
+        self.assertEqual([v["label"] for v in figure["variants"]], ["CURRENT", "A"])
+        self.assertEqual(figure["variants"][0]["vector"], {"file": 0, "page": 3, "plain_page": 3})
+        self.assertNotIn(str(folder), embedded_data(rendered))
+        self.assertIn('data-finding-id="F001" data-figure-index="0"', rendered)
+
+    def test_vector_input_is_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "page.png").write_bytes(PNG_1X1)
+            (folder / "not.pdf").write_text("plain text", encoding="utf-8")
+            self.write_pdf(folder)
+            for vector in ({"path": "not.pdf", "page": 1}, {"path": "figures.pdf", "page": 0},
+                           {"path": "figures.pdf", "page": "1"}, {"page": 1}):
+                with self.subTest(vector=vector):
+                    raw = {"findings": [{"id": "F001", "title": "T", "figures": [{"path": "page.png", "vector": vector}]}]}
+                    with self.assertRaises(ValueError):
+                        builder.normalize_payload(raw, folder / "findings.json", None)
+
+    def test_template_viewer_uses_pdfjs_arrow_keys_and_the_aids_switch(self):
+        template = TEMPLATE_FILE.read_text(encoding="utf-8")
+        self.assertIn("ArrowLeft: () => stepViewer(-1), ArrowRight: () => stepViewer(1),", template)
+        self.assertIn("library.GlobalWorkerOptions.workerSrc", template)
+        self.assertIn("pdf.getPage(state.aids ? vector.page : vector.plain_page)", template)
+        self.assertIn("aids: DATA.initial_aids !== false", template)
+        self.assertIn("initial_aids: state.aids,", template)
 
 
 if __name__ == "__main__":

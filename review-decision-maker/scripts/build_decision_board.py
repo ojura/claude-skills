@@ -173,8 +173,67 @@ def load_figure(value: Any, base_dir: Path, finding_id: str, index: int) -> tupl
         "media_type": media_type,
         "sha256": hashlib.sha256(data).hexdigest(),
     }
+    where = f"finding {finding_id} figure {index + 1}"
+    if "aids" in value:
+        meta["aids"] = normalize_aids(value["aids"], where)
+    if "vector" in value:
+        meta["vector"] = normalize_vector(value["vector"], base_dir, where)
+    if "variants" in value:
+        variants = value["variants"]
+        if not isinstance(variants, list) or not variants:
+            raise ValueError(f"{where} variants must be a non-empty array")
+        meta["variants"] = []
+        for number, variant in enumerate(variants):
+            if not isinstance(variant, dict) or not isinstance(variant.get("label"), str) or not variant["label"].strip():
+                raise ValueError(f"{where} variant {number + 1} needs a label")
+            meta["variants"].append({
+                "label": variant["label"].strip(),
+                "vector": normalize_vector(variant.get("vector"), base_dir, f"{where} variant {number + 1}"),
+            })
     uri = f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}"
     return meta, uri
+
+
+def number_list(value: Any, length: int, where: str) -> list[float]:
+    if (not isinstance(value, list) or len(value) != length
+            or not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in value)):
+        raise ValueError(f"{where} must be a list of {length} numbers")
+    return [float(x) for x in value]
+
+
+def normalize_aids(value: Any, where: str) -> dict[str, Any]:
+    """Visual aids drawn over a figure: outlines (x0, y0, x1, y1) and dashed horizontal
+    lines (x0, x1, y), in the coordinates of a width-by-height layout. Only numbers are
+    accepted, so the overlay the board draws from them cannot carry markup."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} aids must be an object")
+    width, height = number_list([value.get("width"), value.get("height")], 2, f"{where} aids size")
+    if width <= 0 or height <= 0:
+        raise ValueError(f"{where} aids need a positive width and height")
+    return {
+        "width": width,
+        "height": height,
+        "rects": [number_list(r, 4, f"{where} aids rect") for r in value.get("rects", [])],
+        "lines": [number_list(r, 3, f"{where} aids line") for r in value.get("lines", [])],
+    }
+
+
+def normalize_vector(value: Any, base_dir: Path, where: str) -> dict[str, Any]:
+    """A vector version of a figure: a page of a PDF file (with the aids drawn) and the
+    page without them. The file is embedded once however many figures use it."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} vector must be an object")
+    path_value = value.get("path")
+    if not isinstance(path_value, str) or not path_value.strip():
+        raise ValueError(f"{where} vector needs a path")
+    path = Path(path_value.strip())
+    if not path.is_absolute():
+        path = base_dir / path
+    page, plain = value.get("page"), value.get("plain_page", value.get("page"))
+    for number in (page, plain):
+        if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+            raise ValueError(f"{where} vector pages must be positive integers")
+    return {"path": str(path.resolve()), "page": page, "plain_page": plain}
 
 
 def normalize_severity(value: Any) -> str:
@@ -464,7 +523,30 @@ def normalize_payload(
         "initial_notes": initial_notes,
         "option_values": option_values,
         "figure_data": figure_data,
+        "vector_files": collect_vector_files(findings),
     }
+
+
+def collect_vector_files(findings: list[dict[str, Any]]) -> list[str]:
+    """Every PDF file the figures use, each once, and each figure's index into the list."""
+    files: list[str] = []
+    for finding in findings:
+        for figure in finding.get("figures", []):
+            for vector in [figure.get("vector")] + [v["vector"] for v in figure.get("variants", [])]:
+                if vector is None:
+                    continue
+                if vector["path"] not in files:
+                    data = Path(vector["path"]).read_bytes()
+                    if not data.startswith(b"%PDF-"):
+                        raise ValueError(f"{vector['path']} is not a PDF file")
+                    files.append(vector["path"])
+                vector["file"] = files.index(vector["path"])
+    for finding in findings:
+        for figure in finding.get("figures", []):
+            for vector in [figure.get("vector")] + [v["vector"] for v in figure.get("variants", [])]:
+                if vector is not None:
+                    vector.pop("path", None)
+    return files
 
 
 def offered_decisions(
@@ -499,17 +581,37 @@ def render_options(finding: dict[str, Any], decisions: list[dict[str, str]]) -> 
     return f'\n          <dl class="option-list" aria-label="Choices">{"".join(rows)}</dl>'
 
 
+def render_aids(aids: dict[str, Any] | None) -> str:
+    if not aids:
+        return ""
+    width, height = aids["width"], aids["height"]
+    shapes = [
+        f'<rect x="{x0:.1f}" y="{y0:.1f}" width="{x1 - x0:.1f}" height="{y1 - y0:.1f}"/>'
+        for x0, y0, x1, y1 in aids["rects"]
+    ] + [
+        f'<line class="aid-guide" x1="{x0:.1f}" y1="{y:.1f}" x2="{x1:.1f}" y2="{y:.1f}"/>'
+        for x0, x1, y in aids["lines"]
+    ]
+    if not shapes:
+        return ""
+    return (f'<svg class="aid-layer" viewBox="0 0 {width:.1f} {height:.1f}" preserveAspectRatio="none" '
+            f'aria-hidden="true">{"".join(shapes)}</svg>')
+
+
 def render_figures(finding: dict[str, Any], uris: list[str]) -> str:
     if not uris:
         return ""
     items = []
-    for meta, uri in zip(finding.get("figures", []), uris):
+    for index, (meta, uri) in enumerate(zip(finding.get("figures", []), uris)):
         caption = html.escape(meta["caption"])
         label = html.escape(f"Enlarge: {meta['caption'] or meta['alt']}", quote=True)
         items.append(
             '<figure class="finding-figure">'
-            f'<button class="figure-open" type="button" aria-label="{label}">'
+            f'<button class="figure-open" type="button" aria-label="{label}" '
+            f'data-finding-id="{html.escape(finding["id"], quote=True)}" data-figure-index="{index}">'
+            '<span class="figure-art">'
             f'<img src="{uri}" alt="{html.escape(meta["alt"], quote=True)}" loading="lazy" decoding="async">'
+            f"{render_aids(meta.get('aids'))}</span>"
             "</button>"
             + (f"<figcaption>{caption}</figcaption>" if caption else "")
             + "</figure>"
@@ -690,7 +792,20 @@ def safe_json_for_script(value: Any) -> str:
     )
 
 
-def render_board(payload: dict[str, Any], template_file: Path) -> str:
+def render_embedded_files(payload: dict[str, Any], pdfjs_dir: Path | None) -> str:
+    """The vector PDFs and, when given, pdf.js, as base64 text the page decodes on demand."""
+    blocks = []
+    for index, path in enumerate(payload.get("vector_files", [])):
+        data = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+        blocks.append(f'<script type="application/octet-stream" id="vector-file-{index}">{data}</script>')
+    if pdfjs_dir is not None and payload.get("vector_files"):
+        for name, element_id in (("pdf.min.mjs", "pdfjs-module"), ("pdf.worker.min.mjs", "pdfjs-worker")):
+            data = base64.b64encode((pdfjs_dir / name).read_bytes()).decode("ascii")
+            blocks.append(f'<script type="application/octet-stream" id="{element_id}">{data}</script>')
+    return "\n  ".join(blocks)
+
+
+def render_board(payload: dict[str, Any], template_file: Path, pdfjs_dir: Path | None = None) -> str:
     template = template_file.read_text(encoding="utf-8")
     findings = payload["findings"]
     reviewers = sorted({reviewer for finding in findings for reviewer in finding["agents"]})
@@ -700,7 +815,7 @@ def render_board(payload: dict[str, Any], template_file: Path) -> str:
     decisions = payload["decisions"]
     figure_data = payload.get("figure_data", {})
     # The images are in the rows already; the embedded JSON keeps only their metadata.
-    embedded = {key: value for key, value in payload.items() if key != "figure_data"}
+    embedded = {key: value for key, value in payload.items() if key not in ("figure_data", "vector_files")}
     replacements = {
         "@@BOARD_TITLE@@": html.escape(payload["title"]),
         "@@FINDING_COUNT@@": str(len(findings)),
@@ -718,6 +833,7 @@ def render_board(payload: dict[str, Any], template_file: Path) -> str:
         "@@DECISION_FILTER_OPTIONS@@": render_decision_filter_options(decisions),
         "@@DECISION_VALUES_JS@@": render_decision_values_js(decisions),
         "@@DECISION_RANK_JS@@": render_decision_rank_js(decisions),
+        "@@EMBEDDED_FILES@@": render_embedded_files(payload, pdfjs_dir),
     }
     template_tokens = set(TOKEN_PATTERN.findall(template))
     expected_tokens = set(replacements)
@@ -753,6 +869,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--pdfjs",
+        type=Path,
+        help=(
+            "directory with pdf.js's pdf.min.mjs and pdf.worker.min.mjs (for example "
+            "node_modules/pdfjs-dist/build); embedded so that figures with a vector version "
+            "open as vector pages"
+        ),
+    )
+    parser.add_argument(
         "--template",
         type=Path,
         default=package_root / "assets" / "decision-board-template.html",
@@ -766,7 +891,7 @@ def main() -> int:
     try:
         raw = json.loads(args.input.read_text(encoding="utf-8"))
         payload = normalize_payload(raw, args.input, args.title, args.decisions)
-        board = render_board(payload, args.template)
+        board = render_board(payload, args.template, args.pdfjs)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(board, encoding="utf-8")
     except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as error:

@@ -53,7 +53,7 @@ The preferred JSON shape is:
 }
 ```
 
-A finding can list its own choices in `options` (for example CURRENT and suggestions A and B, each tied to a decision of the board), which the board shows under the title and offers as that finding's only choices besides decisions such as Discuss. A finding can also carry `figures`: image paths, or objects with `path`, `caption` and `alt`, which the board shows beside the finding and enlarges on click. A raw findings array also works. See [`SKILL.md`](SKILL.md) for accepted aliases, the complete verification workflow, decision semantics, implementation gates, and the resolution ledger format.
+A finding can list its own choices in `options` (for example CURRENT and suggestions A and B, each tied to a decision of the board), which the board shows under the title and offers as that finding's only choices besides decisions such as Discuss. Figures can carry visual aids (drawn as a switchable overlay), a vector version (a page of a PDF file) and variants to flip between with the arrow keys; build with `--pdfjs node_modules/pdfjs-dist/build` to open them as vector pages. A finding can also carry `figures`: image paths, or objects with `path`, `caption` and `alt`, which the board shows beside the finding and enlarges on click. A raw findings array also works. See [`SKILL.md`](SKILL.md) for accepted aliases, the complete verification workflow, decision semantics, implementation gates, and the resolution ledger format.
 
 ## Board behavior
 
