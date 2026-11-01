@@ -584,6 +584,7 @@ reject module calls to private Resolver methods, and require an empty
 | `completion_answer` | `_complete` |
 | `demotion_plan` | `run_demote` |
 | `doctor_answer` | `run_doctor` |
+| `environment_command_plan` | `run_env_of` |
 | `launch_observation` | `launch_survived` |
 | `launch_plan` | `build` |
 | `lead_migration_plan` | `run_one` |
@@ -599,6 +600,7 @@ reject module calls to private Resolver methods, and require an empty
 | `revalidate_cleanup` | `run_cleanup` |
 | `revalidate_cleanup_cut` | `remove_cleanup_action` |
 | `revalidate_conversion` | `embed`, `materialize` |
+| `revalidate_environment_command` | `run_env_of` |
 | `revalidate_launch` | `run_one` |
 | `revalidate_lead_migration` | `lead_rebind` |
 | `revalidate_member_redirect` | `apply_member_migration` |
@@ -842,8 +844,8 @@ selected target, ordered
 facts about promoted transcripts without a name, rules that decide which dossiers
 are included, objections or refusal, and the exit code. The eight-check doctor
 unit verifies recursive immutability, exclusive `run_doctor` access, private
-evidence readers, answer-only rendering, and use of credentials held by the answer
-without a later `/proc` or Resolver read.
+evidence readers, answer-only rendering, and execution with the launch environment
+held by the answer, without another source selection in the executor.
 
 `MemberRedirectRequest` is immutable and has `kind` `explicit`, `live`, or
 automatic. The explicit branch names a team. The live branch uses the member's
@@ -975,6 +977,34 @@ record to write, terminal context, lead and member runtime facts, `CrewPlacement
 `LaunchDestination`, and `RosterPaneReference`. `_retarget_launch` rebuilds those
 coupled facts after an identity or route change. It does not retain a roster,
 process, or destination record selected for the prior identity.
+
+The launch answer also holds its complete environment. `_environment_source`
+selects and reads the live lead's launch environment, then a Claude ancestor's,
+then the invoking command's. `--caller-env` skips the ancestor fallback when the
+lead is stopped, preserving deliberate wrapper values. `_launch_environment_fact`
+adds the team variables, removes the Recipe 1 poison and the source terminal's
+tmux variables, and records the values for a direct exec and for a pane.
+An unreadable selected source is an objection, not an empty environment.
+`revalidate_launch` checks both the source's process generation and its raw
+launch environment before the roster claim and before tmux.
+
+`launch_environment` temporarily applies the selected values while starting the
+tmux client, so a new server inherits them, then restores the tool's environment.
+The client uses the selected absolute socket path; a different `TMUX_TMPDIR` in
+the source environment therefore cannot change the server it contacts. The
+launch binds a Unix socket in a private temporary directory and runs a Python
+exec helper directly in the pane, without a shell. The helper receives the
+selected values over that socket, adds the new pane's terminal variables, and
+acknowledges receipt before exec. The sender then closes and removes the socket.
+This avoids tmux's command-message size limit and keeps environment values out of
+files, command arguments and launch reports. Replacing the pane's environment
+removes stale server variables and preserves explicit absences without changing
+other panes. The helper sets `PWD` from the actual working directory.
+
+`environment_command_plan` and `revalidate_environment_command` provide the same
+source reader and generation checks to `--env-of`. That mode runs arbitrary
+commands without adding team variables. The crash-resume shell helper delegates
+to it instead of reading procfs or interpreting source markers itself.
 
 A `Seat` is an observed pair of socket and pane. A `LaunchDestination` is a
 selected socket and optional pane reference. They are deliberately distinct: a

@@ -24,6 +24,43 @@ session registry identifies the tmux server.
 The tool rebuilds a missing team directory and launches the resumed transcript
 with identity flags, team environment variables, and initialized inboxes.
 
+### Launch environment
+
+A resumed member gets its live lead's launch environment from `/proc/<pid>/environ`,
+including the user's shell exports and explicit absences. This is the environment
+at the lead's exec, not changes a plugin made later inside the lead. When the lead
+is stopped, Resolver uses the invoking Claude process's launch environment if that
+process is an ancestor, otherwise the invoking command's environment.
+
+The launch report names the source and the variable count without printing values.
+An unreadable selected source refuses the launch. Before launch, Resolver checks
+that the source process and its launch environment still match the selected ones.
+
+A new tmux server starts with that environment. Each new or respawned pane also
+gets the selected environment, even on an existing server with different values.
+Its `TMUX`, `TMUX_PANE`, `TERM` and working directory describe the new pane. The
+other panes keep their existing environments.
+
+For a stopped lead, `--caller-env` explicitly keeps the invoking command's
+environment instead of taking it from a Claude ancestor. Use this when a wrapper
+has deliberately supplied routing or other variables for the resumed member:
+
+```bash
+env-of-claude.sh <restoring-claude-pid> with-proxy.sh agent-resume <name>@<team> --caller-env --no-attach
+```
+
+`--env-of PID -- COMMAND ...` runs an arbitrary command with a plain Claude
+process's launch environment. It rejects a process with tool or teammate launch
+markers and removes the source terminal's `TMUX` and `TMUX_PANE`. It preserves the
+command's arguments and standard streams and checks the source again before exec.
+The crash-resume `env-of-claude.sh` script delegates to this command, so its source
+checks and the resume paths use the same Resolver reader.
+
+```bash
+agent-resume --env-of <claude-pid> --dry-run -- /usr/bin/true
+agent-resume --env-of <claude-pid> -- gnome-terminal --window
+```
+
 ### Resolver decisions
 
 Each command selects its transcript, identity, roster entry, process facts, and

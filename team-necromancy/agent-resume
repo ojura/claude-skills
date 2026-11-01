@@ -1238,6 +1238,7 @@ def check_identity_flags(args, passthrough):
 # either: it says which agents a run is about, not what the run does, so a
 # selector beside a verb is an ordinary command line.
 VERBS = {
+    "env_of": ("--env-of",),
     "selftest": ("--selftest",),
     "doctor": ("--doctor",),
     "census": ("--census",),
@@ -2068,6 +2069,14 @@ class Resolver:
     declared work, and `audit_needs` requires every hard declaration to be used.
     Conditional work belongs in the Maybe bucket.
     """
+
+    # The explicit environment command rejects these source markers when
+    # checking that its source is a plain Claude launch.
+    _SHELL_LAUNCH_MARKERS = (
+        "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_PID",
+        "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN", "AI_AGENT", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_EFFORT",
+    )
 
     @dataclasses.dataclass(frozen=True)
     class RosterSnapshot:
@@ -2999,43 +3008,127 @@ class Resolver:
             return f", suspended; `kill -CONT {pid}` (or fg) to wake it"
         return ""
 
-    def _proc_env(self, pid, names):
+    def _proc_env(self, pid, names=None):
         """The values this process was given for these environment variables.
 
         Env is fixed at exec, so this is what the process is actually running
         with rather than a value set after it started. A reader outside the
         process can learn these values only from /proc/<pid>/environ: another
         record of them, such as a launch command or the parent's environment,
-        can differ from what the process was given.
+        can differ from what the process was given. With names omitted, return
+        every variable, or None when procfs cannot be read; an empty mapping is
+        then an actual empty environment rather than a failed read.
         """
         if not self._may_read(pid, "environ"):
-            return {}
+            return None if names is None else {}
         try:
             raw = Path(f"/proc/{pid}/environ").read_bytes()
         except OSError:
-            return {}
+            return None if names is None else {}
         found = {}
         for item in raw.split(b"\0"):
             if b"=" not in item:
                 continue
             key, value = item.split(b"=", 1)
-            key = key.decode("utf-8", "replace")
-            if key in names:
-                found[key] = value.decode("utf-8", "replace")
+            key = os.fsdecode(key)
+            if names is None or key in names:
+                found[key] = os.fsdecode(value)
         return found
 
-    def _credential_fact(self, lead):
-        """Return credentials tied to the exact selected lead generation."""
+    def _environment_source(self, lead, snapshot, caller_env=False):
+        """Retain the selected lead's complete launch environment.
+
+        With a stopped lead, a Claude ancestor supplies the invoking session's
+        launch environment when that ancestor is available. Otherwise the
+        invoking command supplies its own environment.
+        """
         pid = (lead or {}).get("pid")
         selected = next(
             (row for row in (lead or {}).get("records", ()) if row["pid"] == pid),
-            None)
-        if not pid or not (lead or {}).get("alive") or selected is None:
-            return immutable({"process": None, "values": {}})
+            None) if (lead or {}).get("alive") else None
+        source = "selected lead"
+        if selected is None and not caller_env:
+            source = "invoking Claude process"
+            current, seen = os.getpid(), set()
+            while current and current not in seen:
+                seen.add(current)
+                record = snapshot["by_pid"].get(current)
+                if record is None:
+                    break
+                if record["is_claude"]:
+                    selected = record
+                    break
+                current = record["ppid"]
+        values = (self._proc_env(selected["pid"]) if selected is not None
+                  else dict(os.environ))
+        objection = (f"cannot read the launch environment of {source} "
+                     f"pid {selected['pid']}" if values is None else None)
         return immutable({
             "process": selected,
-            "values": self._proc_env(pid, INHERIT_ENV),
+            "generation": self._process_fact_signature(selected),
+            "source_values": dict(values or {}),
+            "source": source if selected is not None else "invoking command",
+            "objection": objection,
         })
+
+    def _launch_environment_fact(self, lead, snapshot, caller_env=False):
+        """Prepare one retained source environment for an agent launch."""
+        retained = self._environment_source(lead, snapshot, caller_env=caller_env)
+        selected = retained["process"]
+        source = retained["source"]
+        source_values = retained["source_values"]
+        values = dict(source_values)
+        terminal_names = frozenset({"TMUX", "TMUX_PANE", "TERM", "PWD"})
+        # A new server and its panes must not claim the source's terminal.
+        for name in ("TMUX", "TMUX_PANE"):
+            values.pop(name, None)
+        removed_poison = base_url_is_poison(values.get("ANTHROPIC_BASE_URL"))
+        if removed_poison:
+            values.pop("ANTHROPIC_BASE_URL", None)
+        values.update(pair.split("=", 1) for pair in TEAM_ENV)
+        direct = dict(values)
+        # A --here exec stays in the invoking terminal, not the lead's terminal.
+        for name in ("TMUX", "TMUX_PANE", "TERM"):
+            if name in os.environ:
+                direct[name] = os.environ[name]
+        return immutable({
+            **retained,
+            "values": values,
+            "direct": direct,
+            "terminal_names": tuple(sorted(terminal_names)),
+            "source": source if selected is not None else "invoking command",
+            "description": (f"{source} pid {selected['pid']} ({len(source_values)} source variables)"
+                            if selected is not None else
+                            f"invoking command ({len(source_values)} source variables)"),
+            "removed_poison": removed_poison,
+        })
+
+    def environment_command_plan(self, pid, command):
+        """Select a plain Claude process's launch environment for a command."""
+        snapshot = self._runtime(self._process_table())
+        selected = snapshot["by_pid"].get(pid)
+        if selected is None or not selected["is_claude"]:
+            return immutable({"objection": f"pid {pid} is not a readable Claude process"})
+        source = self._environment_source(
+            {"pid": pid, "alive": True, "records": (selected,)}, snapshot)
+        values = dict(source["source_values"])
+        inherited_markers = tuple(name for name in self._SHELL_LAUNCH_MARKERS if name in values)
+        objection = source["objection"]
+        if inherited_markers:
+            objection = (f"pid {pid} has child-session variables "
+                         f"{', '.join(inherited_markers)}; use its lead's process")
+        values.pop("TMUX", None)
+        values.pop("TMUX_PANE", None)
+        return immutable({**source, "values": values, "command": tuple(command),
+                          "objection": objection})
+
+    def revalidate_environment_command(self, plan):
+        """Check the selected process and its environment before exec."""
+        process = plan["process"]
+        current = self._runtime(self._process_table(refresh=True))["by_pid"].get(process["pid"])
+        return bool(
+            self._process_fact_signature(current) == plan["generation"]
+            and self._proc_env(process["pid"]) == plan["source_values"])
 
     def _cmdline(self, pid):
         """One process's exact argv tuple from NUL-delimited procfs bytes."""
@@ -6550,7 +6643,7 @@ class Resolver:
         return typed_team, "as addressed"
 
     def _identity(self, session_uuid=None, agent_id=None, for_team=None, to_team=None,
-                 keep_team=False, table=None, census=None, terminal=None):
+                 keep_team=False, table=None, census=None, terminal=None, caller_env=False):
         """Resolve one transcript and merge its launch identity.
 
         Sources are roster entries, transcript fields, live argv, promotion
@@ -6883,6 +6976,7 @@ class Resolver:
             "placement": (immutable({"team": placed, "why": placed_why})
                           if redirected else None),
             "route": immutable({
+                "caller_environment": caller_env,
                 "to_team": to_team,
                 "to_lead": None,
                 "automatic": False,
@@ -7028,7 +7122,8 @@ class Resolver:
                     parent_session=parent, census=census)
                 if team else None)
         crew = self._crew_placement(team, table)
-        credentials = self._credential_fact(lead)
+        environment = self._launch_environment_fact(
+            lead, process["snapshot"], caller_env=launch["route"].get("caller_environment", False))
         diagnosis = (self._agent_diagnosis(
             agent_id, parent, table=table, census=census,
             member_runtime=runtime, lead_runtime=lead)
@@ -7071,7 +7166,7 @@ class Resolver:
                 "lead_holders": immutable(
                     {"others": lead_others, "ours": lead_ours}),
                 "crew": crew,
-                "credentials": credentials,
+                "environment": environment,
                 "generation": process_generation,
                 "generation_agents": process_agents,
                 "generation_sessions": process_sessions,
@@ -7108,7 +7203,8 @@ class Resolver:
                     parent_session=parent, census=census)
                 if team else None)
         crew = self._crew_placement(team, table)
-        credentials = self._credential_fact(lead)
+        environment = self._launch_environment_fact(
+            lead, snapshot, caller_env=launch["route"].get("caller_environment", False))
         diagnosis = (self._agent_diagnosis(
             agent_id, parent, table=table, census=census,
             member_runtime=runtime, lead_runtime=lead)
@@ -7152,7 +7248,7 @@ class Resolver:
                     "others": lead_others, "ours": lead_ours,
                 }),
                 "crew": crew,
-                "credentials": credentials,
+                "environment": environment,
                 "generation": process_generation,
                 "generation_agents": process_agents,
                 "generation_sessions": process_sessions,
@@ -7297,6 +7393,14 @@ class Resolver:
             teams=process["generation_teams"])
         if current_processes != process["generation"]:
             changed.append("launch runtime generation")
+        environment = process["environment"]
+        source = environment["process"]
+        if source is not None:
+            current_source = snapshot["by_pid"].get(source["pid"])
+            if self._process_fact_signature(current_source) != environment["generation"]:
+                changed.append("launch environment process generation")
+            elif self._proc_env(source["pid"]) != environment["source_values"]:
+                changed.append("launch environment contents")
         current_transcript = self._file_generation(launch["transcript"]["path"])
         if current_transcript != launch["transcript_generation"]:
             changed.append("launch transcript generation")
@@ -7501,13 +7605,14 @@ class Resolver:
 
     def launch_plan(self, session_uuid=None, agent_id=None, for_team=None,
                     keep_team=False, table=None, census=None, terminal=None,
-                    requested_socket=None, socket_reason=None):
+                    requested_socket=None, socket_reason=None, caller_env=False):
         """Return one complete immutable launch answer, including destination."""
         table = (self._process_table(refresh=True) if table is None
                  else tuple(table))
         launch = self._identity(
             session_uuid=session_uuid, agent_id=agent_id, for_team=for_team,
-            keep_team=keep_team, table=table, census=census, terminal=terminal)
+            keep_team=keep_team, table=table, census=census, terminal=terminal,
+            caller_env=caller_env)
         return self._with_launch_destination(
             launch, requested_socket=requested_socket,
             socket_reason=socket_reason)
@@ -11942,44 +12047,97 @@ _MISSING = object()
 RESOLVER = Resolver()
 
 
-# What a revived pane needs from the lead's environment. The harness's swarm
-# server is started BY the leader, so its panes inherit these; a server we start
-# does not, because tool subprocesses have the credentials scrubbed. A new
-# server inherits them from us; topping up an existing one puts the value on a
-# transient tmux client argv, which is why that path only runs for variables the
-# server is actually missing.
-AUTH_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
-# The traffic variable's name reads like a preference, so it invites being
-# dropped from this set as "not a credential". It belongs: when the credential
-# arrives as an OAuth access token in the environment rather than from a normal
-# login, it has to travel with the token, so the two move together or both
-# fail. The report calls the whole set creds for that reason.
-INHERIT_ENV = AUTH_ENV + ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",)
+def run_env_of(args, command):
+    """Run one command with Resolver's selected plain-Claude environment."""
+    plan = RESOLVER.environment_command_plan(args.env_of, command)
+    if plan["objection"]:
+        die(plan["objection"])
+    if args.dry_run:
+        print(f"environment: launch values of Claude pid {args.env_of}\n"
+              f"command: {shlex.join(plan['command'])}")
+        return 0
+    if not RESOLVER.revalidate_environment_command(plan):
+        die("the selected Claude process or its launch environment changed; run the command again")
+    try:
+        os.execvpe(plan["command"][0], list(plan["command"]), dict(plan["values"]))
+    except OSError as exc:
+        die(f"cannot exec {plan['command'][0]}: {exc}")
 
 
-def credential_names(ctx):
-    """Names this launch would copy from its selected lead process."""
-    fact = ctx["process"]["credentials"]
-    if fact["process"] is None:
-        return ()
-    return tuple(sorted(key for key in fact["values"] if not os.environ.get(key)))
+@contextlib.contextmanager
+def launch_environment(environment):
+    """Give a tmux client the environment retained by the launch answer.
+
+    A newly created server inherits it. Restoring this tool's environment keeps
+    a later team member from inheriting another member's selected source.
+    """
+    before = dict(os.environ)
+    try:
+        os.environ.clear()
+        os.environ.update(environment["values"])
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(before)
 
 
-def inherit_credentials(ctx):
-    """Adopt the credential fact retained by the complete launch answer."""
-    adopted = credential_names(ctx)
-    values = ctx["process"]["credentials"]["values"]
-    for key in adopted:
-        os.environ[key] = values[key]
-    # Only shout when the revived agent would not have any way to authenticate
-    # at all. The usual setup keeps credentials in a file, and the traffic flag
-    # is optional, so warning about either on every run trains you to ignore a
-    # tool that kills things.
-    if not any(os.environ.get(key) for key in AUTH_ENV) and not (CLAUDE_DIR / ".credentials.json").exists():
-        warn("this lead does not have an auth env var and "
-             "~/.claude/.credentials.json does not exist; the revived agent "
-             "will not have a credential to authenticate with")
-    return sorted(adopted)
+# tmux's command messages cannot hold an entire large environment. A private
+# Unix socket sends it to the pane after tmux starts the helper; values are not
+# written to a file, put in command arguments or printed in the launch report.
+PANE_ENV_EXEC = (
+    "import json,os,socket,sys; s=socket.socket(socket.AF_UNIX); "
+    "s.connect(sys.argv[1]); packet=json.load(s.makefile('r')); "
+    "env=packet['values']; "
+    "env.update({k:os.environ[k] for k in packet['terminal_names'] if k in os.environ}); "
+    "env['PWD']=os.getcwd(); s.sendall(b'1'); s.close(); "
+    "os.execvpe(sys.argv[2],sys.argv[2:],env)"
+)
+
+
+class PaneEnvironment:
+    """Send one selected environment to one pane, then remove the socket."""
+
+    def __init__(self, environment):
+        self.environment = environment
+        self.directory = self.listener = None
+
+    def __enter__(self):
+        # An explicit short parent keeps the Unix socket below sun_path's limit
+        # even when the caller's TMPDIR has a long path.
+        self.directory = tempfile.TemporaryDirectory(prefix="ar-env-", dir="/tmp")
+        self.path = str(Path(self.directory.name) / "environment.sock")
+        try:
+            self.listener = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+            self.listener.settimeout(LAUNCH_APPEAR_S)
+            self.listener.bind(self.path)
+            self.listener.listen(1)
+        except BaseException:
+            self.__exit__(*sys.exc_info())
+            raise
+        return self
+
+    def command(self, command):
+        return [sys.executable, "-I", "-B", "-c", PANE_ENV_EXEC, self.path, *command]
+
+    def deliver(self):
+        packet = json.dumps({"values": dict(self.environment["values"]),
+                             "terminal_names": self.environment["terminal_names"]}).encode()
+        try:
+            connection, _ = self.listener.accept()
+            with connection:
+                connection.settimeout(LAUNCH_APPEAR_S)
+                connection.sendall(packet)
+                connection.shutdown(socketlib.SHUT_WR)
+                if connection.recv(1) != b"1":
+                    raise LaunchFailed("the pane did not acknowledge its launch environment")
+        except OSError as exc:
+            raise LaunchFailed(f"cannot deliver the selected environment to the pane: {exc}") from exc
+
+    def __exit__(self, *_exc):
+        if self.listener is not None:
+            self.listener.close()
+        if self.directory is not None:
+            self.directory.cleanup()
 
 
 # ---------------------------------------------------------------- disk scanners
@@ -12319,11 +12477,14 @@ def build(args, table=None, census=None, terminal=None):
         keep_team=getattr(args, "keep_team", False),
         table=table, census=census, terminal=terminal,
         requested_socket=getattr(args, "socket", None),
-        socket_reason=getattr(args, "socket_reason", None))
+        socket_reason=getattr(args, "socket_reason", None),
+        caller_env=bool(getattr(args, "caller_env", False)))
 
 
 def enforce_ctx(ctx, args):
-    """Validate identity and restore behavior before the first action."""
+    """Validate identity, environment and restore behavior before acting."""
+    if ctx["process"]["environment"]["objection"]:
+        die(ctx["process"]["environment"]["objection"])
     # Lead migration explicitly requests a team change, so its expected stamp
     # mismatch is allowed after the rebind step records `lead_moving`.
     enforce_identity(ctx, ctx["objections"],
@@ -12623,7 +12784,8 @@ def side_transcripts_note(value, sides):
 
 
 def tmux(socket, *args):
-    return subprocess.run(["tmux", "-L", socket, *args], capture_output=True, text=True)
+    address = ["-S", str(socket)] if isinstance(socket, Path) else ["-L", socket]
+    return subprocess.run(["tmux", *address, *args], capture_output=True, text=True)
 
 
 CLAUDE_PROC = re.compile(r"(^|/)claude$|/versions/[\d.]+$")
@@ -12856,7 +13018,7 @@ class LaunchFailed(Exception):
     """
 
 
-def launch(plan, cwd, command, dry, replace_pane=None):
+def launch(plan, cwd, command, dry, replace_pane=None, *, environment):
     """Apply one preselected tmux launch action without choosing another one.
 
     A refused action raises before any tmux command runs, in a dry run too, so
@@ -12872,26 +13034,17 @@ def launch(plan, cwd, command, dry, replace_pane=None):
                            f"{server['liveness'].reason}")
     session_live = server["session_live"]
     alive = server["liveness"].state == "alive"
-    value = (server["base_url"] if alive
-             else os.environ.get("ANTHROPIC_BASE_URL", ""))
-    carrier = socket if alive else "this shell"
-    scrub = "-u ANTHROPIC_BASE_URL " if poison_said(value, carrier) else ""
-    quoted = (
-        "exec env " + scrub
-        + " ".join(TEAM_ENV) + " "
-        + " ".join(shlex.quote(c) for c in command)
-    )
+    if environment["objection"]:
+        raise LaunchFailed(environment["objection"])
+    if environment["removed_poison"]:
+        warn(f"dropping the Recipe 1 poison from the {environment['source']} environment")
+    if alive and base_url_is_poison(server["base_url"]):
+        warn(f"the pane uses the selected environment instead of the Recipe 1 poison on {socket}")
 
     if replace_pane and not session_live:
         raise LaunchFailed(
             f"cannot replace pane {replace_pane}: {socket} does not have a live "
             f"{TMUX_SESSION} session")
-    if session_live and not dry:
-        for key in INHERIT_ENV:
-            if os.environ.get(key) and tmux(
-                    socket, "show-environment", "-g", key).returncode != 0:
-                tmux(socket, "set-environment", "-g", key, os.environ[key])
-
     action = "respawn" if replace_pane else plan["action"]
     if action == "respawn":
         argv = ["respawn-pane", "-k", "-t", replace_pane]
@@ -12911,15 +13064,18 @@ def launch(plan, cwd, command, dry, replace_pane=None):
         raise LaunchFailed(f"unknown selected tmux action {action!r}")
     if cwd:
         argv += ["-c", cwd]
-    argv.append(quoted)
-
-    rendered = f"tmux -L {socket} {' '.join(shlex.quote(a) for a in argv)}"
+    rendered = (f"tmux -S {shlex.quote(str(server['path']))} {shlex.join(argv)} "
+                f"[environment: {environment['description']}] {shlex.join(command)}")
     if dry:
         step(True, wrap_command(rendered, "  would run: ", "    "), "", indent="")
         return None, action
-    res = tmux(socket, *argv)
-    if res.returncode != 0:
-        raise LaunchFailed(f"tmux {argv[0]} failed: {res.stderr.strip()}")
+    with PaneEnvironment(environment) as channel:
+        argv += channel.command(command)
+        with launch_environment(environment):
+            res = tmux(server["path"], *argv)
+        if res.returncode != 0:
+            raise LaunchFailed(f"tmux {argv[0]} failed: {res.stderr.strip()}")
+        channel.deliver()
     if action in ("split", "new-window"):
         tmux(socket, "select-layout", "-t", TMUX_SESSION, "tiled")
     step(False, "", wrap_command(rendered, "  ran: ", "    "), indent="")
@@ -13372,15 +13528,18 @@ def become_agent(ctx, command, prefix, undo=None):
     for retry.
     """
     agent_id = ctx["identity"]["agentId"]
-    environ = dict(os.environ)
-    if poison_said(environ.get("ANTHROPIC_BASE_URL"), "this shell"):
-        environ.pop("ANTHROPIC_BASE_URL", None)
-    environ.update(pair.split("=", 1) for pair in TEAM_ENV)
+    environment = ctx["process"]["environment"]
+    if environment["objection"]:
+        exec_failed(undo, agent_id, command, OSError(environment["objection"]))
+    environ = dict(environment["direct"])
+    if environment["removed_poison"]:
+        warn(f"dropping the Recipe 1 poison from the {environment['source']} environment")
     try:
         enter_agent_cwd(ctx, prefix)
     except Refusal:
         unwind_launch(undo, agent_id)
         raise
+    environ["PWD"] = os.getcwd()
     try:
         os.execvpe(command[0], command, environ)
     except OSError as exc:
@@ -14019,7 +14178,6 @@ def exec_in_this_terminal(ctx, args, command, prefix):
           f"{'would become' if args.dry_run else 'becomes'} {agent_id}")
     if args.dry_run:
         return Outcome("manual", None, False, None)
-    inherit_credentials(ctx)
     become_agent(ctx, command, prefix, undo=undo)
 
 
@@ -14201,13 +14359,10 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
         # process becomes the agent. A seat is not resolved because it is not
         # used, and the rest of the run does not happen.
         command = build_command(ctx, args, passthrough)
-        selected_credentials = credential_names(ctx)
         cwd = ctx["cwd"]
         seat = [("runs", terminal_note(ctx["terminal"])),
                 ("cwd", cwd or "(inherit)")]
-        if selected_credentials:
-            seat.append(("creds", f"will inherit {', '.join(selected_credentials)} "
-                         "from the selected lead"))
+        seat.append(("env", ctx["process"]["environment"]["description"]))
         report_launch(ctx, command, prefix, extra=seat,
                       restore=RESOLVER.restore_answer(ctx))
         if args.to_team and member_redirect["action"] != "stay":
@@ -14232,15 +14387,12 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
     cwd = ctx["cwd"]
 
     command = build_command(ctx, args, passthrough)
-    selected_credentials = credential_names(ctx)
 
     seat = [("socket", f"{socket}  [{how}] "
                         f"({ctx['socket_states'].get(socket, 'unresolved')})"),
             ("pane", pane_said),
             ("cwd", cwd or "(inherit)")]
-    if selected_credentials:
-        seat.append(("creds", f"will inherit {', '.join(selected_credentials)} "
-                     "from the selected lead"))
+    seat.append(("env", ctx["process"]["environment"]["description"]))
     report_launch(ctx, command, prefix, extra=seat,
                   restore=RESOLVER.restore_answer(ctx))
     if args.to_team and member_redirect["action"] != "stay":
@@ -14312,7 +14464,6 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
                 return Outcome("launched", socket, False, None)
             if not args.no_tint:
                 tint_pane(socket, in_pane, ctx["settings"].get("color"), ctx["identity"]["agentName"], False)
-            inherit_credentials(ctx)
             become_agent(ctx, command, prefix, undo=undo)
 
     # The launch is about to start a tmux server, add the swarm session to one,
@@ -14348,9 +14499,9 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
                 die("the selected launch facts changed before launch ("
                     + ", ".join(checked["changed"])
                     + "); the roster claim was released. Run the command again")
-            inherit_credentials(ctx)
         launched_seat, action = launch(
-            ctx["launch_action"], cwd, command, args.dry_run, replace_pane)
+            ctx["launch_action"], cwd, command, args.dry_run, replace_pane,
+            environment=ctx["process"]["environment"])
         pane = launched_seat.pane if launched_seat else None
     except LaunchFailed as exc:
         # tmux refusing a member's pane stops only that member. The run
@@ -18136,6 +18287,7 @@ def fixture_target(session, path=None, title=None, identity=None, cwd=None,
         "lead_holders": {"others": (), "ours": ()},
         "crew_socket": None, "crew_why": None, "crew_sockets": {},
         "diagnosis": None,
+        "environment": Resolver()._launch_environment_fact(None, empty_snapshot),
     }
     process_values.update(process or {})
     route_values = {
@@ -18220,6 +18372,7 @@ PUBLIC_RESOLVER_QUESTIONS = {
     "completion_answer": ("_complete",),
     "demotion_plan": ("run_demote",),
     "doctor_answer": ("run_doctor",),
+    "environment_command_plan": ("run_env_of",),
     "launch_observation": ("launch_survived",),
     "launch_plan": ("build",),
     "lead_migration_plan": ("run_one",),
@@ -18236,6 +18389,7 @@ PUBLIC_RESOLVER_QUESTIONS = {
     "revalidate_cleanup": ("run_cleanup",),
     "revalidate_cleanup_cut": ("remove_cleanup_action",),
     "revalidate_conversion": ("embed", "materialize"),
+    "revalidate_environment_command": ("run_env_of",),
     "revalidate_launch": ("run_one",),
     "revalidate_lead_migration": ("lead_rebind",),
     "revalidate_member_redirect": ("apply_member_migration",),
@@ -18740,8 +18894,9 @@ def _check_launch_baseurl_carriers(s):
             os.environ.pop("ANTHROPIC_BASE_URL", None)
             if had is not None:
                 os.environ["ANTHROPIC_BASE_URL"] = had
-        ran = " ".join(" ".join(str(part) for part in one) for one in fake.ran)
-        return seen[0] if seen else None, "-u ANTHROPIC_BASE_URL" in ran
+        passed = (fake.environment_packets[-1]["values"]
+                  if fake.environment_packets else {})
+        return seen[0] if seen else None, passed.get("ANTHROPIC_BASE_URL")
 
     on_server, scrubbed_real_server = carrier(real, None)
     poisoned_shell, scrubbed_real_from_poison = carrier(real, POISON_URL)
@@ -18753,11 +18908,11 @@ def _check_launch_baseurl_carriers(s):
         return (action or {}).get("server") or {}
 
     carriers = {
-        "a real url on the server is kept": not scrubbed_real_server,
-        "a live server's real url survives a poisoned shell": not scrubbed_real_from_poison,
-        "a poisoned server is scrubbed": scrubbed_poison_server,
-        "a poison we would pass down is scrubbed": scrubbed_inherited,
-        "a real url we would pass down is kept": not scrubbed_inherited_real,
+        "a server url does not replace an explicit absence in the source": scrubbed_real_server is None,
+        "a live server's url does not replace a poisoned source": scrubbed_real_from_poison is None,
+        "a poisoned server is not in the selected pane environment": scrubbed_poison_server is None,
+        "a poison we would pass down is removed": scrubbed_inherited is None,
+        "a real url from the source is passed to the pane": scrubbed_inherited_real == real,
         # The selected action carried the facts the decision was made from, so
         # the five outcomes above are readings of one answer rather than five
         # unrelated observations of printed text.
@@ -19191,9 +19346,9 @@ def _check_team_batch_revalidation(s):
 
         real_launch = globals()["launch"]
 
-        def observed(plan, cwd, command, dry, replace_pane=None):
+        def observed(plan, cwd, command, dry, replace_pane=None, **kwargs):
             seat, action = real_launch(
-                plan, cwd, command, dry, replace_pane)
+                plan, cwd, command, dry, replace_pane, **kwargs)
             if seat and not dry:
                 agent_id = command[command.index("--agent-id") + 1]
                 session = command[command.index("--resume") + 1]
@@ -24259,6 +24414,7 @@ def _check_lead_migration_operation(s):
             eng._own_lineage = lambda _table: set()
             eng._seat_index = lambda _table: {}
             eng._session_registry = lambda: []
+            eng._proc_env = lambda _pid, names=None: {}
             eng._tmux_server_fact = lambda socket: immutable({
                 "socket": socket, "path": Path("/tmp") / socket,
                 "socket_generation": versions.get(socket, ("fixture", socket)),
@@ -27326,7 +27482,7 @@ def _check_refused_teardown_reports(s):
         booting = {name: kinds for name, kinds in homes.items()
                    if name not in s.suite_fns}
         if booting != {"become_agent": ["execvpe"], "maybe_attach": ["execvp"],
-                       "run_promote": ["execvp"]}:
+                       "run_promote": ["execvp"], "run_env_of": ["execvpe"]}:
             told.append(f"execs live at {booting}")
 
         def guarded(inner, rollback, kind):
@@ -27358,13 +27514,11 @@ def _check_refused_teardown_reports(s):
         elif not any(isinstance(sub, ast.Raise) and sub.exc is None
                      for handler in refusals for sub in ast.walk(handler)):
             told.append("a refused cwd move is not re-raised as it stands")
-        names = {getattr(sub, "id", None) for sub in ast.walk(becomer)}
-        if "TEAM_ENV" not in names:
-            told.append("the exec environment does not carry TEAM_ENV")
-        if "poison_said" not in {getattr(sub.func, "id", None)
-                                 for sub in ast.walk(becomer)
-                                 if isinstance(sub, ast.Call)}:
-            told.append("the poison is not asked about where the strip is loud")
+        becomer_text = s.src_of(becomer)
+        if 'environment["direct"]' not in becomer_text:
+            told.append("the exec does not use the selected launch environment")
+        if 'environment["removed_poison"]' not in becomer_text:
+            told.append("the exec does not report the selected poison removal")
 
         # run_one execs the lead and the member already standing in its pane;
         # exec_in_this_terminal execs a member in this terminal, for --here and
@@ -27644,6 +27798,30 @@ def _invented_pid(pid):
         return False
 
 
+class _FakePaneEnvironment:
+    """An in-memory environment channel for the synthetic tmux fixture."""
+
+    def __init__(self, environment, world):
+        self.environment, self.world = environment, world
+        self.path = f"/synthetic/pane-environment-{id(self)}"
+        self.reached = False
+
+    def __enter__(self):
+        self.world.environment_channels[self.path] = self
+        return self
+
+    def command(self, command):
+        return [sys.executable, "-I", "-B", "-c", PANE_ENV_EXEC, self.path, *command]
+
+    def deliver(self):
+        if not self.reached:
+            raise LaunchFailed("the synthetic pane did not request its environment")
+        self.world.environment_packets.append(self.environment)
+
+    def __exit__(self, *_exc):
+        self.world.environment_channels.pop(self.path, None)
+
+
 class _FakeTmux:
     """A tmux server kept in a dict, answering the tmux commands the tool
     uses. It also owns the process table and session registry associated
@@ -27667,6 +27845,8 @@ class _FakeTmux:
         self.started = dict(started or {})
         self.attached_at = None
         self.env, self.ran, self.fail = {}, [], set()
+        self.process_environments = {}
+        self.environment_channels, self.environment_packets = {}, []
         self.next_pane = 1 + max([int(p["pane"][1:]) for p in self.panes] or [-1])
         self.next_pid = 1 + max([int(p["pid"]) for p in self.panes] or [PID_CEILING + 4241])
         # Named sockets this fixture claims exist, newest first, with what the
@@ -27747,13 +27927,14 @@ class _FakeTmux:
             return ()
         return real(pid)
 
-    def process_env(self, pid, names):
-        """This world's processes do not carry an environment.
+    def process_env(self, pid, names=None):
+        """Read only this world's retained synthetic process environments.
 
         A fixture's pid can be a number some real process on the machine holds,
-        and the engine's own reader would then read that process's environment.
+        so an absent fixture environment is empty rather than read from procfs.
         """
-        return {}
+        values = self.process_environments.get(pid, {})
+        return dict(values) if names is None else {k: v for k, v in values.items() if k in names}
 
     def process_started(self, record):
         """When one of this world's processes started, in epoch ms, or None."""
@@ -27847,11 +28028,12 @@ class _FakeTmux:
         half-way is precisely the one that leaves something for the next unit,
         and in a sharded tier that next unit is somebody else's verdict.
         """
-        was_global = {name: globals()[name] for name in ("tmux", "RESOLVER")}
+        was_global = {name: globals()[name] for name in ("tmux", "RESOLVER", "PaneEnvironment")}
         was_engine = {name: getattr(engine, name) for name in self.ENGINE_INPUTS}
         try:
             self.attach(engine)
             globals()["tmux"], globals()["RESOLVER"] = (through or self), engine
+            globals()["PaneEnvironment"] = lambda environment: _FakePaneEnvironment(environment, self)
             yield self
         finally:
             globals().update(was_global)
@@ -27883,6 +28065,10 @@ class _FakeTmux:
             else:
                 self.env[argv[-2]] = argv[-1]
             return done()
+        if cmd in ("new-session", "split-window", "new-window", "respawn-pane") and PANE_ENV_EXEC in argv:
+            channel = self.environment_channels.get(argv[argv.index(PANE_ENV_EXEC) + 1])
+            if channel is not None:
+                channel.reached = True
         if cmd in ("new-session", "split-window", "new-window"):
             pane = f"%{self.next_pane}"
             self.next_pane += 1
@@ -32132,11 +32318,21 @@ def _check_server_liveness_engine_only(s):
 
     server_questions = {"has-session", "list-clients", "list-sessions"}
     asked_outside = set()
+    # PaneEnvironment binds an owned listener. Its transport must not connect
+    # to a tmux socket or answer a liveness question.
+    channel = next(node for node in tree.body
+                   if isinstance(node, ast.ClassDef) and node.name == "PaneEnvironment")
+    channel_lines = set(range(channel.lineno, channel.end_lineno + 1))
+    for node in ast.walk(channel):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("connect", "connect_ex")):
+            asked_outside.add(f"environment transport connects at line {node.lineno}")
     for node in ast.walk(tree):
         line = getattr(node, "lineno", None)
         if line is None or line in engine_lines or line in selftest_lines:
             continue
-        if isinstance(node, ast.Name) and node.id == "socketlib" and isinstance(node.ctx, ast.Load):
+        if (isinstance(node, ast.Name) and node.id == "socketlib" and isinstance(node.ctx, ast.Load)
+                and line not in channel_lines):
             asked_outside.add(f"an AF_UNIX probe at line {line}")
         elif isinstance(node, ast.Constant) and node.value in server_questions:
             asked_outside.add(f"tmux {node.value} at line {line}")
@@ -32481,11 +32677,12 @@ def _check_here_offer_reaches_the_run(s):
 
 @contextlib.contextmanager
 def _caller_values(**values):
-    """This process's environment with INHERIT_ENV, ANTHROPIC_BASE_URL and the names given set as given.
+    """This process's environment with test credentials and the supplied names set as given.
 
     A name given None is removed. The previous values come back on the way out.
     """
-    names = {*INHERIT_ENV, "ANTHROPIC_BASE_URL", *values}
+    names = {"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "ANTHROPIC_BASE_URL", *values}
     saved = {name: os.environ.get(name) for name in names}
     try:
         for name in names:
@@ -49713,8 +49910,7 @@ def _check_batch_retained_evidence(s):
                     if args[0] in ("new-session", "new-window", "split-window") and result.returncode == 0:
                         pane = result.stdout.strip()
                         pid = next(row["pid"] for row in f.fake.panes if row["pane"] == pane)
-                        command = shlex.split(args[-1])
-                        command = tuple(command[command.index(FAKE_AGENT_BIN):])
+                        command = tuple(args[args.index(FAKE_AGENT_BIN):])
                         f.fake.processes.append((pid, 1, command))
                         # Give the real launch observer a write by the synthetic process.
                         session = command[command.index("--resume") + 1]
@@ -50399,6 +50595,282 @@ def _check_completion_consumes_one_complete_answer(s):
 
 
 @unit(
+    ('launch-environment-selects-complete-source',
+     'a launch retains every lead variable and preserves the lead explicit absences'),
+    ('launch-environment-falls-back-to-caller-claude',
+     'a stopped lead uses the invoking Claude launch environment rather than its tool shell'),
+    ('launch-environment-unreadable-refuses',
+     'an unreadable lead environment refuses before identity or roster changes'),
+    ('launch-environment-revalidates-source',
+     'a launch detects a replaced source process and changed source environment'),
+    ('launch-environment-is-applied-to-server-and-pane',
+     'new and existing tmux servers launch panes with the selected environment and socket'),
+    ('launch-environment-preview-redacts-values',
+     'launch output reports the environment source without its values'),
+)
+def _check_launch_environment_sources(s):
+    checked = []
+    pid = PID_CEILING + 917
+    record = immutable({
+        "pid": pid, "ppid": 1, "proc_start": "fixture-start", "is_claude": True,
+        "argv": (FAKE_AGENT_BIN, "--resume", "fixture-lead"),
+        "session": "fixture-lead", "team": None, "agent_id": None,
+        "placement": ProcessPlacement("outside"),
+    })
+    lead = immutable({"pid": pid, "alive": True, "records": (record,)})
+    snapshot = immutable({"by_pid": {pid: record}, "records": ()})
+    values = {"PAGER": "lead-pager", "HOME": "/fixture-home", "PATH": "/fixture-bin",
+              "CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF": "1",
+              "SYNTHETIC_TOKEN": "fixture-secret-not-for-preview", "EMPTY": "",
+              "ODD-NAME": "spaces and\na newline", "TMUX_TMPDIR": "/fixture-lead-tmux"}
+    eng = Resolver()
+    eng._proc_env = lambda _pid, names=None: dict(values)
+    with _caller_values(PAGER="tool-pager", ABSENT_IN_LEAD="tool-value",
+                        CLAUDE_CODE_CHILD_SESSION="tool-session"):
+        selected = eng._launch_environment_fact(lead, snapshot)
+        source_ok = (
+            selected["process"] is record and selected["source_values"] == values
+            and all(selected["values"].get(k) == v for k, v in values.items())
+            and "ABSENT_IN_LEAD" not in selected["values"]
+            and "CLAUDE_CODE_CHILD_SESSION" not in selected["values"])
+        caller_record = immutable({"pid": os.getpid(), "ppid": pid, "is_claude": False})
+        caller_snapshot = immutable({"by_pid": {os.getpid(): caller_record, pid: record}})
+        fallback = eng._launch_environment_fact(None, caller_snapshot)
+        caller_ok = (fallback["process"] is record
+                     and fallback["source"] == "invoking Claude process"
+                     and fallback["values"].get("PAGER") == "lead-pager"
+                     and "CLAUDE_CODE_CHILD_SESSION" not in fallback["values"])
+    checked.append(_check_verdict("launch-environment-selects-complete-source", source_ok,
+                                  f"selected names={sorted(selected['values'])}"))
+    checked.append(_check_verdict("launch-environment-falls-back-to-caller-claude", caller_ok,
+                                  f"source={fallback['source']}"))
+
+    eng._proc_env = lambda _pid, names=None: None
+    unreadable = eng._launch_environment_fact(lead, snapshot)
+    refused = ""
+    try:
+        with capturing("err"):
+            enforce_ctx({"process": {"environment": unreadable}}, _Run())
+    except Refusal as exc:
+        refused = str(exc)
+    checked.append(_check_verdict("launch-environment-unreadable-refuses",
+                                  bool(unreadable["objection"] and refused
+                                       and str(pid) in refused), refused))
+
+    # Revalidation is exercised with a retained source outside the selected
+    # team's process generation, as when the invoking Claude supplies it.
+    eng._proc_env = lambda _pid, names=None: dict(values)
+    eng._process_table = lambda refresh=False: ()
+    current = {pid: record}
+    eng._runtime = lambda table: immutable({"records": (), "by_pid": current})
+    eng._tmux_launch_action = lambda destination: None
+    eng._file_generation = lambda path: "fixture-file-generation"
+    launch_fact = immutable({
+        "destination": None, "launch_action": None,
+        "process": {"environment": selected, "generation_agents": (),
+                    "generation_sessions": (), "generation_teams": (), "generation": ()},
+        "transcript": {"path": Path("/fixture/transcript")},
+        "transcript_generation": "fixture-file-generation",
+    })
+    initial = eng.revalidate_launch(launch_fact)
+    values["PAGER"] = "changed-lead-pager"
+    changed_values = eng.revalidate_launch(launch_fact)
+    current[pid] = immutable({**record, "proc_start": "replacement-start"})
+    changed_process = eng.revalidate_launch(launch_fact)
+    checked.append(_check_verdict(
+        "launch-environment-revalidates-source",
+        initial["matches"]
+        and "launch environment contents" in changed_values["changed"]
+        and "launch environment process generation" in changed_process["changed"]
+        and selected["values"]["PAGER"] == "lead-pager",
+        f"initial={initial['changed']}, values={changed_values['changed']}, "
+        f"process={changed_process['changed']}"))
+
+    deliveries, output = [], []
+    for alive in (False, True):
+        engine = Resolver(needs=Needs(maybe=set(NEED)))
+        fake = _FakeTmux(session_exists=alive, sockets=["env-fixture"] if alive else [])
+        fake.env["ABSENT_IN_LEAD"] = "stale-server-value"
+
+        def received(socket, *args):
+            if args and args[0] in ("new-session", "new-window", "split-window"):
+                deliveries.append((socket, tuple(args), dict(os.environ)))
+            return fake(socket, *args)
+
+        with fake.installed(engine, through=received):
+            action = engine._tmux_launch_action(LaunchDestination("env-fixture", None))
+            with capturing("out") as out, capturing("err"):
+                launch(action, None, [FAKE_AGENT_BIN, "--resume", "fixture"], False,
+                       environment=selected)
+            output.append(out.getvalue())
+        socket, argv, client_env = deliveries[-1]
+        deliveries[-1] = (socket == action["server"]["path"]
+                           and client_env == dict(selected["values"])
+                           and fake.environment_packets == [selected]
+                           and PANE_ENV_EXEC in argv
+                           and not fake.environment_channels)
+    checked.append(_check_verdict("launch-environment-is-applied-to-server-and-pane",
+                                  all(deliveries), f"new/existing server results={deliveries}"))
+    shown = "\n".join(output)
+    checked.append(_check_verdict("launch-environment-preview-redacts-values",
+                                  selected["description"] in shown
+                                  and values["SYNTHETIC_TOKEN"] not in shown
+                                  and values["ODD-NAME"] not in shown, shown))
+    return checked
+
+
+@unit(('launch-pane-environment-exec-preserves-exact-values',
+       'pane exec preserves selected values and fresh terminal fields while removing stale variables'), live=True)
+def _check_launch_pane_environment_exec(s):
+    # This starts Python only. The synthetic tmux suite above checks the argv
+    # and environment tmux receives without contacting a machine's servers.
+    base = {"PATH": os.defpath, "LC_ALL": "C.UTF-8", "PAGER": "lead-pager",
+            "EMPTY": "", "ODD-NAME": "spaces and\na newline", "LARGE_A": "a" * 70000,
+            "LARGE_B": "b" * 70000, "TMUX": "fresh-socket", "TMUX_PANE": "%73",
+            "TERM": "tmux-256color", "PWD": "/stale-working-directory",
+            "STALE": "must-not-reach-child"}
+    names = tuple(sorted(set(base) - {"STALE"}))
+    environment = immutable({"values": {k: v for k, v in base.items() if k in names},
+                             "terminal_names": ("TMUX", "TMUX_PANE", "TERM", "PWD")})
+    child_code = "import json,os; print(json.dumps(dict(os.environ)))"
+    with PaneEnvironment(environment) as channel:
+        process = subprocess.Popen(
+            channel.command([sys.executable, "-I", "-B", "-c", child_code]),
+            env=base, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        with owned_group(process) as stop:
+            channel.deliver()
+            result = collected(process, 10, stop)
+        transport_removed = channel.path
+    transport_removed = not Path(transport_removed).exists()
+    try:
+        reached = json.loads(result.stdout)
+    except ValueError:
+        reached = {}
+    expected = {k: v for k, v in base.items() if k in names}
+    expected["PWD"] = os.getcwd()
+    good = result.returncode == 0 and reached == expected and transport_removed
+    return [_check_verdict("launch-pane-environment-exec-preserves-exact-values", good,
+                           f"child={process.pid}, exit={result.returncode}, names={sorted(reached)}, "
+                           f"stderr={result.stderr}")]
+
+
+@unit(
+    ('environment-command-keeps-argv-and-source',
+     'the environment command preserves argv and the selected shell environment'),
+    ('environment-command-refuses-child-source',
+     'the environment command refuses a tool or teammate source'),
+    ('environment-command-checks-source-before-exec',
+     'the environment command refuses a changed source before executing'),
+    ('environment-command-parser-keeps-command-flags',
+     'environment command flags after -- remain part of the requested command'),
+    ('launch-caller-env-preserves-proxy-wrapper',
+     'an explicit caller environment preserves proxy wrapper values when the lead is stopped'),
+)
+def _check_environment_command(s):
+    from unittest import mock
+    checked = []
+    pid = PID_CEILING + 948
+    record = immutable({
+        "pid": pid, "ppid": 1, "proc_start": "source-start", "is_claude": True,
+        "argv": (FAKE_AGENT_BIN, "--resume", "shell-session"),
+        "session": "shell-session", "team": None, "agent_id": None,
+        "placement": ProcessPlacement("outside"),
+    })
+    current = {pid: record}
+    values = {"PAGER": "shell-pager", "PATH": os.defpath, "EMPTY": "",
+              "TMUX": "source-terminal", "TMUX_PANE": "%11"}
+    engine = Resolver()
+    engine._process_table = lambda refresh=False: ()
+    engine._runtime = lambda table: immutable({"by_pid": current, "records": ()})
+    engine._proc_env = lambda _pid, names=None: dict(values)
+    command = ("/fixture/command", "--help", "space argument", "--", "--doctor")
+    plan = engine.environment_command_plan(pid, command)
+    expected = {k: v for k, v in values.items() if k not in ("TMUX", "TMUX_PANE")}
+    seen = []
+
+    def exec_command(binary, argv, environment):
+        seen.append((binary, tuple(argv), environment))
+        raise OSError("synthetic exec refusal")
+
+    with mock.patch.dict(globals(), RESOLVER=engine), mock.patch.object(os, "execvpe", exec_command):
+        with capturing("err"):
+            try:
+                run_env_of(_Run(env_of=pid), command)
+            except Refusal:
+                pass
+        reached = list(seen)
+        current[pid] = immutable({**record, "proc_start": "replacement-start"})
+        with capturing("err"):
+            try:
+                run_env_of(_Run(env_of=pid), command)
+            except Refusal:
+                pass
+        # The new plan names the current source, so change it between the
+        # planner and the final generation check for this explicit race.
+        current[pid] = record
+        real_planner = engine.environment_command_plan
+
+        def replacing_source(source_pid, argv):
+            answer = real_planner(source_pid, argv)
+            current[source_pid] = immutable({**record, "proc_start": "replacement-start"})
+            return answer
+
+        before = len(seen)
+        with mock.patch.object(engine, "environment_command_plan", replacing_source):
+            with capturing("err"):
+                try:
+                    run_env_of(_Run(env_of=pid), command)
+                except Refusal:
+                    pass
+        stopped_before_exec = len(seen) == before
+    checked.append(_check_verdict(
+        "environment-command-keeps-argv-and-source",
+        plan["command"] == command and plan["values"] == expected
+        and reached == [(command[0], command, expected)],
+        f"argv={plan['command']}, environment names={sorted(plan['values'])}"))
+    checked.append(_check_verdict("environment-command-checks-source-before-exec", stopped_before_exec,
+                                  f"exec calls before/after race={before}/{len(seen)}"))
+    current[pid] = record
+    refusals = []
+    for marker in Resolver._SHELL_LAUNCH_MARKERS:
+        values[marker] = "synthetic-child-value"
+        answer = engine.environment_command_plan(pid, command)
+        refusals.append(bool(answer["objection"] and marker in answer["objection"]))
+        del values[marker]
+    current[pid] = immutable({**record, "is_claude": False})
+    not_claude = engine.environment_command_plan(pid, command)
+    checked.append(_check_verdict("environment-command-refuses-child-source",
+                                  all(refusals) and bool(not_claude["objection"]),
+                                  f"child markers refused={sum(refusals)}/{len(refusals)}"))
+    parser = build_parser()
+    args, extra = parser.parse_known_args(["--env-of", str(pid), "--", *command])
+    selected, forwarded = classify_passthrough(extra)
+    checked.append(_check_verdict("environment-command-parser-keeps-command-flags",
+                                  args.env_of == pid and not args.help and not args.doctor
+                                  and selected is None and tuple(forwarded) == ("--", *command),
+                                  f"forwarded={forwarded}"))
+
+    ancestor = PID_CEILING + 950
+    fake = _FakeTmux(sockets=["claude-swarm-test"])
+    fake.process_environments[ancestor] = {"PAGER": "ancestor-pager", "PATH": os.defpath}
+    table = ((os.getpid(), ancestor, (sys.executable, "synthetic-tool")),
+             (ancestor, 1, (FAKE_AGENT_BIN, "--resume", "restoring-session")))
+    received = []
+    with _caller_values(ANTHROPIC_BASE_URL="http://proxy.fixture:8317", PAGER="wrapper-pager"):
+        result = resume_run(
+            "willow@session-corpus-alpha", server=fake, table=table,
+            caller_env=True, watch=lambda entry: received.append(dict(os.environ)))
+    checked.append(_check_verdict(
+        "launch-caller-env-preserves-proxy-wrapper",
+        result[0] == "launched" and len(received) == 1
+        and received[0].get("ANTHROPIC_BASE_URL") == "http://proxy.fixture:8317"
+        and received[0].get("PAGER") == "wrapper-pager"
+        and "invoking command" in result[3],
+        f"status={result[0]}, launches={len(received)}"))
+    return checked
+
+
+@unit(
     ('doctor-request-is-typed-and-exclusive',
      'a doctor request is frozen and accepts one selector'),
     ('doctor-answer-has-one-public-caller',
@@ -50411,10 +50883,10 @@ def _check_completion_consumes_one_complete_answer(s):
      'the doctor answer retains its request, selected generations, and diagnosis records'),
     ('doctor-renderer-consumes-answer-only',
      'the doctor renderer asks once and formats only fields from that answer'),
-    ('launch-credentials-retain-selected-fact',
-     'credential application copies the exact credential fact retained by a launch answer'),
-    ('launch-credential-application-does-not-reread-procfs',
-     'credential application does not ask Resolver or procfs after launch selection'),
+    ('launch-environment-retains-selected-fact',
+     'launch execution uses the complete environment retained by the launch answer'),
+    ('launch-environment-execution-does-not-reread-procfs',
+     'launch execution does not ask Resolver or procfs after environment selection'),
 )
 def _check_doctor_and_launch_credential_ownership(s):
     checked = []
@@ -50560,55 +51032,37 @@ def _check_doctor_and_launch_credential_ownership(s):
           f"reader calls={local_reader_calls}")
 
     selected_process = immutable({"pid": PID_CEILING + 12345, "start": 99})
-    selected_credentials = immutable({
+    selected_environment = immutable({
         "process": selected_process,
-        "values": {"ANTHROPIC_AUTH_TOKEN": "selected-token"},
+        "values": {"ANTHROPIC_AUTH_TOKEN": "selected-token", "PAGER": "less"},
     })
-    selected_launch = immutable({"process": {"credentials": selected_credentials}})
-    saved = {name: os.environ.pop(name, None) for name in INHERIT_ENV}
-    try:
-        with capturing("out"), capturing("err"):
-            adopted = inherit_credentials(selected_launch)
-        copied = os.environ.get("ANTHROPIC_AUTH_TOKEN")
-    finally:
-        for name, value in saved.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+    before = dict(os.environ)
+    with launch_environment(selected_environment):
+        copied = dict(os.environ)
     launch_builder = s.funcs["_set_effective_identity"]
-    credential_fact_calls = [node for node in ast.walk(launch_builder)
-                             if isinstance(node, ast.Call)
-                             and getattr(node.func, "attr", None) == "_credential_fact"]
-    credential_keys = [node.value for node in ast.walk(launch_builder)
-                       if isinstance(node, ast.Constant) and node.value == "credentials"]
-    check("launch-credentials-retain-selected-fact",
-          "credential application copies the exact credential fact retained by a launch answer",
-          selected_launch["process"]["credentials"] is selected_credentials
-          and selected_credentials["process"] is selected_process
-          and adopted == ["ANTHROPIC_AUTH_TOKEN"] and copied == "selected-token"
-          and len(credential_fact_calls) == 1 and bool(credential_keys),
-          f"adopted={adopted}, copied={copied!r}, "
-          f"credential fact calls={len(credential_fact_calls)}")
+    fact_calls = [node for node in ast.walk(launch_builder)
+                  if isinstance(node, ast.Call)
+                  and getattr(node.func, "attr", None) == "_launch_environment_fact"]
+    environment_keys = [node.value for node in ast.walk(launch_builder)
+                        if isinstance(node, ast.Constant) and node.value == "environment"]
+    check("launch-environment-retains-selected-fact",
+          "launch execution uses the complete environment retained by the launch answer",
+          copied == dict(selected_environment["values"]) and dict(os.environ) == before
+          and selected_environment["process"] is selected_process
+          and len(fact_calls) == 1 and bool(environment_keys),
+          f"copied names={sorted(copied)}, fact calls={len(fact_calls)}")
 
-    credential_consumer = s.funcs["inherit_credentials"]
-    consumer_nodes = tuple(own_nodes(credential_consumer))
-    procfs_reads = sorted(
-        f"{getattr(node.func, 'attr', getattr(node.func, 'id', '?'))} at line {node.lineno}"
-        for node in consumer_nodes if isinstance(node, ast.Call)
-        and (getattr(node.func, "attr", None) == "proc_env"
-             or getattr(node.func, "id", None) == "proc_env"))
-    procfs_paths = [node.value for node in ast.walk(credential_consumer)
+    consumer = s.funcs["launch_environment"]
+    procfs_paths = [node.value for node in ast.walk(consumer)
                     if isinstance(node, ast.Constant) and isinstance(node.value, str)
                     and "/proc/" in node.value]
     consumer_resolver_calls = sorted(
         question for question, callers in s.resolver_calls.items()
-        if "inherit_credentials" in callers)
-    check("launch-credential-application-does-not-reread-procfs",
-          "credential application does not ask Resolver or procfs after launch selection",
-          not procfs_reads and not procfs_paths and not consumer_resolver_calls,
-          f"procfs calls={procfs_reads}, procfs paths={procfs_paths}, "
-          f"Resolver questions={consumer_resolver_calls}")
+        if "launch_environment" in callers)
+    check("launch-environment-execution-does-not-reread-procfs",
+          "launch execution does not ask Resolver or procfs after environment selection",
+          not procfs_paths and not consumer_resolver_calls,
+          f"procfs paths={procfs_paths}, Resolver questions={consumer_resolver_calls}")
     return checked
 
 
@@ -52396,6 +52850,8 @@ def verb_needs(args, selector):
     that the run did not exercise, so an entry does not survive here just in
     case; the maps are tightened by running the verbs, not by guessing.
     """
+    if getattr(args, "env_of", None) is not None:
+        return Needs(hard={NEED.PROCS})
     if args.complete:
         return completion_needs(args.complete)
     if args.selftest or args.cleanup:
@@ -52530,6 +52986,14 @@ def offers(action, row, completes=None):
     return action
 
 
+def pid_argument(text):
+    """A positive decimal PID for argparse."""
+    value = _whole_pid(text)
+    if value is None:
+        raise argparse.ArgumentTypeError("PID must be a positive decimal integer")
+    return value
+
+
 def build_parser():
     """Every flag this tool takes, declared once, in the groups it prints them in.
 
@@ -52561,6 +53025,12 @@ def build_parser():
     saying = parser.add_argument_group("what it prints")
     swarm = parser.add_argument_group("the swarm tmux server")
     suite = parser.add_argument_group("with --selftest only")
+    offers(verbs.add_argument("--env-of", metavar="PID", type=pid_argument,
+                              help="run the command after -- with a plain Claude process's launch environment"),
+           row="run a command with a Claude process's launch environment")
+    offers(placing.add_argument("--caller-env", action="store_true",
+                               help="when the lead is stopped, use this command's environment instead of a Claude ancestor"),
+           row="use the caller environment when the lead is stopped")
     offers(picking.add_argument("--agent-id", help="resume this agent (by its full id, name@team)"),
            completes='agent-ids',
            row='resume this agent by its full id, name@team')
@@ -52784,6 +53254,13 @@ def main():
     global RESOLVER
     RESOLVER = Resolver(needs=verb_needs(args, selector))
     check_selection_conflicts(args)
+
+    if args.env_of is not None:
+        if selector or args.agent_id or args.resume or args.team:
+            die("--env-of takes a PID and a command after --, not an agent selector")
+        if passthrough[:1] != ["--"] or len(passthrough) < 2:
+            die("--env-of needs a command after --")
+        return run_env_of(args, passthrough[1:])
 
     if args.selftest:
         batch = None
