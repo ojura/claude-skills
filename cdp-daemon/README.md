@@ -7,6 +7,8 @@ consent once per connection and shares that connection among clients.
 
 ## Capabilities
 
+- Bind the local API listener before starting consent pressing or Chrome
+  acquisition; an occupied port fails startup before either action.
 - Discover Chrome's live endpoint through `DevToolsActivePort` and press its
   consent dialog through AT-SPI.
 - Attach to targets, evaluate JavaScript, send arbitrary CDP methods and read a

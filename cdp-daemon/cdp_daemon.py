@@ -642,14 +642,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
 
+def main():
+    # Binding owns the API endpoint before any Chrome acquisition can start.
+    with ThreadingHTTPServer(("127.0.0.1", DAEMON_PORT), Handler) as server:
+        api_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        api_thread.start()
+        try:
+            host, port = server.server_address[:2]
+            log(f"HTTP API on http://{host}:{port}")
+            threading.Thread(target=presser_main, daemon=True).start()
+            connection_manager()
+        finally:
+            server.shutdown()
+            api_thread.join()
+
+
 if __name__ == "__main__":
-    # Start the HTTP server before connection acquisition so /status can report
-    # acquisition progress and failure.
-    threading.Thread(
-        target=lambda: ThreadingHTTPServer(("127.0.0.1", DAEMON_PORT), Handler).serve_forever(),
-        daemon=True).start()
-    log(f"HTTP API on http://127.0.0.1:{DAEMON_PORT}")
-    # In-process presser: parks between connect attempts, armed by connect_once.
-    threading.Thread(target=presser_main, daemon=True).start()
-    # Connection manager owns the single CDP socket and reconnects on drop.
-    connection_manager()
+    main()

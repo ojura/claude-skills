@@ -32,8 +32,12 @@ python3 cdp_daemon.py & disown
 curl -s http://127.0.0.1:7799/status
 ```
 
-The HTTP API starts before Chrome connection acquisition, so `/status` reports
-connection progress and failure. One dedicated presser thread imports
+The daemon binds its HTTP listener synchronously before logging availability,
+starting the presser or acquiring a Chrome connection. An occupied API port fails
+startup at that bind, so another process does not acquire Chrome without owning
+the API endpoint. Startup failures close the listener. Once the server is
+running, `/status` reports connection progress and failure while acquisition
+continues. One dedicated presser thread imports
 `clear_modals` and performs the AT-SPI calls. During acquisition it repeatedly
 looks for Chrome's Allow buttons and reports its observations through `log_tail`.
 It presses each matching button because Chrome can expose multiple button nodes

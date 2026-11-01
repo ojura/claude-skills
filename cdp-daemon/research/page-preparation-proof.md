@@ -187,11 +187,20 @@ events before the helper's later missing-tab exception response. The guarded
 call ended as detached, the shared reader stayed ready, and B's held
 initialization later completed. That terminal handling was retained.
 
-The forward implementation passes 67 Python tests, 10 research-worker tests and
-28 owned-Chrome tests. The native final-viewport control completes both callbacks,
-sets the actual viewport to zero before final metrics, and receives
-`view_uninitialized`. Socket-loss gates now signal after the packet write, so
-those controls exercise a guarded pending reply rather than a pre-write failure.
+The current deterministic suite passes 71 Python tests and 10 research-worker
+tests. The latest owned-Chrome matrix passed 28 tests. Its final-viewport control
+completes both callbacks, sets the actual viewport to zero before final metrics,
+and receives `view_uninitialized`. Socket-loss gates signal after the packet
+write, so those controls exercise a guarded pending reply rather than a pre-write
+failure.
+
+An independent recheck of exact `8e238bca` passed three native final-size cases:
+zero width, zero height, and both zero after callbacks each returned
+`view_uninitialized`. It also passed 28 targeted readiness/snapshot checks. Native
+method spans recorded zero layout-metrics calls for JavaScript, DOM and load
+readiness, and two for stable animation readiness. The normal-profile shared
+client, freeze/discard and post-restart readiness/release controls also passed
+with the daemon and supporting modules loaded wholly from that commit.
 
 An independent production-path control installed the reviewed passive helper
 through Chrome's Developer mode / Load unpacked UI without either
@@ -228,6 +237,14 @@ operations used by this implementation.
 These failures were demonstrated separately from the intentional wait-only
 timeout behavior:
 
+- The API server constructor ran in a background thread. With an actual owned
+  listener occupying its port, binding failed with `EADDRINUSE` while main still
+  logged API availability and attempted Chrome acquisition. Main now acquires the
+  listener synchronously before logging, presser startup or acquisition. The
+  independent reproducer then records bind failure propagation, an empty startup
+  log and acquisition skipped, with zero real Chrome connections. Normal-startup
+  controls serve `/status` while fake acquisition is pending and confirm listener
+  release after thread-start or later startup failure.
 - A socket send failure left a local response waiter registered. The regression
   failed on the old implementation and passes with cleanup in `finally`.
 - The reader did not explicitly close its socket on EOF. It now closes the
