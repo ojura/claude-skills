@@ -1,10 +1,10 @@
 # Page-preparation proof record
 
-The controls use Chrome 156.0.8078.47, Chromium revision
+The current controls use Chrome 156.0.8078.47, Chromium revision
 `1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775`, on 2026-11-01. The binary is the
-workstation's installed Chrome; the profiles, local HTTP fixtures, extension
-installations and Xvfb displays belong to the tests. The existing user profile
-was left unchanged.
+workstation's installed Chrome. The fixture controls use owned profiles, local
+HTTP servers, extension installations and Xvfb displays. The separate approved
+installation in the existing user profile is recorded below.
 
 The supported interface is selection-free `/prepare` plus `/release`. A public
 selection-based option remains a pending user decision. Its prototype is kept
@@ -227,6 +227,255 @@ Cleanup confirmed that the owned Chrome, Xvfb, D-Bus and controller processes ha
 exited. The retained profile still recorded the helper at the same ID/path with
 `location=4`, `disable_reasons=[]` and Developer mode enabled.
 
+## Browser-level automated installation
+
+The approved installation on the actual running Chrome used the existing
+browser-level `Extensions.loadUnpacked` automation. A non-mutating capability
+probe first passed a missing child of an owned empty temporary directory through
+`/cdp`, without `sessionId`. The endpoint returned HTTP 500 with protocol error
+`-32600`, `File path cannot be resolved.` The child remained absent.
+
+The real installation then sent:
+
+```json
+{"method":"Extensions.loadUnpacked","params":{"path":"/home/juraj/claude-skills/cdp-daemon/browser-state-extension"},"timeout_seconds":20}
+```
+
+The response was HTTP 200 with
+`result.id:"mjkdoldgccjabmdemjlgnmkbomppkofg"`. The request omitted `sessionId`
+and did not open a window or native directory chooser. This endpoint supported
+the operation as it was running; the flags used by the isolated integration
+fixture did not establish requirements for the live endpoint.
+
+UI metadata identified the helper as `ENABLED`, `UNPACKED`, version `1.0.0`,
+at the canonical directory, with every disable reason false. Its own runtime
+reported the same ID/version, only `debugger` in both declared and granted
+permissions, and `origins:[]`. The selected persisted entry in the Default
+profile recorded `location=4`, the canonical path, `disable_reasons=[]`,
+`debugger` as its only API permission and empty host-permission lists. Its
+`creation_flags` value was `32806`, including `INSTALLED_VIA_CDP`. Browser-level
+`Extensions.getExtensions` independently reported the same enabled helper,
+canonical path and version.
+
+### Startup policy and owned recovery control
+
+The loader's WebSocket lifetime and Chrome startup have different behavior.
+`ExtensionsHandler::LoadUnpacked` uses the default browser context and the normal
+unpacked installer, marking the installation `INSTALLED_VIA_CDP`. The normal
+installer registers it with the profile. The handler and Chrome DevTools session
+have default destructors. Client detachment erases the DevTools session and
+leaves the profile's extension registration intact.
+
+On profile startup, the `ExtensionPrefs` constructor unconditionally calls
+`CleanUpCdpInstalledExtensions`. That function deletes the preferences for every
+installed record marked `INSTALLED_VIA_CDP`. It does not condition this cleanup
+on Developer mode. Thus the saved `location=4` entry describes the current
+registration but does not establish survival across a Chrome restart.
+
+An owned native-API control confirmed the distinction on the exact revision.
+It used an initially fresh profile, private Xvfb and private D-Bus, with ordinary
+Chrome flags throughout. The missing-path probe and actual helper load both
+worked without `--enable-unsafe-extension-debugging` or `--load-extension`.
+Developer mode was enabled and verified before loading. The actual ID/path/
+version and debugger-only grants matched, and all four readiness modes and
+release passed.
+
+Closing and reopening only the debugging connection retained the same browser
+PID and enabled helper, with the same path/version/grants. A subsequent normal
+Chrome restart retained Developer mode true, so its checkbox was skipped, but
+`Extensions.getExtensions` returned an empty registry. Sending the approved
+canonical path through the native loader again restored the helper. Actual
+metadata/grants and all four readiness modes plus release passed after that
+recovery.
+
+Immediately after startup, the disk preferences could still show the previous
+`location=4` and `creation_flags=32806` entry while the live extension registry
+was already empty. An initial test incorrectly required immediate disk removal
+and failed; after that browser exited, the entry was absent on disk. The
+corrected control verifies the actual registry state. Recovery must inspect the
+running browser, not infer availability from a saved preference record.
+
+### Persistence after ordinary UI Reload
+
+The ordinary Reload control in a background extensions tab cleared the CDP
+marker. With Developer mode enabled, the helper card exposed the ordinary
+Reload control at `#dev-reload-button` inside its shadow root. The older
+`#dev-reload` selector was absent. The control was enabled, had positive
+bounds and the title `Reload`. Calling its normal `click()` handler reported
+`isTrusted:false`.
+
+The actual saved `creation_flags` changed from `32806` to `38`, clearing
+`INSTALLED_VIA_CDP` while retaining `location=4`, the canonical path, version
+and debugger-only grants. The extensions UI and selected control target had the
+same browser window ID. The selected document stayed visible with an empty
+`visibilitychange` history. The native focus observer first detected a deliberate
+`FocusOut`/`FocusIn` pair to verify that it could observe focus changes. During
+the measured Reload, its event history stayed empty and `XGetInputFocus` stayed
+on the owned control window.
+
+After normal Chrome shutdown, the flushed helper entry still had flags `38`.
+After normal restart, Developer mode remained true and was not toggled, the
+native registry retained the enabled helper at the same ID/path/version, its
+permissions still contained only `debugger` with `origins:[]`, and all four
+readiness modes plus release passed without another native load.
+
+The source explains the marker change. `DeveloperPrivateReloadFunction` calls
+the registrar's normal Reload path. For an unpacked extension, the Chrome
+registrar delegate creates a fresh `UnpackedInstaller` and calls `Load` without
+setting `installed_via_cdp`. That member defaults false, so `GetFlags` omits
+`INSTALLED_VIA_CDP`. The preference writer saves the new extension's creation
+flags. The subsequent profile-start cleanup therefore keeps this registration.
+
+The order of operations matters for an existing managed reader. One control had
+already run preparation before UI Reload. Its first subsequent preparation
+returned `browser_state_unavailable` with `Extension context invalidated` in the
+exception details, while the native registry still showed the helper enabled.
+Releasing that failed work registration and explicitly retrying succeeded; all
+four readiness modes and release then passed. The invalidated reader was
+retired and replaced. After Chrome restart, preparation passed directly on the
+new connection.
+
+A separate initially fresh control tested the installation order before managed
+use: native load, raw metadata/permission verification with the manager's reader
+registry still empty, ordinary background UI Reload, then first preparation.
+Every readiness mode and release passed directly, the marker changed from
+`32806` to `38`, selection/focus stayed unchanged, and normal browser-restart
+persistence passed. This is the documented persistent automated installation
+sequence. All controls used ordinary Chrome flags without
+`--enable-unsafe-extension-debugging` or `--load-extension`.
+
+### Approved daemon activation
+
+The approved live activation stopped the previous daemon through `/shutdown`
+and started the canonical daemon with its launch environment, executable and
+working directory preserved. The browser PID and endpoint stayed the same.
+Chrome required a new debugging-consent approval, which the owner clicked
+manually. The new daemon then reported `connected`, with its prepared-page
+registrations and pending waits empty.
+
+The helper survived closure of all setup sessions/pages and the daemon-only
+restart without another load. The native registry on the new connection showed
+the helper enabled at the same canonical path and version; its runtime verified
+debugger-only grants. Checks using an owned regular background page on that live
+connection passed JavaScript, DOM, complete-load and animation readiness.
+Animation completed two callbacks with positive final window and viewport
+dimensions of 1247 by 1388.
+
+Two managed clients retained shared focus after the first release and raw
+session detach. Detaching another raw session that had never enabled focus also
+left the managed client's focus intact. Final release returned the document to
+hidden/unfocused state, repeated release succeeded, and raw evaluation still
+returned 4. The selected tab and Chrome window focus matched their initial
+states. Cleanup removed the owned verification targets and left `pending=0`,
+`prepared_pages=[]` and one ready daemon-owned state reader.
+
+### Persistent registration in the running profile
+
+The approved live helper then received the ordinary Reload action in an owned
+regular background extensions tab. Developer mode was already true and was left
+unchanged. The actual `#dev-reload-button` invoked the normal UI handler. The
+saved creation flags changed from `32806` to `38`, clearing `INSTALLED_VIA_CDP`.
+The first-install time stayed the same while the update time changed.
+
+The helper remained `ENABLED` and `UNPACKED` at the canonical path and version
+`1.0.0`, with the canonical key and only `debugger` declared/granted,
+`origins:[]` and false UI disable reasons. The selected tab, Chrome window focus
+and other extensions' enabled/disabled states stayed unchanged. Chrome PID
+7143 and daemon PID 2550514 stayed the same. Normal browser-restart persistence
+was verified with owned profiles in the control above.
+
+Reload invalidated the cached reader, so the first subsequent preparation failed
+with `browser_state_unavailable` and `Extension context invalidated` in its
+details. Releasing that failed work registration and explicitly retrying
+succeeded. A new daemon-owned reader target replaced the old one while the
+verified helper registration stayed enabled.
+
+The subsequent live checks passed all four readiness levels, shared ownership
+through the first release/raw detach, detachment of a raw session that had never
+enabled focus, final release to hidden/unfocused state, repeated release and raw
+evaluation after release. Selected tabs and Chrome window focus stayed
+unchanged. Setup and verification targets were removed. The final status was
+connected with `pending=0`, `prepared_pages=[]` and one ready state reader.
+
+### Reloading an existing path
+
+A historical repeated-load control returned the existing extension ID and old
+cached code after source files changed at an already-loaded path. The transcript
+records that observation at
+`~/.claude/projects/-tmp/f15c61a7-f79c-4c64-9cf8-550ca5245e87.jsonl:2002`.
+An explicit uninstall/load sequence followed, and line 2023 verified the new
+function and state. The earlier successful browser-level installation is
+recorded at lines 777 to 782. For general updates, Reload preserves extension
+data that uninstall/reinstall can delete; verify the runtime manifest and the
+changed behavior after reloading.
+
+## Background directory-drop installation
+
+The directory-drop control used the reviewed production helper from
+`/home/juraj/claude-skills/cdp-daemon/browser-state-extension` at `5aa3b15`.
+Both initially fresh profiles ran on private Xvfb displays and private D-Bus
+sessions with ordinary Chrome flags. The command set excluded `Extensions.*`;
+the launch arguments excluded `--load-extension` and
+`--enable-unsafe-extension-debugging`. The test did not edit preference files
+or connect to the user's browser.
+
+The control kept a document selected in the original window and put native
+input focus in a separate owned X11 window. It created `chrome://extensions/`
+with `Target.createTarget({url:"chrome://extensions/",background:true})`, without
+`newWindow`, then attached and enabled focus emulation on that target. The final
+run confirmed that the extensions target and selected control target had the
+same browser window ID. The selected control document remained visible, with an
+empty `visibilitychange` history. Native input focus stayed in the control
+window in 5 ms samples; the final run also recorded an empty X11
+`FocusIn`/`FocusOut` event history for that window.
+
+Developer mode was observed before taking action. In the fresh profiles it was
+false and was enabled through trusted mouse input. The backend then reported
+`inDeveloperMode:true` and `canLoadUnpacked:true`, and the drop overlay reported
+`dragEnabled:true`. Normal restarts preserved Developer mode. The repeated
+controls observed it already true and skipped the checkbox click entirely.
+
+The trusted event sequence was `dragEnter`, `dragOver`, then `drop`, each sent
+through `Input.dispatchDragEvent` at a point inside the extensions page with:
+
+```json
+{"items":[],"files":["/home/juraj/claude-skills/cdp-daemon/browser-state-extension"],"dragOperationsMask":1}
+```
+
+The page recorded `isTrusted:true`. At drop it received exactly one file named
+`browser-state-extension`, and `webkitGetAsEntry().isDirectory` was true. Chrome
+still rejected the installation:
+
+- `Log.entryAdded` recorded `Unchecked runtime.lastError: No current drop data.`
+- The extensions UI emitted `drag-and-drop-load-error` with
+  `{message:"No dragged path"}`.
+- The installed-extension list remained empty, including after the normal
+  restarts. Chrome did not register the helper's expected ID, an installation
+  path or a permission grant. The failure prevented helper preparation and a
+  persistence check for an installed helper.
+
+An initial check that waited only for registration reached its 10-second fixture
+deadline. The instrumented controls captured the explicit errors above,
+including with Developer mode already true. The selected document and native
+focus controls stayed unchanged throughout those failures. The test did not
+observe `Page.fileChooserOpened`; the native source also rejects this missing
+path before the branch that opens a directory chooser.
+
+The source at the tested revision explains the distinction. The WebUI directory
+handler calls `loadUnpackedFromDrag()`, which passes `useDraggedPath:true`.
+Earlier, `notifyDragInstallInProgress()` calls `SetDroppedPath()`, which reads
+`WebContents::GetDropData()` and reports `No current drop data.` when that native
+state is absent. The load operation subsequently reads the saved dragged file
+and reports `No dragged path` when its path is empty. CDP's input handler sends
+its drag data directly through `RenderWidgetHostImpl` drag-target calls. The
+trusted renderer events in this control did not populate the native
+`WebContents` drop state required by the installation API.
+
+This failure belongs to the CDP directory-drop route. The browser-level
+`Extensions.loadUnpacked` command succeeded on the actual endpoint as recorded
+above. The manual **Load unpacked** UI with its native directory chooser remains
+a fallback.
+
 ## Helper permissions
 
 A fresh independent fixture changed only the helper's declared permissions from
@@ -308,6 +557,54 @@ timeout behavior:
 ## Chromium source references
 
 All links below refer to the tested revision.
+
+- [Browser-level extension loader](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/chrome/browser/devtools/protocol/extensions_handler.cc):
+  the destructor at line 211 is default; `LoadUnpacked`, lines 213 to 245, uses
+  the default browser context and marks the normal unpacked installation as
+  installed through CDP.
+- [Unpacked installer](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/extensions/browser/unpacked_installer.cc):
+  lines 301 to 303 add `INSTALLED_VIA_CDP`; lines 407 to 409 load `kUnpacked`;
+  lines 437 to 465 grant permissions and register the installed extension.
+- [Ordinary Reload installer](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/chrome/browser/extensions/chrome_extension_registrar_delegate.cc):
+  `DoLoadExtensionForReload`, lines 264 to 293, creates a new unpacked installer
+  without marking it as installed through CDP.
+- [Unpacked installer defaults](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/extensions/browser/unpacked_installer.h):
+  line 207 initializes `installed_via_cdp_` to false.
+- [Registrar Reload dispatch](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/extensions/browser/extension_registrar.cc):
+  `DoReloadExtension`, lines 1160 to 1241, disables the old extension for reload
+  and delegates loading its path.
+- [Reload control](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/chrome/browser/resources/extensions/item.html.ts):
+  lines 189 to 193 define the ordinary `dev-reload-button` and its click handler.
+- [Profile startup cleanup](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/extensions/browser/extension_prefs.cc):
+  the constructor, lines 2189 to 2222, calls `CleanUpCdpInstalledExtensions` at
+  line 2213; lines 2611 to 2619 delete preferences for records with
+  `INSTALLED_VIA_CDP`. `PopulateExtensionInfoPrefs`, lines 2334 to 2347, saves
+  the reloaded extension's new creation flags.
+- [Extension creation flags](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/extensions/common/extension.h):
+  lines 126 to 128 define `INSTALLED_VIA_CDP` as `1 << 15`.
+- [Chrome DevTools session](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/chrome/browser/devtools/chrome_devtools_session.cc):
+  line 151 defines the default destructor.
+- [DevTools client detachment](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/chrome/browser/devtools/chrome_devtools_manager_delegate.cc):
+  `ClientDetached`, lines 430 to 433, erases the DevTools session.
+
+- [Extensions directory-drop handler](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/chrome/browser/resources/extensions/drag_and_drop_handler.ts):
+  `doDragEnter`, lines 41 to 44, requests native drop-path tracking;
+  `doDrop`, lines 54 to 80, recognizes the directory; `handleDirectoryDrop_`,
+  lines 93 to 97, reports load errors.
+- [Extensions UI service](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/chrome/browser/resources/extensions/service.ts):
+  `loadUnpackedFromDrag`, lines 559 to 561, passes `useDraggedPath:true`;
+  `notifyDragInstallInProgress`, lines 567 to 569, calls the native API.
+- [Native extensions installation](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/chrome/browser/extensions/api/developer_private/developer_private_functions.cc):
+  `SetDroppedPath`, lines 333 to 359, reads native `WebContents` drop data;
+  `DeveloperPrivateReloadFunction::Run`, lines 775 to 816, uses the normal
+  registrar Reload path; `DeveloperPrivateLoadUnpackedFunction::Run`, lines
+  930 to 943, rejects a missing dragged path before directory selection;
+  `DeveloperPrivateNotifyDragInstallInProgressFunction::Run`, lines 1122 to
+  1137, calls `SetDroppedPath` before the drop is handled.
+- [CDP drag dispatch](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/content/browser/devtools/protocol/input_handler.cc):
+  `DispatchDragEvent`, lines 1436 to 1463, finds the renderer widget;
+  `OnWidgetForDispatchDragEvent`, lines 1465 to 1534, sends renderer drag-target
+  calls using the supplied protocol data.
 
 - [Focus emulation](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/content/browser/devtools/protocol/emulation_handler.cc):
   `SetFocusEmulationEnabled`, lines 1042 to 1057, increments visible capture;
