@@ -2,6 +2,7 @@
 import concurrent.futures
 import copy
 import importlib.util
+import inspect
 import itertools
 import json
 import os
@@ -39,6 +40,7 @@ def load_daemon():
 class PreparationTests(unittest.TestCase):
     def setUp(self):
         self.daemon = load_daemon()
+        self.daemon.cdp_sock = object()
         self.calls = []
         self.transport = mock.patch.object(self.daemon, "cdp_call", side_effect=self.respond)
         self.transport.start()
@@ -50,6 +52,8 @@ class PreparationTests(unittest.TestCase):
             return {"result": {"targetInfo": {"targetId": "target", "type": "page"}}}
         if method == "Target.createTarget":
             return {"result": {"targetId": "bridge-target"}}
+        if method == "Target.closeTarget":
+            return {"result": {"success": True}}
         if method == "Target.attachToTarget":
             session = "bridge-session" if params["targetId"] == "bridge-target" else "control-session"
             return {"result": {"sessionId": session}}
@@ -130,6 +134,50 @@ class PreparationTests(unittest.TestCase):
             self.calls.clear()
             self.prepare(readiness=readiness)
             self.assertFalse(any(call[0] == "Page.getLayoutMetrics" for call in self.calls))
+
+    def test_animation_revalidates_final_dimensions_after_callbacks(self):
+        for changed in ("window", "viewport"):
+            with self.subTest(changed=changed):
+                original = self.respond
+                callbacks = False
+
+                def resize(method, params=None, **kwargs):
+                    nonlocal callbacks
+                    response = original(method, params, **kwargs)
+                    if (method == "Runtime.evaluate" and kwargs.get("sessionId") == "session" and
+                            'const mode = "animation"' in params["expression"]):
+                        callbacks = True
+                        if changed == "window":
+                            response["result"]["result"]["value"]["window"] = {"width": 0, "height": 0}
+                    if method == "Page.getLayoutMetrics" and callbacks and changed == "viewport":
+                        response["result"]["cssVisualViewport"] = {"clientWidth": 0, "clientHeight": 0}
+                    return response
+
+                with mock.patch.object(self.daemon, "cdp_call", side_effect=resize):
+                    with self.assertRaises(self.daemon.PagePreparationError) as caught:
+                        self.prepare(readiness="animation")
+                self.assertTrue(callbacks)
+                self.assertEqual(caught.exception.kind, "view_uninitialized")
+                self.assertEqual(caught.exception.stage, "animation")
+                self.assertEqual(caught.exception.details["document"]["animationCallbacks"], 2)
+
+    def test_animation_revalidates_final_dom_state_and_callback_count(self):
+        for changed in ("readyState", "animationCallbacks"):
+            with self.subTest(changed=changed):
+                original = self.respond
+
+                def invalidate(method, params=None, **kwargs):
+                    response = original(method, params, **kwargs)
+                    if (method == "Runtime.evaluate" and kwargs.get("sessionId") == "session" and
+                            'const mode = "animation"' in params["expression"]):
+                        response["result"]["result"]["value"][changed] = "loading" if changed == "readyState" else 0
+                    return response
+
+                with mock.patch.object(self.daemon, "cdp_call", side_effect=invalidate):
+                    with self.assertRaises(self.daemon.PagePreparationError) as caught:
+                        self.prepare(readiness="animation")
+                self.assertEqual(caught.exception.kind, "readiness")
+                self.assertEqual(caught.exception.stage, "animation")
 
     def test_null_timeout_waits_without_a_deadline(self):
         self.prepare(timeout_seconds=None)
@@ -624,7 +672,8 @@ class PreparationTests(unittest.TestCase):
         with mock.patch.object(self.daemon, "cdp_call", side_effect=gone):
             manager._retire_bridge(bridge, RuntimeError("reader stopped"))
             self.assertTrue(bridge.completed.wait(2))
-        self.assertTrue(bridge.native_detached)
+        self.assertTrue(bridge.target_closed)
+        self.assertTrue(bridge.session_detached)
         self.assertEqual(bridge.phase, "failed")
         self.prepare()
         self.assertEqual(sum(call[0] == "Target.createTarget" for call in self.calls), 2)
@@ -837,6 +886,26 @@ class CDPTransportTests(unittest.TestCase):
             finished.wait(2)
             manager.join(2)
             self.daemon.pending.clear()
+
+    def test_send_uses_the_socket_that_passed_its_identity_check(self):
+        original = self.daemon.cdp_sock
+        replacement = mock.Mock()
+        lines, first = inspect.getsourcelines(self.daemon.ws_send)
+        send_line = first + next(index for index, line in enumerate(lines) if ".sendall(" in line)
+        previous_trace = sys.gettrace()
+
+        def replace_at_send(frame, event, argument):
+            if frame.f_code is self.daemon.ws_send.__code__ and event == "line" and frame.f_lineno == send_line:
+                self.daemon.cdp_sock = replacement
+            return replace_at_send
+
+        try:
+            sys.settrace(replace_at_send)
+            self.daemon.ws_send('{"method":"Target.getTargets"}', _expected_socket=original)
+        finally:
+            sys.settrace(previous_trace)
+        original.sendall.assert_called_once()
+        replacement.sendall.assert_not_called()
 
     def test_a_control_command_cannot_be_sent_on_a_replacement_connection(self):
         previous = mock.Mock()

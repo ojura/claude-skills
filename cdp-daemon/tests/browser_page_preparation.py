@@ -2,8 +2,8 @@
 """Exercise preparation in an owned Chrome profile on a private X display.
 
 Run with python3 -B -I tests/browser_page_preparation.py -v. Chrome, Xvfb and
-xvfb-run are required. The test extension observes browser-maintained tab state;
-production preparation does not depend on an extension.
+xvfb-run are required. Production preparation uses the bundled passive state
+reader. A separate test extension independently observes browser-maintained state.
 """
 import base64
 import collections
@@ -141,9 +141,10 @@ class OwnedBrowser:
         command = json.loads(message)
         with self.sent_lock:
             self.sent.append(command)
+        result = self.original_send(message, **kwargs)
         if self.on_send is not None:
             self.on_send(command)
-        return self.original_send(message, **kwargs)
+        return result
 
     def start(self, restore=False):
         endpoint = self.profile / "DevToolsActivePort"
@@ -1162,6 +1163,37 @@ class BrowserPreparationTests(unittest.TestCase):
                         self.browser.call("IO.close", {"handle": stream}, sid)
                     self.browser.detach(sid)
                     self.browser.call("Target.closeTarget", {"targetId": target})
+
+    def test_26_animation_rejects_a_viewport_zeroed_after_its_callbacks(self):
+        _, sid = self.create("/animation-final-dimensions")
+        original = self.prepare(sid, "animation")
+        call = CDP.page_preparation.call
+        changed = False
+
+        def resize_after_callbacks(method, params=None, **kwargs):
+            nonlocal changed
+            response = call(method, params, **kwargs)
+            if (not changed and method == "Runtime.evaluate" and kwargs.get("sessionId") == sid and
+                    'const mode = "animation"' in (params or {}).get("expression", "")):
+                changed = True
+                self.browser.call("Emulation.setVisibleSize", {"width": 0, "height": 0}, sid)
+            return response
+
+        try:
+            CDP.page_preparation.call = resize_after_callbacks
+            with self.assertRaises(CDP.PagePreparationError) as caught:
+                self.prepare(sid, "animation")
+            self.assertTrue(changed)
+            self.assertEqual(caught.exception.kind, "view_uninitialized")
+            self.assertEqual(caught.exception.stage, "animation")
+            document = caught.exception.details["document"]
+            self.assertEqual(document["animationCallbacks"], 2)
+            self.assertEqual(document["viewport"], {"width": 0, "height": 0})
+            self.measurements.append({"case": "final_animation_dimensions",
+                                      "callbacks_completed": 2, "zero_final_viewport_rejected": True})
+        finally:
+            CDP.page_preparation.call = call
+            self.browser.call("Emulation.setVisibleSize", original["document"]["window"], sid)
 
 
 if __name__ == "__main__":

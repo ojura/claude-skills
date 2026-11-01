@@ -24,6 +24,11 @@ The extension has two permissions:
   several tabs show the same page. This permission grants broader debugger
   authority than the state reader uses; review that grant before installation.
 
+Chrome describes the actual grants as **"Access the page debugger backend"**
+and **"Read and change all your data on all websites"**. These are the permissions
+being approved, even though this implementation uses them for the narrower
+lifecycle-state reads and target-to-tab identity mapping listed above.
+
 The production manifest is passive. The daemon creates one hidden extension
 page per browser context when state is first needed, then evaluates the fixed
 state-reading expression there. That page does not appear in the tab strip.
@@ -103,7 +108,10 @@ browser state observed before physical preparation, and the document snapshot:
 ```
 
 Animation responses additionally include `document.viewport`, measured by
-`Page.getLayoutMetrics`, and `animationCallbacks: 2`.
+`Page.getLayoutMetrics`, and `animationCallbacks: 2`. The returned snapshot is
+checked again after the callbacks: its DOM readiness, visibility, focus and
+positive window/viewport dimensions must still meet the animation conditions.
+Zero final dimensions return `view_uninitialized` even when both callbacks ran.
 
 ### Release preparation
 
@@ -114,8 +122,10 @@ Content-Type: application/json
 {"sessionId":"work-session","timeout_seconds":15}
 ```
 
-Release removes that session's preparation registration while leaving its raw
-CDP session attached. When the last managed client releases a target, the daemon
+Release ends the session's active managed waits even if its first target query
+is still pending and registration has not yet been acquired. It leaves the raw
+CDP session and already-sent Chrome command intact. If a registration exists,
+release removes it. When the last managed client releases a target, the daemon
 detaches its control session and removes its focus emulation. Repeated release
 is safe. Detaching the work session through `Target.detachFromTarget` also
 releases its registration.
@@ -154,9 +164,13 @@ client's `load` wait does not block another client's `javascript` check.
 
 The current-entry operation is used only after discarded-state observations.
 Applying it indiscriminately to a healthy page can abort a pending navigation.
-Clients coordinate their own navigation and application mutations on a shared
-target; preparation registrations are references to awake state, not exclusive
-application-operation locks.
+The second state check is an observation, not an atomic navigation transaction:
+independent navigation begun before that check is preserved when the check sees
+it loading, but navigation begun after that snapshot and before restoration can
+be aborted with `net::ERR_ABORTED` while preparation succeeds on the older URL.
+Callers must coordinate navigation during discarded-page restoration and their
+subsequent application mutations. Preparation registrations are references to
+awake state, not exclusive application-operation locks.
 
 ### Why focus emulation loads deferred restoration
 
@@ -191,6 +205,17 @@ session that also manages its own focus override is outside that shared-owner
 arrangement. Use a fresh `/attach` session for managed preparation.
 
 ## Timeouts and ownership
+
+Each managed request and resource is bound to its original explicit connection
+generation. Publication checks that generation under the manager lock, and
+worker startup checks it again before issuing native calls. Invalidation ends
+that generation's waits and removes its registrations. Delayed work and late
+disconnect notifications from an older generation cannot acquire ownership on a
+replacement connection. A missing connection is rejected before publication.
+
+A helper's debugging session and its owned target have separate lifetimes.
+Losing the attachment does not delete the hidden page. Cleanup closes that page
+or confirms its absence before publishing a replacement reader.
 
 `timeout_seconds` limits how long the caller waits. It does not cancel a command
 already sent to Chrome, detach the work session, or release its registration.
@@ -259,7 +284,7 @@ Distinguish these observations:
 Run from the `cdp-daemon` directory:
 
 ```bash
-python3 -B -I tests/test_page_preparation.py
+python3 -B -I -m unittest discover -s tests -p 'test_*.py'
 node --test tests/view_initialization.test.mjs
 python3 -B -I tests/browser_page_preparation.py -v
 ```

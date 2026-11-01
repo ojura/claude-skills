@@ -26,11 +26,27 @@ class PagePreparationError(Exception):
         return error
 
 
+class _ConnectionGeneration:
+    """Identify one explicit transport connection and retain its invalidation."""
+
+    def __init__(self, connection):
+        if connection is None:
+            raise ValueError("A managed connection must have an explicit identity")
+        self._connection = connection
+        self.valid = True
+
+    @property
+    def connection(self):
+        return self._connection
+
+
 class PagePreparationState:
     """Observe navigation and terminal events while one request is waiting."""
 
-    def __init__(self, session_id, remember_detachments=False):
+    def __init__(self, session_id, remember_detachments=False, generation=None, request=False):
         self.session_id = session_id
+        self.generation = generation
+        self.request = request
         self.control_session_id = None
         self.additional_sessions = set()
         self.target_id = None
@@ -54,11 +70,19 @@ class PagePreparationState:
             session_ids = ({self.session_id, self.control_session_id} | self.additional_sessions) - {None}
         terminal = None
         if method == "daemon.disconnected":
+            connection = event.get("connection")
+            if (connection is not None and self.generation is not None and
+                    self.generation.connection is not connection):
+                return
             terminal = ("disconnected", "The browser debugging connection closed")
         elif method == "daemon.preparationReleased":
+            if not self.request or params.get("sessionId") != self.session_id:
+                return
+            terminal = ("released", "The preparation registration was released")
+        elif method == "daemon.controlReleased":
             if params.get("sessionId") != self.session_id:
                 return
-            terminal = ("released", "The preparation lease was released")
+            terminal = ("released", "The preparation owner was released")
         elif method == "Target.detachedFromTarget":
             if params.get("sessionId") not in session_ids:
                 return
@@ -133,6 +157,8 @@ class PagePreparationState:
 
     def check(self):
         with self.lock:
+            if self.terminal is None and self.generation is not None and not self.generation.valid:
+                self.terminal = ("disconnected", "The browser debugging connection closed")
             terminal = self.terminal
         if terminal is not None:
             raise PagePreparationError(terminal[0], self.stage, terminal[1])
@@ -145,7 +171,8 @@ class PagePreparationState:
 class _Waitable:
     """Keep a result and wake its response waiters under the manager lock."""
 
-    def __init__(self):
+    def __init__(self, generation):
+        self.generation = generation
         self.error = None
         self.ready = threading.Event()
         self.waiters = set()
@@ -156,8 +183,8 @@ class _Waitable:
 
 
 class _InitializationJob(_Waitable):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, generation):
+        super().__init__(generation)
         self.tab_state = None
         self.state = None
 
@@ -165,24 +192,28 @@ class _InitializationJob(_Waitable):
 class _TargetControl(_Waitable):
     """Own the physical emulation session and the callers that still need it."""
 
-    def __init__(self, target_id, connection):
-        super().__init__()
+    def __init__(self, target_id, generation):
+        super().__init__(generation)
         self.target_id = target_id
-        self.connection = connection
         self.session_id = None
         self.clients = set()
         self.released_clients = set()
         self.phase = "attaching"
-        self.native_detached = False
+        self.session_detached = False
+        self.target_closed = False
         self.completed = threading.Event()
         self.initialization = None
+
+    @property
+    def connection(self):
+        return self.generation.connection
 
 
 class _BrowserStateBridge(_TargetControl):
     """Own the hidden extension page used to read browser-maintained state."""
 
-    def __init__(self, context_id, connection):
-        super().__init__(None, connection)
+    def __init__(self, context_id, generation):
+        super().__init__(None, generation)
         self.context_id = context_id
 
 
@@ -269,19 +300,72 @@ class PagePreparationManager:
         self.controls = {}
         self.bridges = {}
         self.active_states = set()
+        self.generation = None
         manifest = Path(__file__).with_name("browser-state-extension") / "manifest.json"
         key = base64.b64decode(json.loads(manifest.read_text())["key"])
         digest = hashlib.sha256(key).hexdigest()[:32]
         extension_id = "".join(chr(ord("a") + int(digit, 16)) for digit in digest)
         self.extension_origin = "chrome-extension://" + extension_id
 
+    def _invalidate_generation_locked(self, generation):
+        generation.valid = False
+        event = {"method": "daemon.disconnected", "connection": generation.connection}
+        for registry in (self.controls, self.bridges):
+            for key, resource in tuple(registry.items()):
+                if resource.generation is generation:
+                    resource.error = PagePreparationError(
+                        "disconnected", "control", "The browser debugging connection closed")
+                    resource.phase = "closed"
+                    resource.ready.set()
+                    resource.completed.set()
+                    resource.wake()
+                    registry.pop(key)
+        for state in tuple(self.active_states):
+            if state.generation is generation:
+                state.observe(event)
+
+    def _validate_generation_locked(self, generation):
+        if generation is None or not generation.valid:
+            raise PagePreparationError("disconnected", "control",
+                                       "The managed connection was invalidated")
+        if self.current_connection() is not generation.connection:
+            self._invalidate_generation_locked(generation)
+            raise PagePreparationError("disconnected", "control",
+                                       "The browser debugging connection changed")
+
+    def _register_request(self, state):
+        with self.lock:
+            connection = self.current_connection()
+            if connection is None:
+                raise PagePreparationError("disconnected", state.stage,
+                                           "The browser debugging connection is unavailable")
+            generation = self.generation
+            if generation is None or generation.connection is not connection:
+                if generation is not None:
+                    self._invalidate_generation_locked(generation)
+                generation = _ConnectionGeneration(connection)
+                self.generation = generation
+            self._validate_generation_locked(generation)
+            state.generation = generation
+            self.active_states.add(state)
+
+    def _validate_resource_locked(self, resource):
+        self._validate_generation_locked(resource.generation)
+        registry = self.bridges if isinstance(resource, _BrowserStateBridge) else self.controls
+        key = resource.context_id if isinstance(resource, _BrowserStateBridge) else resource.target_id
+        if registry.get(key) is not resource or resource.phase in ("closed", "releasing", "release_failed"):
+            raise PagePreparationError("released", "control",
+                                       "The managed resource was retired before initialization")
+
     def _start(self, resource, function, args, completion, failure_phase=None):
         try:
+            with self.lock:
+                self._validate_generation_locked(resource.generation)
             threading.Thread(target=function, args=args, daemon=True).start()
         except Exception as error:
             with self.lock:
                 resource.error = error
-                if failure_phase is not None:
+                if failure_phase is not None and resource.phase != "closed":
                     resource.phase = failure_phase
                 completion.set()
                 if completion is resource.ready and isinstance(resource, _BrowserStateBridge):
@@ -320,20 +404,21 @@ class PagePreparationManager:
         bridge_cleanup = []
         with self.lock:
             if method == "daemon.disconnected":
-                for control in (*self.controls.values(), *self.bridges.values()):
-                    control.error = PagePreparationError(
-                        "disconnected", "control", "The browser debugging connection closed")
-                    control.phase = "closed"
-                    control.ready.set()
-                    control.completed.set()
-                    control.wake()
-                self.controls.clear()
-                self.bridges.clear()
+                connection = event.get("connection")
+                generations = {resource.generation for resource in
+                               (*self.controls.values(), *self.bridges.values())}
+                generations.update(state.generation for state in self.active_states
+                                   if state.generation is not None)
+                if self.generation is not None:
+                    generations.add(self.generation)
+                for generation in generations:
+                    if connection is None or generation.connection is connection:
+                        self._invalidate_generation_locked(generation)
             elif method == "Target.detachedFromTarget":
                 session_id = params.get("sessionId")
                 for control in tuple(self.controls.values()):
                     if session_id == control.session_id:
-                        control.native_detached = True
+                        control.session_detached = True
                         if control.phase != "releasing":
                             control.error = PagePreparationError(
                                 "detached", "control", "The emulation owner detached")
@@ -346,10 +431,12 @@ class PagePreparationManager:
                             if self._begin_release(control):
                                 cleanup.append(control)
                 for bridge in self.bridges.values():
-                    if session_id == bridge.session_id and bridge.phase == "ready":
-                        bridge_cleanup.append((bridge, PagePreparationError(
-                            "browser_state_unavailable", "browser_state",
-                            "The hidden extension page detached")))
+                    if session_id == bridge.session_id:
+                        bridge.session_detached = True
+                        if bridge.phase == "ready":
+                            bridge_cleanup.append((bridge, PagePreparationError(
+                                "browser_state_unavailable", "browser_state",
+                                "The hidden extension page detached")))
             elif method == "Inspector.targetCrashed":
                 for bridge in self.bridges.values():
                     if event.get("sessionId") == bridge.session_id and bridge.phase == "ready":
@@ -359,7 +446,8 @@ class PagePreparationManager:
             elif method == "Target.targetDestroyed":
                 control = self.controls.pop(params.get("targetId"), None)
                 if control is not None:
-                    control.native_detached = True
+                    control.session_detached = True
+                    control.target_closed = True
                     control.error = PagePreparationError("detached", "control", "The page target closed")
                     control.phase = "closed"
                     control.ready.set()
@@ -367,7 +455,8 @@ class PagePreparationManager:
                     control.wake()
                 for bridge in self.bridges.values():
                     if params.get("targetId") == bridge.target_id:
-                        bridge.native_detached = True
+                        bridge.session_detached = True
+                        bridge.target_closed = True
                         if bridge.error is None:
                             bridge.error = PagePreparationError(
                                 "browser_state_unavailable", "browser_state",
@@ -399,17 +488,22 @@ class PagePreparationManager:
         control.completed.clear()
         job = control.initialization
         if job is not None and job.state is not None:
-            job.state.observe({"method": "daemon.preparationReleased",
+            job.state.observe({"method": "daemon.controlReleased",
                                "params": {"sessionId": control.session_id}})
         return True
 
     def _attach_control(self, control):
-        guard = PagePreparationState(None, remember_detachments=True)
+        guard = PagePreparationState(None, remember_detachments=True,
+                                     generation=control.generation)
         guard.target_id = control.target_id
-        with self.lock:
-            self.active_states.add(guard)
         error = None
         try:
+            with self.lock:
+                self._validate_resource_locked(control)
+                if control.phase != "attaching":
+                    raise PagePreparationError("released", "control",
+                                               "The resource stopped waiting for attachment")
+                self.active_states.add(guard)
             if isinstance(control, _BrowserStateBridge):
                 params = {"url": self.extension_origin + "/bridge.html", "hidden": True}
                 if control.context_id is not None:
@@ -445,7 +539,7 @@ class PagePreparationManager:
         except Exception as caught:
             error = caught
             if isinstance(caught, PagePreparationError) and caught.kind == "detached":
-                control.native_detached = True
+                control.session_detached = True
             if isinstance(control, _BrowserStateBridge):
                 control.error = caught
                 self._close_bridge(control)
@@ -462,13 +556,19 @@ class PagePreparationManager:
     def _close_bridge(self, bridge):
         error = None
         try:
-            if (bridge.target_id is not None and not bridge.native_detached and
-                    self.current_connection() is bridge.connection):
-                self.call("Target.closeTarget", {"targetId": bridge.target_id},
-                          timeout_seconds=None, _expected_socket=bridge.connection)
+            if (bridge.target_id is not None and not bridge.target_closed and
+                    bridge.generation.valid and self.current_connection() is bridge.connection):
+                response = self.call("Target.closeTarget", {"targetId": bridge.target_id},
+                                     timeout_seconds=None, _expected_socket=bridge.connection)
+                if response.get("result", {}).get("success") is not True:
+                    raise PagePreparationError("invalid_response", "cleanup",
+                                               "Chrome did not confirm closing the owned target")
+                bridge.target_closed = True
+                bridge.session_detached = True
         except Exception as caught:
             error = caught
-            if isinstance(caught, self.protocol_error_type) and self.current_connection() is bridge.connection:
+            if (bridge.generation.valid and self.current_connection() is bridge.connection and
+                    isinstance(caught, (self.protocol_error_type, PagePreparationError))):
                 try:
                     response = self.call("Target.getTargets", timeout_seconds=None,
                                          _expected_socket=bridge.connection)
@@ -477,13 +577,14 @@ class PagePreparationManager:
                             all(isinstance(target, dict) and isinstance(target.get("targetId"), str)
                                 for target in targets) and
                             not any(target["targetId"] == bridge.target_id for target in targets)):
-                        bridge.native_detached = True
+                        bridge.target_closed = True
+                        bridge.session_detached = True
                         error = None
                 except Exception:
                     pass
         finally:
             with self.lock:
-                if error is not None and not bridge.native_detached and bridge.phase != "closed":
+                if error is not None and not bridge.target_closed and bridge.phase != "closed":
                     bridge.error = error
                     bridge.phase = "release_failed"
                 elif bridge.phase != "closed":
@@ -497,17 +598,18 @@ class PagePreparationManager:
         control.ready.wait()
         error = None
         try:
-            if (control.session_id is not None and not control.native_detached and
-                    self.current_connection() is control.connection):
+            if (control.session_id is not None and not control.session_detached and
+                    control.generation.valid and self.current_connection() is control.connection):
                 self.call("Target.detachFromTarget", {"sessionId": control.session_id},
                           timeout_seconds=None, _expected_socket=control.connection)
+                control.session_detached = True
         except Exception as caught:
             error = caught
         finally:
             if control.initialization is not None:
                 control.initialization.ready.wait()
             with self.lock:
-                if error is not None and not control.native_detached and control.phase != "closed":
+                if error is not None and not control.session_detached and control.phase != "closed":
                     control.error = error
                     control.phase = "release_failed"
                 else:
@@ -540,12 +642,17 @@ class PagePreparationManager:
             start = False
             start_close = False
             with self.lock:
+                state.check()
+                self._validate_generation_locked(state.generation)
                 bridge = self.bridges.get(context_id)
+                if bridge is not None and bridge.generation is not state.generation:
+                    raise PagePreparationError("disconnected", "browser_state",
+                                               "The state reader belongs to another connection")
                 if bridge is not None and bridge.phase == "failed" and bridge.completed.is_set():
                     self.bridges.pop(context_id)
                     bridge = None
                 if bridge is None:
-                    bridge = _BrowserStateBridge(context_id, self.current_connection())
+                    bridge = _BrowserStateBridge(context_id, state.generation)
                     self.bridges[context_id] = bridge
                     start = True
                 if bridge.phase == "release_failed":
@@ -639,12 +746,17 @@ class PagePreparationManager:
             state.check()
             start = False
             with self.lock:
+                state.check()
+                self._validate_generation_locked(state.generation)
                 if any(control.session_id == session_id for control in self.controls.values()):
                     raise PagePreparationError("invalid_request", "control",
                                                "The supplied session is managed internally")
                 control = self.controls.get(target_id)
+                if control is not None and control.generation is not state.generation:
+                    raise PagePreparationError("disconnected", "control",
+                                               "The control belongs to another connection")
                 if control is None:
-                    control = _TargetControl(target_id, self.current_connection())
+                    control = _TargetControl(target_id, state.generation)
                     self.controls[target_id] = control
                     start = True
                 closing = control.phase in ("releasing", "release_failed", "closed")
@@ -665,10 +777,16 @@ class PagePreparationManager:
 
     def _initialize_target(self, control, target, state, remaining):
         with self.lock:
+            state.check()
+            self._validate_generation_locked(state.generation)
+            self._validate_resource_locked(control)
+            if control.generation is not state.generation or state.session_id not in control.clients:
+                raise PagePreparationError("released", "initialization",
+                                           "The work session is not registered on this connection")
             job = control.initialization
             start = job is None or job.ready.is_set()
             if start:
-                job = _InitializationJob()
+                job = _InitializationJob(control.generation)
                 control.initialization = job
         if start:
             self._start(job, self._run_initialization, (control, target, job), job.ready)
@@ -685,17 +803,18 @@ class PagePreparationManager:
         return job.tab_state
 
     def _run_initialization(self, control, target, job):
-        state = PagePreparationState(control.session_id)
+        state = PagePreparationState(control.session_id, generation=control.generation)
         state.target_id = control.target_id
         with self.lock:
             job.state = state
-            self.active_states.add(state)
 
         def call(stage, method, params=None):
             state.stage = stage
             state.check()
             with self.lock:
-                if (not control.clients or control.native_detached or
+                self._validate_generation_locked(control.generation)
+                if (self.controls.get(control.target_id) is not control or
+                        not control.clients or control.session_detached or
                         control.phase in ("releasing", "closed", "release_failed")):
                     raise PagePreparationError("released", stage,
                                                "The preparation owner was released")
@@ -710,9 +829,12 @@ class PagePreparationManager:
         try:
             state.check()
             with self.lock:
-                if not control.clients or control.native_detached:
+                self._validate_resource_locked(control)
+                if (control.initialization is not job or not control.clients or
+                        control.session_detached):
                     raise PagePreparationError("released", "initialization",
                                                "The preparation owner was released")
+                self.active_states.add(state)
             tab_state = self._tab_state(target, state, lambda: None)
             if tab_state.get("discarded") and tab_state.get("status") == "unloaded":
                 history = call("restore_history", "Page.getNavigationHistory")
@@ -778,7 +900,7 @@ class PagePreparationManager:
 
     def _prepare(self, session_id, readiness, timeout_seconds, allow_tab_selection):
         """Retain the caller's preparation registration on a response timeout."""
-        state = PagePreparationState(session_id)
+        state = PagePreparationState(session_id, request=True)
         try:
             if not isinstance(session_id, str) or not session_id:
                 raise PagePreparationError("invalid_request", "validation",
@@ -794,7 +916,8 @@ class PagePreparationManager:
             def remaining():
                 return self._remaining(deadline)
 
-            connection = self.current_connection()
+            self._register_request(state)
+            connection = state.generation.connection
 
             def call(stage, method, params=None):
                 state.stage = stage
@@ -807,8 +930,6 @@ class PagePreparationManager:
                                                "Chrome did not return a command result")
                 return response["result"]
 
-            with self.lock:
-                self.active_states.add(state)
             result = call("target", "Target.getTargetInfo")
             target = result.get("targetInfo")
             if not isinstance(target, dict):
@@ -849,6 +970,15 @@ class PagePreparationManager:
                         if not isinstance(document, dict):
                             raise PagePreparationError("invalid_response", stage,
                                 "Chrome did not return a document readiness snapshot")
+                        ready = document.get("readyState")
+                        if (mode != "javascript" and
+                                (ready != "complete" if mode == "load" else
+                                 ready not in ("interactive", "complete"))):
+                            raise PagePreparationError("readiness", stage,
+                                "The final document does not meet the requested readiness", document)
+                        if mode == "animation" and document.get("animationCallbacks") != 2:
+                            raise PagePreparationError("readiness", stage,
+                                "The final snapshot does not report both animation callbacks", document)
                         metrics = (call(stage, "Page.getLayoutMetrics").get("cssVisualViewport", {})
                                    if measure_view else None)
                     except (self.protocol_error_type, PagePreparationError):
@@ -884,12 +1014,16 @@ class PagePreparationManager:
                 if not view_has_size() and allow_tab_selection and tab_state.get("tabId") is not None:
                     initialization = self._initialize_view(target, state, remaining)
                     document = snapshot("dom", "view_initialization", measure_view=True)
-                if not view_has_size():
-                    raise PagePreparationError("view_uninitialized", "animation",
-                        "The page has an uninitialized browser view",
-                        {"document": document, "tabState": tab_state,
-                         "viewInitialization": initialization})
+                def require_view_size():
+                    if not view_has_size():
+                        raise PagePreparationError("view_uninitialized", "animation",
+                            "The page has an uninitialized browser view",
+                            {"document": document, "tabState": tab_state,
+                             "viewInitialization": initialization})
+
+                require_view_size()
                 document = snapshot("animation", "animation", measure_view=True)
+                require_view_size()
             response = {"sessionId": session_id, "targetId": state.target_id,
                         "readiness": readiness, "initialTabState": tab_state,
                         "document": document}
@@ -915,11 +1049,16 @@ class PagePreparationManager:
                                            "sessionId must be a nonempty string")
             deadline = self._deadline(timeout_seconds)
             with self.lock:
+                event = {"method": "daemon.preparationReleased", "params": {"sessionId": session_id}}
+                for request in tuple(self.active_states):
+                    if request.request and request.session_id == session_id:
+                        request.observe(event)
                 control = next((control for control in self.controls.values()
                                 if session_id in control.clients or
                                 session_id in control.released_clients), None)
                 if control is None:
                     return {"sessionId": session_id, "released": True}
+                state.generation = control.generation
                 control.clients.discard(session_id)
                 last = not control.clients
                 if last:
@@ -927,7 +1066,6 @@ class PagePreparationManager:
                     start = self._begin_release(control)
                 else:
                     start = False
-            self.observe({"method": "daemon.preparationReleased", "params": {"sessionId": session_id}})
             if start:
                 self._start(control, self._close_control, (control,), control.completed, "release_failed")
             if last:

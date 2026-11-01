@@ -35,9 +35,9 @@ production extension manifest.
 | Target close, crash, release or connection loss | Each corresponding event ended a guarded unbounded wait. Explicit release kept the caller's raw debugging session attached. |
 | Missing helper | Uninstalling the helper caused `browser_state_unavailable`. Reinstallation and a new reader recovered preparation. |
 
-The final controlled run passed 52 Python tests, 10 JavaScript worker tests and
-26 real-Chrome integration tests. The browser suite completed in about 14
-seconds on AC power. Its `MEASURE` records include the actual observations;
+The initial implementation reviewed at `f35a450` passed 52 Python tests,
+10 JavaScript worker tests and 26 real-Chrome integration tests. That browser
+suite completed in about 14 seconds on AC power. Its `MEASURE` records include the actual observations;
 focus-only deferred loading took 11.1 ms in that run. Readiness and rendering are
 checked separately instead of using one 25-second evaluation to guess the state.
 
@@ -64,9 +64,16 @@ issued two current-entry navigations. Single-flight physical initialization now
 issues one, while callers retain independent readiness waits and response
 budgets.
 
-Clients still coordinate their own navigation to a shared physical target. The
-browser APIs used here do not provide a transaction that excludes independent
-navigation by another actor.
+An independent native pairing located that boundary precisely. Navigation
+begun before the second discarded-state check changed its observation to
+loading/non-discarded and completed successfully. Navigation begun after that
+snapshot but before the current-entry request was aborted with `net::ERR_ABORTED`;
+preparation then succeeded on the older URL. Chrome selection stayed unchanged
+in both controls.
+
+Clients must coordinate navigation during discarded-page restoration. The
+browser APIs used here do not provide an atomic check-and-restore transaction
+that excludes another actor's navigation.
 
 ## Rendering controls
 
@@ -139,6 +146,72 @@ background worker, not the hidden page. `chrome.debugger.getTargets()` did list
 that page's exact target ID as type `other`. The research queue therefore checks
 the supplied requester target ID before starting queued UI work. It still
 finishes restoration after an already-applied selection loses its requester.
+
+## Independent review and forward regressions
+
+Independent review of `f35a450` found four defects beyond the initial matrix:
+
+- A request could pass its connection check on A and later publish ownership
+  from the current connection B, or publish with a missing connection. Delayed
+  control and reader workers could also start after their resources were
+  invalidated. Requests and resources now retain one explicit, non-null
+  connection generation. Publication and worker entry validate it under the
+  manager lock. A stale disconnect notification applies only to its generation.
+  The transport writes through the local socket that passed its identity check.
+- Release returned before acquisition without ending an already-active native
+  wait. It now signals active work requests under the same lock used for
+  publication, even when their first `Target.getTargetInfo` is pending. It leaves
+  that already-sent command intact. Creator waits are distinct from work-request
+  waits, preserving cleanup of a late native attach response.
+- A helper's detached debugging session was treated as a closed owned target.
+  Session detachment and target closure now have separate state. An early detach
+  before attach-response binding still causes the hidden page to be closed or
+  confirmed absent before another reader is created.
+- Animation readiness checked positive dimensions before its callbacks but
+  accepted zero final dimensions. It now validates the final returned DOM
+  readiness, visibility, focus, callback count and positive dimensions. An owned
+  Chrome control zeroes the actual viewport after both callbacks and before the
+  final metrics request; preparation returns `view_uninitialized`.
+
+The deterministic ownership model keeps native sessions separate from owned
+helper targets and uses controlled gates around publication, scheduling, worker
+entry and native replies. Its 11 properties detect 10 failures in `f35a450`; the
+late-attach cleanup preservation control already passed there. The four
+final-animation subcases and the captured-send-socket property also fail on that
+reviewed commit. Their positive counterparts pass in the forward implementation.
+
+The additional shared-reader lookup candidate was tested independently and
+rejected as a defect. Ordinary closure, closure after an entered 1.5-second
+unload handler, and discard replacement delivered A's inspector/session terminal
+events before the helper's later missing-tab exception response. The guarded
+call ended as detached, the shared reader stayed ready, and B's held
+initialization later completed. That terminal handling was retained.
+
+The forward implementation passes 66 Python tests, 10 research-worker tests and
+27 owned-Chrome tests. The native final-viewport control completes both callbacks,
+sets the actual viewport to zero before final metrics, and receives
+`view_uninitialized`. Socket-loss gates now signal after the packet write, so
+those controls exercise a guarded pending reply rather than a pre-write failure.
+
+An independent production-path control installed the reviewed passive helper
+through Chrome's Developer mode / Load unpacked UI without either
+`--load-extension` or `--enable-unsafe-extension-debugging`. After a normal
+restart it remained `ENABLED` and `UNPACKED` at the same extension ID and path.
+Developer mode persisted, and the profile entry recorded `location=4` with
+`disable_reasons=[]`.
+
+All four HTTP readiness levels and `/release` passed before and after that
+restart. Release left the raw session attached, removed managed registrations,
+and returned the document to ordinary hidden/unfocused state. Selected-tab IDs
+were unchanged. The recorded method set did not contain `Extensions.*` calls,
+and the passive helper did not have a background worker.
+
+Chrome's actual grant descriptions were "Access the page debugger backend" and
+"Read and change all your data on all websites". The installation guide records
+those broad permissions alongside the narrower lifecycle-state and identity
+operations used by this implementation. This owned-profile production-path
+proof is separate from approval to install into an existing user profile;
+landing and installation remain held for review.
 
 ## Transport and ownership regressions
 

@@ -60,7 +60,7 @@ through the public tabs API.
 ## Tests
 
 ```bash
-python3 -B -I tests/test_page_preparation.py
+python3 -B -I -m unittest discover -s tests -p 'test_*.py'
 node --test tests/view_initialization.test.mjs
 python3 -B -I tests/browser_page_preparation.py -v
 ```

@@ -29,9 +29,9 @@ receive the hook, and unmatched paused targets are resumed.
 Start:  python3 cdp_daemon.py & disown
 Test:   curl 127.0.0.1:7799/status | jq
 
-Connection is self-complete and fails loudly: the HTTP API comes up FIRST, so
-/status is always answerable even while (re)connecting or after a failure. The
-Allow press runs IN-PROCESS: one dedicated thread (all AT-SPI stays on it)
+The HTTP server starts before connection acquisition so /status can report
+acquisition progress and failure. The Allow press runs in-process: one dedicated
+thread (all AT-SPI stays on it)
 imports clear_modals as a library and keeps scanning/pressing for the whole
 connect attempt, streaming its findings into this log. Accessibility health is
 a live diagnostic inside that loop - logged when it changes, never a reason to
@@ -315,9 +315,12 @@ def ws_send(text, _expected_socket=None):
     elif n < 65536: hdr = struct.pack("!BBH", 0x81, 0x80 | 126, n)
     else: hdr = struct.pack("!BBQ", 0x81, 0x80 | 127, n)
     with cdp_lock:
-        if _expected_socket is not None and cdp_sock is not _expected_socket:
+        connection = cdp_sock
+        if _expected_socket is not None and connection is not _expected_socket:
             raise RuntimeError("The browser debugging connection changed")
-        cdp_sock.sendall(hdr + m + masked)
+        if connection is None:
+            raise RuntimeError("The browser debugging connection is unavailable")
+        connection.sendall(hdr + m + masked)
 
 
 def ws_recv_raw():
@@ -349,9 +352,10 @@ def ws_recv_raw():
 
 
 def _run_autohook(sid, url, script):
-    """Inject `script` into a freshly-attached target ASAP, then resume it if it
-    was paused. Runs in its own thread so the reader keeps demuxing (cdp_call
-    would otherwise deadlock the reader waiting on its own response)."""
+    """Inject before resuming a worker paused at startup.
+
+    A separate thread lets the reader deliver the CDP replies these calls await.
+    """
     res = None
     try:
         r = cdp_call("Runtime.evaluate", {"expression": script, "returnByValue": True},
@@ -398,8 +402,10 @@ def _on_attached(params):
 
 
 def reader_thread():
-    """Demux CDP responses (by id) and buffer events. On socket drop, clear the
-    connection and signal the manager to reconnect instead of dying silently."""
+    """Deliver CDP replies and events, then close and report this connection.
+
+    The reader notifies the manager after closing its captured socket.
+    """
     global cdp_sock
     reader_socket = cdp_sock
     try:
@@ -440,7 +446,7 @@ def reader_thread():
             except OSError:
                 pass
         cdp_sock = None
-        notify_preparations({"method": "daemon.disconnected"})
+        notify_preparations({"method": "daemon.disconnected", "connection": reader_socket})
         # Fail any in-flight calls so callers get a clear error, not a hang.
         with id_lock:
             waiters = tuple(pending.values())
@@ -637,8 +643,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    # HTTP API FIRST (in a thread) so /status is always answerable - even while
-    # connecting or after a connect failure. The daemon never dies silently.
+    # Start the HTTP server before connection acquisition so /status can report
+    # acquisition progress and failure.
     threading.Thread(
         target=lambda: ThreadingHTTPServer(("127.0.0.1", DAEMON_PORT), Handler).serve_forever(),
         daemon=True).start()
