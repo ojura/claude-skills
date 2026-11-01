@@ -41,9 +41,11 @@ AT-SPI and Chrome renderer accessibility.
 
 Raw CDP calls work with that connection alone. Full page preparation additionally
 requires the bundled passive `browser-state-extension`, installed with the
-profile owner's approval. Its `tabs` permission reads lifecycle state;
-`debugger` provides exact target-to-tab identity mapping. The production
-manifest does not run a background worker.
+profile owner's approval. It declares only `debugger` for exact target-to-tab
+identity mapping. The tabs API supplies the lifecycle fields without a `tabs`
+permission declaration. The debugger grant still gives broad access to website
+data; see the installation guide's permission warnings. The production manifest
+does not run a background worker.
 
 ## Use
 

@@ -16,18 +16,18 @@ in the Chrome profile being driven: open `chrome://extensions`, enable developer
 mode, and choose **Load unpacked**. Installation into an existing user profile is
 a separate action requiring that profile's owner's approval.
 
-The extension has two permissions:
+The extension declares only `debugger`. It supplies
+`chrome.debugger.getTargets()`, which maps an exact CDP target ID to its Chrome
+tab ID. Matching URLs would choose incorrectly when several tabs show the same
+page. The tabs API provides the non-sensitive `status`, `discarded`, `frozen`
+and `active` fields without a `tabs` permission declaration.
 
-- `tabs` reads Chrome's `status`, `discarded`, `frozen` and `active` fields.
-- `debugger` supplies `chrome.debugger.getTargets()`, which maps an exact CDP
-  target ID to its Chrome tab ID. Matching URLs would choose incorrectly when
-  several tabs show the same page. This permission grants broader debugger
-  authority than the state reader uses; review that grant before installation.
-
-Chrome describes the actual grants as **"Access the page debugger backend"**
-and **"Read and change all your data on all websites"**. These are the permissions
-being approved, even though this implementation uses them for the narrower
-lifecycle-state reads and target-to-tab identity mapping listed above.
+The `debugger` permission grants broader authority than the state reader uses.
+Chrome describes its actual grants as **"Access the page debugger backend"**
+and **"Read and change all your data on all websites"**. Review those grants
+before installation. Omitting the redundant `tabs` declaration does not make
+this extension read-only; this implementation uses its authority only for
+lifecycle-state reads and target-to-tab identity mapping.
 
 The production manifest is passive. The daemon creates one hidden extension
 page per browser context when state is first needed, then evaluates the fixed

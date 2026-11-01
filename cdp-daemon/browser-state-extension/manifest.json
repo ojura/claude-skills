@@ -3,6 +3,6 @@
   "name": "CDP Daemon Tab State",
   "version": "1.0.0",
   "description": "Let the local CDP daemon read browser-maintained tab state and target identifiers.",
-  "permissions": ["tabs", "debugger"],
+  "permissions": ["debugger"],
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApm6q/Kfz6KYK6fBiOLsNlgcTNbYJZqI0pm2q+PUxSxPdJSw8JOjVVEDFcjDTnSO4nMA5y2Q9d7506eZcWRJW04CwbOF+UedPpP9dfdc3mCq7THoxUSajHMdKFmIH0Qyvh9WfyiWKj0Thknq9gxpdF8DGQ4eskIvJmLE32/mpMX72d0RX3RU3ocnTvc3vsUu+XI6vurvm3FncDrm8qCapHAVRWH722FpiDbpV/aicIR+Mz2wHzDWO3yiVT62pwixi9Ak+oCWN1nvpAZ9WoF7eMVHdE2cuUy7b0jPP8+je1B6LqGzcaYwubXS1ULJbR5+ml5ydrkItSoi1vIjVhWNITwIDAQAB"
 }

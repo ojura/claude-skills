@@ -34,6 +34,7 @@ sys.path.insert(0, str(ROOT))
 SPEC = importlib.util.spec_from_file_location("browser_test_cdp", ROOT / "cdp_daemon.py")
 CDP = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CDP)
+from page_preparation import BROWSER_STATE_EXPRESSION
 
 
 class Fixtures(ThreadingHTTPServer):
@@ -547,6 +548,88 @@ class BrowserPreparationTests(unittest.TestCase):
 
     def test_00_established_socket_has_no_read_timeout(self):
         self.assertIsNone(CDP.cdp_sock.gettimeout())
+
+    def test_00_passive_helper_reads_state_with_only_debugger_permission(self):
+        target, sid = self.create("/helper-permissions")
+        loaded = self.prepare(sid, "load")
+        bridge = next(bridge for bridge in CDP.page_preparation.bridges.values()
+                      if bridge.phase == "ready")
+        origin = CDP.page_preparation.extension_origin
+        permissions_expression = """(async () => {
+          const manifest = chrome.runtime.getManifest();
+          return {declared:manifest.permissions, granted:await chrome.permissions.getAll(),
+                  hasBackground:Object.hasOwn(manifest, 'background')};
+        })()"""
+        permissions = self.browser.eval(bridge.session_id, permissions_expression)
+        self.assertEqual(permissions, {
+            "declared": ["debugger"],
+            "granted": {"permissions": ["debugger"], "origins": []},
+            "hasBackground": False,
+        })
+        workers = [item for item in self.browser.call("Target.getTargets")["targetInfos"]
+                   if item["type"] == "service_worker" and
+                   item["url"].startswith(origin + "/")]
+        self.assertEqual(workers, [])
+
+        def state(target_id):
+            expression = BROWSER_STATE_EXPRESSION % (json.dumps(origin), json.dumps(target_id))
+            snapshot = self.browser.eval(bridge.session_id, expression)
+            self.assertTrue(snapshot["available"])
+            self.assertTrue(snapshot["found"])
+            self.assertEqual(snapshot["targetId"], target_id)
+            observer = self.browser.tab(snapshot["tabId"])
+            for field in ("status", "discarded", "frozen", "active"):
+                self.assertEqual(snapshot[field], observer[field])
+            return snapshot
+
+        initial = state(target)
+        self.assertEqual(initial["tabId"], loaded["initialTabState"]["tabId"])
+        self.assertEqual(initial["status"], "complete")
+        self.assertFalse(initial["discarded"])
+        self.assertFalse(initial["frozen"])
+        self.assertFalse(initial["active"])
+        sensitive = self.browser.eval(bridge.session_id, """(async () => {
+          const tab = await chrome.tabs.get(%d);
+          return Object.fromEntries(['url','title','favIconUrl'].map(
+            field => [field, Object.hasOwn(tab, field)]));
+        })()""" % initial["tabId"])
+        self.assertEqual(sensitive, {"url": False, "title": False, "favIconUrl": False})
+
+        selected_target = self.browser.eval(bridge.session_id, """
+          chrome.debugger.getTargets().then(targets => targets.find(
+            target => target.tabId === %d).id)
+        """ % self.selected_before[0])
+        selected = state(selected_target)
+        self.assertTrue(selected["active"])
+        _, restored_target, _ = self.attach_restored()
+        unloaded = state(restored_target)
+        self.assertEqual(unloaded["status"], "unloaded")
+        self.assertFalse(unloaded["discarded"])
+
+        CDP.release_page(sid)
+        self.browser.call("Page.setWebLifecycleState", {"state": "frozen"}, sid)
+        frozen = state(target)
+        self.assertTrue(frozen["frozen"])
+        self.assertTrue(self.prepare(sid, "animation")["initialTabState"]["frozen"])
+        self.assertFalse(state(target)["frozen"])
+        self.browser.detach(sid)
+        discarded_id = self.browser.eval(self.browser.observer,
+            f"chrome.tabs.discard({initial['tabId']}).then(tab=>tab.id)")
+        discarded_target = self.browser.target_for(self.base + "/helper-permissions")["targetId"]
+        self.owned_targets.append(discarded_target)
+        discarded = state(discarded_target)
+        self.assertEqual(discarded["tabId"], discarded_id)
+        self.assertEqual(discarded["status"], "unloaded")
+        self.assertTrue(discarded["discarded"])
+        replacement_sid = self.browser.attach(discarded_target)
+        self.owned_sessions.append(replacement_sid)
+        self.assertTrue(self.prepare(replacement_sid, "dom")["initialTabState"]["discarded"])
+        self.assertFalse(state(discarded_target)["discarded"])
+        self.assertEqual(self.browser.eval(bridge.session_id, permissions_expression), permissions)
+        self.measurements.append({"case": "minimal_helper_permissions", "permissions": permissions,
+                                  "sensitivePresence": sensitive, "loaded": initial,
+                                  "unloaded": unloaded, "frozen": frozen, "discarded": discarded,
+                                  "selected": selected})
 
     def test_01_focus_alone_loads_a_deferred_restored_tab(self):
         tab, _, sid = self.attach_restored()

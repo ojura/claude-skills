@@ -1,4 +1,5 @@
-"""Check that the owned-browser transport matches production socket lifetime."""
+"""Check the owned browser's transport and the passive helper manifest."""
+import json
 from pathlib import Path
 import socket
 import sys
@@ -8,6 +9,18 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import browser_page_preparation as fixture
+
+
+class PassiveHelperManifestTests(unittest.TestCase):
+    def test_passive_helper_declares_only_debugger_and_keeps_its_identity(self):
+        manifest = json.loads(
+            (fixture.ROOT / "browser-state-extension/manifest.json").read_text())
+        self.assertEqual(manifest["permissions"], ["debugger"])
+        for field in ("background", "content_scripts", "host_permissions",
+                      "optional_permissions", "optional_host_permissions"):
+            self.assertNotIn(field, manifest)
+        self.assertEqual(fixture.CDP.page_preparation.extension_origin,
+                         "chrome-extension://mjkdoldgccjabmdemjlgnmkbomppkofg")
 
 
 class OwnedBrowserConnectionTests(unittest.TestCase):

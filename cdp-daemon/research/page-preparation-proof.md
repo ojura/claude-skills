@@ -187,8 +187,8 @@ events before the helper's later missing-tab exception response. The guarded
 call ended as detached, the shared reader stayed ready, and B's held
 initialization later completed. That terminal handling was retained.
 
-The current deterministic suite passes 71 Python tests and 10 research-worker
-tests. The latest owned-Chrome matrix passed 28 tests. Its final-viewport control
+The current deterministic suite passes 72 Python tests and 10 research-worker
+tests. The latest owned-Chrome matrix passed 29 tests. Its final-viewport control
 completes both callbacks, sets the actual viewport to zero before final metrics,
 and receives `view_uninitialized`. Socket-loss gates signal after the packet
 write, so those controls exercise a guarded pending reply rather than a pre-write
@@ -227,10 +227,50 @@ Cleanup confirmed that the owned Chrome, Xvfb, D-Bus and controller processes ha
 exited. The retained profile still recorded the helper at the same ID/path with
 `location=4`, `disable_reasons=[]` and Developer mode enabled.
 
-Chrome's actual grant descriptions were "Access the page debugger backend" and
-"Read and change all your data on all websites". The installation guide records
-those broad permissions alongside the narrower lifecycle-state and identity
-operations used by this implementation.
+## Helper permissions
+
+A fresh independent fixture changed only the helper's declared permissions from
+`["tabs", "debugger"]` to `["debugger"]`, keeping the key and `bridge.html`
+identical. The profile did not have prior user extensions.
+`runtime.getManifest().permissions` and `permissions.getAll()` both reported
+only `debugger`, with `origins: []`. Exact target/tab mapping and the
+`status`, `discarded`, `frozen` and `active` fields worked, including true
+frozen, discarded and active states. The sensitive `url`, `title` and
+`favIconUrl` fields were absent from the returned tab object. All four readiness
+modes, release, shared ownership, freeze/thaw, discard restoration and strict
+rendering classification passed. Non-rendering readiness still made zero
+layout-metrics requests.
+
+With daemon modules from `8e238bca`, that debugger-only installation also survived
+a normal restart. The declared and granted permissions remained only `debugger`
+before operations, after lifecycle controls and after restart, with `origins: []`.
+All four readiness modes and release passed after restart. The helper stayed
+enabled at the same ID/path, Developer mode remained enabled, and the recorded
+method set did not contain `Extensions.*` calls. Cleanup confirmed that the
+owned Chrome, Xvfb, D-Bus and controller processes had exited. The retained
+profile recorded `location=4`, `disable_reasons=[]` and only the `debugger` API
+permission, with empty host-permission lists.
+
+The production helper therefore declares only `debugger`, which is required for
+`chrome.debugger.getTargets()`. The tabs API supplies the non-sensitive lifecycle
+fields without a `tabs` declaration. The key and passive behavior are unchanged.
+The separate test observer retains `tabs` because it reads URLs.
+
+A deterministic test checks the exact permission declaration, passive manifest
+and stable extension ID. The owned-Chrome suite also reads the actual declared
+and granted permissions, checks that the helper does not have a service worker,
+compares its exact target/tab mapping and lifecycle fields with the independent
+observer, and verifies that the sensitive tab fields are absent. It observes
+loaded, deferred, frozen, discarded and selected states, then confirms thaw and
+discard restoration with the same permission grant. The full 29-test browser
+suite passed with this manifest on AC power, alongside 72 Python tests and
+10 JavaScript tests.
+
+The independent fixture still received both Chrome grant descriptions:
+"Access the page debugger backend" and "Read and change all your data on all
+websites". Removing the redundant declaration does not make the helper read-only.
+The installation guide records that broad authority alongside the narrower
+lifecycle-state and identity operations used by this implementation.
 
 ## Transport and ownership regressions
 
