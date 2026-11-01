@@ -22,8 +22,13 @@ connections can raise another **Allow remote debugging?** dialog.
   support enabled through `chrome://accessibility`. Without that accessibility
   information, the consent button may be unavailable to AT-SPI.
 - Managed page preparation additionally requires the bundled browser-side state
-  extension. Read [page-preparation.md](page-preparation.md) before installing it
-  or using `/prepare`. Raw CDP calls remain available without that extension.
+  extension. The browser-level `Extensions.loadUnpacked` command installs it on
+  endpoints that support the operation; omit `sessionId`. The helper's ordinary
+  UI Reload action then retains the registration across Chrome restarts. Read
+  [page-preparation.md](page-preparation.md) for installation, verification,
+  updates, recovery after a Chrome restart and the manual fallback before
+  installing it or using `/prepare`.
+  Raw CDP calls remain available without that extension.
 
 ## Start and connection handling
 

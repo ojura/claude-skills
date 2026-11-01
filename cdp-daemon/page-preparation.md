@@ -11,11 +11,12 @@ another implementation of Chrome's loading, freezing and focus rules.
 
 ## Install the browser-side state reader
 
-Install the bundled `browser-state-extension` directory as an unpacked extension
-in the Chrome profile being driven: open `chrome://extensions`, inspect Developer
-mode, enable it only if it is off, and choose **Load unpacked**. Leave an already
-enabled switch on. Installation into an existing user profile is a separate
-action requiring that profile's owner's approval.
+Install the bundled `browser-state-extension` directory in the intended Chrome
+profile with the profile owner's approval. Use the browser-level
+`Extensions.loadUnpacked` command when the connected endpoint supports it, then
+the ordinary Reload control below to retain the registration across Chrome
+restarts. The manual **Load unpacked** UI is the fallback. Keep the source directory
+at a stable path; Chrome loads the unpacked helper from that directory.
 
 The extension declares only `debugger`. It supplies
 `chrome.debugger.getTargets()`, which maps an exact CDP target ID to its Chrome
@@ -47,18 +48,158 @@ The raw `/attach`, `/eval` and `/cdp` endpoints remain usable without this
 extension. Full page preparation requires browser-maintained state because CDP's
 target list does not identify a discarded tab.
 
-### Installation and focus
+### Automated installation
 
-**Load unpacked** opens a native directory chooser. Treat installation as an
-interactive browser action; `background:true` is not a native-focus guarantee,
-especially when creating a new window.
+Check the browser/profile served by the current daemon connection before
+installation. These requests are browser-level: omit `sessionId` from the
+`/cdp` body. Reuse an existing helper that passes the verification below. For an
+absent helper, once installation is authorized, load its reviewed canonical
+directory directly. From the `cdp-daemon` directory:
 
-The tested `Input.dispatchDragEvent` alternative delivered trusted directory-drop
+```bash
+HELPER_DIR=$(realpath browser-state-extension)
+jq -n --arg directory "$HELPER_DIR" \
+  '{method:"Extensions.loadUnpacked",params:{path:$directory},timeout_seconds:20}' |
+  curl -sS --max-time 25 -H 'Content-Type: application/json' \
+    --data-binary @- http://127.0.0.1:7799/cdp
+```
+
+Success returns the extension ID in `result.id`. The stable bundled key produces
+`mjkdoldgccjabmdemjlgnmkbomppkofg`. The verified live installation completed
+without opening a window or directory chooser. Determine support from the actual
+endpoint instead of assuming requirements from isolated test-fixture flags.
+
+If capability is unknown, an optional non-mutating check uses a missing child
+of a newly created, owned empty directory:
+
+```bash
+probe_dir=$(mktemp -d)
+jq -n --arg directory "$probe_dir/missing-extension" \
+  '{method:"Extensions.loadUnpacked",params:{path:$directory},timeout_seconds:15}' |
+  curl -sS --max-time 20 -w '\nHTTP %{http_code}\n' \
+    -H 'Content-Type: application/json' --data-binary @- \
+    http://127.0.0.1:7799/cdp
+test ! -e "$probe_dir/missing-extension"
+rmdir "$probe_dir"
+```
+
+The verified endpoint returned HTTP 500 with protocol error code `-32600` and
+`File path cannot be resolved.` The request reached path resolution and left the
+missing child absent. Preserve a different response, including an
+unsupported-method or permission error, when deciding whether to use the manual
+fallback.
+
+### Retain the registration across Chrome restarts
+
+Native loading initially marks the helper `INSTALLED_VIA_CDP`. The ordinary
+extensions UI Reload action clears that marker on the tested Chrome, allowing
+the registration to survive profile startup. Do this before the first managed
+preparation when installing a new helper:
+
+1. Use an existing or regular background `chrome://extensions/` target in the
+   existing window, without `newWindow` or tab activation. Attach and enable
+   focus emulation on that UI target so its renderer can run in the background.
+2. Inspect Developer mode and enable it through the ordinary UI only if it is
+   off. Verify it is true. Wait for the exact helper card and its enabled Reload
+   control to render.
+3. Invoke that card's normal Reload control through its shadow DOM. For the
+   bundled helper, evaluate this in the extensions page:
+
+   ```javascript
+   (async () => {
+     await new Promise(resolve =>
+       requestAnimationFrame(() => requestAnimationFrame(resolve)));
+     const manager = document.querySelector('extensions-manager');
+     const list = manager?.shadowRoot?.querySelector('extensions-item-list');
+     const item = list?.shadowRoot?.getElementById('mjkdoldgccjabmdemjlgnmkbomppkofg');
+     const button = item?.shadowRoot?.querySelector('#dev-reload-button');
+     const rect = button?.getBoundingClientRect();
+     if (!button || button.disabled || !rect || rect.width <= 0 || rect.height <= 0) {
+       throw new Error('The helper Reload control is unavailable');
+     }
+     button.click();
+     return {id: item.id, reloadRequested: true};
+   })()
+   ```
+
+4. Wait for Reload to complete, then verify the helper again. Inspect only its
+   selected entry in the profile's `Preferences`: after the update is written,
+   `creation_flags` must have `INSTALLED_VIA_CDP` (`1 << 15`) cleared. Preserve
+   the actual result instead of inferring persistence from `location=4`.
+5. Confirm that the selected tab and native input focus stayed unchanged. Close
+   targets created for setup, detach from reused targets, and proceed to
+   preparation.
+
+The owned control verified that the marker cleared and the helper remained
+enabled at the intended path and version with the expected permissions. All
+readiness modes passed after a normal Chrome restart. This uses the supported
+Reload action, without editing preferences or uninstalling the extension.
+
+### Lifetime and recovery
+
+A helper loaded through CDP survives a daemon-only restart or debugger
+reconnection while Chrome and its profile remain running. If its registration
+still has `INSTALLED_VIA_CDP`, Chrome profile startup removes it, including with
+Developer mode enabled. The Reload step above clears that marker. A `location=4`
+entry on disk alone does not establish browser-restart persistence; the file can
+retain an old entry after the live registry has removed it.
+
+After reconnecting to Chrome, query browser-level `Extensions.getExtensions`
+without `sessionId`. Its response lists installed helpers in `result.extensions`.
+If the approved helper is absent after a Chrome restart, load its reviewed
+canonical path again and perform the Reload and verification steps before
+`/prepare`. Reuse an already enabled helper when its actual path, version and
+permissions match; do not treat reloading an existing path as an update.
+
+Reload invalidates existing helper execution contexts. Release active work
+preparations before updating the helper. If a previously cached reader then
+reports `browser_state_unavailable` with `Extension context invalidated` in its
+details, release that failed work-session registration and explicitly retry
+preparation after verifying the helper is enabled. The owned control confirmed
+that the daemon retires the invalid reader and the retry succeeds. Keep the full
+error if that recovery fails.
+
+The manual **Load unpacked** installation also survived normal Chrome restarts
+in the owned controls and remains available as a fallback.
+
+### Verify installation and updates
+
+Verify the loaded helper, not just the returned ID:
+
+- Use browser-level `Extensions.getExtensions` to verify `enabled:true`, the
+  actual canonical path and the version from that directory's `manifest.json`.
+  This method reports unpacked extensions. For additional UI metadata, check
+  `ENABLED`, `UNPACKED` and false disable reasons through an existing or regular
+  background `chrome://extensions/` target; creating another window is
+  unnecessary.
+- From the helper's own `bridge.html` execution context, read
+  `chrome.runtime.getManifest()` and `chrome.permissions.getAll()`. Check its
+  actual ID/version, declared permissions `["debugger"]`, granted permissions
+  `["debugger"]` and `origins:[]`.
+- Verify preparation and release through the connected daemon after activation.
+  Keep the complete HTTP response so an error cannot be mistaken for page data.
+
+Loading an already-loaded path can return its existing ID and cached code.
+`Extensions.loadUnpacked` is not a reload check. After changing an installed
+helper, use Chrome's Reload control to retain its stored data, then verify the
+runtime manifest and the changed behavior. Generic uninstall/reinstall can
+delete extension data. Matching a returned ID or reading new source files from
+disk does not establish that Chrome runs the new code.
+
+### Manual fallback and focus
+
+Open `chrome://extensions`, inspect Developer mode, enable it only if it is off,
+and choose **Load unpacked**. Leave an already enabled switch on. This opens a
+native directory chooser. Treat it as an interactive browser action;
+`background:true` is not a native-focus guarantee, especially when creating a
+new window.
+
+The tested `Input.dispatchDragEvent` directory-drop route delivered trusted
 events to a regular background extensions tab, but Chrome rejected installation
-with `No current drop data.` and `No dragged path`. Developer mode was already
-enabled in the matching control. Do not substitute that event sequence for the
-supported **Load unpacked** path. The [proof record](research/page-preparation-proof.md#background-directory-drop-installation)
-records the exact browser-side distinction and the focus/selection observations.
+with `No current drop data.` and `No dragged path`, including with Developer mode
+already enabled. The browser-level loader above is a different installation
+route. The [proof record](research/page-preparation-proof.md#background-directory-drop-installation)
+records the failed drop and its browser-side cause.
 
 ## API
 
