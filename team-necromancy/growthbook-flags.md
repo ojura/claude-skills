@@ -314,13 +314,10 @@ server could target differently.
 
 Against his cache from the 2026-10-08 fetch: 1,015 flags served against 857
 cached, 771 the same, 74 with other values, 170 only served and 12 only cached.
-87 of the 256 differing names do not occur in the 2.1.314 bundle. The same day the
-four fields a fetch writes (`cachedGrowthBookFeatures`,
-`cachedGrowthBookFeaturesAt`, `cachedExperimentFeatures`,
-`cachedExperimentData`) were replaced with this payload in `~/.claude.json`,
-under its `~/.claude.json.lock`, keeping Juraj's own entries for
-`tengu_splendid_horizon` and `tengu_saffron_credits_only_tiers`. The file as it
-was is `~/.claude/backups/.claude.json.before-gb-served.1793410511142`.
+87 of the 256 differing names do not occur in the 2.1.314 bundle. His cache still
+holds the 2026-10-08 fetch with his own edits; a served value goes into it only
+flag by flag, after its effect is known. The rows below give the served value of
+each flag that was traced.
 
 ## Traced flags
 
@@ -359,7 +356,7 @@ was is `~/.claude/backups/.claude.json.before-gb-served.1793410511142`.
 | `tengu-model-error-overrides` | `{}` | 2.1.305, read with `JR()`, not `k()`: a non-empty `block` string for a model makes `Y5n()` true, and the consent dialog does not open for that model. What the request does then was not traced. |
 | `tengu_ember_latch` | false | 2.1.305: one term of `k5t()`, which decides whether the consent dialog offers to buy usage credits in Claude Code ("Yes, buy usage credits") instead of sending the person to claude.ai or to an admin. |
 | `tengu_saffron_ladder` | false | 2.1.305: `J2s()` is `Wle() && flag` (`Wle()` not traced); with it the Fable consent dialog offers "Upgrade to Max". |
-| `tengu_pewter_brook` | false | 2.1.314: one of the inputs that decide whether the terminal uses the fullscreen renderer. The `tui` setting (`fullscreen` or `default`) decides first, then two other checks, then this flag, read once per process with `_n()`. Juraj's cache held true from the 2026-10-08 fetch; the 2026-10-31 payload served false, which the cache now holds. |
+| `tengu_pewter_brook` | false | 2.1.314: one of the inputs that decide whether the terminal uses the fullscreen renderer. The `tui` setting (`fullscreen` or `default`) decides first, then two other checks, then this flag, read once per process with `_n()`. Juraj's cache holds true from the 2026-10-08 fetch; the 2026-10-31 payload served false. |
 | `tengu_cedar_lantern` | true | 2.1.314: adds the system-prompt section that begins "When you have enough information to act, act. Do not re-derive facts already established in the conversation". `CLAUDE_CODE_ACT_DONT_REDERIVE` overrides it. Read with `Cn()`, which keeps the first value for the life of the process, so a cache change applies from the next start. Juraj's cache held false from the 2026-10-08 fetch; served true on 2026-10-31. |
 | `tengu_read_dedup_killswitch` | false | 2.1.314: when true, the Read tool returns a file's content again when an unchanged file is read a second time, in place of its short reply that the file is unchanged. Served true on 2026-10-31. |
 | `tengu_compact_cache_prefix` | true | 2.1.310 and 2.1.314: when true, compaction first sends its summary request as a fork of the conversation, with the conversation's system prompt, tools and messages, so it can read their cache. When false, or when that attempt fails, it sends a standalone request with the system prompt "You are a helpful AI assistant tasked with summarizing conversations." and a reduced tool set. Juraj's cache held false from the 2026-08 and 2026-10-08 fetches, yet on 2026-10-26 a 2.1.310 compaction (CLIProxyAPI log `120939-5f809b7a`) in a session that read the disk cache took the fork path; why was not determined. Served true on 2026-10-31. |
