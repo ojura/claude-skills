@@ -149,7 +149,8 @@ modification time and drops out of the time-based selections.
   export, among them `CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF`, which Claude Code
   reads only from the launch environment. `env-of-claude.sh` refuses a process that is
   not claude or that a tool call or a teammate launch started, and drops `TMUX` and
-  `TMUX_PANE`.
+  `TMUX_PANE`. The script delegates these checks and reads to agent-resume's
+  `--env-of` mode.
 - Right before the launch, list the running claude processes and the registry again
   (`pgrep -ax claude`, `~/.claude/sessions/*.json`): the user may have resumed or started
   sessions while the restore was being prepared.
@@ -203,11 +204,12 @@ under its own identity" or as `agent-resume team-lead@<team>`), and the whole-te
 
 ## 5. Resume the teammates
 
-- Resume one teammate at a time, with its lead's environment:
+- Resume one teammate at a time. agent-resume reads its live lead's launch
+  environment through Resolver:
 
   ```bash
-  ~/.claude/skills/crash-resume/scripts/env-of-claude.sh <lead pid> agent-resume <name>@session-<team> --no-attach --dry-run
-  ~/.claude/skills/crash-resume/scripts/env-of-claude.sh <lead pid> agent-resume <name>@session-<team> --no-attach [--model <m>] [--effort <e>]
+  agent-resume <name>@session-<team> --no-attach --dry-run
+  agent-resume <name>@session-<team> --no-attach [--model <m>] [--effort <e>]
   ```
 
   agent-resume picks the model from its own sources (the roster, the spawn record, the
@@ -215,14 +217,16 @@ under its own identity" or as `agent-resume team-lead@<team>`), and the whole-te
   inventory's model and effort, and pass `--model` or `--effort` where they differ; an
   explicit flag replaces the derived one. The dry run's `socket` line names the tmux
   server the teammate will run in.
-- agent-resume starts the tmux server `claude-swarm-<lead pid>` with the environment it
-  runs in, and every pane in that server inherits it, so the first teammate on a server
-  decides the environment of all of them. When a swarm survived, resume teammates into it
-  only after checking its environment (`tmux -L <socket> show-environment -g`).
+- agent-resume starts a new tmux server with the selected environment and applies
+  that environment to each resumed pane, including panes on an existing server.
+  The launch report names the source and variable count. Existing panes keep their
+  environments; resuming another member does not repair a running member's values.
 - A teammate with a lead that is not coming back (a converted teammate often has one) has
-  no lead environment to take. Use the restoring agent's own, and for a GPT model put
+  a lead environment that cannot be read. Use the restoring agent's own, and for a GPT model put
   `with-proxy.sh` in front of agent-resume, which sources the proxy script first:
-  `~/.claude/skills/crash-resume/scripts/env-of-claude.sh "$CLAUDE_PID" ~/.claude/skills/crash-resume/scripts/with-proxy.sh agent-resume <name>@<team> --no-attach`.
+  `~/.claude/skills/crash-resume/scripts/env-of-claude.sh "$CLAUDE_PID" ~/.claude/skills/crash-resume/scripts/with-proxy.sh agent-resume <name>@<team> --caller-env --no-attach`.
+  `--caller-env` preserves the proxy values that the wrapper supplied instead of
+  replacing them with the restoring Claude process's launch values.
   agent-resume then starts the team's own server, `claude-swarm-<team>`. Such a teammate
   does not need a lead spawn first.
 - Resume by agent id rather than with `--team`: `--team` resumes the members and then the
