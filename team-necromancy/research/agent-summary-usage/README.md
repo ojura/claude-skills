@@ -38,7 +38,7 @@ The 36 recorded requests together consumed 223,835 uncached input tokens, 892,33
 | Long tool result followed by Describe text | 29,713 to 29,715 | 18,217 to 18,241 |
 | Describe after a completed assistant reply | 29,797 to 29,976 | 213 to 244 |
 
-The long tool result was already cached by the completed work request. Nevertheless, every one of its 12 summary replays read it again as uncached input. The summary's marker ends before that result. The Describe prompt and its changing `Previous:` line are also beyond the marker.
+The `high`-effort work request cached the long tool result. All six `high`-effort summary replays nevertheless counted that result as uncached input. The six `xhigh` replays reported the same input range, although this experiment did not separately warm the complete long result at `xhigh`. The summary's marker ends before that result. The Describe prompt and its changing `Previous:` line are also beyond the marker.
 
 For the first summary at each effort, where the Describe prompt is identical, the long result adds exactly 17,920 uncached tokens. Subsequent prompts can differ by a few additional tokens because they quote different previous labels. The cached prefix stays the same. This shows why the token cost cannot be described as merely reading a cached conversation and producing a few words: the last business message can be a substantial uncached input on every report.
 
