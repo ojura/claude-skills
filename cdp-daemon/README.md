@@ -1,61 +1,82 @@
-# CDP Daemon
+# CDP daemon
 
-Drive an already-running Chrome over the DevTools Protocol from scripts, without
-the per-call permission modal.
+Drive a running Chrome through one persistent DevTools connection and a local
+HTTP API. On Chrome's consent-controlled endpoint, reconnecting for each call
+can repeatedly ask the user to allow remote debugging. The daemon acquires
+consent once per connection and shares that connection among clients.
 
-## The problem it solves
+## Capabilities
 
-Chrome's remote debugging endpoint pops an "Allow remote debugging?" dialog the
-first time something connects. If your script opens a fresh WebSocket for every
-CDP call, you get a fresh modal every time, which makes scripted automation
-against a real logged-in browser unusable. This daemon connects to Chrome
-exactly once, auto-presses Allow through the accessibility tree, and then serves
-all further CDP calls over that single persistent connection through a small
-local HTTP API.
+- Discover Chrome's live endpoint through `DevToolsActivePort` and press its
+  consent dialog through AT-SPI.
+- Attach to targets, evaluate JavaScript, send arbitrary CDP methods and read a
+  rolling buffer of protocol events.
+- Prepare an attached page from its browser-maintained loading/discard state,
+  share one focus-emulation owner among managed clients, and check the requested
+  JavaScript, DOM, complete-load or animation readiness.
+- Preserve the supplied target and Chrome's selected tab. Clients explicitly
+  choose a new regular background target when their rendering task needs one.
+- Keep already-sent commands intact when their response wait expires.
+- Observe session closure and connection loss, and finish the old reader before
+  opening a replacement connection.
 
-## What it does
+The daemon acts with the authority of the connected browser profile. Page data,
+cookies and application operations need the same care as that browser session.
 
-- Holds one long-lived CDP WebSocket to Chrome, at the endpoint auto-discovered
-  from Chrome's `DevToolsActivePort` file (host/port not hardcoded).
-- Auto-presses the Allow dialog via AT-SPI on connect (in-process presser
-  thread; `clear_modals.py` imported as a library, findings in the daemon log).
-- Exposes `127.0.0.1:7799` with endpoints for `getTargets`, `attachToTarget`,
-  `Runtime.evaluate`, arbitrary CDP methods, a rolling event buffer, and status.
-- Demultiplexes responses by request id and buffers all id-less CDP events
-  (`Network.*`, `Runtime.*`, ...) for incremental polling by sequence number.
+## Start
 
-## When to use it
-
-When you need to script against the user's real, logged-in Chrome: read
-httpOnly cookies, evaluate JS in a page, navigate a tab, or watch network
-requests, and you do not want to either spawn a separate automation browser or
-drown the user in permission prompts. It is the connection-management layer; you
-bring the CDP calls.
-
-## Quick start
+From this directory:
 
 ```bash
 python3 cdp_daemon.py & disown
-curl 127.0.0.1:7799/status
-curl 127.0.0.1:7799/targets | jq
+curl -s http://127.0.0.1:7799/status
 ```
 
-See [`SKILL.md`](SKILL.md) for the full endpoint table, the prerequisites
-(AT-SPI renderer accessibility), and worked examples. Note: `--remote-debugging-port`
-does NOT work for Chrome's default/main user profile; enable debugging via
-`chrome://inspect`, and the daemon discovers the live endpoint from
-`DevToolsActivePort`.
+For the user's default Chrome profile, enable debugging through
+`chrome://inspect`. Chrome 136 and later ignore `--remote-debugging-port` on the
+default user-data directory. Automatic consent pressing needs `python3-gi`,
+AT-SPI and Chrome renderer accessibility.
+
+Raw CDP calls work with that connection alone. Full page preparation additionally
+requires the bundled passive `browser-state-extension`, installed with the
+profile owner's approval. Its `tabs` permission reads lifecycle state;
+`debugger` provides exact target-to-tab identity mapping. The production
+manifest does not run a background worker.
+
+## Use
+
+- [SKILL.md](SKILL.md) documents connection acquisition, every HTTP endpoint,
+  worker instrumentation and event capture.
+- [page-preparation.md](page-preparation.md) defines the supported preparation
+  API, helper installation, readiness levels, ownership, release and errors.
+- [research/page-preparation-proof.md](research/page-preparation-proof.md)
+  records the Chrome revision, controlled results and Chromium source paths.
+
+The supported HTTP preparation interface is selection-free. A selection-based
+prototype is retained for research; exposing it remains a user decision because
+conditional restoration cannot be made atomic with independent tab activity
+through the public tabs API.
+
+## Tests
+
+```bash
+python3 -B -I tests/test_page_preparation.py
+node --test tests/view_initialization.test.mjs
+python3 -B -I tests/browser_page_preparation.py -v
+```
+
+The browser suite uses owned profiles and a guarded private Xvfb display, with
+Wayland removed from the launched environment. It tests the installed Chrome
+binary without restarting or reconfiguring the user's browser. Research worker
+code is enabled only in the owned extension fixture.
 
 ## Files
 
-- `cdp_daemon.py` - the daemon (hand-rolled WebSocket framing, reader thread,
-  HTTP API). No third-party dependencies.
-- `clear_modals.py` - AT-SPI presser library for Chrome's Allow dialog (the
-  daemon imports it in-process). Needs `python3-gi` with the Atspi bindings.
-  Also runnable standalone.
-
-## Scope
-
-The daemon speaks CDP to whatever Chrome is already running and logged in. It
-holds no credentials of its own. Treat anything it can reach (cookies, page
-state) with the same care as the browser session itself.
+- `cdp_daemon.py`: WebSocket framing, connection/reader lifetime and HTTP API.
+- `page_preparation.py`: managed control sessions, shared initialization and
+  per-caller readiness checks.
+- `browser-state-extension/`: passive browser-side state reader.
+- `clear_modals.py`: AT-SPI consent and restore-prompt support, also usable as a
+  standalone manual tool.
+- `research/`: proof record and the unsupported selection prototype.
+- `tests/`: unit tests and controlled real-browser fixtures.

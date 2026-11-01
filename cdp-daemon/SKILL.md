@@ -1,249 +1,245 @@
 ---
 name: cdp-daemon
-description: Drive an already-running Chrome over the DevTools Protocol from scripts without spawning per-call WebSocket connections (which each trigger a permission modal). Opens one persistent CDP WebSocket, auto-presses Chrome's "Allow remote debugging?" dialog via AT-SPI, and exposes a small local HTTP API for targets, attach, eval, arbitrary CDP calls, and buffered events. Use when you need to read cookies, evaluate JS, navigate, or watch network traffic in the user's real logged-in Chrome.
+description: Drive an already-running Chrome through one persistent DevTools connection, avoiding repeated debugging-permission prompts. Provides a local HTTP API for targets, page preparation, evaluation, arbitrary CDP calls, worker startup hooks and events. Use for browser state, page JavaScript, navigation, cookies or network inspection in the user's logged-in Chrome.
 ---
 
-# CDP Daemon
+# CDP daemon
 
-Talks to a running Chrome instance over the Chrome DevTools Protocol through one
-long-lived WebSocket, fronted by a local HTTP API on `127.0.0.1:7799`. The point
-is to connect ONCE: every fresh raw WebSocket to Chrome's debugging endpoint
-pops a "Allow remote debugging?" modal, so scripts that reconnect per call spam
-the user with dialogs. This daemon connects a single time, auto-presses Allow,
-and then every subsequent CDP call rides the same connection with no further
-prompts.
+The daemon holds one Chrome DevTools WebSocket and serves a local HTTP API at
+`127.0.0.1:7799`. Clients reuse that connection instead of opening another
+WebSocket for each call. On Chrome's consent-controlled endpoint, new debugging
+connections can raise another **Allow remote debugging?** dialog.
 
 ## Prerequisites
 
-- Chrome running with remote debugging enabled on the profile you want to drive (normally your
-  **main/default** one). The `--remote-debugging-port` flag can't get you there: Chrome 136+
-  ignores it on the default/main profile as a security measure. Enable it instead, persistently,
-  by opening `chrome://inspect` in the target Chrome, which turns on the local DevTools endpoint
-  on the running profile. The daemon
-  can then connect at all, and that first connection raises the "Allow remote
-  debugging?" consent modal - which this daemon auto-presses. It discovers the live
-  endpoint (port + UUID WebSocket path) from
+- Enable remote debugging in the running Chrome through `chrome://inspect`.
+  Chrome 136 and later ignore `--remote-debugging-port` on the default user-data
+  directory. The daemon discovers the port and browser WebSocket path from
   `~/.config/google-chrome/DevToolsActivePort`, falling back to
-  `127.0.0.1:43809` only if that file is missing.
-- For the auto-Allow press: `python3-gi` with the AT-SPI bindings
-  (`gi.repository.Atspi`), and Chrome launched with
-  `--force-renderer-accessibility` (or "Native accessibility API support"
-  enabled at `chrome://accessibility`). Without renderer accessibility the
-  Allow dialog is invisible to AT-SPI and `clear_modals.py` aborts with a clear
-  diagnostic instead of spinning.
+  `127.0.0.1:43809` when the file is unavailable.
+- Automatic consent pressing requires `python3-gi` with `gi.repository.Atspi`.
+  Chrome needs `--force-renderer-accessibility` or Native accessibility API
+  support enabled through `chrome://accessibility`. Without that accessibility
+  information, the consent button may be unavailable to AT-SPI.
+- Managed page preparation additionally requires the bundled browser-side state
+  extension. Read [page-preparation.md](page-preparation.md) before installing it
+  or using `/prepare`. Raw CDP calls remain available without that extension.
 
-## Start
+## Start and connection handling
 
 ```bash
 python3 cdp_daemon.py & disown
-curl 127.0.0.1:7799/status        # confirm connected
+curl -s http://127.0.0.1:7799/status
 ```
 
-The Allow press runs **in-process**: one dedicated presser thread (all AT-SPI
-calls stay on it) imports `clear_modals` as a library and, for the whole of each
-connect attempt, polls the AT-SPI tree for Chrome's Allow button(s) and presses
-every match (Chrome exposes two push-button nodes under the same alert; pressing
-only the first is unreliable). Its findings — presses, "Chrome not visible via
-AT-SPI", "renderer accessibility looks OFF" — stream into the daemon log
-(`/status` `log_tail`) as live diagnostics; they are never an up-front reason to
-skip pressing, since AT-SPI visibility is transient and a one-shot health check
-proved unreliable.
+The HTTP API starts before Chrome connection acquisition, so `/status` reports
+connection progress and failure. One dedicated presser thread imports
+`clear_modals` and performs the AT-SPI calls. During acquisition it repeatedly
+looks for Chrome's Allow buttons and reports its observations through `log_tail`.
+It presses each matching button because Chrome can expose multiple button nodes
+for the same dialog. Accessibility availability is checked throughout the
+attempt; an earlier failed check does not stop later scanning.
 
-The daemon is long-lived: after editing `cdp_daemon.py`, restart it (`POST
-/shutdown`, or `pkill -f cdp_daemon.py`, then relaunch) - an already-running
-instance keeps executing the old code in memory.
+Each acquisition attempt holds one WebSocket upgrade for about 150 seconds.
+Chrome completes that pending request when consent is granted. An attempt that
+expires without consent waits for `POST /reconnect`; it does not repeatedly open
+consent dialogs. While Chrome's endpoint is absent, the manager periodically
+checks availability. `claude_web`'s `_ensure_daemon` requests reconnection when it
+finds a parked daemon.
 
-Every connect attempt opens **one** WebSocket upgrade and holds it for the whole
-budget (~150s): one pending upgrade = at most one Allow dialog, and Chrome
-completes that exact pending request the instant the dialog is pressed — by the
-presser or by a human click. The daemon never retries on a timer (that is what
-used to spam dialogs); an attempt that expires un-Allowed parks the daemon
-(state `failed`) until `POST /reconnect` re-arms it. `claude_web`'s
-`_ensure_daemon` sends that kick automatically, so a parked daemon self-heals on
-the next client call. `POST /shutdown` to stop; it always terminates the process
-(it `os._exit`s from the HTTP thread), even while a connect is mid-flight.
+`POST /reconnect` closes and joins the old reader before opening another
+connection. Existing work sessions then need fresh attachment. Use it to repair
+a connection, rather than as preparation for every call.
 
-## Waiting for the connect from an agent (fail with a non-zero exit)
+After changing the daemon or its supporting Python module, stop the running
+instance with `POST /shutdown` and relaunch it. The process keeps executing its
+loaded code until restarted. Shutdown also works during connection acquisition.
+Keep `clear_modals.py` beside the daemon, as its presser imports that file.
 
-On the manual-Allow path the connect blocks on a human clicking Allow, so an agent
-that wants to resume the instant it lands should background a single `until`-loop and
-let its exit re-invoke it. This is the single-notification case, so use
-`Bash(run_in_background)` with an `until`-loop, **not** Monitor (Monitor is for
-one-event-per-occurrence streams).
+### Wait for manual consent from an agent
 
-The catch worth stating: make the **timeout/failure path exit non-zero**. A loop that
-prints a timeout and then falls through to an implicit `exit 0` makes "Allow never
-clicked" look identical to "connected" in the completion notification's exit code, so
-the agent can't tell success from failure without reading the output file.
+When consent depends on a person, background one bounded wait and let its exit
+notify the agent. Use `Bash(run_in_background)` for this single completion event.
+Return a nonzero exit code if connection acquisition fails, so the completion
+notification distinguishes failure from success.
 
 ```bash
-# Bash(run_in_background): arm a fresh pending connect, then block until connected.
-# exit 0 = connected (resume the real work);  exit 1 = never clicked (re-prompt / re-arm).
-curl -s -X POST 127.0.0.1:7799/reconnect >/dev/null 2>&1
+curl -s -X POST http://127.0.0.1:7799/reconnect >/dev/null
 for i in $(seq 1 240); do
-  curl -s --max-time 2 127.0.0.1:7799/status 2>/dev/null | grep -q '"connected": true' \
-    && { echo "connected after ${i}s"; exit 0; }
+  if curl -s --max-time 2 http://127.0.0.1:7799/status | grep -q '"connected": true'; then
+    printf 'Connected after %s seconds\n' "$i"
+    exit 0
+  fi
   sleep 1
 done
-echo "timeout: Allow not clicked in 240s" >&2
+printf 'Remote debugging consent was not granted within 240 seconds\n' >&2
 exit 1
 ```
 
+The presser also recognizes Chrome's Restore pages prompt after an owner
+relaunches a crashed browser. Starting or restarting the user's browser remains
+a separate action.
+
 ## HTTP API
 
-| Method | Path | Body | Returns |
-|--------|------|------|---------|
-| GET  | `/targets` | | `Target.getTargets` targetInfos array |
-| POST | `/attach` | `{targetId}` | `{sessionId}` |
-| POST | `/eval` | `{sessionId, expression, [returnByValue=true], [awaitPromise=false], [timeout_seconds=15]}` | `Runtime.evaluate` result |
-| POST | `/cdp` | `{method, [params], [sessionId], [timeout_seconds=15]}` | raw CDP response (200); a CDP protocol error → 500 `{"error":{code,message,...}}` (vs a transport/timeout failure → 500 `{"error":"<string>"}`) |
-| GET  | `/events` | `?since=N&method=substr&limit=N` | buffered CDP events |
-| GET  | `/status` | | `{connected, pending, events_buffered, log_tail, ...}` |
-| POST | `/reconnect` | | force a fresh CDP connect (use if the socket wedges) |
-| POST | `/autohook` | `{urlSubstr, script}` \| `{clear:true}` | inject `script` into matching targets the instant they attach |
-| GET  | `/autohooked` | | recent auto-hook injections `{sid, url, result}` |
-| POST | `/shutdown` | | exits the daemon |
+| Method | Path | Body or query | Returns |
+|---|---|---|---|
+| GET | `/targets` | | `Target.getTargets` target-info array |
+| POST | `/attach` | `{targetId}` | `{sessionId}`; attachment alone does not establish renderer readiness |
+| POST | `/prepare` | `{sessionId, [readiness="dom"], [timeout_seconds=15]}` | Managed page readiness; see the full method below |
+| POST | `/release` | `{sessionId, [timeout_seconds=15]}` | Releases preparation while retaining the caller's raw session |
+| POST | `/eval` | `{sessionId, expression, [returnByValue=true], [awaitPromise=false], [timeout_seconds=15]}` | `Runtime.evaluate` result, including `exceptionDetails` when present |
+| POST | `/cdp` | `{method, [params], [sessionId], [timeout_seconds=15]}` | Raw CDP response; protocol error returns HTTP 500 with structured `error` |
+| GET | `/events` | `?since=N&method=substring&limit=N` | Buffered CDP events |
+| GET | `/status` | | Connection state, pending waits, prepared pages, state readers and recent logs |
+| POST | `/reconnect` | | Requests a fresh connection |
+| POST | `/autohook` | `{urlSubstr, script}` or `{clear:true}` | Registers or clears worker startup hooks |
+| GET | `/autohooked` | | Recent hook results `{sid, url, result}` |
+| POST | `/shutdown` | | Terminates the daemon |
 
-`timeout_seconds` on `/cdp` and `/eval` limits the daemon's wait for a
-response. A timeout removes the local response waiter; it does not cancel
-the command in Chrome. A queued command can still execute later, for example
-when a busy worker yields or an unloaded tab gets a ready renderer. The daemon
-ignores the late response. Retrying a command with side effects can therefore
-perform the action twice.
+`timeout_seconds` limits the response wait; it does not cancel the command in
+Chrome. A queued command can execute later when its target can handle it. The
+daemon removes its local response waiter on expiry and ignores a late reply.
+Retrying a command with side effects can therefore perform the action twice.
+Keep the HTTP client's read timeout above the daemon's requested response wait.
+The unit is seconds for both `/eval` and `/cdp`.
 
-`/events` is a rolling buffer (last 10k) of every CDP event with no `id`
-(`Network.*`, `Runtime.*`, etc.). Enable the relevant CDP domain first via
-`/cdp` (e.g. `Network.enable` on a session), then poll `/events?since=<seq>` to
-stream new ones. Each event carries a monotonic `seq` for cheap incremental
-reads.
+A raw CDP protocol error is returned as `{"error":{"code":...,"message":...}}`.
+A raw transport or response-timeout error is returned as `{"error":"..."}`.
+Preparation errors have their own structured `kind` and `stage` fields. Preserve
+the complete response rather than reading only `.result.value`: that extraction
+would confuse JavaScript exceptions, protocol errors, expired waits and actual
+values.
 
-## Typical use
+## Prepare pages before application work
+
+Read [the complete page-preparation method](page-preparation.md). It defines
+helper installation and permissions, ownership, readiness levels, release,
+timeouts, errors and rendering choices.
+
+The supported method preserves the supplied target and Chrome's selected tab.
+It reads browser-maintained loading/discard state, restores a discarded target
+when required, enables focus emulation through one shared control session, and
+clears freezing before checking the requested condition. Clients share physical
+initialization but have independent JavaScript, DOM, complete-load or animation
+waits. JavaScript readiness is sufficient for a client that only needs to run a
+fetch.
+
+Two diagnostic rules matter:
+
+- A target can be listed and attached while its renderer remains unloaded.
+  Focus emulation can load a deferred restored document through Chrome's visible
+  capture and `LoadIfNecessary` path.
+- A frozen document can answer an immediate inspector evaluation while its
+  animation callbacks remain suspended. An evaluation timeout alone does not
+  identify freezing, and a returned `2+2` does not establish frame readiness.
+
+The daemon handles these distinctions. Clients should use `/prepare` instead of
+copying a separate wake procedure. An uninitialized browser view produces
+`view_uninitialized` for animation requests; the supported API does not silently
+select tabs or replace a pin. The proof and selection research are retained in
+[the research record](research/page-preparation-proof.md).
+
+A work-session example:
 
 ```bash
-# Find a claude.ai tab, attach, read its cookies
-TID=$(curl -s 127.0.0.1:7799/targets | jq -r '.[] | select(.url|contains("claude.ai")) | .targetId' | head -1)
-SID=$(curl -s -X POST 127.0.0.1:7799/attach -d "{\"targetId\":\"$TID\"}" | jq -r .sessionId)
-curl -s -X POST 127.0.0.1:7799/cdp -d "{\"method\":\"Network.enable\",\"sessionId\":\"$SID\"}"
-curl -s -X POST 127.0.0.1:7799/eval -d "{\"sessionId\":\"$SID\",\"expression\":\"location.href\"}"
+SID=$(curl -s -X POST http://127.0.0.1:7799/attach \
+  -H 'Content-Type: application/json' -d '{"targetId":"chosen-target"}' | jq -r .sessionId)
+curl -s -X POST http://127.0.0.1:7799/prepare \
+  -H 'Content-Type: application/json' \
+  -d "{\"sessionId\":\"$SID\",\"readiness\":\"javascript\"}"
+curl -s -X POST http://127.0.0.1:7799/eval \
+  -H 'Content-Type: application/json' \
+  -d "{\"sessionId\":\"$SID\",\"expression\":\"document.title\"}"
+curl -s -X POST http://127.0.0.1:7799/release \
+  -H 'Content-Type: application/json' -d "{\"sessionId\":\"$SID\"}"
+curl -s -X POST http://127.0.0.1:7799/cdp \
+  -H 'Content-Type: application/json' \
+  -d "{\"method\":\"Target.detachFromTarget\",\"params\":{\"sessionId\":\"$SID\"}}"
 ```
 
-## Instrumenting a worker before its code runs (auto-hook)
+## Instrument workers before their code runs
 
-To wrap a function (a WASM export, `crypto.subtle`, a library like tweetnacl)
-*before* a worker executes, you must inject while the worker is paused at start,
-then resume it. The daemon automates that race:
+Page preparation rejects workers. To wrap a worker's library before startup,
+pause the new worker, inject its hook and resume it:
 
-1. Arm pause-on-start on the BROWSER session (no `sessionId`):
-   `/cdp {"method":"Target.setAutoAttach","params":{"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true,"filter":[{"type":"shared_worker"}]}}`
-2. Register the hook: `/autohook {"urlSubstr":"static_resources/webworker","script":"<js>"}`.
-   On each `Target.attachedToTarget` whose URL contains `urlSubstr` **and** that
-   arrived paused (`waitingForDebugger:true`), the daemon `Runtime.evaluate`s the
-   script then `Runtime.runIfWaitingForDebugger` to resume. Non-matching paused
-   targets are resumed too, so a broad pause never strands unrelated workers.
-   Re-registering the same `urlSubstr` replaces (never stacks a stale duplicate).
-3. Open/create the target. The cold worker pauses, the hook lands before its
-   first line, then it resumes. Read the injection result via `/autohooked`.
+1. On the browser session, without `sessionId`, send through `/cdp`:
 
-If the worker's library isn't defined yet at the pause (e.g. an FB-module
-`require('x')`), have the injected script poll (`setInterval(...,0)`) and wrap as
-soon as it appears, rather than wrapping inline.
+   ```json
+   {"method":"Target.setAutoAttach","params":{"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true,"filter":[{"type":"shared_worker"}]}}
+   ```
 
-## Gotchas (CDP target/worker instrumentation)
+2. Register `/autohook {"urlSubstr":"static_resources/webworker","script":"..."}`.
+3. Create the worker. On `Target.attachedToTarget` with a matching URL and
+   `waitingForDebugger:true`, the daemon evaluates the script and calls
+   `Runtime.runIfWaitingForDebugger`. It resumes unmatched paused targets too.
+4. Read `/autohooked` for the result. Registering the same `urlSubstr` replaces
+   that hook rather than adding a second copy.
 
-- **Cold vs reused workers.** A genuinely COLD shared worker pauses under
-  `waitForDebuggerOnStart` (Chrome M143+). A REUSED one does not: `Target.closeTarget`
-  does not evict the `SharedWorkerHost` (it lingers in `terminated_hosts_`, pinned
-  by your auto-attach session's refcount, with no time-based eviction), so the next
-  `new SharedWorker()` reconnects the same host and skips the pause. To force cold:
-  disarm auto-attach (drops the ref), close the client page(s), let the host evict,
-  then re-arm and reopen; or restart the browser (deterministic cold).
-- **Only inject into PAUSED targets.** A worker stuck in synchronous WASM never
-  services the inspector: `Runtime.evaluate` AND `Debugger.enable` both hang to
-  their full timeout (the same calls return in ms on a responsive worker), and a
-  batch of such timeouts starves the single CDP socket. The auto-hook only fires
-  on `waitingForDebugger:true` targets for this reason; never `/eval` a busy worker.
-- **A Memory-Saver-frozen page hangs eval the same way a busy worker does.** Chrome
-  freezes background tabs: the target still lists and `/attach` still returns a
-  `sessionId`, but the renderer's task queue is suspended, so `Runtime.evaluate`
-  never runs and hangs to the full `timeout_seconds`. This is NOT a debugger pause -
-  `Runtime.runIfWaitingForDebugger` does nothing for it. Eval against a foregrounded
-  or freshly-created tab; never trust a stale background tab (with 100s of targets,
-  expect several frozen). To revive one specific frozen tab, `POST /cdp
-  Target.activateTarget {targetId}` first, then poll/retry the eval - the resume is
-  async, and a fully *discarded* tab reloads rather than resuming instantly. Two
-  corollaries that cost real debugging time here: (1) make eval **self-reporting** -
-  classify each call as value / JS-exception / daemon-timeout, because a parser that
-  reads only `.result.value` collapses timeout, exception, and empty-result into one
-  indistinguishable blank; (2) `timeout_seconds` is SECONDS (passed to `ev.wait`),
-  accepted by both `/cdp` and `/eval` - keep the HTTP client's read timeout *above*
-  it, or the client aborts first and you never see the daemon's own 500
-  timeout/diagnosis.
-- **No browser-handshake calls in a paused-start injection.** `new BroadcastChannel(...)`
-  (and similar) blocks forever when constructed in a worker paused at start: the
-  constructor needs a browser-process handshake the suspended task loop cannot
-  complete, so the injecting `Runtime.evaluate` never returns. Defer such calls
-  with `setTimeout(0)` (runs post-resume) and read captures from a global instead.
-- **A busy worker's eval is queued, not rejected.** `Runtime.evaluate` on a worker
-  mid-task does not fail; it waits in the worker's inspector queue and runs the next
-  time the worker yields to its event loop (V8 services interrupts only at
-  safepoints). So a call that "failed" under a short timeout can succeed with a long
-  one if the worker ever yields. Only a worker in one perpetual never-returning
-  synchronous call (e.g. a WASM engine main loop) is truly uninjectable. Use long
-  timeouts and fire concurrently (the ThreadingHTTPServer demuxes by id) rather than
-  declaring "unhookable" from a short-timeout miss.
-- **Hook before the page's own scripts.** `Page.addScriptToEvaluateOnNewDocument`
-  runs your script in the main world before any page script on the next navigation.
-  Use it to wrap `MessagePort`/`Worker`/`crypto.subtle`/library globals before the
-  app captures references to them, then `Page.navigate`. A warm `Runtime.evaluate`
-  after load is too late: the app already holds the originals.
-- **WASM exports can't be monkey-patched.** They are non-writable and
-  non-configurable, so `defineProperty`/assignment silently fails. Wrap
-  `WebAssembly.instantiate`/`instantiateStreaming`/`Instance` and return a value
-  whose `.exports` is a `Proxy` (emscripten reads each export lazily on first
-  call, so the Proxy `get` trap is where you wrap).
-- **Do not pause dedicated workers on Chrome 148.** `setAutoAttach{waitForDebuggerOnStart,
-  filter:[{type:"worker"}]}` followed by a target create/navigate SIGSEGVs the
-  browser (the renderer child-pause path is not covered by crrev.com/c/7552776 as
-  of .215). Pause only `shared_worker`.
-- **Navigation restarts the shared worker.** `Page.reload`/`Page.navigate` resets
-  the SW's JS global (same target id, fresh scope), wiping any warm-injected hook.
-  Hook a cold worker via auto-hook, not a warm one you then reload.
-- **Recover a crashed browser via AT-SPI.** After a Chrome crash the relaunch
-  shows a "Restore pages?" prompt; `clear_modals.py` presses its "Restore"
-  button alongside "Allow" (see `BUTTON_NAMES`), so the daemon's connect-time
-  presser recovers the session automatically.
+The hook runs in its own thread so the socket reader can continue delivering
+responses. Running-worker inspector commands can stay pending behind the
+worker's work. The auto-hook avoids that startup race by using the explicit
+paused-start event; unrelated targets remain usable on the shared connection.
 
-## Capturing high-volume events (WebSocket frames, Network)
+### Worker instrumentation details
 
-`/events` is a 10k rolling ring. A busy WebSocket or a `Network.*` flood can emit
-far more than 10k events between polls, silently dropping the oldest. To capture a
-complete stream, `Network.enable` on the owning session(s), then DRAIN
-incrementally: poll `/events?since=<lastSeq>`, advance the cursor to the max `seq`
-returned, append, and persist each round (every few hundred ms of activity). For
-WebSocket payloads read `Network.webSocketFrameReceived` -> `response.payloadData`
-(base64 for binary frames). This captures an app's wire protocol directly, without
-touching its workers - often the cleanest path when the data never crosses a
-hookable in-page boundary (it may travel via shared memory the page reads instead).
+- **New and reused shared workers differ.** A new shared worker pauses under
+  `waitForDebuggerOnStart`. A reused worker does not repeat startup. Closing its
+  target may leave `SharedWorkerHost` retained by an auto-attach reference. To
+  arrange a new worker, disarm auto-attach, close its client pages, allow those
+  references to be released, then re-arm and create it again.
+- **Defer browser handshakes until resume.** A constructor such as
+  `new BroadcastChannel(...)` can wait for a browser-process handshake while
+  the worker's paused task loop cannot complete it. Schedule that operation
+  with `setTimeout(...,0)` and inspect its result after resume.
+- **Queued evaluation remains pending.** An expired response wait does not
+  reject or revoke the worker's command. Choose a response budget that fits
+  the experiment, and keep its session while waiting for the worker to run it.
+  A worker that never handles inspector work can leave that wait unbounded.
+- **Install page hooks before navigation.**
+  `Page.addScriptToEvaluateOnNewDocument` runs before the next document's page
+  scripts. It can wrap `MessagePort`, `Worker`, `crypto.subtle` or library
+  globals before the application captures their references.
+- **Wrap WebAssembly instantiation rather than exported properties.** WASM
+  exports are non-writable and non-configurable. Wrap
+  `WebAssembly.instantiate`, `instantiateStreaming` or `Instance`, then return
+  an object with a `Proxy` for `.exports` when the application's access pattern
+  permits that wrapper.
+- **Navigation can replace the worker.** A new worker has new globals and loses
+  an earlier injected hook. Use pause-on-start for the replacement and inspect
+  target events to distinguish replacement from reuse.
+- **Dedicated-worker pause has a version-specific crash record.** Chrome 148
+  with patch version .215 was observed to crash when a dedicated worker was
+  created or navigated under paused auto-attach; the shared-worker path avoided
+  it. The recipe here filters `shared_worker`.
 
-## Files
+If a library is undefined at the initial pause, the hook can register a short
+poll to wrap it when it appears after resume. Wrapping the undefined value
+immediately would miss the later assignment.
 
-- `cdp_daemon.py` - the daemon. Hand-rolled WebSocket framing (no external WS
-  library), single reader thread demultiplexing responses by id and buffering
-  events, HTTP server for the API.
-- `clear_modals.py` - AT-SPI presser library for Chrome's Allow dialog. The
-  daemon imports its `scan_and_press`/`chrome_accessibility_health` in-process
-  (it must live alongside; if you relocate it, update `PRESSER` in
-  `cdp_daemon.py`). Also runnable standalone for manual/debug use: bare
-  invocation does a single scan-and-press, `--wait` polls until it presses at
-  least one button or hits a 60s deadline.
+## Capture high-volume events incrementally
 
-## Notes
+`/events` retains the last 10,000 events without a response ID. Enable the needed
+domain first, for example `Network.enable` on the owning session, then read
+`/events?since=<lastSeq>`. Each event has a monotonic `seq`.
 
-- Auth and identity come entirely from the Chrome instance you attach to. The
-  daemon does not handle credentials; it speaks CDP to whatever Chrome is
-  already logged into.
-- Keep the daemon to one instance. It binds `127.0.0.1:7799` and owns the single
-  CDP socket.
-- This is Linux/AT-SPI specific for the auto-Allow path. On other platforms the
-  CDP machinery still works, but you handle the Allow dialog yourself (or launch
-  Chrome so it does not prompt).
+A busy connection can produce more events than the buffer holds between reads.
+Drain it during activity, advance the cursor to the maximum returned sequence,
+and append each batch to the capture file. For WebSockets, inspect
+`Network.webSocketFrameReceived` and its `response.payloadData`, which is base64
+for binary frames. This records the application's network messages without
+injecting into a worker or relying on data crossing a JavaScript hook.
+
+## Files and scope
+
+- `cdp_daemon.py` owns the WebSocket, HTTP API, reader and response waits.
+- `page_preparation.py` owns managed control sessions and readiness checks.
+- `browser-state-extension/` is the passive browser-side state reader.
+- `page-preparation.md` defines the supported page method.
+- `research/` retains the proof record and the unsupported selection prototype.
+- `clear_modals.py` implements AT-SPI consent/restore pressing. It also runs as
+  a manual tool: one scan by default, or `--wait` for a bounded wait.
+
+Run one daemon per configured endpoint. It acts with the authority of the Chrome
+session it is connected to. Treat page data and credentials accordingly, and
+avoid printing cookie or token values during diagnostics.
