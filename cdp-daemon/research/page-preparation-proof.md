@@ -227,6 +227,72 @@ Cleanup confirmed that the owned Chrome, Xvfb, D-Bus and controller processes ha
 exited. The retained profile still recorded the helper at the same ID/path with
 `location=4`, `disable_reasons=[]` and Developer mode enabled.
 
+## Background directory-drop installation
+
+The directory-drop control used the reviewed production helper from
+`/home/juraj/claude-skills/cdp-daemon/browser-state-extension` at `5aa3b15`.
+Both initially fresh profiles ran on private Xvfb displays and private D-Bus
+sessions with ordinary Chrome flags. The command set excluded `Extensions.*`;
+the launch arguments excluded `--load-extension` and
+`--enable-unsafe-extension-debugging`. The test did not edit preference files
+or connect to the user's browser.
+
+The control kept a document selected in the original window and put native
+input focus in a separate owned X11 window. It created `chrome://extensions/`
+with `Target.createTarget({url:"chrome://extensions/",background:true})`, without
+`newWindow`, then attached and enabled focus emulation on that target. The final
+run confirmed that the extensions target and selected control target had the
+same browser window ID. The selected control document remained visible, with an
+empty `visibilitychange` history. Native input focus stayed in the control
+window in 5 ms samples; the final run also recorded an empty X11
+`FocusIn`/`FocusOut` event history for that window.
+
+Developer mode was observed before taking action. In the fresh profiles it was
+false and was enabled through trusted mouse input. The backend then reported
+`inDeveloperMode:true` and `canLoadUnpacked:true`, and the drop overlay reported
+`dragEnabled:true`. Normal restarts preserved Developer mode. The repeated
+controls observed it already true and skipped the checkbox click entirely.
+
+The trusted event sequence was `dragEnter`, `dragOver`, then `drop`, each sent
+through `Input.dispatchDragEvent` at a point inside the extensions page with:
+
+```json
+{"items":[],"files":["/home/juraj/claude-skills/cdp-daemon/browser-state-extension"],"dragOperationsMask":1}
+```
+
+The page recorded `isTrusted:true`. At drop it received exactly one file named
+`browser-state-extension`, and `webkitGetAsEntry().isDirectory` was true. Chrome
+still rejected the installation:
+
+- `Log.entryAdded` recorded `Unchecked runtime.lastError: No current drop data.`
+- The extensions UI emitted `drag-and-drop-load-error` with
+  `{message:"No dragged path"}`.
+- The installed-extension list remained empty, including after the normal
+  restarts. Chrome did not register the helper's expected ID, an installation
+  path or a permission grant. The failure prevented helper preparation and a
+  persistence check for an installed helper.
+
+An initial check that waited only for registration reached its 10-second fixture
+deadline. The instrumented controls captured the explicit errors above,
+including with Developer mode already true. The selected document and native
+focus controls stayed unchanged throughout those failures. The test did not
+observe `Page.fileChooserOpened`; the native source also rejects this missing
+path before the branch that opens a directory chooser.
+
+The source at the tested revision explains the distinction. The WebUI directory
+handler calls `loadUnpackedFromDrag()`, which passes `useDraggedPath:true`.
+Earlier, `notifyDragInstallInProgress()` calls `SetDroppedPath()`, which reads
+`WebContents::GetDropData()` and reports `No current drop data.` when that native
+state is absent. The load operation subsequently reads the saved dragged file
+and reports `No dragged path` when its path is empty. CDP's input handler sends
+its drag data directly through `RenderWidgetHostImpl` drag-target calls. The
+trusted renderer events in this control did not populate the native
+`WebContents` drop state required by the installation API.
+
+This result applies to the tested CDP directory-drop route. It does not establish
+that every possible quiet installation method fails. The supported installation
+path remains **Load unpacked** with its native directory chooser.
+
 ## Helper permissions
 
 A fresh independent fixture changed only the helper's declared permissions from
@@ -308,6 +374,24 @@ timeout behavior:
 ## Chromium source references
 
 All links below refer to the tested revision.
+
+- [Extensions directory-drop handler](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/chrome/browser/resources/extensions/drag_and_drop_handler.ts):
+  `doDragEnter`, lines 41 to 44, requests native drop-path tracking;
+  `doDrop`, lines 54 to 80, recognizes the directory; `handleDirectoryDrop_`,
+  lines 93 to 97, reports load errors.
+- [Extensions UI service](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/chrome/browser/resources/extensions/service.ts):
+  `loadUnpackedFromDrag`, lines 559 to 561, passes `useDraggedPath:true`;
+  `notifyDragInstallInProgress`, lines 567 to 569, calls the native API.
+- [Native extensions installation](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/chrome/browser/extensions/api/developer_private/developer_private_functions.cc):
+  `SetDroppedPath`, lines 333 to 359, reads native `WebContents` drop data;
+  `DeveloperPrivateLoadUnpackedFunction::Run`, lines 930 to 943, rejects a
+  missing dragged path before directory selection;
+  `DeveloperPrivateNotifyDragInstallInProgressFunction::Run`, lines 1122 to
+  1137, calls `SetDroppedPath` before the drop is handled.
+- [CDP drag dispatch](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/content/browser/devtools/protocol/input_handler.cc):
+  `DispatchDragEvent`, lines 1436 to 1463, finds the renderer widget;
+  `OnWidgetForDispatchDragEvent`, lines 1465 to 1534, sends renderer drag-target
+  calls using the supplied protocol data.
 
 - [Focus emulation](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/content/browser/devtools/protocol/emulation_handler.cc):
   `SetFocusEmulationEnabled`, lines 1042 to 1057, increments visible capture;

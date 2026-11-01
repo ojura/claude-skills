@@ -12,9 +12,10 @@ another implementation of Chrome's loading, freezing and focus rules.
 ## Install the browser-side state reader
 
 Install the bundled `browser-state-extension` directory as an unpacked extension
-in the Chrome profile being driven: open `chrome://extensions`, enable developer
-mode, and choose **Load unpacked**. Installation into an existing user profile is
-a separate action requiring that profile's owner's approval.
+in the Chrome profile being driven: open `chrome://extensions`, inspect Developer
+mode, enable it only if it is off, and choose **Load unpacked**. Leave an already
+enabled switch on. Installation into an existing user profile is a separate
+action requiring that profile's owner's approval.
 
 The extension declares only `debugger`. It supplies
 `chrome.debugger.getTargets()`, which maps an exact CDP target ID to its Chrome
@@ -45,6 +46,19 @@ cleanup before replacing that reader.
 The raw `/attach`, `/eval` and `/cdp` endpoints remain usable without this
 extension. Full page preparation requires browser-maintained state because CDP's
 target list does not identify a discarded tab.
+
+### Installation and focus
+
+**Load unpacked** opens a native directory chooser. Treat installation as an
+interactive browser action; `background:true` is not a native-focus guarantee,
+especially when creating a new window.
+
+The tested `Input.dispatchDragEvent` alternative delivered trusted directory-drop
+events to a regular background extensions tab, but Chrome rejected installation
+with `No current drop data.` and `No dragged path`. Developer mode was already
+enabled in the matching control. Do not substitute that event sequence for the
+supported **Load unpacked** path. The [proof record](research/page-preparation-proof.md#background-directory-drop-installation)
+records the exact browser-side distinction and the focus/selection observations.
 
 ## API
 
