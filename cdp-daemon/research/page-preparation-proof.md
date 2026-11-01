@@ -136,7 +136,7 @@ orders cooperating requests; it cannot supply that missing browser primitive.
 The research worker also tests observed third-tab selection, a previous tab
 moved to another window, selection failure, queued requester closure and
 independent windows. These controls are retained for the pending selection-option
-decision. They do not authorize installation or a selection-based supported API.
+decision.
 
 ### Hidden extension-page identity
 
@@ -187,8 +187,8 @@ events before the helper's later missing-tab exception response. The guarded
 call ended as detached, the shared reader stayed ready, and B's held
 initialization later completed. That terminal handling was retained.
 
-The forward implementation passes 66 Python tests, 10 research-worker tests and
-27 owned-Chrome tests. The native final-viewport control completes both callbacks,
+The forward implementation passes 67 Python tests, 10 research-worker tests and
+28 owned-Chrome tests. The native final-viewport control completes both callbacks,
 sets the actual viewport to zero before final metrics, and receives
 `view_uninitialized`. Socket-loss gates now signal after the packet write, so
 those controls exercise a guarded pending reply rather than a pre-write failure.
@@ -206,12 +206,22 @@ and returned the document to ordinary hidden/unfocused state. Selected-tab IDs
 were unchanged. The recorded method set did not contain `Extensions.*` calls,
 and the passive helper did not have a background worker.
 
+Additional normal-profile controls exercised two shared clients: releasing the
+first retained emulated focus, and releasing the last restored hidden/unfocused
+state. Explicit freeze/thaw retained document identity and delivered freeze and
+resume events; immediate inspector evaluation still returned 4 while a frame
+wait was suspended. Discarded replacement mapping and JavaScript/DOM restoration
+passed, while strict animation reported the zero-sized view explicitly. The
+separate input-focus window and Chrome's selected tab stayed unchanged.
+
+Cleanup confirmed that the owned Chrome, Xvfb, D-Bus and controller processes had
+exited. The retained profile still recorded the helper at the same ID/path with
+`location=4`, `disable_reasons=[]` and Developer mode enabled.
+
 Chrome's actual grant descriptions were "Access the page debugger backend" and
 "Read and change all your data on all websites". The installation guide records
 those broad permissions alongside the narrower lifecycle-state and identity
-operations used by this implementation. This owned-profile production-path
-proof is separate from approval to install into an existing user profile;
-landing and installation remain held for review.
+operations used by this implementation.
 
 ## Transport and ownership regressions
 
@@ -232,6 +242,11 @@ timeout behavior:
 - An externally closed state-reader target can make a repeated close command
   fail. Cleanup verifies target absence through the browser's target list before
   recording success; an unconfirmed failure remains `release_failed`.
+- The owned-browser fixture retained the 10-second acquisition read timeout,
+  unlike production, which already cleared it after upgrading. The fixture now
+  calls `settimeout(None)` before starting its reader. A deterministic socket-pair
+  control observed `10.0` before the correction and `None` afterward at reader
+  startup; the real-browser suite also checks the established socket directly.
 
 ## Chromium source references
 

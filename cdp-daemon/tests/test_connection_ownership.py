@@ -256,10 +256,10 @@ class ConnectionOwnershipTests(unittest.TestCase):
     def test_control_worker_started_after_invalidation_cannot_send_native_calls(self):
         self.delayed_start("control", False)
 
-    def test_bridge_scheduled_after_invalidation_cannot_create_an_orphan(self):
+    def test_bridge_scheduled_after_invalidation_cannot_create_an_untracked_helper_target(self):
         self.delayed_start("bridge", True)
 
-    def test_bridge_worker_started_after_invalidation_cannot_create_an_orphan(self):
+    def test_bridge_worker_started_after_invalidation_cannot_create_an_untracked_helper_target(self):
         self.delayed_start("bridge", False)
 
     def test_an_old_disconnect_notification_does_not_close_the_new_generation(self):

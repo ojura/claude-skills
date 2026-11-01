@@ -231,6 +231,7 @@ class OwnedBrowser:
         if reply[0] != "ok":
             raise RuntimeError(str(reply))
         CDP.cdp_sock, CDP.cdp_leftover = reply[1:]
+        CDP.cdp_sock.settimeout(None)
         self.reader = threading.Thread(target=CDP.reader_thread, daemon=True)
         self.reader.start()
 
@@ -543,6 +544,9 @@ class BrowserPreparationTests(unittest.TestCase):
         self.owned_sessions.append(sid)
         self.browser.call("Runtime.enable", sid=sid)
         return sid
+
+    def test_00_established_socket_has_no_read_timeout(self):
+        self.assertIsNone(CDP.cdp_sock.gettimeout())
 
     def test_01_focus_alone_loads_a_deferred_restored_tab(self):
         tab, _, sid = self.attach_restored()
