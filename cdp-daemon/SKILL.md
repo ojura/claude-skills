@@ -104,6 +104,13 @@ exit 1
 | GET  | `/autohooked` | | recent auto-hook injections `{sid, url, result}` |
 | POST | `/shutdown` | | exits the daemon |
 
+`timeout_seconds` on `/cdp` and `/eval` limits the daemon's wait for a
+response. A timeout removes the local response waiter; it does not cancel
+the command in Chrome. A queued command can still execute later, for example
+when a busy worker yields or an unloaded tab gets a ready renderer. The daemon
+ignores the late response. Retrying a command with side effects can therefore
+perform the action twice.
+
 `/events` is a rolling buffer (last 10k) of every CDP event with no `id`
 (`Network.*`, `Runtime.*`, etc.). Enable the relevant CDP domain first via
 `/cdp` (e.g. `Network.enable` on a session), then poll `/events?since=<seq>` to
