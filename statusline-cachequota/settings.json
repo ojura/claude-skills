@@ -1,6 +1,0 @@
-{
-  "subagentStatusLine": {
-    "type": "command",
-    "command": "\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/statusline-client\" --task-metadata"
-  }
-}

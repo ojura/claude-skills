@@ -15,7 +15,7 @@ EVERY match. Pressing only the first is unreliable.
 
 Usage:
   clear_modals.py           single-shot scan (exits 0 immediately)
-  clear_modals.py --wait    poll until at least one button is pressed
+  clear_modals.py --wait    poll until a native button action call completes
                             (or 60s deadline)
 The daemon no longer subprocesses this; it imports scan_and_press /
 chrome_accessibility_health directly (in-process presser thread). The CLI
@@ -49,7 +49,7 @@ def _pump_glib(seconds=0.2):
 BUTTON_NAMES = ('Allow', 'Restore')
 
 
-def find_all(node, role_match, names, depth=0, max_depth=30, out=None):
+def find_all(node, role_match, names, depth=0, max_depth=30, out=None, query_errors=None):
     if out is None: out = []
     if node is None or depth > max_depth: return out
     try:
@@ -57,62 +57,104 @@ def find_all(node, role_match, names, depth=0, max_depth=30, out=None):
             out.append(node)
         for i in range(node.get_child_count()):
             try:
-                find_all(node.get_child_at_index(i), role_match, names, depth+1, max_depth, out)
+                find_all(node.get_child_at_index(i), role_match, names,
+                         depth+1, max_depth, out, query_errors)
             except Exception:
-                pass
+                if query_errors is not None:
+                    query_errors[0] += 1
     except Exception:
-        pass
+        if query_errors is not None:
+            query_errors[0] += 1
     return out
 
 
-def press_button(btn):
-    """Invoke 'press' action on an AT-SPI button. Returns True on success."""
+def _report(reporter, event, **metadata):
+    """Keep optional diagnostic failures from interrupting native actions."""
+    if reporter is not None:
+        try:
+            reporter(event, **metadata)
+        except Exception:
+            pass
+
+
+def press_button(btn, reporter=None, button='unknown'):
+    """Invoke 'press'; return whether a native action call completed.
+
+    Preserve the existing completed-call count. The diagnostic separately records
+    Chrome's boolean result, which can be false even when the call completes.
+    A completed call or accepted action does not establish that consent was granted.
+    """
+    action_started = False
     try:
         act = btn.get_action_iface()
         for j in range(act.get_n_actions()):
             if act.get_action_name(j) == 'press':
-                act.do_action(j)
+                _report(reporter, 'native_action_started', button=button)
+                action_started = True
+                result = act.do_action(j)
+                _report(reporter, 'native_action_finished', button=button,
+                        native_result=result if isinstance(result, bool) else None)
                 return True
-    except Exception:
-        pass
+        _report(reporter, 'press_action_unavailable', button=button)
+    except Exception as error:
+        event = 'native_action_error' if action_started else 'accessibility_query_error'
+        _report(reporter, event, button=button, error_type=type(error).__name__)
     return False
 
 
-def scan_and_press():
-    """Scan AT-SPI desktop for Chrome's Allow/Restore buttons; press all found."""
+def scan_and_press(reporter=None):
+    """Invoke Chrome's matching Allow/Restore actions; count completed calls.
+
+    Optional reports contain recognized button names and query/action outcomes,
+    not accessibility labels from other controls or page content.
+    """
     _pump_glib()
     desk = Atspi.get_desktop(0)
-    pressed = 0
+    completed = 0
+    applications = 0
+    matched = 0
+    query_errors = [0]
+
+    def report(event, **metadata):
+        if event == 'accessibility_query_error':
+            query_errors[0] += 1
+        _report(reporter, event, **metadata)
+
     for i in range(desk.get_child_count()):
         try:
             app = desk.get_child_at_index(i)
             if app and app.get_name() == 'Google Chrome':
-                buttons = find_all(app, ('push button', 'button'), BUTTON_NAMES)
+                applications += 1
+                buttons = find_all(app, ('push button', 'button'), BUTTON_NAMES,
+                                   query_errors=query_errors)
+                matched += len(buttons)
                 for btn in buttons:
-                    if press_button(btn):
-                        pressed += 1
-        except Exception:
-            pass
-    return pressed
+                    try:
+                        name = btn.get_name()
+                    except Exception as error:
+                        report('accessibility_query_error', error_type=type(error).__name__)
+                        name = None
+                    button = name if name in BUTTON_NAMES else 'unknown'
+                    report('button_matched', button=button)
+                    if press_button(btn, report, button):
+                        completed += 1
+        except Exception as error:
+            report('accessibility_query_error', error_type=type(error).__name__)
+    report('scan_finished', chrome_applications=applications,
+            matched_buttons=matched, completed_calls=completed,
+            query_errors=query_errors[0])
+    return completed
 
 
 def chrome_accessibility_health():
-    """Returns (found_chrome_app, has_renderer_a11y).
+    """Return whether Chrome and renderer-content roles are visible to AT-SPI.
 
-    Two failure modes to distinguish:
-    - No Chrome app at AT-SPI desktop at all: Chrome isn't running, or AT-SPI
-      bridge is broken.
-    - Chrome app present but `Native accessibility API support` is OFF in
-      chrome://accessibility: the browser-shell tree (toolbar, tabs, omnibox,
-      extension buttons) IS exposed (~hundreds of nodes), but the rendered
-      page content and the renderer-owned Allow dialog are NOT. The dialog
-      this script is supposed to press lives in that hidden tree, so we must
-      reject this state explicitly instead of spinning to deadline.
-
-    Discriminator: renderer-content roles. With toggle ON, the tree exposes
-    'document web', 'document frame', 'heading', 'link', etc. With toggle
-    OFF, only browser-shell roles ('push button', 'panel', 'notification',
-    'page tab', 'tool bar', 'frame') appear."""
+    Native accessibility can expose browser controls while renderer content,
+    including the consent dialog, remains unavailable. Missing renderer roles
+    can indicate disabled native accessibility or an incomplete current tree;
+    this observation does not establish the setting's value. The daemon logs
+    the observation and continues scanning.
+    """
     RENDERER_ROLES = {'document web', 'document frame', 'document',
                       'web view', 'heading', 'paragraph', 'link',
                       'text container'}
@@ -145,18 +187,13 @@ def main():
     wait_mode = '--wait' in sys.argv
     if not wait_mode:
         n = scan_and_press()
-        print(f'pressed {n}')
+        print(f'completed {n} native action call(s)')
         return
 
-    # Wait mode: keep scanning until a modal appears AND we press at least
-    # one button (Allow or Restore). Chrome adds the Allow modal asynchronously
-    # after the WS upgrade, so a single startup scan misses it; the crash
-    # "Restore pages?" prompt is up at relaunch and caught by the same scan.
-    # Health check: if after ~2s Chrome's accessibility tree is empty,
-    # bail fast with a clear diagnostic. The most common cause is the
-    # global Accessibility flag being off in chrome://accessibility;
-    # without it, AT-SPI sees a Chrome app node but no descendants, so
-    # this scanner would spin to its 60s deadline producing nothing.
+    # Wait until a matching native action call completes. Chrome adds the Allow
+    # dialog asynchronously after the upgrade request, so one startup scan can
+    # miss it. Check accessibility after two seconds to report whether Chrome
+    # and renderer-content roles are visible during this standalone invocation.
     deadline = time.time() + 60
     health_deadline = time.time() + 2
     health_checked = False
@@ -172,20 +209,18 @@ def main():
             time.sleep(0.5)
             extra = scan_and_press()
             total += extra
-            print(f'clean (round {rounds}, total {total} pressed)')
+            print(f'completed {total} native action call(s) in {rounds} round(s)')
             return
         if not health_checked and time.time() > health_deadline:
             health_checked = True
             found, has_renderer = chrome_accessibility_health()
             if not found:
-                print('ABORT: no Chrome app found via AT-SPI. Is Chrome running?')
+                print('ABORT: AT-SPI did not report Chrome. Check that Chrome is running.')
                 sys.exit(2)
             if not has_renderer:
-                print('ABORT: Chrome browser-shell is in AT-SPI but renderer-side '
-                      'accessibility is OFF. Enable "Native accessibility API support" '
-                      'at chrome://accessibility (or restart Chrome with '
-                      '--force-renderer-accessibility), then retry. The Allow dialog '
-                      'lives in the renderer-side tree and is invisible without it.')
+                print('ABORT: AT-SPI exposes Chrome controls but did not expose '
+                      'renderer content. Check "Native accessibility API support" '
+                      'at chrome://accessibility, or approve the debugging request manually.')
                 sys.exit(3)
         time.sleep(0.3)
     print(f'timeout (no Allow/Restore button found in {rounds} rounds)')

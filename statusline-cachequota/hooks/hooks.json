@@ -1,4 +1,0 @@
-{
-  "description": "Pass the terminal's selected transcript to the statusline client.",
-  "modules": ["./register.js"]
-}

@@ -5,6 +5,8 @@ on connect), exposes a local HTTP API on 127.0.0.1:7799 for CDP calls.
 Endpoints:
   GET  /targets                                → Target.getTargets
   POST /attach        {targetId}               → returns sessionId
+  POST /prepare       {sessionId, [readiness=dom], [timeout_seconds=15]} → page readiness
+  POST /release       {sessionId, [timeout_seconds=15]} → release preparation
   POST /eval          {sessionId, expression, [returnByValue=true], [awaitPromise=false], [timeout_seconds=15]}
                                                 → Runtime.evaluate
   POST /cdp           {method, [params], [sessionId], [timeout_seconds=15]}  → arbitrary CDP method
@@ -20,32 +22,35 @@ Auto-hook: pair with Target.setAutoAttach{waitForDebuggerOnStart, filter incl.
 shared_worker, flatten} on the BROWSER session. A COLD shared worker pauses at
 start (Chrome M143+); on Target.attachedToTarget the reader thread injects the
 script then runIfWaitingForDebugger to resume, so the hook lands before the
-worker's first line. Only PAUSED (waitingForDebugger) targets are injected - a
-busy worker never services eval and would stall the socket to timeout; matching
-paused targets get the script, non-matching paused ones are just resumed.
+worker's first line. Hooks run only on paused (waitingForDebugger) targets.
+Running workers can keep inspector commands pending; matching paused targets
+receive the hook, and unmatched paused targets are resumed.
 
 Start:  python3 cdp_daemon.py & disown
 Test:   curl 127.0.0.1:7799/status | jq
 
-Connection is self-complete and fails loudly: the HTTP API comes up FIRST, so
-/status is always answerable even while (re)connecting or after a failure. The
-Allow press runs IN-PROCESS: one dedicated thread (all AT-SPI stays on it)
+The HTTP server starts before connection acquisition so /status can report
+acquisition progress and failure. The Allow press runs in-process: one dedicated
+thread (all AT-SPI stays on it)
 imports clear_modals as a library and keeps scanning/pressing for the whole
 connect attempt, streaming its findings into this log. Accessibility health is
 a live diagnostic inside that loop - logged when it changes, never a reason to
 stop scanning (AT-SPI visibility is transient; a one-shot check must not latch
 the outcome). Each attempt holds exactly ONE WebSocket upgrade open for the
-whole budget - one pending upgrade = at most one Allow dialog (no spam) - and
-Chrome completes that same upgrade the instant the dialog is pressed, by the
-presser or by a human. A failed attempt parks the daemon (no timer retries)
-until POST /reconnect, which claude_web's _ensure_daemon sends automatically.
-It never exits with a bare traceback.
+acquisition budget. One pending upgrade presents at most one Allow dialog.
+Chrome completes it when consent is granted by the presser or a person.
+A failed consent attempt waits for POST /reconnect, which claude_web's
+_ensure_daemon sends when needed. Connection progress stays available in /status.
 
 clear_modals.py (alongside) stays a standalone CLI for manual/debug pressing;
 the daemon imports its scan_and_press / chrome_accessibility_health directly.
 """
 import socket, struct, json, sys, secrets, threading, time, collections, os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from page_preparation import PagePreparationError, PagePreparationManager, PagePreparationState
 
 HOST = "127.0.0.1"
 
@@ -59,8 +64,8 @@ def _discover_endpoint():
     when the file is missing.
     """
     try:
-        lines = open(os.path.expanduser(
-            "~/.config/google-chrome/DevToolsActivePort")).read().split()
+        with open(os.path.expanduser("~/.config/google-chrome/DevToolsActivePort")) as endpoint:
+            lines = endpoint.read().split()
         return int(lines[0]), lines[1]
     except Exception:
         return 43809, "/devtools/browser"
@@ -84,18 +89,18 @@ events = collections.deque(maxlen=10000)
 events_lock = threading.Lock()
 event_seq = [0]
 
-# Connection state, surfaced via /status so a failed/odd connect is always
-# observable rather than a dead process with a bare traceback.
+# /status reports acquisition progress and failure while the HTTP API stays up.
 cdp_state = "init"   # init|connecting|waiting_for_allow|connected|no_chrome|failed|disconnected
 cdp_diag = ""        # human-readable explanation of the current state
 disconnected = threading.Event()
 reconnect_now = threading.Event()
+connection_wake = threading.Event()
 
 # Auto-hook: inject a script into a target the instant it attaches PAUSED at start
 # (arm Target.setAutoAttach{waitForDebuggerOnStart} on the browser session), so a
 # worker is instrumented before its first line runs; the reader thread injects then
-# resumes. Only paused (waitingForDebugger) targets are injected: a busy worker
-# never services Runtime.evaluate and would stall the single socket to timeout.
+# resumes. Existing running workers can keep inspector calls pending, so the
+# hook uses the explicit paused-start event as its injection point.
 autohooks = []                              # [{"urlSubstr": str, "script": str}]
 autohook_lock = threading.Lock()
 autohooked = collections.deque(maxlen=80)   # recent {sid, url, result} for observability
@@ -124,8 +129,104 @@ def log(msg):
     if len(log_lines) > 500: log_lines.pop(0)
 
 
+# Keep acquisition metadata separate from page/network CDP events. Old records
+# can be evicted; sequence numbers and dropped_events make that loss explicit.
+consent_lock = threading.Lock()
+consent_events = collections.deque(maxlen=1024)
+consent_sequence = 0
+consent_attempt = 0
+consent_scan = 0
+consent_log_failures = 0
+consent_log_error_type = None
+CONSENT_EVENTS = {
+    'attempt_started', 'presser_requested', 'upgrade_request_sent', 'upgrade_finished',
+    'connection_ready', 'presser_import_started', 'presser_import_finished',
+    'presser_import_failed', 'scan_started', 'scan_finished', 'scan_failed',
+    'button_matched', 'native_action_started', 'native_action_finished',
+    'press_action_unavailable', 'native_action_error', 'accessibility_query_error',
+    'accessibility_health_started', 'accessibility_health_finished',
+    'accessibility_health_failed',
+}
+CONSENT_NUMBERS = {'scan_id', 'budget_seconds', 'duration_ms', 'chrome_applications',
+                   'matched_buttons', 'completed_calls', 'query_errors'}
+
+
+def consent_event(event, attempt_id=None, *, state=None, **metadata):
+    """Record selected metadata once; derive the human log from that record."""
+    global consent_sequence, consent_log_failures, consent_log_error_type, cdp_state, cdp_diag
+    if event not in CONSENT_EVENTS:
+        raise ValueError('Unknown consent diagnostic event')
+    fields = {}
+    for key, value in metadata.items():
+        if key in CONSENT_NUMBERS and type(value) in (int, float):
+            fields[key] = value
+        elif key in {'native_result', 'chrome_found', 'renderer_found'} and (value is None or type(value) is bool):
+            fields[key] = value
+        elif key == 'button':
+            fields[key] = value if value in ('Allow', 'Restore') else 'unknown'
+        elif key == 'outcome' and value in {'ok', 'noport', 'denied', 'timeout', 'error'}:
+            fields[key] = value
+        elif key == 'error_type' and isinstance(value, str) and value.isidentifier():
+            fields[key] = value[:80]
+    with consent_lock:
+        consent_sequence += 1
+        entry = {
+            'seq': consent_sequence, 'attempt_id': attempt_id, 'event': event,
+            'time_zagreb': datetime.now(ZoneInfo('Europe/Zagreb')).isoformat(timespec='microseconds'),
+            'monotonic_ns': time.monotonic_ns(), **fields,
+        }
+        consent_events.append(entry)
+        message = 'consent: ' + json.dumps(entry, sort_keys=True)
+        if state is not None:
+            cdp_state, cdp_diag = state, message
+    if event not in {'scan_started', 'scan_finished'} or fields.get('matched_buttons') or fields.get('query_errors'):
+        try:
+            log(message)
+        except Exception as error:
+            # The record is retained even when its text writer fails. Do not
+            # let an optional log write cancel an upgrade or native action.
+            with consent_lock:
+                consent_log_failures += 1
+                consent_log_error_type = type(error).__name__
+    return entry
+
+
+def consent_snapshot():
+    with consent_lock:
+        return {'capacity': consent_events.maxlen,
+                'text_log_failures': consent_log_failures,
+                'last_text_log_error_type': consent_log_error_type,
+                'dropped_events': consent_sequence - len(consent_events),
+                'first_seq': consent_events[0]['seq'] if consent_events else None,
+                'last_seq': consent_sequence, 'events': list(consent_events)}
+
+
+def begin_consent_attempt(budget):
+    global consent_attempt
+    with consent_lock:
+        consent_attempt += 1
+        attempt_id = consent_attempt
+    consent_event('attempt_started', attempt_id, state='connecting', budget_seconds=budget)
+    return attempt_id
+
+
+def begin_consent_scan():
+    global consent_scan
+    with consent_lock:
+        consent_scan += 1
+        attempt_id, scan_id = consent_attempt, consent_scan
+    started = time.monotonic_ns()
+    consent_event('scan_started', attempt_id, scan_id=scan_id)
+
+    def report(event, **metadata):
+        if event == 'scan_finished':
+            metadata['duration_ms'] = (time.monotonic_ns() - started) / 1_000_000
+        consent_event(event, attempt_id, scan_id=scan_id, **metadata)
+    return report
+
+
 def set_state(state, diag=""):
-    """Record connection state + a human diagnosis (surfaced via /status and logged)."""
+    """Record connection state and its explanation in /status and the log."""
     global cdp_state, cdp_diag
     cdp_state = state
     if diag:
@@ -134,52 +235,52 @@ def set_state(state, diag=""):
 
 
 # === Connect + Allow flow ===
-# In-process presser: ONE dedicated thread owns every AT-SPI call for the
-# daemon's lifetime (clear_modals imported as a library, not subprocessed, so
-# its findings land in this log). It parks on press_wanted between connect
-# attempts; while armed it scans/presses Chrome's Allow/Restore dialogs and
-# logs its diagnosis on change. Accessibility health is a live diagnostic
-# INSIDE the loop - never an up-front reason to skip pressing, because AT-SPI
-# visibility is transient (a one-shot check used to latch "not visible" here
-# and disable auto-press for the whole attempt).
+# One presser thread owns AT-SPI calls for the daemon's lifetime and parks on
+# press_wanted between attempts. While requested, it invokes matching Chrome
+# Allow/Restore actions and records scan, action and health observations.
+# AT-SPI visibility can change during acquisition, so health observations do
+# not disable later scans.
 press_wanted = threading.Event()
 presser_beat = [0.0]   # wall time of the presser's last live lap (hang detection)
 
 
 def presser_main():
+    import_started = time.monotonic_ns()
+    consent_event('presser_import_started')
     try:
         sys.path.insert(0, os.path.dirname(PRESSER))
         import clear_modals
-    except Exception as e:
-        log(f"presser: AT-SPI unavailable ({type(e).__name__}: {e}) - auto-press disabled; "
-            "click Allow manually when the dialog appears")
+    except Exception as error:
+        consent_event('presser_import_failed', error_type=type(error).__name__)
         return
-    last_diag, laps = None, 0
+    consent_event('presser_import_finished',
+                  duration_ms=(time.monotonic_ns() - import_started) / 1_000_000)
+    laps = 0
     while True:
         if not press_wanted.is_set():
-            last_diag, laps = None, 0
+            laps = 0
             press_wanted.wait()
         presser_beat[0] = time.time()
+        report = begin_consent_scan()
         try:
-            n = clear_modals.scan_and_press()
-            if n:
-                log(f"presser: pressed {n} button(s)")
-                time.sleep(0.5)   # brief lap gap; loop again for straggler dialogs
+            completed = clear_modals.scan_and_press(reporter=report)
+            if completed:
+                time.sleep(0.5)
                 continue
-            if laps % 10 == 0:    # diagnose every ~5s, log only when the diagnosis changes
-                found, renderer = clear_modals.chrome_accessibility_health()
-                diag = ("watching for the Allow dialog" if (found and renderer) else
-                        "Chrome not visible via AT-SPI right now (locked screen / a11y "
-                        "bridge asleep?) - still scanning; a manual Allow also lands"
-                        if not found else
-                        "Chrome renderer accessibility looks OFF - the dialog may be "
-                        "invisible to AT-SPI; enable chrome://accessibility or click "
-                        "Allow manually")
-                if diag != last_diag:
-                    log("presser: " + diag)
-                    last_diag = diag
-        except Exception as e:
-            log(f"presser: {type(e).__name__}: {e}")
+            if laps % 10 == 0:
+                health_started = time.monotonic_ns()
+                report('accessibility_health_started')
+                try:
+                    found, renderer = clear_modals.chrome_accessibility_health()
+                except Exception as error:
+                    report('accessibility_health_failed', error_type=type(error).__name__,
+                           duration_ms=(time.monotonic_ns() - health_started) / 1_000_000)
+                else:
+                    report('accessibility_health_finished', chrome_found=found,
+                           renderer_found=renderer,
+                           duration_ms=(time.monotonic_ns() - health_started) / 1_000_000)
+        except Exception as error:
+            report('scan_failed', error_type=type(error).__name__)
         laps += 1
         time.sleep(0.5)
 
@@ -191,9 +292,11 @@ def ws_upgrade(timeout):
       ("ok", sock, leftover_bytes)  upgraded (101)
       ("noport", errmsg)            devtools port unreachable (Chrome not up with the flag)
       ("denied", statusline)        HTTP response that wasn't 101 (e.g. 403 = not allowed yet)
-      ("timeout", msg)              no response in time (Allow dialog up, not yet clicked)
+      ("timeout", msg)              the upgrade response wait expired
       ("error", msg)
     """
+    with consent_lock:
+        attempt_id = consent_attempt or None
     try:
         s = socket.create_connection((HOST, PORT), timeout=10)
     except OSError as e:
@@ -201,6 +304,7 @@ def ws_upgrade(timeout):
     s.settimeout(timeout)
     try:
         s.sendall(_ws_req())
+        consent_event('upgrade_request_sent', attempt_id)
         buf = b""
         while b"\r\n\r\n" not in buf:
             ch = s.recv(4096)
@@ -215,7 +319,7 @@ def ws_upgrade(timeout):
         return ("denied", status)
     except socket.timeout:
         s.close()
-        return ("timeout", "no response (Allow not granted yet)")
+        return ("timeout", "The WebSocket upgrade did not answer within the acquisition wait")
     except Exception as e:
         try: s.close()
         except Exception: pass
@@ -229,25 +333,23 @@ def connect_once(budget=150):
     pending upgrade = at most one Allow dialog (the anti-spam mechanism), and
     Chrome completes that same upgrade the instant the dialog is pressed -
     whether by the in-process presser (armed for the duration) or a human
-    click. No branching on a health snapshot: the presser scans regardless
-    and reports what it actually sees through the log."""
+    click. The presser scans throughout the attempt and reports its current
+    observations through the log."""
     global cdp_sock, cdp_leftover, PORT, PATH
     PORT, PATH = _discover_endpoint()   # re-read: Chrome rewrites these on restart
-    set_state("connecting", "opening CDP...")
-    set_state("waiting_for_allow",
-              f"holding ONE CDP upgrade open (= at most one Allow dialog) for up to {budget}s; "
-              "the in-process presser is scanning for the dialog, and a manual Allow click "
-              "lands on this same upgrade. Presser diagnostics stream into the log.")
+    attempt_id = begin_consent_attempt(budget)
+    consent_event('presser_requested', attempt_id, state='waiting_for_allow', budget_seconds=budget)
     press_wanted.set()
     try:
         kind, *rest = ws_upgrade(timeout=max(5, budget))   # one held attempt = one dialog
     finally:
         press_wanted.clear()
+    consent_event('upgrade_finished', attempt_id, outcome=kind)
     if kind == "ok":
         sock, leftover = rest
         sock.settimeout(None)
         cdp_sock, cdp_leftover = sock, leftover
-        set_state("connected", "CDP connected.")
+        consent_event('connection_ready', attempt_id, state='connected')
         return True
     if kind == "noport":
         set_state("no_chrome",
@@ -264,40 +366,46 @@ def connect_once(budget=150):
 
 
 def connection_manager():
-    """Keep a live CDP socket: connect, hold until it drops, then reconnect.
+    """Connect once per attempt and finish the old reader before reconnecting.
 
-    Runs forever in a thread so the HTTP API (started first) is always up. After
-    a failed attempt it backs off and retries, so fixing accessibility / clicking
-    Allow later self-heals without a restart."""
+    A failed consent attempt waits for POST /reconnect. While Chrome is absent,
+    the manager checks its endpoint periodically without opening a WebSocket.
+    """
     while True:
         if connect_once():
-            # A /reconnect kick issued before or during this attempt is satisfied
-            # by it - clearing here stops a stale flag from tearing down the fresh
-            # socket and popping a surplus Allow dialog.
+            # A reconnect request made during this attempt is satisfied by the
+            # new connection, so it must not open another consent dialog.
             reconnect_now.clear()
             disconnected.clear()
-            threading.Thread(target=reader_thread, daemon=True).start()
-            # Block until the socket drops or a manual /reconnect is requested.
-            while not disconnected.wait(timeout=1):
-                if reconnect_now.is_set():
-                    break
+            connection_wake.clear()
+            reader = threading.Thread(target=reader_thread, daemon=True)
+            reader.start()
+            while not disconnected.is_set() and not reconnect_now.is_set():
+                connection_wake.wait()
+                connection_wake.clear()
+            if not disconnected.is_set() and cdp_sock is not None:
+                try:
+                    cdp_sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            reader.join()
             reconnect_now.clear()
         elif cdp_state == "no_chrome":
-            # Chrome not up yet: poll quietly (this pops no Allow dialog) until it
-            # appears or a /reconnect is requested.
+            # While the endpoint is absent, check availability or accept an
+            # explicit reconnect request. A refused connection cannot show a dialog.
             reconnect_now.wait(timeout=20)
             reconnect_now.clear()
         else:
             # Connect needs a human (manual Allow click / enable accessibility). Do
             # NOT retry on a timer - that is what popped repeated dialogs. Go idle and
             # wait for an explicit POST /reconnect (or /shutdown).
-            log("idle: connect needs a manual Allow; waiting for POST /reconnect (no auto-retry).")
+            log("Connection acquisition is parked; POST /reconnect starts another attempt.")
             reconnect_now.wait()
             reconnect_now.clear()
 
 
 # === WS framing ===
-def ws_send(text):
+def ws_send(text, _expected_socket=None):
     p = text.encode("utf-8")
     n = len(p)
     m = secrets.token_bytes(4)
@@ -306,7 +414,12 @@ def ws_send(text):
     elif n < 65536: hdr = struct.pack("!BBH", 0x81, 0x80 | 126, n)
     else: hdr = struct.pack("!BBQ", 0x81, 0x80 | 127, n)
     with cdp_lock:
-        cdp_sock.sendall(hdr + m + masked)
+        connection = cdp_sock
+        if _expected_socket is not None and connection is not _expected_socket:
+            raise RuntimeError("The browser debugging connection changed")
+        if connection is None:
+            raise RuntimeError("The browser debugging connection is unavailable")
+        connection.sendall(hdr + m + masked)
 
 
 def ws_recv_raw():
@@ -338,9 +451,10 @@ def ws_recv_raw():
 
 
 def _run_autohook(sid, url, script):
-    """Inject `script` into a freshly-attached target ASAP, then resume it if it
-    was paused. Runs in its own thread so the reader keeps demuxing (cdp_call
-    would otherwise deadlock the reader waiting on its own response)."""
+    """Inject before resuming a worker paused at startup.
+
+    A separate thread lets the reader deliver the CDP replies these calls await.
+    """
     res = None
     try:
         r = cdp_call("Runtime.evaluate", {"expression": script, "returnByValue": True},
@@ -357,13 +471,12 @@ def _run_autohook(sid, url, script):
 
 
 def _on_attached(params):
-    """On Target.attachedToTarget for a target PAUSED at start (waitingForDebugger=true),
-    inject any matching autohook then resume it. Targets that are already running
-    (not waiting) are ignored: injecting then is too late to beat their init AND each
-    Runtime.evaluate into a busy worker blocks for the full timeout, which - multiplied
-    across every pre-existing worker when a broad filter is armed - wedges the single
-    CDP socket. Non-matching paused targets are resumed so a browser-wide
-    waitForDebuggerOnStart does not hang unrelated workers."""
+    """Inject matching hooks into a target paused at startup, then resume it.
+
+    Running targets have already passed that injection point and can keep an
+    inspector call pending. Resume unmatched paused targets so a broad startup
+    filter does not leave unrelated workers waiting for a debugger.
+    """
     try:
         sid = params.get("sessionId")
         url = (params.get("targetInfo") or {}).get("url", "")
@@ -388,23 +501,28 @@ def _on_attached(params):
 
 
 def reader_thread():
-    """Demux CDP responses (by id) and buffer events. On socket drop, clear the
-    connection and signal the manager to reconnect instead of dying silently."""
+    """Deliver CDP replies and events, then close and report this connection.
+
+    The reader notifies the manager after closing its captured socket.
+    """
     global cdp_sock
+    reader_socket = cdp_sock
     try:
         while True:
             text = ws_recv_raw()
             if text is None:
-                log("CDP closed by server")
+                log("CDP socket reached EOF")
                 break
             if not text: continue
             obj = json.loads(text)
             mid = obj.get("id")
-            if mid is not None and mid in pending:
-                ev = pending[mid]
+            with id_lock:
+                ev = pending.get(mid) if mid is not None else None
+            if ev is not None:
                 ev.response = obj
                 ev.set()
             elif obj.get("method"):
+                notify_preparations(obj)
                 with events_lock:
                     event_seq[0] += 1
                     events.append({
@@ -421,13 +539,21 @@ def reader_thread():
     except Exception as e:
         log(f"reader err: {e}")
     finally:
+        if reader_socket is not None:
+            try:
+                reader_socket.close()
+            except OSError:
+                pass
         cdp_sock = None
+        notify_preparations({"method": "daemon.disconnected", "connection": reader_socket})
         # Fail any in-flight calls so callers get a clear error, not a hang.
-        for ev in list(pending.values()):
-            try: ev.set()
-            except Exception: pass
+        with id_lock:
+            waiters = tuple(pending.values())
+        for ev in waiters:
+            ev.set()
         set_state("disconnected", "CDP socket dropped; reconnecting.")
         disconnected.set()
+        connection_wake.set()
 
 
 class CDPError(Exception):
@@ -440,7 +566,8 @@ class CDPError(Exception):
         super().__init__(f"CDP error {error.get('code')}: {error.get('message')}")
 
 
-def cdp_call(method, params=None, sessionId=None, timeout_seconds=15):
+def cdp_call(method, params=None, sessionId=None, timeout_seconds=15,
+             _page_state=None, _expected_socket=None):
     if cdp_sock is None:
         raise RuntimeError(f"CDP not connected (state={cdp_state}): {cdp_diag or 'connecting'}")
     ev = threading.Event()
@@ -449,18 +576,48 @@ def cdp_call(method, params=None, sessionId=None, timeout_seconds=15):
         mid = next_id[0]
         next_id[0] += 1
         pending[mid] = ev
-    msg = {"id": mid, "method": method, "params": params or {}}
-    if sessionId: msg["sessionId"] = sessionId
-    ws_send(json.dumps(msg))
-    if not ev.wait(timeout_seconds):
-        pending.pop(mid, None)
-        raise TimeoutError(f"{method} timed out after {timeout_seconds}s")
-    pending.pop(mid, None)
-    if ev.response is None:
-        raise RuntimeError(f"{method} failed: CDP socket dropped mid-call (state={cdp_state})")
-    if ev.response.get("error"):  # Chrome rejected the command (vs transport failure above)
-        raise CDPError(ev.response["error"])
-    return ev.response
+    try:
+        if _page_state is not None:
+            _page_state.register(ev)
+            _page_state.check()
+        msg = {"id": mid, "method": method, "params": params or {}}
+        if sessionId:
+            msg["sessionId"] = sessionId
+        if _expected_socket is None:
+            ws_send(json.dumps(msg))
+        else:
+            ws_send(json.dumps(msg), _expected_socket=_expected_socket)
+        if not ev.wait(timeout_seconds):
+            raise TimeoutError(f"{method} timed out after {timeout_seconds}s")
+        if _page_state is not None:
+            _page_state.check()
+        if ev.response is None:
+            raise RuntimeError(f"{method} failed: CDP socket dropped mid-call (state={cdp_state})")
+        if ev.response.get("error"):
+            raise CDPError(ev.response["error"])
+        return ev.response
+    finally:
+        with id_lock:
+            pending.pop(mid, None)
+        if _page_state is not None:
+            _page_state.unregister(ev)
+
+
+page_preparation = PagePreparationManager(
+    lambda *args, **kwargs: cdp_call(*args, **kwargs),
+    lambda: cdp_sock, CDPError, clock=lambda: time.monotonic())
+
+
+def notify_preparations(event):
+    page_preparation.observe(event)
+
+
+def prepare_page(session_id, readiness="dom", timeout_seconds=15):
+    return page_preparation.prepare(session_id, readiness, timeout_seconds)
+
+
+def release_page(session_id, timeout_seconds=15):
+    return page_preparation.release(session_id, timeout_seconds)
 
 
 # === HTTP server ===
@@ -492,7 +649,10 @@ class Handler(BaseHTTPRequestHandler):
                     "next_id": next_id[0],
                     "events_buffered": len(events),
                     "event_seq": event_seq[0],
+                    "prepared_pages": page_preparation.status(),
+                    "browser_state_pages": page_preparation.bridge_status(),
                     "log_tail": log_lines[-20:],
+                    "consent_diagnostics": consent_snapshot(),
                 })
             elif u.path == "/events":
                 since = int(qs.get("since", ["0"])[0])
@@ -518,6 +678,27 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/attach":
                 r = cdp_call("Target.attachToTarget", {"targetId": body["targetId"], "flatten": True})
                 self._send(200, {"sessionId": r["result"]["sessionId"]})
+            elif self.path == "/prepare":
+                if not isinstance(body, dict):
+                    raise PagePreparationError("invalid_request", "validation",
+                                               "The request body must be an object")
+                unknown = body.keys() - {"sessionId", "readiness", "timeout_seconds"}
+                if unknown:
+                    raise PagePreparationError("invalid_request", "validation",
+                                               "Unexpected preparation fields: " + ", ".join(sorted(unknown)))
+                self._send(200, prepare_page(
+                    body.get("sessionId"), body.get("readiness", "dom"),
+                    body.get("timeout_seconds", 15)))
+            elif self.path == "/release":
+                if not isinstance(body, dict):
+                    raise PagePreparationError("invalid_request", "validation",
+                                               "The request body must be an object")
+                unknown = body.keys() - {"sessionId", "timeout_seconds"}
+                if unknown:
+                    raise PagePreparationError("invalid_request", "validation",
+                                               "Unexpected release fields: " + ", ".join(sorted(unknown)))
+                self._send(200, release_page(body.get("sessionId"),
+                                             body.get("timeout_seconds", 15)))
             elif self.path == "/eval":
                 params = {
                     "expression": body["expression"],
@@ -534,14 +715,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, r)
             elif self.path == "/reconnect":
                 reconnect_now.set()
+                connection_wake.set()
                 self._send(200, {"ok": True, "state": cdp_state})
             elif self.path == "/autohook":
-                # Register a script to inject into every target whose URL contains
-                # urlSubstr, the instant it attaches. Registering REPLACES any existing
-                # rule with the same urlSubstr (re-registering updates in place and never
-                # stacks a stale duplicate, which the already-installed hook would
-                # otherwise win via `if(globalThis.__W) return 'already'`). Distinct
-                # urlSubstrs coexist; {clear:true} wipes all rules.
+                # Each URL substring has one hook. Registering it again replaces
+                # that hook; distinct substrings coexist. clear removes all hooks.
                 with autohook_lock:
                     if body.get("clear"):
                         autohooks.clear()
@@ -555,20 +733,29 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=lambda: (time.sleep(0.1), os._exit(0))).start()
             else:
                 self._send(404, {"error": "not found"})
+        except PagePreparationError as e:
+            code = 400 if e.kind == "invalid_request" else 500
+            self._send(code, {"error": e.as_dict()})
         except CDPError as e:
             self._send(500, {"error": e.error})   # structured CDP error object preserved
         except Exception as e:
             self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
 
+def main():
+    # Binding owns the API endpoint before any Chrome acquisition can start.
+    with ThreadingHTTPServer(("127.0.0.1", DAEMON_PORT), Handler) as server:
+        api_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        api_thread.start()
+        try:
+            host, port = server.server_address[:2]
+            log(f"HTTP API on http://{host}:{port}")
+            threading.Thread(target=presser_main, daemon=True).start()
+            connection_manager()
+        finally:
+            server.shutdown()
+            api_thread.join()
+
+
 if __name__ == "__main__":
-    # HTTP API FIRST (in a thread) so /status is always answerable - even while
-    # connecting or after a connect failure. The daemon never dies silently.
-    threading.Thread(
-        target=lambda: ThreadingHTTPServer(("127.0.0.1", DAEMON_PORT), Handler).serve_forever(),
-        daemon=True).start()
-    log(f"HTTP API on http://127.0.0.1:{DAEMON_PORT}")
-    # In-process presser: parks between connect attempts, armed by connect_once.
-    threading.Thread(target=presser_main, daemon=True).start()
-    # Connection manager owns the single CDP socket and reconnects on drop.
-    connection_manager()
+    main()

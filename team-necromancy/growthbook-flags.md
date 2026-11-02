@@ -771,6 +771,50 @@ available, the chair-sermon flag is bypassed and both flag values take the same
 path closest to native user-message ordering; leaving it false avoids the
 broader tool-output merge only on fallback and mixed-content paths.
 
+## Generated `Tool loaded.` text and cached history
+
+Verified against native Claude Code 2.1.309 and 2.1.316. This decision is not
+controlled by GrowthBook. It is separate from the chair-sermon attachment merge.
+
+The 2.1.309 request normalizer adds a `Tool loaded.` text block after a group
+containing a `tool_reference` result. The text need not exist in the saved user
+conversation: it is generated while preparing the API request.
+
+In 2.1.316, the normalizer computes removal as mid-conversation-system support
+AND the absence of the model capability `tool_loaded_text`. On that path it
+removes matching text, including text already present in its normalization
+input. Otherwise it preserves or adds the block. Thus a client upgrade can
+change an early item of an already-sent conversation even with unchanged
+retained messages, model, effort and system/tools shape hash.
+
+The relevant 2.1.316 sources are the main normalizer `AT` in module 535
+(`L = w && !Wss(r)` and the `oxs` removal branch), model helpers `rne`, `d$` and
+`Wss` in module 170, and capability lookup `yS`/`Dfs` in module 48. `Wss` reads
+`tool_loaded_text`; the model-catalog lookup and explicit capability override
+are used, not a GrowthBook read. `d$` uses HIPAA policy, the force environment
+variable, model metadata and `mid_conv_system`, with a true fallback for models
+that pass its exclusions. These names are scoped to these releases/modules.
+
+`CLAUDE_CODE_MODEL_CAPABILITIES` supports the explicit model-scoped override
+`gpt-6.1-sol=tool_loaded_text`. Its semicolon-separated model rules can coexist
+with an unrelated global negative such as `-quizzical_shore`. The extracted
+native branch and parser tests confirm that this retains the old generated
+text without changing that negative override or other models.
+
+Do not treat that override as an automatic global repair. Enabling it also adds
+text to histories already sent without it; changing the mode can cause another
+early prefix rewrite. It is a current-request normalization choice, not a
+per-message record of how older requests were serialized. Do not change
+GrowthBook values to address this specific decision.
+
+CLIProxyAPI commit `4956f2748499f91e79dc3a47a57a8be7caf2609c` preserves the concrete
+200-hour resumption investigation and ten extracted-native regression cases at
+`docs/investigations/2026-11-01-e51176b4-cache-resumption.md` and
+`scripts/check-native-tool-loaded-history.py`. It proves that removal of one
+such text block changed source message 5 and deleted upstream item 16. Other
+local changes in that pair prevent isolating the cache cost of this deletion
+or using the miss to establish a retention limit.
+
 ## Task tools: `tengu_rosy_wren`
 
 Traced in 2.1.234. Both the flag and its env override are new in that build:
