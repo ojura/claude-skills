@@ -53,7 +53,7 @@ import traceback
 import types
 import unicodedata
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -959,6 +959,21 @@ class SocketLiveness:
 
 
 @dataclasses.dataclass(frozen=True)
+class LaunchCommand(Sequence):
+    """The selected native argv, wrapper argv and read-only configuration observation."""
+    fact: Mapping = dataclasses.field(repr=False)
+
+    def __len__(self):
+        return len(self.fact["argv"])
+
+    def __getitem__(self, index):
+        return self.fact["argv"][index]
+
+    def __iter__(self):
+        return iter(self.fact["argv"])
+
+
+@dataclasses.dataclass(frozen=True)
 class LaunchDestination:
     """A tmux server and optional pane reference chosen before launch."""
 
@@ -1789,6 +1804,8 @@ def wrap_command(command, label, hang, paste=False, width=None):
     restores the exact string: reflowed, never reworded.
     """
     width = width or term_width()
+    if isinstance(command, LaunchCommand):
+        command = command.fact["manual"]
     if isinstance(command, (list, tuple)):
         tokens = [shlex.quote(c) for c in command]
     else:
@@ -3071,13 +3088,37 @@ class Resolver:
             "objection": objection,
         })
 
+    @staticmethod
+    def _new_process_environment(values, *, direct=False):
+        """Node IPC descriptor numbers cannot be copied from another process.
+
+        A direct exec can retain the invoking process's own open, inheritable
+        channel. A new tmux pane has a different descriptor table.
+        """
+        prepared = dict(values)
+        for name in ("NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE"):
+            prepared.pop(name, None)
+        raw = os.environ.get("NODE_CHANNEL_FD", "")
+        if direct and raw.isascii() and raw.isdecimal():
+            try:
+                fd = int(raw)
+                mode = os.fstat(fd).st_mode
+                valid = os.get_inheritable(fd) and (statlib.S_ISSOCK(mode) or statlib.S_ISFIFO(mode))
+            except (OSError, OverflowError, ValueError):
+                valid = False
+            if valid:
+                prepared["NODE_CHANNEL_FD"] = raw
+                if "NODE_CHANNEL_SERIALIZATION_MODE" in os.environ:
+                    prepared["NODE_CHANNEL_SERIALIZATION_MODE"] = os.environ["NODE_CHANNEL_SERIALIZATION_MODE"]
+        return prepared
+
     def _launch_environment_fact(self, lead, snapshot, caller_env=False):
         """Prepare one retained source environment for an agent launch."""
         retained = self._environment_source(lead, snapshot, caller_env=caller_env)
         selected = retained["process"]
         source = retained["source"]
         source_values = retained["source_values"]
-        values = dict(source_values)
+        values = self._new_process_environment(source_values)
         terminal_names = frozenset({"TMUX", "TMUX_PANE", "TERM", "PWD"})
         # A new server and its panes must not claim the source's terminal.
         for name in ("TMUX", "TMUX_PANE"):
@@ -3086,7 +3127,7 @@ class Resolver:
         if removed_poison:
             values.pop("ANTHROPIC_BASE_URL", None)
         values.update(pair.split("=", 1) for pair in TEAM_ENV)
-        direct = dict(values)
+        direct = self._new_process_environment(values, direct=True)
         # A --here exec stays in the invoking terminal, not the lead's terminal.
         for name in ("TMUX", "TMUX_PANE", "TERM"):
             if name in os.environ:
@@ -3111,7 +3152,7 @@ class Resolver:
             return immutable({"objection": f"pid {pid} is not a readable Claude process"})
         source = self._environment_source(
             {"pid": pid, "alive": True, "records": (selected,)}, snapshot)
-        values = dict(source["source_values"])
+        values = self._new_process_environment(source["source_values"], direct=True)
         inherited_markers = tuple(name for name in self._SHELL_LAUNCH_MARKERS if name in values)
         objection = source["objection"]
         if inherited_markers:
@@ -4713,11 +4754,12 @@ class Resolver:
                 stat.st_mtime_ns)
 
     @classmethod
-    def _file_observation(cls, path):
+    def _file_observation(cls, path, *, opener=None):
         """Read bytes and mode together; preserve the existing OSError-as-absence rule."""
         path = Path(path)
         try:
-            with path.open("rb") as handle:
+            stream = path.open("rb") if opener is None else open(path, "rb", opener=opener)
+            with stream as handle:
                 raw = handle.read()
                 stat = os.fstat(handle.fileno())
             current = path.stat()
@@ -6463,6 +6505,8 @@ class Resolver:
         """Direct option values from exact `/proc/<pid>/cmdline` arguments."""
         options = {}
         for index, token in enumerate(argv):
+            if token == "--":
+                break
             if not token.startswith("--"):
                 continue
             if "=" in token:
@@ -7373,9 +7417,122 @@ class Resolver:
                 server, action, target, wanted_present),
         })
 
-    def revalidate_launch(self, launch):
+    @staticmethod
+    def _wrapper_opener(filename, flags):
+        descriptor = os.open(filename, flags | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            if not statlib.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError(errno.EINVAL, "not a regular settings file")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def _wrapper_query(self, environment, command, cwd):
+        """Read the installed wrapper reader's answer without running the configured wrapper."""
+        tool = shutil.which("cc-env")
+        installed = Path.home() / ".local" / "bin" / "cc-env"
+        if tool is None and installed.is_file():
+            tool = str(installed)
+        program = Path(tool).resolve().with_name("cc-env-launcher") if tool else None
+        if program is not None and program.is_file() and os.access(program, os.X_OK):
+            try:
+                answer = subprocess.run(
+                    [str(program), "prefix"],
+                    input=json.dumps({"environment": dict(environment), "command": list(command), "cwd": str(cwd)}),
+                    capture_output=True, text=True, timeout=4)
+                selected = json.loads(answer.stdout)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                return {"error": "cc-env could not read the process-wrapper configuration"}
+            if not isinstance(selected, dict):
+                return {"error": "cc-env returned an invalid process-wrapper observation"}
+            if isinstance(selected.get("error"), str):
+                return {"error": "processWrapper: " + selected["error"]}
+            prefix = selected.get("argv")
+            if answer.returncode or not isinstance(prefix, list) or not all(isinstance(word, str) for word in prefix) or \
+                    not isinstance(selected.get("observed"), list) or "executable" not in selected:
+                return {"error": "cc-env returned an incomplete process-wrapper observation"}
+            return {"program": str(program), "generation": self._path_generation(program), "selected": selected}
+        # Without cc-env, ordinary unwrapped launches remain available only when the trusted sources
+        # establish that a wrapper is not configured. A configured or unreadable value needs the reader.
+        if environment.get("CLAUDE_CODE_PROCESS_WRAPPER"):
+            return {"error": f"processWrapper is configured; update cc-env so {TOOL} can read it before launching"}
+        home = environment.get("HOME") or str(Path.home())
+        directory = Path(environment.get("CLAUDE_CONFIG_DIR") or str(Path(home) / ".claude"))
+        if not directory.is_absolute():
+            directory = Path(cwd) / directory
+        options = self._argv_options(command)
+        files = [directory / "remote-settings.json", Path("/etc/claude-code/managed-settings.json")]
+        sources = options.get("--setting-sources")
+        if sources is None or "user" in sources.split(","):
+            files.append(directory / "settings.json")
+        drop_ins = Path("/etc/claude-code/managed-settings.d")
+        try:
+            files.extend(sorted(file for file in drop_ins.glob("*.json") if not file.name.startswith(".")))
+        except OSError:
+            return {"error": "the managed settings could not be read; update cc-env before launching"}
+        inline = []
+        for name in ("--settings", "--managed-settings"):
+            value = options.get(name)
+            if value is None:
+                continue
+            if value.strip().startswith("{"):
+                inline.append(value)
+            elif name == "--settings":
+                files.append(Path(cwd) / value)
+            else:
+                return {"error": "the managed settings argument could not be read; update cc-env before launching"}
+        observed = []
+        documents = []
+        for file in files:
+            observation = self._file_observation(file, opener=self._wrapper_opener)
+            observed.append((str(file), observation.generation))
+            if observation.raw is None:
+                try:
+                    file.lstat()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    pass
+                return {"error": "a launcher settings source could not be read; update cc-env before launching"}
+            if observation.generation[0] == "changed-during-read":
+                return {"error": "a launcher settings source changed while it was being read"}
+            documents.append(observation.raw)
+        documents.extend(inline)
+        try:
+            for raw in documents:
+                document = json.loads(raw)
+                if not isinstance(document, dict) or document.get("processWrapper") not in (None, ""):
+                    return {"error": f"processWrapper may be configured; update cc-env so {TOOL} can honor it"}
+        except (ValueError, UnicodeError):
+            return {"error": "a launcher settings source is not readable JSON; update cc-env before launching"}
+        return {"program": None, "generation": None,
+                "selected": {"argv": (), "source": None, "observed": tuple(observed), "executable": None}}
+
+    def command_plan(self, launch, command):
+        """Select a wrapper for the complete native command in the retained launch environment."""
+        native = tuple(command)
+        cwd = launch["cwd"] or os.getcwd()
+        query = self._wrapper_query(launch["process"]["environment"]["values"], native, cwd)
+        objection = query.get("error")
+        prefix = tuple(query.get("selected", {}).get("argv", ()))
+        argv = prefix + native if objection is None else ()
+        manual = (query["program"], "wrap", "--", *native) if prefix and query.get("program") else native
+        display = shlex.join(native) + (f" [wrapper: {shlex.quote(prefix[0])}]" if prefix else "")
+        return LaunchCommand(immutable({"native": native, "argv": argv, "prefix": prefix, "query": query,
+                                        "manual": manual, "display": display, "objection": objection}))
+
+    def revalidate_command(self, launch, command):
+        if not isinstance(command, LaunchCommand):
+            return immutable({"matches": True, "changed": ()})
+        fact = command.fact
+        current = immutable(self._wrapper_query(launch["process"]["environment"]["values"], fact["native"], launch["cwd"] or os.getcwd()))
+        matches = current == fact["query"] and fact["objection"] is None
+        return immutable({"matches": matches, "changed": () if matches else ("process-wrapper configuration",)})
+
+    def revalidate_launch(self, launch, *, command=None):
         """Compare retained runtime, transcript, and tmux launch generations."""
-        changed = []
+        changed = list(self.revalidate_command(launch, command)["changed"])
         selected_action = launch.get("launch_action")
         current_action = self._tmux_launch_action(launch.get("destination"))
         action_matches = bool(
@@ -13065,7 +13222,8 @@ def launch(plan, cwd, command, dry, replace_pane=None, *, environment):
     if cwd:
         argv += ["-c", cwd]
     rendered = (f"tmux -S {shlex.quote(str(server['path']))} {shlex.join(argv)} "
-                f"[environment: {environment['description']}] {shlex.join(command)}")
+                f"[environment: {environment['description']}] "
+                + (command.fact["display"] if isinstance(command, LaunchCommand) else shlex.join(command)))
     if dry:
         step(True, wrap_command(rendered, "  would run: ", "    "), "", indent="")
         return None, action
@@ -13528,6 +13686,9 @@ def become_agent(ctx, command, prefix, undo=None):
     for retry.
     """
     agent_id = ctx["identity"]["agentId"]
+    current = RESOLVER.revalidate_command(ctx, command)
+    if not current["matches"]:
+        exec_failed(undo, agent_id, command, OSError("the process-wrapper configuration changed before exec"))
     environment = ctx["process"]["environment"]
     if environment["objection"]:
         exec_failed(undo, agent_id, command, OSError(environment["objection"]))
@@ -13541,7 +13702,7 @@ def become_agent(ctx, command, prefix, undo=None):
         raise
     environ["PWD"] = os.getcwd()
     try:
-        os.execvpe(command[0], command, environ)
+        os.execvpe(command[0], list(command), environ)
     except OSError as exc:
         exec_failed(undo, agent_id, command, exc)
 
@@ -13554,7 +13715,8 @@ def env_prefixed(command):
     """
     scrub = (["-u", "ANTHROPIC_BASE_URL"]
              if base_url_is_poison(os.environ.get("ANTHROPIC_BASE_URL")) else [])
-    return ["env", *scrub, *TEAM_ENV, *command]
+    selected = command.fact["manual"] if isinstance(command, LaunchCommand) else command
+    return ["env", *scrub, *TEAM_ENV, *selected]
 
 
 def claude_binary(args):
@@ -13612,6 +13774,13 @@ def build_command(ctx, args, passthrough):
             cmd += ["--permission-mode", mode]
 
     return cmd + passthrough
+
+
+def planned_command(ctx, args, passthrough):
+    command = RESOLVER.command_plan(ctx, build_command(ctx, args, passthrough))
+    if command.fact["objection"]:
+        die(command.fact["objection"])
+    return command
 
 
 # How wide the value column may grow before a long value is allowed to push
@@ -13980,13 +14149,16 @@ def report_launch(ctx, command, prefix="", extra=(), restore=None):
     # having one: when a conversation's window start carries stamps, the
     # harness adopts them on the way up, and a reader who typed --bare has
     # every reason to expect otherwise.
-    if "--agent-id" not in command:
+    native = command.fact["native"] if isinstance(command, LaunchCommand) else command
+    if "--agent-id" not in native:
         said = "the command does not pass a team, name, model or effort"
         if restore and restore["state"] == "restored":
             said += (f"; the harness still brings it back as {restore['team']}, "
                      "from its own stamps")
         print(fill(f"{prefix}identity {said}"))
-    print(wrap_command(command, f"{prefix}command  ", f"{prefix}{'':11}", paste=True))
+    if isinstance(command, LaunchCommand) and command.fact["prefix"]:
+        print(fill(f"{prefix}wrapper  {command.fact['prefix'][0]}"))
+    print(wrap_command(native, f"{prefix}command  ", f"{prefix}{'':11}", paste=True))
     # The facts end here and the doing starts. Without the gap the two run
     # together as one wall, and the report is long enough that a reader needs
     # to be told where to stop reading facts.
@@ -14257,7 +14429,7 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
             taking_over = migration["taking_over"]
         if args.explain:
             explain(ctx)
-        command = build_command(ctx, args, passthrough)
+        command = planned_command(ctx, args, passthrough)
         # A lead is the socket's namesake: a swarm server is named after the
         # lead's pid, and members resolve theirs by asking who their lead is.
         # So where its crew already sits is a launch fact for the lead too.
@@ -14358,7 +14530,7 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
         # A member given this terminal takes the lead's route: exec, so the
         # process becomes the agent. A seat is not resolved because it is not
         # used, and the rest of the run does not happen.
-        command = build_command(ctx, args, passthrough)
+        command = planned_command(ctx, args, passthrough)
         cwd = ctx["cwd"]
         seat = [("runs", terminal_note(ctx["terminal"])),
                 ("cwd", cwd or "(inherit)")]
@@ -14386,7 +14558,7 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
     want_pane, pane_said = destination.pane, roster_pane_note(pane_reference)
     cwd = ctx["cwd"]
 
-    command = build_command(ctx, args, passthrough)
+    command = planned_command(ctx, args, passthrough)
 
     seat = [("socket", f"{socket}  [{how}] "
                         f"({ctx['socket_states'].get(socket, 'unresolved')})"),
@@ -14485,7 +14657,7 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
     # Validate every retained launch fact before the roster claim and again
     # immediately before tmux. The report names exactly what changed.
     if not args.dry_run:
-        checked = RESOLVER.revalidate_launch(ctx)
+        checked = RESOLVER.revalidate_launch(ctx, command=command)
         if not checked["matches"]:
             die("the selected launch facts changed before the roster claim ("
                 + ", ".join(checked["changed"])
@@ -14493,7 +14665,7 @@ def run_one(args, passthrough, table, prefix="", pending=(), terminal=None):
     claimed = reserve_membership(ctx, args)
     try:
         if not args.dry_run:
-            checked = RESOLVER.revalidate_launch(ctx)
+            checked = RESOLVER.revalidate_launch(ctx, command=command)
             if not checked["matches"]:
                 release_membership(claimed, args)
                 die("the selected launch facts changed before launch ("
@@ -18389,6 +18561,8 @@ PUBLIC_RESOLVER_QUESTIONS = {
     "revalidate_cleanup": ("run_cleanup",),
     "revalidate_cleanup_cut": ("remove_cleanup_action",),
     "revalidate_conversion": ("embed", "materialize"),
+    "command_plan": ("planned_command",),
+    "revalidate_command": ("become_agent",),
     "revalidate_environment_command": ("run_env_of",),
     "revalidate_launch": ("run_one",),
     "revalidate_lead_migration": ("lead_rebind",),
@@ -27846,6 +28020,10 @@ class _FakeTmux:
         self.attached_at = None
         self.env, self.ran, self.fail = {}, [], set()
         self.process_environments = {}
+        self.wrapper = ()
+        self.wrapper_generation = 1
+        self.wrapper_error = None
+        self.wrapper_queries = []
         self.environment_channels, self.environment_packets = {}, []
         self.next_pane = 1 + max([int(p["pane"][1:]) for p in self.panes] or [-1])
         self.next_pid = 1 + max([int(p["pid"]) for p in self.panes] or [PID_CEILING + 4241])
@@ -27957,6 +28135,14 @@ class _FakeTmux:
         name = socket.name if isinstance(socket, Path) else socket
         return self.sockets.get(name, SocketLiveness("absent"))
 
+    def wrapper_query(self, environment, command, cwd):
+        self.wrapper_queries.append((dict(environment), tuple(command), cwd))
+        if self.wrapper_error is not None:
+            return {"error": self.wrapper_error}
+        return {"program": "/synthetic/cc-env-launcher", "generation": self.wrapper_generation,
+                "selected": {"argv": tuple(self.wrapper), "source": "synthetic settings" if self.wrapper else None,
+                             "observed": (), "executable": None}}
+
     # The engine's inputs that read processes: the process table, the session
     # registry and the readers that answer for one process.
     PROCESS_INPUTS = ("_process_table", "_session_registry", "_process_start_ms",
@@ -27965,7 +28151,7 @@ class _FakeTmux:
     # What attach replaces on the engine, named once so the restore below
     # cannot fall behind it: adding an input here and forgetting to put it
     # back is exactly the leak this pair exists to prevent.
-    ENGINE_INPUTS = PROCESS_INPUTS + ("_swarm_sockets", "_socket_alive", "_now", "_wait")
+    ENGINE_INPUTS = PROCESS_INPUTS + ("_swarm_sockets", "_socket_alive", "_now", "_wait", "_wrapper_query")
 
     def attach(self, engine):
         """Give a Resolver this fixture's process, session, socket and clock inputs.
@@ -28007,6 +28193,7 @@ class _FakeTmux:
         engine._socket_alive = self.socket_liveness
         engine._now = self.now
         engine._wait = self.wait
+        engine._wrapper_query = self.wrapper_query
         if self.attached_at is None:
             self.attached_at = int(time.time() * 1000)
         return engine
@@ -52367,6 +52554,152 @@ def _check_check_description_matches_registry(s):
              f"(check(), register() or append()), {len(unreached)} registered ids without a "
              "literal row")
     return checked
+
+
+@unit(('pane-does-not-copy-source-ipc', "a new pane does not receive another process's Node IPC descriptors"),
+      ('direct-exec-retains-own-ipc', 'a direct exec retains its own valid IPC descriptor and serialization mode'),
+      ('stale-caller-ipc-is-not-reused', 'a non-inheritable caller descriptor is not mistaken for an IPC channel'))
+def _check_source_ipc_environment(s):
+    source = {"HOME": "/synthetic/home", "KEEP": "source", "NODE_CHANNEL_FD": "99999",
+              "NODE_CHANNEL_SERIALIZATION_MODE": "advanced"}
+    left, right = socketlib.socketpair()
+    saved = {name: os.environ.get(name) for name in ("NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE")}
+    number = left.fileno()
+    try:
+        left.set_inheritable(True)
+        os.environ["NODE_CHANNEL_FD"] = str(number)
+        os.environ["NODE_CHANNEL_SERIALIZATION_MODE"] = "json"
+        pane = Resolver._new_process_environment(source)
+        direct = Resolver._new_process_environment(source, direct=True)
+        left.set_inheritable(False)
+        stale = Resolver._new_process_environment(source, direct=True)
+        os.environ["NODE_CHANNEL_FD"] = "9" * 5000
+        invalid = Resolver._new_process_environment(source, direct=True)
+    finally:
+        left.close()
+        right.close()
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    names = {"NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE"}
+    return [
+        ("pane-does-not-copy-source-ipc", "a new pane does not receive another process's Node IPC descriptors",
+         names.isdisjoint(pane) and pane["KEEP"] == "source", ""),
+        ("direct-exec-retains-own-ipc", "a direct exec retains its own valid IPC descriptor and serialization mode",
+         direct.get("NODE_CHANNEL_FD") == str(number) and direct.get("NODE_CHANNEL_SERIALIZATION_MODE") == "json", ""),
+        ("stale-caller-ipc-is-not-reused", "a non-inheritable caller descriptor is not mistaken for an IPC channel",
+         names.isdisjoint(stale) and names.isdisjoint(invalid), ""),
+    ]
+
+
+@unit(('wrapper-settings-read-is-single-and-regular', 'wrapper settings use one retained regular-file read and reject a pipe'))
+def _check_wrapper_file_observation(s):
+    with tempfile.TemporaryDirectory(prefix=own("wrapper-settings")) as directory:
+        regular = Path(directory) / "settings.json"
+        regular.write_bytes(b'{"processWrapper":""}')
+        pipe = Path(directory) / "pipe.json"
+        os.mkfifo(pipe)
+        opened = []
+
+        def opener(filename, flags):
+            opened.append(filename)
+            return Resolver._wrapper_opener(filename, flags)
+
+        observed = Resolver._file_observation(regular, opener=opener)
+        started = time.monotonic()
+        refused = Resolver._file_observation(pipe, opener=opener)
+        bounded = time.monotonic() - started < 0.5
+        correct = (observed.raw == b'{"processWrapper":""}' and refused.raw is None
+                   and opened == [str(regular), str(pipe)] and bounded)
+    return [("wrapper-settings-read-is-single-and-regular",
+             "wrapper settings use one retained regular-file read and reject a pipe", correct, "")]
+
+
+@unit(('wrapper-command-is-selected-once', 'the selected process wrapper precedes the exact native argv'),
+      ('wrapper-query-uses-selected-environment', 'wrapper resolution reads the retained source environment and target cwd'),
+      ('wrapper-command-is-revalidated', 'a changed wrapper observation prevents execution of the old selection'),
+      ('wrapper-error-prevents-unwrapped-launch', 'a wrapper error refuses before an unwrapped command can run'),
+      ('wrapper-report-keeps-private-arguments', 'launch reports and manual commands do not disclose configured wrapper arguments'),
+      ('every-launch-route-selects-wrapper', 'lead, here and tmux routes all request the complete command plan'),
+      ('wrapper-options-stop-at-literal-arguments', 'literal arguments cannot select launcher settings'),
+      ('wrapper-exec-uses-platform-argv', 'foreground exec receives a tuple or list with the selected wrapper argv'))
+def _check_process_wrapper_command(s):
+    world = _FakeTmux()
+    world.wrapper = ("/synthetic/wrapper", "SYNTHETIC-SECRET")
+    engine = world.attach(Resolver())
+    source = {"HOME": "/synthetic/home", "PATH": "/synthetic/bin", "MARKER": "selected lead"}
+    engine._environment_source = lambda lead, snapshot, caller_env=False: immutable({
+        "process": None, "generation": None, "source_values": source,
+        "source": "synthetic lead", "objection": None})
+    environment = engine._launch_environment_fact(None, {})
+    ctx = fixture_target("wrapper-test", cwd="/synthetic/work", process={"environment": environment})
+    native = ("/synthetic/claude", "--resume", "wrapper-test", "--agent-name", "worker")
+    command = engine.command_plan(ctx, native)
+    same = engine.revalidate_command(ctx, command)
+    world.wrapper_generation += 1
+    changed = engine.revalidate_command(ctx, command)
+    world.wrapper_generation -= 1
+    display = io.StringIO()
+    with capturing("out", into=display), capturing("err", into=display):
+        report_launch(ctx, command)
+        print(wrap_command(env_prefixed(command), "", "", paste=True))
+        server = {"path": Path("/synthetic/tmux"), "liveness": SocketLiveness("absent"),
+                  "session_live": False, "base_url": None}
+        launch(immutable({"destination": LaunchDestination("synthetic-wrapper"), "server": server, "action": "new-session"}),
+               ctx["cwd"], command, True, environment=environment)
+    refused = False
+    old_engine, old_builder = globals()["RESOLVER"], globals()["build_command"]
+    old_exec, old_cwd = os.execvpe, globals()["enter_agent_cwd"]
+    accepted = []
+    try:
+        globals()["RESOLVER"] = engine
+        globals()["build_command"] = lambda *_args: list(native)
+        globals()["enter_agent_cwd"] = lambda *_args: None
+
+        def exec_checked(program, arguments, environment):
+            accepted.append(isinstance(arguments, (tuple, list)) and tuple(arguments) == tuple(command))
+            raise OSError(errno.ENOENT, "synthetic exec stopped")
+
+        os.execvpe = exec_checked
+        with capturing("out"), capturing("err"):
+            try:
+                become_agent(ctx, command, "")
+            except Refusal:
+                pass
+        world.wrapper_error = "synthetic wrapper configuration is unavailable"
+        with capturing("out"), capturing("err"):
+            try:
+                planned_command(ctx, None, [])
+            except Refusal:
+                refused = True
+    finally:
+        globals()["RESOLVER"], globals()["build_command"] = old_engine, old_builder
+        os.execvpe, globals()["enter_agent_cwd"] = old_exec, old_cwd
+    import ast
+    run = next(node for node in s.tree.body if isinstance(node, ast.FunctionDef) and node.name == "run_one")
+    calls = [node.func.id for node in ast.walk(run) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
+    observed = world.wrapper_queries[0]
+    rendered = display.getvalue()
+    return [
+        ("wrapper-command-is-selected-once", "the selected process wrapper precedes the exact native argv",
+         tuple(command) == world.wrapper + native and command.fact["native"] == native, ""),
+        ("wrapper-query-uses-selected-environment", "wrapper resolution reads the retained source environment and target cwd",
+         observed == (dict(environment["values"]), native, "/synthetic/work"), ""),
+        ("wrapper-command-is-revalidated", "a changed wrapper observation prevents execution of the old selection",
+         same["matches"] and not changed["matches"], ""),
+        ("wrapper-error-prevents-unwrapped-launch", "a wrapper error refuses before an unwrapped command can run",
+         refused, ""),
+        ("wrapper-report-keeps-private-arguments", "launch reports and manual commands do not disclose configured wrapper arguments",
+         "SYNTHETIC-SECRET" not in rendered and "/synthetic/wrapper" in rendered and "wrap --" in rendered, ""),
+        ("every-launch-route-selects-wrapper", "lead, here and tmux routes all request the complete command plan",
+         calls.count("planned_command") == 3 and "build_command" not in calls, ""),
+        ("wrapper-options-stop-at-literal-arguments", "literal arguments cannot select launcher settings",
+         engine._argv_options(("claude", "--", "--settings", "ignored")) == {}, ""),
+        ("wrapper-exec-uses-platform-argv", "foreground exec receives a tuple or list with the selected wrapper argv",
+         accepted == [True], ""),
+    ]
 
 
 def selftest_catalog(live=False, jobs=1):

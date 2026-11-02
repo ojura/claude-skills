@@ -1,6 +1,10 @@
 """Check that launch-environment regressions fail the tests that describe them."""
 
-import probe
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import probe  # noqa: E402
 
 
 CASES = [

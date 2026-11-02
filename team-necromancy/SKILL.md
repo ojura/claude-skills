@@ -41,6 +41,20 @@ gets the selected environment, even on an existing server with different values.
 Its `TMUX`, `TMUX_PANE`, `TERM` and working directory describe the new pane. The
 other panes keep their existing environments.
 
+Node IPC descriptor variables belong to one process's descriptor table. A new
+pane omits the source process's `NODE_CHANNEL_FD` and serialization mode.
+`--here` and `--env-of` retain the invoking process's own open, inheritable
+channel when it has one.
+
+Resolver also selects `processWrapper` for the complete resumed command. It asks
+the installed cc-env launcher reader for the prefix under the selected environment
+and target working directory, then checks the same configuration and executable
+observations before launch. A configured but unusable or unreadable wrapper
+refuses the launch instead of running Claude unwrapped. The native argv stays
+unchanged after the prefix. Reports show the wrapper program and omit its configured arguments. The reader is found beside the installed
+`cc-env` command; update cc-env to use a configured wrapper when that reader is
+unavailable. An unconfigured launch remains usable without it.
+
 For a stopped lead, `--caller-env` explicitly keeps the invoking command's
 environment instead of taking it from a Claude ancestor. Use this when a wrapper
 has deliberately supplied routing or other variables for the resumed member:

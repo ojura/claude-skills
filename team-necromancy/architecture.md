@@ -996,8 +996,9 @@ launch binds a Unix socket in a private temporary directory and runs a Python
 exec helper directly in the pane, without a shell. The helper receives the
 selected values over that socket, adds the new pane's terminal variables, and
 acknowledges receipt before exec. The sender then closes and removes the socket.
-This avoids tmux's command-message size limit and keeps environment values out of
-files, command arguments and launch reports. Replacing the pane's environment
+This avoids tmux's command-message size limit. The selected environment map is
+sent over the private socket instead of being written to a file or command
+arguments; launch reports show its source and variable count. Replacing the pane's environment
 removes stale server variables and preserves explicit absences without changing
 other panes. The helper sets `PWD` from the actual working directory.
 
@@ -1005,6 +1006,28 @@ other panes. The helper sets `PWD` from the actual working directory.
 source reader and generation checks to `--env-of`. That mode runs arbitrary
 commands without adding team variables. The crash-resume shell helper delegates
 to it instead of reading procfs or interpreting source markers itself.
+
+Node IPC variables describe a descriptor table. `_new_process_environment` removes
+the source process's channel variables for a new pane. A direct exec preserves the
+invoking process's own channel only while its descriptor is open, inheritable and
+a pipe or socket. This keeps a source descriptor number from referring to an
+unrelated object in the resumed process.
+
+`command_plan` returns a frozen `LaunchCommand` containing the exact native argv,
+the selected prefix, the complete exec argv and the wrapper reader's observations.
+All three launch routes use `planned_command`. Wrapper selection is a read-only
+query to cc-env's shared implementation of native settings precedence and argv
+parsing. Without that reader, Resolver permits an unwrapped launch only when its
+trusted settings observations establish that a wrapper is absent. Unreadable or
+configured values require the reader. `revalidate_command` compares a fresh query
+with the retained answer; tmux revalidation includes it, and foreground exec checks
+it again. Executors use the selected argv and do not resolve the wrapper.
+
+Reports print the native command and wrapper program separately. Dry-run tmux
+output uses the selected public description. A manual command uses the reader's
+`wrap` mode, which resolves the configured prefix in that terminal without
+printing private wrapper arguments. Like other manually pasted commands, it uses
+that terminal's environment.
 
 A `Seat` is an observed pair of socket and pane. A `LaunchDestination` is a
 selected socket and optional pane reference. They are deliberately distinct: a
