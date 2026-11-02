@@ -65,6 +65,48 @@ instance with `POST /shutdown` and relaunch it. The process keeps executing its
 loaded code until restarted. Shutdown also works during connection acquisition.
 Keep `clear_modals.py` beside the daemon, as its presser imports that file.
 
+Coordinate browser clients before a planned reset, then check `pending=0` and
+`prepared_pages=[]` immediately before shutdown. These fields describe current
+response waits and managed registrations. They do not identify idle clients or
+raw sessions that independently enabled focus. A client process exiting does not
+detach sessions it created through the daemon: Chrome's WebSocket belongs to the
+daemon. Resetting that connection detaches its sessions, including legacy focus
+owners. Other clients must attach fresh sessions afterward. Debuggers using
+separate Chrome connections retain their sessions and require separate
+coordination.
+
+### Consent diagnostics
+
+`/status.consent_diagnostics` records acquisition attempts, presser import,
+scan start/completion, recognized Allow/Restore matches, native action calls,
+accessibility observations and WebSocket upgrade completion. Each event has a
+sequence number, a Zagreb wall-clock timestamp and `monotonic_ns`. Scan and action
+reports retain the attempt and scan IDs captured when that scan began, including
+when they finish after another acquisition starts.
+
+`native_action_started` precedes the AT-SPI call; `native_action_finished`
+follows its return and includes Chrome's actual boolean `native_result`.
+`upgrade_request_sent` follows the socket write, and `connection_ready` follows
+the completed WebSocket upgrade and socket publication. These observation times
+allow comparison of action calls with connection progress. A native result of
+`true` reports acceptance of that action request; the separate connection event
+establishes when debugging became available. The completed-call count includes
+calls returning `false`, preserving the existing scan return value and polling
+schedule. It is not a successful-approval count.
+
+One producer stores these events and derives the human log entries from them.
+Scans without matches or query errors remain in the structured history without
+adding text-log lines. Records contain fixed event names, recognized button
+names, booleans, counts, timings and exception class names. They omit other
+accessibility labels, page contents, exception messages and endpoint paths.
+
+The history retains the latest 1,024 events. A 150-second attempt with the
+half-second scan interval produces about 600 scan start/completion records,
+leaving room for import, health and action records during an ordinary wait.
+Repeated matches or multiple attempts can evict the beginning of an attempt.
+`dropped_events`, `first_seq` and `last_seq` identify that loss. The separate text
+log still retains 500 lines and exposes its latest 20 through `log_tail`.
+
 ### Wait for manual consent from an agent
 
 When consent depends on a person, background one bounded wait and let its exit

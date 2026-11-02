@@ -47,6 +47,8 @@ the daemon imports its scan_and_press / chrome_accessibility_health directly.
 """
 import socket, struct, json, sys, secrets, threading, time, collections, os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from page_preparation import PagePreparationError, PagePreparationManager, PagePreparationState
 
@@ -127,6 +129,90 @@ def log(msg):
     if len(log_lines) > 500: log_lines.pop(0)
 
 
+# Keep acquisition metadata separate from page/network CDP events. Old records
+# can be evicted; sequence numbers and dropped_events make that loss explicit.
+consent_lock = threading.Lock()
+consent_events = collections.deque(maxlen=1024)
+consent_sequence = 0
+consent_attempt = 0
+consent_scan = 0
+CONSENT_EVENTS = {
+    'attempt_started', 'presser_requested', 'upgrade_request_sent', 'upgrade_finished',
+    'connection_ready', 'presser_import_started', 'presser_import_finished',
+    'presser_import_failed', 'scan_started', 'scan_finished', 'scan_failed',
+    'button_matched', 'native_action_started', 'native_action_finished',
+    'press_action_unavailable', 'native_action_error', 'accessibility_query_error',
+    'accessibility_health',
+}
+CONSENT_NUMBERS = {'scan_id', 'budget_seconds', 'duration_ms', 'chrome_applications',
+                   'matched_buttons', 'completed_calls', 'query_errors'}
+
+
+def consent_event(event, attempt_id=None, *, state=None, **metadata):
+    """Record selected metadata once; derive the human log from that record."""
+    global consent_sequence, cdp_state, cdp_diag
+    if event not in CONSENT_EVENTS:
+        raise ValueError('Unknown consent diagnostic event')
+    fields = {}
+    for key, value in metadata.items():
+        if key in CONSENT_NUMBERS and type(value) in (int, float):
+            fields[key] = value
+        elif key in {'native_result', 'chrome_found', 'renderer_found'} and (value is None or type(value) is bool):
+            fields[key] = value
+        elif key == 'button':
+            fields[key] = value if value in ('Allow', 'Restore') else 'unknown'
+        elif key == 'outcome' and value in {'ok', 'noport', 'denied', 'timeout', 'error'}:
+            fields[key] = value
+        elif key == 'error_type' and isinstance(value, str) and value.isidentifier():
+            fields[key] = value[:80]
+    with consent_lock:
+        consent_sequence += 1
+        entry = {
+            'seq': consent_sequence, 'attempt_id': attempt_id, 'event': event,
+            'time_zagreb': datetime.now(ZoneInfo('Europe/Zagreb')).isoformat(timespec='microseconds'),
+            'monotonic_ns': time.monotonic_ns(), **fields,
+        }
+        consent_events.append(entry)
+        message = 'consent: ' + json.dumps(entry, sort_keys=True)
+        if state is not None:
+            cdp_state, cdp_diag = state, message
+    if event not in {'scan_started', 'scan_finished'} or fields.get('matched_buttons') or fields.get('query_errors'):
+        log(message)
+    return entry
+
+
+def consent_snapshot():
+    with consent_lock:
+        return {'capacity': consent_events.maxlen,
+                'dropped_events': consent_sequence - len(consent_events),
+                'first_seq': consent_events[0]['seq'] if consent_events else None,
+                'last_seq': consent_sequence, 'events': list(consent_events)}
+
+
+def begin_consent_attempt(budget):
+    global consent_attempt
+    with consent_lock:
+        consent_attempt += 1
+        attempt_id = consent_attempt
+    consent_event('attempt_started', attempt_id, state='connecting', budget_seconds=budget)
+    return attempt_id
+
+
+def begin_consent_scan():
+    global consent_scan
+    with consent_lock:
+        consent_scan += 1
+        attempt_id, scan_id = consent_attempt, consent_scan
+    started = time.monotonic_ns()
+    consent_event('scan_started', attempt_id, scan_id=scan_id)
+
+    def report(event, **metadata):
+        if event == 'scan_finished':
+            metadata['duration_ms'] = (time.monotonic_ns() - started) / 1_000_000
+        consent_event(event, attempt_id, scan_id=scan_id, **metadata)
+    return report
+
+
 def set_state(state, diag=""):
     """Record connection state and its explanation in /status and the log."""
     global cdp_state, cdp_diag
@@ -150,39 +236,36 @@ presser_beat = [0.0]   # wall time of the presser's last live lap (hang detectio
 
 
 def presser_main():
+    import_started = time.monotonic_ns()
+    consent_event('presser_import_started')
     try:
         sys.path.insert(0, os.path.dirname(PRESSER))
         import clear_modals
-    except Exception as e:
-        log(f"presser: AT-SPI unavailable ({type(e).__name__}: {e}) - auto-press disabled; "
-            "click Allow manually when the dialog appears")
+    except Exception as error:
+        consent_event('presser_import_failed', error_type=type(error).__name__)
         return
+    consent_event('presser_import_finished',
+                  duration_ms=(time.monotonic_ns() - import_started) / 1_000_000)
     last_diag, laps = None, 0
     while True:
         if not press_wanted.is_set():
             last_diag, laps = None, 0
             press_wanted.wait()
         presser_beat[0] = time.time()
+        report = begin_consent_scan()
         try:
-            n = clear_modals.scan_and_press()
-            if n:
-                log(f"presser: pressed {n} button(s)")
-                time.sleep(0.5)   # brief lap gap; loop again for straggler dialogs
+            completed = clear_modals.scan_and_press(reporter=report)
+            if completed:
+                time.sleep(0.5)
                 continue
-            if laps % 10 == 0:    # diagnose every ~5s, log only when the diagnosis changes
+            if laps % 10 == 0:
                 found, renderer = clear_modals.chrome_accessibility_health()
-                diag = ("watching for the Allow dialog" if (found and renderer) else
-                        "Chrome not visible via AT-SPI right now (locked screen / a11y "
-                        "bridge asleep?) - still scanning; a manual Allow also lands"
-                        if not found else
-                        "Chrome renderer accessibility looks OFF - the dialog may be "
-                        "invisible to AT-SPI; enable chrome://accessibility or click "
-                        "Allow manually")
+                diag = (found, renderer)
                 if diag != last_diag:
-                    log("presser: " + diag)
+                    report('accessibility_health', chrome_found=found, renderer_found=renderer)
                     last_diag = diag
-        except Exception as e:
-            log(f"presser: {type(e).__name__}: {e}")
+        except Exception as error:
+            report('scan_failed', error_type=type(error).__name__)
         laps += 1
         time.sleep(0.5)
 
@@ -197,6 +280,8 @@ def ws_upgrade(timeout):
       ("timeout", msg)              the upgrade response wait expired
       ("error", msg)
     """
+    with consent_lock:
+        attempt_id = consent_attempt or None
     try:
         s = socket.create_connection((HOST, PORT), timeout=10)
     except OSError as e:
@@ -204,6 +289,7 @@ def ws_upgrade(timeout):
     s.settimeout(timeout)
     try:
         s.sendall(_ws_req())
+        consent_event('upgrade_request_sent', attempt_id)
         buf = b""
         while b"\r\n\r\n" not in buf:
             ch = s.recv(4096)
@@ -236,21 +322,19 @@ def connect_once(budget=150):
     observations through the log."""
     global cdp_sock, cdp_leftover, PORT, PATH
     PORT, PATH = _discover_endpoint()   # re-read: Chrome rewrites these on restart
-    set_state("connecting", "opening CDP...")
-    set_state("waiting_for_allow",
-              f"holding ONE CDP upgrade open (= at most one Allow dialog) for up to {budget}s; "
-              "the in-process presser is scanning for the dialog, and a manual Allow click "
-              "lands on this same upgrade. Presser diagnostics stream into the log.")
+    attempt_id = begin_consent_attempt(budget)
+    consent_event('presser_requested', attempt_id, state='waiting_for_allow', budget_seconds=budget)
     press_wanted.set()
     try:
         kind, *rest = ws_upgrade(timeout=max(5, budget))   # one held attempt = one dialog
     finally:
         press_wanted.clear()
+    consent_event('upgrade_finished', attempt_id, outcome=kind)
     if kind == "ok":
         sock, leftover = rest
         sock.settimeout(None)
         cdp_sock, cdp_leftover = sock, leftover
-        set_state("connected", "CDP connected.")
+        consent_event('connection_ready', attempt_id, state='connected')
         return True
     if kind == "noport":
         set_state("no_chrome",
@@ -553,6 +637,7 @@ class Handler(BaseHTTPRequestHandler):
                     "prepared_pages": page_preparation.status(),
                     "browser_state_pages": page_preparation.bridge_status(),
                     "log_tail": log_lines[-20:],
+                    "consent_diagnostics": consent_snapshot(),
                 })
             elif u.path == "/events":
                 since = int(qs.get("since", ["0"])[0])
