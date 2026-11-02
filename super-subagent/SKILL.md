@@ -1,13 +1,42 @@
 ---
 name: super-subagent
-description: Prepare an addressable Claude Code worker that inherits the calling conversation or another selected worker, then start it with SendMessage. Supports arbitrary model IDs that the Agent tool schema rejects, generates a readable agent name from the description, and links workflow agents into the session's top-level subagents directory for resumption. Use when the user asks for a super subagent, a nested context-inheriting worker, a child of another worker, an unrestricted provider model, or recovery of workflow subagents after a workflow failure.
+description: Prepare fresh non-fork subagents on non-Claude models, whose model IDs the regular Agent tool cannot select, then start them with SendMessage. Also prepares same-model context-inheriting forks and links workflow agents for resumption. Use for fresh GPT or other provider workers, a super subagent, a child of another worker, or recovery of workflow subagents.
 ---
 
 # Super subagent
 
-Prepare a child from the conversation that invokes the helper. The helper writes new agent files and prints the agent ID for `SendMessage`.
+The regular `Agent` tool selects Claude models only. Use this helper to prepare a fresh, non-fork subagent on a non-Claude model. It writes the agent files and prints the ID to start with `SendMessage`.
 
-For every automatic call, choose a fresh 32-character lowercase hexadecimal invocation ID. Put its literal value in the environment assignment in the same Bash tool call. Choose the value yourself; never ask the user for it or reuse the example below.
+## Fresh workers
+
+```bash
+python3 /home/juraj/claude-skills/super-subagent/scripts/super_subagent.py prepare \
+  "Review the proxy retirement tests" --fresh --model gpt-6.1-sol
+```
+
+Then start it with a self-contained assignment:
+
+```text
+SendMessage({to: "<agent_id>", message: "<self-contained assignment>"})
+```
+
+`--fresh` requires an explicit model ID and creates a regular `general-purpose` agent with one bootstrap message. It does not inherit conversation history, copy a worker transcript, or read the parent transcript's contents. Its model is stored in the agent metadata and remains selected on later `SendMessage` resumes. Prepare fresh workers through this command rather than calling the Python publisher functions yourself.
+
+The helper uses `CLAUDE_CODE_SESSION_ID` to locate the session that owns the new agent. `--session-id` and `--parent-jsonl` can select that session explicitly; they do not supply context in fresh mode. Fresh preparation does not use caller discovery, so it needs neither an invocation ID nor an active Bash tool call. `--from-main`, `--from-agent-id`, `--from-agent-name`, `--parent-last-uuid` and `--fork-another-model` do not apply to `--fresh`.
+
+### Reuse project grounding
+
+For repeated work in a project, prepare one fresh GPT worker and give it a light grounding assignment: read the project instructions, locate the relevant files and learn the interfaces it will use. Resume that worker with `SendMessage` for later assignments on the same model. The initial grounding is paid for once; subsequent requests read the unchanged prefix from the prompt cache. GPT's long cache retention makes this useful across gaps between assignments.
+
+Keep the reusable grounding prefix light. The whole parent conversation or a worker's accumulated implementation history is not project grounding. If preparing children from it, use a dedicated worker that stopped after grounding: `--from-agent-id` copies the selected worker's entire recorded history.
+
+For Claude workers, another pattern to test is one-hour caching for the grounding step, followed by five-minute caching for later work. Configure the TTL through the client's cache controls and check its usage counters after switching to establish that the grounding prefix is still being read from cache. Scope the TTL change to the intended worker; an environment setting shared by a process also affects its other in-process workers.
+
+## Context-inheriting forks
+
+Omit `--fresh` when the task needs inherited context. A fork keeps its parent's model. For a different model, prepare a fresh worker and provide its assignment explicitly.
+
+For every automatic fork call, choose a fresh 32-character lowercase hexadecimal invocation ID. Put its literal value in the environment assignment in the same Bash tool call. Choose the value yourself; never ask the user for it or reuse the example below.
 
 ```bash
 SUPER_SUBAGENT_INVOCATION_ID=7c5e3f4918a2d6b04e9f1a7c3d8b2650 \
@@ -25,7 +54,7 @@ The helper never edits the parent or source transcript. New files use mode `0600
 
 ## Caller selection
 
-`prepare` selects its source automatically:
+Without `--fresh`, `prepare` selects its source automatically:
 
 - From the main conversation, it writes `fork-context-ref` plus a seed sidechain message. Claude Code loads the main prefix from the session JSONL.
 - From an existing worker, it copies the recorded history up to the current boundary and retargets its `agentId` fields. It retains the original UUIDs, prompt IDs and root `fork-context-ref` when one exists. General-purpose and specialized workers without that record are also supported.
@@ -90,26 +119,16 @@ SUPER_SUBAGENT_INVOCATION_ID=REPLACE_WITH_FRESH_32_HEX_DIGITS \
   "Review the proxy retirement tests"
 ```
 
-To use any other provider model ID:
+For a non-Claude model, use the fresh-worker command above: `prepare --fresh --model gpt-6.1-sol`. The regular `Agent` tool accepts only Claude model choices; this helper stores the requested provider model ID in regular-agent metadata.
 
-```bash
-SUPER_SUBAGENT_INVOCATION_ID=REPLACE_WITH_FRESH_32_HEX_DIGITS \
-  python3 /home/juraj/claude-skills/super-subagent/scripts/super_subagent.py prepare \
-  "Review the proxy retirement tests" \
-  --model gpt-5.6-sol \
-  --fork-another-model
-```
-
-Claude Code forces built-in forks to `model: inherit`. An explicitly selected model therefore uses regular-agent resume metadata while retaining the inherited context and fork instructions.
-
-Prompt caches are model-specific. The selected model cannot reuse the parent model's cached prefix, so the inherited conversation may be processed and cached again under that model. The helper prints this warning and requires `--fork-another-model` as acknowledgement.
+Claude Code forces built-in forks to `model: inherit`. Keep forks on their parent's model. Fresh preparation starts without an inherited prompt prefix, so changing providers does not resend the parent's conversation. Use `SendMessage` to continue an existing worker on its selected model.
 
 Optional creation controls:
 
 ```text
 --name NAME          replace the generated readable name
 --agent-id ID        use a predetermined agent ID
---spawn-depth N      override depth; defaults to 1 from main or parent depth plus 1
+--spawn-depth N      override depth; fresh workers and main forks default to 1; worker forks use parent depth plus 1
 ```
 
 ## Resume workflow agents

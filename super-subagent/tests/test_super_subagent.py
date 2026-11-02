@@ -60,6 +60,7 @@ class SuperSubagentTest(unittest.TestCase):
         values = {
             "description": "Review the proxy retirement tests",
             "model": "gpt-5.6-sol",
+            "fresh": False,
             "fork_another_model": True,
             "name": None,
             "agent_id": "areview-proxy-retirement-tests-0123456789abcdef",
@@ -75,6 +76,110 @@ class SuperSubagentTest(unittest.TestCase):
         }
         values.update(changes)
         return argparse.Namespace(**values)
+
+    def fresh_args(self, **changes):
+        return self.prepare_args(**{
+            "fresh": True, "model": "gpt-6.1-sol",
+            "fork_another_model": False, "from_main": False, **changes,
+        })
+
+    def test_fresh_preparation_does_not_read_or_inherit_history(self):
+        original = b"not even a valid transcript; its contents must not be read\n"
+        self.parent.write_bytes(original)
+        with mock.patch.object(super_subagent, "discover_prepare_caller", side_effect=AssertionError), \
+                mock.patch.object(Path, "read_bytes", side_effect=AssertionError), \
+                mock.patch.object(Path, "read_text", side_effect=AssertionError):
+            result = super_subagent.prepare_agent(self.fresh_args())
+        self.assertEqual(result["mode"], "fresh")
+        self.assertEqual(result["model"], "gpt-6.1-sol")
+        self.assertNotIn("cache_warning", result)
+        self.assertNotIn("parent_last_uuid", result)
+        records = super_subagent.read_transcript_records(Path(result["jsonl"]))
+        self.assertEqual(len(records), 1)
+        seed = records[0]
+        self.assertEqual(seed["type"], "user")
+        self.assertIsNone(seed["parentUuid"])
+        self.assertTrue(seed["isSidechain"])
+        self.assertEqual(seed["sessionId"], self.session_id)
+        self.assertEqual(seed["agentId"], result["agent_id"])
+        self.assertEqual(seed["cwd"], os.getcwd())
+        self.assertIn("fresh worker", seed["message"]["content"][0]["text"])
+        self.assertNotIn("fork", seed["message"]["content"][0]["text"])
+        metadata = json.loads(Path(result["meta"]).read_text())
+        self.assertEqual(metadata["agentType"], "general-purpose")
+        self.assertEqual(metadata["model"], "gpt-6.1-sol")
+        self.assertEqual(metadata["spawnDepth"], 1)
+        self.assertNotIn("isFork", metadata)
+        self.assertNotIn("parentAgentId", metadata)
+        for filename in (result["jsonl"], result["meta"]):
+            self.assertEqual(stat.S_IMODE(Path(filename).stat().st_mode), 0o600)
+        self.assertEqual(self.parent.read_bytes(), original)
+        self.assertEqual(result["send_message"]["to"], result["agent_id"])
+
+    def test_fresh_creation_options_and_other_provider_model(self):
+        self.parent.touch()
+        result = super_subagent.prepare_agent(self.fresh_args(
+            model="  provider/model-name  ", name="chosen-worker", spawn_depth=3,
+            parent_jsonl=str(self.parent),
+        ))
+        metadata = json.loads(Path(result["meta"]).read_text())
+        self.assertEqual(metadata["model"], "provider/model-name")
+        self.assertEqual(metadata["name"], "chosen-worker")
+        self.assertEqual(metadata["spawnDepth"], 3)
+
+    def test_fresh_requires_explicit_model_and_rejects_history_options(self):
+        self.parent.touch()
+        cases = [
+            {"model": "inherit"}, {"model": ""}, {"model": "   "},
+            {"fork_another_model": True}, {"parent_last_uuid": "history-point"},
+            {"from_main": True}, {"from_agent_id": "asource-0123456789abcdef"},
+            {"from_agent_name": "source"},
+        ]
+        for changes in cases:
+            with self.subTest(changes=changes):
+                with self.assertRaises(super_subagent.UsageError):
+                    super_subagent.prepare_agent(self.fresh_args(**changes))
+        self.assertFalse((self.project / self.session_id / "subagents").exists())
+
+    def test_fresh_publication_does_not_overwrite_an_existing_agent(self):
+        self.parent.touch()
+        result = super_subagent.prepare_agent(self.fresh_args())
+        before = {key: Path(result[key]).read_bytes() for key in ("jsonl", "meta")}
+        with self.assertRaisesRegex(super_subagent.UsageError, "already exists"):
+            super_subagent.prepare_agent(self.fresh_args())
+        self.assertEqual({key: Path(result[key]).read_bytes() for key in before}, before)
+
+    def test_fresh_cli_uses_session_environment_without_invocation_nonce(self):
+        self.parent.touch()
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.session_id}, clear=True), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = super_subagent.main([
+                "prepare", "Fresh review", "--fresh", "--model", "gpt-6.1-sol",
+                "--projects-root", str(self.projects),
+            ])
+        self.assertEqual(code, 0)
+        self.assertEqual(errors.getvalue(), "")
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["mode"], "fresh")
+        self.assertEqual(result["parent_session_id"], self.session_id)
+        self.assertTrue(Path(result["meta"]).is_file())
+
+    def test_fresh_cli_rejects_fork_source_and_missing_model(self):
+        self.parent.touch()
+        parser = super_subagent.build_parser()
+        for option in (["--from-main"], ["--from-agent-id", "asource-0123456789abcdef"],
+                       ["--from-agent-name", "source"]):
+            with self.subTest(option=option), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(["prepare", "Fresh", "--fresh", *option])
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            code = super_subagent.main([
+                "prepare", "Fresh", "--fresh", "--parent-jsonl", str(self.parent),
+            ])
+        self.assertEqual(code, 2)
+        self.assertIn("requires an explicit --model", errors.getvalue())
 
     def link_args(self, workflow, **changes):
         values = {

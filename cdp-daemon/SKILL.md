@@ -44,10 +44,20 @@ the API endpoint. Startup failures close the listener. Once the server is
 running, `/status` reports connection progress and failure while acquisition
 continues. One dedicated presser thread imports
 `clear_modals` and performs the AT-SPI calls. During acquisition it repeatedly
-looks for Chrome's Allow buttons and reports its observations through `log_tail`.
-It presses each matching button because Chrome can expose multiple button nodes
-for the same dialog. Accessibility availability is checked throughout the
-attempt; an earlier failed check does not stop later scanning.
+finds native alert/dialog containers titled **Allow remote debugging?** or
+**Restore pages?**, then invokes their Allow or Restore buttons. Renderer document
+subtrees are excluded, so web content cannot qualify by imitating those titles.
+A browser window's Restore button is outside these prompt containers and is
+excluded. All distinct intended buttons retain their traversal order because
+Chrome can expose multiple nodes for one prompt. Unsupported or conflicting
+prompt structures remain observable in consent diagnostics; the presser does
+not fall back to clicking buttons throughout the browser. Accessibility
+availability is checked throughout the attempt; an earlier failed check does
+not stop later scanning.
+
+Chrome itself requests window activation when creating its consent dialog.
+The presser does not issue window-activation commands. Reusing the persistent
+connection avoids repeatedly creating that native prompt.
 
 Each acquisition attempt holds one WebSocket upgrade for about 150 seconds.
 Chrome completes that pending request when consent is granted. An attempt that
@@ -104,8 +114,15 @@ One producer stores these events and derives the human log entries from them.
 Text-writer failures leave the structured record available and do not cancel
 an upgrade or native action. `text_log_failures` and `last_text_log_error_type`
 report those failures without recording exception messages.
-Scans without matches or query errors remain in the structured history without
-adding text-log lines. Records contain fixed event names, recognized button
+Scan-start records are retained only in structured history. Scan-completion
+records also omit the text log when their match and query-error counts are both
+zero. Rejection and unsupported-structure events remain logged independently.
+`button_matched` includes the recognized `prompt_kind`;
+`button_rejected` and `prompt_structure_unavailable` explain exclusions with
+fixed reason codes. Scan summaries count skipped document subtrees, unsupported
+prompts, excluded buttons and traversal depth limits. These observations remain
+available when Chrome presents an unsupported prompt; the scanner does not use
+a global-button fallback. Records contain fixed event names, recognized button
 names, booleans, counts, timings and exception class names. They omit other
 accessibility labels, page contents, exception messages and endpoint paths.
 

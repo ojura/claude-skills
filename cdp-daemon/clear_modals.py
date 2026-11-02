@@ -2,16 +2,18 @@
 """Press Chrome's "Allow remote debugging?" and crash-recovery "Restore"
 button(s) via AT-SPI.
 
-Uses Chrome's accessibility tree (enabled by --force-renderer-accessibility)
-to find the buttons without focus stealing or keyboard injection. Two prompts
-are handled (see BUTTON_NAMES):
-  - "Allow remote debugging?" -> "Allow"   (pops on every fresh CDP WebSocket)
-  - "Restore pages?"          -> "Restore" (pops after a Chrome crash; pressing
-                                 it recovers the prior session/tabs on relaunch)
+Uses Chrome's native accessibility tree to find recognized alert/dialog
+containers and invoke their intended buttons. It skips renderer documents.
+  - "Allow remote debugging?" -> "Allow" on consent-controlled CDP connections.
+  - "Restore pages?" -> "Restore" after a Chrome crash.
 
-Bug to avoid: Chrome exposes the Allow button as TWO push-button nodes under
-the same `alert: 'Allow remote debugging?'` parent. find_all() and press
-EVERY match. Pressing only the first is unreliable.
+Chrome exposes distinct Allow nodes for the same prompt; retain their traversal
+order and attempt each intended control. A window's Restore button and web
+content imitating these prompt titles do not qualify. Unsupported structures
+are reported without falling back to a browser-wide button search.
+
+Chrome requests window activation when it creates the consent dialog. This
+presser invokes native actions without issuing a window-activation command.
 
 Usage:
   clear_modals.py           single-shot scan (exits 0 immediately)
@@ -43,10 +45,17 @@ def _pump_glib(seconds=0.2):
     while time.time() < end and ctx.pending():
         ctx.iteration(False)
 
-# Modal buttons we press. "Allow" clears the remote-debugging consent dialog
-# that pops on every fresh CDP WebSocket; "Restore" clears Chrome's crash
-# "Restore pages?" prompt so a relaunch recovers the prior session/tabs.
-BUTTON_NAMES = ('Allow', 'Restore')
+# These are native Chrome prompt titles, not titles from rendered web pages.
+PROMPTS = {
+    'Allow remote debugging?': ('consent', 'Allow'),
+    'Restore pages?': ('crash_recovery', 'Restore'),
+}
+BUTTON_NAMES = tuple(button for kind, button in PROMPTS.values())
+PROMPT_ROLES = {'dialog', 'alert'}
+DOCUMENT_ROLES = {
+    'document', 'document web', 'document frame', 'document text',
+    'document email', 'document presentation', 'document spreadsheet', 'web view',
+}
 
 
 def find_all(node, role_match, names, depth=0, max_depth=30, out=None, query_errors=None):
@@ -77,7 +86,7 @@ def _report(reporter, event, **metadata):
             pass
 
 
-def press_button(btn, reporter=None, button='unknown'):
+def press_button(btn, reporter=None, button='unknown', prompt_kind=None):
     """Invoke 'press'; return whether a native action call completed.
 
     Preserve the existing completed-call count. The diagnostic separately records
@@ -89,71 +98,120 @@ def press_button(btn, reporter=None, button='unknown'):
         act = btn.get_action_iface()
         for j in range(act.get_n_actions()):
             if act.get_action_name(j) == 'press':
-                _report(reporter, 'native_action_started', button=button)
+                _report(reporter, 'native_action_started', button=button, prompt_kind=prompt_kind)
                 action_started = True
                 result = act.do_action(j)
-                _report(reporter, 'native_action_finished', button=button,
+                _report(reporter, 'native_action_finished', button=button, prompt_kind=prompt_kind,
                         native_result=result if isinstance(result, bool) else None)
                 return True
-        _report(reporter, 'press_action_unavailable', button=button)
+        _report(reporter, 'press_action_unavailable', button=button, prompt_kind=prompt_kind)
     except Exception as error:
         event = 'native_action_error' if action_started else 'accessibility_query_error'
-        _report(reporter, event, button=button, error_type=type(error).__name__)
+        _report(reporter, event, button=button, prompt_kind=prompt_kind,
+                error_type=type(error).__name__)
     return False
 
 
-def scan_and_press(reporter=None):
-    """Invoke Chrome's matching Allow/Restore actions; count completed calls.
+def find_prompt_buttons(node, report, counts, prompt=None, depth=0, max_depth=30):
+    """Find intended native buttons without entering renderer documents.
 
-    Optional reports contain recognized button names and query/action outcomes,
-    not accessibility labels from other controls or page content.
+    Traverse once so distinct Allow nodes retain their order. Buttons in
+    unrecognized or conflicting dialog contexts are excluded. A nested native
+    window starts a separate context.
     """
+    found = []
+    if node is None:
+        return found
+    if depth > max_depth:
+        counts['depth_limited'] += 1
+        report('prompt_structure_unavailable', reason='depth_limit')
+        return found
+    try:
+        role = node.get_role_name()
+        if role in DOCUMENT_ROLES:
+            counts['document_subtrees_skipped'] += 1
+            return found
+        if role in ('frame', 'window') and prompt is not None:
+            counts['unsupported_prompts'] += 1
+            report('prompt_structure_unavailable', reason='nested_window')
+            prompt = None
+        if role in PROMPT_ROLES:
+            selected = PROMPTS.get(node.get_name())
+            if selected is None:
+                counts['unsupported_prompts'] += 1
+                report('prompt_structure_unavailable', reason='unrecognized_prompt')
+                prompt = ('blocked', None)
+            elif prompt is not None and prompt[0] == 'blocked':
+                counts['unsupported_prompts'] += 1
+                report('prompt_structure_unavailable', reason='unsupported_ancestor')
+            elif prompt is not None and selected != prompt:
+                counts['unsupported_prompts'] += 1
+                report('prompt_structure_unavailable', reason='conflicting_prompts')
+                prompt = ('ambiguous', None)
+            else:
+                prompt = selected
+                counts['matched_prompts'] += 1
+        if role in ('push button', 'button'):
+            name = node.get_name()
+            if name in BUTTON_NAMES:
+                if prompt is not None and prompt[1] == name:
+                    found.append((node, name, prompt[0]))
+                else:
+                    counts['excluded_buttons'] += 1
+                    report('button_rejected', button=name, reason='outside_intended_prompt')
+        for index in range(node.get_child_count()):
+            try:
+                found.extend(find_prompt_buttons(node.get_child_at_index(index), report,
+                    counts, prompt, depth + 1, max_depth))
+            except Exception as error:
+                report('accessibility_query_error', error_type=type(error).__name__)
+    except Exception as error:
+        report('accessibility_query_error', error_type=type(error).__name__)
+    return found
+
+
+def scan_and_press(reporter=None):
+    """Invoke buttons from recognized native Chrome prompts; count completed calls."""
     _pump_glib()
     desk = Atspi.get_desktop(0)
     completed = 0
     applications = 0
     matched = 0
-    query_errors = [0]
+    counts = dict.fromkeys(('query_errors', 'document_subtrees_skipped',
+                           'unsupported_prompts', 'matched_prompts',
+                           'excluded_buttons', 'depth_limited'), 0)
 
     def report(event, **metadata):
         if event == 'accessibility_query_error':
-            query_errors[0] += 1
+            counts['query_errors'] += 1
         _report(reporter, event, **metadata)
 
-    for i in range(desk.get_child_count()):
+    for index in range(desk.get_child_count()):
         try:
-            app = desk.get_child_at_index(i)
+            app = desk.get_child_at_index(index)
             if app and app.get_name() == 'Google Chrome':
                 applications += 1
-                buttons = find_all(app, ('push button', 'button'), BUTTON_NAMES,
-                                   query_errors=query_errors)
+                buttons = find_prompt_buttons(app, report, counts)
                 matched += len(buttons)
-                for btn in buttons:
-                    try:
-                        name = btn.get_name()
-                    except Exception as error:
-                        report('accessibility_query_error', error_type=type(error).__name__)
-                        name = None
-                    button = name if name in BUTTON_NAMES else 'unknown'
-                    report('button_matched', button=button)
-                    if press_button(btn, report, button):
+                for btn, button, prompt_kind in buttons:
+                    report('button_matched', button=button, prompt_kind=prompt_kind)
+                    if press_button(btn, report, button, prompt_kind):
                         completed += 1
         except Exception as error:
             report('accessibility_query_error', error_type=type(error).__name__)
     report('scan_finished', chrome_applications=applications,
-            matched_buttons=matched, completed_calls=completed,
-            query_errors=query_errors[0])
+           matched_buttons=matched, completed_calls=completed, **counts)
     return completed
 
 
 def chrome_accessibility_health():
     """Return whether Chrome and renderer-content roles are visible to AT-SPI.
 
-    Native accessibility can expose browser controls while renderer content,
-    including the consent dialog, remains unavailable. Missing renderer roles
-    can indicate disabled native accessibility or an incomplete current tree;
-    this observation does not establish the setting's value. The daemon logs
-    the observation and continues scanning.
+    Browser controls and renderer content are observed separately. Chrome's
+    consent and recovery dialogs are native controls; their availability is
+    established by prompt scanning, not by renderer-content roles. Missing
+    renderer roles can indicate disabled accessibility or an incomplete tree.
+    The daemon records this observation and continues scanning.
     """
     RENDERER_ROLES = {'document web', 'document frame', 'document',
                       'web view', 'heading', 'paragraph', 'link',

@@ -145,10 +145,12 @@ CONSENT_EVENTS = {
     'button_matched', 'native_action_started', 'native_action_finished',
     'press_action_unavailable', 'native_action_error', 'accessibility_query_error',
     'accessibility_health_started', 'accessibility_health_finished',
-    'accessibility_health_failed',
+    'accessibility_health_failed', 'button_rejected', 'prompt_structure_unavailable',
 }
 CONSENT_NUMBERS = {'scan_id', 'budget_seconds', 'duration_ms', 'chrome_applications',
-                   'matched_buttons', 'completed_calls', 'query_errors'}
+                   'matched_buttons', 'completed_calls', 'query_errors',
+                   'document_subtrees_skipped', 'unsupported_prompts',
+                   'matched_prompts', 'excluded_buttons', 'depth_limited'}
 
 
 def consent_event(event, attempt_id=None, *, state=None, **metadata):
@@ -164,6 +166,12 @@ def consent_event(event, attempt_id=None, *, state=None, **metadata):
             fields[key] = value
         elif key == 'button':
             fields[key] = value if value in ('Allow', 'Restore') else 'unknown'
+        elif key == 'prompt_kind' and value in {'consent', 'crash_recovery'}:
+            fields[key] = value
+        elif key == 'reason' and value in {'depth_limit', 'unrecognized_prompt',
+                                         'conflicting_prompts', 'outside_intended_prompt',
+                                         'nested_window', 'unsupported_ancestor'}:
+            fields[key] = value
         elif key == 'outcome' and value in {'ok', 'noport', 'denied', 'timeout', 'error'}:
             fields[key] = value
         elif key == 'error_type' and isinstance(value, str) and value.isidentifier():

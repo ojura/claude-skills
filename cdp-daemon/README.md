@@ -67,12 +67,27 @@ through the public tabs API.
 python3 -B -I -m unittest discover -s tests -p 'test_*.py'
 node --test tests/view_initialization.test.mjs
 python3 -B -I tests/browser_page_preparation.py -v
+python3 -B -I tests/browser_consent.py
 ```
 
 The browser suite uses owned profiles and a guarded private Xvfb display, with
 Wayland removed from the launched environment. It tests the installed Chrome
 binary without restarting or reconfiguring the user's browser. Research worker
 code is enabled only in the owned extension fixture.
+
+The native consent suite additionally requires system Python with GI/AT-SPI,
+`dbus-run-session`, `xfwm4`, `xdotool`, `xprop`, `xwininfo` and `gdbus`. It runs only
+on AC power and records observed AC loss. Its browser profile, display, session bus
+and accessibility bus are private; every fresh presser process verifies the
+observed Chrome application PID against the owned profile and endpoint before
+invoking actions. The suite calibrates focus and window-state observations,
+rejects a maximized window's Restore button and webpage prompt imitations, then
+acquires Chrome through its actual native consent dialog. It deliberately
+crashes only the owned browser to test actual session recovery and checks that
+the saved navigation returns in the background while the selected tab, focus
+and maximization remain unchanged. Results and selected native metadata are
+retained in the reported `/tmp/cdp-native-prompts.*` directory. It does not call
+the user's daemon or change the user's Chrome profile.
 
 ## Files
 
