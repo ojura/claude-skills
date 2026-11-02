@@ -84,19 +84,21 @@ def press_button(btn, reporter=None, button='unknown'):
     Chrome's boolean result, which can be false even when the call completes.
     Neither a completed call nor an accepted action proves consent was granted.
     """
+    action_started = False
     try:
         act = btn.get_action_iface()
         for j in range(act.get_n_actions()):
             if act.get_action_name(j) == 'press':
                 _report(reporter, 'native_action_started', button=button)
+                action_started = True
                 result = act.do_action(j)
                 _report(reporter, 'native_action_finished', button=button,
                         native_result=result if isinstance(result, bool) else None)
                 return True
         _report(reporter, 'press_action_unavailable', button=button)
     except Exception as error:
-        _report(reporter, 'native_action_error', button=button,
-                error_type=type(error).__name__)
+        event = 'native_action_error' if action_started else 'accessibility_query_error'
+        _report(reporter, event, button=button, error_type=type(error).__name__)
     return False
 
 
@@ -112,6 +114,12 @@ def scan_and_press(reporter=None):
     applications = 0
     matched = 0
     query_errors = [0]
+
+    def report(event, **metadata):
+        if event == 'accessibility_query_error':
+            query_errors[0] += 1
+        _report(reporter, event, **metadata)
+
     for i in range(desk.get_child_count()):
         try:
             app = desk.get_child_at_index(i)
@@ -123,15 +131,16 @@ def scan_and_press(reporter=None):
                 for btn in buttons:
                     try:
                         name = btn.get_name()
-                    except Exception:
+                    except Exception as error:
+                        report('accessibility_query_error', error_type=type(error).__name__)
                         name = None
                     button = name if name in BUTTON_NAMES else 'unknown'
-                    _report(reporter, 'button_matched', button=button)
-                    if press_button(btn, reporter, button):
+                    report('button_matched', button=button)
+                    if press_button(btn, report, button):
                         completed += 1
         except Exception as error:
-            _report(reporter, 'accessibility_query_error', error_type=type(error).__name__)
-    _report(reporter, 'scan_finished', chrome_applications=applications,
+            report('accessibility_query_error', error_type=type(error).__name__)
+    report('scan_finished', chrome_applications=applications,
             matched_buttons=matched, completed_calls=completed,
             query_errors=query_errors[0])
     return completed

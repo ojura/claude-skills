@@ -82,7 +82,13 @@ scan start/completion, recognized Allow/Restore matches, native action calls,
 accessibility observations and WebSocket upgrade completion. Each event has a
 sequence number, a Zagreb wall-clock timestamp and `monotonic_ns`. Scan and action
 reports retain the attempt and scan IDs captured when that scan began, including
-when they finish after another acquisition starts.
+when they finish after another acquisition starts. Every health traversal also
+has `accessibility_health_started` followed by `accessibility_health_finished`
+or `accessibility_health_failed`, with duration and the same captured IDs.
+Unchanged health observations are recorded on every scheduled invocation, so a
+pending health traversal can be distinguished from the completed button scan.
+`query_errors` counts failures during application, tree, matched-label and action
+interface queries; a native action failure is reported separately.
 
 `native_action_started` precedes the AT-SPI call; `native_action_finished`
 follows its return and includes Chrome's actual boolean `native_result`.
@@ -95,6 +101,9 @@ calls returning `false`, preserving the existing scan return value and polling
 schedule. It is not a successful-approval count.
 
 One producer stores these events and derives the human log entries from them.
+Text-writer failures leave the structured record available and do not cancel
+an upgrade or native action. `text_log_failures` and `last_text_log_error_type`
+report those failures without recording exception messages.
 Scans without matches or query errors remain in the structured history without
 adding text-log lines. Records contain fixed event names, recognized button
 names, booleans, counts, timings and exception class names. They omit other

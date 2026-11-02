@@ -247,6 +247,164 @@ class ConsentDiagnosticsTests(unittest.TestCase):
         fake.chrome_accessibility_health.assert_not_called()
         self.assertEqual(len(self.events('scan_started')), 1)
 
+    def test_writer_failure_keeps_valid_upgrade_open_and_retains_diagnostics(self):
+        sock = mock.Mock()
+        sock.recv.return_value = b'HTTP/1.1 101 Switching Protocols\r\n\r\n'
+        with mock.patch.object(self.daemon.socket, 'create_connection', return_value=sock):
+            with mock.patch.object(self.daemon, 'log', side_effect=OSError('private writer detail')):
+                result = self.daemon.ws_upgrade(150)
+        self.assertEqual(result[0], 'ok')
+        sock.recv.assert_called_once()
+        sock.close.assert_not_called()
+        snapshot = self.daemon.consent_snapshot()
+        self.assertEqual(snapshot['text_log_failures'], 1)
+        self.assertEqual(snapshot['last_text_log_error_type'], 'OSError')
+        self.assertEqual(snapshot['events'][0]['event'], 'upgrade_request_sent')
+        self.assertNotIn('private writer detail', json.dumps(snapshot))
+
+    def test_writer_failure_does_not_interrupt_full_successful_acquisition(self):
+        sock = mock.Mock()
+        sock.recv.return_value = b'HTTP/1.1 101 Switching Protocols\r\n\r\n'
+        with mock.patch.object(self.daemon.socket, 'create_connection', return_value=sock):
+            with mock.patch.object(self.daemon, 'log', side_effect=OSError('owned writer failure')):
+                self.assertTrue(self.daemon.connect_once(150))
+        self.assertIs(self.daemon.cdp_sock, sock)
+        self.assertEqual(self.daemon.cdp_state, 'connected')
+        sock.close.assert_not_called()
+        self.assertEqual(self.daemon.consent_snapshot()['text_log_failures'], 5)
+
+    def test_application_queries_increment_scan_error_count(self):
+        for operation in ('get_name', 'get_child_at_index', 'get_child_count'):
+            with self.subTest(operation=operation):
+                application = Node('Google Chrome')
+                desktop = Node(children=[application])
+                owner = application if operation == 'get_name' else desktop
+                if operation == 'get_child_count':
+                    owner = application
+                setattr(owner, operation, mock.Mock(side_effect=RuntimeError('private query text')))
+                self.modals.Atspi.get_desktop.return_value = desktop
+                self.modals.scan_and_press(self.daemon.begin_consent_scan())
+                self.assertEqual(self.events('scan_finished')[-1]['query_errors'], 1)
+        self.assertNotIn('private query text', json.dumps(self.events()))
+
+    def test_matched_label_query_error_is_counted_and_native_call_still_runs(self):
+        button = Node('Allow', 'push button')
+        button.get_name = mock.Mock(side_effect=['Allow', RuntimeError('private label')])
+        self.assertEqual(self.scan(button), 1)
+        self.assertEqual(button.calls, 1)
+        self.assertEqual(self.events('scan_finished')[0]['query_errors'], 1)
+        self.assertEqual(self.events('button_matched')[0]['button'], 'unknown')
+        self.assertNotIn('private label', json.dumps(self.events()))
+
+    def test_action_interface_queries_are_counted_separately_from_native_errors(self):
+        for operation in ('get_action_iface', 'get_n_actions', 'get_action_name'):
+            with self.subTest(operation=operation):
+                button = Node('Allow', 'push button')
+                setattr(button, operation, mock.Mock(side_effect=RuntimeError('private action query')))
+                self.assertEqual(self.scan(button), 0)
+                self.assertEqual(button.calls, 0)
+                self.assertEqual(self.events('scan_finished')[-1]['query_errors'], 1)
+        self.assertEqual(self.events('native_action_error'), [])
+        self.assertNotIn('private action query', json.dumps(self.events()))
+
+    def test_health_start_is_visible_while_blocked_and_completion_keeps_old_identity(self):
+        old_attempt = self.daemon.begin_consent_attempt(150)
+        self.daemon.press_wanted.set()
+        entered, finish = threading.Event(), threading.Event()
+        clock = [1_000_000_000]
+        failures = []
+
+        def scan(reporter):
+            reporter('scan_finished', completed_calls=0, matched_buttons=0, query_errors=0)
+            return 0
+
+        def health():
+            entered.set()
+            if not finish.wait(5):
+                raise AssertionError('Owned health call did not get its completion signal')
+            clock[0] += 5_000_000_000
+            return True, False
+
+        def run():
+            try:
+                self.daemon.presser_main()
+            except StopPresser:
+                pass
+            except BaseException as error:
+                failures.append(error)
+
+        fake = types.SimpleNamespace(scan_and_press=scan, chrome_accessibility_health=health)
+        with mock.patch.dict(sys.modules, {'clear_modals': fake}):
+            with mock.patch.object(self.daemon.time, 'sleep', side_effect=StopPresser):
+                with mock.patch.object(self.daemon.time, 'monotonic_ns', side_effect=lambda: clock[0]):
+                    thread = threading.Thread(target=run)
+                    thread.start()
+                    try:
+                        self.assertTrue(entered.wait(5))
+                        during = self.events()
+                        self.assertEqual(during[-1]['event'], 'accessibility_health_started')
+                        self.assertEqual(self.events('accessibility_health_finished'), [])
+                        self.daemon.begin_consent_attempt(150)
+                    finally:
+                        finish.set()
+                        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(failures, [])
+        start = self.events('accessibility_health_started')[0]
+        end = self.events('accessibility_health_finished')[0]
+        self.assertEqual(start['attempt_id'], old_attempt)
+        self.assertEqual(end['attempt_id'], old_attempt)
+        self.assertEqual(start['scan_id'], end['scan_id'])
+        self.assertEqual(end['duration_ms'], 5000)
+
+    def test_every_unchanged_health_observation_is_recorded_without_cadence_change(self):
+        self.daemon.begin_consent_attempt(150)
+        self.daemon.press_wanted.set()
+        scans = []
+
+        def scan(reporter):
+            scans.append(True)
+            reporter('scan_finished', completed_calls=0, matched_buttons=0, query_errors=0)
+            return 0
+
+        def sleep(seconds):
+            self.assertEqual(seconds, 0.5)
+            if len(scans) == 11:
+                raise StopPresser
+
+        health = mock.Mock(return_value=(True, False))
+        fake = types.SimpleNamespace(scan_and_press=scan, chrome_accessibility_health=health)
+        with mock.patch.dict(sys.modules, {'clear_modals': fake}):
+            with mock.patch.object(self.daemon.time, 'sleep', side_effect=sleep):
+                with self.assertRaises(StopPresser):
+                    self.daemon.presser_main()
+        self.assertEqual(len(scans), 11)
+        self.assertEqual(health.call_count, 2)
+        self.assertEqual(len(self.events('accessibility_health_started')), 2)
+        self.assertEqual(len(self.events('accessibility_health_finished')), 2)
+        self.assertTrue(all(entry['duration_ms'] >= 0 for entry in self.events('accessibility_health_finished')))
+
+    def test_health_failure_is_timed_and_distinguished_from_scan_failure(self):
+        self.daemon.begin_consent_attempt(150)
+        self.daemon.press_wanted.set()
+
+        def scan(reporter):
+            reporter('scan_finished', completed_calls=0, matched_buttons=0, query_errors=0)
+            return 0
+
+        fake = types.SimpleNamespace(scan_and_press=scan,
+            chrome_accessibility_health=mock.Mock(side_effect=RuntimeError('private health failure')))
+        with mock.patch.dict(sys.modules, {'clear_modals': fake}):
+            with mock.patch.object(self.daemon.time, 'sleep', side_effect=StopPresser) as sleep:
+                with self.assertRaises(StopPresser):
+                    self.daemon.presser_main()
+        sleep.assert_called_once_with(0.5)
+        failure = self.events('accessibility_health_failed')[0]
+        self.assertEqual(failure['error_type'], 'RuntimeError')
+        self.assertGreaterEqual(failure['duration_ms'], 0)
+        self.assertEqual(self.events('scan_failed'), [])
+        self.assertNotIn('private health failure', json.dumps(self.events()))
+
 
 if __name__ == '__main__':
     unittest.main()

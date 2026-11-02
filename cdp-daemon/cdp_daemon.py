@@ -136,13 +136,16 @@ consent_events = collections.deque(maxlen=1024)
 consent_sequence = 0
 consent_attempt = 0
 consent_scan = 0
+consent_log_failures = 0
+consent_log_error_type = None
 CONSENT_EVENTS = {
     'attempt_started', 'presser_requested', 'upgrade_request_sent', 'upgrade_finished',
     'connection_ready', 'presser_import_started', 'presser_import_finished',
     'presser_import_failed', 'scan_started', 'scan_finished', 'scan_failed',
     'button_matched', 'native_action_started', 'native_action_finished',
     'press_action_unavailable', 'native_action_error', 'accessibility_query_error',
-    'accessibility_health',
+    'accessibility_health_started', 'accessibility_health_finished',
+    'accessibility_health_failed',
 }
 CONSENT_NUMBERS = {'scan_id', 'budget_seconds', 'duration_ms', 'chrome_applications',
                    'matched_buttons', 'completed_calls', 'query_errors'}
@@ -150,7 +153,7 @@ CONSENT_NUMBERS = {'scan_id', 'budget_seconds', 'duration_ms', 'chrome_applicati
 
 def consent_event(event, attempt_id=None, *, state=None, **metadata):
     """Record selected metadata once; derive the human log from that record."""
-    global consent_sequence, cdp_state, cdp_diag
+    global consent_sequence, consent_log_failures, consent_log_error_type, cdp_state, cdp_diag
     if event not in CONSENT_EVENTS:
         raise ValueError('Unknown consent diagnostic event')
     fields = {}
@@ -177,13 +180,22 @@ def consent_event(event, attempt_id=None, *, state=None, **metadata):
         if state is not None:
             cdp_state, cdp_diag = state, message
     if event not in {'scan_started', 'scan_finished'} or fields.get('matched_buttons') or fields.get('query_errors'):
-        log(message)
+        try:
+            log(message)
+        except Exception as error:
+            # The record is retained even when its text writer fails. Do not
+            # let an optional log write cancel an upgrade or native action.
+            with consent_lock:
+                consent_log_failures += 1
+                consent_log_error_type = type(error).__name__
     return entry
 
 
 def consent_snapshot():
     with consent_lock:
         return {'capacity': consent_events.maxlen,
+                'text_log_failures': consent_log_failures,
+                'last_text_log_error_type': consent_log_error_type,
                 'dropped_events': consent_sequence - len(consent_events),
                 'first_seq': consent_events[0]['seq'] if consent_events else None,
                 'last_seq': consent_sequence, 'events': list(consent_events)}
@@ -223,14 +235,11 @@ def set_state(state, diag=""):
 
 
 # === Connect + Allow flow ===
-# In-process presser: ONE dedicated thread owns every AT-SPI call for the
-# daemon's lifetime (clear_modals imported as a library, not subprocessed, so
-# its findings land in this log). It parks on press_wanted between connect
-# attempts; while armed it scans/presses Chrome's Allow/Restore dialogs and
-# logs its diagnosis on change. Accessibility health is a live diagnostic
-# INSIDE the loop - never an up-front reason to skip pressing, because AT-SPI
-# visibility is transient (a one-shot check used to latch "not visible" here
-# and disable auto-press for the whole attempt).
+# One presser thread owns AT-SPI calls for the daemon's lifetime and parks on
+# press_wanted between attempts. While requested, it invokes matching Chrome
+# Allow/Restore actions and records scan, action and health observations.
+# AT-SPI visibility can change during acquisition, so health observations do
+# not disable later scans.
 press_wanted = threading.Event()
 presser_beat = [0.0]   # wall time of the presser's last live lap (hang detection)
 
@@ -246,10 +255,10 @@ def presser_main():
         return
     consent_event('presser_import_finished',
                   duration_ms=(time.monotonic_ns() - import_started) / 1_000_000)
-    last_diag, laps = None, 0
+    laps = 0
     while True:
         if not press_wanted.is_set():
-            last_diag, laps = None, 0
+            laps = 0
             press_wanted.wait()
         presser_beat[0] = time.time()
         report = begin_consent_scan()
@@ -259,11 +268,17 @@ def presser_main():
                 time.sleep(0.5)
                 continue
             if laps % 10 == 0:
-                found, renderer = clear_modals.chrome_accessibility_health()
-                diag = (found, renderer)
-                if diag != last_diag:
-                    report('accessibility_health', chrome_found=found, renderer_found=renderer)
-                    last_diag = diag
+                health_started = time.monotonic_ns()
+                report('accessibility_health_started')
+                try:
+                    found, renderer = clear_modals.chrome_accessibility_health()
+                except Exception as error:
+                    report('accessibility_health_failed', error_type=type(error).__name__,
+                           duration_ms=(time.monotonic_ns() - health_started) / 1_000_000)
+                else:
+                    report('accessibility_health_finished', chrome_found=found,
+                           renderer_found=renderer,
+                           duration_ms=(time.monotonic_ns() - health_started) / 1_000_000)
         except Exception as error:
             report('scan_failed', error_type=type(error).__name__)
         laps += 1
