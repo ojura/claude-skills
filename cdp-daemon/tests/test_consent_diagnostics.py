@@ -77,7 +77,10 @@ class ConsentDiagnosticsTests(unittest.TestCase):
         self.modals = load_modals()
 
     def scan(self, *nodes):
-        self.modals.Atspi.get_desktop.return_value = Node(children=[Node('Google Chrome', children=nodes)])
+        prompts = [Node('Restore pages?' if node.name == 'Restore' else 'Allow remote debugging?',
+                        'alert' if node.name == 'Restore' else 'dialog', children=[node])
+                   for node in nodes]
+        self.modals.Atspi.get_desktop.return_value = Node(children=[Node('Google Chrome', children=prompts)])
         self.daemon.begin_consent_attempt(150)
         return self.modals.scan_and_press(self.daemon.begin_consent_scan())
 
@@ -287,13 +290,13 @@ class ConsentDiagnosticsTests(unittest.TestCase):
                 self.assertEqual(self.events('scan_finished')[-1]['query_errors'], 1)
         self.assertNotIn('private query text', json.dumps(self.events()))
 
-    def test_matched_label_query_error_is_counted_and_native_call_still_runs(self):
+    def test_button_label_query_error_is_counted_without_guessing_its_action(self):
         button = Node('Allow', 'push button')
-        button.get_name = mock.Mock(side_effect=['Allow', RuntimeError('private label')])
-        self.assertEqual(self.scan(button), 1)
-        self.assertEqual(button.calls, 1)
+        button.get_name = mock.Mock(side_effect=RuntimeError('private label'))
+        self.assertEqual(self.scan(button), 0)
+        self.assertEqual(button.calls, 0)
         self.assertEqual(self.events('scan_finished')[0]['query_errors'], 1)
-        self.assertEqual(self.events('button_matched')[0]['button'], 'unknown')
+        self.assertEqual(self.events('button_matched'), [])
         self.assertNotIn('private label', json.dumps(self.events()))
 
     def test_action_interface_queries_are_counted_separately_from_native_errors(self):
@@ -404,6 +407,106 @@ class ConsentDiagnosticsTests(unittest.TestCase):
         self.assertGreaterEqual(failure['duration_ms'], 0)
         self.assertEqual(self.events('scan_failed'), [])
         self.assertNotIn('private health failure', json.dumps(self.events()))
+
+    def scan_native_tree(self, *children):
+        self.modals.Atspi.get_desktop.return_value = Node(children=[Node('Google Chrome', children=children)])
+        self.daemon.begin_consent_attempt(150)
+        return self.modals.scan_and_press(self.daemon.begin_consent_scan())
+
+    def test_maximized_window_restore_is_excluded_but_both_intended_prompts_work(self):
+        window_restore = Node('Restore', 'push button')
+        consent_buttons = [Node('Allow', 'push button'), Node('Allow', 'push button')]
+        recovery_restore = Node('Restore', 'push button')
+        frame = Node('Owned maximized window', 'frame', children=[
+            Node('Window controls', children=[window_restore]),
+            Node('Allow remote debugging?', 'dialog', children=consent_buttons),
+            Node('Restore pages?', 'alert', children=[recovery_restore]),
+        ])
+        self.assertEqual(self.scan_native_tree(frame), 3)
+        self.assertEqual(window_restore.calls, 0)
+        self.assertEqual([button.calls for button in consent_buttons], [1, 1])
+        self.assertEqual(recovery_restore.calls, 1)
+        actions = self.events('native_action_finished')
+        self.assertEqual([(event['button'], event['prompt_kind']) for event in actions],
+                         [('Allow', 'consent'), ('Allow', 'consent'), ('Restore', 'crash_recovery')])
+        self.assertEqual(self.events('scan_finished')[0]['excluded_buttons'], 1)
+
+    def test_web_document_cannot_imitate_native_prompt_titles_and_buttons(self):
+        allow, restore = Node('Allow', 'button'), Node('Restore', 'button')
+        imitations = Node('Owned web page', 'document web', children=[
+            Node('Allow remote debugging?', 'dialog', children=[allow]),
+            Node('Restore pages?', 'alert', children=[restore]),
+        ])
+        self.assertEqual(self.scan_native_tree(Node(role='frame', children=[imitations])), 0)
+        self.assertEqual((allow.calls, restore.calls), (0, 0))
+        self.assertEqual(self.events('scan_finished')[0]['document_subtrees_skipped'], 1)
+        self.assertEqual(self.events('button_matched'), [])
+
+    def test_document_subtree_is_skipped_before_reading_its_content(self):
+        content = Node('private page content')
+        content.get_name = mock.Mock(side_effect=AssertionError('Web content was inspected'))
+        for role in sorted(self.modals.DOCUMENT_ROLES):
+            with self.subTest(role=role):
+                document = Node(role=role, children=[content])
+                document.get_child_count = mock.Mock(side_effect=AssertionError('Document traversal occurred'))
+                self.assertEqual(self.scan_native_tree(document), 0)
+                content.get_name.assert_not_called()
+                document.get_child_count.assert_not_called()
+
+    def test_unknown_native_prompt_is_observable_without_global_fallback(self):
+        button = Node('Allow', 'button')
+        self.assertEqual(self.scan_native_tree(Node('private dialog title', 'dialog', children=[button])), 0)
+        self.assertEqual(button.calls, 0)
+        self.assertEqual(self.events('scan_finished')[0]['unsupported_prompts'], 1)
+        self.assertEqual(self.events('prompt_structure_unavailable')[0]['reason'], 'unrecognized_prompt')
+        self.assertNotIn('private dialog title', json.dumps(self.events()))
+
+    def test_known_prompt_nested_under_unrecognized_dialog_stays_excluded(self):
+        button = Node('Allow', 'button')
+        nested = Node('private unrelated dialog', 'dialog', children=[
+            Node('Allow remote debugging?', 'alert', children=[button])])
+        self.assertEqual(self.scan_native_tree(nested), 0)
+        self.assertEqual(button.calls, 0)
+        reasons = [event['reason'] for event in self.events('prompt_structure_unavailable')]
+        self.assertEqual(reasons, ['unrecognized_prompt', 'unsupported_ancestor'])
+        self.assertNotIn('private unrelated dialog', json.dumps(self.events()))
+
+    def test_title_without_native_dialog_role_does_not_authorize_button(self):
+        button = Node('Allow', 'button')
+        self.assertEqual(self.scan_native_tree(Node('Allow remote debugging?', 'panel', children=[button])), 0)
+        self.assertEqual(button.calls, 0)
+        self.assertEqual(self.events('button_rejected')[0]['reason'], 'outside_intended_prompt')
+
+    def test_conflicting_nested_prompt_context_is_observable_and_not_invoked(self):
+        button = Node('Restore', 'button')
+        nested = Node('Allow remote debugging?', 'dialog', children=[
+            Node('Restore pages?', 'alert', children=[button])])
+        self.assertEqual(self.scan_native_tree(nested), 0)
+        self.assertEqual(button.calls, 0)
+        self.assertEqual(self.events('prompt_structure_unavailable')[0]['reason'], 'conflicting_prompts')
+
+    def test_native_window_nested_under_prompt_does_not_inherit_button_permission(self):
+        button = Node('Restore', 'button')
+        prompt = Node('Restore pages?', 'alert', children=[
+            Node('Owned window', 'frame', children=[button])])
+        self.assertEqual(self.scan_native_tree(prompt), 0)
+        self.assertEqual(button.calls, 0)
+        self.assertEqual(self.events('prompt_structure_unavailable')[0]['reason'], 'nested_window')
+
+    def test_nested_same_prompt_keeps_distinct_buttons_and_visits_each_once(self):
+        buttons = [Node('Allow', 'button'), Node('Allow', 'push button')]
+        prompt = Node('Allow remote debugging?', 'dialog', children=[
+            Node('Allow remote debugging?', 'alert', children=buttons)])
+        self.assertEqual(self.scan_native_tree(prompt), 2)
+        self.assertEqual([button.calls for button in buttons], [1, 1])
+
+    def test_depth_limit_is_reported_without_scanning_unbounded_structure(self):
+        node = Node('Allow', 'button')
+        for unused in range(33):
+            node = Node(children=[node])
+        self.assertEqual(self.scan_native_tree(node), 0)
+        self.assertGreater(self.events('scan_finished')[0]['depth_limited'], 0)
+        self.assertEqual(self.events('prompt_structure_unavailable')[0]['reason'], 'depth_limit')
 
 
 if __name__ == '__main__':
