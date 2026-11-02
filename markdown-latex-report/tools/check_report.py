@@ -8,9 +8,9 @@ and its Markdown source. `make check` runs it; by hand:
 
 It writes OUT/check.md and prints it, renders the pages into OUT/render at the
 given dpi, and exits 1 when the PDF has a defect that loses or garbles content
-(an overfull vertical box, a missing character, an undefined reference, a
-missing figure) and 0 otherwise. Every finding names a page or a source line,
-so that the writer can go there.
+(a LaTeX error, an overfull vertical box, a missing character, an undefined
+reference, a missing figure) and 0 otherwise. Every finding names a page or a
+source line, so that the writer can go there.
 
 What it checks:
   log      overfull and underfull boxes with their page and source line,
@@ -115,6 +115,7 @@ def parse_log(log_text):
         i += 1
     other = {
         "missing_character": [l for l in lines if "Missing character" in l],
+        "error": [l for l in lines if l.startswith("! ")],
         "undefined": [l for l in lines if re.search(r"(Reference|Citation) .* undefined", l)],
         "rerun": [l for l in lines if "Rerun to get" in l or "Label(s) may have changed" in l],
         "float": [l for l in lines if re.search(r"Float too large|float\(s\) lost|contains only floats", l)],
@@ -507,11 +508,11 @@ def main():
     R.append("")
     R.append("Pages %d, %.0f x %.0f pt. Overfull boxes %d (%d horizontal, %d vertical). "
              "Underfull lines %d (%d above badness 1000, %d above 3000). Missing characters %d. "
-             "Undefined references %d." % (
+             "Undefined references %d. LaTeX errors %d." % (
                  n_pages, W, H, len(over_h) + len(over_v), len(over_h), len(over_v), len(under_h),
                  sum(1 for b in under_h if (b["badness"] or 0) > 1000),
                  sum(1 for b in under_h if (b["badness"] or 0) > 3000),
-                 len(other["missing_character"]), len(undef)))
+                 len(other["missing_character"]), len(undef), len(other["error"])))
     R.append("")
 
     # ---- log ----
@@ -530,6 +531,10 @@ def main():
         hard.append("overfull vertical box")
         said = True
         R.append("- Overfull vertical box (%s), page about %d: text is pushed past the page edge and lost. %s" % (b["amount"], b["page_guess"], b["rest"]))
+    for l in other["error"]:
+        hard.append("LaTeX error")
+        said = True
+        R.append("- %s (a LaTeX error: the run went on in nonstop mode, so the PDF may lack or misplace content; `make` stops on it)" % l.strip())
     for l in other["missing_character"]:
         hard.append("missing character")
         said = True

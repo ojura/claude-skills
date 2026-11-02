@@ -349,12 +349,13 @@ showcase under `docs/` with the fresh build and fails while they differ; a
 check of another document does not run that comparison.
 
 Pass extra options with `CHECK_ARGS="--root path/to/evidence --render 100"`.
-The check exits 1 when the PDF has lost or garbled content: an overfull
-vertical box (text below the page edge), a missing character, an undefined
-reference, a missing image. The other findings are for reading. Then look at
-the rendered pages the report names, and at a sample of the others; the
-checker cannot see a figure that overlaps its caption or a chart with text too
-small to read.
+The check exits 1 when the PDF has lost or garbled content: a LaTeX error
+(the check runs LaTeX in nonstop mode, so it still gets a PDF, while `make`
+stops), an overfull vertical box (text below the page edge), a missing
+character, an undefined reference, a missing image. The other findings are
+for reading. Then look at the rendered pages the report names, and at a
+sample of the others; the checker cannot see a figure that overlaps its
+caption or a chart with text too small to read.
 
 `python3 tools/prose_check.py REPORT.md [--terms terms.txt] [--banned words.txt]`
 scans the Markdown for the countable faults of "Writing the report" and prints

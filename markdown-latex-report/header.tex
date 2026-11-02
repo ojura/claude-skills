@@ -269,12 +269,13 @@
 % as a diff. Override with conventional green/red so + and - read at a
 % glance. C++ string literals (also \StringTok) become red, which matches
 % common IDE themes; variable highlighting in other languages (e.g. shell)
-% becomes green. Pandoc emits the \newcommand{...} definitions ahead of
-% the include-in-header content, so \renewcommand here lands cleanly.
+% becomes green. Pandoc defines the token commands only when the document
+% has highlighted code, so \def defines them in either case: a document
+% without a code block has no \VariableTok for \renewcommand to change.
 \definecolor{diffaddcolor}{HTML}{007020}
 \definecolor{diffdelcolor}{HTML}{B22222}
-\renewcommand{\VariableTok}[1]{\textcolor{diffaddcolor}{#1}}
-\renewcommand{\StringTok}[1]{\textcolor{diffdelcolor}{#1}}
+\def\VariableTok#1{\textcolor{diffaddcolor}{#1}}
+\def\StringTok#1{\textcolor{diffdelcolor}{#1}}
 
 % ---- longtable spacing ----
 \setlength{\LTpre}{6pt}
