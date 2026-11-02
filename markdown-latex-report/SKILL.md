@@ -35,6 +35,8 @@ finished in one pass instead of after a reviewer's second.
   `ukenglish` with the patterns in `hyph-en-gb.tex` (from hyph-utf8, MIT
   licence), which babel then loads. Without them TeX does not hyphenate such
   a document. An installation that has `ukenglish` keeps its own patterns.
+  `hyph-hr.tex` does the same for Croatian (`lang: hr`, the rules `croatian`,
+  from hyph-utf8 under LPPL), for installations without hyphen-croatian.
 - `filter.lua`: the pandoc Lua filter, which does most of the work:
   1. renders every Markdown table as a raw-LaTeX longtable with column widths
      computed from content (long-text columns dampened, short columns floored,
@@ -383,9 +385,9 @@ and the three previews. It fails with `sample report is stale: run make
 sample` while they differ.
 
 Run `make check` after changes to the Makefile, `header.tex`, `filter.lua`,
-the `.sty` files, `bblopts.cfg`, `hyph-en-gb.tex`, `chartstyle.py`, or the
-fixture under `test/`. The comparison uses the PDF built in `CHECK_DIR`
-during that check, independently of any existing `REPORT.pdf`. If the output
+the `.sty` files, `bblopts.cfg`, `hyph-en-gb.tex`, `hyph-hr.tex`,
+`chartstyle.py`, or the fixture under `test/`. The comparison uses the PDF
+built in `CHECK_DIR` during that check, independently of any existing `REPORT.pdf`. If the output
 changes as intended, run `make sample`, run `make check` again, and commit
 the regenerated `docs/` files with the source changes.
 

@@ -88,7 +88,7 @@ $(CHARTS_STAMP): $(wildcard $(PLOT)) chartstyle.py
 # by filter.lua; regenerating a figure must trigger a re-embed
 FIGS := $(wildcard $(dir $(REPORT))img/*)
 
-$(OUT): Makefile $(REPORT) header.tex filter.lua bblopts.cfg hyph-en-gb.tex $(LOCAL_STYS) $(CHARTS_STAMP) $(FIGS)
+$(OUT): Makefile $(REPORT) header.tex filter.lua bblopts.cfg hyph-en-gb.tex hyph-hr.tex $(LOCAL_STYS) $(CHARTS_STAMP) $(FIGS)
 	TEXINPUTS=.:$$TEXINPUTS pandoc $(REPORT) $(PANDOC_FLAGS) \
 		--pdf-engine=lualatex \
 		-o $(OUT)

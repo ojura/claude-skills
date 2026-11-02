@@ -75,7 +75,8 @@ and customization (fonts, chart directory, manual table overrides).
 - `bblopts.cfg`, `hyph-en-gb.tex`: British hyphenation for documents with
   `lang: en-GB` on installations without the package hyphen-english:
   `bblopts.cfg` makes babel load the patterns in `hyph-en-gb.tex` (hyph-utf8,
-  MIT licence).
+  MIT licence). `hyph-hr.tex` (hyph-utf8, LPPL) does the same for Croatian,
+  `lang: hr`, on installations without hyphen-croatian.
 - `test/`: a self-contained fixture (a fictional toaster-firmware performance
   report) that exercises the pipeline's features and serves as the smoke test. Building
   it is how you confirm the pipeline works.
