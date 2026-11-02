@@ -51,8 +51,8 @@ the installed cc-env launcher reader for the prefix under the selected environme
 and target working directory, then checks the same configuration and executable
 observations before launch. A configured but unusable or unreadable wrapper
 refuses the launch instead of running Claude unwrapped. The native argv stays
-unchanged after the prefix. Reports show the wrapper program and omit its configured arguments. The reader is found beside the installed
-`cc-env` command; update cc-env to use a configured wrapper when that reader is
+unchanged after the prefix. Reports show the wrapper program and omit its
+configured arguments. The reader is found beside the installed `cc-env` command; update cc-env to use a configured wrapper when that reader is
 unavailable. An unconfigured launch remains usable without it.
 
 For a stopped lead, `--caller-env` explicitly keeps the invoking command's

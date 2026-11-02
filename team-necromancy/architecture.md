@@ -992,13 +992,14 @@ launch environment before the roster claim and before tmux.
 tmux client, so a new server inherits them, then restores the tool's environment.
 The client uses the selected absolute socket path; a different `TMUX_TMPDIR` in
 the source environment therefore cannot change the server it contacts. The
-launch binds a Unix socket in a private temporary directory and runs a Python
-exec helper directly in the pane, without a shell. The helper receives the
+launcher creates a temporary directory with mode 0700 and binds a Unix socket
+inside it. Programs running as the launcher's user can open that socket. A Python
+exec helper runs directly in the pane, without a shell. The helper receives the
 selected values over that socket, adds the new pane's terminal variables, and
 acknowledges receipt before exec. The sender then closes and removes the socket.
 This avoids tmux's command-message size limit. The selected environment map is
-sent over the private socket instead of being written to a file or command
-arguments; launch reports show its source and variable count. Replacing the pane's environment
+sent over the socket; launch reports show its source and variable count.
+Replacing the pane's environment
 removes stale server variables and preserves explicit absences without changing
 other panes. The helper sets `PWD` from the actual working directory.
 
@@ -1025,9 +1026,9 @@ it again. Executors use the selected argv and do not resolve the wrapper.
 
 Reports print the native command and wrapper program separately. Dry-run tmux
 output uses the selected public description. A manual command uses the reader's
-`wrap` mode, which resolves the configured prefix in that terminal without
-printing private wrapper arguments. Like other manually pasted commands, it uses
-that terminal's environment.
+`wrap` mode, which resolves the configured prefix in that terminal. Reports
+omit configured wrapper arguments. Like other manually pasted commands, the
+manual command uses that terminal's environment.
 
 A `Seat` is an observed pair of socket and pane. A `LaunchDestination` is a
 selected socket and optional pane reference. They are deliberately distinct: a
