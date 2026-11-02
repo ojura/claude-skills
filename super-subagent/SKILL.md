@@ -24,6 +24,14 @@ SendMessage({to: "<agent_id>", message: "<self-contained assignment>"})
 
 The helper uses `CLAUDE_CODE_SESSION_ID` to locate the session that owns the new agent. `--session-id` and `--parent-jsonl` can select that session explicitly; they do not supply context in fresh mode. Fresh preparation does not use caller discovery, so it needs neither an invocation ID nor an active Bash tool call. `--from-main`, `--from-agent-id`, `--from-agent-name`, `--parent-last-uuid` and `--fork-another-model` do not apply to `--fresh`.
 
+### Reuse project grounding
+
+For repeated work in a project, prepare one fresh GPT worker and give it a light grounding assignment: read the project instructions, locate the relevant files and learn the interfaces it will use. Resume that worker with `SendMessage` for later assignments on the same model. The initial grounding is paid for once; subsequent requests read the unchanged prefix from the prompt cache. GPT's long cache retention makes this useful across gaps between assignments.
+
+Keep the reusable grounding prefix light. The whole parent conversation or a worker's accumulated implementation history is not project grounding. If preparing children from it, use a dedicated worker that stopped after grounding: `--from-agent-id` copies the selected worker's entire recorded history.
+
+For Claude workers, another pattern to test is one-hour caching for the grounding step, followed by five-minute caching for later work. Configure the TTL through the client's cache controls and check its usage counters after switching to establish that the grounding prefix is still being read from cache. Scope the TTL change to the intended worker; an environment setting shared by a process also affects its other in-process workers.
+
 ## Context-inheriting forks
 
 Omit `--fresh` when the task needs inherited context. A fork keeps its parent's model. For a different model, prepare a fresh worker and provide its assignment explicitly.
