@@ -355,8 +355,9 @@ def fork_model_settings(args: argparse.Namespace) -> tuple[str, bool, str | None
     fork_another_model = args.fork_another_model
     if model != "inherit" and not fork_another_model:
         raise UsageError(
-            "a non-inherit model requires --fork-another-model; the selected model "
-            "cannot reuse the parent's cached prefix"
+            "use --fresh --model for a worker without inherited history; changing the "
+            "model of inherited context requires --fork-another-model and cannot reuse "
+            "the parent's cached prefix"
         )
     if model == "inherit" and fork_another_model:
         raise UsageError("--fork-another-model requires a non-inherit --model value")
@@ -414,6 +415,19 @@ def make_fork_seed(
     parent_uuid: str | None,
     template_record: dict[str, Any],
 ) -> dict[str, Any]:
+    return make_agent_seed(
+        agent_id, session_id, parent_uuid, template_record,
+        FORK_BOILERPLATE + "\n\nYour directive is the following user message.",
+    )
+
+
+def make_agent_seed(
+    agent_id: str,
+    session_id: str,
+    parent_uuid: str | None,
+    template_record: dict[str, Any],
+    text: str,
+) -> dict[str, Any]:
     seed: dict[str, Any] = {
         "parentUuid": parent_uuid,
         "isSidechain": True,
@@ -425,10 +439,7 @@ def make_fork_seed(
             "content": [
                 {
                     "type": "text",
-                    "text": (
-                        FORK_BOILERPLATE
-                        + "\n\nYour directive is the following user message."
-                    ),
+                    "text": text,
                 }
             ],
         },
@@ -1172,6 +1183,45 @@ def prepare_worker_agent(
     }
 
 
+def prepare_fresh_agent(
+    args: argparse.Namespace, parent_jsonl: Path, session_id: str,
+) -> dict[str, Any]:
+    if args.parent_last_uuid or args.from_main or args.from_agent_id or args.from_agent_name:
+        raise UsageError("--fresh cannot select inherited history")
+    if args.fork_another_model:
+        raise UsageError("--fresh does not use --fork-another-model")
+    model = args.model.strip()
+    if not model or model == "inherit":
+        raise UsageError("--fresh requires an explicit --model")
+    description, agent_name, agent_id = agent_identity(args)
+    seed = make_agent_seed(
+        agent_id, session_id, None, {},
+        "You are a fresh worker. Your assignment follows in the next message.",
+    )
+    metadata = {
+        "agentType": "general-purpose",
+        "description": description,
+        "name": agent_name,
+        "spawnDepth": spawn_depth(args),
+        "model": model,
+    }
+    jsonl_path, meta_path = publish_agent_files(
+        parent_jsonl.parent / session_id / "subagents", agent_id,
+        json_line(seed), metadata,
+    )
+    return {
+        "agent_id": agent_id,
+        "name": agent_name,
+        "description": description,
+        "mode": "fresh",
+        "model": model,
+        "parent_session_id": session_id,
+        "jsonl": str(jsonl_path),
+        "meta": str(meta_path),
+        "send_message": {"to": agent_id, "message": "<directive>"},
+    }
+
+
 def prepare_agent(args: argparse.Namespace) -> dict[str, Any]:
     projects_root = Path(args.projects_root).expanduser().resolve()
     parent_jsonl, session_id = find_parent_jsonl(
@@ -1179,6 +1229,8 @@ def prepare_agent(args: argparse.Namespace) -> dict[str, Any]:
         session_id=args.session_id,
         projects_root=projects_root,
     )
+    if args.fresh:
+        return prepare_fresh_agent(args, parent_jsonl, session_id)
     subagents_directory = parent_jsonl.parent / session_id / "subagents"
     selection = discover_prepare_caller(args, parent_jsonl, subagents_directory)
     if selection.source_id is None:
@@ -1487,12 +1539,12 @@ def add_parent_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def add_fork_creation_options(parser: argparse.ArgumentParser) -> None:
+def add_agent_creation_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("description", help="short description used to generate the agent name")
     parser.add_argument(
         "--model",
         default="inherit",
-        help="model id; non-inherit values require --fork-another-model",
+        help="explicit model id for --fresh; inherited context requires --fork-another-model to change models",
     )
     parser.add_argument(
         "--fork-another-model",
@@ -1514,16 +1566,21 @@ def add_fork_creation_options(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Prepare fork agents and resume failed workflow agents through SendMessage."
+        description="Prepare fresh workers or forks, and resume workflow agents through SendMessage."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     prepare = subparsers.add_parser(
         "prepare",
-        help="prepare a child from the calling main session or worker",
+        help="prepare a fresh worker or a child inheriting the caller's context",
     )
-    add_fork_creation_options(prepare)
+    add_agent_creation_options(prepare)
     source = prepare.add_mutually_exclusive_group()
+    source.add_argument(
+        "--fresh",
+        action="store_true",
+        help="prepare a regular agent with an explicit model and without inherited conversation history",
+    )
     source.add_argument(
         "--from-main",
         action="store_true",
