@@ -114,8 +114,10 @@ One producer stores these events and derives the human log entries from them.
 Text-writer failures leave the structured record available and do not cancel
 an upgrade or native action. `text_log_failures` and `last_text_log_error_type`
 report those failures without recording exception messages.
-Scans without matches or query errors remain in the structured history without
-adding text-log lines. `button_matched` includes the recognized `prompt_kind`;
+Scan-start records are retained only in structured history. Scan-completion
+records also omit the text log when their match and query-error counts are both
+zero. Rejection and unsupported-structure events remain logged independently.
+`button_matched` includes the recognized `prompt_kind`;
 `button_rejected` and `prompt_structure_unavailable` explain exclusions with
 fixed reason codes. Scan summaries count skipped document subtrees, unsupported
 prompts, excluded buttons and traversal depth limits. These observations remain
