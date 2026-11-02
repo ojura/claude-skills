@@ -82,7 +82,7 @@ def press_button(btn, reporter=None, button='unknown'):
 
     Preserve the existing completed-call count. The diagnostic separately records
     Chrome's boolean result, which can be false even when the call completes.
-    Neither a completed call nor an accepted action proves consent was granted.
+    A completed call or accepted action does not establish that consent was granted.
     """
     action_started = False
     try:
