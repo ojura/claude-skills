@@ -68,11 +68,10 @@ A finding can list its own choices in `options` (for example CURRENT and suggest
 - Changing finding content produces a separate state.
 - Exported decision JSON can be imported with merge or replace preview. Undo remains available until the next manual decision or note edit.
 - Seeded `decision` and `note` fields become the board's reset state.
-- Each finding's `figures` appear under its locations as embedded images (PNG, JPEG, GIF or WebP; SVG is refused); a click shows one at full size.
+- Each finding's `figures` appear under its locations as embedded images (PNG, JPEG, GIF, WebP or SVG); a click shows one at full size.
 - **Export HTML** downloads a standalone copy with the current decisions, notes, theme, and density embedded.
 - Each exported HTML snapshot uses its own local-storage namespace, so other board state cannot override its embedded decisions.
-- Source text is escaped both in HTML and in the embedded JSON script block.
-- CSV cells beginning with spreadsheet formula markers are prefixed so imported findings and notes remain literal.
+- Source text is escaped both in HTML and in the embedded JSON script block, so `<`, `&` and `</script>` in a finding show as written.
 
 ## Test
 
@@ -80,4 +79,4 @@ A finding can list its own choices in `options` (for example CURRENT and suggest
 python3 -m unittest discover -s test -v
 ```
 
-The tests cover generation, the Resolved decision category and semantics, the sticky progress panel, static filters, bottom action panel, connected export buttons, embedded HTML snapshots, initial decisions, source-ID preservation, duplicate IDs, category symbols, token-shaped source text, unresolved template tokens, import preview and undo guards, spreadsheet formula markers, and script-breakout escaping.
+The tests cover generation, the Resolved decision category and semantics, the sticky progress panel, static filters, bottom action panel, connected export buttons, embedded HTML snapshots, initial decisions, source-ID preservation, duplicate IDs, category symbols, token-shaped source text, unresolved template tokens, import preview and undo guards, CSV quoting, figure formats, and `</script>` inside finding text.

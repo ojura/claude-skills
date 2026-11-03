@@ -1748,13 +1748,10 @@
       };
     }
 
+    // Writing < as \u003c keeps a </script> in a finding or note from ending the
+    // script element early. JSON.parse reads \u003c back as <.
     function jsonForEmbeddedScript(value) {
-      return JSON.stringify(value)
-        .replaceAll('<', '\\u003c')
-        .replaceAll('>', '\\u003e')
-        .replaceAll('&', '\\u0026')
-        .replaceAll(String.fromCharCode(0x2028), '\\u2028')
-        .replaceAll(String.fromCharCode(0x2029), '\\u2029');
+      return JSON.stringify(value).replaceAll('<', '\\u003c');
     }
 
     function exportHtmlText() {
@@ -1825,10 +1822,7 @@
     }
 
     function csvCell(value) {
-      const text = String(value ?? '');
-      // Spreadsheet applications can execute leading formula markers in imported CSV cells.
-      const safeText = /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
-      return `"${safeText.replaceAll('"', '""')}"`;
+      return `"${String(value ?? '').replaceAll('"', '""')}"`;
     }
 
     function exportCsv() {

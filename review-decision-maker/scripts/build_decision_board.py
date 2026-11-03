@@ -55,13 +55,18 @@ SEVERITY_ALIASES = {
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 LINE_PATTERN = re.compile(r"^(.*):(\d+(?:-\d+)?)$")
 TOKEN_PATTERN = re.compile(r"@@[A-Z0-9_]+@@")
-# Raster formats a browser shows inline, recognized by their first bytes. SVG is not
-# accepted, because an SVG image can carry script.
+# Raster formats a browser shows inline, recognized by their first bytes.
 FIGURE_SIGNATURES = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
     (b"\xff\xd8\xff", "image/jpeg"),
     (b"GIF87a", "image/gif"),
     (b"GIF89a", "image/gif"),
+)
+# An SVG file is recognized by its <svg> root element, which may follow an XML
+# declaration, processing instructions, comments and a doctype.
+SVG_ROOT_PATTERN = re.compile(
+    r"\A\ufeff?\s*(?:(?:<\?.*?\?>|<!--.*?-->|<!DOCTYPE[^\[>]*(?:\[.*?\])?\s*>)\s*)*<svg[\s/>]",
+    re.DOTALL,
 )
 
 
@@ -138,6 +143,8 @@ def figure_media_type(data: bytes) -> str | None:
             return media_type
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
+    if SVG_ROOT_PATTERN.match(data.decode("utf-8", errors="replace")):
+        return "image/svg+xml"
     return None
 
 
@@ -164,7 +171,7 @@ def load_figure(value: Any, base_dir: Path, finding_id: str, index: int) -> tupl
     media_type = figure_media_type(data)
     if media_type is None:
         raise ValueError(
-            f"finding {finding_id} figure {index + 1}: {path} is not a PNG, JPEG, GIF or WebP image"
+            f"finding {finding_id} figure {index + 1}: {path} is not a PNG, JPEG, GIF, WebP or SVG image"
         )
     caption = caption.strip()
     meta = {
@@ -781,15 +788,11 @@ def option_list(values: list[str], display) -> str:
     )
 
 
-def safe_json_for_script(value: Any) -> str:
+def json_for_embedded_script(value: Any) -> str:
+    # Writing "<" as \u003c keeps a "</script>" in finding text from ending the script
+    # element early. JSON.parse reads \u003c back as "<".
     serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return (
-        serialized.replace("<", "\\u003c")
-        .replace(">", "\\u003e")
-        .replace("&", "\\u0026")
-        .replace(chr(0x2028), "\\u2028")
-        .replace(chr(0x2029), "\\u2029")
-    )
+    return serialized.replace("<", "\\u003c")
 
 
 def render_embedded_files(payload: dict[str, Any], pdfjs_dir: Path | None) -> str:
@@ -827,7 +830,7 @@ def render_board(payload: dict[str, Any], template_file: Path, pdfjs_dir: Path |
             for index, item in enumerate(findings)
         ),
         "@@SOURCE_NAME@@": html.escape(payload["source"]),
-        "@@FINDINGS_DATA@@": safe_json_for_script(embedded),
+        "@@FINDINGS_DATA@@": json_for_embedded_script(embedded),
         "@@DECISION_CSS@@": render_decision_css(decisions),
         "@@DECISION_STAT_BUTTONS@@": render_decision_stat_buttons(decisions, len(findings)),
         "@@DECISION_FILTER_OPTIONS@@": render_decision_filter_options(decisions),

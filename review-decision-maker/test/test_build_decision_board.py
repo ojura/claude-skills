@@ -384,7 +384,7 @@ class DecisionBoardBuilderTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate finding id F001"):
             builder.normalize_payload(raw, Path("findings.json"), None)
 
-    def test_csv_cells_neutralize_spreadsheet_formula_markers(self):
+    def test_csv_cells_are_quoted_with_inner_quotes_doubled(self):
         template = TEMPLATE_FILE.read_text(encoding="utf-8")
         csv_function = re.search(
             r"function csvCell\(value\) \{.*?\n    \}",
@@ -392,9 +392,7 @@ class DecisionBoardBuilderTest(unittest.TestCase):
             flags=re.DOTALL,
         )
         self.assertIsNotNone(csv_function)
-        self.assertIn("/^[=+\\-@\\t\\r]/.test(text)", csv_function.group(0))
-        self.assertIn("? `'${text}` : text", csv_function.group(0))
-        self.assertIn("safeText.replaceAll", csv_function.group(0))
+        self.assertIn("""`"${String(value ?? '').replaceAll('"', '""')}"`""", csv_function.group(0))
 
     def test_import_undo_is_invalidated_by_manual_edits(self):
         template = TEMPLATE_FILE.read_text(encoding="utf-8")
@@ -425,15 +423,9 @@ class DecisionBoardBuilderTest(unittest.TestCase):
         )
         self.assertNotIn("missingCount: FINDINGS.length - entries.length", template)
 
-    def test_script_breakout_text_is_escaped(self):
-        raw = {
-            "findings": [
-                {
-                    "id": "F001",
-                    "title": "Close </script><script>alert(1)</script>",
-                }
-            ]
-        }
+    def test_script_end_tag_in_finding_text_stays_inside_the_json(self):
+        title = "Inline </script> in index.html ends the bootstrap block early"
+        raw = {"findings": [{"id": "F001", "title": title}]}
         payload = builder.normalize_payload(raw, Path("findings.json"), None)
         rendered = builder.render_board(payload, TEMPLATE_FILE)
         embedded_match = re.search(
@@ -443,10 +435,7 @@ class DecisionBoardBuilderTest(unittest.TestCase):
         )
         self.assertIsNotNone(embedded_match)
         self.assertNotIn("</script>", embedded_match.group(1))
-        self.assertEqual(
-            json.loads(embedded_match.group(1))["findings"][0]["title"],
-            "Close </script><script>alert(1)</script>",
-        )
+        self.assertEqual(json.loads(embedded_match.group(1))["findings"][0]["title"], title)
 
 
     def test_figures_are_embedded_beside_the_finding(self):
@@ -493,14 +482,29 @@ class DecisionBoardBuilderTest(unittest.TestCase):
         self.assertEqual(first, again)
         self.assertNotEqual(first, changed)
 
-    def test_figures_reject_svg_unreadable_files_and_missing_paths(self):
+    def test_svg_figures_are_embedded(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
-            (folder / "drawing.svg").write_text(
-                '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+            (folder / "diagram.svg").write_text(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<!-- Created with Inkscape -->\n'
+                '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">'
+                '<rect width="10" height="10"/></svg>\n',
                 encoding="utf-8",
             )
-            for figure in ({"path": "drawing.svg"}, {"path": "absent.png"}, {"caption": "no path"}, 7):
+            raw = {"findings": [{"id": "F001", "title": "T", "figures": ["diagram.svg"]}]}
+            payload = builder.normalize_payload(raw, folder / "findings.json", None)
+            rendered = builder.render_board(payload, TEMPLATE_FILE)
+
+        self.assertIn('<img src="data:image/svg+xml;base64,', rendered)
+        figure = json.loads(embedded_data(rendered))["findings"][0]["figures"][0]
+        self.assertEqual(figure["media_type"], "image/svg+xml")
+
+    def test_figures_reject_non_images_unreadable_files_and_missing_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "notes.txt").write_text("Page 12 has a wide gap.\n", encoding="utf-8")
+            for figure in ({"path": "notes.txt"}, {"path": "absent.png"}, {"caption": "no path"}, 7):
                 with self.subTest(figure=figure):
                     raw = {"findings": [{"id": "F001", "title": "T", "figures": [figure]}]}
                     with self.assertRaises(ValueError):
