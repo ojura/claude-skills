@@ -1748,7 +1748,7 @@
       };
     }
 
-    // Writing < as \u003c keeps a </script> in a finding or note from ending the
+    // Writing < as \u003c keeps a closing script tag in a finding or note from ending the
     // script element early. JSON.parse reads \u003c back as <.
     function jsonForEmbeddedScript(value) {
       return JSON.stringify(value).replaceAll('<', '\\u003c');
@@ -2234,7 +2234,10 @@
     document.getElementById('viewer-zoom-out').addEventListener('click', () => zoomViewer(0.8));
     document.getElementById('viewer-fit').addEventListener('click', () => zoomViewer(0));
     document.getElementById('viewer-aids').addEventListener('click', () => document.getElementById('aids-toggle').click());
-    figureDialog.addEventListener('keydown', (event) => {
+    // On the document, not the dialog: keys must work wherever the focus is while the viewer is open
+    // (after a click on the picture, focus can be on the page body).
+    document.addEventListener('keydown', (event) => {
+      if (!figureDialog.open) return;
       const actions = {
         ArrowLeft: () => stepViewer(-1), ArrowRight: () => stepViewer(1),
         '+': () => zoomViewer(1.25), '=': () => zoomViewer(1.25), '-': () => zoomViewer(0.8), '0': () => zoomViewer(0),

@@ -6,6 +6,7 @@ import json
 import re
 import tempfile
 import unittest
+from html.parser import HTMLParser
 from pathlib import Path
 
 
@@ -669,6 +670,50 @@ class DecisionBoardBuilderTest(unittest.TestCase):
                     raw = {"findings": [{"id": "F001", "title": "T", "figures": [{"path": "page.png", "vector": vector}]}]}
                     with self.assertRaises(ValueError):
                         builder.normalize_payload(raw, folder / "findings.json", None)
+
+    def test_main_script_is_not_ended_early_by_a_closing_tag_in_its_own_text(self):
+        # The HTML parser ends a script element at the first "</script", even inside a JavaScript
+        # comment or string. Everything after it, such as the start-up calls at the end of the
+        # script, would never run. Python's parser treats script content the same way.
+        raw = json.loads(EXAMPLE_FILE.read_text(encoding="utf-8"))
+        payload = builder.normalize_payload(raw, EXAMPLE_FILE, None)
+        rendered = builder.render_board(payload, TEMPLATE_FILE)
+
+        class Scripts(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.scripts, self.current = [], None
+
+            def handle_starttag(self, tag, attrs):
+                if tag == "script":
+                    self.current = [dict(attrs), ""]
+
+            def handle_data(self, data):
+                if self.current is not None:
+                    self.current[1] += data
+
+            def handle_endtag(self, tag):
+                if tag == "script" and self.current is not None:
+                    self.scripts.append(self.current)
+                    self.current = None
+
+        parser = Scripts()
+        parser.feed(rendered)
+        main = [data for attrs, data in parser.scripts if not attrs]
+        self.assertEqual(len(main), 1)
+        self.assertIn("loadState();", main[0])
+        self.assertIn("refreshAll();", main[0])
+
+    def test_viewer_keys_work_wherever_the_focus_is(self):
+        # A click on the picture leaves the focus on the page body, outside the dialog, so a key
+        # listener on the dialog would not hear the arrow keys. The listener is on the document and
+        # acts only while the viewer is open.
+        template = TEMPLATE_FILE.read_text(encoding="utf-8")
+        self.assertNotIn("figureDialog.addEventListener('keydown'", template)
+        self.assertRegex(
+            template,
+            r"document\.addEventListener\('keydown', \(event\) => \{\s*if \(!figureDialog\.open\) return;",
+        )
 
     def test_template_viewer_uses_pdfjs_arrow_keys_and_the_aids_switch(self):
         template = TEMPLATE_FILE.read_text(encoding="utf-8")
