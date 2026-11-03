@@ -100,6 +100,13 @@ measures idle CPU time and thread context switches, tests recovery after a
 blocked scan fills the queue, and verifies that shutdown removes the connection.
 The fixture deletes its temporary files after the run.
 
+The presser performs scans, health queries, native actions and signal dispatch
+on one thread. A blocking call stops dispatch for its duration and can fill the
+bus queue, causing signals to be rejected. Dispatch resumes after the call
+returns and drains accepted messages, but cannot recover rejected signals.
+A call that never returns leaves the connection undrained until process shutdown
+closes it.
+
 ## Files
 
 - `cdp_daemon.py`: WebSocket framing, connection/reader lifetime and HTTP API.

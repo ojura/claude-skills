@@ -61,6 +61,11 @@ continue even when consent scanning is inactive. Idle dispatch blocks until bus
 traffic or an acquisition/shutdown request wakes it; it does not poll. During
 acquisition the existing half-second scan interval also dispatches signals.
 Disarming an acquisition cancels its interval source without closing AT-SPI.
+A scan, health query or native action that blocks also stops this thread from
+dispatching signals. The bus can fill its queue and reject signals during that
+call. When the call returns, dispatch resumes and drains the accepted messages;
+it cannot recover rejected signals. If the call never returns, the connection
+remains undrained until process shutdown closes it.
 The thread calls `Atspi.exit` once when it stops. A dispatch failure is recorded
 as `presser_dispatch_failed` and closes that thread's AT-SPI connection. Shutdown
 wakes the thread for cleanup; the existing process-exit deadline also closes its
