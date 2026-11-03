@@ -81,7 +81,11 @@ The native consent suite additionally requires system Python with GI/AT-SPI,
 on AC power and records observed AC loss. Its browser profile, display, session bus
 and accessibility bus are private; every fresh presser process verifies the
 observed Chrome application PID against the owned profile and endpoint before
-invoking actions. The suite calibrates focus and window-state observations,
+invoking actions. Before launching Chrome, the controller waits for the owned
+Xfwm4 to publish its EWMH window identity, checks that the supporting window
+references itself, and verifies its name. The observations are recorded in
+`window-manager-readiness.json` inside the fixture directory. The suite
+calibrates focus and window-state observations,
 rejects a maximized window's Restore button and webpage prompt imitations, then
 acquires Chrome through its actual native consent dialog. It deliberately
 crashes only the owned browser to test actual session recovery and checks that

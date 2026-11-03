@@ -9,6 +9,7 @@ import datetime
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -70,6 +71,49 @@ def wait_for(function, description, seconds=20):
         if time.monotonic() >= deadline:
             raise TimeoutError(description)
         time.sleep(0.05)
+
+
+def wait_for_window_manager(process, evidence_file):
+    """Wait for the owned Xfwm4 to publish its EWMH identity before Chrome starts."""
+    observations = []
+    started = time.monotonic()
+    ready = False
+
+    def published():
+        if process.poll() is not None:
+            raise RuntimeError("Owned window manager exited before readiness")
+        observed = {"root_published": False, "self_reference": False,
+                    "xfwm4": False, "query_timeout": False}
+        observations.append(observed)
+        try:
+            root = subprocess.run(["xprop", "-root", "_NET_SUPPORTING_WM_CHECK"],
+                                  capture_output=True, text=True, timeout=2)
+            match = re.search(r"window id # (0x[0-9a-fA-F]+)", root.stdout)
+            if root.returncode or match is None or int(match[1], 16) == 0:
+                return False
+            observed["root_published"] = True
+            identity = subprocess.run(["xprop", "-id", match[1],
+                                       "_NET_SUPPORTING_WM_CHECK", "_NET_WM_NAME"],
+                                      capture_output=True, text=True, timeout=2)
+            self_reference = re.search(r"window id # (0x[0-9a-fA-F]+)", identity.stdout)
+            observed["self_reference"] = (self_reference is not None
+                                          and int(self_reference[1], 16) == int(match[1], 16))
+            observed["xfwm4"] = bool(re.search(
+                r'^_NET_WM_NAME\([^)]*\) = "Xfwm4"$', identity.stdout, re.MULTILINE))
+            return (identity.returncode == 0 and observed["self_reference"]
+                    and observed["xfwm4"] and process.poll() is None)
+        except subprocess.TimeoutExpired:
+            observed["query_timeout"] = True
+            return False
+
+    try:
+        wait_for(published, "Owned window manager did not publish its Xfwm4 EWMH identity", 10)
+        ready = True
+    finally:
+        evidence_file.write_text(json.dumps({
+            "ready": ready, "duration_ms": (time.monotonic() - started) * 1000,
+            "observations": observations,
+        }, indent=2))
 
 
 def request(route, body=None, timeout=40):
@@ -431,6 +475,11 @@ def main():
         configuration = wait_for(ready, "Owned native controller did not start", 40)
         API = configuration["api"]
         assert configuration["connected"]
+        wm_readiness = json.loads((ROOT / "window-manager-readiness.json").read_text())
+        assert wm_readiness["ready"]
+        record("owned_window_manager_ready_before_chrome",
+               readiness_checks=len(wm_readiness["observations"]),
+               duration_ms=wm_readiness["duration_ms"])
         verify_profile()
         window_control()
         calibrate_observers()

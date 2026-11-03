@@ -16,6 +16,7 @@ SOURCE = Path(__file__).resolve().parents[1]
 assert ROOT.parent == Path("/tmp") and ROOT.name.startswith("cdp-native-prompts.")
 sys.path.insert(0, str(SOURCE))
 import cdp_daemon as CDP
+from browser_consent import wait_for_window_manager
 
 assert os.environ.get("DISPLAY") and not re.match(r"^:(0|1)(\.|$)", os.environ["DISPLAY"])
 assert os.environ.get("WAYLAND_DISPLAY") is None
@@ -43,6 +44,14 @@ bus_call("--object-path", "/org/a11y/bus", "--method", "org.freedesktop.DBus.Pro
 wm_log = (ROOT / "window-manager.log").open("ab")
 wm = subprocess.Popen(["xfwm4", "--replace", "--compositor=off"],
                       stdout=wm_log, stderr=subprocess.STDOUT)
+try:
+    wait_for_window_manager(wm, ROOT / "window-manager-readiness.json")
+except BaseException:
+    if wm.poll() is None:
+        wm.terminate()
+        wm.wait(10)
+    wm_log.close()
+    raise
 profile = ROOT / "profile"
 chrome_log = (ROOT / "chrome.log").open("ab")
 chrome = None
