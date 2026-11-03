@@ -34,9 +34,10 @@ acquisition progress and failure. The Allow press runs in-process: one dedicated
 thread (all AT-SPI stays on it)
 imports clear_modals as a library and keeps scanning/pressing for the whole
 connect attempt, streaming its findings into this log. Accessibility health is
-a live diagnostic inside that loop - logged when it changes, never a reason to
-stop scanning (AT-SPI visibility is transient; a one-shot check must not latch
-the outcome). Each attempt holds exactly ONE WebSocket upgrade open for the
+a live diagnostic recorded on each scheduled check; a failed health observation
+does not stop later scans because AT-SPI visibility can change. The same thread
+dispatches GLib between scans and while idle to drain AT-SPI cache signals.
+Each attempt holds exactly ONE WebSocket upgrade open for the
 acquisition budget. One pending upgrade presents at most one Allow dialog.
 Chrome completes it when consent is granted by the presser or a person.
 A failed consent attempt waits for POST /reconnect, which claude_web's
@@ -141,7 +142,7 @@ consent_log_error_type = None
 CONSENT_EVENTS = {
     'attempt_started', 'presser_requested', 'upgrade_request_sent', 'upgrade_finished',
     'connection_ready', 'presser_import_started', 'presser_import_finished',
-    'presser_import_failed', 'scan_started', 'scan_finished', 'scan_failed',
+    'presser_import_failed', 'presser_dispatch_failed', 'scan_started', 'scan_finished', 'scan_failed',
     'button_matched', 'native_action_started', 'native_action_finished',
     'press_action_unavailable', 'native_action_error', 'accessibility_query_error',
     'accessibility_health_started', 'accessibility_health_finished',
@@ -243,13 +244,72 @@ def set_state(state, diag=""):
 
 
 # === Connect + Allow flow ===
-# One presser thread owns AT-SPI calls for the daemon's lifetime and parks on
-# press_wanted between attempts. While requested, it invokes matching Chrome
-# Allow/Restore actions and records scan, action and health observations.
-# AT-SPI visibility can change during acquisition, so health observations do
-# not disable later scans.
-press_wanted = threading.Event()
+# One thread owns AT-SPI calls and dispatches its GLib context even between
+# acquisition attempts. libatspi subscribes to cache signals on initialization;
+# parking that thread on a Python event leaves the bus queuing those signals.
+class PresserRequest(threading.Event):
+    def __init__(self):
+        super().__init__()
+        self.stopping = threading.Event()
+        self.context_lock = threading.Lock()
+        self.context = None
+        self.glib = None
+
+    def wake(self):
+        with self.context_lock:
+            if self.context is not None:
+                self.context.wakeup()
+
+    def set(self):
+        super().set()
+        self.wake()
+
+    def clear(self):
+        super().clear()
+        self.wake()
+
+    def stop(self):
+        self.stopping.set()
+        self.wake()
+
+    def bind(self, glib, context):
+        with self.context_lock:
+            self.glib, self.context = glib, context
+
+    def dispatch(self, seconds=None):
+        """Dispatch while idle or until the existing scan interval expires.
+
+        State changes wake GLib's blocking poll. Only an active acquisition
+        installs a timer; idle operation waits for bus traffic or a state change.
+        """
+        expired = False
+        timer = None
+
+        def expire(*unused):
+            nonlocal expired
+            expired = True
+            return False
+
+        try:
+            if seconds is not None:
+                timer = self.glib.timeout_source_new(round(seconds * 1000))
+                timer.set_callback(expire)
+                timer.attach(self.context)
+            while not self.stopping.is_set() and not expired:
+                if self.is_set() != (seconds is not None):
+                    break
+                self.context.iteration(True)
+        finally:
+            if timer is not None:
+                timer.destroy()
+
+
+press_wanted = PresserRequest()
 presser_beat = [0.0]   # wall time of the presser's last live lap (hang detection)
+
+
+def presser_wait(seconds=None):
+    press_wanted.dispatch(seconds)
 
 
 def presser_main():
@@ -263,34 +323,48 @@ def presser_main():
         return
     consent_event('presser_import_finished',
                   duration_ms=(time.monotonic_ns() - import_started) / 1_000_000)
-    laps = 0
-    while True:
-        if not press_wanted.is_set():
-            laps = 0
-            press_wanted.wait()
-        presser_beat[0] = time.time()
-        report = begin_consent_scan()
-        try:
-            completed = clear_modals.scan_and_press(reporter=report)
-            if completed:
-                time.sleep(0.5)
+    context = clear_modals.GLib.MainContext.default()
+    if not context.acquire():
+        consent_event('presser_dispatch_failed', error_type='RuntimeError')
+        return
+    press_wanted.bind(clear_modals.GLib, context)
+    try:
+        laps = 0
+        while not press_wanted.stopping.is_set():
+            if not press_wanted.is_set():
+                laps = 0
+                presser_wait()
                 continue
-            if laps % 10 == 0:
-                health_started = time.monotonic_ns()
-                report('accessibility_health_started')
-                try:
-                    found, renderer = clear_modals.chrome_accessibility_health()
-                except Exception as error:
-                    report('accessibility_health_failed', error_type=type(error).__name__,
-                           duration_ms=(time.monotonic_ns() - health_started) / 1_000_000)
-                else:
-                    report('accessibility_health_finished', chrome_found=found,
-                           renderer_found=renderer,
-                           duration_ms=(time.monotonic_ns() - health_started) / 1_000_000)
-        except Exception as error:
-            report('scan_failed', error_type=type(error).__name__)
-        laps += 1
-        time.sleep(0.5)
+            presser_beat[0] = time.time()
+            report = begin_consent_scan()
+            completed = 0
+            try:
+                completed = clear_modals.scan_and_press(reporter=report)
+                if not completed and laps % 10 == 0:
+                    health_started = time.monotonic_ns()
+                    report('accessibility_health_started')
+                    try:
+                        found, renderer = clear_modals.chrome_accessibility_health()
+                    except Exception as error:
+                        report('accessibility_health_failed', error_type=type(error).__name__,
+                               duration_ms=(time.monotonic_ns() - health_started) / 1_000_000)
+                    else:
+                        report('accessibility_health_finished', chrome_found=found,
+                               renderer_found=renderer,
+                               duration_ms=(time.monotonic_ns() - health_started) / 1_000_000)
+            except Exception as error:
+                report('scan_failed', error_type=type(error).__name__)
+            if not completed:
+                laps += 1
+            presser_wait(0.5)
+    except Exception as error:
+        consent_event('presser_dispatch_failed', error_type=type(error).__name__)
+    finally:
+        press_wanted.bind(None, None)
+        try:
+            clear_modals.Atspi.exit()
+        finally:
+            context.release()
 
 
 def ws_upgrade(timeout):
@@ -738,6 +812,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": True, "count": count})
             elif self.path == "/shutdown":
                 self._send(200, {"ok": True})
+                press_wanted.stop()
+                # Give the owner thread the existing response-flush interval to
+                # release AT-SPI. Process exit also closes a stuck native call's
+                # connections, so shutdown remains available during acquisition.
                 threading.Thread(target=lambda: (time.sleep(0.1), os._exit(0))).start()
             else:
                 self._send(404, {"error": "not found"})
@@ -761,6 +839,7 @@ def main():
             threading.Thread(target=presser_main, daemon=True).start()
             connection_manager()
         finally:
+            press_wanted.stop()
             server.shutdown()
             api_thread.join()
 

@@ -242,8 +242,9 @@ class ConsentDiagnosticsTests(unittest.TestCase):
         self.daemon.press_wanted.set()
         fake = types.SimpleNamespace(scan_and_press=mock.Mock(return_value=1),
                                      chrome_accessibility_health=mock.Mock())
+        fake.GLib, fake.Atspi = self.modals.GLib, self.modals.Atspi
         with mock.patch.dict(sys.modules, {'clear_modals': fake}):
-            with mock.patch.object(self.daemon.time, 'sleep', side_effect=StopPresser) as sleep:
+            with mock.patch.object(self.daemon, 'presser_wait', side_effect=StopPresser) as sleep:
                 with self.assertRaises(StopPresser):
                     self.daemon.presser_main()
         sleep.assert_called_once_with(0.5)
@@ -337,8 +338,9 @@ class ConsentDiagnosticsTests(unittest.TestCase):
                 failures.append(error)
 
         fake = types.SimpleNamespace(scan_and_press=scan, chrome_accessibility_health=health)
+        fake.GLib, fake.Atspi = self.modals.GLib, self.modals.Atspi
         with mock.patch.dict(sys.modules, {'clear_modals': fake}):
-            with mock.patch.object(self.daemon.time, 'sleep', side_effect=StopPresser):
+            with mock.patch.object(self.daemon, 'presser_wait', side_effect=StopPresser):
                 with mock.patch.object(self.daemon.time, 'monotonic_ns', side_effect=lambda: clock[0]):
                     thread = threading.Thread(target=run)
                     thread.start()
@@ -377,8 +379,9 @@ class ConsentDiagnosticsTests(unittest.TestCase):
 
         health = mock.Mock(return_value=(True, False))
         fake = types.SimpleNamespace(scan_and_press=scan, chrome_accessibility_health=health)
+        fake.GLib, fake.Atspi = self.modals.GLib, self.modals.Atspi
         with mock.patch.dict(sys.modules, {'clear_modals': fake}):
-            with mock.patch.object(self.daemon.time, 'sleep', side_effect=sleep):
+            with mock.patch.object(self.daemon, 'presser_wait', side_effect=sleep):
                 with self.assertRaises(StopPresser):
                     self.daemon.presser_main()
         self.assertEqual(len(scans), 11)
@@ -397,8 +400,9 @@ class ConsentDiagnosticsTests(unittest.TestCase):
 
         fake = types.SimpleNamespace(scan_and_press=scan,
             chrome_accessibility_health=mock.Mock(side_effect=RuntimeError('private health failure')))
+        fake.GLib, fake.Atspi = self.modals.GLib, self.modals.Atspi
         with mock.patch.dict(sys.modules, {'clear_modals': fake}):
-            with mock.patch.object(self.daemon.time, 'sleep', side_effect=StopPresser) as sleep:
+            with mock.patch.object(self.daemon, 'presser_wait', side_effect=StopPresser) as sleep:
                 with self.assertRaises(StopPresser):
                     self.daemon.presser_main()
         sleep.assert_called_once_with(0.5)

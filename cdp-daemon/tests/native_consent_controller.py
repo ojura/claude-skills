@@ -48,6 +48,7 @@ chrome_log = (ROOT / "chrome.log").open("ab")
 chrome = None
 reader = None
 connection_thread = None
+presser_thread = None
 connection_result = None
 used_sigterm_fallback = False
 STOP = threading.Event()
@@ -66,19 +67,23 @@ def call(method, params=None, sid=None, timeout=10):
     return CDP.cdp_call(method, params or {}, sessionId=sid, timeout_seconds=timeout)["result"]
 
 
-def connect():
+def connect(managed=False):
     global reader, connection_result
     try:
         assert chrome is not None and chrome.poll() is None
-        CDP.PORT, CDP.PATH = endpoint()
-        attempt = CDP.begin_consent_attempt(150)
-        response = CDP.ws_upgrade(150)
-        if response[0] != "ok":
-            raise RuntimeError("Owned upgrade outcome " + response[0])
-        CDP.cdp_sock, CDP.cdp_leftover = response[1:]
-        CDP.cdp_sock.settimeout(None)
+        if managed:
+            if not CDP.connect_once(150):
+                raise RuntimeError("Owned managed acquisition failed")
+        else:
+            CDP.PORT, CDP.PATH = endpoint()
+            attempt = CDP.begin_consent_attempt(150)
+            response = CDP.ws_upgrade(150)
+            if response[0] != "ok":
+                raise RuntimeError("Owned upgrade outcome " + response[0])
+            CDP.cdp_sock, CDP.cdp_leftover = response[1:]
+            CDP.cdp_sock.settimeout(None)
+            CDP.consent_event("connection_ready", attempt, state="connected")
         CDP.disconnected.clear()
-        CDP.consent_event("connection_ready", attempt, state="connected")
         reader = threading.Thread(target=CDP.reader_thread, daemon=True)
         reader.start()
         connection_result = {"connected": True}
@@ -202,7 +207,7 @@ class Handler(CDP.Handler):
             super().do_GET()
 
     def do_POST(self):
-        global connection_thread
+        global connection_thread, presser_thread, connection_result
         if self.path.startswith("/fixture/"):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -212,9 +217,20 @@ class Handler(CDP.Handler):
                 elif self.path == "/fixture/close":
                     stop_browser(body.get("crash", False))
                     result = info()
+                elif self.path == "/fixture/disconnect":
+                    assert CDP.cdp_sock is not None and reader is not None
+                    CDP.cdp_sock.shutdown(CDP.socket.SHUT_RDWR)
+                    reader.join(5)
+                    assert not reader.is_alive() and CDP.cdp_sock is None
+                    result = {"disconnected": True}
                 elif self.path == "/fixture/connect":
                     assert CDP.cdp_sock is None
-                    connection_thread = threading.Thread(target=connect, daemon=True)
+                    managed = body.get("managed", False)
+                    connection_result = None
+                    if managed and presser_thread is None:
+                        presser_thread = threading.Thread(target=CDP.presser_main, daemon=True)
+                        presser_thread.start()
+                    connection_thread = threading.Thread(target=connect, args=(managed,), daemon=True)
                     connection_thread.start()
                     result = {"started": True}
                 elif self.path == "/fixture/presser":
@@ -241,7 +257,14 @@ try:
     STOP.wait()
 finally:
     try:
-        stop_browser()
+        CDP.press_wanted.stop()
+        try:
+            if presser_thread is not None:
+                presser_thread.join(5)
+        finally:
+            stop_browser()
+        if presser_thread is not None:
+            assert not presser_thread.is_alive()
     finally:
         wm.terminate()
         wm.wait(10)

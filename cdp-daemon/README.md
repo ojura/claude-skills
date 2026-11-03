@@ -68,6 +68,7 @@ python3 -B -I -m unittest discover -s tests -p 'test_*.py'
 node --test tests/view_initialization.test.mjs
 python3 -B -I tests/browser_page_preparation.py -v
 python3 -B -I tests/browser_consent.py
+python3 -B -I tests/atspi_dispatch_bus.py
 ```
 
 The browser suite uses owned profiles and a guarded private Xvfb display, with
@@ -85,9 +86,19 @@ rejects a maximized window's Restore button and webpage prompt imitations, then
 acquires Chrome through its actual native consent dialog. It deliberately
 crashes only the owned browser to test actual session recovery and checks that
 the saved navigation returns in the background while the selected tab, focus
-and maximization remain unchanged. Results and selected native metadata are
+and maximization remain unchanged. It then acquires native consent twice through
+the production presser thread, checking that disarming stops scans and that the
+same thread handles the next acquisition. Results and selected native metadata are
 retained in the reported `/tmp/cdp-native-prompts.*` directory. It does not call
 the user's daemon or change the user's Chrome profile.
+
+The AT-SPI dispatch fixture requires system Python with GI/AT-SPI and
+`dbus-daemon`. It runs on AC power with an owned bus and registry. It reproduces
+queue saturation when an initialized client parks without dispatching, then
+checks signal delivery through idle, acquisition and rearm transitions. It also
+measures idle CPU time and thread context switches, tests recovery after a
+blocked scan fills the queue, and verifies that shutdown removes the connection.
+The fixture deletes its temporary files after the run.
 
 ## Files
 

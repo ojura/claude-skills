@@ -161,6 +161,37 @@ def acquire(label):
            maximization_selection_focus_preserved=True, connected=True)
 
 
+def managed_acquisition():
+    """Use the production presser thread for two native consent acquisitions."""
+    for cycle in range(2):
+        label = f"managed-presser-{cycle + 1}"
+        before = native(label + "-before")
+        cursor = request("/status")["consent_diagnostics"]["last_seq"]
+        request("/fixture/disconnect", {})
+        request("/fixture/connect", {"managed": True})
+
+        def connected():
+            info = request("/fixture/info")
+            if info["connection_result"] is not None and not info["connected"]:
+                raise RuntimeError("Owned managed presser failed to acquire Chrome")
+            return info["connected"]
+
+        wait_for(connected, "Owned managed presser did not finish native consent", 40)
+        after = native(label + "-after")
+        assert before["native_before"] == after["native_after"]
+        assert selected(before) == selected(after, "after")
+        events = request("/status")["consent_diagnostics"]["events"]
+        actions = [e for e in events if e["seq"] > cursor and e["event"] == "native_action_started"]
+        assert actions and all(e["button"] == "Allow" and e["prompt_kind"] == "consent" for e in actions)
+        scan_count = sum(e["event"] == "scan_started" for e in events)
+        time.sleep(0.6)
+        idle_events = request("/status")["consent_diagnostics"]["events"]
+        assert sum(e["event"] == "scan_started" for e in idle_events) == scan_count
+        assert not any(e["event"] == "presser_dispatch_failed" for e in idle_events)
+        record(label, production_thread_acquired_native_consent=True,
+               idle_scanning_stopped=True, maximization_selection_focus_preserved=True)
+
+
 def first_page():
     return next(target for target in cdp("Target.getTargets")["targetInfos"]
                 if target["type"] == "page" and target["url"] == "about:blank")
@@ -410,6 +441,7 @@ def main():
         request("/fixture/start", {"bootstrap": False})
         acquire("actual-consent")
         actual_recovery()
+        managed_acquisition()
         require_ac()
         REPORT["outcome"] = "passed"
     except BaseException as error:

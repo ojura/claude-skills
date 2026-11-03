@@ -33,16 +33,13 @@ def _pump_glib(seconds=0.2):
     """Drain pending GLib main-context events so libatspi processes its
     D-Bus cache/registry signals (app register/deregister, children-changed).
 
-    The daemon's presser thread only polls scan_and_press() on a sleep loop
-    and never runs a GLib main loop, so without this the thread's AT-SPI cache
-    goes stale: after Chrome relaunches, the cached desktop still points at the
-    dead Chrome app object and no live Allow dialog is ever found. Pumping the
-    thread's default context (Atspi is implicitly init'd on this thread by the
-    first get_desktop call) keeps the desktop view current. Bounded by
-    `seconds` so a signal storm can't wedge the scan."""
+    The standalone scanner does not run a main loop between calls. Dispatch
+    before reading the desktop so application and tree changes reach its cache.
+    The daemon also dispatches this context between scans and while idle.
+    Bound this pass by `seconds` so continuous signals cannot prevent a scan."""
     ctx = GLib.MainContext.default()
-    end = time.time() + seconds
-    while time.time() < end and ctx.pending():
+    end = time.monotonic() + seconds
+    while time.monotonic() < end and ctx.pending():
         ctx.iteration(False)
 
 # These are native Chrome prompt titles, not titles from rendered web pages.

@@ -55,6 +55,17 @@ not fall back to clicking buttons throughout the browser. Accessibility
 availability is checked throughout the attempt; an earlier failed check does
 not stop later scanning.
 
+The same thread dispatches GLib's default context while connected or parked.
+libatspi installs cache-signal subscriptions on initialization, so dispatch must
+continue even when consent scanning is inactive. Idle dispatch blocks until bus
+traffic or an acquisition/shutdown request wakes it; it does not poll. During
+acquisition the existing half-second scan interval also dispatches signals.
+Disarming an acquisition cancels its interval source without closing AT-SPI.
+The thread calls `Atspi.exit` once when it stops. A dispatch failure is recorded
+as `presser_dispatch_failed` and closes that thread's AT-SPI connection. Shutdown
+wakes the thread for cleanup; the existing process-exit deadline also closes its
+connections if a native call has not returned.
+
 Chrome itself requests window activation when creating its consent dialog.
 The presser does not issue window-activation commands. Reusing the persistent
 connection avoids repeatedly creating that native prompt.
