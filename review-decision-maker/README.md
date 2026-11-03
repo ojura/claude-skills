@@ -1,6 +1,6 @@
 # Review Decision Maker
 
-A Claude Code skill for taking a review report from untrusted claims to verified decisions, implemented fixes, tests, and a final resolution ledger.
+A Claude Code skill for taking a review report to verified decisions, implemented fixes, tests, and a final resolution ledger.
 
 It also includes a reusable, self-contained HTML decision board derived from a real 50-finding branch review. The board is now data-driven and works with any findings JSON file.
 
