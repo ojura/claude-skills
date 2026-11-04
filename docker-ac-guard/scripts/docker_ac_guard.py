@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+from enum import Enum
 import io
 import json
 import os
@@ -28,6 +29,12 @@ VALUE_OPTIONS = {
     "--name", "--label", "--network", "--user", "--cpus", "--memory",
     "--pull", "--env", "--volume", "--workdir", "-e", "-v", "-w",
 }
+
+
+class CleanupState(Enum):
+    PENDING = "pending"
+    UNCERTAIN = "uncertain"
+    CONFIRMED = "confirmed"
 
 
 class InterfaceError(Exception):
@@ -134,8 +141,7 @@ class Guard:
         self.phase = "initial"
         self.initial_offline = False
         self.start_submitted = False
-        self.cleanup_confirmed = False
-        self.cleanup_uncertain = False
+        self.cleanup_state = CleanupState.PENDING
         self.had_api_error = False
         self.logging_failed = False
         self.power_log_failed = False
@@ -154,6 +160,17 @@ class Guard:
         self.created_output = private_file(self.directory / "create.stdout")
         self.api_sequence = 0
         self.previous_handlers = {}
+
+    @property
+    def cleanup_confirmed(self):
+        return self.cleanup_state is CleanupState.CONFIRMED
+
+    @property
+    def cleanup_uncertain(self):
+        return self.cleanup_state is CleanupState.UNCERTAIN
+
+    def confirm_cleanup(self):
+        self.cleanup_state = CleanupState.CONFIRMED
 
     def diagnostic(self, message):
         try:
@@ -280,7 +297,7 @@ class Guard:
                 self.reason = "artifact-error"
 
     def report_uncertain(self, error):
-        self.cleanup_uncertain = True
+        self.cleanup_state = CleanupState.UNCERTAIN
         self.had_api_error = True
         kind = type(error).__name__
         if self.last_cleanup_error != kind:
@@ -307,14 +324,14 @@ class Guard:
                 self.wait_tick()
                 continue
             if not identifiers:
-                self.cleanup_confirmed = True
+                self.confirm_cleanup()
                 return
             self.container_id = identifiers[0]
         while not self.cleanup_confirmed:
             try:
                 state = self.inspect()
                 if state is None:
-                    self.cleanup_confirmed = True
+                    self.confirm_cleanup()
                     break
                 if state["Running"] or state["Status"] in ("paused", "restarting"):
                     # Use Docker's configured graceful stop before removal. Its
@@ -322,7 +339,7 @@ class Guard:
                     self.api(["stop", self.container_id])
                     state = self.inspect()
                     if state is None:
-                        self.cleanup_confirmed = True
+                        self.confirm_cleanup()
                         break
                 if state["Status"] == "exited":
                     self.container_exit_status = state["ExitCode"]
@@ -332,13 +349,12 @@ class Guard:
                 status, _ = self.api(["rm", "--volumes", self.container_id])
                 state = self.inspect()
                 if state is None:
-                    self.cleanup_confirmed = True
+                    self.confirm_cleanup()
                     break
                 raise DockerError("Docker did not confirm container removal")
             except (DockerError, OwnershipError, OSError) as error:
                 self.report_uncertain(error)
                 self.wait_tick()
-        self.cleanup_uncertain = False
 
     def reap_attached(self):
         if self.attached is None:
@@ -374,7 +390,7 @@ class Guard:
         self.observe(force=True)
         if self.reason is not None:
             self.initial_offline = self.reason == "power"
-            self.cleanup_confirmed = True
+            self.confirm_cleanup()
             return
         self.phase = "create"
         # The image and its command follow all Docker flags. Insert the owner
@@ -449,7 +465,9 @@ class Guard:
             "attach_client_pid": self.attached.pid if self.attached is not None else None,
             "active_api_client_pid": self.api_child.pid if self.api_child is not None else None,
             "signal": self.signal_received, "container_id": self.container_id,
-            "start_submitted": self.start_submitted, "cleanup_confirmed": self.cleanup_confirmed,
+            "start_submitted": self.start_submitted,
+            "cleanup_state": self.cleanup_state.value,
+            "cleanup_confirmed": self.cleanup_confirmed,
             "cleanup_uncertain": self.cleanup_uncertain,
             "api_error_observed": self.had_api_error,
             "create_client_status": self.create_status,

@@ -113,6 +113,12 @@ observed power loss take precedence over workload status; the actual workload
 status remains recorded. `result.json` records the create client, attach client,
 terminal container, cancellation, power, cleanup and output outcomes separately.
 
+Cleanup has one current state: pending, uncertain or confirmed. The reported
+`cleanup_confirmed` and `cleanup_uncertain` values are derived from that state.
+Successful absence confirmation clears current uncertainty, while
+`api_error_observed` retains any earlier API error and its effect on the return
+status.
+
 A stopped Docker CLI does not prove that its container stopped. Failed Docker
 queries or ownership mismatches keep cleanup unconfirmed. The guard retains
 ownership and waits for a successful state/absence confirmation; it does not
@@ -154,6 +160,7 @@ client/container exits. It does not contact Docker or a live proxy.
 
 ```bash
 python3 -I -B tests/test_docker_ac_guard.py -v
+python3 -I -B tests/test_power_support.py -v
 ```
 
 Set `DOCKER_AC_TEST_OUTPUT` to a private directory to retain each test's command,
@@ -165,7 +172,11 @@ Real-container controls require explicit opt-in, physical AC and a locally
 available `golang:1.27` image, or `DOCKER_AC_TEST_IMAGE`. They use only uniquely
 named, network-isolated containers and owned temporary files. The real fixture
 also samples physical AC and cancels its exact guard on loss; a lost interval
-fails validation. Its controlled injected power loss is recorded separately.
+fails validation. Read, observation and logging failures are retained, cancel
+tracked work and make `finish()` reject the interval. They are recorded
+separately from an observed offline input. A failure while child creation is
+returning is rechecked after that child is recorded. The fixture's controlled
+injected power loss remains separate from actual physical observations.
 
 ```bash
 DOCKER_AC_REAL_TESTS=1 \

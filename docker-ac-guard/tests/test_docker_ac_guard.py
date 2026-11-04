@@ -553,6 +553,33 @@ class GuardTests(unittest.TestCase):
         self.assertFalse(result["start_submitted"])
         self.assertFalse(self.fake.states)
 
+    def test_recovered_empty_token_query_confirms_cleanup_without_current_uncertainty(self):
+        original = self.fake.respond
+        token_queries = 0
+
+        def respond(arguments):
+            nonlocal token_queries
+            if arguments[0] == "create":
+                return {"exit": 7, "stderr": "owned simulated creation failure\n"}
+            if arguments[0] == "ps" and arguments[-1].startswith("label=local.ac-guard.owner="):
+                token_queries += 1
+                if token_queries == 1:
+                    return {"exit": 1, "stderr": "owned simulated recovery API failure\n"}
+            return original(arguments)
+
+        self.fake.respond = respond
+        child = self.launch()
+        _, _, result = self.complete(child, 7)
+        self.assertEqual(token_queries, 2)
+        self.assertEqual(result["cleanup_state"], "confirmed")
+        self.assertTrue(result["api_error_observed"])
+        self.assertEqual(result["create_client_status"], 7)
+        self.assertEqual(result["selected_docker_status"], 7)
+        self.assertIsNone(result["container_id"])
+        self.assertFalse(result["start_submitted"])
+        self.assertFalse(any(item["args"][0] == "start" for item in self.fake.requests))
+        self.assertFalse(self.fake.states)
+
     def test_api_error_keeps_cleanup_owned_until_state_can_be_confirmed(self):
         self.fake.failed_remove = True
         child = self.launch()
