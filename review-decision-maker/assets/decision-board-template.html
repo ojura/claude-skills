@@ -1315,6 +1315,9 @@
     let saveTimer = null;
     let pinnedFindingId = null;
     const pendingSaveIds = new Set();
+    // The rulings and notes this tab has changed since its last save. A save writes only these into the stored
+    // state and keeps the rest as another tab may have stored it, so two open tabs keep each other's work.
+    const unsaved = {decisions: new Set(), notes: new Set()};
 
     function setSaveMessage(message) {
       const saveState = document.getElementById('save-state');
@@ -1391,14 +1394,33 @@
       }
     }
 
+    function storedState() {
+      try {
+        const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY));
+        return parsed && typeof parsed === 'object' && parsed.datasetSignature === DATASET_SIGNATURE ? parsed : null;
+      } catch (error) {
+        return null;
+      }
+    }
+
     function persistNow() {
       if (saveTimer !== null) {
         window.clearTimeout(saveTimer);
         saveTimer = null;
       }
       try {
+        // Read what is stored now (another tab may have saved since this one loaded) and change only what this
+        // tab changed. Without anything stored yet, this tab's whole state is the start.
+        const stored = storedState();
+        const decisions = stored ? {...(stored.decisions || {})} : {...state.decisions};
+        const notes = stored ? {...(stored.notes || {})} : {...state.notes};
+        for (const id of unsaved.decisions) decisions[id] = state.decisions[id];
+        for (const id of unsaved.notes) notes[id] = state.notes[id];
         state.updatedAt = new Date().toISOString();
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({...state, decisions, notes}));
+        unsaved.decisions.clear();
+        unsaved.notes.clear();
+        if (stored) adoptStored({decisions, notes});
         for (const id of pendingSaveIds) setRowSaveState(id, 'saved', 'Saved');
         pendingSaveIds.clear();
         setStorageFailure(false);
@@ -1411,6 +1433,49 @@
         setSaveMessage('Local save failed. Export or copy JSON now.');
       }
     }
+
+    // Take the rulings and notes stored by another tab of this board, except those this tab has changed and
+    // not saved yet.
+    function adoptStored(parsed) {
+      const decisions = parsed.decisions || {};
+      const notes = parsed.notes || {};
+      let changed = false;
+      for (const finding of FINDINGS) {
+        const id = finding.id;
+        const row = rowById.get(id);
+        if (!unsaved.decisions.has(id) && Object.hasOwn(decisions, id) && decisions[id] !== state.decisions[id]) {
+          state.decisions[id] = decisions[id];
+          const decision = currentDecision(id);
+          row.dataset.decision = decision;
+          markChosenOption(row, decision);
+          const radio = row.querySelector(`input[type="radio"][value="${CSS.escape(decision)}"]`);
+          if (radio) radio.checked = true;
+          changed = true;
+        }
+        if (!unsaved.notes.has(id) && Object.hasOwn(notes, id) && (notes[id] || '') !== (state.notes[id] || '')) {
+          state.notes[id] = notes[id];
+          const note = row.querySelector('textarea[data-note-id]');
+          if (note) {
+            note.value = notes[id] || '';
+            resizeNote(note);
+          }
+          changed = true;
+        }
+      }
+      if (!changed) return;
+      updateSummary();
+      applyFilters();
+    }
+
+    window.addEventListener('storage', (event) => {
+      if (event.storageArea !== localStorage || event.key !== STORAGE_KEY || !event.newValue) return;
+      try {
+        const parsed = JSON.parse(event.newValue);
+        if (parsed && parsed.datasetSignature === DATASET_SIGNATURE) adoptStored(parsed);
+      } catch (error) {
+        console.warn('Cannot read the decisions another tab saved', error);
+      }
+    });
 
     function scheduleSave(id) {
       if (id) {
@@ -1928,6 +1993,11 @@
       state.decisions = nextDecisions;
       state.notes = nextNotes;
       for (const entry of preview.entries) pendingSaveIds.add(entry.id);
+      // An import that replaces the review work sets every question; a merge only the imported ones.
+      for (const id of mode === 'replace' ? FINDINGS.map((finding) => finding.id) : preview.entries.map((entry) => entry.id)) {
+        unsaved.decisions.add(id);
+        unsaved.notes.add(id);
+      }
       refreshAll();
       for (const entry of preview.entries) setRowSaveState(entry.id, 'saving', 'Saving...');
       persistNow();
@@ -1954,7 +2024,11 @@
       state.decisions = {...rollback.decisions};
       state.notes = {...rollback.notes};
       state.importRollback = null;
-      for (const id of affectedIds) pendingSaveIds.add(id);
+      for (const id of affectedIds) {
+        pendingSaveIds.add(id);
+        unsaved.decisions.add(id);
+        unsaved.notes.add(id);
+      }
       refreshAll();
       for (const id of affectedIds) setRowSaveState(id, 'saving', 'Saving...');
       persistNow();
@@ -1995,6 +2069,7 @@
       const id = radio.dataset.findingId;
       invalidateImportRollback();
       state.decisions[id] = radio.value;
+      unsaved.decisions.add(id);
       rowById.get(id).dataset.decision = radio.value;
       markChosenOption(rowById.get(id), radio.value);
       const decisionFilterWouldHide = controls.decision.value !== 'all' && controls.decision.value !== radio.value;
@@ -2011,6 +2086,7 @@
       if (!note) return;
       invalidateImportRollback();
       state.notes[note.dataset.noteId] = note.value;
+      unsaved.notes.add(note.dataset.noteId);
       resizeNote(note);
       scheduleSave(note.dataset.noteId);
       if (controls.search.value) applyFilters();
@@ -2285,6 +2361,10 @@
     document.getElementById('reset-decisions').addEventListener('click', () => {
       if (!window.confirm('Reset local review work to this board\'s supplied starting state? Export or copy first if you may need it later.')) return;
       state = {...defaultState(), theme: state.theme, density: state.density, aids: state.aids};
+      for (const finding of FINDINGS) {
+        unsaved.decisions.add(finding.id);
+        unsaved.notes.add(finding.id);
+      }
       refreshAll();
       persistNow();
       setSaveMessage('Local review work reset');

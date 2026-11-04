@@ -723,6 +723,94 @@ class DecisionBoardBuilderTest(unittest.TestCase):
         self.assertIn("aids: DATA.initial_aids !== false", template)
         self.assertIn("initial_aids: state.aids,", template)
 
+    def test_two_tabs_of_a_board_keep_each_others_rulings(self):
+        # Each tab saved its whole state, so a ruling made in one tab was lost when the other tab saved
+        # next. A save now re-reads the stored state and writes only what this tab changed, and a tab takes
+        # over another tab's saves through the browser's storage event. Runs in a headless Chrome.
+        import shutil
+        import subprocess
+        import time
+        import urllib.parse
+        import urllib.request
+
+        chrome = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+        try:
+            import websocket
+        except ImportError:
+            websocket = None
+        if not chrome or websocket is None:
+            self.skipTest("needs Chrome and the websocket-client package")
+        raw = json.loads(EXAMPLE_FILE.read_text(encoding="utf-8"))
+        payload = builder.normalize_payload(raw, EXAMPLE_FILE, None)
+        rendered = builder.render_board(payload, TEMPLATE_FILE)
+        with tempfile.TemporaryDirectory() as folder:
+            board = Path(folder) / "board.html"
+            board.write_text(rendered, encoding="utf-8")
+            profile = Path(folder) / "profile"
+            process = subprocess.Popen(
+                [chrome, "--headless=new", "--remote-debugging-port=0", f"--user-data-dir={profile}",
+                 "--no-first-run", "--no-default-browser-check", "about:blank"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                port_file = profile / "DevToolsActivePort"
+                for _ in range(200):
+                    if port_file.exists() and port_file.read_text().strip():
+                        break
+                    time.sleep(0.05)
+                base = f"http://127.0.0.1:{port_file.read_text().split()[0]}"
+
+                class Tab:
+                    def __init__(self):
+                        request = urllib.request.Request(f"{base}/json/new?{urllib.parse.quote(board.as_uri(), safe=':/')}",
+                                                         method="PUT")
+                        info = json.loads(urllib.request.urlopen(request).read())
+                        self.ws = websocket.create_connection(info["webSocketDebuggerUrl"], timeout=60, suppress_origin=True)
+                        self.next = 0
+
+                    def ev(self, expression):
+                        self.next += 1
+                        self.ws.send(json.dumps({"id": self.next, "method": "Runtime.evaluate",
+                                                 "params": {"expression": expression, "returnByValue": True}}))
+                        while True:
+                            message = json.loads(self.ws.recv())
+                            if message.get("id") == self.next:
+                                return message.get("result", {}).get("result", {}).get("value")
+
+                    def wait(self, expression):
+                        for _ in range(200):
+                            if self.ev(expression):
+                                return
+                            time.sleep(0.05)
+                        raise AssertionError(f"timed out: {expression}")
+
+                    def rule(self, finding_id, value):
+                        self.ev(f"document.querySelector('input[type=\"radio\"][data-finding-id={json.dumps(finding_id)}]"
+                                f"[value={json.dumps(value)}]').click()")
+                        # a hidden tab runs the 180 ms save timer up to a second late
+                        self.wait("saveTimer === null")
+
+                first, second = Tab(), Tab()
+                for tab in (first, second):
+                    tab.wait("document.readyState === 'complete' && typeof saveTimer !== 'undefined'"
+                             " && document.querySelectorAll('.finding-row').length > 0")
+                choices = second.ev("""JSON.stringify([...document.querySelectorAll('.finding-row')].slice(0, 3).map((row) =>
+                    [row.dataset.findingId, [...row.querySelectorAll('input[type="radio"]')].map((input) => input.value)
+                      .find((value) => value !== 'undecided' && value !== row.dataset.decision)]))""")
+                (a, va), (b, vb), (c, vc) = json.loads(choices)
+                first.rule(a, va)
+                second.rule(b, vb)
+                first.rule(c, vc)
+                stored = json.loads(first.ev("localStorage.getItem(STORAGE_KEY)"))["decisions"]
+                self.assertEqual((stored.get(a), stored.get(b), stored.get(c)), (va, vb, vc))
+                second.wait(f"state.decisions[{json.dumps(c)}] === {json.dumps(vc)}")
+                first.ws.close()
+                second.ws.close()
+            finally:
+                import os
+                import signal
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=20)
+
 
 if __name__ == "__main__":
     unittest.main()
