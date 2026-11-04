@@ -1604,6 +1604,11 @@
     function sortRows() {
       const body = document.getElementById('findings-body');
       rows.sort(compareRows);
+      // Move the rows only when their order changed: appending all of them again makes the browser lay out the
+      // whole table, and every ruling waits for that before the next frame.
+      const placed = new Set(rows);
+      const order = [...body.children].filter((element) => placed.has(element));
+      if (order.length === rows.length && order.every((row, index) => row === rows[index])) return;
       for (const row of rows) body.appendChild(row);
     }
 
