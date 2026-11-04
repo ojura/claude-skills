@@ -2163,6 +2163,26 @@
       return fetch(`data:application/octet-stream;base64,${text.trim()}`).then((response) => response.arrayBuffer());
     }
 
+    // pdf.js reads the PDFs and decodes their photos in a worker thread. A board opened from a file has an
+    // opaque origin, where a module worker does not start from a blob: URL; pdf.js then runs the worker's code on
+    // the page's own thread, and every page it reads or draws blocks the page meanwhile. A module worker from a
+    // data: URL does start. It is handed to pdf.js once it has sent its first message ("ready"), so that a worker
+    // that fails to start leaves pdf.js its own fallback.
+    function startPdfWorker(base64) {
+      return new Promise((resolve) => {
+        let worker;
+        try {
+          worker = new Worker(`data:text/javascript;base64,${base64}`, {type: 'module'});
+        } catch (error) {
+          resolve(null);
+          return;
+        }
+        const timer = setTimeout(() => { worker.terminate(); resolve(null); }, 10000);
+        worker.addEventListener('message', () => { clearTimeout(timer); resolve(worker); }, {once: true});
+        worker.addEventListener('error', () => { clearTimeout(timer); worker.terminate(); resolve(null); }, {once: true});
+      });
+    }
+
     let pdfjsPromise = null;
     function loadPdfjs() {
       if (pdfjsPromise) return pdfjsPromise;
@@ -2173,7 +2193,9 @@
         const url = async (element) => URL.createObjectURL(
           new Blob([await base64Bytes(element.textContent)], {type: 'text/javascript'}));
         const library = await import(await url(moduleElement));
-        library.GlobalWorkerOptions.workerSrc = await url(workerElement);
+        const worker = await startPdfWorker(workerElement.textContent.trim());
+        if (worker) library.GlobalWorkerOptions.workerPort = worker;
+        else library.GlobalWorkerOptions.workerSrc = await url(workerElement);
         return library;
       })().catch((error) => {
         console.warn('pdf.js could not be loaded; figures open as pictures', error);
@@ -2192,6 +2214,7 @@
           return library.getDocument({data: new Uint8Array(await base64Bytes(element.textContent))}).promise;
         })().catch((error) => {
           console.warn('The vector figures could not be read', error);
+          vectorDocuments.delete(file);   // the next time, try again
           return null;
         }));
       }

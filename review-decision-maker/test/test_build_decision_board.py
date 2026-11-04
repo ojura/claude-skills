@@ -3,6 +3,7 @@
 import base64
 import importlib.util
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -39,6 +40,32 @@ def embedded_data(rendered):
     return match.group(1)
 
 
+def pdf_page():
+    """A valid one-page PDF with a filled square, made with the standard library."""
+    content = b"0.2 0.4 0.8 rg 20 20 160 160 re f"
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+               b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>",
+               b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream"]
+    out, offsets = b"%PDF-1.4\n", []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+    start = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1) + b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    return out + b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, start)
+
+
+def pdfjs_directory():
+    """pdf.js's build directory (pdf.min.mjs and pdf.worker.min.mjs): PDFJS_DIR, or node_modules/pdfjs-dist/build
+    beside the skill or in ~/src/overleaf-workshop; None when there is none."""
+    candidates = [os.environ.get("PDFJS_DIR"), PACKAGE_ROOT / "node_modules/pdfjs-dist/build",
+                  Path.home() / "src/overleaf-workshop/node_modules/pdfjs-dist/build"]
+    for candidate in candidates:
+        if candidate and (Path(candidate) / "pdf.min.mjs").is_file() and (Path(candidate) / "pdf.worker.min.mjs").is_file():
+            return Path(candidate)
+    return None
+
+
 class HeadlessChrome:
     """A headless Chrome with its own profile in a temporary folder, for tests of the board's behaviour.
     The test is skipped without Chrome or the websocket-client package."""
@@ -54,6 +81,7 @@ class HeadlessChrome:
         self.websocket = websocket
 
     def __enter__(self):
+        import os
         import subprocess
         import time
         if not self.binary or self.websocket is None:
@@ -61,10 +89,16 @@ class HeadlessChrome:
         self._folder = tempfile.TemporaryDirectory()
         self.folder = Path(self._folder.name)
         profile = self.folder / "profile"
+        # Keep the test browser off the desktop: no Wayland connection, the X11 platform, and never the
+        # desktop's own X displays :0 and :1. A headless Chrome needs no display to run.
+        env = {key: value for key, value in os.environ.items() if key != "WAYLAND_DISPLAY"}
+        if env.get("DISPLAY", "").split(".")[0] in (":0", ":1"):
+            del env["DISPLAY"]
         self.process = subprocess.Popen(
-            [self.binary, "--headless=new", "--remote-debugging-port=0", f"--user-data-dir={profile}",
-             "--no-first-run", "--no-default-browser-check", "--window-size=1400,900", "about:blank"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            [self.binary, "--headless=new", "--ozone-platform=x11", "--remote-debugging-port=0",
+             f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check", "--window-size=1400,900",
+             "about:blank"],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         port_file = profile / "DevToolsActivePort"
         for _ in range(200):
             if port_file.exists() and port_file.read_text().strip():
@@ -84,16 +118,16 @@ class HeadlessChrome:
         self._folder.cleanup()
         return False
 
-    def board(self, raw):
+    def board(self, raw, pdfjs=None):
         source = self.folder / "findings.json"
         source.write_text(json.dumps(raw), encoding="utf-8")
         payload = builder.normalize_payload(raw, source, None)
         board = self.folder / "board.html"
-        board.write_text(builder.render_board(payload, TEMPLATE_FILE), encoding="utf-8")
+        board.write_text(builder.render_board(payload, TEMPLATE_FILE, pdfjs), encoding="utf-8")
         return board
 
-    def tab(self, board):
-        tab = ChromeTab(self, board)
+    def tab(self, board, before_load=None):
+        tab = ChromeTab(self, board, before_load)
         self.tabs.append(tab)
         tab.wait("document.readyState === 'complete' && typeof saveTimer !== 'undefined'"
                  " && document.querySelectorAll('.finding-row').length > 0")
@@ -101,23 +135,28 @@ class HeadlessChrome:
 
 
 class ChromeTab:
-    def __init__(self, chrome, board):
-        import urllib.parse
+    def __init__(self, chrome, board, before_load=None):
         import urllib.request
-        request = urllib.request.Request(f"{chrome.base}/json/new?{urllib.parse.quote(board.as_uri(), safe=':/')}",
-                                         method="PUT")
+        request = urllib.request.Request(f"{chrome.base}/json/new?about:blank", method="PUT")
         info = json.loads(urllib.request.urlopen(request).read())
         self.ws = chrome.websocket.create_connection(info["webSocketDebuggerUrl"], timeout=60, suppress_origin=True)
         self.next = 0
+        if before_load:
+            self.call("Page.enable")
+            self.call("Page.addScriptToEvaluateOnNewDocument", {"source": before_load})
+        self.call("Page.navigate", {"url": board.as_uri()})
 
-    def ev(self, expression):
+    def call(self, method, params=None):
         self.next += 1
-        self.ws.send(json.dumps({"id": self.next, "method": "Runtime.evaluate",
-                                 "params": {"expression": expression, "returnByValue": True}}))
+        self.ws.send(json.dumps({"id": self.next, "method": method, "params": params or {}}))
         while True:
             message = json.loads(self.ws.recv())
             if message.get("id") == self.next:
-                return message.get("result", {}).get("result", {}).get("value")
+                return message
+
+    def ev(self, expression):
+        message = self.call("Runtime.evaluate", {"expression": expression, "returnByValue": True})
+        return message.get("result", {}).get("result", {}).get("value")
 
     def wait(self, expression):
         import time
@@ -851,6 +890,31 @@ class DecisionBoardBuilderTest(unittest.TestCase):
             tab.rule(finding_id, value)
             self.assertNotEqual(sort, "decision")
             self.assertEqual(tab.ev("window.__moves"), 0)
+
+    def test_pdfjs_reads_figures_in_a_worker_thread_when_the_board_is_opened_from_a_file(self):
+        # A board opened from a file has an opaque origin, where a module worker does not start from a blob: URL.
+        # pdf.js then ran its worker's code on the page's own thread ("Setting up fake worker."), and every page
+        # it read or drew blocked the page meanwhile. The worker now starts from a data: URL. pdf.js's fallback
+        # loads the worker module into the page, which defines window.pdfjsWorker; a real worker does not.
+        pdfjs = pdfjs_directory()
+        if pdfjs is None:
+            self.skipTest("needs pdf.js's build directory (set PDFJS_DIR)")
+        with HeadlessChrome(self) as chrome:
+            (chrome.folder / "page.png").write_bytes(PNG_1X1)
+            (chrome.folder / "figures.pdf").write_bytes(pdf_page())
+            raw = {"findings": [{"id": "F001", "title": "T", "figures": [{"path": "page.png",
+                                                                          "vector": {"path": "figures.pdf", "page": 1}}]}]}
+            tab = chrome.tab(chrome.board(raw, pdfjs), before_load="""
+                window.__messages = [];
+                for (const name of ['log', 'warn', 'info']) {
+                  const original = console[name];
+                  console[name] = function (...args) { window.__messages.push(args.map(String).join(' ')); return original.apply(this, args); };
+                }""")
+            tab.ev("document.querySelector('.figure-open').click()")
+            tab.wait("!document.getElementById('viewer-canvas').hidden && document.getElementById('viewer-canvas').width > 0")
+            self.assertFalse(tab.ev("typeof window.pdfjsWorker !== 'undefined'"))
+            self.assertEqual([m for m in tab.ev("window.__messages") if "fake worker" in m.lower()], [])
+
 
 if __name__ == "__main__":
     unittest.main()
