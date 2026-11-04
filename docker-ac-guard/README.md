@@ -108,9 +108,10 @@ Ordinary workload exits are preserved. Negative CLI signal returns become the
 conventional `128 + signal` status. Cancellation returns `128 + signal`, initial
 offline returns `2`, and observed AC loss after launch returns `3`. Setup,
 protocol, artifact or output-replay errors make an otherwise successful command
-return `125`. A previous nonzero workload status remains recorded and returned.
-`result.json` records the create client, attach client, terminal container,
-cancellation, power, cleanup and output outcomes separately.
+return `125` and preserve an already-nonzero workload status. Cancellation and
+observed power loss take precedence over workload status; the actual workload
+status remains recorded. `result.json` records the create client, attach client,
+terminal container, cancellation, power, cleanup and output outcomes separately.
 
 A stopped Docker CLI does not prove that its container stopped. Failed Docker
 queries or ownership mismatches keep cleanup unconfirmed. The guard retains
