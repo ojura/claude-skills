@@ -120,6 +120,12 @@ dependency-free Python file: each request is signed and accepted only from your 
 machine, a safer alternative to passwordless (`NOPASSWD`) sudo.
 [Read more](sudo-listener).
 
+### docker-ac-guard
+
+Runs named foreground Docker build and validation jobs on AC power. One tracked
+supervisor owns the container through cancellation and confirmed cleanup, without
+signaling a calling deployment or live service. [Read more](docker-ac-guard).
+
 ## Installing a skill
 
 Copy any skill's directory into your Claude Code skills folder
