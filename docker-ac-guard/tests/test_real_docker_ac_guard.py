@@ -1,6 +1,5 @@
 #!/usr/bin/env -S python3 -I -B
 """Explicit real controls using only owned, network-isolated containers."""
-import datetime
 import json
 import os
 from pathlib import Path
@@ -11,9 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
-from zoneinfo import ZoneInfo
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "docker_ac_guard.py"
 POWER_SUPPORT = runpy.run_path(str(Path(__file__).with_name("power_support.py")))
@@ -52,10 +49,12 @@ class RealDockerTests(unittest.TestCase):
         if self.child is not None and self.child.poll() is None:
             self.child.send_signal(signal.SIGTERM)
             self.child.wait()
-        self.physical.finish()
-        os.close(self.ready_fd)
-        if self.temporary is not None:
-            self.temporary.cleanup()
+        try:
+            self.physical.finish()
+        finally:
+            os.close(self.ready_fd)
+            if self.temporary is not None:
+                self.temporary.cleanup()
 
     def launch(self, command):
         self.assertEqual(PHYSICAL_AC.read_text().strip(), "1")
@@ -100,6 +99,15 @@ class RealDockerTests(unittest.TestCase):
         self.launch("printf 'owned real output\\n'")
         output, result = self.complete(0)
         self.assertEqual(output, b"owned real output\n")
+        self.assertEqual(result["container_exit_status"], 0)
+
+    def test_native_go_build_info_output_is_preserved(self):
+        self.launch("go version -m /usr/local/go/bin/go")
+        output, result = self.complete(0)
+        self.assertIn(b"/usr/local/go/bin/go: go1.", output)
+        self.assertIn(b"\tbuild\tGOARCH=", output)
+        directory, = self.logs.iterdir()
+        self.assertEqual(output, (directory / "output.log").read_bytes())
         self.assertEqual(result["container_exit_status"], 0)
 
     def test_exit_seven(self):

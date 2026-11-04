@@ -1,13 +1,11 @@
 #!/usr/bin/env -S python3 -I -B
 """Isolated protocol tests. They start only owned fake Docker clients."""
-import importlib.util
 import json
 import os
 from pathlib import Path
 import queue
 import runpy
 import signal
-import shutil
 import socket
 import subprocess
 import sys
@@ -298,6 +296,7 @@ class GuardTests(unittest.TestCase):
         self.fake.bad_owner = False
         self.fake.failed_remove = False
         self.fake.failed_stop = False
+        failures = []
         for child in self.children:
             if child.poll() is None:
                 child.send_signal(signal.SIGTERM)
@@ -306,16 +305,31 @@ class GuardTests(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     os.killpg(child.pid, signal.SIGKILL)
                     child.wait()
-                    self.fail("Owned fixture required SIGKILL after TERM and released API gates")
-        self.fake.close()
+                    failures.append("Owned fixture required SIGKILL after TERM and released API gates")
+        try:
+            self.fake.close()
+        except Exception as error:
+            failures.append(str(error))
         for output in self.output_files:
-            output.close()
+            try:
+                output.close()
+            except OSError as error:
+                failures.append(str(error))
         if self.physical is not None:
-            self.physical.finish()
+            try:
+                self.physical.finish()
+            except RuntimeError as error:
+                failures.append(str(error))
         if self.temporary is not None:
             self.temporary.cleanup()
         else:
-            (self.root / "fake-protocol.json").write_text(json.dumps({"requests": self.fake.all_requests, "remaining_containers": self.fake.states}, indent=2) + "\n")
+            (self.root / "fake-protocol.json").write_text(json.dumps({
+                "requests": self.fake.all_requests,
+                "remaining_containers": self.fake.states,
+                "fixture_cleanup_errors": failures,
+            }, indent=2) + "\n")
+        if failures:
+            self.fail("\n".join(failures))
 
     def launch(self, mode="", number=signal.SIGTERM, stdout=subprocess.PIPE, stderr=subprocess.PIPE, arguments=None):
         environment = os.environ.copy()
@@ -324,7 +338,13 @@ class GuardTests(unittest.TestCase):
             DOCKER_AC_REAL_DOCKER=str(self.docker), FAKE_DOCKER_SOCKET=str(self.fake.socket_path),
             GUARD_TEST_MODE=mode, GUARD_TEST_SIGNAL=str(number),
         )
-        args = ["run", "--rm", "--pull", "never", "--name", "owned-fixture", "--label", "cliproxyapi.run=fixture", "--label", "cliproxyapi.part=test", "--network", "none", "--cpus", "1", "--memory", "256m", "-e", "SYNTHETIC=value with spaces", "-v", "/owned fixture:/src", "-w", "/src", "owned-image", "echo", "--rm", "argument with spaces"]
+        args = [
+            "run", "--rm", "--pull", "never", "--name", "owned-fixture",
+            "--label", "cliproxyapi.run=fixture", "--label", "cliproxyapi.part=test",
+            "--network", "none", "--cpus", "1", "--memory", "256m",
+            "-e", "SYNTHETIC=value with spaces", "-v", "/owned fixture:/src",
+            "-w", "/src", "owned-image", "echo", "--rm", "argument with spaces",
+        ]
         previous_directories = set(self.logs.iterdir())
         child = subprocess.Popen(
             [sys.executable, "-I", "-B", str(self.entry), str(SCRIPT), *(args if arguments is None else arguments)],
@@ -342,9 +362,14 @@ class GuardTests(unittest.TestCase):
         directories = list(set(self.logs.iterdir()) - self.invocations[child.pid])
         self.assertEqual(len(directories), 1)
         result = json.loads((directories[0] / "result.json").read_text())
+        if output is not None:
+            (directories[0] / "caller-output.log").write_bytes(output)
+        if error is not None:
+            (directories[0] / "caller-diagnostics.log").write_bytes(error)
         self.assertTrue(result["cleanup_confirmed"], result)
         self.assertFalse(result["cleanup_uncertain"], result)
         self.assertEqual(result["exit_status"], expected)
+        self.assertEqual(result["supervisor_pid"], child.pid)
         for request in self.fake.requests:
             self.assertFalse(Path("/proc", str(request["pid"])).exists(), request)
         return output, error, result
@@ -383,6 +408,34 @@ class GuardTests(unittest.TestCase):
         _, _, result = self.complete(self.launch(), 2)
         self.assertEqual(self.fake.requests, [])
         self.assertFalse(result["valid_power_interval"])
+
+    def test_unreadable_power_is_offline_before_launch(self):
+        self.ac.unlink()
+        _, _, result = self.complete(self.launch(), 2)
+        self.assertEqual(self.fake.requests, [])
+        self.assertTrue(result["offline_observed"])
+        self.assertFalse(result["valid_power_interval"])
+
+    def test_run_profile_rejects_unsupported_or_implicit_work_before_creation(self):
+        variants = [
+            ["run", "--rm", "--name", "owned-fixture", "owned-image"],
+            ["run", "--rm", "--name", "owned-fixture", "--pull", "always", "owned-image"],
+            ["run", "--rm", "--name", "owned-fixture", "--pull", "never", "--privileged", "owned-image"],
+            ["run", "--rm", "--name", "owned-fixture", "--pull", "never", "--label", "local.ac-guard.owner=reserved", "owned-image"],
+        ]
+        for arguments in variants:
+            with self.subTest(arguments=arguments):
+                child = self.launch(arguments=arguments)
+                output, error = child.communicate(timeout=15)
+                self.assertEqual(child.returncode, 125, (output, error))
+                self.assertEqual(self.fake.requests, [])
+                self.assertFalse(list(self.logs.iterdir()))
+        failed_stderr = open("/dev/full", "wb")
+        self.output_files.append(failed_stderr)
+        child = self.launch(arguments=variants[0], stderr=failed_stderr)
+        child.communicate(timeout=15)
+        self.assertEqual(child.returncode, 125)
+        self.assertEqual(self.fake.requests, [])
 
     def test_mid_run_power_loss_removes_owned_container(self):
         self.fake.finish_gate.clear()
@@ -478,7 +531,7 @@ class GuardTests(unittest.TestCase):
         self.fake.create_reply = "truncated-id\n"
         self.fake.create_exit = 7
         _, _, result = self.complete(self.launch(), 7)
-        self.assertFalse(result["started"])
+        self.assertFalse(result["start_submitted"])
         self.assertFalse(any(item["args"][0] == "start" for item in self.fake.requests))
         self.assertFalse(self.fake.states)
 
@@ -497,7 +550,7 @@ class GuardTests(unittest.TestCase):
     def test_missing_create_id_is_error_and_still_cleans_allocated_container(self):
         self.fake.create_reply = "\n"
         _, _, result = self.complete(self.launch(), 125)
-        self.assertFalse(result["started"])
+        self.assertFalse(result["start_submitted"])
         self.assertFalse(self.fake.states)
 
     def test_api_error_keeps_cleanup_owned_until_state_can_be_confirmed(self):

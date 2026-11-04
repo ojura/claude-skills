@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import io
 import json
 import os
 from pathlib import Path
@@ -51,12 +52,13 @@ def parse_run(arguments: list[str]) -> tuple[str, list[str]]:
     name = None
     remove = False
     has_init = False
+    pull_value = None
     index = 0
     while index < len(arguments):
         argument = arguments[index]
         if not argument.startswith("-"):
-            if not name or not remove:
-                raise InterfaceError("Docker run requires an explicit name and --rm")
+            if not name or not remove or pull_value != "never":
+                raise InterfaceError("Docker run requires a name, --rm and --pull never")
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
                 raise InterfaceError("Docker name is invalid")
             if not has_init:
@@ -86,6 +88,8 @@ def parse_run(arguments: list[str]) -> tuple[str, list[str]]:
             options.extend((argument, value))
         else:
             options.append(argument)
+        if key == "--pull":
+            pull_value = value
         if key == "--name":
             if name is not None:
                 raise InterfaceError("Docker name must be specified once")
@@ -94,6 +98,16 @@ def parse_run(arguments: list[str]) -> tuple[str, list[str]]:
             raise InterfaceError("The owner label is reserved for this supervisor")
         index += 1
     raise InterfaceError("Docker image is missing")
+
+
+def discard_failed_stream(name):
+    # A later interpreter flush must not replace an already-recorded failure
+    # status. These are this supervisor process's streams, not its caller's.
+    try:
+        getattr(sys, name).close()
+    except (OSError, ValueError):
+        pass
+    setattr(sys, name, io.StringIO())
 
 
 def private_file(filename: Path, mode: str = "wb"):
@@ -119,7 +133,7 @@ class Guard:
         self.reason = None
         self.phase = "initial"
         self.initial_offline = False
-        self.started = False
+        self.start_submitted = False
         self.cleanup_confirmed = False
         self.cleanup_uncertain = False
         self.had_api_error = False
@@ -146,6 +160,7 @@ class Guard:
             print("docker-ac-guard: " + message, file=sys.stderr, flush=True)
         except (OSError, ValueError):
             self.logging_failed = True
+            discard_failed_stream("stderr")
 
     def close_artifact(self, output):
         try:
@@ -215,6 +230,7 @@ class Guard:
             [self.docker, *arguments], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
         )
+        self.snapshot()
         while True:
             self.observe()
             try:
@@ -226,6 +242,7 @@ class Guard:
                 pass
         status = exit_status(self.api_child.wait())
         self.api_child = None
+        self.snapshot()
         try:
             with private_file(destination) as output:
                 output.write(data)
@@ -254,6 +271,14 @@ class Guard:
         except (ValueError, KeyError, TypeError):
             raise DockerError("Docker returned invalid container state") from None
 
+    def snapshot(self):
+        try:
+            self.write_result(None)
+        except OSError:
+            self.logging_failed = True
+            if self.reason is None:
+                self.reason = "artifact-error"
+
     def report_uncertain(self, error):
         self.cleanup_uncertain = True
         self.had_api_error = True
@@ -261,10 +286,7 @@ class Guard:
         if self.last_cleanup_error != kind:
             self.diagnostic("cleanup is unconfirmed; waiting for Docker ownership/state confirmation (" + kind + ")")
             self.last_cleanup_error = kind
-        try:
-            self.write_result(None)
-        except OSError:
-            self.logging_failed = True
+        self.snapshot()
 
     def cleanup(self):
         if self.cleanup_confirmed:
@@ -302,7 +324,7 @@ class Guard:
                     if state is None:
                         self.cleanup_confirmed = True
                         break
-                if state["Status"] == "exited" and self.started:
+                if state["Status"] == "exited":
                     self.container_exit_status = state["ExitCode"]
                 # Non-forced removal cannot kill a concurrently starting job.
                 # If start wins this race, removal fails and we stop it on the
@@ -321,6 +343,8 @@ class Guard:
     def reap_attached(self):
         if self.attached is None:
             return
+        self.phase = "cli-reap"
+        self.snapshot()
         if self.attached.poll() is None:
             # Container absence is already confirmed. Signal only the recorded
             # session/group created for this exact CLI, never its caller.
@@ -360,6 +384,7 @@ class Guard:
             [self.docker, *create], stdin=subprocess.DEVNULL,
             stdout=self.created_output, stderr=self.output, start_new_session=True,
         )
+        self.snapshot()
         self.finish_create()
         if self.create_status:
             self.actual_status = self.create_status
@@ -367,6 +392,7 @@ class Guard:
         if self.container_id is None:
             raise DockerError("Docker create did not return an immutable container ID")
         self.phase = "before-start"
+        self.snapshot()
         self.observe(force=True)
         if self.reason is not None:
             return
@@ -376,13 +402,14 @@ class Guard:
         self.observe(force=True)
         if self.reason is not None:
             return
-        self.phase = "attached"
+        self.phase = "start-attach"
         self.attached = subprocess.Popen(
             [self.docker, "start", "--attach", self.container_id],
             stdin=subprocess.DEVNULL, stdout=self.output, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        self.started = True
+        self.start_submitted = True
+        self.snapshot()
         while self.attached.poll() is None:
             self.observe()
             if self.reason is not None:
@@ -417,8 +444,12 @@ class Guard:
     def write_result(self, status):
         record = {
             "phase": self.phase, "reason": self.reason,
+            "supervisor_pid": os.getpid(),
+            "create_client_pid": self.creating.pid if self.creating is not None else None,
+            "attach_client_pid": self.attached.pid if self.attached is not None else None,
+            "active_api_client_pid": self.api_child.pid if self.api_child is not None else None,
             "signal": self.signal_received, "container_id": self.container_id,
-            "started": self.started, "cleanup_confirmed": self.cleanup_confirmed,
+            "start_submitted": self.start_submitted, "cleanup_confirmed": self.cleanup_confirmed,
             "cleanup_uncertain": self.cleanup_uncertain,
             "api_error_observed": self.had_api_error,
             "create_client_status": self.create_status,
@@ -464,13 +495,7 @@ class Guard:
                     sys.stdout.buffer.flush()
             except (OSError, ValueError):
                 self.replay_failed = True
-                # Prevent Python's final stdout flush from replacing our status
-                # after the already-recorded replay error.
-                try:
-                    sys.stdout.close()
-                except OSError:
-                    pass
-                sys.stdout = open(os.devnull, "w")
+                discard_failed_stream("stdout")
             self.phase = "complete"
             self.observe(force=True)
             self.close_artifact(self.samples)
@@ -497,7 +522,10 @@ def main(arguments=None):
             Path(os.environ.get("DOCKER_AC_PATH", "/sys/class/power_supply/ACAD/online")),
         )
     except (OSError, KeyError, InterfaceError) as error:
-        print("docker-ac-guard: invalid setup (" + type(error).__name__ + ")", file=sys.stderr)
+        try:
+            print("docker-ac-guard: invalid setup (" + type(error).__name__ + ")", file=sys.stderr, flush=True)
+        except (OSError, ValueError):
+            discard_failed_stream("stderr")
         return 125
     return guard.run()
 

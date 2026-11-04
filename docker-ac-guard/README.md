@@ -6,7 +6,8 @@ TERM, INT and HUP without signaling the calling runner or a live service.
 
 The executable itself is the process the runner starts and waits for. It does
 not launch another untracked supervisor. Commands other than `run` execute the
-real Docker command unchanged.
+real Docker command unchanged. Only `run` receives AC supervision; this override
+does not add AC checks to other Docker commands such as `build` or `pull`.
 
 ## Use
 
@@ -33,7 +34,9 @@ configuration and credential settings. Do not wrap its entire process group in a
 power monitor: that could signal a live swap as well as the validation job.
 
 The supported `run` profile is a named, foreground, noninteractive job with
-`--rm`. The guard accepts the options used by build runners: `--pull`, `--init`,
+`--rm` and `--pull never`, using a locally available image. Image pulling is not
+part of the supervised workload. The guard accepts the options used by build
+runners: `--pull`, `--init`,
 `--name`, `--label`, `--network`, `--user`, `--cpus`, `--memory`, `--env`/`-e`,
 `--volume`/`-v` and `--workdir`/`-w`. Long options may use `=value`. Other options
 are rejected before container creation. Arguments after the image keep their
@@ -120,8 +123,10 @@ Neither that grace period nor a successful `stop` return proves cleanup: the
 guard verifies removal afterwards. The guard does not invent a timer that proves
 termination. If Docker never responds, cleanup can wait indefinitely and a
 running container may continue until Docker responds. Restore Docker control
-before expecting cleanup to finish. Killing only the CLI or guard cannot supply
-that missing confirmation.
+before expecting cleanup to finish. Reaping a CLI that does not respond to TERM
+can also wait indefinitely. The pending result identifies the known child and
+phase; the caller must keep waiting for that owner. Killing only the CLI or guard
+cannot supply missing container confirmation.
 
 ## Artifacts and privacy
 
@@ -151,10 +156,21 @@ python3 -I -B tests/test_docker_ac_guard.py -v
 ```
 
 Set `DOCKER_AC_TEST_OUTPUT` to a private directory to retain each test's command,
-power and fake-protocol artifacts. The tests use owned fake power files; their
-simulated transitions are not physical AC measurements.
+power and fake-protocol artifacts. Set `DOCKER_AC_MONITOR_TESTS=1` to add physical
+AC observations while running the isolated suite. Its simulated transitions use
+owned fake power files and remain distinct from those physical observations.
 
 Real-container controls require explicit opt-in, physical AC and a locally
-available image. They use only uniquely named, network-isolated containers and
-owned temporary files. See the real-control test instructions when available;
-do not treat prepared or skipped controls as successful execution.
+available `golang:1.27` image, or `DOCKER_AC_TEST_IMAGE`. They use only uniquely
+named, network-isolated containers and owned temporary files. The real fixture
+also samples physical AC and cancels its exact guard on loss; a lost interval
+fails validation. Its controlled injected power loss is recorded separately.
+
+```bash
+DOCKER_AC_REAL_TESTS=1 \
+DOCKER_AC_TEST_OUTPUT=/private/control-results \
+python3 -I -B tests/test_real_docker_ac_guard.py -v
+```
+
+Without explicit opt-in, all real controls are skipped. Do not report those
+skips, prepared controls or a physical-power interruption as successful execution.

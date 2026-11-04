@@ -28,26 +28,28 @@ class PowerMonitor:
             raise RuntimeError("Physical AC is offline before the test")
         self.thread.start()
 
+    def record(self, output):
+        online = self.online()
+        output.write(json.dumps({
+            "time_zagreb": datetime.datetime.now(ZoneInfo("Europe/Zagreb")).isoformat(),
+            "online": online,
+        }) + "\n")
+        output.flush()
+        if not online:
+            self.lost.set()
+            for child in self.children():
+                if child.poll() is None:
+                    try:
+                        child.send_signal(signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+
     def observe(self):
         with (self.directory / "physical-power.samples.jsonl").open("w") as output:
             while True:
-                online = self.online()
-                output.write(json.dumps({"time_zagreb": datetime.datetime.now(ZoneInfo("Europe/Zagreb")).isoformat(), "online": online}) + "\n")
-                output.flush()
-                if not online:
-                    self.lost.set()
-                    for child in self.children():
-                        if child.poll() is None:
-                            try:
-                                child.send_signal(signal.SIGTERM)
-                            except ProcessLookupError:
-                                pass
+                self.record(output)
                 if self.done.wait(1):
-                    online = self.online()
-                    output.write(json.dumps({"time_zagreb": datetime.datetime.now(ZoneInfo("Europe/Zagreb")).isoformat(), "online": online}) + "\n")
-                    output.flush()
-                    if not online:
-                        self.lost.set()
+                    self.record(output)
                     return
 
     def check_after_assignment(self, child):
