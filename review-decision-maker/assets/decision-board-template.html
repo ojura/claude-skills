@@ -410,7 +410,7 @@
 
     .button:hover { border-color: var(--accent); }
     .button-primary { border-color: var(--button-primary); background: var(--button-primary); color: #ffffff; }
-    .button-danger { border-color: var(--critical); color: var(--text); box-shadow: inset 3px 0 0 var(--critical); }
+    .button-danger { border-color: var(--critical); color: var(--text); }
 
     .segmented-export {
       display: inline-flex;
@@ -526,7 +526,6 @@
       background: color-mix(in srgb, var(--accent-soft) 32%, var(--surface));
     }
 
-    tbody tr > :first-child { border-left: 4px solid var(--row-status); }
 
     .reference-cell {
       position: sticky;
@@ -624,7 +623,7 @@
       gap: 0.6rem;
       align-items: baseline;
       padding: 0.32rem 0.55rem;
-      border-left: 4px solid var(--row-choice, var(--border-strong));
+      border: 1px solid var(--row-choice, var(--border-strong));
       border-radius: 0.35rem;
       background: var(--surface-raised);
     }
@@ -759,12 +758,12 @@
 
     .detail-grid section {
       padding: 0.65rem 0.75rem;
-      border-left: 3px solid var(--border-strong);
+      border: 1px solid var(--border);
       border-radius: 0.35rem;
       background: var(--surface-raised);
     }
 
-    .detail-grid .resolution-panel { border-left-color: var(--accent); }
+    .detail-grid .resolution-panel { border-color: var(--accent); }
 
     .detail-grid h3 {
       margin: 0 0 0.28rem;
@@ -812,7 +811,7 @@
     .decision-option:hover { border-color: var(--accent); }
     .decision-option:has(input:focus-visible) { outline: 3px solid var(--focus-color); outline-offset: 2px; }
     .decision-option input:focus-visible { outline: none; box-shadow: none; }
-    .decision-option:has(input:checked) { border-color: var(--row-choice, var(--neutral)); box-shadow: inset 3px 0 0 var(--row-choice, var(--neutral)); }
+    .decision-option:has(input:checked) { border-color: var(--row-choice, var(--neutral)); box-shadow: 0 0 0 2px var(--row-choice, var(--neutral)); }
 
     .note-cell textarea {
       min-height: 4.25rem;
@@ -937,7 +936,7 @@
 
     .import-counts dt { color: var(--text-secondary); font-size: 0.78rem; }
     .import-counts dd { margin: 0.1rem 0 0; font-size: 1.25rem; font-weight: 800; }
-    .import-guidance { padding: 0.7rem; border-left: 3px solid var(--warning); background: var(--surface-muted); }
+    .import-guidance { padding: 0.7rem; border: 1px solid var(--warning); border-radius: 0.35rem; background: var(--surface-muted); }
     .dialog-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.55rem; margin-top: 1rem; }
 
     @media (max-width: 1700px) {
@@ -990,7 +989,6 @@
         scroll-margin-top: calc(var(--sticky-controls-offset, 0px) + 0.75rem);
         overflow: hidden;
         border: 1px solid var(--border);
-        border-left: 5px solid var(--row-status);
         border-radius: 0.8rem;
         background: var(--surface);
         box-shadow: 0 5px 18px rgba(11, 11, 11, 0.06);
@@ -1009,8 +1007,6 @@
         border: 0;
         background: transparent;
       }
-
-      tbody tr > :first-child { border-left: 0; }
 
       .reference-cell {
         display: grid;
@@ -1053,7 +1049,6 @@
 
     @media (forced-colors: active) {
       .severity-badge, .agent-badge, .decision-option, .stat-button { forced-color-adjust: auto; }
-      tbody tr > :first-child { border-left-style: double; }
     }
 
     @media print {

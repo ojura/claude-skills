@@ -664,11 +664,6 @@ def render_decision_css(decisions: list[dict[str, str]]) -> str:
     lines = [f"    .stat-{value} .stat-mark {{ background: var({var}); }}" for value, var in slots]
     lines.append("")
     lines.extend(
-        f'    tbody tr[data-decision="{value}"] {{ --row-status: var({var}); }}'
-        for value, var in slots
-    )
-    lines.append("")
-    lines.extend(
         f"    .decision-{value} {{ --row-choice: var({var}); }}" for value, var in slots
     )
     return "\n".join(lines).lstrip()

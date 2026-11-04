@@ -321,9 +321,8 @@ class DecisionBoardBuilderTest(unittest.TestCase):
         self.assertIn(".stat-fix .stat-mark { background: var(--good); }", rendered)
         self.assertIn(".decision-resolved { --row-choice: var(--purple); }", rendered)
         self.assertIn(".decision-fix { --row-choice: var(--good); }", rendered)
-        self.assertIn('tbody tr[data-decision="resolved"] { --row-status: var(--purple); }', rendered)
-        self.assertIn('tbody tr[data-decision="fix"] { --row-status: var(--good); }', rendered)
-        self.assertIn('tbody tr[data-decision="undecided"] { --row-status: var(--neutral); }', rendered)
+        # The rows have no coloured stripe; the chosen ruling shows in its own control.
+        self.assertNotIn("--row-status", rendered)
 
     def test_custom_decisions_render_across_the_board(self):
         raw = {
