@@ -54,8 +54,21 @@ modification time and drops out of the time-based selections.
 1. Find the crash time:
    `journalctl -o short-iso --since '<day>' | grep -iE 'gnome-shell.*crashed|gnome-terminal-server.service: Main process exited|systemd-oomd.*Killed|core-dump|Removed session'`.
    For a freeze or a failed suspend, `journalctl --list-boots` gives the index of the boot
-   that ended in it, and `journalctl -b <index> -n 20` shows how it ended.
+   that ended in it, and `journalctl -b <index> -n 20` shows how it ended. Its first
+   entry is the boot's oldest entry that journald kept: on a boot that ran for days,
+   the start can already be deleted, and so can the scope records of everything started
+   then.
 2. Run the inventory. It only reads.
+   - First, everything since the last restore:
+     `~/.claude/skills/crash-resume/scripts/crash-inventory.py --since "<time of the last line in ~/.local/state/crash-resume/launches.log>" --until "<crash time>"`.
+     Every process that was running at the crash came back in that restore or was
+     started after it, and a start writes to the transcript, so this list holds every
+     candidate, whatever the journal kept. Sessions with an earlier modification time
+     that the restore brought back show up too, because the restore wrote to them.
+     Without a launch log, use the start of the boot (`uptime -s` on the crashed boot is
+     gone, so take the earliest `Started` scope or login in its journal, or ask). The
+     candidates that end in `cost-state` either exited or were resumed and stayed idle;
+     the methods below and the user tell them apart.
    - After a crash with a time:
      `~/.claude/skills/crash-resume/scripts/crash-inventory.py --at "YYYY-MM-DD HH:MM:SS"`
      (local time) lists the transcripts last modified from a minute before to three

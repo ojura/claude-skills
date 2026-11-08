@@ -7,14 +7,17 @@ GNOME Shell or gnome-terminal-server crash), the transcripts last modified aroun
 crash belong to the processes that were running then: select them with --at. A freeze or
 a failed suspend ends processes without that record: --boot selects every transcript
 modified during the boot being recovered and says which ones end without it.
---sessions inspects given sessions.
+--since selects every transcript modified after a time, such as the last restore launch:
+every process running at the crash was restored then or started later, and a start writes
+to the transcript. --sessions inspects given sessions.
 
 For each transcript this prints whether it is a lead or plain session or a teammate,
 whether a process runs it now, its entrypoint, launch directory, current model and
 effort, the shell history lines and restore-tab.sh launch-log lines that mention it,
 and for a lead the evidence for its team name. It only reads.
 
-usage: crash-inventory.py --at "YYYY-MM-DD HH:MM:SS" [--before 60] [--after 180]
+usage: crash-inventory.py --since "YYYY-MM-DD HH:MM:SS" [--until "YYYY-MM-DD HH:MM:SS"]
+       crash-inventory.py --at "YYYY-MM-DD HH:MM:SS" [--before 60] [--after 180]
        crash-inventory.py --boot -1
        crash-inventory.py --sessions <uuid or prefix>...
 """
@@ -304,6 +307,12 @@ def select(args):
     paths = glob.glob(os.path.join(PROJECTS, '*', '*.jsonl'))
     if args.sessions:
         return [p for p in paths if any(os.path.basename(p).startswith(s) for s in args.sessions)], None
+    if args.since:
+        lo = datetime.datetime.strptime(args.since, '%Y-%m-%d %H:%M:%S').timestamp()
+        hi = (datetime.datetime.strptime(args.until, '%Y-%m-%d %H:%M:%S').timestamp() if args.until
+              else datetime.datetime.now().timestamp())
+        chosen = [p for p in paths if lo <= os.path.getmtime(p) <= hi]
+        return chosen, f'{local(lo)} to {local(hi)}'
     if args.boot is not None:
         # Both kinds: a transcript without a final cost-state was cut off by the freeze, and one
         # ending in cost-state either exited or was resumed and stayed idle until the freeze.
@@ -348,9 +357,11 @@ def print_table(leads, teammates):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--since', help='select transcripts modified after this local time, "YYYY-MM-DD HH:MM:SS"')
     group.add_argument('--at', help='crash time, local, "YYYY-MM-DD HH:MM:SS"')
     group.add_argument('--boot', type=int, help='journalctl boot index of a boot that ended in a freeze, e.g. -1')
     group.add_argument('--sessions', nargs='+', help='session ids or prefixes to inspect')
+    parser.add_argument('--until', help='with --since, the end of the window (default: now)')
     parser.add_argument('--before', type=int, default=60, help='seconds before --at to include (default 60)')
     parser.add_argument('--after', type=int, default=180, help='seconds after --at or the boot end (default 180)')
     args = parser.parse_args()
