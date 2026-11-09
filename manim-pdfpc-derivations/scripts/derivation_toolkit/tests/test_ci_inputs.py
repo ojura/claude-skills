@@ -3,10 +3,12 @@ from contextlib import redirect_stdout
 import base64
 import io
 import json
+import os
 from pathlib import Path
 import re
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import fitz
 
@@ -17,7 +19,9 @@ from ..package_assets import collect_assets
 
 class DeliveryInputs(unittest.TestCase):
     def test_downloaded_external_editions_feed_html_and_complete_native_inputs(self):
-        with tempfile.TemporaryDirectory(prefix="delivery inputs ") as temporary:
+        with tempfile.TemporaryDirectory(prefix="delivery inputs ") as temporary, patch.dict(
+            os.environ, {"DERIVATION_CACHE_ROOT": "", "DERIVATION_BUILD_DIR": ""}
+        ):
             root = Path(temporary)
             project, assets = root / "project", root / "downloaded artifacts"
             project.mkdir()

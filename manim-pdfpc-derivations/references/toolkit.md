@@ -126,9 +126,10 @@ Override `SceneLayout` or explicit placement arguments for the teaching layout.
 `checkpoint(label, caption, crop=None, handout=None, pause=True)` saves a printed
 state. `label` is the live control label; `caption` is authored TeX for the printed
 panel. `handout` accepts compact mobjects, and `crop` is `[x, y, width, height]` in
-canvas coordinates. `pause=False` retains that printable state while omitting
-the live pause. The optional `REFERENCE_TIMES` provider dictionary sets review
-sample times by scene ID; `RESULTS` supplies named reusable TeX expressions.
+canvas coordinates. `pause=False` retains the compact printed panel while omitting
+the live pause and its full-scene Steps overlay. The optional `REFERENCE_TIMES`
+provider dictionary sets review sample times by scene ID; `RESULTS` supplies named
+reusable TeX expressions.
 
 `article_template()` uses Latin Modern by default. Supply a validated
 DVI-compatible preamble to match figure typography. For a Pagella/Heros report,

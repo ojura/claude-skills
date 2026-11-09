@@ -113,6 +113,7 @@ def build_bundle(catalog: Catalog, deck: Deck, *, output: Path | None = None,
                  inputs: dict | None = None,
                  archive=True, cache_root: Path | None = None) -> Path:
     paths = get_paths(deck, cache_root)
+    explicit_output = output is not None
     output = output_path(output or paths.build_dir / "html5", catalog.root)
     output_path(output.parent, catalog.root)
     pdf_dir = (pdf_dir or paths.build_dir).expanduser().resolve()
@@ -130,7 +131,7 @@ def build_bundle(catalog: Catalog, deck: Deck, *, output: Path | None = None,
     version = json.loads((vendor / "package.json").read_text())["version"]
     if version != PDFJS_VERSION:
         raise ValueError(f"Expected pdfjs-dist {PDFJS_VERSION}; found {version}")
-    distribution = deck.id + "-html5"
+    distribution = output.name if explicit_output else deck.id + "-html5"
     manifest = {"version": 1, "title": deck.title, "language": deck.language,
                 "revision": source_revision(catalog.root), "themes": {}}
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -210,7 +211,7 @@ def add_arguments(parser):
     parser.add_argument("--page-map", type=Path, help="Explicit physical/logical page metadata")
     parser.add_argument("--inputs", type=Path, help="Shared per-deck/theme PDF, vector and page-map input map")
     parser.add_argument("--pdfjs-dist", type=Path)
-    parser.add_argument("--output", type=Path)
+    parser.add_argument("--output", type=Path, help="Output directory; its name also names the ZIP")
     parser.add_argument("--cache-root", type=Path)
     parser.add_argument("--theme", choices=("both", "light", "dark"), default="both")
     parser.add_argument("--no-zip", dest="archive", action="store_false")

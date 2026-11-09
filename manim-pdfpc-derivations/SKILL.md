@@ -119,7 +119,7 @@ the figure layout for each edition:
 
 - **Live:** a complete poster occupies the animation region, and pdfpc can play,
   pause and navigate the authored checkpoints there.
-- **Steps:** successive printable checkpoint states appear as Beamer overlays on the
+- **Steps:** successive exported full-scene states appear as Beamer overlays on the
   same logical frame.
 - **Handout:** the useful derivation states share one printed slide. Label the
   reading order, keep the text readable at slide size and use an intentional

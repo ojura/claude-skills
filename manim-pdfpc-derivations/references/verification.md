@@ -142,7 +142,7 @@ ctest --test-dir "$(dirname "$(dirname "$probe")")" --output-on-failure
 ```
 
 Repeat parity for the dark theme. The comparer reads the scene and manifest
-names from exported `steps.json`, renders each printable full state through
+names from exported `steps.json`, renders each exported full-scene state through
 native Cairo at the reference size, and records pixel differences. Add
 `--midpoints` when the provider declares reference times, or `--scene ID` to
 select one scene.
