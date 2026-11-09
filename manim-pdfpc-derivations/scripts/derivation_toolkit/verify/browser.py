@@ -83,6 +83,17 @@ def transition(participants, fixture, page, theme, name, reports, *, preview=Fal
 
 
 def open_projector(view, page, theme):
+    control = view.eval("""(()=>{
+        const button=document.getElementById('projector');
+        const r=button.getBoundingClientRect();
+        const hit=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);
+        return {visible:r.width>0 && r.height>0 && r.left>=0 && r.top>=0 &&
+                        r.right<=innerWidth && r.bottom<=innerHeight,
+                unobscured:button.contains(hit),disabled:button.disabled,
+                bounds:{left:r.left,top:r.top,right:r.right,bottom:r.bottom},
+                hit:hit?.id,viewport:[innerWidth,innerHeight]};
+    })()""")
+    assert control["visible"] and control["unobscured"] and not control["disabled"], control
     before = {item["id"] for item in view.pages()}
     view.click("projector")
     deadline = time.monotonic() + 20
@@ -179,7 +190,7 @@ def exercise_projector(view, fixture, url, output, prefix, reports):
     transition((("presenter", view),), fixture, anchor, theme, "presenter-resize", reports, preview=True)
     projector = open_projector(view, anchor, theme)
     participants = (("presenter", view), ("projector", projector))
-    checks = []
+    checks = ["visible-projector-control"]
     try:
         surface(projector, fixture, theme, anchor)
         source = scene_at(fixture, theme, anchor)

@@ -29,10 +29,10 @@ button[aria-pressed="true"] { background: #355576; }
 #previous, #next { font-size: 25px; font-weight: 400; line-height: 20px; width: 36px; }
 #progress { min-width: 6ch; font-variant-numeric: tabular-nums; text-align: center; font-weight: 600; }
 #step-caption { max-width: 26ch; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #c7d4e4; font-size: 13px; }
-#presenter { flex: 0 0 min(25vw, 350px); min-width: 230px; padding: 20px; border-left: 1px solid #364355; background: #1c2530; overflow-y: auto; }
+#presenter { flex: 0 0 min(25vw, 350px); min-width: 230px; min-height: 0; padding: 20px; border-left: 1px solid #364355; background: #1c2530; overflow-y: auto; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto auto auto; }
 #presenter h2 { margin: 0 0 22px; font-size: 22px; font-weight: 550; }
 #next-heading { font-size: 13px; font-weight: 650; color: #b2bfce; }
-#next-preview { display: block; width: 100%; height: auto; background: #fff; margin: 9px 0; box-shadow: 0 2px 15px #0005; }
+#next-preview { display: block; width: 100%; height: 100%; min-height: 0; padding: 9px 0; object-fit: contain; }
 #next-title { color: #c7d5e4; margin-bottom: 24px; font-size: 14px; }
 .notes { border-top: 1px solid #435166; padding: 18px 0; display: grid; gap: 11px; color: #b2bfce; font-size: 14px; }
 #step-label { color: #f4f7fc; font-size: 17px; font-weight: 550; }
