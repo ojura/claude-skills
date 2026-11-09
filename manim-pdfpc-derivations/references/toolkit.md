@@ -277,9 +277,9 @@ container:
 docker build --platform linux/amd64 -t derivation-focal-builder \
   -f tools/vendor/manim_pdfpc/derivation_toolkit/ci/focal-builder.Dockerfile \
   tools/vendor/manim_pdfpc/derivation_toolkit
-mkdir -p build/home
+mkdir -p build/cache
 docker run --rm --platform linux/amd64 --user "$(id -u):$(id -g)" \
-  -e HOME=/project/build/home \
+  -e XDG_CACHE_HOME=/project/build/cache \
   --mount type=bind,source="$PWD",target=/project --workdir /project \
   derivation-focal-builder python3 -B tools/derivations.py package example \
   --assets /project/build/decks
@@ -329,10 +329,14 @@ skill. `PROJECT` must be an absolute path:
 ```bash
 python3 prepare_report.py prepare \
   --source-skill "$SKILLS_REPO/markdown-latex-report" --project "$PROJECT"
-mkdir -p "$PROJECT/build/home" "$PROJECT/build/matplotlib"
+mkdir -p "$PROJECT"/build/runtime/{cache,matplotlib,texmf-var,texmf-config,texmf-cache}
 toaster_run() {
   docker run --rm --network none --user "$(id -u):$(id -g)" \
-    -e HOME="$PROJECT/build/home" -e MPLCONFIGDIR="$PROJECT/build/matplotlib" \
+    -e XDG_CACHE_HOME="$PROJECT/build/runtime/cache" \
+    -e MPLCONFIGDIR="$PROJECT/build/runtime/matplotlib" \
+    -e TEXMFVAR="$PROJECT/build/runtime/texmf-var" \
+    -e TEXMFCONFIG="$PROJECT/build/runtime/texmf-config" \
+    -e TEXMFCACHE="$PROJECT/build/runtime/texmf-cache" \
     --mount type=bind,source="$PROJECT",target="$PROJECT" --workdir "$PROJECT" \
     toaster-report:local "$@"
 }
@@ -351,9 +355,11 @@ stops and a three-column handout. Its compact panel definitions and configured
 Pagella/Heros/Pazo template are in `scene.py`.
 
 The adapter copies the full tracked report tree into the project's build
-directory so chart generation stays inside the copy. It inserts the generated
-handout beside Appendix A.3 and runs the report's existing checker with an added
-TeX header. The source report and its committed showcase remain in place.
+directory so chart generation stays inside the copy. Its local Git snapshot
+must match the committed source tree exactly before the adapter adds the derived
+report, header and build recipe. This lets the original checker inspect tracked
+paths inside the copy. The adapter inserts the generated handout beside
+Appendix A.3; the source report and its committed showcase remain in place.
 
 The checked article is `build/report/REPORT-derivations.pdf`. Package the article
 and animated companion with:
