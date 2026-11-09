@@ -110,10 +110,17 @@ Keep the handout's compact geometry in the scene definition when it needs a
 different arrangement. Choose its panel count to fit the reasoning. Reuse the
 authored expressions and checkpoint captions in each edition.
 
-Build products, previews, environments and native binaries use external cache
-directories. Commit only source and the figure assets that Overleaf needs to
+Use the repository's configured build root for products, previews, environments
+and native binaries. PSR defaults to repository-root `build/`, with deck outputs
+under `build/decks/<catalog-id>/`; explicit cache and output overrides remain
+available. Commit only source and the figure assets that Overleaf needs to
 compile. Use the repository's explicit asset publication command or output
 directory when updating those tracked figures.
+
+Check the syncing tool's own ignore rules before building in a live replica.
+Overleaf Workshop's replica does not consult `.gitignore`; its project sync
+ignore patterns must include `**/build/**`. Keep work in the isolated worktree
+until that supported setting is confirmed.
 
 ## Build, inspect and exercise
 
