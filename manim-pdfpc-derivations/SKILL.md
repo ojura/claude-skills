@@ -29,6 +29,9 @@ The catalog identifies each source, language, ROS generation and animation
 provider. Select the requested edition explicitly. Historical ROS examples keep
 their historical versions; current ROS2 material reads the repository setting.
 
+Register a new deck in the repository catalog before using the shared commands.
+For an isolated prototype, add that entry only in its detached worktree.
+
 Read the selected provider, scene registration, Beamer figure macros and a
 comparable existing scene. Reuse the shared authoring modules under
 `tools/presentations/animation/`. The pdfpc checkout's
@@ -110,19 +113,19 @@ directory when updating those tracked figures.
 Follow the repository's publication order. Publish a reviewable source candidate
 before lengthy downstream validation when the project requests that workflow.
 
-Export the changed scene, then build its light and dark live, stepped and
-handout editions through the shared command. For example, with a catalog deck
-ID in `DECK`:
+Build the changed scene's light and dark live, stepped and handout editions
+through the shared command. Use `--regenerate` to export and compile from the
+fresh result. For example, with a catalog deck ID in `DECK`:
 
 ```bash
-python3 tools/presentations/presentations.py export "$DECK" --theme both
-python3 tools/presentations/presentations.py build "$DECK" --theme both --mode all
-python3 tools/presentations/presentations.py run "$DECK" --theme light -- --windowed=both
+python3 tools/presentations/presentations.py build "$DECK" --theme both --mode all --regenerate
 ```
 
-Use the documented regeneration option when the builder must consume a fresh
-export. Read the exporter and builder output paths so the inspected PDFs are
-the actual products of the changed source.
+To inspect or reuse a separate export, use `export` with an explicit output
+directory and pass the same directory to `build --assets-dir`. Default builds
+use the tracked assets. Read the reported output paths and launch the generated
+live PDF with the repository's pinned viewer so the inspected and presented
+files are the products of the changed source.
 
 Check the mathematics independently, including a simple numerical example,
 signs, basis directions, inverse relationships and dimensions. Inspect every
