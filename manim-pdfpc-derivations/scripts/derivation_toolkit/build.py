@@ -111,39 +111,65 @@ def require_assets(deck: Deck, theme: str, modes: list[str], assets: Path) -> No
 
 
 @contextmanager
-def source_workspace(deck: Deck, auxiliary: Path, assets: Path | None):
+def source_workspace(deck: Deck, auxiliary: Path, assets: Path | None, *, copy_workspace=False):
     # The ASCII aliases keep minted 2.x shell commands independent of source
     # and cache directory names. Tools that write to cwd use this private view.
     with tempfile.TemporaryDirectory(prefix="derivation-latex-") as temporary:
         workspace = Path(temporary)
         output_alias = workspace / "output"
-        output_alias.symlink_to(auxiliary, target_is_directory=True)
+        if copy_workspace:
+            output_alias.mkdir()
+        else:
+            output_alias.symlink_to(auxiliary, target_is_directory=True)
+
+        def expose(source, target):
+            if copy_workspace:
+                copy_workspace_files(source, target)
+            else:
+                target.symlink_to(source, target_is_directory=source.is_dir())
+
         repository_view = workspace / "source"
         original, view = deck.repository_root, repository_view
         for component in deck.source_dir.relative_to(deck.repository_root).parts:
             view.mkdir(parents=True, exist_ok=True)
             for entry in original.iterdir():
                 if entry.name not in (component, "build") and not entry.name.startswith("."):
-                    (view / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+                    expose(entry, view / entry.name)
             original, view = original / component, view / component
         view.mkdir(parents=True, exist_ok=True)
         for entry in original.iterdir():
             if not entry.name.startswith(".") and entry.name not in ("build", "svg-inkscape"):
-                (view / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+                expose(entry, view / entry.name)
         assets_alias = None
         if assets is not None:
             assets_alias = workspace / "assets"
-            assets_alias.symlink_to(assets, target_is_directory=True)
-        yield view, repository_view, output_alias, assets_alias
+            expose(assets, assets_alias)
+        try:
+            yield view, repository_view, output_alias, assets_alias
+        finally:
+            if copy_workspace:
+                copy_workspace_files(output_alias, auxiliary)
+
+
+def copy_workspace_files(source: Path, destination: Path) -> None:
+    """Copy regular source/output bytes without creating links or copying xattrs."""
+    if source.is_dir():
+        destination.mkdir(parents=True, exist_ok=True)
+        for entry in source.iterdir():
+            if entry.name not in {"build", ".git"}:
+                copy_workspace_files(entry, destination / entry.name)
+    else:
+        shutil.copyfile(source, destination)
 
 
 def build_one(deck: Deck, theme: str, mode: str, env: dict[str, str],
-              paths: CachePaths, assets: Path | None = None) -> Path:
+              paths: CachePaths, assets: Path | None = None, *, copy_workspace=False) -> Path:
     catalog = Catalog(deck.repository_root)
     stem = f"{deck.document}-{theme}-{mode}"
     auxiliary = paths.latex_dir / stem
     auxiliary.mkdir(parents=True, exist_ok=True)
-    with source_workspace(deck, auxiliary, assets) as (working, repository, output, assets_alias):
+    with source_workspace(deck, auxiliary, assets, copy_workspace=copy_workspace) as (
+            working, repository, output, assets_alias):
         compile_env = env.copy()
         compile_env["TEXINPUTS"] = str(working) + ":" + str(deck.source_dir) + ":" + env.get("TEXINPUTS", "")
         definitions = []
@@ -175,7 +201,7 @@ def build_one(deck: Deck, theme: str, mode: str, env: dict[str, str],
         engine = deck.build.get("engine", catalog.tex.get("engine", "pdflatex"))
         command = [engine, "-interaction=nonstopmode", "-halt-on-error",
                    "-file-line-error", "-shell-escape",
-                   f"-output-directory={auxiliary}", f"-jobname={stem}", " ".join(definitions)]
+                   f"-output-directory={output}", f"-jobname={stem}", " ".join(definitions)]
         for number in (1, 2):
             terminal_log = auxiliary / f"pass-{number}.txt"
             with terminal_log.open("w", encoding="utf-8") as output_log:
@@ -193,7 +219,8 @@ def build_one(deck: Deck, theme: str, mode: str, env: dict[str, str],
         raise RuntimeError(f"{stem} has multiple physical pages for a logical frame")
     destination = paths.pdf(theme, mode)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(auxiliary / f"{stem}.pdf", destination)
+    copy_file = shutil.copyfile if copy_workspace else shutil.copy2
+    copy_file(auxiliary / f"{stem}.pdf", destination)
     page_map = [None] * int(page_count.group(1))
     for logical, (first, last) in enumerate(frames, 1):
         for page in range(int(first), int(last) + 1):
@@ -211,7 +238,7 @@ def build_one(deck: Deck, theme: str, mode: str, env: dict[str, str],
     }, indent=2) + "\n", encoding="utf-8")
     sidecar = destination.with_suffix(".vector.json")
     if mode == "live" and deck.animation is not None:
-        shutil.copy2(assets / theme / deck.animation.manifest, sidecar)
+        copy_file(assets / theme / deck.animation.manifest, sidecar)
     elif sidecar.exists():
         sidecar.unlink()
     print(f"Built {destination} ({len(frames)} frames, {int(page_count.group(1))} pages)", flush=True)
@@ -220,7 +247,8 @@ def build_one(deck: Deck, theme: str, mode: str, env: dict[str, str],
 
 def build_deck(deck: Deck, themes: list[str], modes: list[str], paths: CachePaths, *,
                regenerate: bool = False, fetch_tex: bool = False,
-               assets_dir: Path | None = None) -> list[Path]:
+               assets_dir: Path | None = None, copy_workspace: bool = False,
+               isolated_cache: bool = False) -> list[Path]:
     catalog = Catalog(deck.repository_root)
     if deck.build.get("kind", "beamer") != "beamer":
         raise ValueError(f"{deck.id}: build the source with its declared project tool, then supply its compiled PDF")
@@ -233,9 +261,17 @@ def build_deck(deck: Deck, themes: list[str], modes: list[str], paths: CachePath
         if not shutil.which(command):
             raise RuntimeError(f"Required build command {command} is unavailable. "
                                "Install the project's TeX/tools dependencies or use its authoring image.")
+    if isolated_cache:
+        if regenerate or fetch_tex:
+            raise ValueError("A new isolated TeX cache uses existing figure assets and installed TeX dependencies")
+        try:
+            paths.cache_root.mkdir(parents=True, exist_ok=False)
+        except FileExistsError as error:
+            raise ValueError(f"An isolated build requires a new cache directory: {paths.cache_root}") from error
     paths.source_cache_dir.mkdir(parents=True, exist_ok=True)
     with (paths.source_cache_dir / "build.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not isolated_cache:
+            fcntl.flock(lock, fcntl.LOCK_EX)
         env = tex_environment(paths)
         missing = missing_tex_packages(env, packages)
         if missing and fetch_tex:
@@ -259,5 +295,6 @@ def build_deck(deck: Deck, themes: list[str], modes: list[str], paths: CachePath
             if deck.animation is not None:
                 require_assets(deck, theme, modes, assets)
             for mode in modes:
-                outputs.append(build_one(deck, theme, mode, env, paths, assets))
+                outputs.append(build_one(deck, theme, mode, env, paths, assets,
+                                         copy_workspace=copy_workspace))
         return outputs

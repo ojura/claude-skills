@@ -96,7 +96,7 @@ absolute_path() {
 app_dir=${APPDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}
 app_dir=$(absolute_path "$app_dir")
 export APPDIR="$app_dir"
-asset_dir="$app_dir/usr/share/derivation-presentations"
+asset_dir="${APPIMAGE_PAYLOAD_DIR:-$app_dir}/usr/share/derivation-presentations"
 for catalog_file in decks.tsv default-deck; do
     if [[ ! -r "$asset_dir/$catalog_file" ]]; then
         printf 'Missing bundled catalog: %s/%s\n' "$asset_dir" "$catalog_file" >&2

@@ -50,6 +50,10 @@ def main(argv=None, *, default_project=None) -> int:
     building.add_argument("--fetch-tex", action="store_true",
                           help="Extract the project's tex.debian_packages archives into the build directory")
     building.add_argument("--assets-dir", type=Path, help="Use scene assets from this directory")
+    building.add_argument("--copy-workspace", action="store_true",
+                          help="Copy private TeX input/output bytes without links or xattrs")
+    building.add_argument("--isolated-cache", action="store_true",
+                          help="Claim a new explicit --cache-root for one deck, without a shared-cache lock")
     queries = building.add_mutually_exclusive_group()
     queries.add_argument("--print-pdf", action="store_true", help="Print selected PDF paths without building")
     queries.add_argument("--print-output-dir", action="store_true", help="Print PDF directories without building")
@@ -82,6 +86,27 @@ def main(argv=None, *, default_project=None) -> int:
     packaging.add_argument("--work-dir", type=Path)
     packaging.add_argument("--output", type=Path)
     packaging.add_argument("--source-revision")
+
+    template = commands.add_parser("package-template", help="Prepare a data-aware runtime template in the Focal builder")
+    template.add_argument("--appdir", type=Path, required=True)
+    template.add_argument("--tools", type=Path, required=True)
+    template.add_argument("--destination", type=Path)
+
+    transport = commands.add_parser("package-prepare", help="Split a pinned template into regular transport files")
+    transport.add_argument("deck", nargs="?", default="all")
+    transport.add_argument("--template", type=Path, required=True)
+    transport.add_argument("--template-info", type=Path, required=True)
+    transport.add_argument("--destination", type=Path)
+    transport.add_argument("--source-revision")
+
+    assembling = commands.add_parser("package-assemble", help="Compile missing PDFs and append data without running uploaded tools")
+    assembling.add_argument("--transport", type=Path, required=True)
+    assembling.add_argument("--inputs", type=Path, help="Existing per-deck/per-theme PDF/vector inputs; other decks compile fresh")
+    assembling.add_argument("--work-dir", type=Path)
+    assembly_output = assembling.add_mutually_exclusive_group()
+    assembly_output.add_argument("--output-dir", type=Path)
+    assembly_output.add_argument("--host-output-dir", type=Path,
+                                 help="Explicit host compile-artifact directory, including its source working directory")
 
     verifying = commands.add_parser("verify", help="Check page bindings and selectable glyph bounds")
     _build_options(verifying)
@@ -133,6 +158,21 @@ def main(argv=None, *, default_project=None) -> int:
                             cache_root=args.cache_root, selection=args.deck, inputs=args.inputs,
                             source_revision=args.source_revision))
         return 0
+    if args.command == "package-template":
+        from .native.payload_template import build_template
+        print(json.dumps(build_template(catalog, args.appdir, args.tools, args.destination), indent=2))
+        return 0
+    if args.command == "package-prepare":
+        from .native.data_assembly import prepare_transport
+        print(json.dumps(prepare_transport(catalog, args.template, args.template_info,
+              destination=args.destination, selection=args.deck, source_revision=args.source_revision), indent=2))
+        return 0
+    if args.command == "package-assemble":
+        from .native.data_assembly import assemble
+        report = assemble(catalog, args.transport, work_dir=args.work_dir, output_dir=args.output_dir,
+                          inputs=args.inputs, host_output_dir=args.host_output_dir)
+        print(json.dumps(report, indent=2))
+        return 0 if report["ok"] else 1
     themes = list(THEMES) if args.theme == "both" else [args.theme]
     if args.command == "html":
         from .web.build import run
@@ -150,6 +190,8 @@ def main(argv=None, *, default_project=None) -> int:
     if args.command == "build":
         from .build import build_deck
 
+        if args.isolated_cache and (args.cache_root is None or args.deck == "all"):
+            parser.error("--isolated-cache requires one deck and an explicit new --cache-root")
         decks = catalog.select(args.deck)
         modes = list(MODES) if args.mode == "all" else [args.mode]
         failures = []
@@ -167,7 +209,8 @@ def main(argv=None, *, default_project=None) -> int:
                     assets = assets / deck.id
                 try:
                     build_deck(deck, themes, modes, paths, regenerate=args.regenerate,
-                               fetch_tex=args.fetch_tex, assets_dir=assets)
+                               fetch_tex=args.fetch_tex, assets_dir=assets,
+                               copy_workspace=args.copy_workspace, isolated_cache=args.isolated_cache)
                 except (ValueError, RuntimeError, OSError, subprocess.CalledProcessError) as error:
                     if args.deck != "all":
                         raise

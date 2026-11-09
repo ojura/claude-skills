@@ -299,6 +299,11 @@ only in the light theme uses:
 
 An animated entry also supplies a `vectors` path beside `pdf`.
 
+For a host that compiles documents but cannot execute uploaded packaging tools,
+use [Data-only assembly](data-only-packaging.md). Its `package-template`,
+`package-prepare` and `package-assemble` commands keep the pinned runtime intact
+and append fresh catalog data with installed Python and TeX.
+
 ## Run the toaster example
 
 Use [the toaster source](../examples/toaster/) for a complete independent

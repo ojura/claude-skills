@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+app_dir=${APPDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}
+export APPDIR="$app_dir"
+launcher="$app_dir/usr/libexec/payload-application"
+cache_root=${DERIVATION_CACHE_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/derivation-presentations}
+transient=0
+arguments=("$@")
+while (($#)); do
+    case "$1" in
+        -h|--help) exec "$launcher" "${arguments[@]}" ;;
+        --list|--print-pdf) transient=1; shift ;;
+        --cache-root)
+            (($# >= 2)) && [[ -n $2 ]] || { printf 'Missing cache directory\n' >&2; exit 2; }
+            cache_root=$2; shift 2 ;;
+        --) break ;;
+        *) shift ;;
+    esac
+done
+if [[ -z ${APPIMAGE:-} ]]; then
+    printf 'Launch the complete AppImage, or set APPIMAGE to its absolute path when using an extracted AppDir.\n' >&2
+    exit 2
+fi
+export LD_LIBRARY_PATH="$app_dir/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$app_dir/usr/bin/appimage-payload-reader" \
+    "$app_dir/usr/share/appimage-payload/policy.json" "$APPIMAGE" \
+    run "$cache_root" "$transient" "$launcher" "${arguments[@]}"

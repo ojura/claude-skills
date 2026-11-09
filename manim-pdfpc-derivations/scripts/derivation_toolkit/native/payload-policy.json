@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "prefixes": [
+    "usr/share/derivation-presentations/"
+  ],
+  "extensions": [
+    ".pdf",
+    ".json",
+    ".txt",
+    ".tsv"
+  ],
+  "names": [
+    "default-deck",
+    "project-title",
+    "bundle-id",
+    "source-revision",
+    "build-timestamp"
+  ]
+}

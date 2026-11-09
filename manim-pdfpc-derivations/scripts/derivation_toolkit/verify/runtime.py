@@ -295,6 +295,25 @@ def validate_feedback(records):
             "unavailable_timestamp_frames": unavailable, "expired_frames": expired}
 
 
+def packaged_payload(appdir, appimage, inspection_cache, environment):
+    """Inspect ordinary data directly or materialize a trailer with its bundled reader."""
+    payload = appdir / "usr/share/derivation-presentations"
+    if payload.is_dir():
+        return payload
+    reader = appdir / "usr/bin/appimage-payload-reader"
+    policy = appdir / "usr/share/appimage-payload/policy.json"
+    assert reader.is_file() and policy.is_file(), "Package has neither catalog data nor a data reader"
+    libraries = str(appdir / "usr/lib")
+    if environment.get("LD_LIBRARY_PATH"):
+        libraries += ":" + environment["LD_LIBRARY_PATH"]
+    result = command([str(reader), str(policy), str(appimage), "extract", str(inspection_cache)],
+                     dict(environment, LD_LIBRARY_PATH=libraries), timeout=60)
+    root = Path(result.stdout.strip())
+    root.relative_to(inspection_cache.resolve() / "payloads")
+    assert (root / ".payload-manifest.json").is_file(), "The reader did not validate its data manifest"
+    return root / "usr/share/derivation-presentations"
+
+
 def catalog_smoke(appimage, fixtures, output, environment):
     directory = output / "catalog"
     directory.mkdir()
@@ -306,13 +325,15 @@ def catalog_smoke(appimage, fixtures, output, environment):
         appdir = Path(temporary) / "squashfs-root"
         invocation = [str(appdir / "AppRun"), "--cache-root", str(cache)]
         environment["APPDIR"] = str(appdir)
+        environment["APPIMAGE"] = str(appimage)
         listing = command(invocation + ["--list"], environment)
         rows = list(csv.DictReader(listing.stdout.splitlines(), delimiter="\t"))
         expected_rows = [{"ID": deck["id"], "Language": deck["language"],
                           "Archive": str(int(deck["archived"])), "Themes": ",".join(deck["themes"]), "Title": deck["title"]}
                          for deck in fixtures["catalog"]]
         assert rows == expected_rows, (rows, expected_rows)
-        payload = appdir / "usr/share/derivation-presentations"
+        payload = packaged_payload(appdir, appimage, Path(temporary) / "inspection", environment)
+        result["payload_storage"] = "appdir" if payload == appdir / "usr/share/derivation-presentations" else "trailer"
         assert (payload / "default-deck").read_text().strip() == fixtures["default"]
         bundle = (payload / "bundle-id").read_text().strip()
         assert re.fullmatch("[0-9a-f]{64}", bundle), bundle
@@ -446,7 +467,8 @@ def theme_smoke(appimage, deck_id, theme, fixture, output, environment):
         assert not font_probe.stderr.strip(), font_probe.stderr
         result["bundled_font_resolution"] = json.loads(font_probe.stdout)
         result["font_cache_initially_absent"] = True
-        payload = appdir / "usr/share/derivation-presentations"
+        payload_root = Path(os.fsdecode(native_environment.get(b"APPIMAGE_PAYLOAD_DIR", os.fsencode(appdir))))
+        payload = payload_root / "usr/share/derivation-presentations"
         source_revision = (payload / "source-revision").read_text().strip()
         build_timestamp = (payload / "build-timestamp").read_text().strip()
         assert re.fullmatch("[A-Za-z0-9._-]+", source_revision), source_revision
@@ -589,7 +611,7 @@ def run(options):
         assert fixtures["schema"] == 3
         environment = os.environ.copy()
         for name in ("DERIVATION_CACHE_ROOT", "DERIVATION_BUILD_DIR", "PDFPC_VECTOR_MANIFEST", "PDFPC_VECTOR_TRACE",
-                     "PDFPC_DATA_DIR", "PDFPC_CONFIG_DIR"):
+                     "PDFPC_DATA_DIR", "PDFPC_CONFIG_DIR", "APPIMAGE_PAYLOAD_DIR", "APPDIR", "APPIMAGE"):
             environment.pop(name, None)
         environment.update({"GDK_BACKEND": "x11", "NO_AT_BRIDGE": "1", "GIO_USE_VFS": "local",
                             "XDG_CONFIG_HOME": str(output / "config"),
