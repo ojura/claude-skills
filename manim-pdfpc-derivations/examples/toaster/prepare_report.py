@@ -12,8 +12,25 @@ import subprocess
 import tarfile
 
 
-def git(directory, *arguments):
-    return subprocess.check_output(["git", "-C", str(directory), *arguments])
+def git(directory, *arguments, data=None):
+    return subprocess.check_output(["git", "-C", str(directory), *arguments], input=data)
+
+
+def snapshot(directory: Path, paths: list[str], message: str, *, parent=None, expected_tree=None):
+    """Keep the unchanged report checker's tracked-path checks inside this copy."""
+    git(directory, "add", "-f", "--", *paths)
+    tree = git(directory, "write-tree").decode().strip()
+    if expected_tree is not None and tree != expected_tree:
+        raise ValueError(f"The copied report tree differs from its committed source: {tree}")
+    command = ["-c", "user.name=Derivation fixture", "-c", "user.email=derivation-fixture@local",
+               "commit-tree", tree]
+    if parent is not None:
+        command += ["-p", parent]
+    revision = git(directory, *command, data=(message + "\n").encode()).decode().strip()
+    git(directory, "update-ref", "--no-deref", "HEAD", revision)
+    if git(directory, "for-each-ref", "--format=%(refname)", "refs/heads").strip():
+        raise ValueError("The isolated report snapshot must have no named branches")
+    return {"revision": revision, "tree": tree}
 
 
 def prepare(source_skill: Path, project: Path):
@@ -46,6 +63,9 @@ def prepare(source_skill: Path, project: Path):
             else:
                 raise ValueError(f"The report fixture requires a regular file: {member.name}")
 
+    git(destination, "init", "--quiet")
+    baseline = snapshot(destination, ["."], f"Snapshot report source from {revision}",
+                        expected_tree=tree)
     source_report = destination / "test/REPORT.md"
     original = source_report.read_text(encoding="utf-8")
     anchor = "The BEADS v2.1 analysis scripts are available at"
@@ -95,9 +115,14 @@ def prepare(source_skill: Path, project: Path):
         '\tcp "$(CHECK_DIR)/$(BASE).pdf" "$(OUT)"\n'
     )
     (destination / "fixture.mk").write_text(makefile, encoding="utf-8")
+    derived = snapshot(destination, ["test/REPORT-derivations.md", "derivation-header.tex", "fixture.mk"],
+                       "Embed the geometric-mean derivation in the report fixture",
+                       parent=baseline["revision"])
     receipt = {
         "source_revision": revision,
         "source_tree": tree,
+        "baseline_snapshot": baseline,
+        "derived_snapshot": derived,
         "source_report_sha256": hashlib.sha256(source_report.read_bytes()).hexdigest(),
         "report": str(report),
         "workspace": str(destination),
