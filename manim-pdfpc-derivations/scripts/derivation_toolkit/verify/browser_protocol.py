@@ -48,7 +48,7 @@ class CDP:
             if result:
                 return
             time.sleep(0.25)
-        diagnostics = self.eval("({page:document.getElementById('progress')?.textContent,"
+        diagnostics = self.eval("({url:location.href,page:document.getElementById('progress')?.textContent,"
                                 "loading:document.getElementById('loading')?.textContent,"
                                 "hidden:document.getElementById('loading')?.hidden,"
                                 "error:document.getElementById('error')?.textContent})")
@@ -237,6 +237,14 @@ class Chrome(CDP):
         self.call("Emulation.setFocusEmulationEnabled", {"enabled": True})
 
     def navigate(self, url):
+        # The active player writes its own page hash. Destroy that document
+        # before navigating to another fixture hash, so it cannot restore the
+        # old page between same-document navigation and reload.
+        if self.eval("location.href") != "about:blank":
+            self._load_document("about:blank")
+        self._load_document(url)
+
+    def _load_document(self, url):
         previous = self.eval("performance.timeOrigin")
         result = self.call("Page.navigate", {"url": url})
         if result.get("errorText"):
@@ -308,12 +316,13 @@ class Firefox:
         return json.loads(encoded) if encoded is not None else None
 
     def navigate(self, url):
-        previous = self.eval("performance.timeOrigin")
+        if self.eval("location.href") != "about:blank":
+            self.protocol.call("browsingContext.navigate", {
+                "context": self.context, "url": "about:blank", "wait": "complete",
+            })
         self.protocol.call("browsingContext.navigate", {
             "context": self.context, "url": url, "wait": "complete",
         })
-        if self.eval("performance.timeOrigin") == previous:
-            self.protocol.call("browsingContext.reload", {"context": self.context, "wait": "complete"})
 
     def pages(self):
         pages = self.protocol.call("browsingContext.getTree", {})["contexts"]
