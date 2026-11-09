@@ -428,6 +428,7 @@ def ready(view, page, theme):
 
 
 def check_document_resources(view):
-    requests = view.eval("performance.getEntriesByType('resource').map(x=>new URL(x.name).protocol)"
-                         ".filter(x=>!['data:','blob:'].includes(x))")
+    requests = view.eval("performance.getEntriesByType('resource')"
+                         ".filter(x=>!['data:','blob:'].includes(new URL(x.name).protocol))"
+                         ".map(x=>({url:x.name,initiator:x.initiatorType,responseStatus:x.responseStatus}))")
     assert not requests, requests

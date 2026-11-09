@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager, suppress
 from functools import partial
+import hashlib
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -17,7 +18,7 @@ from urllib.parse import quote
 from .browser_fixture import load_fixture, scene_at
 from .browser_protocol import (
     assert_blank_playback_ignored, assert_transition, begin_transition,
-    browser, check_document_resources, ready, wait_rendered,
+    browser, check_document_resources, ready,
 )
 
 
@@ -341,6 +342,18 @@ def main(argv=None):
     output.mkdir(parents=True, exist_ok=True)
     fixture = load_fixture(args.html)
     results = []
+    html_digest = hashlib.sha256(args.html.read_bytes()).hexdigest()
+
+    def record_progress(status, failure=None):
+        receipt = {"status": status, "html": str(args.html.resolve()),
+                   "html_sha256": html_digest, "results": results}
+        if failure is not None:
+            receipt["failure"] = failure
+        temporary = output / ".progress.json.tmp"
+        temporary.write_text(json.dumps(receipt, indent=2) + "\n")
+        temporary.replace(output / "progress.json")
+
+    record_progress("running")
     with tempfile.TemporaryDirectory(prefix="browser-acceptance-", dir=output) as scratch:
         temporary = Path(scratch)
         standalone = temporary / "only-html"
@@ -354,19 +367,27 @@ def main(argv=None):
                 raise SystemExit("Missing installed browser: " + kind)
             directory = temporary / kind
             directory.mkdir()
+            protocol = None
             try:
                 with browser(kind, str(executable), directory) as view:
                     for protocol in (("file", "http") if args.protocol == "both" else (args.protocol,)):
                         with presentation_url(html, protocol) as url:
                             try:
                                 results.append(exercise(view, fixture, url, output, kind + "-" + protocol, protocol))
+                                record_progress("running")
                             except Exception:
-                                view.capture(output / f"{kind}-{protocol}-failure.png")
+                                with suppress(Exception):
+                                    view.capture(output / f"{kind}-{protocol}-failure.png")
                                 raise
+            except Exception as error:
+                record_progress("failed", {"browser": kind, "protocol": protocol,
+                                           "error": f"{type(error).__name__}: {error}"})
+                raise
             finally:
                 log = directory / (kind + ".log")
                 if log.is_file():
                     shutil.copyfile(log, output / log.name)
+    record_progress("passed")
     print(json.dumps({"status": "passed", "results": results}, indent=2))
     return 0
 
