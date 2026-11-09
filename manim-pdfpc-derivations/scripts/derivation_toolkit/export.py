@@ -16,7 +16,7 @@ import tempfile
 from types import ModuleType
 
 from .catalog import Catalog, Deck, PACKAGE_ROOT
-from .palette import load_palettes
+from .palette import load_palettes, palette_tex
 from .paths import CachePaths, get_paths
 
 
@@ -114,17 +114,6 @@ def configure(theme: str, paths: CachePaths | None = None, *, canvas=None) -> No
     config.save_last_frame = False
     config.dry_run = True
     config.verbosity = "ERROR"
-
-
-def palette_tex(repository_root: Path | None = None) -> str:
-    catalog = Catalog(repository_root)
-    prefix = catalog.data["palette"].get("prefix", "derivation")
-    lines = ["% Generated from the project TeX palette by derivation_toolkit.export."]
-    for theme, palette in load_palettes(repository_root).items():
-        for name, value in palette.items():
-            lines.append(r"\definecolor{" + prefix + theme.title() + name.title()
-                         + r"}{HTML}{" + value[1:] + "}")
-    return "\n".join(lines) + "\n"
 
 
 def compare_checkpoint(scene, state, destination: Path) -> None:

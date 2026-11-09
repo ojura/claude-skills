@@ -47,7 +47,8 @@ def main(argv=None, *, default_project=None) -> int:
     building = commands.add_parser("build", help="Build live, stepped and handout PDFs")
     _build_options(building)
     building.add_argument("--regenerate", action="store_true", help="Export registered scenes into the build directory first")
-    building.add_argument("--fetch-tex", action="store_true", help="Fetch missing TeX packages into the build directory")
+    building.add_argument("--fetch-tex", action="store_true",
+                          help="Extract the project's tex.debian_packages archives into the build directory")
     building.add_argument("--assets-dir", type=Path, help="Use scene assets from this directory")
     queries = building.add_mutually_exclusive_group()
     queries.add_argument("--print-pdf", action="store_true", help="Print selected PDF paths without building")

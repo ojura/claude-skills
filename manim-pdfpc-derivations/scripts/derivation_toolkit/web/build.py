@@ -45,7 +45,7 @@ def page_mapping(pdf_path: Path, mapping: Path | dict | None, count: int) -> tup
     if any(type(number) is not int or number < 1 for number in logical):
         raise ValueError("Logical page numbers must be positive integers")
     ordered = list(dict.fromkeys(logical))
-    if ordered != list(range(1, len(ordered) + 1)):
+    if logical != sorted(logical) or ordered != list(range(1, len(ordered) + 1)):
         raise ValueError("Logical pages must retain their authored order")
     if mapping.get("logicalSlides", len(ordered)) != len(ordered):
         raise ValueError("The declared logical page count differs from its page map")

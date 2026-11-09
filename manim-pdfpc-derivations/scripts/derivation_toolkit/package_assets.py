@@ -10,6 +10,11 @@ import shutil
 from .catalog import Catalog, THEMES
 
 
+def input_path(catalog: Catalog, value: str | Path) -> Path:
+    """Resolve paths stored in the project input map against its project root."""
+    return (catalog.root / Path(value).expanduser()).resolve()
+
+
 def collect_assets(catalog: Catalog, assets: Path, *, selection="all", inputs: dict | None = None):
     """Explicit inputs map deck IDs to theme PDF/vector paths for external documents."""
     rows, files = [], []
@@ -28,8 +33,8 @@ def collect_assets(catalog: Catalog, assets: Path, *, selection="all", inputs: d
             edition = external.get(theme) if external else None
             if external is not None and not edition:
                 raise ValueError(f"Missing package input for {deck.id}/{theme}")
-            pdf = Path(edition["pdf"]).expanduser().resolve() if edition else assets / deck.id / filename
-            vector = (Path(edition["vectors"]).expanduser().resolve() if edition.get("vectors") else None) if edition else (
+            pdf = input_path(catalog, edition["pdf"]) if edition else assets / deck.id / filename
+            vector = (input_path(catalog, edition["vectors"]) if edition.get("vectors") else None) if edition else (
                 pdf.with_suffix(".vector.json") if deck.animation else None)
             animation_flags.append(vector is not None)
             for source, name in ((pdf, filename), (vector, Path(filename).with_suffix(".vector.json").name)):

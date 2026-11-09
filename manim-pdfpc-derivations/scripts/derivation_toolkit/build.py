@@ -49,20 +49,31 @@ def missing_tex_packages(env: dict[str, str], packages=TEX_PACKAGES) -> list[str
 
 
 def fetch_tex_packages(paths: CachePaths) -> None:
+    """Extract explicitly selected Debian archives; dependencies stay project-owned."""
+    packages = Catalog(paths.repository_root).tex.get("debian_packages")
+    selector = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9][a-z0-9-]*)?(?:=[A-Za-z0-9.+:~_-]+)?")
+    if not isinstance(packages, list) or not packages or any(
+            not isinstance(package, str) or selector.fullmatch(package) is None for package in packages):
+        raise ValueError("Configure tex.debian_packages as a nonempty list of Debian package selectors "
+                         "for --fetch-tex, or use an environment that already supplies tex.packages.")
     for command in ("apt-get", "dpkg-deb"):
         if not shutil.which(command):
-            raise RuntimeError(f"{command} is unavailable; install texlive-latex-extra and preview-latex-style.")
+            raise RuntimeError(f"{command} is unavailable; --fetch-tex requires Debian archive tools.")
     cache, destination = paths.tex_packages_dir, paths.texlive_dir
     cache.mkdir(parents=True, exist_ok=True)
     destination.mkdir(parents=True, exist_ok=True)
     with (cache / "download.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        for package in ("texlive-latex-extra", "preview-latex-style"):
-            subprocess.run(["apt-get", "download", package], cwd=cache, check=True)
-            archives = sorted(cache.glob(package + "_*.deb"), key=lambda path: path.stat().st_mtime)
-            if not archives:
-                raise RuntimeError(f"apt-get did not download an archive for {package}.")
-            subprocess.run(["dpkg-deb", "-x", str(archives[-1]), str(destination)], check=True)
+        for package in packages:
+            with tempfile.TemporaryDirectory(prefix="download-", dir=cache) as temporary:
+                staging = Path(temporary)
+                subprocess.run(["apt-get", "download", package], cwd=staging, check=True)
+                archives = list(staging.glob("*.deb"))
+                if len(archives) != 1:
+                    raise RuntimeError(f"Expected one downloaded archive for {package}; found {len(archives)}.")
+                archive = cache / archives[0].name
+                shutil.copyfile(archives[0], archive)
+                subprocess.run(["dpkg-deb", "-x", str(archive), str(destination)], check=True)
 
 
 def require_assets(deck: Deck, theme: str, modes: list[str], assets: Path) -> None:
@@ -220,7 +231,8 @@ def build_deck(deck: Deck, themes: list[str], modes: list[str], paths: CachePath
     commands = [engine, "kpsewhich", *catalog.tex.get("commands", [])]
     for command in commands:
         if not shutil.which(command):
-            raise RuntimeError(f"{command} is unavailable. Install TeX Live and Python Pygments.")
+            raise RuntimeError(f"Required build command {command} is unavailable. "
+                               "Install the project's TeX/tools dependencies or use its authoring image.")
     paths.source_cache_dir.mkdir(parents=True, exist_ok=True)
     with (paths.source_cache_dir / "build.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -231,8 +243,12 @@ def build_deck(deck: Deck, themes: list[str], modes: list[str], paths: CachePath
             env = tex_environment(paths)
             missing = missing_tex_packages(env, packages)
         if missing:
-            raise RuntimeError("Missing TeX packages: " + ", ".join(missing) +
-                               ". Use --fetch-tex, or install texlive-latex-extra and preview-latex-style.")
+            hint = ("The configured Debian archives were extracted, but these resources are still missing. "
+                    "Archive extraction does not install dependency packages or configure fonts."
+                    if fetch_tex else
+                    "Install the project's TeX dependencies, or configure tex.debian_packages "
+                    "for opt-in --fetch-tex archive extraction.")
+            raise RuntimeError("Missing TeX resources: " + ", ".join(missing) + ". " + hint)
         assets = assets_dir.resolve() if assets_dir else (deck.animation.assets if deck.animation else None)
         if regenerate and deck.animation is not None:
             from .export import run_export

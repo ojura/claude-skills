@@ -336,11 +336,9 @@ def catalog_smoke(appimage, fixtures, output, environment):
         default_pdf = cache / "bundles" / bundle / default["id"] / "pdf" / default["themes"]["light"]["pdf_name"]
         assert Path(command(invocation + ["--print-pdf"], environment).stdout.strip()) == default_pdf
         assert not cache.exists(), "Catalog queries created the presentation cache"
-        samples = {}
         for deck in fixtures["catalog"]:
-            if not deck["animation"]:
-                samples.setdefault((deck["language"], deck["archived"]), deck)
-        for deck in samples.values():
+            if deck["animation"]:
+                continue
             for theme, fixture in deck["themes"].items():
                 case = {"deck": deck["id"], "theme": theme, "pages": fixture["pages"]}
                 log_path = directory / (deck["id"] + "-" + theme + ".log")

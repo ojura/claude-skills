@@ -10,7 +10,7 @@ ROLES = ("background", "foreground", "accent", "muted", "guide", "faint")
 DEFINITION = re.compile(r"\\definecolor\{([A-Za-z][A-Za-z0-9]*)\}\{HTML\}\{([0-9A-Fa-f]{6})\}")
 
 
-def load_palettes(repository_root: str | Path | None = None) -> dict[str, dict[str, str]]:
+def _palette_data(repository_root: str | Path | None) -> tuple[dict[str, dict[str, str]], list[tuple[str, str]]]:
     catalog = Catalog(repository_root)
     definition = catalog.data.get("palette")
     if not isinstance(definition, dict) or "file" not in definition:
@@ -20,6 +20,7 @@ def load_palettes(repository_root: str | Path | None = None) -> dict[str, dict[s
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", prefix):
         raise ValueError("The palette prefix must be a TeX colour-name prefix")
     palettes: dict[str, dict[str, str]] = {"light": {}, "dark": {}}
+    definitions: list[tuple[str, str]] = []
     for line in source.read_text(encoding="utf-8").splitlines():
         match = DEFINITION.fullmatch(line.split("%", 1)[0].strip())
         if match is None:
@@ -33,8 +34,22 @@ def load_palettes(repository_root: str | Path | None = None) -> dict[str, dict[s
             if role in colours:
                 raise ValueError(f"Duplicate {theme} {role} colour in {source}")
             colours[role] = f"#{value.upper()}"
+            definitions.append((name, value.upper()))
     for theme, colours in palettes.items():
         missing = set(ROLES) - colours.keys()
         if missing:
             raise ValueError(f"Missing {theme} colours in {source}: {', '.join(sorted(missing))}")
-    return palettes
+    return palettes, definitions
+
+
+def load_palettes(repository_root: str | Path | None = None) -> dict[str, dict[str, str]]:
+    return _palette_data(repository_root)[0]
+
+
+def palette_tex(repository_root: str | Path | None = None) -> str:
+    """Export validated definitions with their exact authored TeX colour names."""
+    _, definitions = _palette_data(repository_root)
+    lines = ["% Generated from the project TeX palette by derivation_toolkit.export."]
+    lines.extend(r"\definecolor{" + name + r"}{HTML}{" + value + "}"
+                 for name, value in definitions)
+    return "\n".join(lines) + "\n"

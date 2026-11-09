@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from ..catalog import Catalog
-from ..export import inspect_interpreter, metadata_tex
+from ..export import inspect_interpreter, metadata_tex, palette_tex
 from .. import install as installer
 from ..package_assets import collect_assets
 from ..web.build import page_mapping
@@ -49,11 +49,45 @@ class ProjectContracts(unittest.TestCase):
         self.assertEqual(rows[0].split("\t")[5], "light")
         self.assertEqual(files[0][0], pdf)
 
+    def test_package_input_paths_are_relative_to_the_project(self):
+        documents = self.project / "documents"
+        documents.mkdir()
+        pdf = documents / "report.pdf"
+        vector = documents / "report.vector.json"
+        pdf.write_bytes(b"project PDF")
+        vector.write_text('{"version":1,"scenes":[]}')
+        original_directory = Path.cwd()
+        try:
+            os.chdir(self.root)
+            _, files = collect_assets(Catalog(self.project), self.root / "absent", inputs={
+                "sample": {"light": {"pdf": "documents/report.pdf",
+                                     "vectors": "documents/report.vector.json"}}})
+        finally:
+            os.chdir(original_directory)
+        self.assertEqual([source for source, _ in files], [pdf, vector])
+
+    def test_palette_export_preserves_authored_colour_names(self):
+        self.catalog["palette"] = {"file": "palette.tex", "prefix": "sample"}
+        self.write_catalog()
+        names = [f"sample{theme}{role}" for theme in ("Light", "Dark")
+                 for role in ("Background", "Foreground", "Accent", "Muted", "Guide", "Faint",
+                              "AxisX", "AxisY", "AxisZ")]
+        definitions = [rf"\definecolor{{{name}}}{{HTML}}{{a1b2c3}}" for name in names]
+        definitions.append(r"\definecolor{unrelatedColour}{HTML}{FFFFFF}")
+        (self.project / "palette.tex").write_text("\n".join(definitions) + "\n")
+        exported = palette_tex(self.project)
+        for name in names:
+            self.assertIn(rf"\definecolor{{{name}}}{{HTML}}{{A1B2C3}}", exported)
+        self.assertNotIn("Axisx", exported)
+        self.assertNotIn("unrelatedColour", exported)
+
     def test_page_map_rejects_missing_and_disordered_logical_pages(self):
         for pages in ([{"number": 2, "logical": 1}],
-                      [{"number": 1, "logical": 2}]):
-            with self.assertRaises(ValueError):
-                page_mapping(Path("unused.pdf"), {"version": 1, "pages": pages}, 1)
+                      [{"number": 1, "logical": 2}],
+                      [{"number": 1, "logical": 1}, {"number": 2, "logical": 2},
+                       {"number": 3, "logical": 1}]):
+            with self.subTest(pages=pages), self.assertRaises(ValueError):
+                page_mapping(Path("unused.pdf"), {"version": 1, "pages": pages}, len(pages))
         pages, count = page_mapping(Path("unused.pdf"), {"version": 1, "pages": [
             {"number": 1, "logical": 1}, {"number": 2, "logical": 1},
             {"number": 3, "logical": 2}]}, 3)
@@ -119,6 +153,38 @@ class OfflineInstaller(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "local edits"):
             installer.install(self.project, self.source, self.revision)
         self.assertEqual(edited.read_text(), "# consumer local work\n")
+
+    def test_existing_lock_symlink_preserves_its_target_and_installed_files(self):
+        installer.install(self.project, self.source, self.revision)
+        lock_path = self.project / installer.LOCK
+        external = self.root / "external-lock.json"
+        lock_path.rename(external)
+        lock_path.symlink_to(external)
+        before = external.read_bytes()
+        entry_before = (self.project / installer.ENTRY).read_bytes()
+        inventory_before = installer._inventory(self.project / installer.VENDOR)
+        for operation in (lambda: installer.verify_installation(self.project),
+                          lambda: installer.install(self.project, self.source, self.revision)):
+            with self.assertRaisesRegex(ValueError, "ordinary toolkit lock"):
+                operation()
+        self.assertTrue(lock_path.is_symlink())
+        self.assertEqual(external.read_bytes(), before)
+        self.assertEqual((self.project / installer.ENTRY).read_bytes(), entry_before)
+        self.assertEqual(installer._inventory(self.project / installer.VENDOR), inventory_before)
+
+    def test_dangling_lock_symlink_is_rejected_before_installation(self):
+        lock_path = self.project / installer.LOCK
+        lock_path.parent.mkdir()
+        external = self.root / "uncreated-lock.json"
+        lock_path.symlink_to(external)
+        for operation in (lambda: installer.verify_installation(self.project),
+                          lambda: installer.install(self.project, self.source, self.revision)):
+            with self.assertRaisesRegex(ValueError, "ordinary toolkit lock"):
+                operation()
+        self.assertTrue(lock_path.is_symlink())
+        self.assertFalse(external.exists())
+        self.assertFalse((self.project / installer.ENTRY).exists())
+        self.assertFalse((self.project / installer.VENDOR).exists())
 
     def test_failed_update_restores_code_entry_and_lock(self):
         installer.install(self.project, self.source, self.revision)

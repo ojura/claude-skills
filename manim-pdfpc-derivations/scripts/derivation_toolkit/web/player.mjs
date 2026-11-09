@@ -99,8 +99,9 @@ function setProgress() {
   ui.restart.disabled = !scene;
   ui.stepBack.disabled = !scene || time <= 0.0001;
   ui.stepNext.disabled = !scene || time >= scene.duration - 0.0001;
-  ui.previous.disabled = pageIndex <= 0;
-  ui.next.disabled = pageIndex >= activeMetadata().pages.length - 1;
+  ui.previous.disabled = pageIndex <= 0 && (!scene || time <= 0.0001);
+  ui.next.disabled = !isBlank && pageIndex >= activeMetadata().pages.length - 1 &&
+    (!scene || time >= scene.duration - 0.0001);
 }
 
 function positionVector(meta, activeScene, canvas, box) {
@@ -391,6 +392,7 @@ function toggleBlank() {
   pause();
   isBlank = !isBlank;
   ui.blank.hidden = !isBlank;
+  setProgress();
   sendState(true);
 }
 

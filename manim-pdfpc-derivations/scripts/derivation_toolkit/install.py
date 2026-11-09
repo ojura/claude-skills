@@ -60,6 +60,8 @@ def verify_installation(project: str | Path) -> dict:
     """Check every installed byte and mode without a skill checkout or network."""
     project = Path(project).expanduser().resolve()
     path = project / LOCK
+    if not path.is_file() or path.is_symlink():
+        raise ValueError(f"Missing ordinary toolkit lock file: {path}")
     lock = json.loads(path.read_text(encoding="utf-8"))
     if lock.get("version") != 1 or lock.get("source_path") != SOURCE_PREFIX:
         raise ValueError(f"Unsupported toolkit lock: {path}")
@@ -116,7 +118,7 @@ def install(project: str | Path, source: str | Path, revision: str) -> dict:
     if not project.is_dir():
         raise ValueError(f"The target project does not exist: {project}")
     target, lock_path, entry = project / VENDOR, project / LOCK, project / ENTRY
-    if lock_path.exists():
+    if lock_path.exists() or lock_path.is_symlink():
         verify_installation(project)
     elif target.exists() or target.is_symlink() or entry.exists() or entry.is_symlink():
         raise ValueError("Preserving existing unowned toolkit or entry point; select an empty installation location")
