@@ -69,6 +69,13 @@ existing shared definitions. Use the palette loader and semantic text helpers.
 Register TeX semantics when constructing text, before copies and transforms, so
 PDF export preserves the actual glyph geometry and text selection.
 
+Author visible teaching descriptions and their checkpoint labels from one text
+definition. The shared `StepDescriptions` helper reveals each declared step,
+dims earlier descriptions and checks their presence before clearing the sequence
+for the result. Supply its text factory to control typography and placement.
+Checkpoint metadata also serves the presenter controls; student-facing
+instructions need actual text objects in the scene.
+
 Move existing tokens when the mathematical expression stays the same. When an
 expression changes, construct the new semantic text and animate its introduction
 or replacement with a supported operation. Preserve the intended object order
@@ -132,6 +139,12 @@ signs, basis directions, inverse relationships and dimensions. Inspect every
 changed checkpoint and representative intermediate times in both themes.
 Render the final Beamer pages as well as the standalone figures. Check copied
 text from the exported figures and final handout when text or transforms change.
+
+For a visible description sequence, check the exported text and painted colours
+at every stage, including the removal of earlier descriptions at the result.
+Keep a regression whose negative control removes or hides the text while leaving
+the checkpoint metadata valid. The inverse scene's semantic tests demonstrate
+this check in both themes.
 
 Run the relevant existing source, semantic-text, PDF and native-render checks.
 Follow small numeric drawing differences through to their visible effect; use
