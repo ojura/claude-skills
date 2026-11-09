@@ -1,0 +1,49 @@
+% Console listings with optional minted settings and theme colours.
+\ifdefined\DerivationCodeLoaded\expandafter\endinput\fi
+\let\DerivationCodeLoaded\relax
+\RequirePackage{etoolbox}
+\RequirePackage{pmboxdraw}
+\providecommand{\DerivationTheme}{light}
+\providecommand{\DerivationCodeFontFamily}{\ttdefault}
+\providecommand{\DerivationLightCodeStyle}{default}
+\providecommand{\DerivationDarkCodeStyle}{native}
+\makeatletter
+\@ifpackageloaded{minted}{}{%
+  \ifdefined\DerivationMintedOutputDir
+    \edef\Derivation@mintedoptions{outputdir=\DerivationMintedOutputDir}%
+    \expandafter\PassOptionsToPackage\expandafter{\Derivation@mintedoptions}{minted}%
+  \fi
+  \RequirePackage{minted}%
+}
+\@ifundefinedcolor{derivationConsole}{%
+  \PackageError{derivation-code}{The console palette is not loaded}{Load theme.tex before code.tex.}%
+}{}
+\setminted{fontfamily=\DerivationCodeFontFamily}
+\fvset{listparameters={\setlength{\topsep}{0pt}\setlength{\partopsep}{0pt}}}
+\AtBeginEnvironment{minted}{%
+  \let\itshape\relax
+  \setlength{\medskipamount}{0pt}%
+}
+\ifdefstring{\DerivationTheme}{dark}{%
+  \expandafter\usemintedstyle\expandafter{\DerivationDarkCodeStyle}%
+}{%
+  \expandafter\usemintedstyle\expandafter{\DerivationLightCodeStyle}%
+}
+
+% Use the text lexer when a listing contains escaped TeX substitutions.
+\newcommand{\DerivationDefineConsole}[2]{%
+  \expandafter\newcommand\csname Derivation@begin@#1\endcsname[1][]{%
+    \begin{minted}[bgcolor=derivationConsole,tabsize=0,##1]{#2}%
+  }%
+  \newenvironment{#1}{%
+    \VerbatimEnvironment
+    % Preserve the first newline while checking for optional settings.
+    \catcode`\^^M=\active\relax
+    \csname Derivation@begin@#1\endcsname
+  }{%
+    \end{minted}%
+  }%
+}
+\DerivationDefineConsole{derivationconsole}{console}
+\DerivationDefineConsole{derivationconsoletext}{text}
+\makeatother

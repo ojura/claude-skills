@@ -1,0 +1,99 @@
+% Figures, teaching overlays and compact handouts from one scene export.
+\ifdefined\DerivationFiguresLoaded\expandafter\endinput\fi
+\let\DerivationFiguresLoaded\relax
+\RequirePackage{graphicx}
+\RequirePackage{xcolor}
+\RequirePackage{hyperref}
+\providecommand{\DerivationTheme}{light}
+\providecommand{\DerivationRepositoryRoot}{.}
+\providecommand{\DerivationAssets}{animations/generated}
+\providecommand{\DerivationGraphicOptions}{width=\linewidth,height=.8\textheight,keepaspectratio}
+\input{\DerivationAssets/steps.tex}
+
+% Link margins are read at shipout.
+\ifdefined\DerivationLive\hypersetup{pdflinkmargin=0pt}\fi
+
+\newcommand{\DerivationGraphic}[2][\DerivationGraphicOptions]{%
+  \expandafter\includegraphics\expandafter[#1]{\DerivationAssets/\DerivationTheme/#2}%
+}
+\newcommand{\DerivationPoster}[1]{\csname DerivationPoster@#1\endcsname}
+\newcommand{\DerivationFigure}[2]{\csname DerivationFigure@#1@#2\endcsname}
+\newcommand{\DerivationCaption}[2]{\csname DerivationCaption@#1@#2\endcsname}
+\newcommand{\DerivationResult}[1]{\csname DerivationResult@#1\endcsname}
+
+\newlength{\DerivationPanelGap}
+\setlength{\DerivationPanelGap}{.03\linewidth}
+\newlength{\DerivationPanelWidth}
+\newlength{\DerivationPanelHeight}
+
+\makeatletter
+\newcommand{\Derivation@layout}[1]{%
+  \edef\Derivation@columns{\csname DerivationColumns@#1\endcsname}%
+  \edef\Derivation@rows{\csname DerivationRows@#1\endcsname}%
+  \ifnum\Derivation@columns<1
+    \PackageError{derivations}{Handout columns must be positive}{Check the scene's HandoutLayout.}%
+    \def\Derivation@columns{1}%
+  \fi
+  \ifnum\Derivation@rows<1
+    \PackageError{derivations}{Handout rows must be positive}{Check the exported scene metadata.}%
+    \def\Derivation@rows{1}%
+  \fi
+  \setlength{\DerivationPanelWidth}{\linewidth}%
+  \setlength{\@tempdima}{\DerivationPanelGap}%
+  \@tempcnta=\Derivation@columns\relax
+  \advance\@tempcnta by -1
+  \multiply\@tempdima by \@tempcnta
+  \addtolength{\DerivationPanelWidth}{-\@tempdima}%
+  \divide\DerivationPanelWidth by \Derivation@columns\relax
+  \setlength{\DerivationPanelHeight}{\csname DerivationHeightFraction@#1\endcsname\textheight}%
+  \setlength{\@tempdima}{\csname DerivationRowGap@#1\endcsname mm}%
+  \@tempcnta=\Derivation@rows\relax
+  \advance\@tempcnta by -1
+  \multiply\@tempdima by \@tempcnta
+  \addtolength{\DerivationPanelHeight}{-\@tempdima}%
+  \divide\DerivationPanelHeight by \Derivation@rows\relax
+  \ifdim\DerivationPanelWidth>0pt\else
+    \PackageError{derivations}{The panel gaps consume the handout width}{Reduce DerivationPanelGap or the column count.}%
+  \fi
+  \ifdim\DerivationPanelHeight>0pt\else
+    \PackageError{derivations}{The row gaps consume the handout height}{Reduce the row gap or increase max_height_fraction.}%
+  \fi
+}
+
+% Override either hook before or after loading this file.
+\providecommand{\DerivationPanel}[2]{%
+  \begin{minipage}[t]{\DerivationPanelWidth}
+    \centering
+    \DerivationGraphic[width=\linewidth,height=\DerivationPanelHeight,keepaspectratio]%
+      {\DerivationFigure{#1}{#2}}\par
+    {\scriptsize\textcolor{derivationAccent}{\textbf{(#2)}}\enspace
+      \DerivationCaption{#1}{#2}\par}%
+  \end{minipage}%
+}
+\providecommand{\DerivationHandout}[1]{%
+  \begingroup
+  \centering
+  \Derivation@layout{#1}%
+  \csname DerivationHandout@#1\endcsname\par
+  \endgroup
+}
+\newcommand{\DerivationScene}[1]{%
+  \begingroup
+  \centering
+  \ifdefined\DerivationCompactHandout
+    \DerivationHandout{#1}%
+  \else
+    \ifdefined\DerivationLive
+      \href{pdfpc-vector:#1}{\DerivationGraphic{\DerivationPoster{#1}}}%
+    \else
+      \@ifclassloaded{beamer}{%
+        \csname DerivationFullSteps@#1\endcsname
+      }{%
+        \DerivationHandout{#1}%
+      }%
+    \fi
+  \fi
+  \par
+  \endgroup
+}
+\makeatother

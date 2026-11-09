@@ -1,0 +1,105 @@
+% Shared palette selection and optional Beamer styling.
+\ifdefined\DerivationThemeLoaded\expandafter\endinput\fi
+\let\DerivationThemeLoaded\relax
+\RequirePackage{etoolbox}
+\RequirePackage{xcolor}
+\RequirePackage{graphicx}
+\RequirePackage{tikz}
+\providecommand{\DerivationTheme}{light}
+\providecommand{\DerivationRepositoryRoot}{.}
+\providecommand{\DerivationPaletteFile}{\DerivationRepositoryRoot/palette.tex}
+\providecommand{\DerivationPalettePrefix}{derivation}
+\providecommand{\DerivationCoveredOpacity}{16}
+\input{\DerivationPaletteFile}
+\newif\ifDerivationDark
+
+\makeatletter
+\ifdefstring{\DerivationTheme}{dark}{%
+  \DerivationDarktrue
+  \def\Derivation@variant{Dark}%
+}{%
+  \ifdefstring{\DerivationTheme}{light}{%
+    \DerivationDarkfalse
+    \def\Derivation@variant{Light}%
+  }{%
+    \PackageError{derivation-theme}{Unknown theme '\DerivationTheme'}{Use light or dark.}%
+  }%
+}
+\edef\Derivation@palette{\DerivationPalettePrefix\Derivation@variant}
+\newcommand{\Derivation@requiredcolor}[1]{%
+  \@ifundefinedcolor{\Derivation@palette#1}{%
+    \PackageError{derivation-theme}{Missing palette colour \Derivation@palette#1}%
+      {Define the six palette roles for both Light and Dark in DerivationPaletteFile.}%
+  }{%
+    \colorlet{derivation#1}{\Derivation@palette#1}%
+  }%
+}
+\forcsvlist{\Derivation@requiredcolor}{Background,Foreground,Accent,Muted,Guide,Faint}
+\newcommand{\Derivation@optionalcolor}[2]{%
+  \@ifundefinedcolor{\Derivation@palette#1}{%
+    \colorlet{derivation#1}{#2}%
+  }{%
+    \colorlet{derivation#1}{\Derivation@palette#1}%
+  }%
+}
+\Derivation@optionalcolor{Panel}{derivationBackground!95!derivationForeground}
+\Derivation@optionalcolor{Console}{derivationBackground!92!derivationForeground}
+\Derivation@optionalcolor{Title}{derivationPanel}
+\Derivation@optionalcolor{AxisX}{derivationAccent}
+\Derivation@optionalcolor{AxisY}{derivationForeground}
+\Derivation@optionalcolor{AxisZ}{derivationMuted}
+
+\@ifclassloaded{beamer}{%
+  \setbeamercolor{normal text}{fg=derivationForeground,bg=derivationBackground}
+  \setbeamercolor{background canvas}{bg=derivationBackground}
+  \setbeamercolor{structure}{fg=derivationAccent}
+  \setbeamercolor{example text}{fg=derivationForeground}
+  \setbeamercolor{alerted text}{fg=derivationAccent}
+  \setbeamercolor{titlelike}{fg=derivationForeground,bg=derivationPanel}
+  \setbeamercolor{frametitle}{parent=titlelike,bg=derivationTitle}
+  \setbeamercolor{section in toc}{fg=derivationForeground}
+  \setbeamercolor{subsection in toc}{fg=derivationForeground}
+  \setbeamercolor{section in toc shaded}{fg=derivationMuted}
+  \setbeamercolor{subsection in toc shaded}{fg=derivationMuted}
+  \setbeamercolor{item projected}{fg=derivationBackground,bg=derivationAccent}
+  \setbeamercolor{block title}{fg=derivationForeground,bg=derivationPanel}
+  \setbeamercolor{block title alerted}{parent=block title}
+  \setbeamercolor{block title example}{parent=block title}
+  \setbeamercolor{block body}{fg=derivationForeground,bg=derivationPanel}
+  \setbeamercolor{block body alerted}{parent=block body}
+  \setbeamercolor{block body example}{parent=block body}
+  \setbeamercolor{sidebar}{bg=derivationPanel}
+  \setbeamercolor{palette sidebar primary}{fg=derivationForeground}
+  \setbeamercolor{palette sidebar secondary}{fg=derivationMuted}
+  \setbeamercolor{palette sidebar tertiary}{fg=derivationMuted}
+  \setbeamercolor{palette sidebar quaternary}{fg=derivationForeground}
+  \setbeamertemplate{navigation symbols}{}
+  \setbeamercovered{transparent=\DerivationCoveredOpacity}
+  \hypersetup{urlcolor=derivationAccent,linkcolor=derivationAccent}
+}{}
+\tikzset{every picture/.append style={color=derivationForeground}}
+
+\newcommand{\Derivation@legacygraphic}[2]{%
+  \ifDerivationDark
+    {\setlength{\fboxsep}{0pt}\colorbox{white}{\includegraphics[#1]{#2}}}%
+  \else
+    \includegraphics[#1]{#2}%
+  \fi
+}
+\@ifclassloaded{beamer}{%
+  \newcommand<>{\DerivationLegacyGraphics}[2][]{%
+    \only#3{\Derivation@legacygraphic{#1}{#2}}%
+  }
+  \newcommand<>{\DerivationUncoverGraphics}[2][]{%
+    \begin{tikzpicture}[baseline=(figure.south)]
+      \node[inner sep=0,outer sep=0] (figure) {\Derivation@legacygraphic{#1}{#2}};
+      \pgfmathsetmacro{\Derivation@veil}{1-\DerivationCoveredOpacity/100}%
+      \alt#3{}{\fill[derivationBackground,opacity=\Derivation@veil]
+        (figure.south west) rectangle (figure.north east);}%
+    \end{tikzpicture}%
+  }
+}{%
+  \newcommand{\DerivationLegacyGraphics}[2][]{\Derivation@legacygraphic{#1}{#2}}
+  \newcommand{\DerivationUncoverGraphics}[2][]{\Derivation@legacygraphic{#1}{#2}}
+}
+\makeatother
