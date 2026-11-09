@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'HELP'
+Usage: presentation.appimage [--deck ID] [--light | --dark] [--print-pdf]
+       [--cache-root DIR] [--output-dir DIR] [-- pdfpc options]
+       presentation.appimage --list
+
+Open a presentation from the bundled catalog.
+The bundle supplies pdfpc, the available themes and their vector animation data.
+Running the presentation does not require TeX, Manim, downloads or compilation.
+
+Options:
+  --deck ID        Select a presentation from the bundled catalog.
+  --list           List the bundled presentations, then exit.
+  --light | --dark  Select the slide theme (default: light).
+  --print-pdf       Print where the selected PDF will be stored, then exit.
+  --cache-root DIR  Store this presentation's cached files under DIR.
+  --output-dir DIR  Place the selected PDF and animation data in DIR.
+  -h, --help        Show this help.
+  -- pdfpc options  Pass remaining options to the bundled viewer.
+
+Environment:
+  DERIVATION_CACHE_ROOT  Saved default for --cache-root.
+  DERIVATION_BUILD_DIR   Saved default for --output-dir.
+
+By default, presentation files use your user cache directory
+(normally ~/.cache/derivation-presentations), with a separate folder for each build and deck.
+Use --output-dir to choose the presentation folder directly.
+Command-line directory options override these environment variables.
+
+Examples:
+  ./presentation.appimage
+  ./presentation.appimage --dark
+  ./presentation.appimage --list
+  ./presentation.appimage --deck example --dark
+  ./presentation.appimage --print-pdf
+  ./presentation.appimage -- --windowed=both --page=6
+HELP
+}
+
+theme=light
+deck_id=
+list_decks=0
+print_pdf=0
+pdfpc_args=()
+while (($#)); do
+    case "$1" in
+        --light) theme=light; shift ;;
+        --dark) theme=dark; shift ;;
+        --deck)
+            if (($# < 2)) || [[ -z $2 ]]; then
+                printf 'Missing presentation ID after --deck\n' >&2
+                exit 2
+            fi
+            deck_id=$2; shift 2 ;;
+        --list) list_decks=1; shift ;;
+        --print-pdf) print_pdf=1; shift ;;
+        --cache-root|--output-dir)
+            if (($# < 2)) || [[ -z $2 ]]; then
+                printf 'Missing directory after %s\n' "$1" >&2
+                exit 2
+            fi
+            if [[ $1 == --cache-root ]]; then
+                export DERIVATION_CACHE_ROOT="$2"
+            else
+                export DERIVATION_BUILD_DIR="$2"
+            fi
+            shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; pdfpc_args+=("$@"); break ;;
+        *) pdfpc_args+=("$1"); shift ;;
+    esac
+done
+
+absolute_path() {
+    local path_value=$1 path_prefix path_user path_entry path_home
+    if [[ $path_value == '~'* ]]; then
+        path_prefix=${path_value%%/*}
+        path_user=${path_prefix:1}
+        if [[ -z $path_user ]]; then
+            path_home=$HOME
+        else
+            path_entry=$(getent passwd "$path_user") || {
+                printf 'Cannot resolve home directory for %s\n' "$path_prefix" >&2
+                return 1
+            }
+            IFS=: read -r _ _ _ _ _ path_home _ <<< "$path_entry"
+        fi
+        path_value="$path_home${path_value#"$path_prefix"}"
+    fi
+    realpath -m -- "$path_value"
+}
+
+app_dir=${APPDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}
+app_dir=$(absolute_path "$app_dir")
+export APPDIR="$app_dir"
+asset_dir="$app_dir/usr/share/derivation-presentations"
+for catalog_file in decks.tsv default-deck; do
+    if [[ ! -r "$asset_dir/$catalog_file" ]]; then
+        printf 'Missing bundled catalog: %s/%s\n' "$asset_dir" "$catalog_file" >&2
+        exit 1
+    fi
+done
+if ((list_decks)); then
+    printf 'ID\tLanguage\tArchive\tThemes\tTitle\n'
+    while IFS=$'\t' read -r row_id row_stem row_language row_archived row_animation row_themes row_title; do
+        printf '%s\t%s\t%s\t%s\t%s\n' "$row_id" "$row_language" "$row_archived" "$row_themes" "$row_title"
+    done < "$asset_dir/decks.tsv"
+    exit 0
+fi
+deck_id=${deck_id:-$(<"$asset_dir/default-deck")}
+document=
+has_animation=
+available_themes=
+while IFS=$'\t' read -r row_id row_stem row_language row_archived row_animation row_themes row_title; do
+    if [[ $row_id == "$deck_id" ]]; then
+        document=$row_stem
+        has_animation=$row_animation
+        available_themes=$row_themes
+        break
+    fi
+done < "$asset_dir/decks.tsv"
+if [[ ! $deck_id =~ ^[a-z0-9][a-z0-9-]*$ || ! $document =~ ^[A-Za-z0-9_.-]+$ ||
+      ! $has_animation =~ ^[01]$ ]]; then
+    printf 'Unknown or invalid presentation: %s. Use --list to see the catalog.\n' "$deck_id" >&2
+    exit 2
+fi
+if [[ ,$available_themes, != *",$theme,"* ]]; then
+    printf 'Theme %s is unavailable for %s (available: %s).\n' "$theme" "$deck_id" "$available_themes" >&2
+    exit 2
+fi
+if [[ ! -r "$asset_dir/bundle-id" ]]; then
+    printf 'Missing bundled presentation identity: %s/bundle-id\n' "$asset_dir" >&2
+    exit 1
+fi
+bundle_id=$(<"$asset_dir/bundle-id")
+if [[ ! $bundle_id =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'Invalid bundled presentation identity in %s/bundle-id\n' "$asset_dir" >&2
+    exit 1
+fi
+cache_root=$(absolute_path "${DERIVATION_CACHE_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/derivation-presentations}")
+output_dir=$(absolute_path "${DERIVATION_BUILD_DIR:-$cache_root/bundles/$bundle_id/$deck_id/pdf}")
+filename="$document-$theme-live.pdf"
+live_pdf="$output_dir/$filename"
+if ((print_pdf)); then
+    printf '%s\n' "$live_pdf"
+    exit 0
+fi
+
+viewer="$app_dir/usr/bin/pdfpc"
+if [[ ! -x $viewer ]]; then
+    printf 'Missing bundled viewer: %s\n' "$viewer" >&2
+    exit 1
+fi
+selected_assets=("$filename")
+if [[ $has_animation == 1 ]]; then
+    selected_assets+=("${filename%.pdf}.vector.json")
+fi
+deck_assets="$asset_dir/decks/$deck_id"
+for name in "${selected_assets[@]}"; do
+    if [[ ! -r "$deck_assets/$name" ]]; then
+        printf 'Missing bundled presentation asset: %s/%s\n' "$deck_assets" "$name" >&2
+        exit 1
+    fi
+done
+font_template="$app_dir/etc/fonts/fonts.conf.in"
+if [[ ! -r $font_template || ! -d "$app_dir/usr/share/fonts" ]]; then
+    printf 'Missing bundled font configuration or fonts in %s\n' "$app_dir" >&2
+    exit 1
+fi
+for metadata_name in source-revision build-timestamp project-title; do
+    if [[ ! -r "$asset_dir/$metadata_name" ]]; then
+        printf 'Missing bundled build metadata: %s/%s\n' "$asset_dir" "$metadata_name" >&2
+        exit 1
+    fi
+done
+source_revision=$(<"$asset_dir/source-revision")
+project_title=$(<"$asset_dir/project-title")
+build_timestamp=$(<"$asset_dir/build-timestamp")
+if [[ ! $source_revision =~ ^[A-Za-z0-9._-]+$ ||
+      ! $build_timestamp =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+    printf 'Invalid bundled source revision or UTC build timestamp in %s\n' "$asset_dir" >&2
+    exit 1
+fi
+mkdir -p -- "$output_dir"
+exec 9>"$output_dir/.bundle-assets.lock"
+flock 9
+temporary_asset=
+cleanup() {
+    if [[ -n $temporary_asset ]]; then
+        rm -f -- "$temporary_asset"
+    fi
+}
+trap cleanup EXIT
+for name in "${selected_assets[@]}"; do
+    if ! cmp -s -- "$deck_assets/$name" "$output_dir/$name"; then
+        temporary_asset=$(mktemp "$output_dir/.$name.XXXXXX")
+        cp -- "$deck_assets/$name" "$temporary_asset"
+        chmod 644 "$temporary_asset"
+        mv -fT -- "$temporary_asset" "$output_dir/$name"
+        temporary_asset=
+    fi
+done
+
+# Fontconfig 2.13.1 needs an absolute font directory. Keep each mounted AppDir's
+# configuration separate so concurrent AppImages cannot replace its font path.
+font_key=$(printf '%s' "$app_dir" | sha256sum)
+font_config_dir="$cache_root/bundles/$bundle_id/fontconfig/${font_key%% *}"
+font_config_file="$font_config_dir/fonts.conf"
+font_directory_xml="$app_dir/usr/share/fonts"
+font_directory_xml=${font_directory_xml//&/"&amp;"}
+font_directory_xml=${font_directory_xml//</"&lt;"}
+font_directory_xml=${font_directory_xml//>/"&gt;"}
+font_configuration=$(<"$font_template")
+font_configuration=${font_configuration//@BUNDLED_FONT_DIRECTORY@/"$font_directory_xml"}
+mkdir -p -- "$font_config_dir"
+if ! printf '%s\n' "$font_configuration" | cmp -s - "$font_config_file"; then
+    temporary_asset=$(mktemp "$font_config_dir/.fonts.conf.XXXXXX")
+    printf '%s\n' "$font_configuration" > "$temporary_asset"
+    chmod 644 "$temporary_asset"
+    mv -fT -- "$temporary_asset" "$font_config_file"
+    temporary_asset=
+fi
+flock -u 9
+exec 9>&-
+trap - EXIT
+
+# linuxdeploy's GTK helper stages runtime setup in these packaged hooks.
+export LD_LIBRARY_PATH="$app_dir/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+export FONTCONFIG_PATH="$font_config_dir"
+export FONTCONFIG_FILE="$font_config_file"
+# Keep the bundled GLib from loading modules compiled for a newer host GLib.
+export GIO_MODULE_DIR="$app_dir/usr/lib/gio/modules"
+unset GIO_EXTRA_MODULES
+set +u
+for runtime_hook in "$app_dir"/apprun-hooks/*.sh; do
+    [[ -f $runtime_hook ]] || continue
+    source "$runtime_hook"
+done
+set -u
+export PDFPC_DATA_DIR="$app_dir/usr/share/pdfpc"
+export PDFPC_CONFIG_DIR="$app_dir/etc"
+export PDFPC_TITLE_SUFFIX="$project_title ${source_revision:0:8} | built $build_timestamp"
+exec "$viewer" "${pdfpc_args[@]}" "$live_pdf"

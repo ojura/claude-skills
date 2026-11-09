@@ -1,0 +1,4 @@
+# Reader/selection tests, installed in the cached authoring venv after requirements.lock.
+# Production export does not import these packages. Pin both wrapper and binary runtime.
+PyMuPDF==1.23.7
+PyMuPDFb==1.23.7

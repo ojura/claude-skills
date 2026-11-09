@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#15191f">
+  <title>Presentation</title>
+  <link rel="stylesheet" href="./player.css">
+  <script type="importmap" id="derivation-imports">
+    {"imports":{"pdfjs":"./vendor/pdf.mjs","derivation-vector":"./vector.mjs","derivation-resources":"./resources.mjs"}}
+  </script>
+  <script type="module" src="./player.mjs"></script>
+</head>
+<body>
+  <main id="app">
+    <section class="projection">
+      <div id="slide" class="slide" aria-label="Presentation page">
+        <canvas id="pdf" aria-label="PDF page"></canvas>
+        <canvas id="vector" aria-label="Animated derivation"></canvas>
+        <div id="text-layer" class="textLayer"></div>
+        <div id="blank" hidden></div>
+        <div id="loading" aria-live="polite">Loading the presentation…</div>
+      </div>
+    </section>
+    <aside id="presenter" hidden>
+      <h2>Presenter</h2>
+      <div id="next-heading">Next slide</div>
+      <canvas id="next-preview" aria-label="Next slide preview"></canvas>
+      <div id="next-title"></div>
+      <div class="notes">
+        <div>Current teaching step</div>
+        <strong id="step-label">No animation on this slide</strong>
+        <div class="status" id="clock">00:00 · paused</div>
+      </div>
+      <button id="projector" title="Open a synchronized audience window">Open projector window</button>
+    </aside>
+  </main>
+  <footer id="controls">
+    <div class="group">
+      <button id="previous" title="Previous step or slide (Left)" aria-label="Previous step or slide">‹</button>
+      <button id="next" title="Next segment or slide (Right or Space)" aria-label="Next segment or slide">›</button>
+      <span id="progress">Loading…</span>
+    </div>
+    <div class="group">
+      <button id="step-back" title="Previous teaching checkpoint (Ctrl+Left)">|‹</button>
+      <button id="restart" title="Restart animation (R)" aria-label="Restart animation">↺</button>
+      <button id="play" title="Play or pause animation (A); V plays continuously" aria-label="Play animation">▶</button>
+      <button id="step-next" title="Next teaching checkpoint (Ctrl+Right)">›|</button>
+      <span id="step-caption" aria-live="polite">No animation</span>
+    </div>
+    <div class="group">
+      <label for="speed">Speed</label>
+      <select id="speed"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select>
+      <label for="theme">Theme</label>
+      <select id="theme"></select>
+      <button id="presenter-mode" title="Presenter layout (P)">Presenter</button>
+      <button id="fullscreen" title="Fullscreen (F)">Fullscreen</button>
+    </div>
+  </footer>
+  <div id="error" role="alert" hidden></div>
+</body>
+</html>

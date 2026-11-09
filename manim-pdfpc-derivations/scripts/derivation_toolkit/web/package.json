@@ -1,0 +1,13 @@
+{
+  "name": "derivation-html5",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Standalone PDF and vector-animation presentation player",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "pdfjs-dist": "5.1.91"
+  }
+}

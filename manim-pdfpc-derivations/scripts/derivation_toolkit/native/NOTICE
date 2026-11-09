@@ -1,0 +1,21 @@
+Native vector animation extension for pdfpc
+
+The default native source is https://github.com/ojura/pdfpc.
+revision.txt pins its source revision; a project may explicitly select another
+compatible repository and full revision in presentations.json.
+The fork builds on pdfpc v4.7.0 from https://github.com/pdfpc/pdfpc.
+pdfpc, its vector implementation and these integration helpers are distributed
+under GPL-3.0-or-later. Upstream copyright notices remain in the fork's sources.
+The accompanying LICENSE is the GNU General Public License version 3.
+
+The fork adds native Cairo path rendering to pdfpc's GTK drawing areas.
+Manim supplies the vector geometry, style keyframes and semantic checkpoints.
+The standard PDF is still independently readable; its linked poster rectangle
+identifies where pdfpc draws the corresponding scene.
+
+Upstream dependency and compilation documentation:
+https://github.com/pdfpc/pdfpc/tree/v4.7.0#compilation-from-sources
+
+Ubuntu development packages:
+cmake ninja-build valac libgee-0.8-dev libpoppler-glib-dev libgtk-3-dev
+libjson-glib-dev librsvg2-dev libgirepository1.0-dev
