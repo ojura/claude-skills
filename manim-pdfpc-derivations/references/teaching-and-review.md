@@ -38,6 +38,21 @@ If a symbol's position changes for layout, make that distinct from a geometric
 transformation. Check text at the start, middle and end of each motion for
 collisions, clipping, lingering glyphs and unexpected fills.
 
+## Keep geometric annotations complete
+
+Build related geometric marks with one shared constructor and migrate comparable
+call sites to it. A marked angle must own an explicit zero-direction reference
+ray, its arc and a semantic label. Derive the ray and arc from the same origin
+and start direction. Transform the complete group so the ray starts at the arc
+center and points along the arc's start direction after translation, rotation
+or scaling.
+
+Inspect exported intermediate and transformed states in both themes. Include a
+state where the annotation separates from any coincident axis, and verify each
+required component's position and visible stroke or text. Keep a regression
+that fails when a required component is removed or hidden while checkpoint
+metadata remains valid.
+
 ## Review the printed slide independently
 
 A printable derivation needs an explicit reading order and a complete final

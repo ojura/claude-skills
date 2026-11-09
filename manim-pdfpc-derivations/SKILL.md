@@ -54,8 +54,9 @@ time to follow each contribution. A cumbersome scalar calculation used to
 motivate a matrix can move quickly through its intermediate algebra. Preserve
 the conclusion that justifies the new representation.
 
-See [Teaching and visual review](references/teaching-and-review.md) when choosing
-the sequence, pacing or handout layout.
+Read [Teaching and visual review](references/teaching-and-review.md) when
+planning the sequence, constructing geometric annotations or reviewing the
+pacing and handout layout.
 
 ## Author one scene for all outputs
 
