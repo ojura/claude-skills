@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manim and pdfpc derivations"
+  short_description: "Author vector derivations for Beamer and pdfpc"
+  default_prompt: "Use $manim-pdfpc-derivations to add an animated derivation to this lecture, with teaching checkpoints and a printable handout."

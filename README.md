@@ -103,6 +103,16 @@ same input renders the same way every time and no font is silently swapped.
 Especially handy for getting ChatGPT to iterate on a tricky render without it
 switching the engine under you. [Read more](claude-html-pdf-polisher).
 
+## Teaching with animated derivations
+
+### manim-pdfpc-derivations
+
+Authors mathematical derivations with Manim for live vector playback inside
+pdfpc, matching Beamer overlays and a printable handout. Covers teaching
+checkpoints, geometry and algebra, selectable text, light and dark themes,
+review and the lectures repository's shared build workflow.
+[Read the skill](manim-pdfpc-derivations/SKILL.md).
+
 ## Driving your browser and system
 
 ### cdp-daemon
