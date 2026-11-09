@@ -8,6 +8,8 @@
 - [Package HTML](#package-html)
 - [Use native presentation tools](#use-native-presentation-tools)
 - [Run the toaster example](#run-the-toaster-example)
+- [Add the reusable CI workflow](#add-the-reusable-ci-workflow)
+- [Verify the delivered outputs](verification.md)
 - [Keep dependencies and products reproducible](#keep-dependencies-and-products-reproducible)
 
 ## Install a pinned copy
@@ -31,6 +33,11 @@ an installation independently with the same installer and `--check --project`;
 add `--source` to compare the lock with its committed canonical source. An update
 requires the previous installation to match its lock. Preserve local edits in
 the canonical skill, publish them, then install the new revision.
+
+Add `--ci` to install `.github/workflows/derivation-toolkit.yml` from the same
+committed toolkit. Commit that managed workflow too. Its hash is part of the
+lock, and later updates retain the CI opt-in. Keep project triggers and custom
+checks in a separate caller workflow.
 
 ## Describe the project
 
@@ -182,7 +189,8 @@ layout. An explicit report figure can use:
 
 Keep a report's existing fonts and build filters. A Pandoc report can load this
 setup through an additional `--include-in-header` file and place the figure in
-a raw LaTeX block.
+a raw LaTeX block. When the figure must stay beside the derivation it explains,
+load `float` and use `[H]`; the toaster report uses that placement in Appendix A.3.
 
 The figure API is:
 
@@ -214,6 +222,11 @@ minted option list. Use the text lexer with `escapeinside` for TeX substitutions
 `\DerivationDarkCodeStyle` before loading. The default font family is the
 document's `\ttdefault`.
 
+Direct pdfTeX output also loads the maintained `glyphtounicode-cmex.tex` table
+for extensible mathematical glyphs. The supplied image includes it through
+`texlive-latex-base`; the shared reader regression checks copied symbols and
+unchanged pixels. LuaLaTeX retains its own Unicode font handling.
+
 ## Build the document editions
 
 ```bash
@@ -225,7 +238,7 @@ same result. Without it, builds use the catalog's declared assets. For a separat
 export, pass its directory with `build --assets-dir`.
 
 The builder preserves source-relative paths in a private view and writes TeX
-auxiliaries under the build root. Each live PDF receives its matching
+auxiliaries under the build root. Each animated live PDF receives its matching
 `.vector.json` sidecar. A `.presentation.json` file maps physical pages to logical
 frames using Beamer's actual navigation metadata. Handouts require one physical
 page per logical frame.
@@ -253,10 +266,25 @@ python3 tools/derivations.py html example --theme light \
   --pdf build/report.pdf --vectors build/report.vector.json
 ```
 
+For a document in a shared compiled-input map:
+
+```bash
+python3 tools/derivations.py html article --inputs build/package-inputs.json
+```
+
+This uses the same per-deck/theme map as native packaging, including an optional
+`page_map`. Paths resolve from the project root. The HTML contains the available
+requested themes, so a light-only article retains its single edition.
+
 Omit `--vectors` for a static PDF. Supply `--page-map` when physical and logical
 page numbers differ; otherwise the builder sidecar or physical page order
 supplies the mapping. Explicit maps use version 1, `logicalSlides`, and a `pages`
-list with `number` and `logical` integers.
+list with `number` and `logical` integers. Animated compiled inputs need their
+matching timeline; preserve the page-map sidecar when moving Beamer PDFs.
+
+Use the shared [browser verification command](verification.md#exercise-the-standalone-browser-document)
+to exercise the actual file and projector in Chrome and Firefox, including
+transition frames.
 
 ## Use native presentation tools
 
@@ -277,17 +305,20 @@ container:
 docker build --platform linux/amd64 -t derivation-focal-builder \
   -f tools/vendor/manim_pdfpc/derivation_toolkit/ci/focal-builder.Dockerfile \
   tools/vendor/manim_pdfpc/derivation_toolkit
+source_revision="$(git rev-parse HEAD)"
 mkdir -p build/cache
 docker run --rm --platform linux/amd64 --user "$(id -u):$(id -g)" \
   -e XDG_CACHE_HOME=/project/build/cache \
   --mount type=bind,source="$PWD",target=/project --workdir /project \
   derivation-focal-builder python3 -B tools/derivations.py package example \
-  --assets /project/build/decks
+  --assets /project/build/decks --source-revision "$source_revision"
 ```
 
 The first build fetches the pinned viewer commit and packaging tools. A complete
 warm cache supports `--network none`. The default output is
-`build/appimage/<package.id>.appimage`.
+`build/appimage/<package.id>.appimage`. Capture the revision on the host when
+using a Git worktree; for an archive, pass the full revision associated with
+that source snapshot.
 
 Use `--inputs /project/package-inputs.json` for externally compiled documents.
 Paths in this map resolve from the consumer root. A static article available
@@ -377,6 +408,51 @@ python3 tools/derivations.py html toaster-demo --theme both
 
 `prepare_report.py page-map --pdf PATH --output PATH` creates explicit physical
 page metadata when needed.
+
+## Add the reusable CI workflow
+
+Install with `--ci`, then call the managed workflow from the consumer's own
+workflow:
+
+```yaml
+name: Document editions
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  documents:
+    uses: ./.github/workflows/derivation-toolkit.yml
+    with:
+      project: .
+      artifact_name: example
+      html_deck: example
+```
+
+The shared workflow tests the installed toolkit, compares source exports,
+builds PDF editions, exercises standalone HTML in Chrome, and packages ordinary
+and data-only AppImages on Ubuntu 20.04. It runs each downloaded package form
+with networking disabled on Ubuntu 20.04 and 24.04. Container and action pins
+stay with the toolkit.
+
+`source_checks` adds consumer assertions before export/build; `artifact_checks`
+runs after compilation. Both execute in the authoring container with the
+consumer mounted read-only at `/src`, build cache at `/cache` and outputs at
+`/assets`. `build_command` can retain an existing document build.
+`package_inputs` names an input map beneath `/assets` for externally compiled
+documents. That same map supplies the HTML job, including each document's
+available themes and page map; the adapter relocates its `/assets` paths into
+the runner's downloaded artifact tree. Leave `html_deck` empty to omit the
+browser job.
+
+Document and check artifacts use the chosen `artifact_name` prefix. The HTML
+ZIP uses its deck ID. Native files are `<artifact_name>.appimage` and
+`<artifact_name>-data-only.appimage`; runtime diagnostics use
+`<artifact_name>-runtime-{ordinary,data-only}-{20.04,24.04}`.
+For local checks and interpretation of export or display measurements, use
+[Verification and rendering measurements](verification.md).
 
 ## Keep dependencies and products reproducible
 

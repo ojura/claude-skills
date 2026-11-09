@@ -119,7 +119,7 @@ the figure layout for each edition:
 
 - **Live:** a complete poster occupies the animation region, and pdfpc can play,
   pause and navigate the authored checkpoints there.
-- **Steps:** successive live teaching stops appear as Beamer overlays on the
+- **Steps:** successive printable checkpoint states appear as Beamer overlays on the
   same logical frame.
 - **Handout:** the useful derivation states share one printed slide. Label the
   reading order, keep the text readable at slide size and use an intentional
@@ -174,7 +174,9 @@ at every stage, including the removal of earlier descriptions at the result.
 Keep a regression whose negative control removes or hides the text while leaving
 the checkpoint metadata valid.
 
-Run the relevant existing source, semantic-text, PDF and native-render checks.
+Use [Verification and rendering measurements](references/verification.md) for
+the shipped source, semantic-text, PDF, browser and native commands. Run the
+checks relevant to the change.
 Follow small numeric drawing differences through to their visible effect; use
 the repository's established warning policy. Choose additional tests for the
 remaining risk rather than repeating completed checks.
