@@ -1,0 +1,30 @@
+\documentclass[aspectratio=169]{beamer}
+\usepackage[T1]{fontenc}
+\usepackage{mathpazo}
+\usepackage{tgpagella}
+\usepackage{tgheros}
+\usepackage{amsmath}
+\usefonttheme{professionalfonts}
+\providecommand{\DerivationRepositoryRoot}{.}
+\providecommand{\DerivationPalettePrefix}{toaster}
+\providecommand{\DerivationAssets}{animations/generated}
+\input{\DerivationRepositoryRoot/tools/vendor/manim_pdfpc/derivation_toolkit/tex/theme.tex}
+\input{\DerivationRepositoryRoot/tools/vendor/manim_pdfpc/derivation_toolkit/tex/derivations.tex}
+\setbeamertemplate{footline}[frame number]
+\title{Pop-time speedups}
+\subtitle{The geometric mean in the fictional toaster report}
+\author{Illustrative derivation}
+\date{}
+\begin{document}
+\begin{frame}
+  \titlepage
+\end{frame}
+\begin{frame}{From trial ratios to one speedup}
+  \DerivationScene{geometric-mean}
+\end{frame}
+\begin{frame}{Read the result}
+  For the illustrative trial ratios, the equal per-trial factor is
+  \[ \DerivationResult{toaster-example} \]
+  For positive trial times, averaging the log ratios gives the same result.
+\end{frame}
+\end{document}

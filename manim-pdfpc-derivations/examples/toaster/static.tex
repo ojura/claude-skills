@@ -1,0 +1,22 @@
+\documentclass[aspectratio=169]{beamer}
+\usepackage[T1]{fontenc}
+\usepackage{mathpazo}
+\usepackage{tgpagella}
+\usepackage{tgheros}
+\usepackage{amsmath}
+\usefonttheme{professionalfonts}
+\providecommand{\DerivationRepositoryRoot}{.}
+\providecommand{\DerivationPalettePrefix}{toaster}
+\input{\DerivationRepositoryRoot/tools/vendor/manim_pdfpc/derivation_toolkit/tex/theme.tex}
+\setbeamertemplate{footline}[frame number]
+\begin{document}
+\begin{frame}{Trial ratios}
+  Let $b_i>0$ be the baseline pop time and $o_i>0$ the optimised pop time.
+  \[r_i=\frac{b_i}{o_i}.\]
+  \uncover<2->{A ratio above one means the optimised trial took less time.}
+\end{frame}
+\begin{frame}{A typical factor}
+  The geometric mean preserves the product of the trial ratios:
+  \[S^n=\prod_{i=1}^n r_i,\qquad S=\left(\prod_{i=1}^n r_i\right)^{1/n}.\]
+\end{frame}
+\end{document}

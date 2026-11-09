@@ -1,0 +1,37 @@
+{
+  "version": 2,
+  "project": {"title": "Toaster derivations"},
+  "default": "toaster-demo",
+  "palette": {"file": "palette.tex", "prefix": "toaster"},
+  "tex": {
+    "engine": "pdflatex",
+    "packages": ["beamer.cls", "graphicx.sty", "etoolbox.sty", "hyperref.sty", "mathpazo.sty", "tgpagella.sty", "tgheros.sty"]
+  },
+  "package": {"id": "toaster-derivations", "title": "Toaster derivations"},
+  "decks": [
+    {
+      "id": "toaster-demo",
+      "title": "A typical pop-time speedup",
+      "source": "slides.tex",
+      "language": "en-GB",
+      "animation": {
+        "provider": "scene.py",
+        "assets": "animations/generated",
+        "manifest": "toaster.vector.json"
+      }
+    },
+    {
+      "id": "toaster-static",
+      "title": "Trial-ratio reference",
+      "source": "static.tex",
+      "language": "en-GB"
+    },
+    {
+      "id": "article",
+      "title": "The fictional toaster report",
+      "source": "build/report/REPORT-derivations.pdf",
+      "language": "en-GB",
+      "build": {"kind": "external"}
+    }
+  ]
+}
