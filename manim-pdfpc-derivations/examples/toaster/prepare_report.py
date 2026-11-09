@@ -80,7 +80,7 @@ def prepare(source_skill: Path, project: Path):
         f"with ratios ${ratios[0]:g}$ and ${ratios[1]:g}$. Their product is ${product:g}$, "
         f"the same as two equal factors of ${speedup:g}$, so $S={speedup:g}$.\n\n"
         "```{=latex}\n"
-        "\\begin{figure}[tbp]\n"
+        "\\begin{figure}[H]\n"
         "\\centering\n"
         "\\DerivationHandout{geometric-mean}\n"
         "\\caption{The geometric mean of two illustrative trial ratios. "
