@@ -167,6 +167,9 @@ class VectorScene(Scene):
     def play(self, *animations, **kwargs):
         self.record()
         self.animations = self.compile_animations(*animations, **kwargs)
+        # Match Manim's scene setup: a newly animated group must own its existing
+        # children before cleanup can remove it, and unadded animations must appear.
+        self.add_mobjects_from_animations(self.animations)
         for animation in self.animations:
             animation._setup_scene(self)
             animation.begin()
