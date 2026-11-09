@@ -270,6 +270,15 @@ def task_lists():
     return lists
 
 
+def process_start(pid):
+    """The start time of a live process in clock ticks, field 22 of /proc/<pid>/stat."""
+    try:
+        stat = open(f'/proc/{pid}/stat').read()
+    except (OSError, TypeError):
+        return None
+    return stat[stat.rfind(')') + 2:].split()[19]
+
+
 def running_sessions():
     """Live processes by session id (from the registry and --resume in a command line) and by
     agent id (from --agent-id, which a teammate that Claude Code spawned has without --resume)."""
@@ -279,7 +288,9 @@ def running_sessions():
             d = json.load(open(entry))
         except (OSError, ValueError):
             continue
-        if d.get('sessionId') and os.path.exists(f"/proc/{d.get('pid')}"):
+        # A crash leaves registry files behind, and after a reboot their PIDs can belong to
+        # other processes, so the entry counts only when procStart matches the live process.
+        if d.get('sessionId') and str(d.get('procStart')) == process_start(d.get('pid')):
             running[d['sessionId']] = d['pid']
     for cmdline in glob.glob('/proc/[0-9]*/cmdline'):
         try:
