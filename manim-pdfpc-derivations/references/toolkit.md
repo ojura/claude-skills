@@ -69,6 +69,14 @@ roles `theme`, `repository_root`, `minted_output_dir`, `assets`, `live` and
 `handout` to an existing consumer macro; the builder also defines the generic
 macros. A deck's `build.engine` overrides the project engine.
 
+`tex.packages` lists resources checked with `kpsewhich`, such as `beamer.cls`.
+For optional `build --fetch-tex`, supply a nonempty `tex.debian_packages` list
+of Debian selectors: `name`, `name:architecture`, or either with `=version`.
+When required resources are missing, this option downloads and extracts those
+exact archives into `build/texlive/tree`. Dependency packages and font-map
+configuration belong in the project's environment; the authoring container
+provides a complete baseline for the bundled templates.
+
 Define palette values in flat TeX `\definecolor` lines. For each `Light` and
 `Dark` variant, provide `Background`, `Foreground`, `Accent`, `Muted`, `Guide`
 and `Faint`, prefixed by the configured name. For example:
@@ -262,6 +270,35 @@ The optional `native` catalog object selects an exact viewer `repository` and
 sets the application `id`. Keep the consumer's title and default deck in the
 project catalog.
 
+Build a portable Linux package from the consumer root with the supplied Focal
+container:
+
+```bash
+docker build --platform linux/amd64 -t derivation-focal-builder \
+  -f tools/vendor/manim_pdfpc/derivation_toolkit/ci/focal-builder.Dockerfile \
+  tools/vendor/manim_pdfpc/derivation_toolkit
+mkdir -p build/home
+docker run --rm --platform linux/amd64 --user "$(id -u):$(id -g)" \
+  -e HOME=/project/build/home \
+  --mount type=bind,source="$PWD",target=/project --workdir /project \
+  derivation-focal-builder python3 -B tools/derivations.py package example \
+  --assets /project/build/decks
+```
+
+The first build fetches the pinned viewer commit and packaging tools. A complete
+warm cache supports `--network none`. The default output is
+`build/appimage/<package.id>.appimage`.
+
+Use `--inputs /project/package-inputs.json` for externally compiled documents.
+Paths in this map resolve from the consumer root. A static article available
+only in the light theme uses:
+
+```json
+{"article": {"light": {"pdf": "build/report/REPORT-derivations.pdf"}}}
+```
+
+An animated entry also supplies a `vectors` path beside `pdf`.
+
 ## Run the toaster example
 
 Use [the toaster source](../examples/toaster/) for a complete independent
@@ -270,24 +307,48 @@ toolkit there using the pinned revision. It derives a geometric mean from two
 illustrative trial ratios in the fictional `markdown-latex-report` showcase.
 The data lives in `trials.json`; the scene and report insertion read it.
 
-From that project, build the animated and static companion decks:
+The report container extends the toolkit's authoring image with Pandoc 3.1.3,
+LuaLaTeX, TeX Gyre fonts and the locked chart/check environment. Build both
+dependency images from the copied example project:
 
 ```bash
-python3 tools/derivations.py build toaster-demo --theme both --mode all --regenerate
-python3 tools/derivations.py build toaster-static --theme both --mode all
+docker build -t derivation-assets:local \
+  -f tools/vendor/manim_pdfpc/derivation_toolkit/ci/assets.Dockerfile \
+  tools/vendor/manim_pdfpc/derivation_toolkit
+docker build -t toaster-report:local -f report.Dockerfile .
 ```
 
-The animated source uses a 1280 by 720 canvas, five printed states, three live
-stops and a three-column handout. Its compact panel definitions and configured
-Pagella/Heros/Pazo template are in `scene.py`.
+Pass `--build-arg AUTHORING_IMAGE=IMAGE` to reuse an existing authoring image.
+The report image keeps Manim in `/opt/manim` and its chart/check packages in
+`/opt/report`; `python3` selects Manim, and the report Makefile's `PYTHON` selects
+the latter. Installed versions are recorded under `/opt/report-environment`.
 
-Prepare the article from a committed checkout of the actual report skill:
+Prepare the article on the host from a committed checkout of the actual report
+skill. `PROJECT` must be an absolute path:
 
 ```bash
 python3 prepare_report.py prepare \
   --source-skill "$SKILLS_REPO/markdown-latex-report" --project "$PROJECT"
-make -C "$PROJECT/build/report-source" -f Makefile -f fixture.mk checked-report
+mkdir -p "$PROJECT/build/home" "$PROJECT/build/matplotlib"
+toaster_run() {
+  docker run --rm --network none --user "$(id -u):$(id -g)" \
+    -e HOME="$PROJECT/build/home" -e MPLCONFIGDIR="$PROJECT/build/matplotlib" \
+    --mount type=bind,source="$PROJECT",target="$PROJECT" --workdir "$PROJECT" \
+    toaster-report:local "$@"
+}
+toaster_run python3 tools/derivations.py build toaster-demo \
+  --theme both --mode all --regenerate
+toaster_run python3 tools/derivations.py build toaster-static --theme both --mode all
+toaster_run make -C build/report-source -f Makefile -f fixture.mk checked-report
 ```
+
+Mount the consumer at the same absolute path used during preparation so the
+generated TeX header resolves its figure and toolkit paths. These runs need only
+that consumer mount and use no network.
+
+The animated source uses a 1280 by 720 canvas, five printed states, three live
+stops and a three-column handout. Its compact panel definitions and configured
+Pagella/Heros/Pazo template are in `scene.py`.
 
 The adapter copies the full tracked report tree into the project's build
 directory so chart generation stays inside the copy. It inserts the generated

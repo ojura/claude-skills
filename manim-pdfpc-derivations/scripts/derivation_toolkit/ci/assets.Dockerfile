@@ -4,7 +4,7 @@ FROM ${BASE_IMAGE}
 ENV DEBIAN_FRONTEND=noninteractive PYTHONDONTWRITEBYTECODE=1
 RUN apt-get update \
     && apt-get install --no-install-recommends -y \
-      texlive-latex-extra texlive-fonts-recommended texlive-pictures \
+      texlive-latex-extra texlive-fonts-recommended texlive-pictures tex-gyre \
       lmodern preview-latex-style dvisvgm poppler-utils inkscape \
       python3-pygments python3-pypdf python3-venv python3-dev \
       build-essential pkg-config libcairo2-dev libpango1.0-dev \
