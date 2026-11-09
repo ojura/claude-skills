@@ -5,6 +5,14 @@
 \RequirePackage{xcolor}
 \RequirePackage{graphicx}
 \RequirePackage{tikz}
+\RequirePackage{iftex}
+% Complete the Unicode maps for Computer Modern extension glyphs.
+\ifPDFTeX
+  \ifnum\pdfoutput>0
+    \input{glyphtounicode-cmex.tex}
+    \pdfgentounicode=1
+  \fi
+\fi
 \providecommand{\DerivationTheme}{light}
 \providecommand{\DerivationRepositoryRoot}{.}
 \providecommand{\DerivationPaletteFile}{\DerivationRepositoryRoot/palette.tex}
