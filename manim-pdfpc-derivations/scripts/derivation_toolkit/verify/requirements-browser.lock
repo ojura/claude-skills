@@ -1,0 +1,2 @@
+# Browser protocol client used by the real Chrome/Firefox acceptance harness.
+websocket-client==1.7.0
