@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("probe", type=Path)
     parser.add_argument("reference", type=Path, help="Theme folder with PNG previews")
@@ -21,13 +21,13 @@ def main():
     parser.add_argument("--midpoints", action="store_true",
                         help="Also compare <scene>-midpoint.png at steps.json reference_time")
     parser.add_argument("--scene", action="append", help="Compare only the requested scene ID")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     args.output.mkdir(parents=True, exist_ok=True)
     assets = args.assets or args.reference
-    manifest = assets / "derivations.vector.json"
+    metadata = json.loads((assets.parent / "steps.json").read_text())
+    manifest = assets / metadata.get("manifest", "derivations.vector.json")
     data = json.loads(manifest.read_text())
-    recorded = {scene["id"]: scene for scene in
-                json.loads((assets.parent / "steps.json").read_text())["scenes"]}
+    recorded = {scene["id"]: scene for scene in metadata["scenes"]}
     results = []
     for scene in data["scenes"]:
         if args.scene and scene["id"] not in args.scene:

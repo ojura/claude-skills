@@ -7,7 +7,7 @@ RUN apt-get update \
       texlive-latex-extra texlive-fonts-recommended texlive-pictures tex-gyre \
       lmodern preview-latex-style dvisvgm poppler-utils inkscape \
       python3-pygments python3-pypdf python3-venv python3-dev \
-      build-essential pkg-config libcairo2-dev libpango1.0-dev \
+      build-essential pkg-config git libcairo2-dev libpango1.0-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY animation/requirements.lock animation/requirements-test.lock /opt/requirements/
 RUN python3 -m venv /opt/manim \

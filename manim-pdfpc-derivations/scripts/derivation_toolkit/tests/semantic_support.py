@@ -154,6 +154,10 @@ def serialized_glyph_ink(program, reader):
 
 
 class SemanticAssertions(unittest.TestCase):
+    palettes = PALETTES
+    scene_type = Derivation
+    configure = staticmethod(configure)
+
     @classmethod
     def setUpClass(cls):
         if not shutil.which("pdftotext"):
@@ -176,8 +180,8 @@ class SemanticAssertions(unittest.TestCase):
         cls.folder = Path(cls.temporary.name)
 
     def setUp(self):
-        configure("light")
-        self.scene = Derivation(PALETTES["light"], sample_rate=10)
+        self.configure("light")
+        self.scene = self.scene_type(self.palettes["light"], sample_rate=10)
         self.output_index = 0
 
     def pdf(self, mobjects, *, theme="light", crop=None, paths=None):
@@ -185,7 +189,7 @@ class SemanticAssertions(unittest.TestCase):
         destination = self.folder / f"{self._testMethodName}-{self.output_index}.pdf"
         if paths is None:
             paths = paths_from_mobjects(mobjects)
-        palette = PALETTES[theme]
+        palette = self.palettes[theme]
         background = [int(palette["background"][i:i + 2], 16) / 255 for i in (1, 3, 5)] + [1]
         write_snapshot(destination, paths, background, crop=crop)
         self.assertTrue(destination.is_file())

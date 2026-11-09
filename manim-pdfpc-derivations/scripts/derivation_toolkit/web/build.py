@@ -13,6 +13,7 @@ import zipfile
 
 from .bundle import embed
 from ..catalog import Catalog, Deck
+from ..package_assets import explicit_editions
 from ..paths import get_paths, output_path
 
 WEB = Path(__file__).resolve().parent
@@ -109,11 +110,19 @@ def build_bundle(catalog: Catalog, deck: Deck, *, output: Path | None = None,
                  pdf_dir: Path | None = None, pdfjs_dist: Path | None = None,
                  themes=("light", "dark"), pdf: Path | None = None,
                  vectors: Path | None = None, page_map: Path | None = None,
+                 inputs: dict | None = None,
                  archive=True, cache_root: Path | None = None) -> Path:
     paths = get_paths(deck, cache_root)
     output = output_path(output or paths.build_dir / "html5", catalog.root)
     output_path(output.parent, catalog.root)
     pdf_dir = (pdf_dir or paths.build_dir).expanduser().resolve()
+    external = explicit_editions(catalog, deck, inputs)
+    if external is not None:
+        if any(value is not None for value in (pdf, vectors, page_map)):
+            raise ValueError("Choose the input map or explicit PDF/vector/page-map arguments")
+        themes = tuple(theme for theme in themes if theme in external)
+        if not themes:
+            raise ValueError(f"The input map has none of the requested themes: {deck.id}")
     tools = paths.cache_root / "tools/html5"
     vendor = (pdfjs_dist or tools / "node_modules/pdfjs-dist").expanduser().resolve()
     if not vendor.is_dir():
@@ -139,15 +148,19 @@ def build_bundle(catalog: Catalog, deck: Deck, *, output: Path | None = None,
         ):
             shutil.copyfile(vendor / source, stage / "vendor" / destination)
         for theme in themes:
-            selected_pdf = pdf.resolve() if pdf is not None else pdf_dir / f"{deck.document}-{theme}-live.pdf"
-            selected_vectors = vectors.resolve() if vectors is not None else selected_pdf.with_suffix(".vector.json")
-            if not selected_vectors.is_file():
-                if vectors is not None or (pdf is None and deck.animation is not None):
+            edition = external[theme] if external is not None else None
+            selected_pdf = edition["pdf"] if edition else (
+                pdf.resolve() if pdf is not None else pdf_dir / f"{deck.document}-{theme}-live.pdf")
+            selected_vectors = edition["vectors"] if edition else (
+                vectors.resolve() if vectors is not None else selected_pdf.with_suffix(".vector.json"))
+            if selected_vectors is not None and not selected_vectors.is_file():
+                if edition or vectors is not None or (pdf is None and deck.animation is not None):
                     raise ValueError(f"Missing matching live timeline: {selected_vectors}")
                 selected_vectors = None
             if not selected_pdf.is_file() or selected_pdf.stat().st_size == 0:
                 raise ValueError(f"Missing compiled presentation PDF: {selected_pdf}")
-            entry = pdf_manifest(selected_pdf, selected_vectors, theme, page_map)
+            entry = pdf_manifest(selected_pdf, selected_vectors, theme,
+                                 edition["page_map"] if edition else page_map)
             shutil.copyfile(selected_pdf, stage / entry["pdf"])
             timeline = (selected_vectors.read_bytes() if selected_vectors is not None
                         else b'{"version":1,"scenes":[]}\n')
@@ -195,6 +208,7 @@ def add_arguments(parser):
     parser.add_argument("--pdf", type=Path, help="Explicit compiled PDF, including an article")
     parser.add_argument("--vectors", type=Path, help="Matching explicit vector timeline")
     parser.add_argument("--page-map", type=Path, help="Explicit physical/logical page metadata")
+    parser.add_argument("--inputs", type=Path, help="Shared per-deck/theme PDF, vector and page-map input map")
     parser.add_argument("--pdfjs-dist", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--cache-root", type=Path)
@@ -207,5 +221,6 @@ def run(args, catalog: Catalog):
         catalog, catalog.get(args.deck), output=args.output, pdf_dir=args.pdf_dir,
         pdfjs_dist=args.pdfjs_dist, themes=("light", "dark") if args.theme == "both" else (args.theme,),
         pdf=args.pdf, vectors=args.vectors, page_map=args.page_map,
+        inputs=json.loads(args.inputs.read_text()) if args.inputs else None,
         archive=args.archive, cache_root=args.cache_root,
     )

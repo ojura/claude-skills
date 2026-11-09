@@ -8,6 +8,7 @@ from ..catalog import Catalog, Deck
 from ..paths import CachePaths
 from ..web.build import pdf_manifest
 from .pdf_type3_bounds import validate_type3_bounds
+from .pdf_text import validate_vector_text
 
 
 def verify_documents(deck: Deck, paths: CachePaths, themes, modes, *,
@@ -28,7 +29,7 @@ def verify_documents(deck: Deck, paths: CachePaths, themes, modes, *,
             records.append({"pdf": str(document), "theme": theme, "mode": mode,
                             "pages": len(meta["pages"]),
                             "animation_links": sum(page["scene"] is not None for page in meta["pages"]),
-                            **validate_type3_bounds(document)})
+                            **validate_type3_bounds(document), **validate_vector_text(document)})
     figures = []
     if assets is not None:
         metadata = json.loads((assets / "steps.json").read_text())
@@ -38,5 +39,6 @@ def verify_documents(deck: Deck, paths: CachePaths, themes, modes, *,
         for theme in themes:
             for name in sorted(names):
                 path = assets / theme / name
-                figures.append({"pdf": str(path), **validate_type3_bounds(path)})
+                figures.append({"pdf": str(path), **validate_type3_bounds(path),
+                                **validate_vector_text(path, figure=True)})
     return {"ok": True, "deck": deck.id, "documents": records, "figures": figures}

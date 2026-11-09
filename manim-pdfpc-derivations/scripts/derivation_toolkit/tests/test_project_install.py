@@ -132,6 +132,8 @@ class OfflineInstaller(unittest.TestCase):
         package.mkdir(parents=True)
         for name in ("__init__.py", "cli.py", "install.py"):
             (package / name).write_text("# committed package\n")
+        (package / "ci").mkdir()
+        (package / installer.WORKFLOW_SOURCE).write_text("name: Canonical workflow\non: workflow_call\n")
         subprocess.run(["git", "-C", str(self.source), "add", "."], check=True)
         tree = subprocess.check_output(["git", "-C", str(self.source), "write-tree"], text=True).strip()
         environment = dict(os.environ, GIT_AUTHOR_NAME="Fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
@@ -187,8 +189,9 @@ class OfflineInstaller(unittest.TestCase):
         self.assertFalse((self.project / installer.VENDOR).exists())
 
     def test_failed_update_restores_code_entry_and_lock(self):
-        installer.install(self.project, self.source, self.revision)
-        before = {name: (self.project / name).read_bytes() for name in (installer.ENTRY, installer.LOCK)}
+        installer.install(self.project, self.source, self.revision, ci=True)
+        managed = (installer.ENTRY, installer.LOCK, installer.WORKFLOW)
+        before = {name: (self.project / name).read_bytes() for name in managed}
         real_verify = installer.verify_installation
         calls = 0
         def verify(project):
@@ -202,6 +205,48 @@ class OfflineInstaller(unittest.TestCase):
                 installer.install(self.project, self.source, self.revision)
         real_verify(self.project)
         self.assertEqual(before, {name: (self.project / name).read_bytes() for name in before})
+
+    def test_optional_ci_is_exact_owned_source_and_survives_an_ordinary_update(self):
+        installer.install(self.project, self.source, self.revision)
+        self.assertFalse((self.project / installer.WORKFLOW).exists())
+        lock = installer.install(self.project, self.source, self.revision, ci=True)
+        workflow = self.project / installer.WORKFLOW
+        self.assertEqual(workflow.read_bytes(),
+                         (self.project / installer.VENDOR / installer.WORKFLOW_SOURCE).read_bytes())
+        self.assertEqual(installer.install(self.project, self.source, self.revision), lock)
+        workflow.write_text("name: Consumer edit\n")
+        with self.assertRaisesRegex(ValueError, "workflow has local edits"):
+            installer.install(self.project, self.source, self.revision, ci=True)
+        self.assertEqual(workflow.read_text(), "name: Consumer edit\n")
+
+    def test_optional_ci_preserves_an_unowned_file_or_dangling_symlink(self):
+        workflow = self.project / installer.WORKFLOW
+        workflow.parent.mkdir(parents=True)
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink):
+                outside = self.root / "uncreated-workflow.yml"
+                if symlink:
+                    workflow.symlink_to(outside)
+                else:
+                    workflow.write_text("name: Unrelated workflow\n")
+                with self.assertRaisesRegex(ValueError, "unowned CI workflow"):
+                    installer.install(self.project, self.source, self.revision, ci=True)
+                self.assertFalse((self.project / installer.VENDOR).exists())
+                self.assertFalse(outside.exists())
+                self.assertEqual(workflow.is_symlink(), symlink)
+                if not symlink:
+                    self.assertEqual(workflow.read_text(), "name: Unrelated workflow\n")
+                workflow.unlink()
+
+    def test_optional_ci_rejects_a_symlinked_workflow_directory(self):
+        outside = self.root / "outside-workflows"
+        outside.mkdir()
+        (self.project / ".github").mkdir()
+        (self.project / ".github/workflows").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "ordinary directory"):
+            installer.install(self.project, self.source, self.revision, ci=True)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse((self.project / installer.VENDOR).exists())
 
     def test_unowned_destination_and_extra_file_are_preserved(self):
         entry = self.project / installer.ENTRY

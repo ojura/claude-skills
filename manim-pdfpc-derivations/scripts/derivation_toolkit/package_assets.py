@@ -7,12 +7,38 @@ from pathlib import Path
 import re
 import shutil
 
-from .catalog import Catalog, THEMES
+from .catalog import Catalog, Deck, THEMES
 
 
 def input_path(catalog: Catalog, value: str | Path) -> Path:
     """Resolve paths stored in the project input map against its project root."""
     return (catalog.root / Path(value).expanduser()).resolve()
+
+
+def validate_input_map(inputs: dict | None) -> dict | None:
+    if inputs is not None and not isinstance(inputs, dict):
+        raise ValueError("Presentation inputs must be an object keyed by deck ID")
+    return inputs
+
+
+def explicit_editions(catalog: Catalog, deck: Deck, inputs: dict | None) -> dict | None:
+    """Resolve the shared per-deck/theme input map used by all delivery formats."""
+    inputs = validate_input_map(inputs)
+    if inputs is None or deck.id not in inputs:
+        return None
+    declared = inputs[deck.id]
+    if not isinstance(declared, dict) or not declared or set(declared) - set(THEMES):
+        raise ValueError(f"Unsupported or empty input themes: {deck.id}")
+    editions = {}
+    for theme in THEMES:
+        if theme not in declared:
+            continue
+        edition = declared[theme]
+        if not isinstance(edition, dict) or not edition.get("pdf"):
+            raise ValueError(f"Missing document input for {deck.id}/{theme}")
+        editions[theme] = {key: input_path(catalog, edition[key]) if edition.get(key) else None
+                           for key in ("pdf", "vectors", "page_map")}
+    return editions
 
 
 def collect_assets(catalog: Catalog, assets: Path, *, selection="all", inputs: dict | None = None):
@@ -23,18 +49,14 @@ def collect_assets(catalog: Catalog, assets: Path, *, selection="all", inputs: d
             raise ValueError(f"Unsupported PDF filename: {deck.document}")
         if any(character in deck.title for character in "\t\r\n"):
             raise ValueError(f"Unsupported title in package catalog: {deck.id}")
-        external = (inputs or {}).get(deck.id)
-        themes = [theme for theme in THEMES if theme in external] if external is not None else list(THEMES)
-        if not themes or external is not None and set(external) - set(THEMES):
-            raise ValueError(f"Unsupported or empty package themes: {deck.id}")
+        external = explicit_editions(catalog, deck, inputs)
+        themes = list(external) if external is not None else list(THEMES)
         animation_flags = []
         for theme in themes:
             filename = f"{deck.document}-{theme}-live.pdf"
             edition = external.get(theme) if external else None
-            if external is not None and not edition:
-                raise ValueError(f"Missing package input for {deck.id}/{theme}")
-            pdf = input_path(catalog, edition["pdf"]) if edition else assets / deck.id / filename
-            vector = (input_path(catalog, edition["vectors"]) if edition.get("vectors") else None) if edition else (
+            pdf = edition["pdf"] if edition else assets / deck.id / filename
+            vector = edition["vectors"] if edition else (
                 pdf.with_suffix(".vector.json") if deck.animation else None)
             animation_flags.append(vector is not None)
             for source, name in ((pdf, filename), (vector, Path(filename).with_suffix(".vector.json").name)):
