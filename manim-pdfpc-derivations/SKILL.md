@@ -1,15 +1,17 @@
 ---
 name: manim-pdfpc-derivations
-description: Author and revise mathematical derivations for Beamer using Manim vector timelines rendered inside pdfpc. Use when a lecture needs animated geometry or algebra, lecturer-controlled teaching checkpoints, matching stepped PDFs and a compact printable handout, including light and dark themes and selectable mathematical text.
+description: Author mathematical derivations from one Manim scene and ship live pdfpc or HTML presentations, stepped PDFs and compact vector handouts. Use for animated geometry or algebra, lecturer-controlled teaching checkpoints, selectable mathematical text, light and dark themes, report figures, and portable presentation packaging. Includes the reusable authoring, export, TeX, browser and native packaging toolkit.
 ---
 
-# Manim derivations for Beamer and pdfpc
+# Manim derivations, handouts and live presentations
 
-Use the repository's Manim exporter to produce a vector timeline and matching PDF
-figures. Beamer places the figures on the lecture slide; pdfpc draws the animated
-paths in the same region during presentation.
+Use the bundled toolkit in `scripts/derivation_toolkit/`. Author geometry,
+expressions, teaching stops and printable states once; export matching vector
+timelines and selectable PDF figures. Place those figures in Beamer or an
+article, and present the live scene through pdfpc or the self-contained HTML
+player.
 
-## Find the project and its commands
+## Install or inspect the project toolkit
 
 Read the repository's `AGENTS.md` and presentation build guide before editing.
 Check the working tree, publication workflow, supported themes and output paths.
@@ -17,26 +19,32 @@ Use an isolated worktree for a repository that syncs edits to Overleaf. Preserve
 the existing deck order, notation and lecturer's teaching approach unless the
 task requests a broader revision.
 
-For PSR lectures, read `docs/presentations.md` and inspect the selected entry in
-`presentations.json`. Discover the current commands with:
+Read [Toolkit installation and interfaces](references/toolkit.md) when installing
+the suite, adding a project, changing a provider or integrating TeX, HTML or
+native packaging. Install an explicit committed skill revision with
+`scripts/install.py`. The installer writes the project entry point, complete
+vendored package and revision/hash lock. Commit those generated files with the
+consumer so a clean checkout and Overleaf have the same implementation.
+
+Inspect `presentations.json`, then discover the installed commands with:
 
 ```bash
-python3 tools/presentations/presentations.py list --json
-python3 tools/presentations/presentations.py --help
+python3 tools/derivations.py list --json
+python3 tools/derivations.py --help
 ```
 
-The catalog identifies each source, language, ROS generation and animation
-provider. Select the requested edition explicitly. Historical ROS examples keep
-their historical versions; current ROS2 material reads the repository setting.
+Keep subject matter, palette values, branding, source paths and teaching layout
+in the consumer. Change reusable mechanisms in this skill, publish them, then
+update the consumer through the installer. Its lock check identifies local
+changes before an update.
 
 Register a new deck in the repository catalog before using the shared commands.
 For an isolated prototype, add that entry only in its detached worktree.
 
-Read the selected provider, scene registration, Beamer figure macros and a
-comparable existing scene. Reuse the shared authoring modules under
-`tools/presentations/animation/`. The pdfpc checkout's
-`VECTOR_ANIMATIONS.md` owns the timeline format and viewer behavior. Consult its
-current source and tests when changing those interfaces.
+Read the selected provider, scene registration, document figure macros and a
+comparable scene. Use the installed `derivation_toolkit.animation` modules. Read
+the pinned pdfpc checkout's `VECTOR_ANIMATIONS.md` and current tests when
+changing the timeline format or viewer behavior.
 
 ## Plan the reasoning before the motion
 
@@ -60,15 +68,27 @@ pacing and handout layout.
 
 ## Author one scene for all outputs
 
-Use the supplied `VectorScene` lifecycle. Its `play()` records vector geometry
-during Manim animations; its `checkpoint()` records the current figure and,
-when requested, a live teaching stop. Use the current method signatures from the
-shared module. The exporter runs that lifecycle with movie writing disabled.
+Use `AuthoringScene` for the shared semantic text, emphasis, arrows, coordinate
+frames, marked angles, brackets and fitting helpers, or `VectorScene` for a
+custom composition. Declare one immutable `Canvas` per scene; it determines
+geometry, text metrics and exported dimensions. Set `HandoutLayout` for the
+number of columns, available figure height and row spacing.
 
-Keep equations, coordinate transforms, captions and theme colours in their
-existing shared definitions. Use the palette loader and semantic text helpers.
-Register TeX semantics when constructing text, before copies and transforms, so
-PDF export preserves the actual glyph geometry and text selection.
+Use `play()` to record Manim motion and `checkpoint()` to save each printable
+state. A checkpoint also creates a live teaching stop by default; use
+`pause=False` for a useful printed intermediate that needs no live pause. Supply
+compact mobjects and a crop when the printed figure needs a different layout.
+Keep the first state at time zero and the final teaching stop at the endpoint.
+
+Keep equations, coordinate transforms and captions in the provider. Define the
+light/dark colours once in the project's TeX palette; the Python exporter and
+document theme read the same roles. Choose an explicit DVI-compatible figure
+font template when matching a document's typography. Check the exported font
+identities and selected text against that choice. Keep an article's existing
+LuaLaTeX or XeLaTeX workflow when embedding the resulting PDFs.
+
+Use the semantic text factories before copies and transforms so PDF export
+preserves the actual glyph geometry and text selection.
 
 Author visible teaching descriptions and their checkpoint labels from one text
 definition. The shared `StepDescriptions` helper reveals each declared step,
@@ -83,40 +103,39 @@ or replacement with a supported operation. Preserve the intended object order
 and explicit z ordering. Check brackets, filled paths, masks and fading objects
 at intermediate times.
 
-Use `play()` for motion driven by updaters. The vector implementation's
-`wait()` records a hold. Keep each scene's first teaching stop at its initial
-time and its final stop at the intended endpoint. Define checkpoints after the
-geometry and text have reached their complete state.
+Use `play()` for motion driven by updaters; `wait()` records a hold. Define
+checkpoints after the geometry and text have reached their complete state.
 
 Use vector mobjects supported by the exporter. If an effect requires a raster
 image, shader, camera trick or unsupported text morph, adapt the design to the
-exporter's supported geometry before building the lecture. Do not invoke a movie
-render for this workflow.
+exporter's supported geometry before building. Export vectors for the live
+workflow. Render a video only when the user requests a video deliverable.
 
-## Integrate the three lecture editions
+## Generate the document editions
 
-Register the scene in the deck's animation provider and connect its ID to the
-Beamer figure region. Use the existing macros and generated metadata to obtain
-the native `pdfpc-vector:` link and matching poster.
+Register the scene in the provider's `SCENES`, then use `\DerivationScene{id}` in
+the document. The toolkit's TeX module reads the generated metadata and selects
+the figure layout for each edition:
 
 - **Live:** a complete poster occupies the animation region, and pdfpc can play,
   pause and navigate the authored checkpoints there.
-- **Steps:** successive exported checkpoints appear as Beamer overlays on the
+- **Steps:** successive live teaching stops appear as Beamer overlays on the
   same logical frame.
 - **Handout:** the useful derivation states share one printed slide. Label the
   reading order, keep the text readable at slide size and use an intentional
   final state for replacement photographs or figures.
 
-Keep the handout's compact geometry in the scene definition when it needs a
-different arrangement. Choose its panel count to fit the reasoning. Reuse the
-authored expressions and checkpoint captions in each edition.
+In an article, `\DerivationScene` defaults to the compact handout.
+`\DerivationHandout{id}` also embeds that layout explicitly in a report figure.
+Use the `\DerivationPanel` or `\DerivationHandout` override for an authored
+composition such as panels followed by a separate result. Reuse the provider's
+expressions, compact geometry and captions in each edition.
 
-Use the repository's configured build root for products, previews, environments
-and native binaries. PSR defaults to repository-root `build/`, with deck outputs
-under `build/decks/<catalog-id>/`; explicit cache and output overrides remain
-available. Commit only source and the figure assets that Overleaf needs to
-compile. Use the repository's explicit asset publication command or output
-directory when updating those tracked figures.
+Use repository-root `build/` for products, previews, environments and native
+binaries; deck products go under `build/decks/<catalog-id>/`. Explicit cache and
+output overrides can point outside the repository. Commit the source, installed
+toolkit and figure assets needed by the document's build. Publish tracked
+figures by exporting explicitly to the catalog's animation assets directory.
 
 Check the syncing tool's own ignore rules before building in a live replica.
 Overleaf Workshop's replica does not consult `.gitignore`; its project sync
@@ -133,37 +152,48 @@ through the shared command. Use `--regenerate` to export and compile from the
 fresh result. For example, with a catalog deck ID in `DECK`:
 
 ```bash
-python3 tools/presentations/presentations.py build "$DECK" --theme both --mode all --regenerate
+python3 tools/derivations.py build "$DECK" --theme both --mode all --regenerate
 ```
 
 To inspect or reuse a separate export, use `export` with an explicit output
 directory and pass the same directory to `build --assets-dir`. Default builds
 use the tracked assets. Read the reported output paths and launch the generated
-live PDF with the repository's pinned viewer so the inspected and presented
-files are the products of the changed source.
+live PDF with the pinned viewer. Build the HTML edition from the same PDF and
+timeline pair. For a report, retain its existing build/check commands and pass
+the compiled PDF to the HTML packager; page mapping can use explicit metadata
+or physical page order.
 
 Check the mathematics independently, including a simple numerical example,
 signs, basis directions, inverse relationships and dimensions. Inspect every
 changed checkpoint and representative intermediate times in both themes.
-Render the final Beamer pages as well as the standalone figures. Check copied
+Render the final document pages as well as the standalone figures. Check copied
 text from the exported figures and final handout when text or transforms change.
 
 For a visible description sequence, check the exported text and painted colours
 at every stage, including the removal of earlier descriptions at the result.
 Keep a regression whose negative control removes or hides the text while leaving
-the checkpoint metadata valid. The inverse scene's semantic tests demonstrate
-this check in both themes.
+the checkpoint metadata valid.
 
 Run the relevant existing source, semantic-text, PDF and native-render checks.
 Follow small numeric drawing differences through to their visible effect; use
 the repository's established warning policy. Choose additional tests for the
 remaining risk rather than repeating completed checks.
 
-Exercise the real pdfpc presenter and audience windows when changing timing,
+Exercise the real presenter and audience windows when changing timing,
 bindings or controls. Check Next, Previous, play/pause, replay, continuous play,
 final state and return to slide navigation. Confirm both windows share the
 timeline and that freeze, blank or hidden states behave as documented. Use
 private display and bus sessions for automated checks.
+
+For HTML, open the packaged file directly in Chrome and Firefox and exercise
+its projector window. Sample transition frames as well as settled states:
+page, theme and resize changes must commit their PDF, vector and text surfaces
+together. Check backward entry into a completed scene in both windows.
+
+When changing the reusable suite, also build an independent consumer with
+different canvas geometry and an odd handout panel count. Exercise unequal
+printable/live checkpoint sets and sequential exports of differing canvases.
+Keep the consumer's existing document checks and typography intact.
 
 If the task changes rendering performance, measure the actual target display
 with the viewer visible. Report the display refresh rate, window geometry,
@@ -175,8 +205,9 @@ slow interval in the report and investigate its cause.
 
 Finish the applicable repository checks, review, commits and authorized
 publication. Provide the lecturer's launch command, themes, controls, handout
-and stepped PDFs, plus a precise account of remaining issues. Verify a packaged
-viewer from its downloaded artifact when packaging changed.
+and stepped PDFs, plus the standalone HTML or portable native package requested
+by the user. Verify a packaged viewer from its delivered artifact when packaging
+changed, and report concrete remaining issues.
 
 Remove owned temporary processes and disposable build output after their use.
 Keep user windows, unrelated edits, needed figure assets and the requested
