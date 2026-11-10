@@ -188,6 +188,13 @@ def scan_and_press(reporter=None):
             app = desk.get_child_at_index(index)
             if app and app.get_name() == 'Google Chrome':
                 applications += 1
+                # Chrome's Linux relation query activates platform accessibility;
+                # name/role/child reads alone can leave native controls unavailable.
+                # Query only the identified application root, never page content.
+                try:
+                    app.get_relation_set()
+                except Exception as error:
+                    report('accessibility_query_error', error_type=type(error).__name__)
                 buttons = find_prompt_buttons(app, report, counts)
                 matched += len(buttons)
                 for btn, button, prompt_kind in buttons:

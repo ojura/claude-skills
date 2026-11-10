@@ -34,6 +34,9 @@ class Node:
     def get_child_at_index(self, index):
         return self.children[index]
 
+    def get_relation_set(self):
+        return []
+
     def get_action_iface(self):
         return self
 
@@ -416,6 +419,61 @@ class ConsentDiagnosticsTests(unittest.TestCase):
         self.modals.Atspi.get_desktop.return_value = Node(children=[Node('Google Chrome', children=children)])
         self.daemon.begin_consent_attempt(150)
         return self.modals.scan_and_press(self.daemon.begin_consent_scan())
+
+    def test_root_relation_query_exposes_deferred_native_dialog(self):
+        button = Node('Allow', 'push button')
+        chrome = Node('Google Chrome', 'application')
+
+        def expose_controls():
+            chrome.children = [Node('Allow remote debugging?', 'dialog', children=[button])]
+            return []
+
+        chrome.get_relation_set = mock.Mock(side_effect=expose_controls)
+        self.modals.Atspi.get_desktop.return_value = Node(children=[chrome])
+        self.assertEqual(self.modals.scan_and_press(self.daemon.begin_consent_scan()), 1)
+        chrome.get_relation_set.assert_called_once_with()
+        self.assertEqual(button.calls, 1)
+        self.assertEqual(self.events('scan_finished')[0]['query_errors'], 0)
+
+    def test_relation_query_is_limited_to_chrome_application_root(self):
+        native_button = Node('Allow', 'push button')
+        page_button = Node('Allow', 'push button')
+        document = Node('Google Chrome', 'document web', children=[
+            Node('Allow remote debugging?', 'dialog', children=[page_button])])
+        chrome = Node('Google Chrome', 'application', children=[
+            document, Node('Allow remote debugging?', 'dialog', children=[native_button])])
+        other = Node('Another application', 'application')
+        for node in (chrome, document, other, native_button, page_button):
+            node.get_relation_set = mock.Mock(return_value=[])
+        self.modals.Atspi.get_desktop.return_value = Node(children=[other, chrome])
+
+        self.assertEqual(self.modals.scan_and_press(self.daemon.begin_consent_scan()), 1)
+        chrome.get_relation_set.assert_called_once_with()
+        for node in (document, other, native_button, page_button):
+            node.get_relation_set.assert_not_called()
+        self.assertEqual((native_button.calls, page_button.calls), (1, 0))
+
+    def test_root_relation_query_failure_keeps_scanning_and_records_only_error_class(self):
+        button = Node('Allow', 'push button')
+        chrome = Node('Google Chrome', 'application', children=[
+            Node('Allow remote debugging?', 'dialog', children=[button])])
+        chrome.get_relation_set = mock.Mock(side_effect=RuntimeError('private relation details'))
+        self.modals.Atspi.get_desktop.return_value = Node(children=[chrome])
+
+        self.assertEqual(self.modals.scan_and_press(self.daemon.begin_consent_scan()), 1)
+        chrome.get_relation_set.assert_called_once_with()
+        self.assertEqual(button.calls, 1)
+        self.assertEqual(self.events('scan_finished')[0]['query_errors'], 1)
+        self.assertEqual(self.events('accessibility_query_error')[0]['error_type'], 'RuntimeError')
+        self.assertNotIn('private relation details', json.dumps(self.events()))
+
+    def test_health_observation_does_not_activate_chrome(self):
+        chrome = Node('Google Chrome', 'application')
+        chrome.get_relation_set = mock.Mock(return_value=[])
+        self.modals.Atspi.get_desktop.return_value = Node(children=[chrome])
+
+        self.assertEqual(self.modals.chrome_accessibility_health(), (True, False))
+        chrome.get_relation_set.assert_not_called()
 
     def test_maximized_window_restore_is_excluded_but_both_intended_prompts_work(self):
         window_restore = Node('Restore', 'push button')

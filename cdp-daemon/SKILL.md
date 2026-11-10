@@ -18,9 +18,8 @@ connections can raise another **Allow remote debugging?** dialog.
   `~/.config/google-chrome/DevToolsActivePort`, falling back to
   `127.0.0.1:43809` when the file is unavailable.
 - Automatic consent pressing requires `python3-gi` with `gi.repository.Atspi`.
-  Chrome needs `--force-renderer-accessibility` or Native accessibility API
-  support enabled through `chrome://accessibility`. Without that accessibility
-  information, the consent button may be unavailable to AT-SPI.
+  Chrome must be registered with the desktop's AT-SPI bus. The presser requests
+  native accessibility through the application-root query described below.
 - Managed page preparation additionally requires the bundled browser-side state
   extension. The browser-level `Extensions.loadUnpacked` command installs it on
   endpoints that support the operation; omit `sessionId`. The helper's ordinary
@@ -54,6 +53,15 @@ prompt structures remain observable in consent diagnostics; the presser does
 not fall back to clicking buttons throughout the browser. Accessibility
 availability is checked throughout the attempt; an earlier failed check does
 not stop later scanning.
+
+Before each active scan, the presser queries `get_relation_set()` on each
+identified Google Chrome application root. This normal Linux AT-SPI query
+activates Chrome's platform accessibility: native controls, basic web
+accessibility and extended properties. Native controls can then appear when only
+the application and top-level windows were initially visible. Chrome owns this
+mode for its current process; it outlives the presser. A query failure is counted
+in `accessibility_query_error` and scanning continues. Health-only observations
+do not issue this activation query.
 
 The same thread dispatches GLib's default context while connected or parked.
 libatspi installs cache-signal subscriptions on initialization, so dispatch must
