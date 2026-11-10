@@ -123,6 +123,14 @@ shared `arrow`, `line`, `frame`, `marked_angle`, `brackets`, `compact` and `fit`
 helpers where they match the intended composition. Prose strings are TeX input.
 Override `SceneLayout` or explicit placement arguments for the teaching layout.
 
+Each recorded path keeps its paint layer and order. Registering a new group
+preserves the order of its existing children, including groups introduced later
+by `Succession`. Group membership still controls movement, updates and removal.
+Changing a recorded path's `z_index`, reversing visible scene order, or re-adding
+an already-present object to move it in front raises an authoring error, because
+the timeline stores a fixed paint order. Full-scene snapshots use that same
+order; explicitly supplied compact handout objects use their own composition.
+
 `checkpoint(label, caption, crop=None, handout=None, pause=True)` saves a printed
 state. `label` is the live control label; `caption` is authored TeX for the printed
 panel. `handout` accepts compact mobjects, and `crop` is `[x, y, width, height]` in

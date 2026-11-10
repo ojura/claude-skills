@@ -5,7 +5,7 @@ import unittest
 
 import cairo
 import numpy as np
-from manim import Circle, FadeOut, LEFT, RIGHT, Square, UP, VGroup
+from manim import AnimationGroup, Circle, FadeIn, FadeOut, LEFT, RIGHT, Square, Succession, UP, VGroup, Wait
 
 from ..animation.vector_scene import VectorScene, draw_paths, scene_paths_at
 from .support import PALETTES, configure
@@ -150,6 +150,68 @@ class VectorAnimationLifecycle(unittest.TestCase):
                 target = VGroup(first, second) if regroup else second
                 with self.assertRaisesRegex(ValueError, "reorder visible"):
                     self.scene.play(target.animate.set_opacity(1), run_time=.2)
+
+    def test_introducer_registration_keeps_subset_occlusion(self):
+        for mode in ("direct", "group", "succession", "nested-succession"):
+            with self.subTest(mode=mode):
+                self.scene = VectorScene(PALETTES["light"], sample_rate=10)
+                first, retained, second = self.overlapping_shapes()
+                group = VGroup(first, second)
+                animation = FadeIn(group, run_time=.2)
+                if mode == "group":
+                    animation = AnimationGroup(animation)
+                elif mode in ("succession", "nested-succession"):
+                    animation = Succession(Wait(run_time=.2), animation)
+                    if mode == "nested-succession":
+                        animation = AnimationGroup(animation)
+                self.scene.play(animation)
+                self.scene.checkpoint("Introduced", "Introduced")
+                self.assertIn(group, self.scene.get_mobject_family_members())
+                self.assert_retained_is_in_front_of_first(self.scene.current_paths())
+                self.assert_retained_is_in_front_of_first(self.scene.handout_states[-1]["full_paths"])
+                timeline = self.scene.export()
+                for time in np.linspace(0, timeline["duration"], 9):
+                    self.assert_retained_is_in_front_of_first(scene_paths_at(timeline, time))
+                self.scene.play(FadeOut(group), run_time=.2)
+                self.scene.wait(.1)
+                final = visible(self.scene.current_paths())
+                self.assertEqual(len(final), 1)
+                self.assertEqual(final[0]["fill"], [0, 1, 0, 1])
+
+    def test_introducer_does_not_accept_hidden_authored_reorder(self):
+        for deferred in (False, True):
+            with self.subTest(deferred=deferred):
+                self.scene = VectorScene(PALETTES["light"], sample_rate=10)
+                first, retained, second = self.overlapping_shapes()
+                second.set_opacity(0)
+                self.scene.record()
+                self.scene.mobjects[:] = [second, first, retained]
+                self.scene.record()
+                animation = FadeIn(VGroup(first, second), run_time=.2)
+                if deferred:
+                    animation = Succession(Wait(run_time=.2), animation)
+                # Registration succeeds while the reordered child is hidden.
+                # Its later reveal must still expose the authored permutation.
+                self.scene.play(animation)
+                with self.assertRaisesRegex(ValueError, "reorder visible"):
+                    self.scene.play(second.animate.set_opacity(1), run_time=.2)
+
+    def test_readding_a_present_object_does_not_accept_authored_reorder(self):
+        first, _retained, _second = self.overlapping_shapes()
+        self.scene.record()
+        self.scene.add(first)
+        with self.assertRaisesRegex(ValueError, "reorder visible"):
+            self.scene.record()
+
+    def test_explicit_group_order_operations_remain_checked(self):
+        for operation in ("bring_to_front", "bring_to_back", "add_foreground_mobjects"):
+            with self.subTest(operation=operation):
+                self.scene = VectorScene(PALETTES["light"], sample_rate=10)
+                first, _retained, second = self.overlapping_shapes()
+                self.scene.record()
+                getattr(self.scene, operation)(VGroup(first, second))
+                with self.assertRaisesRegex(ValueError, "reorder visible"):
+                    self.scene.record()
 
 
 if __name__ == "__main__":

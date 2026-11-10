@@ -93,7 +93,40 @@ class VectorScene(Scene):
         self.object_orders = {}
         self.object_layers = {}
         self._scene_orders = {}
+        self._ordering_requested = False
         super().__init__()
+
+    def add(self, *mobjects):
+        # Manim registers an animation's new owner here, including introducers
+        # begun later by Succession. Its existing children keep their paint
+        # order even though Scene.add moves their new group in the scene list.
+        # Re-adding an already-present object is an authored order operation,
+        # so that permutation remains subject to record()'s rejection.
+        before = self._path_members() if self.object_orders else None
+        family = self.get_mobject_family_members() if before is not None else ()
+        registration = (before is not None and not self._ordering_requested and
+                        all(item not in family for item in mobjects))
+        result = super().add(*mobjects)
+        if registration:
+            self._remember_registration(before)
+        return result
+
+    def _change_scene_order(self, operation, *mobjects):
+        previous = self._ordering_requested
+        self._ordering_requested = True
+        try:
+            return operation(*mobjects)
+        finally:
+            self._ordering_requested = previous
+
+    def bring_to_front(self, *mobjects):
+        return self._change_scene_order(super().bring_to_front, *mobjects)
+
+    def bring_to_back(self, *mobjects):
+        return self._change_scene_order(super().bring_to_back, *mobjects)
+
+    def add_foreground_mobjects(self, *mobjects):
+        return self._change_scene_order(super().add_foreground_mobjects, *mobjects)
 
     def record(self):
         now = round(self.vector_time, 6)
@@ -156,13 +189,13 @@ class VectorScene(Scene):
         return list({id(member): member for top in self.mobjects
                      for member in top.family_members_with_points()}.values())
 
-    def _remember_animation_grouping(self, before):
+    def _remember_registration(self, before):
         """Accept Manim's ownership regrouping without changing path occlusion.
 
-        add_mobjects_from_animations reparents existing children into a new
-        animated group so updaters and removal apply to that group. Its scene
-        traversal can therefore change around other same-layer objects. Apply
-        only that setup permutation to the expected traversal. An earlier
+        Registering a new group reparents its existing children so updaters
+        and removal apply to that group. Its scene traversal can therefore
+        change around other same-layer objects. Apply only that registration
+        permutation to the expected traversal. An earlier
         authored reorder of hidden paths must still fail when they reappear.
         Absent objects retain their previous slots and ordering history.
         """
@@ -206,9 +239,7 @@ class VectorScene(Scene):
         self.animations = self.compile_animations(*animations, **kwargs)
         # Match Manim's scene setup: a newly animated group must own its existing
         # children before cleanup can remove it, and unadded animations must appear.
-        before = self._path_members()
         self.add_mobjects_from_animations(self.animations)
-        self._remember_animation_grouping(before)
         for animation in self.animations:
             animation._setup_scene(self)
             animation.begin()
