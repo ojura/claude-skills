@@ -30,32 +30,6 @@ connections can raise another **Allow remote debugging?** dialog.
   installing it or using `/prepare`.
   Raw CDP calls remain available without that extension.
 
-### Keep native accessibility enabled across Chrome launches
-
-The `chrome://accessibility` Native accessibility API switch repairs the current
-browser process while that settings tab stays open on that page. Chrome scopes
-these flags to the page's lifetime; closing it or navigating away removes its
-mode contribution. Keep that tab open when using this temporary repair. This
-behavior was also observed on Chrome 157; see Chromium's
-[accessibility UI implementation](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/chrome/browser/ui/webui/accessibility/accessibility_ui.cc).
-For subsequent desktop launches, the bundled
-`google-chrome.desktop` adds `--force-renderer-accessibility` to the standard
-Google Chrome launcher and its New Window and New Incognito Window actions.
-It uses the existing browser and profile. On a system with
-`/usr/bin/google-chrome-stable`, install the user-level override from this folder:
-
-```bash
-install -Dm644 google-chrome.desktop ~/.local/share/applications/google-chrome.desktop
-update-desktop-database ~/.local/share/applications
-```
-
-Inspect an existing user override before replacing it and preserve any local
-launcher customizations. The override takes effect when Chrome next starts from
-that desktop entry; it does not change an already-running process. A direct
-shell launch needs the same flag. Do not restart a shared browser to apply this
-setting during other work. The page-preparation extension reports tab state
-after CDP has connected; it does not expose or press the native Allow dialog.
-
 ## Start and connection handling
 
 ```bash
@@ -360,8 +334,6 @@ injecting into a worker or relying on data crossing a JavaScript hook.
   a manual tool: one scan by default, or `--wait` for a bounded wait. Its early
   accessibility health observation is diagnostic; it continues waiting for a
   matching native prompt until a native action completes or the deadline ends.
-- `google-chrome.desktop` is an optional user-level Chrome launcher that keeps
-  native accessibility available across desktop launches.
 
 Run one daemon per configured endpoint. It acts with the authority of the Chrome
 session it is connected to. Treat page data and credentials accordingly, and
