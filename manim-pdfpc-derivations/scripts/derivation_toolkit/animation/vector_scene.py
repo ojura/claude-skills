@@ -92,6 +92,7 @@ class VectorScene(Scene):
         self.recorded_mobjects = {}
         self.object_orders = {}
         self.object_layers = {}
+        self._scene_orders = {}
         super().__init__()
 
     def record(self):
@@ -113,6 +114,7 @@ class VectorScene(Scene):
                 # fixed-topology moves; this also handles Manim's arrow internals.
                 key = (id(mobject), commands, len(state["coords"]))
                 self.recorded_mobjects[id(mobject)] = mobject
+                self._scene_orders.setdefault(id(mobject), len(self._scene_orders))
                 if id(mobject) not in self.object_orders:
                     self.object_orders[id(mobject)] = len(self.object_orders)
                     self.object_layers[id(mobject)] = float(mobject.z_index)
@@ -137,10 +139,11 @@ class VectorScene(Scene):
                             })
                 self._append_state(key, state, now)
                 if state["fill"][3] > 0 or (state["stroke"][3] > 0 and state["stroke_width"] > 0):
-                    paint_order.append((float(mobject.z_index), self.tracks[key]["z"]))
-        # The native format has fixed paint order. Fail at authoring time if
-        # Manim changes that order, rather than silently changing occlusion.
-        ranks = [rank for _, rank in sorted(paint_order, key=lambda item: item[0])]
+                    paint_order.append((float(mobject.z_index), self._scene_orders[id(mobject)]))
+        # Author changes to visible traversal order are unsupported. Automatic
+        # animation grouping updates only _scene_orders; object_orders remains
+        # the common fixed drawing order for timelines and full snapshots.
+        ranks = sorted(paint_order, key=lambda item: item[0])
         if ranks != sorted(ranks):
             raise ValueError("Vector scenes cannot reorder visible paths within one z_index")
         for key in self.last_states.keys() - active.keys():
@@ -148,6 +151,40 @@ class VectorScene(Scene):
             self._append_state(key, state, now)
             active[key] = state
         self.last_states = active
+
+    def _path_members(self):
+        return list({id(member): member for top in self.mobjects
+                     for member in top.family_members_with_points()}.values())
+
+    def _remember_animation_grouping(self, before):
+        """Accept Manim's ownership regrouping without changing path occlusion.
+
+        add_mobjects_from_animations reparents existing children into a new
+        animated group so updaters and removal apply to that group. Its scene
+        traversal can therefore change around other same-layer objects. Apply
+        only that setup permutation to the expected traversal. An earlier
+        authored reorder of hidden paths must still fail when they reappear.
+        Absent objects retain their previous slots and ordering history.
+        """
+        after = self._path_members()
+        if [id(member) for member in before] == [id(member) for member in after]:
+            return
+        layers = {}
+        for member in before:
+            identifier = id(member)
+            self._scene_orders.setdefault(identifier, len(self._scene_orders))
+            layers.setdefault(float(member.z_index), []).append(identifier)
+        expected = {}
+        for identifiers in layers.values():
+            expected.update(zip(identifiers, sorted(identifiers, key=self._scene_orders.__getitem__)))
+        members = [expected.get(id(member), id(member)) for member in after]
+        for identifier in members:
+            self._scene_orders.setdefault(identifier, len(self._scene_orders))
+        active = set(members)
+        replacement = iter(members)
+        order = [next(replacement) if identifier in active else identifier
+                 for identifier in self._scene_orders]
+        self._scene_orders = {identifier: rank for rank, identifier in enumerate(order)}
 
     def _append_state(self, key, state, now):
         frames = self.tracks[key]["keyframes"]
@@ -169,7 +206,9 @@ class VectorScene(Scene):
         self.animations = self.compile_animations(*animations, **kwargs)
         # Match Manim's scene setup: a newly animated group must own its existing
         # children before cleanup can remove it, and unadded animations must appear.
+        before = self._path_members()
         self.add_mobjects_from_animations(self.animations)
+        self._remember_animation_grouping(before)
         for animation in self.animations:
             animation._setup_scene(self)
             animation.begin()
@@ -216,7 +255,7 @@ class VectorScene(Scene):
         })
 
     def current_paths(self):
-        return paths_from_mobjects(self.mobjects, self.canvas)
+        return paths_from_mobjects(self.mobjects, self.canvas, order=self.object_orders)
 
     def export(self):
         self.record()
@@ -238,7 +277,7 @@ class VectorScene(Scene):
         }
 
 
-def paths_from_mobjects(mobjects, canvas=DEFAULT_CANVAS):
+def paths_from_mobjects(mobjects, canvas=DEFAULT_CANVAS, *, order=None):
     mobjects = list(mobjects)
     validate_text_tree(mobjects)
     result = []
@@ -249,7 +288,9 @@ def paths_from_mobjects(mobjects, canvas=DEFAULT_CANVAS):
             if id(mobject) not in seen:
                 seen.add(id(mobject))
                 members.append(mobject)
-    for mobject in sorted(members, key=lambda item: item.z_index):
+    ranks = order or {}
+    for mobject in sorted(members, key=lambda item: (
+            item.z_index, ranks.get(id(item), math.inf))):
         commands, state = state_of(mobject, canvas)
         if commands:
             item = {"commands": commands, "fill_rule": "nonzero", **state}

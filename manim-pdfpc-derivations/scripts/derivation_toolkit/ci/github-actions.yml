@@ -164,10 +164,10 @@ jobs:
           python -B -m derivation_toolkit.ci.authoring html \
             --project "$GITHUB_WORKSPACE/$PROJECT" --deck "$HTML_DECK" \
             --assets "$RUNNER_TEMP/derivation-assets" \
-            --output-dir "$RUNNER_TEMP/derivation-html/presentation" "${input_args[@]}"
+            --output-dir "$RUNNER_TEMP/derivation-html/$HTML_DECK-html5" "${input_args[@]}"
           node --test "$toolkit/web/test/"*.test.mjs
           python -B -m derivation_toolkit.verify.browser \
-            --html "$RUNNER_TEMP/derivation-html/presentation/index.html" \
+            --html "$RUNNER_TEMP/derivation-html/$HTML_DECK-html5/index.html" \
             --output-dir "$RUNNER_TEMP/derivation-html/review" --browser chrome --protocol both
           test -s "$RUNNER_TEMP/derivation-html/$HTML_DECK-html5.zip"
       - name: Upload the standalone browser presentation
