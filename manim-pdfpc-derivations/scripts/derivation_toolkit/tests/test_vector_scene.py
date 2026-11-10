@@ -9,10 +9,10 @@ from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
-from manim import Annulus, Dot, FadeOut, Line, ORIGIN, Rotate, smooth
+from manim import Annulus, Dot, FadeOut, Line, ORIGIN, Rotate, Square, smooth
 
 from ..animation.geometry import MarkedAngle
-from ..animation.vector_scene import VectorScene, paths_from_mobjects, state_at, write_snapshot
+from ..animation.vector_scene import VectorScene, paths_from_mobjects, scene_paths_at, state_at, write_snapshot
 from .support import PALETTES, configure
 
 
@@ -133,6 +133,32 @@ class VectorPlayback(unittest.TestCase):
         first.set_z_index(1)
         with self.assertRaisesRegex(ValueError, "fixed z_index"):
             scene.record()
+
+    def test_fractional_and_large_layers_share_snapshot_and_timeline_order(self):
+        for lower_z, upper_z in ((0, 1e-6), (-1e-6, 0),
+                                 (1e14, 1e14 + 1), (1e304, 2e304)):
+            with self.subTest(lower_z=lower_z, upper_z=upper_z):
+                scene = VectorScene(PALETTES["light"])
+                upper = Square(fill_color="#FF0000", fill_opacity=1, stroke_width=0).set_z_index(upper_z)
+                lower = Square(fill_color="#00FF00", fill_opacity=1, stroke_width=0).set_z_index(lower_z)
+                scene.add(upper, lower)
+                scene.checkpoint("Layers", "Layers")
+                scene.wait(.2)
+                expected = [[0, 1, 0, 1], [1, 0, 0, 1]]
+                self.assertEqual([item["fill"] for item in scene.current_paths()], expected)
+                self.assertEqual([item["fill"] for item in scene.handout_states[-1]["full_paths"]], expected)
+                timeline = scene.export()
+                self.assertTrue(all(math.isfinite(item["z"]) for item in timeline["objects"]))
+                for time in (0, .1, .2):
+                    self.assertEqual([item["fill"] for item in scene_paths_at(timeline, time)], expected)
+
+    def test_nonfinite_layers_fail_during_authoring(self):
+        for layer in (math.inf, -math.inf, math.nan):
+            with self.subTest(layer=layer):
+                scene = VectorScene(PALETTES["light"])
+                scene.add(Square(fill_opacity=1, stroke_width=0).set_z_index(layer))
+                with self.assertRaisesRegex(ValueError, "finite z_index"):
+                    scene.record()
 
 
 if __name__ == "__main__":

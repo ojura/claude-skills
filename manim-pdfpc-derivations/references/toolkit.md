@@ -130,6 +130,9 @@ Changing a recorded path's `z_index`, reversing visible scene order, or re-addin
 an already-present object to move it in front raises an authoring error, because
 the timeline stores a fixed paint order. Full-scene snapshots use that same
 order; explicitly supplied compact handout objects use their own composition.
+Layer values must be finite. Export sorts the layer and path order separately,
+then assigns numeric timeline ranks, so fractional and large layers retain the
+same overlap order as the static figures.
 
 `checkpoint(label, caption, crop=None, handout=None, pause=True)` saves a printed
 state. `label` is the live control label; `caption` is authored TeX for the printed

@@ -143,6 +143,9 @@ class VectorScene(Scene):
                 commands, state = state_of(mobject, self.canvas)
                 if not commands:
                     continue
+                layer = float(mobject.z_index)
+                if not math.isfinite(layer):
+                    raise ValueError("Vector scenes require a finite z_index for every path")
                 # Topology changes get separate tracks. Our teaching scenes use
                 # fixed-topology moves; this also handles Manim's arrow internals.
                 key = (id(mobject), commands, len(state["coords"]))
@@ -150,14 +153,13 @@ class VectorScene(Scene):
                 self._scene_orders.setdefault(id(mobject), len(self._scene_orders))
                 if id(mobject) not in self.object_orders:
                     self.object_orders[id(mobject)] = len(self.object_orders)
-                    self.object_layers[id(mobject)] = float(mobject.z_index)
-                elif self.object_layers[id(mobject)] != float(mobject.z_index):
+                    self.object_layers[id(mobject)] = layer
+                elif self.object_layers[id(mobject)] != layer:
                     raise ValueError("Vector scenes require a fixed z_index for every path")
                 active[key] = state
                 if key not in self.tracks:
                     track = {
                         "id": f"path-{len(self.tracks):04d}",
-                        "z": float(mobject.z_index) * 100000 + self.object_orders[id(mobject)],
                         "commands": commands,
                         "fill_rule": "nonzero",
                         "keyframes": [],
@@ -172,7 +174,7 @@ class VectorScene(Scene):
                             })
                 self._append_state(key, state, now)
                 if state["fill"][3] > 0 or (state["stroke"][3] > 0 and state["stroke_width"] > 0):
-                    paint_order.append((float(mobject.z_index), self._scene_orders[id(mobject)]))
+                    paint_order.append((layer, self._scene_orders[id(mobject)]))
         # Author changes to visible traversal order are unsupported. Automatic
         # animation grouping updates only _scene_orders; object_orders remains
         # the common fixed drawing order for timelines and full snapshots.
@@ -291,15 +293,20 @@ class VectorScene(Scene):
     def export(self):
         self.record()
         objects = []
-        for track in self.tracks.values():
+        # Convert the lexicographic layer/path order into finite numeric ranks.
+        # Arithmetic spacing between layers loses small differences and can
+        # overflow for large, otherwise valid Manim z_index values.
+        ordered = sorted(self.tracks.items(), key=lambda item: (
+            self.object_layers[item[0][0]], self.object_orders[item[0][0]]))
+        for rank, (_key, track) in enumerate(ordered):
             if all(frame["fill"][3] == 0 and frame["stroke"][3] == 0
                    for frame in track["keyframes"]):
                 continue
             frames = track["keyframes"]
             if len(frames) == 2 and all(frames[0][k] == frames[1][k]
                                         for k in frames[0] if k != "time"):
-                track["keyframes"] = frames[:1]
-            objects.append(track)
+                frames = frames[:1]
+            objects.append({**track, "z": rank, "keyframes": frames})
         return {
             "id": self.scene_id, "width": self.canvas.width, "height": self.canvas.height,
             "background": rgba(self.camera.background_color),
