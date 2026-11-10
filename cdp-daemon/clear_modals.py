@@ -249,6 +249,7 @@ def main():
     # dialog asynchronously after the upgrade request, so one startup scan can
     # miss it. Check accessibility after two seconds to report whether Chrome
     # and renderer-content roles are visible during this standalone invocation.
+    # These observations do not determine whether a native prompt can appear.
     deadline = time.time() + 60
     health_deadline = time.time() + 2
     health_checked = False
@@ -270,13 +271,12 @@ def main():
             health_checked = True
             found, has_renderer = chrome_accessibility_health()
             if not found:
-                print('ABORT: AT-SPI did not report Chrome. Check that Chrome is running.')
-                sys.exit(2)
-            if not has_renderer:
-                print('ABORT: AT-SPI exposes Chrome controls but did not expose '
-                      'renderer content. Check "Native accessibility API support" '
-                      'at chrome://accessibility, or approve the debugging request manually.')
-                sys.exit(3)
+                print('AT-SPI did not report Chrome; continuing to wait for '
+                      'native Allow/Restore prompts.')
+            elif not has_renderer:
+                print('AT-SPI exposes Chrome controls but did not expose '
+                      'renderer content; continuing to wait for native '
+                      'Allow/Restore prompts.')
         time.sleep(0.3)
     print(f'timeout (no Allow/Restore button found in {rounds} rounds)')
     sys.exit(1)
