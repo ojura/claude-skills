@@ -464,21 +464,63 @@ def draw_paths(context, paths):
             context.new_path()
 
 
-def draw_scene_fitted(context, scene, time, width, height):
-    """Center a timeline in its region, preserving the surrounding PDF pixels."""
+def _snap_pixel_boundary(value):
+    # Match the native renderer: only remove arithmetic noise at an integer
+    # boundary, not a genuine fractional displacement of the authored region.
+    nearest = round(value)
+    tolerance = 8 * math.ulp(1.0) * max(1, abs(value))
+    return nearest if abs(value - nearest) <= tolerance else value
+
+
+def _paint_pixel_background(context, scene):
+    """Replace a raster poster's complete physical-pixel footprint once."""
+    transform = context.get_matrix()
+    if transform.xy != 0 or transform.yx != 0 or scene["background"][3] != 1:
+        return False
+    x0, y0 = context.user_to_device(0, 0)
+    x1, y1 = context.user_to_device(scene["width"], scene["height"])
+    surface = context.get_group_target()
+    sx, sy = surface.get_device_scale()
+    ox, oy = surface.get_device_offset()
+    left = math.floor(_snap_pixel_boundary(min(x0 * sx + ox, x1 * sx + ox)))
+    top = math.floor(_snap_pixel_boundary(min(y0 * sy + oy, y1 * sy + oy)))
+    right = math.ceil(_snap_pixel_boundary(max(x0 * sx + ox, x1 * sx + ox)))
+    bottom = math.ceil(_snap_pixel_boundary(max(y0 * sy + oy, y1 * sy + oy)))
+    context.save()
+    context.identity_matrix()
+    context.new_path()
+    context.rectangle((left - ox) / sx, (top - oy) / sy,
+                      (right - left) / sx, (bottom - top) / sy)
+    context.set_source_rgb(*scene["background"][:3])
+    context.fill()
+    context.restore()
+    return True
+
+
+def draw_scene_fitted(context, scene, time, width, height, *, pixel_background=False):
+    """Center and clip a timeline; optionally replace its raster PDF poster.
+
+    Pixel replacement precedes the scene clip so fractional bounds cannot leave
+    the old poster's antialiasing behind. The caller must not preclip the region.
+    Ordinary vector output retains geometric coverage and surrounding margins.
+    """
     if not all(math.isfinite(value) and value > 0 for value in (width, height)):
         raise ValueError("The vector region must have positive finite dimensions")
     scale = min(width / scene["width"], height / scene["height"])
     context.save()
-    context.rectangle(0, 0, width, height)
-    context.clip()
+    if not pixel_background:
+        context.rectangle(0, 0, width, height)
+        context.clip()
     context.translate((width - scene["width"] * scale) / 2,
                       (height - scene["height"] * scale) / 2)
     context.scale(scale, scale)
+    background_painted = pixel_background and _paint_pixel_background(context, scene)
+    context.new_path()
     context.rectangle(0, 0, scene["width"], scene["height"])
     context.clip()
-    context.set_source_rgba(*scene["background"])
-    context.paint()
+    if not background_painted:
+        context.set_source_rgba(*scene["background"])
+        context.paint()
     draw_paths(context, scene_paths_at(scene, min(scene["duration"], max(0, time))))
     context.restore()
 

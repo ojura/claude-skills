@@ -5,6 +5,7 @@ import argparse
 from contextlib import redirect_stdout
 import io
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -16,6 +17,8 @@ from unittest.mock import patch
 
 import cairo
 import fitz
+import numpy as np
+from PIL import Image
 
 from ..catalog import Catalog
 from ..cli import main as project_command
@@ -103,6 +106,20 @@ class VideoExport(unittest.TestCase):
         self.assertTrue(all(abs(a-b) <= 4 for a, b in zip(pixels[offset:offset+3], (26, 51, 77))))
         self.assert_cleaned()
 
+    def test_deck_and_chapter_titles_round_trip_through_ffprobe(self):
+        title = "Frame \\theta_B = 3; # report\nnext line"
+        chapter = "A \\ B = C; # step"
+        metadata = render_video.chapters([
+            render_video.Section(1, chapter, 0, 0, 2, False),
+        ], 10, title)
+        result = json.loads(subprocess.check_output([
+            "ffprobe", "-v", "error", "-f", "ffmetadata",
+            "-show_entries", "format_tags=title:chapter_tags=title",
+            "-of", "json", "-i", "pipe:0",
+        ], input=metadata, text=True))
+        self.assertEqual(result["format"]["tags"]["title"], title.replace("\n", " "))
+        self.assertEqual(result["chapters"][0]["tags"]["title"], chapter)
+
     def test_existing_output_is_preserved_without_launching_encoder(self):
         original = b"previous delivery"
         self.output.write_bytes(original)
@@ -144,6 +161,78 @@ class VideoExport(unittest.TestCase):
             self.assertTrue(all(abs(a-b) <= 5 for a, b in zip(frames[offset:offset+3], expected)),
                             (number, x, list(frames[offset:offset+3])))
         self.assert_cleaned()
+
+    def test_fitted_scene_replaces_fractional_poster_and_preserves_pdf_margins(self):
+        fixture = Path(__file__).with_name("fixtures") / "format-options.vector.json"
+        for width in (320, 640):
+            for region_size in ((240, 144), (160, 160)):
+                for theme, colour in (("light", [1, 1, 1, 1]), ("dark", [.2, .2, .2, 1])):
+                    with self.subTest(width=width, region_size=region_size, theme=theme):
+                        scene = json.loads(fixture.read_text())["scenes"][0]
+                        scene["background"] = colour
+                        for item in scene["objects"]:
+                            initial = item["keyframes"][0]
+                            item["keyframes"].append({
+                                "time": scene["duration"], "fill": [*initial["fill"][:3], 0],
+                                "stroke": [0, 0, 0, 0], "stroke_width": 0,
+                            })
+                        # A visible path outside the scene must not enter the PDF margin.
+                        scene["objects"].append({"id": "outside-top", "commands": "MLLLZ",
+                            "keyframes": [{"time": 0, "coords": [-20, -20, 140, -20, 140, -5, -20, -5],
+                                           "fill": [0, 0, 1, 1], "stroke": [0, 0, 0, 0], "stroke_width": 0}]})
+                        rw, rh = region_size
+                        region = fitz.Rect(40.25, 50.375, 40.25 + rw, 50.375 + rh)
+                        scale = min(rw / scene["width"], rh / scene["height"])
+                        left = region.x0 + (rw - scene["width"] * scale) / 2
+                        top = region.y0 + (rh - scene["height"] * scale) / 2
+                        fitted = (left, top, left + scene["width"] * scale,
+                                  top + scene["height"] * scale)
+                        with fitz.open() as document:
+                            page = document.new_page(width=320, height=240)
+                            page.draw_rect(page.rect, color=None, fill=(.1, .2, .3))
+                            # The static poster has a saturated shape touching every edge.
+                            page.draw_rect(fitz.Rect(fitted), color=None, fill=(1, 0, 1))
+                            page.insert_link({"kind": fitz.LINK_URI, "uri": "pdfpc-vector:" + scene["id"],
+                                              "from": region})
+                            document.save(self.pdf)
+                        self.pdf.with_suffix(".vector.json").write_text(json.dumps({"version": 1, "scenes": [scene]}))
+                        name = f"composition-{width}-{rw}-{rh}-{theme}"
+                        self.output = self.project / "build" / (name + ".mp4")
+                        self.args.output = self.output
+                        self.args.snapshots = self.project / "build" / (name + "-frames")
+                        self.args.width, self.args.fps, self.args.theme = width, 2, theme
+                        with patch.object(render_video.subprocess, "Popen", side_effect=self.start_encoder):
+                            result = self.render()
+                        height = result["height"]
+                        pixel_scale = width / 320
+                        x0, y0 = (math.floor(value * pixel_scale) for value in fitted[:2])
+                        x1, y1 = (math.ceil(value * pixel_scale) for value in fitted[2:])
+                        with Image.open(self.args.snapshots / "page-01-time-002.00.png") as image:
+                            final = np.asarray(image.convert("RGB"))
+                        expected = np.array([round(value * 255) for value in colour[:3]], dtype=np.uint8)
+                        covered = np.zeros((height, width), dtype=bool)
+                        covered[y0:y1, x0:x1] = True
+                        damaged = np.any(final != expected, axis=2) & covered
+                        self.assertFalse(damaged.any(),
+                                         f"{np.count_nonzero(damaged)} fitted pixels retain the old PDF poster")
+                        with fitz.open(self.pdf) as document:
+                            poster = document[0].get_pixmap(matrix=fitz.Matrix(pixel_scale, pixel_scale),
+                                                            alpha=False, annots=False)
+                            baseline = np.frombuffer(poster.samples, dtype=np.uint8).reshape(height, width, 3)
+                        np.testing.assert_array_equal(final[~covered], baseline[~covered])
+                        frames = subprocess.check_output([
+                            "ffmpeg", "-v", "error", "-i", str(self.output),
+                            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+                        ])
+                        decoded = np.frombuffer(frames, dtype=np.uint8).reshape(-1, height, width, 3)
+                        self.assertEqual(len(decoded), result["frames"])
+                        self.assertEqual(result["frames"], 10)
+                        cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+                        np.testing.assert_allclose(decoded[0, cy, cx], [255, 0, 0], rtol=0, atol=5)
+                        np.testing.assert_allclose(decoded[-1, cy, cx], expected, rtol=0, atol=5)
+                        # Lossless snapshots assert edge composition exactly; codec
+                        # tolerance applies only to these decoded interior colours.
+                        self.assert_cleaned()
 
     def test_output_created_during_encoding_is_never_replaced(self):
         original = b"a competing producer owns this path"
