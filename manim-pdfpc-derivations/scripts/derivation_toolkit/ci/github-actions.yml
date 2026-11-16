@@ -16,6 +16,18 @@ on:
         description: Catalog deck to export to standalone HTML; empty disables that job.
         type: string
         default: ""
+      authoring_dockerfile:
+        description: Optional consumer Dockerfile relative to project, extending the supplied AUTHORING_IMAGE.
+        type: string
+        default: ""
+      authoring_context:
+        description: Build context for the consumer authoring image, relative to project.
+        type: string
+        default: .
+      prepare_command:
+        description: Optional host command from the project directory to stage external sources under RUNNER_TEMP/derivation-cache.
+        type: string
+        default: ""
       source_checks:
         description: Additional project checks inside the authoring container.
         type: string
@@ -71,9 +83,33 @@ jobs:
           file: ${{ inputs.project }}/tools/vendor/manim_pdfpc/derivation_toolkit/ci/assets.Dockerfile
           platforms: linux/amd64
           load: true
-          tags: derivation-assets:ci
+          tags: |
+            derivation-assets:base
+            derivation-assets:ci
           cache-from: type=gha,version=2,scope=derivation-assets
           cache-to: type=gha,version=2,scope=derivation-assets,mode=max,timeout=3m,ignore-error=true
+      - name: Build the consumer authoring image
+        if: inputs.authoring_dockerfile != ''
+        env:
+          AUTHORING_DOCKERFILE: ${{ inputs.authoring_dockerfile }}
+          AUTHORING_CONTEXT: ${{ inputs.authoring_context }}
+          # The Docker driver can use the base loaded into the local image store.
+          BUILDX_BUILDER: default
+        run: |
+          test -f "$GITHUB_WORKSPACE/$PROJECT/$AUTHORING_DOCKERFILE"
+          test -d "$GITHUB_WORKSPACE/$PROJECT/$AUTHORING_CONTEXT"
+          docker build --platform linux/amd64 \
+            --build-arg AUTHORING_IMAGE=derivation-assets:base \
+            --file "$GITHUB_WORKSPACE/$PROJECT/$AUTHORING_DOCKERFILE" \
+            --tag derivation-assets:ci "$GITHUB_WORKSPACE/$PROJECT/$AUTHORING_CONTEXT"
+      - name: Prepare external source inputs
+        if: inputs.prepare_command != ''
+        env:
+          PREPARE_COMMAND: ${{ inputs.prepare_command }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/derivation-cache" "$RUNNER_TEMP/derivation-assets" "$RUNNER_TEMP/derivation-checks"
+          cd "$GITHUB_WORKSPACE/$PROJECT"
+          bash -euc "$PREPARE_COMMAND"
       - name: Test the toolkit, check source exports and build the project
         env:
           SOURCE_CHECKS: ${{ inputs.source_checks }}
