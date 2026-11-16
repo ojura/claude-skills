@@ -1,5 +1,5 @@
 import * as pdfjs from "pdfjs";
-import { checkpointAt, prepareScene, renderScene, seekCheckpoint } from "derivation-vector";
+import { checkpointAt, prepareScene, renderSceneFitted, seekCheckpoint } from "derivation-vector";
 import { configurePdfWorker, readManifest, openPdf, readVectors } from "derivation-resources";
 
 configurePdfWorker(pdfjs);
@@ -126,18 +126,23 @@ function positionVector(meta, activeScene, canvas, box) {
   if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
 }
 
-function drawVector(canvas, activeScene, at) {
+function drawVector(canvas, activeScene, at, region) {
   if (!activeScene) return;
-  const ctx = canvas.getContext("2d", { alpha: false });
-  ctx.setTransform(canvas.width / activeScene.width, 0, 0,
-                   canvas.height / activeScene.height, 0, 0);
-  renderScene(ctx, activeScene, at);
+  const ctx = canvas.getContext("2d", { alpha: true });
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const width = region[2] - region[0];
+  const height = region[3] - region[1];
+  // Fit in PDF coordinates, then map to the canvas. This preserves aspect
+  // ratio on screen even when device-pixel rounding differs between axes.
+  ctx.setTransform(canvas.width / width, 0, 0, canvas.height / height, 0, 0);
+  renderSceneFitted(ctx, activeScene, at, width, height);
 }
 
 function paintVector() {
   if (!scene || !currentMeta().scene || ui.vector.style.display === "none") return;
   if (time === lastDisplayedTime) return;
-  drawVector(ui.vector, scene, time);
+  drawVector(ui.vector, scene, time, currentMeta().scene.rect);
   lastDisplayedTime = time;
 }
 
@@ -306,7 +311,7 @@ async function showPage(number, opts = {}) {
       if (changed || request.backwards) playTarget = time;
     }
     positionVector(meta, scene, nextVector, box);
-    drawVector(nextVector, scene, time);
+    drawVector(nextVector, scene, time, meta.scene?.rect);
     // Keep the complete old slide visible until all three new layers are ready.
     ui.slide.style.width = box.width + "px";
     ui.slide.style.height = box.height + "px";

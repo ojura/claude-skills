@@ -360,21 +360,33 @@ def state_at(track, time):
 
 def scene_paths_at(scene, time):
     return [{**track, **state_at(track, time)}
-            for track in sorted(scene["objects"], key=lambda item: item["z"])]
+            for track in sorted(scene["objects"], key=lambda item: item.get("z", 0))]
 
 
 def append_path(context, item):
-    """Append the common cubic geometry without changing the paint source."""
+    """Append native-format path commands without changing the paint source."""
     coords = iter(item["coords"])
+    x = y = first_x = first_y = 0.0
     for command in item["commands"]:
         if command == "M":
-            context.move_to(next(coords), next(coords))
+            x, y = first_x, first_y = next(coords), next(coords)
+            context.move_to(x, y)
         elif command == "L":
-            context.line_to(next(coords), next(coords))
+            x, y = next(coords), next(coords)
+            context.line_to(x, y)
         elif command == "C":
-            context.curve_to(*(next(coords) for _ in range(6)))
+            control = tuple(next(coords) for _ in range(6))
+            context.curve_to(*control)
+            x, y = control[-2:]
+        elif command == "Q":
+            cx, cy, end_x, end_y = (next(coords) for _ in range(4))
+            context.curve_to(x + (cx - x) * 2 / 3, y + (cy - y) * 2 / 3,
+                             end_x + (cx - end_x) * 2 / 3,
+                             end_y + (cy - end_y) * 2 / 3, end_x, end_y)
+            x, y = end_x, end_y
         elif command == "Z":
             context.close_path()
+            x, y = first_x, first_y
         else:
             raise ValueError(f"Unsupported path command {command}")
     context.set_fill_rule(cairo.FILL_RULE_EVEN_ODD if item.get("fill_rule") == "evenodd"
@@ -398,6 +410,25 @@ def draw_paths(context, paths):
             context.stroke()
         else:
             context.new_path()
+
+
+def draw_scene_fitted(context, scene, time, width, height):
+    """Center a timeline in its region, preserving the surrounding PDF pixels."""
+    if not all(math.isfinite(value) and value > 0 for value in (width, height)):
+        raise ValueError("The vector region must have positive finite dimensions")
+    scale = min(width / scene["width"], height / scene["height"])
+    context.save()
+    context.rectangle(0, 0, width, height)
+    context.clip()
+    context.translate((width - scene["width"] * scale) / 2,
+                      (height - scene["height"] * scale) / 2)
+    context.scale(scale, scale)
+    context.rectangle(0, 0, scene["width"], scene["height"])
+    context.clip()
+    context.set_source_rgba(*scene["background"])
+    context.paint()
+    draw_paths(context, scene_paths_at(scene, min(scene["duration"], max(0, time))))
+    context.restore()
 
 
 def write_snapshot(destination, paths, background, crop=None, png_scale=None, *, canvas=DEFAULT_CANVAS):

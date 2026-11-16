@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "scenes": [
+    {
+      "id": "default-layers", "width": 120, "height": 80,
+      "background": [1, 1, 1, 1], "duration": 2,
+      "checkpoints": [{"time": 0, "label": "Start"}, {"time": 2, "label": "End"}],
+      "objects": [
+        {
+          "id": "foreground", "z": 1, "commands": "MLLLZ",
+          "keyframes": [{"time": 0, "coords": [10, 10, 90, 10, 90, 70, 10, 70],
+            "fill": [1, 0, 0, 1], "stroke": [0, 0, 0, 0], "stroke_width": 0}]
+        },
+        {
+          "id": "default-layer", "commands": "MLLLZ",
+          "keyframes": [{"time": 0, "coords": [20, 20, 100, 20, 100, 60, 20, 60],
+            "fill": [0, 0, 1, 1], "stroke": [0, 0, 0, 0], "stroke_width": 0}]
+        },
+        {
+          "id": "background-layer", "z": -1, "commands": "MLLLZ",
+          "keyframes": [{"time": 0, "coords": [0, 0, 120, 0, 120, 80, 0, 80],
+            "fill": [0, 1, 0, 1], "stroke": [0, 0, 0, 0], "stroke_width": 0}]
+        }
+      ]
+    },
+    {
+      "id": "equal-layers", "width": 120, "height": 80,
+      "background": [1, 1, 1, 1], "duration": 2,
+      "checkpoints": [{"time": 0, "label": "Start"}, {"time": 2, "label": "End"}],
+      "objects": [
+        {
+          "id": "first-default", "commands": "MLLLZ",
+          "keyframes": [{"time": 0, "coords": [10, 10, 110, 10, 110, 70, 10, 70],
+            "fill": [1, 0, 0, 1], "stroke": [0, 0, 0, 0], "stroke_width": 0}]
+        },
+        {
+          "id": "explicit-zero", "z": 0, "commands": "MLLLZ",
+          "keyframes": [{"time": 0, "coords": [20, 20, 100, 20, 100, 60, 20, 60],
+            "fill": [0, 0, 1, 1], "stroke": [0, 0, 0, 0], "stroke_width": 0}]
+        },
+        {
+          "id": "last-default", "commands": "MLLLZ",
+          "keyframes": [{"time": 0, "coords": [30, 30, 90, 30, 90, 50, 30, 50],
+            "fill": [0, 1, 0, 1], "stroke": [0, 0, 0, 0], "stroke_width": 0}]
+        }
+      ]
+    },
+    {
+      "id": "quadratic-paths", "width": 120, "height": 80,
+      "background": [1, 1, 1, 1], "duration": 2,
+      "checkpoints": [{"time": 0, "label": "Start"}, {"time": 2, "label": "End"}],
+      "objects": [
+        {
+          "id": "quadratic-after-close", "commands": "MQZQZ",
+          "keyframes": [
+            {"time": 0, "coords": [10, 40, 40, 0, 70, 40, 40, 80, 70, 40],
+              "fill": [0.9, 0.3, 0.1, 1], "stroke": [0, 0, 0, 1], "stroke_width": 1},
+            {"time": 2, "fill": [0.9, 0.3, 0.1, 0.5], "stroke": [0, 0, 0, 1], "stroke_width": 3}
+          ]
+        },
+        {
+          "id": "quadratic-after-cubic", "commands": "MCQLZ", "fill_rule": "evenodd",
+          "keyframes": [
+            {"time": 0, "coords": [80, 10, 90, 0, 110, 0, 115, 10, 120, 40, 100, 65, 80, 65],
+              "fill": [0.2, 0.3, 0.8, 1], "stroke": [0, 0, 0, 1], "stroke_width": 1},
+            {"time": 2, "coords": [80, 10, 90, 0, 110, 0, 115, 10, 90, 40, 100, 65, 80, 65],
+              "fill": [0.2, 0.3, 0.8, 1], "stroke": [0, 0, 0, 1], "stroke_width": 1}
+          ]
+        }
+      ]
+    }
+  ]
+}

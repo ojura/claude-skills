@@ -81,9 +81,6 @@ def pdf_manifest(pdf_path: Path, vector_path: Path | None, theme: str,
                 if rectangle.is_empty or not page.rect.contains(rectangle):
                     raise ValueError(f"Animation region leaves PDF page {page.number + 1}")
                 area = [round(float(coordinate), 5) for coordinate in rectangle]
-                scene = scenes[name]
-                if abs(rectangle.width / rectangle.height - scene["width"] / scene["height"]) > .0002:
-                    raise ValueError("Scene/PDF aspect mismatch: " + name)
             lines = page.get_text().splitlines()
             pages.append({
                 "number": page.number + 1, "logical": mapped["logical"],

@@ -20,7 +20,7 @@ import fitz
 from .build import pdf_manifest
 from ..catalog import Catalog
 from ..paths import get_paths, output_path
-from ..animation.vector_scene import draw_paths, scene_paths_at
+from ..animation.vector_scene import draw_scene_fitted
 
 
 @dataclass(frozen=True)
@@ -153,10 +153,7 @@ def render(args: argparse.Namespace, catalog: Catalog) -> dict:
                                 context.rectangle(x0, y0, x1 - x0, y1 - y0)
                                 context.clip()
                                 context.translate(x0, y0)
-                                context.scale((x1 - x0) / scene["width"], (y1 - y0) / scene["height"])
-                                context.set_source_rgba(*scene["background"])
-                                context.paint()
-                                draw_paths(context, scene_paths_at(scene, scene_time))
+                                draw_scene_fitted(context, scene, scene_time, x1 - x0, y1 - y0)
                                 context.restore()
                             surface.flush()
                             if snapshots and (index == 0 or section.moving and index == section.frames // 2):

@@ -4,6 +4,36 @@ function mix(a, b, amount) {
   return a + (b - a) * amount;
 }
 
+function number(value, name, minimum = -1e9, maximum = 1e9) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < minimum || value > maximum) {
+    throw new Error(name + " must be a finite number between " + minimum + " and " + maximum);
+  }
+  return value;
+}
+
+function object(value, name) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(name + " must be an object");
+  return value;
+}
+
+function string(value, name, nonempty = false) {
+  if (typeof value !== "string" || (nonempty && !value.length)) throw new Error(name + " must be a string" + (nonempty ? " with content" : ""));
+  return value;
+}
+
+function array(value, name, minimum, maximum) {
+  if (!Array.isArray(value) || value.length < minimum || value.length > maximum) {
+    throw new Error(name + " must contain between " + minimum + " and " + maximum + " entries");
+  }
+  return value;
+}
+
+function numbers(value, name, length, color = false) {
+  array(value, name, length, length);
+  for (const component of value) number(component, name, color ? 0 : -1e9, color ? 1 : 1e9);
+  return value;
+}
+
 export function bracket(keyframes, time) {
   if (!keyframes.length) throw new Error("Empty animation track");
   let lo = 0;
@@ -22,20 +52,64 @@ export function bracket(keyframes, time) {
 }
 
 export function prepareScene(source) {
-  if (!source || !Array.isArray(source.objects) || source.width <= 0 || source.height <= 0) {
-    throw new Error("Invalid vector scene");
+  object(source, "Scene");
+  string(source.id, "Scene id", true);
+  number(source.width, "Scene width");
+  number(source.height, "Scene height");
+  number(source.duration, "Scene duration", 0, 86400);
+  if (source.width <= 0 || source.height <= 0 || source.duration <= 0) {
+    throw new Error("Scene dimensions and duration must be positive");
   }
-  const objects = source.objects.map((item) => {
+  numbers(source.background, "Scene background", 4, true);
+  if (source.background[3] !== 1) throw new Error("Scene background must be opaque");
+  const checkpoints = array(source.checkpoints, "Checkpoints", 2, 10000);
+  for (let i = 0; i < checkpoints.length; i++) {
+    const point = object(checkpoints[i], "Checkpoint");
+    number(point.time, "Checkpoint time", 0, source.duration);
+    string(point.label, "Checkpoint label");
+    if ((i === 0 && point.time !== 0) || (i > 0 && point.time <= checkpoints[i - 1].time)) {
+      throw new Error("Checkpoint times must start at zero and increase");
+    }
+  }
+  if (Math.abs(checkpoints.at(-1).time - source.duration) > 1e-6) {
+    throw new Error("Final checkpoint must equal scene duration");
+  }
+  const identifiers = new Set();
+  const objects = array(source.objects, "Scene objects", 0, 20000).map((item) => {
+    object(item, "Vector object");
+    string(item.id, "Object id", true);
+    if (identifiers.has(item.id)) throw new Error("Duplicate object id: " + item.id);
+    identifiers.add(item.id);
+    const z = Object.hasOwn(item, "z") ? number(item.z, "Object z") : 0;
+    const commands = string(item.commands, "Path commands", true);
+    if (commands[0] !== "M") throw new Error("A path must start with M");
+    const counts = { M: 2, L: 2, C: 6, Q: 4, Z: 0 };
+    let coordinateCount = 0;
+    for (const command of commands) {
+      if (!Object.hasOwn(counts, command)) throw new Error("Unsupported path command: " + command);
+      coordinateCount += counts[command];
+    }
+    if (coordinateCount > 200000) throw new Error("Path has too many coordinates");
+    const fillRule = Object.hasOwn(item, "fill_rule") ? item.fill_rule : "nonzero";
+    if (fillRule !== "nonzero" && fillRule !== "evenodd") throw new Error("Invalid fill_rule");
     let geometry;
-    const frames = item.keyframes.map((frame) => {
-      if (frame.coords !== undefined) geometry = frame.coords;
+    const frames = array(item.keyframes, "Keyframes", 1, 200000).map((frame, index) => {
+      object(frame, "Keyframe");
+      number(frame.time, "Keyframe time", 0, source.duration + 1e-6);
+      if ((index === 0 && frame.time !== 0) || (index > 0 && frame.time <= item.keyframes[index - 1].time)) {
+        throw new Error("Keyframe times must start at zero and increase");
+      }
+      if (Object.hasOwn(frame, "coords")) geometry = numbers(frame.coords, "Path coordinates", coordinateCount);
       if (!geometry) throw new Error("No first geometry for " + item.id);
+      numbers(frame.fill, "Keyframe fill", 4, true);
+      numbers(frame.stroke, "Keyframe stroke", 4, true);
+      number(frame.stroke_width, "Keyframe stroke_width", 0);
       return { ...frame, coords: geometry };
     });
     const original = frames[0].coords;
     const fixed = frames.every((frame) => frame.coords.length === original.length &&
       frame.coords.every((value, i) => value === original[i]));
-    return { ...item, frames, fixed, cachedPath: null, interpolated: new Float64Array(original.length) };
+    return { ...item, z, fill_rule: fillRule, frames, fixed, cachedPath: null, interpolated: new Float64Array(original.length) };
   });
   objects.sort((a, b) => a.z - b.z);
   return { ...source, objects };
@@ -126,5 +200,20 @@ export function renderScene(ctx, scene, time) {
       ctx.stroke(path);
     }
   }
+  ctx.restore();
+}
+
+export function renderSceneFitted(ctx, scene, time, width, height) {
+  if (!(width > 0 && height > 0 && Number.isFinite(width) && Number.isFinite(height))) {
+    throw new Error("The vector region must have positive finite dimensions");
+  }
+  const scale = Math.min(width / scene.width, height / scene.height);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, width, height);
+  ctx.clip();
+  ctx.translate((width - scene.width * scale) / 2, (height - scene.height * scale) / 2);
+  ctx.scale(scale, scale);
+  renderScene(ctx, scene, time);
   ctx.restore();
 }
