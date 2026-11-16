@@ -35,6 +35,20 @@ class BrowserFormatRasterChecks(unittest.TestCase):
         report = compare_rasters(browser, native)
         self.assertLessEqual(report["maximumCoverageRatio"], 1)
 
+    def test_shared_closing_edge_can_have_two_different_coverage_samples(self):
+        # Red-channel samples from the actual MQZQZ baseline at one-pixel
+        # stroke width. Both rasterizers paint the same two adjacent rows.
+        native = np.full((16, 24, 4), 255, dtype=np.uint8)
+        native[:, :, :3] = 230
+        browser = native.copy()
+        native[6, :, :3] = native[9, :, :3] = 221
+        native[7, :, :3] = 123
+        native[8, :, :3] = 107
+        browser[7:9, :, :3] = 57
+        for first, second in ((native, browser), (browser, native)):
+            report = compare_rasters(first, second)
+            self.assertLessEqual(report["maximumCoverageRatio"], 1)
+
     def test_missing_thin_path_fails_in_both_directions(self):
         native = self.stroke()
         absent = np.full_like(native, 255)

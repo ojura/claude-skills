@@ -70,10 +70,11 @@ def compare_rasters(actual, native):
     low_a, high_a = neighbourhood(painted[0], radius=2)
     low_n, high_n = neighbourhood(painted[1], radius=2)
     contrast = np.maximum(high_a, high_n) - np.minimum(low_a, low_n)
-    # Allow one pixel-equivalent of local contrast over each 3x3 neighbourhood,
-    # plus one channel quantization level per sample. This permits boundary
-    # sampling differences while rejecting missing cores and one-pixel shifts.
-    allowance = contrast.astype(np.float64) + 9
+    # A thin stroke has two antialiased sides. Allow two pixel-equivalents of
+    # local contrast in the 3x3 sum, plus one quantization level per sample.
+    # The shared MQZQZ edge measures 1.91 pixel-equivalents across Cairo/Canvas;
+    # the missing-core and one-pixel-shift controls each exceed 2.89.
+    allowance = 2 * contrast.astype(np.float64) + 9
     coverage = float(np.max(delta / allowance))
     if coverage > 1:
         raise AssertionError(f"Local stroke coverage differs by {coverage:.6f} times its allowance")

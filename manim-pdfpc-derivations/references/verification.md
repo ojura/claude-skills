@@ -126,6 +126,26 @@ the input HTML hash, completed browser/protocol cases and any later failure.
 The harness closes its owned browsers; `--chrome` and `--firefox` select
 explicit executables.
 
+For changes to path drawing or PDF/vector composition, run the format fixtures
+against the native probe in the authoring environment:
+
+```bash
+PYTHONPATH="$toolkit/.." python3 -B -m derivation_toolkit.verify.browser_format \
+  --pdfjs-dist build/tools/html5/node_modules/pdfjs-dist \
+  --vector-probe "$(python3 tools/derivations.py native --probe)" \
+  --output-dir build/review/browser-format --browser both
+```
+
+This exercises default/equal layers, quadratic paths after cubic and closing
+commands, interpolation and aspect-preserving fitting. It compares evaluated
+geometry and styles exactly, checks constant-colour interiors and accumulated
+edge coverage, and records the raw raster differences. The coverage checks have
+positive fixtures for measured Cairo/Canvas fringe differences and negative
+fixtures for missing stroke cores and displaced one-pixel strokes. Separate
+composed-PDF checks require exact background replacement and unchanged pixels
+outside the fitted footprint, including fractional origins in both themes.
+The same run opens a static-only document. Its browsers are closed on exit.
+
 ## Compare the native renderer
 
 Build the pinned probe and export reference previews from the same provider:
