@@ -14,13 +14,8 @@ import subprocess
 import sys
 import tempfile
 
-import cairo
-import fitz
-
-from .build import pdf_manifest
-from ..catalog import Catalog
+from ..catalog import Catalog, PACKAGE_ROOT
 from ..paths import get_paths, output_path
-from ..animation.vector_scene import draw_paths, scene_paths_at
 
 
 @dataclass(frozen=True)
@@ -73,10 +68,18 @@ def chapters(sections: list[Section], fps: int, title: str) -> str:
 
 
 def render(args: argparse.Namespace, catalog: Catalog) -> dict:
+    import cairo
+    import fitz
+    from .build import pdf_manifest
+    from ..animation.vector_scene import draw_paths, scene_paths_at
+
     if not 1 <= args.fps <= 240 or args.width < 320 or args.width % 2:
         raise ValueError("Use an even width of at least 320 and a frame rate from 1 to 240")
-    if args.static_hold <= 0 or args.checkpoint_hold <= 0:
-        raise ValueError("Reading pauses must be positive")
+    if not all(math.isfinite(value) and value > 0
+               for value in (args.static_hold, args.checkpoint_hold)):
+        raise ValueError("Reading pauses must be positive and finite")
+    if args.threads < 1:
+        raise ValueError("The encoder thread count must be positive")
     encoder = shutil.which("ffmpeg")
     if not encoder:
         raise RuntimeError("FFmpeg is required to encode the video")
@@ -85,16 +88,19 @@ def render(args: argparse.Namespace, catalog: Catalog) -> dict:
     vector = (args.vectors or pdf.with_suffix(".vector.json")).expanduser().resolve()
     if args.vectors and not vector.is_file():
         raise ValueError(f"Missing explicit timeline: {vector}")
-    output = output_path(args.output or get_paths(deck).build_dir / "video" /
-                         f"{deck.document}-{args.theme}-{args.fps}fps.mp4", catalog.root)
-    output_path(output.parent, catalog.root)
+    destination = Path(args.output or get_paths(deck, getattr(args, "cache_root", None)).build_dir / "video" /
+                       f"{deck.document}-{args.theme}-{args.fps}fps.mp4").expanduser()
+    # Resolve the directory, not the final name: even a dangling symlink is
+    # an existing destination, not permission to create its missing target.
+    output = output_path(destination.parent, catalog.root) / destination.name
     snapshots = output_path(args.snapshots, catalog.root) if args.snapshots else None
-    if output.exists():
+    if os.path.lexists(output):
         raise FileExistsError(f"Output already exists: {output}")
+    output_path(output, catalog.root)
     metadata = pdf_manifest(pdf, vector if vector.is_file() else None, args.theme, args.page_map)
     timeline = json.loads(vector.read_text(encoding="utf-8")) if vector.is_file() else {"scenes": []}
     scenes = {scene["id"]: scene for scene in timeline["scenes"]}
-    last_page = args.last_page or len(metadata["pages"])
+    last_page = len(metadata["pages"]) if args.last_page is None else args.last_page
     selected = [page for page in metadata["pages"] if args.first_page <= page["number"] <= last_page]
     if not selected or args.first_page < 1 or last_page > len(metadata["pages"]):
         raise ValueError("The requested page interval is outside the PDF")
@@ -120,12 +126,14 @@ def render(args: argparse.Namespace, catalog: Catalog) -> dict:
                    "-threads", str(args.threads), "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                    str(movie)]
         with (scratch / "ffmpeg.log").open("w+") as log, fitz.open(pdf) as document:
-            encoder_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log)
-            surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, args.width, height)
-            context = cairo.Context(surface)
-            current_page = None
-            completed = 0
+            encoder_process = None
+            surface = None
             try:
+                encoder_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log)
+                surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, args.width, height)
+                context = cairo.Context(surface)
+                current_page = None
+                completed = 0
                 for section in sections:
                     meta = metadata["pages"][section.page - 1]
                     scene = scenes[meta["scene"]["id"]] if meta["scene"] else None
@@ -170,28 +178,43 @@ def render(args: argparse.Namespace, catalog: Catalog) -> dict:
                 if returncode:
                     log.seek(0)
                     raise RuntimeError("FFmpeg failed: " + log.read())
-            except BaseException:
-                if encoder_process.stdin and not encoder_process.stdin.closed:
-                    encoder_process.stdin.close()
-                if encoder_process.poll() is None:
-                    encoder_process.terminate()
+            except BaseException as error:
+                if encoder_process is not None:
+                    if encoder_process.poll() is None:
+                        try:
+                            encoder_process.terminate()
+                        except ProcessLookupError:
+                            pass
+                    # Stop the reader before flushing the writer; a failed
+                    # encoder may have closed its end of the pipe already.
+                    if encoder_process.stdin and not encoder_process.stdin.closed:
+                        try:
+                            encoder_process.stdin.close()
+                        except OSError:
+                            pass
                     try:
                         encoder_process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         encoder_process.kill()
                         encoder_process.wait()
+                    if isinstance(error, BrokenPipeError):
+                        log.seek(0)
+                        raise RuntimeError("FFmpeg failed: " + log.read()) from error
                 raise
             finally:
-                surface.finish()
-        os.replace(movie, output)
+                if surface is not None:
+                    surface.finish()
+        # The completed movie and destination share a filesystem. Linking is
+        # atomic and refuses any name created since the initial check; replacing
+        # here would overwrite another producer's completed file.
+        os.link(movie, output)
     return {"output": str(output), "bytes": output.stat().st_size, "frames": completed,
             "fps": args.fps, "seconds": completed / args.fps, "width": args.width, "height": height,
             "pages": [page["number"] for page in selected], "theme": args.theme}
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", type=Path)
+def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """One option contract for the project CLI and standalone module."""
     parser.add_argument("deck", nargs="?")
     parser.add_argument("--pdf", type=Path, required=True, help="The accepted live PDF")
     parser.add_argument("--vectors", type=Path, help="Matching vector JSON; defaults to the PDF sidecar")
@@ -206,6 +229,35 @@ def main() -> None:
     parser.add_argument("--checkpoint-hold", type=float, default=1)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--snapshots", type=Path, help="Optional checkpoint/midpoint PNGs for visual review")
+    parser.add_argument("--cache-root", type=Path)
+    parser.add_argument("--in-authoring-environment", action="store_true", help=argparse.SUPPRESS)
+
+
+def run(args: argparse.Namespace, catalog: Catalog, arguments: list[str]) -> None:
+    """Run the project command in its locked authoring environment."""
+    if args.in_authoring_environment:
+        print(json.dumps(render(args, catalog), indent=2))
+        return
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("FFmpeg is required to encode the video")
+    from ..export import authoring_python
+
+    python = authoring_python(get_paths(catalog.get(args.deck), args.cache_root))
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(PACKAGE_ROOT.parent) + os.pathsep + environment.get("PYTHONPATH", "")
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    # Preserve the caller's cwd and every original option, including relative
+    # input paths. An explicit project prefix also carries the installed entry
+    # point's default project into the fresh interpreter.
+    subprocess.run([str(python), "-B", "-m", "derivation_toolkit",
+                    "--project", str(catalog.root), *arguments,
+                    "--in-authoring-environment"], env=environment, check=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project", type=Path)
+    add_arguments(parser)
     args = parser.parse_args()
     print(json.dumps(render(args, Catalog(args.project)), indent=2))
 

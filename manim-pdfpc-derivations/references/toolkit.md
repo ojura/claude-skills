@@ -6,6 +6,7 @@
 - [Include figures in TeX](#include-figures-in-tex)
 - [Build the document editions](#build-the-document-editions)
 - [Package HTML](#package-html)
+- [Render a requested video](#render-a-requested-video)
 - [Use native presentation tools](#use-native-presentation-tools)
 - [Run the toaster example](#run-the-toaster-example)
 - [Add the reusable CI workflow](#add-the-reusable-ci-workflow)
@@ -330,6 +331,35 @@ matching timeline; preserve the page-map sidecar when moving Beamer PDFs.
 Use the shared [browser verification command](verification.md#exercise-the-standalone-browser-document)
 to exercise the actual file and projector in Chrome and Firefox, including
 transition frames.
+
+## Render a requested video
+
+Use the compiled live PDF and its matching timeline when a video is requested:
+
+```bash
+python3 tools/derivations.py video example \
+  --pdf build/decks/example/example-light-live.pdf \
+  --first-page 2 --last-page 4 --fps 60 --width 1920 \
+  --output build/video/example-excerpt.mp4
+```
+
+The command uses the toolkit's locked authoring interpreter and requires FFmpeg
+on `PATH`. Its first run prepares the authoring environment when necessary;
+`--cache-root` selects that environment's build location. The PDF's adjacent
+`.vector.json` is used by default, or `--vectors` selects an explicit timeline.
+Static pages need no timeline. Selected pages must share an aspect ratio.
+
+The H.264 MP4 retains authored motion timing and adds reading pauses: one second
+at an animation's opening, two seconds at its final state, and
+`--checkpoint-hold` seconds at intermediate stops (default one). Static slides
+use `--static-hold` seconds (default three). PDF pages become video chapters.
+`--snapshots build/video/review` also writes checkpoint and midpoint PNGs.
+
+Choose a new output filename for each render. The command publishes the complete
+movie only after encoding succeeds and preserves any file or symbolic link
+already at that name, including one created while the encoder runs. A failed
+or interrupted render closes and reaps its encoder and removes its partial
+movie. The default output is below `build/decks/<deck-id>/video/`.
 
 ## Use native presentation tools
 
