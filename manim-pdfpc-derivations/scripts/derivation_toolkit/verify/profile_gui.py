@@ -35,18 +35,21 @@ def frame_identity(event, counter=None):
 
 def scene_metrics(events, scene_id, playback_id, duration, view):
     # A completed timing belongs to the draw with this clock/counter, even if
-    # the receipt arrives after a checkpoint, pause, or scene change.
-    origins = {}
-    for event in events:
-        if (event["event"] == "frame" and event["view"] == view and
-                event.get("scene") == scene_id and event.get("playback_id") == playback_id):
-            origins[frame_identity(event)] = event
+    # the receipt arrives after a checkpoint, pause, or scene change. Resolve
+    # the final origin globally: another run can repaint the same GTK frame.
+    origins = {frame_identity(event): event for event in events if event["event"] == "frame"}
+    run_draws = [event for event in events if event["event"] == "frame" and
+                 event["view"] == view and event.get("scene") == scene_id and
+                 event.get("playback_id") == playback_id]
     frames = []
-    for event in sorted(origins.values(), key=lambda item: item["clock_us"]):
+    for event in sorted(run_draws, key=lambda item: item["clock_us"]):
         frames.append(event)
         if event["displayed_time"] >= duration - 1e-6:
             break
-    selected = {frame_identity(event): event for event in frames}
+    # Every draw through the first final state contributes work and timing.
+    # Only its globally last content can own presentation feedback.
+    selected = {frame_identity(event): event for event in frames
+                if origins[frame_identity(event)] is event}
     timings = {}
     timing_receipts = {}
     for event in events:
@@ -59,7 +62,7 @@ def scene_metrics(events, scene_id, playback_id, duration, view):
                 timing_receipts[key] = event
     known_keys = {key for key, timing in timings.items()
                   if timing["presentation_time_us"] > 0 and not timing.get("expired", False)}
-    clocks = {key[0] for key in selected}
+    clocks = {event["frame_clock_id"] for event in frames}
     # Collection-event counts cover the supplied events for these frame clocks,
     # including later states; verified/unverified frame counts stay scene-selected.
     collection_events = [event for event in events if "completed_timings" in event and
@@ -96,9 +99,10 @@ def scene_metrics(events, scene_id, playback_id, duration, view):
                 verified_bounds += 1
     feedback = [(timings[key]["presentation_time_us"], frame)
                 for key, frame in selected.items() if key in known_keys]
-    source_indices = {frame_identity(frame): index for index, frame in enumerate(frames)}
+    feedback_frames = list(selected.values())
+    source_indices = {frame_identity(frame): index for index, frame in enumerate(feedback_frames)}
     unknown_prefix = [0]
-    for frame in frames:
+    for frame in feedback_frames:
         unknown_prefix.append(unknown_prefix[-1] + (frame_identity(frame) not in known_keys))
     # Several submitted draws can be reported at one display refresh. Count
     # that refresh once, using its newest originating scene state.
@@ -158,6 +162,8 @@ def scene_metrics(events, scene_id, playback_id, duration, view):
     cpu_frames = [event for event in frames if event.get("render_cpu_us", -1) >= 0]
     return {
         "frames": len(frames),
+        "selected_frame_keys": len(selected),
+        "superseded_draw_events": len(frames) - len(selected),
         "native_draw_ms": distribution([event["render_us"]/1000 for event in frames]),
         "native_cpu_ms": distribution([event["render_cpu_us"]/1000 for event in cpu_frames]),
         "native_wall_minus_cpu_ms": distribution([
@@ -206,6 +212,19 @@ def scene_metrics(events, scene_id, playback_id, duration, view):
         "presented_fps": observed_positive_fps if complete_feedback else None,
         "size": [frames[-1]["width"], frames[-1]["height"]] if frames else None,
     }
+
+
+def refresh_scene_metrics(scenes, events):
+    """Reconcile each scene with later repaints and receipts before saving."""
+    errors = []
+    for scene in scenes:
+        scene["views"] = {
+            view: scene_metrics(events, scene["scene"], scene["playback_id"], scene["duration"], view)
+            for view in ("presentation", "presenter")
+        }
+        for view, metrics in scene["views"].items():
+            errors.extend(f'{scene["scene"]} {view}: {error}' for error in metrics["timing_errors"])
+    return errors
 
 
 def fit_window_layout(width, height, decoration_height=0):
@@ -649,8 +668,11 @@ def main():
             app_log.close()
         if cleanup_errors:
             report["cleanup_errors"] = cleanup_errors
+        final_timing_errors = refresh_scene_metrics(report["scenes"], events)
+        if final_timing_errors:
+            report.setdefault("error", "; ".join(final_timing_errors))
         (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
-    return 0
+    return 1 if report.get("error") else 0
 
 
 if __name__ == "__main__":

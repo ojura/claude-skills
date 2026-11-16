@@ -8,7 +8,7 @@ import unittest
 
 sys.dont_write_bytecode = True
 
-from ..verify.profile_gui import (desktop_workarea, fit_window_layout, scene_metrics,
+from ..verify.profile_gui import (desktop_workarea, fit_window_layout, refresh_scene_metrics, scene_metrics,
                          validate_window_layout, window_rectangles)
 
 from ..verify import runtime as packaged_smoke
@@ -87,6 +87,99 @@ class FrameAccounting(unittest.TestCase):
                               [receipt([(0, 900000), (1, 1000000), (2, 1010000), (3, 1030000)])])
         self.assertEqual(result["frames"], 3)
         self.assertEqual(result["completed_frames"], 3)
+
+    def test_later_run_or_scene_owns_a_repainted_frame(self):
+        for changes in ({"playback_id": 2000000}, {"scene": "other"},
+                        {"playback_id": 2000000, "scene": "other"}):
+            with self.subTest(changes=changes):
+                repaint = dict(frame(3, .031, False), **changes)
+                result = self.metrics(self.frames[:3] + [repaint,
+                    receipt([(1, 1000000), (2, 1010000), (3, 1032000)])])
+                self.assertEqual(result["frames"], 3)
+                self.assertEqual(result["native_draw_ms"]["count"], 3)
+                self.assertEqual(result["native_cpu_ms"]["count"], 3)
+                self.assertEqual(result["first_final_wall_seconds"], .03)
+                self.assertEqual(result["timing_errors"], [])
+                self.assertEqual(result["completed_frames"], 2)
+                self.assertEqual(result["presented_frames"], 2)
+                self.assertEqual(result["selected_frame_keys"], 2)
+                self.assertEqual(result["superseded_draw_events"], 1)
+                self.assertEqual(result["missing_completion_frames"], 0)
+                self.assertEqual(result["feedback_coverage"], 1)
+                self.assertAlmostEqual(result["presented_fps"], 100)
+
+    def test_duplicate_draw_counts_every_render_but_only_latest_content(self):
+        repaint = dict(frame(2, .011), render_us=19000, render_cpu_us=9000)
+        events = self.frames[:2] + [repaint, self.frames[2],
+                  receipt([(1, 1000000), (2, 1011000), (3, 1030000)])]
+        result = self.metrics(events)
+        self.assertEqual(result["frames"], 4)
+        self.assertEqual(result["native_draw_ms"]["count"], 4)
+        self.assertEqual(result["native_draw_ms"]["mean"], 6.25)
+        self.assertEqual(result["native_cpu_ms"]["count"], 4)
+        self.assertEqual(result["native_cpu_ms"]["mean"], 3.375)
+        self.assertEqual(result["selected_frame_keys"], 3)
+        self.assertEqual(result["superseded_draw_events"], 1)
+        self.assertEqual(result["presented_frames"], 3)
+        self.assertEqual(result["presentation_interval_ms"]["max"], 19)
+        self.assertEqual(result["sample_interval_ms"]["count"], 3)
+        self.assertEqual(result["timing_errors"], [])
+
+    def test_paused_repaint_after_endpoint_does_not_replace_draw_deadline(self):
+        repaint = dict(frame(3, .03, False), clock_us=1031000, sample_clock_us=1031000)
+        result = self.metrics(self.frames[:3] + [repaint,
+            receipt([(1, 1000000), (2, 1010000), (3, 1032000)])])
+        self.assertEqual(result["frames"], 3)
+        self.assertEqual(result["first_final_wall_seconds"], .03)
+        self.assertEqual(result["completed_frames"], 2)
+        self.assertEqual(result["superseded_draw_events"], 1)
+        self.assertEqual(result["timing_errors"], [])
+
+    def test_superseded_middle_draw_is_not_unknown_feedback(self):
+        repaint = frame(2, .02, False, run=2000000)
+        result = self.metrics(self.frames[:2] + [repaint, self.frames[2],
+            receipt([(1, 1000000), (2, 1020000), (3, 1030000)])])
+        self.assertEqual(result["frames"], 3)
+        self.assertEqual(result["presented_frames"], 2)
+        self.assertEqual(result["unknown_feedback_span_count"], 0)
+        self.assertEqual(result["presentation_interval_ms"]["max"], 30)
+        self.assertEqual(result["missing_completion_frames"], 0)
+
+    def test_fully_superseded_run_keeps_costs_and_endpoint(self):
+        repaints = [frame(counter, .04 + counter / 1000, False, run=2000000)
+                    for counter in (1, 2, 3)]
+        result = self.metrics(self.frames[:3] + repaints +
+                              [receipt([(1, 1041000), (2, 1042000), (3, 1043000)])])
+        self.assertEqual(result["frames"], 3)
+        self.assertEqual(result["native_draw_ms"]["count"], 3)
+        self.assertEqual(result["first_final_wall_seconds"], .03)
+        self.assertEqual(result["presented_frames"], 0)
+        self.assertEqual(result["selected_frame_keys"], 0)
+        self.assertEqual(result["superseded_draw_events"], 3)
+        self.assertEqual(result["missing_completion_frames"], 0)
+        self.assertFalse(result["complete_feedback"])
+        self.assertIsNone(result["feedback_coverage"])
+        self.assertIsNone(result["presented_fps"])
+        self.assertEqual(result["timing_errors"], [])
+
+    def test_superseding_a_premature_endpoint_does_not_hide_its_error(self):
+        early = dict(frame(3, .03, False), clock_us=1011000, sample_clock_us=1011000)
+        repaint = frame(3, .031, False, run=2000000)
+        result = self.metrics(self.frames[:2] + [early, repaint,
+            receipt([(1, 1000000), (2, 1010000), (3, 1031000)])])
+        self.assertEqual(result["presented_frames"], 2)
+        self.assertTrue(result["early_final_frame"])
+        self.assertEqual(result["first_final_wall_seconds"], .011)
+        self.assertEqual(len(result["timing_errors"]), 1)
+
+    def test_other_view_and_clock_repaint_does_not_steal_completion(self):
+        repaint = dict(frame(3, .031, False, run=2000000, clock=2), view="presenter")
+        other_receipt = dict(receipt([(3, 1031000)], clock=2), view="presenter")
+        result = self.metrics(self.frames[:3] + [repaint, other_receipt,
+            receipt([(1, 1000000), (2, 1010000), (3, 1030000)])])
+        self.assertEqual(result["presented_frames"], 3)
+        self.assertEqual(result["completed_frames"], 3)
+        self.assertEqual(result["timing_errors"], [])
 
     def test_cpu_and_wall_time_remain_separate(self):
         result = self.metrics(self.frames)
@@ -194,6 +287,43 @@ class FrameAccounting(unittest.TestCase):
         self.assertEqual(result["unknown_feedback_span_ms"]["max"], 108.332)
         self.assertIsNone(result["presentation_interval_ms"])
         self.assertEqual(result["presentation_gap_counts"]["33.4"], 0)
+
+
+class ReportFinalization(unittest.TestCase):
+    def events(self):
+        audience = [frame(1, 0), frame(2, .01), frame(3, .03, False)]
+        presenter = [dict(item, view="presenter", frame_clock_id=2) for item in audience]
+        return audience + presenter
+
+    def scenes(self):
+        return [{"scene": "sample", "playback_id": 1000000, "duration": .03,
+                 "action": "vectorPlayAll", "views": {}}]
+
+    def test_final_refresh_observes_later_content_and_late_feedback(self):
+        scenes = self.scenes()
+        early = self.events()
+        self.assertEqual(refresh_scene_metrics(scenes, early), [])
+        self.assertEqual(scenes[0]["views"]["presentation"]["missing_completion_frames"], 3)
+        later = [frame(3, .031, False, run=2000000),
+                 receipt([(1, 1000000), (2, 1010000), (3, 1032000)]),
+                 dict(receipt([(1, 1000000), (2, 1010000), (3, 1030000)], clock=2),
+                      view="presenter")]
+        self.assertEqual(refresh_scene_metrics(scenes, early + later), [])
+        audience, presenter = (scenes[0]["views"][view] for view in ("presentation", "presenter"))
+        self.assertEqual(audience["presented_frames"], 2)
+        self.assertEqual(presenter["presented_frames"], 3)
+        self.assertEqual(audience["superseded_draw_events"], 1)
+        self.assertEqual(audience["native_draw_ms"]["count"], 3)
+        self.assertEqual(scenes[0]["action"], "vectorPlayAll")
+
+    def test_final_refresh_propagates_new_feedback_clock_errors(self):
+        scenes = self.scenes()
+        events = self.events()
+        self.assertEqual(refresh_scene_metrics(scenes, events), [])
+        late = receipt([(1, 999999)])
+        errors = refresh_scene_metrics(scenes, events + [late])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("sample presentation: Invalid presentation feedback clock", errors[0])
 
 
 def delayed_receipt_fixture():

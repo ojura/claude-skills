@@ -214,17 +214,26 @@ the previous focus when its viewer still owns focus.
 
 Outputs include `report.json`, `trace.jsonl`, monitor details and per-scene
 screenshots. Binary, PDF and timeline hashes tie measurements to their inputs.
+Draw costs and endpoint checks include every draw through the first final state.
+When multiple draws share a frame-clock ID and counter, presentation feedback
+belongs only to the last recorded content, including repaints from a later run
+or scene. The final report reconciles all scenes against the complete collected
+trace; earlier draws remain in the work measurements and are counted as
+`superseded_draw_events` rather than missing feedback.
 
 | Field | Measurement |
 | --- | --- |
+| `frames` | All run draws through the first final scene state |
+| `selected_frame_keys` | Draws in that interval that still own their GTK frame's final content |
+| `superseded_draw_events` | Run draws replaced by later content on the same GTK frame |
 | `native_draw_ms` | Wall time spent in native drawing |
 | `native_cpu_ms` | Drawing-thread CPU time, when that clock is available |
 | `sample_interval_ms` | Intervals between monotonic draw samples |
 | `presentation_interval_ms` | Delivery intervals with continuous known display feedback |
 | `unknown_feedback_span_ms` | Spans crossing missing, expired or unavailable feedback |
-| `feedback_coverage` | Fraction of selected draws with positive presentation timestamps |
+| `feedback_coverage` | Fraction of selected frame keys with positive presentation timestamps |
 | `observed_positive_fps` | Rate of observed distinct presentation timestamps |
-| `presented_fps` | Presentation rate when all selected draws have feedback |
+| `presented_fps` | Presentation rate when all selected frame keys have feedback |
 
 Compare mean rate with the 99th-percentile and maximum delivery intervals,
 feedback coverage and completion timing. The private-display tests exercise
