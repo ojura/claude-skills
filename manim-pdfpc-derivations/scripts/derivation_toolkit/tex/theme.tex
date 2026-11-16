@@ -87,7 +87,7 @@
 }{}
 \tikzset{every picture/.append style={color=derivationForeground}}
 
-\newcommand{\Derivation@legacygraphic}[2]{%
+\newcommand{\Derivation@whitebackgroundgraphic}[2]{%
   \ifDerivationDark
     {\setlength{\fboxsep}{0pt}\colorbox{white}{\includegraphics[#1]{#2}}}%
   \else
@@ -95,19 +95,19 @@
   \fi
 }
 \@ifclassloaded{beamer}{%
-  \newcommand<>{\DerivationLegacyGraphics}[2][]{%
-    \only#3{\Derivation@legacygraphic{#1}{#2}}%
+  \newcommand<>{\DerivationWhiteBackgroundGraphics}[2][]{%
+    \only#3{\Derivation@whitebackgroundgraphic{#1}{#2}}%
   }
   \newcommand<>{\DerivationUncoverGraphics}[2][]{%
     \begin{tikzpicture}[baseline=(figure.south)]
-      \node[inner sep=0,outer sep=0] (figure) {\Derivation@legacygraphic{#1}{#2}};
+      \node[inner sep=0,outer sep=0] (figure) {\Derivation@whitebackgroundgraphic{#1}{#2}};
       \pgfmathsetmacro{\Derivation@veil}{1-\DerivationCoveredOpacity/100}%
       \alt#3{}{\fill[derivationBackground,opacity=\Derivation@veil]
         (figure.south west) rectangle (figure.north east);}%
     \end{tikzpicture}%
   }
 }{%
-  \newcommand{\DerivationLegacyGraphics}[2][]{\Derivation@legacygraphic{#1}{#2}}
-  \newcommand{\DerivationUncoverGraphics}[2][]{\Derivation@legacygraphic{#1}{#2}}
+  \newcommand{\DerivationWhiteBackgroundGraphics}[2][]{\Derivation@whitebackgroundgraphic{#1}{#2}}
+  \newcommand{\DerivationUncoverGraphics}[2][]{\Derivation@whitebackgroundgraphic{#1}{#2}}
 }
 \makeatother

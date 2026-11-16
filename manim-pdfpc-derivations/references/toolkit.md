@@ -223,8 +223,10 @@ sets the row count and figure height. `\DerivationGraphicOptions` defaults to
 The theme exposes active `derivationBackground`, `derivationForeground` and
 the other palette roles. It applies Beamer colours and covered-item fading;
 article fonts and page colours remain under the report's control.
-`\DerivationLegacyGraphics` supplies a white backing for legacy figures in dark
-mode. `\DerivationUncoverGraphics` provides a fading overlay-aware figure.
+`\DerivationWhiteBackgroundGraphics` puts a zero-padding white background behind
+the included graphic in dark mode and includes it unchanged in light mode.
+Use it for figures whose labels and colours assume a light background.
+`\DerivationUncoverGraphics` applies the same treatment with overlay-aware fading.
 
 Load `tex/code.tex` after the theme when listings are needed. It defines
 `derivationconsole` and `derivationconsoletext`, each accepting an optional
