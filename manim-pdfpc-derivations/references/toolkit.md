@@ -280,6 +280,14 @@ auxiliaries under the build root. Each animated live PDF receives its matching
 frames using Beamer's actual navigation metadata. Handouts require one physical
 page per logical frame.
 
+Each build requires fresh PDF and navigation output, and compares the navigation
+with the PDF's actual page count using installed `pdfinfo` or TeX's `texlua` PDF
+reader. The Python build path needs only the standard library. The PDF, page map
+and live timeline are prepared together; validation or publication failure
+preserves the previous output set. Preparing an explicit PDF preserves its
+authored page map, or creates a physical-page map when the input has none, and
+removes an obsolete destination timeline when the input is static.
+
 ## Package HTML
 
 Install the pinned PDF.js dependency under `build/tools/html5` by copying the

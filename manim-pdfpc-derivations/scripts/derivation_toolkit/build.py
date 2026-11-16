@@ -13,6 +13,7 @@ import tempfile
 
 from .catalog import Catalog, Deck, PACKAGE_ROOT
 from .paths import CachePaths, get_paths
+from .publication import publish_files
 
 
 TEX_PACKAGES = ("beamer.cls", "graphicx.sty", "etoolbox.sty", "hyperref.sty")
@@ -162,12 +163,35 @@ def copy_workspace_files(source: Path, destination: Path) -> None:
         shutil.copyfile(source, destination)
 
 
+def pdf_page_count(filename: Path, env: dict[str, str]) -> int:
+    """Read the actual PDF using Poppler or the installed TeX PDF reader."""
+    if not filename.is_file():
+        raise RuntimeError(f"LaTeX did not produce a compiled PDF: {filename}")
+    search = env.get("PATH")
+    if reader := shutil.which("pdfinfo", path=search):
+        command = [reader, str(filename)]
+    elif reader := shutil.which("texlua", path=search):
+        command = [reader, str(PACKAGE_ROOT / "tex/pdf-pages.lua"), str(filename)]
+    else:
+        raise RuntimeError("Checking compiled PDF pages requires pdfinfo or TeX's texlua command")
+    result = subprocess.run(command, env={**env, "LC_ALL": "C"}, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    count = re.search(r"^Pages:\s*(\d+)\s*$", result.stdout, re.MULTILINE)
+    if result.returncode or count is None or int(count.group(1)) < 1:
+        raise RuntimeError(f"Could not read compiled PDF pages from {filename}: "
+                           + (result.stderr.strip() or result.stdout.strip()))
+    return int(count.group(1))
+
+
 def build_one(deck: Deck, theme: str, mode: str, env: dict[str, str],
               paths: CachePaths, assets: Path | None = None, *, copy_workspace=False) -> Path:
     catalog = Catalog(deck.repository_root)
     stem = f"{deck.document}-{theme}-{mode}"
     auxiliary = paths.latex_dir / stem
     auxiliary.mkdir(parents=True, exist_ok=True)
+    # These two products must come from this compilation, including copied builds.
+    for suffix in (".nav", ".pdf"):
+        (auxiliary / (stem + suffix)).unlink(missing_ok=True)
     with source_workspace(deck, auxiliary, assets, copy_workspace=copy_workspace) as (
             working, repository, output, assets_alias):
         compile_env = env.copy()
@@ -210,38 +234,49 @@ def build_one(deck: Deck, theme: str, mode: str, env: dict[str, str],
             if result.returncode:
                 tail = "\n".join(terminal_log.read_text(errors="replace").splitlines()[-45:])
                 raise RuntimeError(f"LaTeX failed for {deck.id}/{theme}/{mode}:\n{tail}\nFull log: {terminal_log}")
-    navigation = (auxiliary / f"{stem}.nav").read_text(encoding="utf-8")
-    frames = re.findall(r"\\beamer@framepages\s*\{(\d+)\}\{(\d+)\}", navigation)
-    page_count = re.search(r"\\beamer@documentpages\s*\{(\d+)\}", navigation)
-    if not frames or page_count is None:
-        raise RuntimeError(f"{deck.id}: LaTeX did not produce Beamer navigation metadata")
+    navigation_file = auxiliary / f"{stem}.nav"
+    if not navigation_file.is_file():
+        raise RuntimeError(f"{deck.id}: LaTeX did not produce fresh Beamer navigation metadata")
+    navigation = navigation_file.read_text(encoding="utf-8")
+    frames = [(int(first), int(last)) for first, last in re.findall(
+        r"\\beamer@framepages\s*\{(\d+)\}\{(\d+)\}", navigation)]
+    declared_counts = re.findall(r"\\beamer@documentpages\s*\{(\d+)\}", navigation)
+    if not frames or len(declared_counts) != 1:
+        raise RuntimeError(f"{deck.id}: LaTeX did not produce complete Beamer navigation metadata")
+    compiled = auxiliary / f"{stem}.pdf"
+    page_count = pdf_page_count(compiled, env)
+    if int(declared_counts[0]) != page_count:
+        raise RuntimeError(f"{deck.id}: Beamer navigation declares {declared_counts[0]} pages, "
+                           f"but the compiled PDF contains {page_count}")
     if mode == "handout" and any(first != last for first, last in frames):
         raise RuntimeError(f"{stem} has multiple physical pages for a logical frame")
-    destination = paths.pdf(theme, mode)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    copy_file = shutil.copyfile if copy_workspace else shutil.copy2
-    copy_file(auxiliary / f"{stem}.pdf", destination)
-    page_map = [None] * int(page_count.group(1))
+    page_map = []
+    next_page = 1
     for logical, (first, last) in enumerate(frames, 1):
-        for page in range(int(first), int(last) + 1):
-            if not 1 <= page <= len(page_map) or page_map[page - 1] is not None:
-                raise RuntimeError(f"{deck.id}: invalid overlapping Beamer page ranges")
-            page_map[page - 1] = logical
-    if any(number is None for number in page_map):
+        if first != next_page or last < first or last > page_count:
+            raise RuntimeError(f"{deck.id}: invalid Beamer page ranges at frame {logical}: "
+                               f"{first}..{last}; expected the next page to be {next_page}")
+        page_map.extend([logical] * (last - first + 1))
+        next_page = last + 1
+    if next_page != page_count + 1:
         raise RuntimeError(f"{deck.id}: Beamer navigation does not cover every PDF page")
-    destination.with_suffix(".presentation.json").write_text(json.dumps({
+    metadata = {
         "version": 1, "deck": deck.id, "title": deck.title, "theme": theme,
         "logicalSlides": len(frames), "pages": [
             {"number": index, "logical": logical}
             for index, logical in enumerate(page_map, 1)
         ],
-    }, indent=2) + "\n", encoding="utf-8")
+    }
+    destination = paths.pdf(theme, mode)
     sidecar = destination.with_suffix(".vector.json")
-    if mode == "live" and deck.animation is not None:
-        copy_file(assets / theme / deck.animation.manifest, sidecar)
-    elif sidecar.exists():
-        sidecar.unlink()
-    print(f"Built {destination} ({len(frames)} frames, {int(page_count.group(1))} pages)", flush=True)
+    with tempfile.TemporaryDirectory(prefix=".document-output-", dir=auxiliary) as temporary:
+        staged_map = Path(temporary) / "presentation.json"
+        staged_map.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        replacements = {destination: compiled, destination.with_suffix(".presentation.json"): staged_map}
+        if mode == "live" and deck.animation is not None:
+            replacements[sidecar] = assets / theme / deck.animation.manifest
+        publish_files(replacements, removals=[sidecar] if sidecar not in replacements else [])
+    print(f"Built {destination} ({len(frames)} frames, {page_count} pages)", flush=True)
     return destination
 
 
