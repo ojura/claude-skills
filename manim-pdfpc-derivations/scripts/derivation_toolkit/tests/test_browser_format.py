@@ -25,6 +25,16 @@ class BrowserFormatRasterChecks(unittest.TestCase):
         self.assertEqual(report["constantInteriorMaximum"], 0)
         self.assertEqual(report["maximumDifference"], 25)
 
+    def test_outer_fringe_uses_the_adjacent_stroke_contrast(self):
+        native = self.stroke()
+        browser = native.copy()
+        browser[5, 21, :3] = 236
+        browser[6, 21, :3] = 239
+        # The actual quadratic pair has two such outer-fringe pixels. A 3x3
+        # window at their outside edge sees only the fringe, not the stroke.
+        report = compare_rasters(browser, native)
+        self.assertLessEqual(report["maximumCoverageRatio"], 1)
+
     def test_missing_thin_path_fails_in_both_directions(self):
         native = self.stroke()
         absent = np.full_like(native, 255)

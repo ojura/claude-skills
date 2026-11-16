@@ -33,14 +33,14 @@ def rgba(encoded):
     return np.asarray(Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGBA")).copy()
 
 
-def neighbours(image):
-    padded = np.pad(image, ((1, 1), (1, 1), (0, 0)), mode="edge")
+def neighbours(image, radius=1):
+    padded = np.pad(image, ((radius, radius), (radius, radius), (0, 0)), mode="edge")
     return [padded[y:y + image.shape[0], x:x + image.shape[1]]
-            for y in range(3) for x in range(3)]
+            for y in range(2 * radius + 1) for x in range(2 * radius + 1)]
 
 
-def neighbourhood(image):
-    samples = neighbours(image)
+def neighbourhood(image, radius=1):
+    samples = neighbours(image, radius)
     return np.minimum.reduce(samples), np.maximum.reduce(samples)
 
 
@@ -65,8 +65,10 @@ def compare_rasters(actual, native):
         value[:, :, :3] *= value[:, :, 3:] / 255
         painted.append(value)
     delta = np.abs(np.add.reduce(neighbours(painted[0] - painted[1])))
-    low_a, high_a = neighbourhood(painted[0])
-    low_n, high_n = neighbourhood(painted[1])
+    # Include the adjacent pixel ring when measuring contrast: at an outer
+    # fringe the 3x3 window alone can exclude the stroke it belongs to.
+    low_a, high_a = neighbourhood(painted[0], radius=2)
+    low_n, high_n = neighbourhood(painted[1], radius=2)
     contrast = np.maximum(high_a, high_n) - np.minimum(low_a, low_n)
     # Allow one pixel-equivalent of local contrast over each 3x3 neighbourhood,
     # plus one channel quantization level per sample. This permits boundary
@@ -173,7 +175,9 @@ def canvas_cases(view, probe, scratch):
                 try:
                     report.update(compare_rasters(actual, native))
                 except AssertionError as error:
-                    Image.fromarray(actual).save(scratch / "canvas-failure.png")
+                    stem = f"{scene['id']}-{width}x{height}-{time:g}"
+                    Image.fromarray(actual).save(scratch / f"{stem}-canvas.png")
+                    Image.fromarray(native).save(scratch / f"{stem}-native.png")
                     report["error"] = str(error)
                 reports.append(report)
     return reports
