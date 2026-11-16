@@ -53,14 +53,18 @@ def clip_sections(pages: list[dict], scenes: dict, fps: int,
     return result
 
 
+def _metadata_text(value: str) -> str:
+    value = value.replace("\\", "\\\\").replace("=", "\\=")
+    return value.replace(";", "\\;").replace("#", "\\#").replace("\n", " ")
+
+
 def chapters(sections: list[Section], fps: int, title: str) -> str:
-    lines = [";FFMETADATA1", "title=" + title.replace("\n", " ").replace("=", r"\=")]
+    lines = [";FFMETADATA1", "title=" + _metadata_text(title)]
     current = 0
     for page in dict.fromkeys(section.page for section in sections):
         selected = [section for section in sections if section.page == page]
         end = current + sum(section.frames for section in selected)
-        title = selected[0].title.replace("\\", "\\\\").replace("=", "\\=")
-        title = title.replace(";", "\\;").replace("#", "\\#").replace("\n", " ")
+        title = _metadata_text(selected[0].title)
         lines.extend(["[CHAPTER]", f"TIMEBASE=1/{fps}", f"START={current}",
                       f"END={end}", f"title={title}"])
         current = end
@@ -158,10 +162,9 @@ def render(args: argparse.Namespace, catalog: Catalog) -> dict:
                                 x0, y0, x1, y1 = meta["scene"]["rect"]
                                 context.save()
                                 context.scale(args.width / meta["width"], height / meta["height"])
-                                context.rectangle(x0, y0, x1 - x0, y1 - y0)
-                                context.clip()
                                 context.translate(x0, y0)
-                                draw_scene_fitted(context, scene, scene_time, x1 - x0, y1 - y0)
+                                draw_scene_fitted(context, scene, scene_time, x1 - x0, y1 - y0,
+                                                  pixel_background=True)
                                 context.restore()
                             surface.flush()
                             if snapshots and (index == 0 or section.moving and index == section.frames // 2):

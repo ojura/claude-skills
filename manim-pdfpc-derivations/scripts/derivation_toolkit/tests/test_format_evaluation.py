@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -144,6 +145,60 @@ class FormatEvaluation(unittest.TestCase):
                     np.testing.assert_array_equal(pixels(actual), pixels(expected))
                     actual.finish()
                     expected.finish()
+
+    def test_pixel_background_uses_the_surface_device_grid(self):
+        for device_scale, device_offset in (((1, 1), (0, 0)), ((2, 2), (3.25, -2.5)),
+                                            ((1.5, 2.25), (-1.125, 2.625))):
+            for colour, packed in (([1, 1, 1, 1], 0xFFFFFFFF), ([.2, .2, .2, 1], 0xFF333333)):
+                for width, height in ((80, 80), (120, 40)):
+                    with self.subTest(device_scale=device_scale, device_offset=device_offset,
+                                      colour=colour, region=(width, height)):
+                        scene = {**SCENES[0], "objects": [], "background": colour}
+                        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 360, 320)
+                        surface.set_device_scale(*device_scale)
+                        surface.set_device_offset(*device_offset)
+                        context = cairo.Context(surface)
+                        context.set_source_rgb(1, 0, 1)
+                        context.paint()
+                        context.translate(20.25, 25.375)
+                        context.scale(1.25, .75)
+                        transform = context.get_matrix()
+                        fit = min(width / scene["width"], height / scene["height"])
+                        left, top = (width - scene["width"] * fit) / 2, (height - scene["height"] * fit) / 2
+                        bounds = (left, top, left + scene["width"] * fit, top + scene["height"] * fit)
+                        sx, sy = device_scale
+                        ox, oy = device_offset
+                        x0 = math.floor((20.25 + 1.25 * bounds[0]) * sx + ox)
+                        y0 = math.floor((25.375 + .75 * bounds[1]) * sy + oy)
+                        x1 = math.ceil((20.25 + 1.25 * bounds[2]) * sx + ox)
+                        y1 = math.ceil((25.375 + .75 * bounds[3]) * sy + oy)
+                        draw_scene_fitted(context, scene, 0, width, height, pixel_background=True)
+                        self.assertEqual(context.get_matrix(), transform)
+                        surface.flush()
+                        actual = np.frombuffer(surface.get_data(), dtype=np.uint32).reshape(320, 360)
+                        expected = np.full((320, 360), 0xFFFF00FF, dtype=np.uint32)
+                        expected[y0:y1, x0:x1] = packed
+                        np.testing.assert_array_equal(actual, expected)
+                        surface.finish()
+
+    def test_pixel_background_distinguishes_roundoff_from_fractional_bounds(self):
+        scene = {**SCENES[0], "width": 20, "height": 20, "objects": []}
+        for origin, bounds in ((10, (10, 30)), (math.nextafter(10, -math.inf), (10, 30)),
+                               (math.nextafter(10, math.inf), (10, 30)),
+                               (10 - 1e-7, (9, 30)), (10 + 1e-7, (10, 31))):
+            with self.subTest(origin=origin):
+                surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 50, 50)
+                context = cairo.Context(surface)
+                context.set_source_rgb(1, 0, 1)
+                context.paint()
+                context.translate(origin, 10)
+                draw_scene_fitted(context, scene, 0, 20, 20, pixel_background=True)
+                surface.flush()
+                actual = np.frombuffer(surface.get_data(), dtype=np.uint32).reshape(50, 50)
+                expected = np.full((50, 50), 0xFFFF00FF, dtype=np.uint32)
+                expected[10:30, bounds[0]:bounds[1]] = 0xFFFFFFFF
+                np.testing.assert_array_equal(actual, expected)
+                surface.finish()
 
     @unittest.skipUnless(os.environ.get("DERIVATION_VECTOR_PROBE"), "Set DERIVATION_VECTOR_PROBE to compare the native renderer")
     def test_fixture_pixels_match_native_with_fixed_path_preparation(self):
