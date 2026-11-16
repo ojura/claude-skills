@@ -310,6 +310,14 @@ preserves the previous output set. Preparing an explicit PDF preserves its
 authored page map, or creates a physical-page map when the input has none, and
 removes an obsolete destination timeline when the input is static.
 
+Compiled inputs are checked before any delivery files are replaced. Native
+collection and document builds inspect actual PDF URI annotations through
+installed Poppler GLib or TeX Live's `texlua`; HTML packaging uses its PDF reader.
+Every `pdfpc-vector:` link must name a scene in the matching timeline. The shared
+version-1 validator checks every scene, checkpoint, path and keyframe, including
+sparse coordinates and numeric bounds. IDs and labels must be well-formed Unicode
+without NUL characters. A static PDF needs no timeline.
+
 ## Package HTML
 
 Install the pinned PDF.js dependency under `build/tools/html5` by copying the
@@ -348,6 +356,10 @@ page numbers differ; otherwise the builder sidecar or physical page order
 supplies the mapping. Explicit maps use version 1, `logicalSlides`, and a `pages`
 list with `number` and `logical` integers. Animated compiled inputs need their
 matching timeline; preserve the page-map sidecar when moving Beamer PDFs.
+
+An animation region may have a different aspect ratio from its scene. The player
+fits and centers the scene within that rectangle; keep the authored rectangle
+rather than resizing the PDF annotation to satisfy a packaging check.
 
 Use the shared [browser verification command](verification.md#exercise-the-standalone-browser-document)
 to exercise the actual file and projector in Chrome and Firefox, including

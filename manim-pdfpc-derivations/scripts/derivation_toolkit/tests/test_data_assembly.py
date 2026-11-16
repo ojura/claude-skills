@@ -5,16 +5,22 @@ from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 import zipfile
 
+import fitz
+
+from .. import pdf_inputs
 from ..catalog import Catalog
 from ..native import data_assembly as assembly
 from ..native.build import native_pin
 from ..native.payload_bundle import digest, inspect
 from ..native.payload_template import HERE, PAYLOAD, TEMPLATE_FORMAT
+from .test_compiled_inputs import timeline
 
 
 class DataAssembly(unittest.TestCase):
@@ -55,15 +61,24 @@ class DataAssembly(unittest.TestCase):
         documents.mkdir(parents=True)
         self.inputs = self.root / "inputs.json"
         mapping = {"paper": {"light": {"pdf": "build/documents/paper.pdf"}}, "motion": {}}
-        (documents / "paper.pdf").write_bytes(b"%PDF-1.7\nindependent light-only article\n")
+        self.write_pdf(documents / "paper.pdf")
         for theme in ("light", "dark"):
             pdf = documents / f"motion-{theme}.pdf"
             vectors = pdf.with_suffix(".vector.json")
-            pdf.write_bytes(f"%PDF-1.7\n{theme} companion\n".encode())
-            vectors.write_text(json.dumps({"version": 1, "theme": theme, "scenes": []}))
+            self.write_pdf(pdf, animated=True)
+            vectors.write_text(json.dumps(timeline()))
             mapping["motion"][theme] = {"pdf": str(pdf.relative_to(self.project)),
                                          "vectors": str(vectors.relative_to(self.project))}
         self.inputs.write_text(json.dumps(mapping))
+
+    def write_pdf(self, path, animated=False):
+        with fitz.open() as document:
+            page = document.new_page(width=320, height=180)
+            page.insert_text((15, 20), "Actual independent input")
+            if animated:
+                page.insert_link({"kind": fitz.LINK_URI, "uri": "pdfpc-vector:example",
+                                  "from": fitz.Rect(30, 40, 190, 130)})
+            document.save(path)
 
     def prepare(self, **kwargs):
         return assembly.prepare_transport(self.catalog, self.template, self.receipt,
@@ -72,9 +87,21 @@ class DataAssembly(unittest.TestCase):
     def test_transport_and_data_only_roundtrip_preserves_generic_catalog(self):
         config = self.prepare()
         self.assertGreater(len(config["template_parts"]), 1)
+        # Inspect with installed PDF readers; never execute the uploaded runtime
+        # or packer. Resolve library discovery before the execution guard.
+        libraries = {name: pdf_inputs.find_library(name)
+                     for name in ("poppler-glib", "gobject-2.0", "glib-2.0")}
+        popen = subprocess.Popen
+        texlua = shutil.which("texlua")
+        script = Path(pdf_inputs.__file__).parent / "tex/pdf-links.lua"
+        def installed_reader_only(command, *args, **kwargs):
+            if not texlua or list(command[:2]) != [texlua, str(script)]:
+                raise AssertionError("forbidden hosted executable")
+            return popen(command, *args, **kwargs)
         with ExitStack() as blocked:
-            for target in ("subprocess.run", "subprocess.Popen", "os.symlink", "os.link",
-                           "fcntl.flock", "shutil.copystat", "os.setxattr"):
+            blocked.enter_context(patch.object(pdf_inputs, "find_library", side_effect=libraries.get))
+            blocked.enter_context(patch("subprocess.Popen", side_effect=installed_reader_only))
+            for target in ("os.symlink", "os.link", "fcntl.flock", "shutil.copystat", "os.setxattr"):
                 blocked.enter_context(patch(target, side_effect=AssertionError("forbidden hosted operation")))
             report = assembly.assemble(self.catalog, self.transport, output_dir=self.output, inputs=self.inputs)
         self.assertTrue(report["ok"], report)

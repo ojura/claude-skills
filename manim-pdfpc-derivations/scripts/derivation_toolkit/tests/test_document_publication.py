@@ -17,6 +17,7 @@ from .. import build, launch
 from ..catalog import Animation, Catalog
 from ..paths import get_paths
 from ..web.build import pdf_manifest
+from .test_compiled_inputs import timeline as valid_timeline
 
 
 class DocumentFixture(unittest.TestCase):
@@ -133,12 +134,12 @@ class CompiledDocumentPublication(DocumentFixture):
         assets = self.project / "assets"
         (assets / "light").mkdir(parents=True)
         timeline = assets / "light/timeline.vector.json"
-        timeline.write_text('{"version":1,"scenes":[],"generation":"old"}\n')
+        timeline.write_text(json.dumps({**valid_timeline(), "generation": "old"}))
         deck = replace(self.deck, animation=Animation(self.project / "provider.py", assets, timeline.name))
         self.compile(deck)
         previous = self.output_bytes()
         self.write_tex(["Changed first page", "Changed second page"])
-        timeline.write_text('{"version":1,"scenes":[],"generation":"new"}\n')
+        timeline.write_text(json.dumps({**valid_timeline(), "generation": "new"}))
         copy = shutil.copyfile
 
         def copyfile(source, destination, *args, **kwargs):
@@ -150,6 +151,25 @@ class CompiledDocumentPublication(DocumentFixture):
             with self.assertRaisesRegex(OSError, "timeline copy failed"):
                 self.compile(deck)
         self.assert_output_preserved(previous)
+
+    def test_invalid_timeline_or_pdf_scene_link_cannot_replace_the_compiled_set(self):
+        self.compile()
+        previous = self.output_bytes()
+        assets = self.project / "assets"
+        (assets / "light").mkdir(parents=True)
+        timeline = assets / "light/timeline.vector.json"
+        deck = replace(self.deck, animation=Animation(self.project / "provider.py", assets, timeline.name))
+        self.deck.source.write_text(
+            r"\documentclass{beamer}\begin{document}\begin{frame}{Animated input}"
+            r"\href{pdfpc-vector:example}{Linked scene}\end{frame}\end{document}" + "\n")
+        malformed = valid_timeline()
+        del malformed["scenes"][0]["objects"][0]["keyframes"][0]["coords"]
+        for label, data in (("invalid keyframe", malformed), ("unknown link", valid_timeline("other"))):
+            with self.subTest(case=label):
+                timeline.write_text(json.dumps(data))
+                with self.assertRaises(ValueError):
+                    self.compile(deck)
+                self.assert_output_preserved(previous)
 
     def test_failed_map_publication_restores_the_previous_pdf_and_map(self):
         self.compile()
@@ -190,7 +210,7 @@ class ExplicitDocumentPublication(DocumentFixture):
         super().setUp()
         self.write_pdf(self.target, ["Accepted page"])
         self.write_map(self.map, [1])
-        self.vector.write_text('{"version":1,"scenes":[]}\n')
+        self.vector.write_text(json.dumps(valid_timeline()))
         self.source = self.project / "external/report.pdf"
         self.write_pdf(self.source, ["New first page", "New second page"])
 
@@ -237,6 +257,16 @@ class ExplicitDocumentPublication(DocumentFixture):
     def test_preparing_the_existing_output_preserves_its_sidecars(self):
         previous = self.output_bytes()
         launch.prepare_document(self.deck, "light", self.paths, pdf=self.target)
+        self.assert_output_preserved(previous)
+
+    def test_invalid_explicit_timeline_preserves_the_previous_set(self):
+        previous = self.output_bytes()
+        invalid = valid_timeline()
+        del invalid["scenes"][0]["objects"][0]["keyframes"][0]["coords"]
+        vector = self.source.with_suffix(".vector.json")
+        vector.write_text(json.dumps(invalid))
+        with self.assertRaises(ValueError):
+            launch.prepare_document(self.deck, "light", self.paths, pdf=self.source, vectors=vector)
         self.assert_output_preserved(previous)
 
 

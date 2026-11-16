@@ -15,6 +15,7 @@ from .bundle import embed
 from ..catalog import Catalog, Deck
 from ..package_assets import explicit_editions
 from ..paths import get_paths, output_path
+from ..timeline import load_timeline
 
 WEB = Path(__file__).resolve().parent
 PDFJS_VERSION = "5.1.91"
@@ -56,15 +57,15 @@ def page_mapping(pdf_path: Path, mapping: Path | dict | None, count: int) -> tup
 def pdf_manifest(pdf_path: Path, vector_path: Path | None, theme: str,
                  page_map: Path | dict | None = None) -> dict:
     import fitz
-    timeline = (json.loads(vector_path.read_text(encoding="utf-8")) if vector_path is not None
-                else {"version": 1, "scenes": []})
-    if timeline.get("version") != 1:
-        raise ValueError("Unsupported vector timeline version")
-    scenes = {scene["id"]: scene for scene in timeline["scenes"]}
-    if len(scenes) != len(timeline["scenes"]):
-        raise ValueError("Timeline scene IDs must be unique")
+    scenes = load_timeline(vector_path)
     pages = []
-    with fitz.open(pdf_path) as document:
+    try:
+        document = fitz.open(pdf_path)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"Cannot read PDF {pdf_path}: {error}") from error
+    with document:
+        if document.needs_pass or len(document) == 0:
+            raise ValueError(f"PDF contains no readable unencrypted pages: {pdf_path}")
         mapping, logical_count = page_mapping(pdf_path, page_map, len(document))
         for page, mapped in zip(document, mapping):
             name, area = None, None
@@ -81,9 +82,6 @@ def pdf_manifest(pdf_path: Path, vector_path: Path | None, theme: str,
                 if rectangle.is_empty or not page.rect.contains(rectangle):
                     raise ValueError(f"Animation region leaves PDF page {page.number + 1}")
                 area = [round(float(coordinate), 5) for coordinate in rectangle]
-                scene = scenes[name]
-                if abs(rectangle.width / rectangle.height - scene["width"] / scene["height"]) > .0002:
-                    raise ValueError("Scene/PDF aspect mismatch: " + name)
             lines = page.get_text().splitlines()
             pages.append({
                 "number": page.number + 1, "logical": mapped["logical"],

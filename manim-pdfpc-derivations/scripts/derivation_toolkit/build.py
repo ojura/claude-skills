@@ -13,6 +13,7 @@ import tempfile
 
 from .catalog import Catalog, Deck, PACKAGE_ROOT
 from .paths import CachePaths, get_paths
+from .pdf_inputs import validate_compiled_input
 from .publication import publish_files
 
 
@@ -269,12 +270,14 @@ def build_one(deck: Deck, theme: str, mode: str, env: dict[str, str],
     }
     destination = paths.pdf(theme, mode)
     sidecar = destination.with_suffix(".vector.json")
+    timeline = assets / theme / deck.animation.manifest if mode == "live" and deck.animation is not None else None
+    validate_compiled_input(compiled, timeline)
     with tempfile.TemporaryDirectory(prefix=".document-output-", dir=auxiliary) as temporary:
         staged_map = Path(temporary) / "presentation.json"
         staged_map.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
         replacements = {destination: compiled, destination.with_suffix(".presentation.json"): staged_map}
-        if mode == "live" and deck.animation is not None:
-            replacements[sidecar] = assets / theme / deck.animation.manifest
+        if timeline is not None:
+            replacements[sidecar] = timeline
         publish_files(replacements, removals=[sidecar] if sidecar not in replacements else [])
     print(f"Built {destination} ({len(frames)} frames, {page_count} pages)", flush=True)
     return destination
