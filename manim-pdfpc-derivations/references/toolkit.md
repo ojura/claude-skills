@@ -149,6 +149,27 @@ Layer values must be finite. Export sorts the layer and path order separately,
 then assigns numeric timeline ranks, so fractional and large layers retain the
 same overlap order as the static figures.
 
+`scene.time` is the absolute time of the state being evaluated, including inside
+animation and updater callbacks. `wait(duration, stop_condition=None,
+frozen_frame=None)` follows Manim's wait selection: time-based mobject updaters,
+scene updaters, `always_update_mobjects` or a stop condition require sampled
+updates. `frozen_frame=False` also evaluates position-only updaters;
+`frozen_frame=True` evaluates no updaters. `pause()` selects a frozen wait.
+`wait_until(condition, max_time)` stops at the first sampled state that satisfies
+the condition, or at the requested limit. A condition already true at the start
+does not advance time. A frozen wait cannot have a stop condition.
+
+Direct edits such as `remove()` or `shift()` at an already recorded time become
+instantaneous changes. The export retains the old state at the immediately
+preceding representable floating-point time and the new state at the boundary.
+Keyframe times remain strictly increasing; keep those full-precision timestamps
+when processing the JSON. Several edits at the same time preserve the original
+pre-edit state and publish their final result. New paths remain hidden before
+their introduction. At time zero, edits simply define the initial state.
+Animation durations must be finite and nonnegative; a positive duration must
+advance the microsecond authoring clock. Updaters and stop conditions are sampled
+at the scene's configured `sample_rate`, with the duration endpoint included.
+
 `checkpoint(label, caption, crop=None, handout=None, pause=True)` saves a printed
 state. `label` is the live control label; `caption` is authored TeX for the printed
 panel. `handout` accepts compact mobjects, and `crop` is `[x, y, width, height]` in

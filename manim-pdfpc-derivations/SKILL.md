@@ -103,8 +103,12 @@ or replacement with a supported operation. Preserve the intended object order
 and explicit z ordering. Check brackets, filled paths, masks and fading objects
 at intermediate times.
 
-Use `play()` for motion driven by updaters; `wait()` records a hold. Define
-checkpoints after the geometry and text have reached their complete state.
+Use `play()` for animated motion. `wait()` samples time-based mobject and scene
+updaters; use `frozen_frame=True` for an unchanged reading pause. Callbacks see
+the current absolute `scene.time`, and `wait_until()` stops at the first sampled
+state satisfying its condition. Instantaneous edits take effect at their current
+time without altering a completed hold. Define checkpoints after the geometry
+and text have reached their complete state.
 
 Use vector mobjects supported by the exporter. If an effect requires a raster
 image, shader, camera trick or unsupported text morph, adapt the design to the
