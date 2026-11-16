@@ -349,15 +349,27 @@ jobs:
         with:
           name: ${{ inputs.artifact_name }}-runtime-fixtures
           path: ${{ runner.temp }}/derivation-fixtures
+      - name: Match the runtime account to the runner
+        id: runtime_account
+        run: |
+          uid="$(id -u)"
+          gid="$(id -g)"
+          test "$uid" -gt 0
+          test "$gid" -gt 0
+          printf 'uid=%s\ngid=%s\n' "$uid" "$gid" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
         with:
           version: v0.38.2
           driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+      - name: Build the minimal runtime image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
         with:
           context: ${{ inputs.project }}/tools/vendor/manim_pdfpc/derivation_toolkit
           file: ${{ inputs.project }}/tools/vendor/manim_pdfpc/derivation_toolkit/ci/runtime.Dockerfile
-          build-args: BASE_IMAGE=${{ matrix.image }}
+          build-args: |
+            BASE_IMAGE=${{ matrix.image }}
+            TEST_UID=${{ steps.runtime_account.outputs.uid }}
+            TEST_GID=${{ steps.runtime_account.outputs.gid }}
           platforms: linux/amd64
           load: true
           tags: derivation-runtime:ci
@@ -366,11 +378,13 @@ jobs:
       - name: Exercise the exact relocated package with networking disabled
         env:
           PACKAGE_SUFFIX: ${{ matrix.suffix }}
+          RUNTIME_UID: ${{ steps.runtime_account.outputs.uid }}
+          RUNTIME_GID: ${{ steps.runtime_account.outputs.gid }}
         run: |
           chmod +x "$RUNNER_TEMP/derivation-runtime/$ARTIFACT_NAME$PACKAGE_SUFFIX.appimage"
           mkdir -p "$RUNNER_TEMP/derivation-runtime-checks"
           docker run --rm --network none --platform linux/amd64 \
-            --user "$(id -u):$(id -g)" --workdir /evidence \
+            --user "$RUNTIME_UID:$RUNTIME_GID" --workdir /evidence \
             --mount "type=bind,src=$RUNNER_TEMP/derivation-runtime/$ARTIFACT_NAME$PACKAGE_SUFFIX.appimage,dst=/bundle/presentation.appimage,readonly" \
             --mount "type=bind,src=$RUNNER_TEMP/derivation-fixtures/runtime-fixtures.json,dst=/input/fixtures.json,readonly" \
             --mount "type=bind,src=$RUNNER_TEMP/derivation-runtime-checks,dst=/evidence" \
