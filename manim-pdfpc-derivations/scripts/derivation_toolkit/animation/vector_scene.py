@@ -17,7 +17,7 @@ import numpy as np
 from manim import Scene, VMobject, config
 from .export_precision import COORDINATE_DECIMALS
 from .layout import Canvas, DEFAULT_CANVAS, HandoutLayout
-from .tex_semantics import snapshot_glyph, validate_text_transform, validate_text_tree
+from .tex_semantics import snapshot_glyph, text_animation_checks, validate_text_tree
 
 
 WIDTH, HEIGHT, SCALE = DEFAULT_CANVAS.width, DEFAULT_CANVAS.height, DEFAULT_CANVAS.scale
@@ -239,30 +239,29 @@ class VectorScene(Scene):
     def play(self, *animations, **kwargs):
         self.record()
         self.animations = self.compile_animations(*animations, **kwargs)
-        # Match Manim's scene setup: a newly animated group must own its existing
-        # children before cleanup can remove it, and unadded animations must appear.
-        self.add_mobjects_from_animations(self.animations)
-        for animation in self.animations:
-            animation._setup_scene(self)
-            animation.begin()
-            # FadeIn/FadeOut create their actual same-content target in begin();
-            # validate that target before any animation interpolation is sampled.
-            validate_text_transform(animation)
-        self.record()
-        duration = max(animation.run_time for animation in self.animations)
-        steps = max(1, math.ceil(duration * self.sample_rate))
-        start = self.vector_time
-        self.last_t = 0.0
-        for step in range(1, steps + 1):
-            elapsed = duration * step / steps
-            self.update_to_time(elapsed)
-            self.vector_time = start + elapsed
+        with text_animation_checks(self.animations):
+            # Register new animation owners so updates and cleanup apply to
+            # their children. Semantic targets are checked when Manim creates
+            # them, including children started later by Succession.
+            self.add_mobjects_from_animations(self.animations)
+            for animation in self.animations:
+                animation._setup_scene(self)
+                animation.begin()
             self.record()
-        for animation in self.animations:
-            animation.finish()
-            animation.clean_up_from_scene(self)
-        self.update_mobjects(0)
-        self.record()
+            duration = max(animation.run_time for animation in self.animations)
+            steps = max(1, math.ceil(duration * self.sample_rate))
+            start = self.vector_time
+            self.last_t = 0.0
+            for step in range(1, steps + 1):
+                elapsed = duration * step / steps
+                self.update_to_time(elapsed)
+                self.vector_time = start + elapsed
+                self.record()
+            for animation in self.animations:
+                animation.finish()
+                animation.clean_up_from_scene(self)
+            self.update_mobjects(0)
+            self.record()
         return self
 
     def wait(self, duration=0.3, **_kwargs):
