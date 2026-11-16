@@ -12,6 +12,7 @@ import subprocess
 
 from ..catalog import Catalog
 from ..paths import output_path
+from ..verify.runtime import verify_native_documentation
 from .build import native_pin
 from .payload_bundle import digest
 
@@ -33,6 +34,7 @@ def build_template(catalog: Catalog, appdir: Path, tools: Path,
             or system.get("VERSION_ID", "").strip('"') != "20.04" or os.uname().machine != "x86_64"):
         raise ValueError("Prepare the native template in the Ubuntu 20.04 x86_64 builder")
     origin, tools = appdir.expanduser().resolve(), tools.expanduser().resolve()
+    verify_native_documentation(origin)
     requested = destination or catalog.root / "build/appimage/template"
     if os.path.lexists(Path(requested).expanduser()):
         raise ValueError(f"Preserving existing template directory: {requested}")
