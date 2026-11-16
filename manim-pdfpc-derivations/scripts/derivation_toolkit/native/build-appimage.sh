@@ -107,8 +107,10 @@ done
 desktop_file="$work_dir/$identity.desktop"
 package_icon="$work_dir/$identity.svg"
 cp -- "$packaging_dir/presentation.svg" "$package_icon"
+# linuxdeploy resolves Exec inside AppDir before the custom AppRun is installed.
+# The package identity names its desktop/icon files, not the native executable.
 printf '[Desktop Entry]\nType=Application\nName=Animated presentations\nExec=%s\nIcon=%s\nCategories=Education;\nTerminal=false\n' \
-    "$identity" "$identity" > "$desktop_file"
+    pdfpc "$identity" > "$desktop_file"
 desktop-file-validate "$desktop_file"
 DEPLOY_GTK_VERSION=3 "$linuxdeploy" --appdir "$appdir" \
     --executable "$appdir/usr/bin/pdfpc" \
