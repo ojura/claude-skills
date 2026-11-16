@@ -14,7 +14,7 @@ from pathlib import Path
 
 import cairo
 import numpy as np
-from manim import Scene, VMobject, config
+from manim import Scene, VMobject, Wait, config
 from .export_precision import COORDINATE_DECIMALS
 from .layout import Canvas, DEFAULT_CANVAS, HandoutLayout
 from .tex_semantics import snapshot_glyph, text_animation_checks, validate_text_tree
@@ -81,10 +81,14 @@ class VectorScene(Scene):
             raise TypeError("A vector scene's canvas must be a Canvas")
         if not isinstance(self.handout_layout, HandoutLayout):
             raise TypeError("A vector scene's handout_layout must be a HandoutLayout")
+        if not math.isfinite(sample_rate) or sample_rate <= 0:
+            raise ValueError("A vector scene's sample_rate must be positive and finite")
         self.canvas.configure()
         self.palette = palette
         self.sample_rate = sample_rate
         self.vector_time = 0.0
+        self._animation_start = 0.0
+        self._cut_times = {}
         self.tracks = {}
         self.checkpoints = []
         self.handout_states = []
@@ -95,6 +99,11 @@ class VectorScene(Scene):
         self._scene_orders = {}
         self._ordering_requested = False
         super().__init__()
+
+    @property
+    def time(self):
+        """Elapsed authoring time, including the current updater sample."""
+        return self.vector_time
 
     def add(self, *mobjects):
         # Manim registers an animation's new owner here, including introducers
@@ -167,11 +176,7 @@ class VectorScene(Scene):
                     self.tracks[key] = track
                     if now > 0:
                         track["keyframes"].append({"time": 0.0, **hidden(state)})
-                        if now > 1 / self.sample_rate:
-                            track["keyframes"].append({
-                                "time": round(now - 1 / self.sample_rate, 6),
-                                **hidden(state),
-                            })
+                        track["keyframes"].append({"time": now, **hidden(state)})
                 self._append_state(key, state, now)
                 if state["fill"][3] > 0 or (state["stroke"][3] > 0 and state["stroke_width"] > 0):
                     paint_order.append((layer, self._scene_orders[id(mobject)]))
@@ -225,7 +230,21 @@ class VectorScene(Scene):
         frames = self.tracks[key]["keyframes"]
         entry = {"time": now, **state}
         if frames and frames[-1]["time"] == now:
-            frames[-1] = entry
+            changed = any(frames[-1][name] != value for name, value in state.items())
+            if now > 0 and changed and self._cut_times.get(key) != now:
+                # Keep the old state until the last representable instant before
+                # the edit. These adjacent doubles form a cut without duplicate
+                # timestamps or a fade across the completed reading pause.
+                predecessor = math.nextafter(now, -math.inf)
+                if len(frames) > 1 and frames[-2]["time"] >= predecessor:
+                    raise ValueError("An instantaneous edit needs a free timestamp before its boundary")
+                frames[-1] = {**frames[-1], "time": predecessor}
+                frames.append(entry)
+                self._cut_times[key] = now
+            else:
+                # Several edits at the same instant share the original pre-cut
+                # state. Only their resulting state changes.
+                frames[-1] = entry
         elif len(frames) >= 2 and all(
             frames[-1][name] == frames[-2][name] == state[name]
             for name in state
@@ -237,8 +256,18 @@ class VectorScene(Scene):
             frames.append(entry)
 
     def play(self, *animations, **kwargs):
-        self.record()
         self.animations = self.compile_animations(*animations, **kwargs)
+        if not self.animations:
+            raise ValueError("VectorScene.play requires at least one animation")
+        for animation in self.animations:
+            self._check_duration(animation.run_time)
+        duration = max(animation.run_time for animation in self.animations)
+        self.record()
+        self._animation_start = self.vector_time
+        self.last_t = 0.0
+        wait = self.animations[0] if len(self.animations) == 1 and isinstance(self.animations[0], Wait) else None
+        static_wait = wait is not None and not self.should_update_mobjects()
+        stop_condition = wait.stop_condition if wait is not None else None
         with text_animation_checks(self.animations):
             # Register new animation owners so updates and cleanup apply to
             # their children. Semantic targets are checked when Manim creates
@@ -247,28 +276,52 @@ class VectorScene(Scene):
             for animation in self.animations:
                 animation._setup_scene(self)
                 animation.begin()
+            if wait is not None and not static_wait:
+                self.update_to_time(0)
             self.record()
-            duration = max(animation.run_time for animation in self.animations)
-            steps = max(1, math.ceil(duration * self.sample_rate))
-            start = self.vector_time
-            self.last_t = 0.0
-            for step in range(1, steps + 1):
-                elapsed = duration * step / steps
-                self.update_to_time(elapsed)
-                self.vector_time = start + elapsed
+            if static_wait:
+                self.vector_time = self._animation_start + duration
                 self.record()
+            elif not (stop_condition is not None and stop_condition()):
+                steps = max(1, math.ceil(duration * self.sample_rate))
+                for step in range(1, steps + 1):
+                    elapsed = duration * step / steps
+                    self.update_to_time(elapsed)
+                    self.record()
+                    if stop_condition is not None and stop_condition():
+                        break
             for animation in self.animations:
                 animation.finish()
                 animation.clean_up_from_scene(self)
-            self.update_mobjects(0)
+            if not static_wait:
+                self.update_mobjects(0)
             self.record()
         return self
 
-    def wait(self, duration=0.3, **_kwargs):
-        self.record()
-        self.vector_time += float(duration)
-        self.record()
-        return self
+    def _check_duration(self, duration):
+        if not math.isfinite(duration) or duration < 0:
+            raise ValueError("Animation duration must be finite and nonnegative")
+        if duration > 0 and round(self.vector_time + duration, 6) <= round(self.vector_time, 6):
+            raise ValueError("Animation duration must advance the microsecond authoring clock")
+
+    def update_to_time(self, elapsed):
+        # Use Manim's update order, but publish the absolute vector clock first.
+        # The raster renderer never runs and therefore cannot supply Scene.time.
+        self.vector_time = self._animation_start + elapsed
+        dt = elapsed - self.last_t
+        self.last_t = elapsed
+        for animation in self.animations:
+            animation.update_mobjects(dt)
+            animation.interpolate(elapsed / animation.run_time if animation.run_time else 1)
+        self.update_mobjects(dt)
+        self.update_meshes(dt)
+        self.update_self(dt)
+
+    def wait(self, duration=0.3, stop_condition=None, frozen_frame=None):
+        """Hold, or sample updaters until the duration or stop condition ends."""
+        self._check_duration(duration)
+        return self.play(Wait(run_time=duration, stop_condition=stop_condition,
+                              frozen_frame=frozen_frame))
 
     def checkpoint(self, label, caption, crop=None, handout=None, pause=True):
         """Save a static teaching state, optionally making it a live pause."""

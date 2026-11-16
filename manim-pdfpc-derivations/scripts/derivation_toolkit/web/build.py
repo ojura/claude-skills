@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import gzip
 import json
 import os
@@ -15,11 +16,14 @@ from .bundle import embed
 from ..catalog import Catalog, Deck
 from ..package_assets import explicit_editions
 from ..paths import get_paths, output_path
+from ..publication import publish_files
+from ..timeline import load_timeline
 
 WEB = Path(__file__).resolve().parent
 PDFJS_VERSION = "5.1.91"
 COPY_SOURCE = ("index.html", "player.mjs", "player.css", "vector.mjs", "resources.mjs")
 MARKER = ".derivation-html5"
+BUNDLE_FILES = ("index.html", "PDFJS-LICENSE.txt", "README.txt", MARKER)
 
 
 def source_revision(root: Path) -> str:
@@ -56,15 +60,15 @@ def page_mapping(pdf_path: Path, mapping: Path | dict | None, count: int) -> tup
 def pdf_manifest(pdf_path: Path, vector_path: Path | None, theme: str,
                  page_map: Path | dict | None = None) -> dict:
     import fitz
-    timeline = (json.loads(vector_path.read_text(encoding="utf-8")) if vector_path is not None
-                else {"version": 1, "scenes": []})
-    if timeline.get("version") != 1:
-        raise ValueError("Unsupported vector timeline version")
-    scenes = {scene["id"]: scene for scene in timeline["scenes"]}
-    if len(scenes) != len(timeline["scenes"]):
-        raise ValueError("Timeline scene IDs must be unique")
+    scenes = load_timeline(vector_path)
     pages = []
-    with fitz.open(pdf_path) as document:
+    try:
+        document = fitz.open(pdf_path)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"Cannot read PDF {pdf_path}: {error}") from error
+    with document:
+        if document.needs_pass or len(document) == 0:
+            raise ValueError(f"PDF contains no readable unencrypted pages: {pdf_path}")
         mapping, logical_count = page_mapping(pdf_path, page_map, len(document))
         for page, mapped in zip(document, mapping):
             name, area = None, None
@@ -81,9 +85,6 @@ def pdf_manifest(pdf_path: Path, vector_path: Path | None, theme: str,
                 if rectangle.is_empty or not page.rect.contains(rectangle):
                     raise ValueError(f"Animation region leaves PDF page {page.number + 1}")
                 area = [round(float(coordinate), 5) for coordinate in rectangle]
-                scene = scenes[name]
-                if abs(rectangle.width / rectangle.height - scene["width"] / scene["height"]) > .0002:
-                    raise ValueError("Scene/PDF aspect mismatch: " + name)
             lines = page.get_text().splitlines()
             pages.append({
                 "number": page.number + 1, "logical": mapped["logical"],
@@ -104,6 +105,31 @@ def pack_source(root: Path, name: str) -> Path:
                 output.write(file, arcname=str(Path(name) / file.relative_to(root)))
     os.replace(temporary, archive)
     return archive
+
+
+def publish_bundle(stage: Path, output: Path, archive: Path | None = None) -> None:
+    """Publish a prepared HTML/ZIP set while preserving unrelated user files."""
+    # One parent lock also serializes explicit/default output names that share
+    # an archive path. Private builds can proceed independently before this.
+    with (output.parent / ".derivation-html5.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        existed = os.path.lexists(output)
+        if existed and not (output.is_dir() and (output / MARKER).is_file()):
+            raise ValueError(f"Preserving an unrelated HTML output directory: {output}")
+        replacements = {output / name: stage / name for name in BUNDLE_FILES}
+        if archive is not None:
+            replacements[output.parent / archive.name] = archive
+        try:
+            publish_files(replacements)
+        except BaseException:
+            if not existed:
+                # A successful rollback can leave the newly created empty
+                # directory. Retained recovery files or user additions stay.
+                try:
+                    output.rmdir()
+                except OSError:
+                    pass
+            raise
 
 
 def build_bundle(catalog: Catalog, deck: Deck, *, output: Path | None = None,
@@ -193,11 +219,10 @@ def build_bundle(catalog: Catalog, deck: Deck, *, output: Path | None = None,
             f"Contains Mozilla PDF.js {PDFJS_VERSION}, Apache 2.0; its license is included.\n",
             encoding="utf-8",
         )
-        if output.exists():
-            shutil.rmtree(output)
-        os.replace(stage, output)
+        prepared_archive = pack_source(stage, distribution) if archive else None
+        publish_bundle(stage, output, prepared_archive)
     if archive:
-        print("ZIP", pack_source(output, distribution))
+        print("ZIP", output.parent / f"{distribution}.zip")
     print("HTML5", output / "index.html")
     print("PDF pages", {key: len(value["pages"]) for key, value in manifest["themes"].items()})
     return output / "index.html"

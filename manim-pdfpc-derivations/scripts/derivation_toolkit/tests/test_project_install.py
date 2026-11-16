@@ -12,11 +12,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import fitz
+
 from ..catalog import Catalog
 from ..export import inspect_interpreter, metadata_tex, palette_tex
 from .. import install as installer
 from ..package_assets import collect_assets
 from ..web.build import page_mapping
+from .test_compiled_inputs import timeline
 
 
 class ProjectContracts(unittest.TestCase):
@@ -44,7 +47,9 @@ class ProjectContracts(unittest.TestCase):
         self.catalog["decks"][0].update(source="report.pdf", build={"kind": "external"})
         self.write_catalog()
         pdf = self.root / "actual-portrait.pdf"
-        pdf.write_bytes(b"owned input")
+        with fitz.open() as document:
+            document.new_page(width=200, height=300)
+            document.save(pdf)
         rows, files = collect_assets(Catalog(self.project), self.root / "absent",
                                     inputs={"sample": {"light": {"pdf": str(pdf)}}})
         self.assertEqual(len(files), 1)
@@ -56,8 +61,10 @@ class ProjectContracts(unittest.TestCase):
         documents.mkdir()
         pdf = documents / "report.pdf"
         vector = documents / "report.vector.json"
-        pdf.write_bytes(b"project PDF")
-        vector.write_text('{"version":1,"scenes":[]}')
+        with fitz.open() as document:
+            document.new_page(width=200, height=300)
+            document.save(pdf)
+        vector.write_text(json.dumps(timeline()))
         original_directory = Path.cwd()
         try:
             os.chdir(self.root)

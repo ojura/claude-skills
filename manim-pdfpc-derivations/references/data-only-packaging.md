@@ -91,6 +91,11 @@ flag, title, default selection and arbitrary project/deck metadata. An external
 document with no compiled input is reported as an error. Its existing build
 workflow remains responsible for producing that PDF.
 
+Before staging, each PDF is opened with installed Poppler GLib or TeX Live's
+`texlua` reader. Animation URI annotations must name a scene in the matching
+fully validated version-1 timeline. This check reads real PDF objects, including
+compressed object streams; it requires no Python PDF package on the host.
+
 Default artifacts go to `build/appimage/assembled/`:
 
 - `output.appimage`: unchanged template followed by the validated data trailer.
@@ -180,8 +185,9 @@ inspection agreement and the durable printed-PDF contract.
 `tests.test_data_assembly` covers generic metadata, light-only inputs, transport
 identity and preservation of existing outputs. `tests.test_private_build`
 checks the separate new-cache path and actual TeX compilation when installed
-Beamer is available. The assembly case denies subprocess launch, links, locks
-and xattr operations while packaging prebuilt inputs.
+Beamer is available. The assembly case uses real PDFs and denies uploaded
+executable launches, links, locks and xattr operations while packaging prebuilt
+inputs. Only an installed PDF reader may run during that input inspection.
 
 Before delivery, exercise the exact resulting image offline on Ubuntu 20.04 and
 24.04 with its actual input map: available themes, all selected live scenes,

@@ -8,6 +8,7 @@ import re
 import shutil
 
 from .catalog import Catalog, Deck, THEMES
+from .pdf_inputs import validate_compiled_input
 
 
 def input_path(catalog: Catalog, value: str | Path) -> Path:
@@ -65,6 +66,7 @@ def collect_assets(catalog: Catalog, assets: Path, *, selection="all", inputs: d
                 if not source.is_file() or source.stat().st_size == 0:
                     raise ValueError(f"Missing built presentation asset: {source}")
                 files.append((source, Path("decks") / deck.id / name))
+            validate_compiled_input(pdf, vector)
         if len(set(animation_flags)) != 1:
             raise ValueError(f"Package themes must agree about timeline availability: {deck.id}")
         rows.append("\t".join((deck.id, deck.document, deck.language,

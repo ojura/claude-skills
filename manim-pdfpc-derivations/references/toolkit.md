@@ -149,6 +149,27 @@ Layer values must be finite. Export sorts the layer and path order separately,
 then assigns numeric timeline ranks, so fractional and large layers retain the
 same overlap order as the static figures.
 
+`scene.time` is the absolute time of the state being evaluated, including inside
+animation and updater callbacks. `wait(duration, stop_condition=None,
+frozen_frame=None)` follows Manim's wait selection: time-based mobject updaters,
+scene updaters, `always_update_mobjects` or a stop condition require sampled
+updates. `frozen_frame=False` also evaluates position-only updaters;
+`frozen_frame=True` evaluates no updaters. `pause()` selects a frozen wait.
+`wait_until(condition, max_time)` stops at the first sampled state that satisfies
+the condition, or at the requested limit. A condition already true at the start
+does not advance time. A frozen wait cannot have a stop condition.
+
+Direct edits such as `remove()` or `shift()` at an already recorded time become
+instantaneous changes. The export retains the old state at the immediately
+preceding representable floating-point time and the new state at the boundary.
+Keyframe times remain strictly increasing; keep those full-precision timestamps
+when processing the JSON. Several edits at the same time preserve the original
+pre-edit state and publish their final result. New paths remain hidden before
+their introduction. At time zero, edits simply define the initial state.
+Animation durations must be finite and nonnegative; a positive duration must
+advance the microsecond authoring clock. Updaters and stop conditions are sampled
+at the scene's configured `sample_rate`, with the duration endpoint included.
+
 `checkpoint(label, caption, crop=None, handout=None, pause=True)` saves a printed
 state. `label` is the live control label; `caption` is authored TeX for the printed
 panel. `handout` accepts compact mobjects, and `crop` is `[x, y, width, height]` in
@@ -289,6 +310,14 @@ preserves the previous output set. Preparing an explicit PDF preserves its
 authored page map, or creates a physical-page map when the input has none, and
 removes an obsolete destination timeline when the input is static.
 
+Compiled inputs are checked before any delivery files are replaced. Native
+collection and document builds inspect actual PDF URI annotations through
+installed Poppler GLib or TeX Live's `texlua`; HTML packaging uses its PDF reader.
+Every `pdfpc-vector:` link must name a scene in the matching timeline. The shared
+version-1 validator checks every scene, checkpoint, path and keyframe, including
+sparse coordinates and numeric bounds. IDs and labels must be well-formed Unicode
+without NUL characters. A static PDF needs no timeline.
+
 ## Package HTML
 
 Install the pinned PDF.js dependency under `build/tools/html5` by copying the
@@ -304,6 +333,12 @@ The output contains a self-contained `index.html`, its license and instructions;
 an adjacent ZIP includes the same files. Open `index.html` directly in Chrome
 or Firefox. The embedded PDF.js, PDFs and vectors also support a synchronized
 projector window.
+
+The HTML, license, instructions and optional ZIP are prepared before publication.
+Replacing that complete set is serialized with other writers to the same output
+parent; a failed or interrupted replacement restores the prior files. Notes and
+other unrelated files beside `index.html` are preserved and excluded from the
+ZIP. `--no-zip` updates only the HTML bundle and leaves an existing ZIP unchanged.
 
 For an externally compiled document, pass its PDF and matching vector timeline:
 
@@ -327,6 +362,10 @@ page numbers differ; otherwise the builder sidecar or physical page order
 supplies the mapping. Explicit maps use version 1, `logicalSlides`, and a `pages`
 list with `number` and `logical` integers. Animated compiled inputs need their
 matching timeline; preserve the page-map sidecar when moving Beamer PDFs.
+
+An animation region may have a different aspect ratio from its scene. The player
+fits and centers the scene within that rectangle; keep the authored rectangle
+rather than resizing the PDF annotation to satisfy a packaging check.
 
 Use the shared [browser verification command](verification.md#exercise-the-standalone-browser-document)
 to exercise the actual file and projector in Chrome and Firefox, including
