@@ -112,3 +112,29 @@ test("scene fitting uses a centered uniform scale and restores its context", () 
     assert.equal(calls.filter((item) => item[0] === "restore").length, 2);
   }
 });
+
+test("PDF background coverage paints once before clipping paths", () => {
+  const calls = [];
+  const context = Object.fromEntries(["save", "restore", "beginPath", "rect", "clip", "translate", "scale", "fillRect", "setTransform"]
+    .map((name) => [name, (...args) => calls.push([name, ...args])]));
+  context.getTransform = () => ({ a: 2, b: 0, c: 0, d: 2, e: 0.25, f: 0.125 });
+  const scene = prepareScene({ ...structuredClone(options.scenes[0]), objects: [] });
+  renderSceneFitted(context, scene, 0, 120, 120, { pixelBackground: true });
+  assert.deepEqual(calls.filter((item) => item[0] === "fillRect"), [
+    ["fillRect", 0, 40, 241, 161],
+  ]);
+  assert.ok(calls.findIndex((item) => item[0] === "fillRect") < calls.findIndex((item) => item[0] === "clip"));
+  assert.deepEqual(calls.filter((item) => item[0] === "setTransform"), [["setTransform", 1, 0, 0, 1, 0, 0]]);
+  assert.equal(calls.filter((item) => item[0] === "save").length, 3);
+  assert.equal(calls.filter((item) => item[0] === "restore").length, 3);
+});
+
+test("pixel background coverage rejects rotated or reversed projection transforms", () => {
+  const scene = prepareScene({ ...structuredClone(options.scenes[0]), objects: [] });
+  for (const matrix of [{ a: 1, b: .1, c: 0, d: 1 }, { a: -1, b: 0, c: 0, d: 1 }]) {
+    let depth = 0;
+    const context = { save() { depth++; }, restore() { depth--; }, getTransform() { return matrix; } };
+    assert.throws(() => renderSceneFitted(context, scene, 0, 120, 80, { pixelBackground: true }), /axis-aligned/);
+    assert.equal(depth, 0);
+  }
+});

@@ -192,6 +192,10 @@ function cssColor(color) {
 }
 
 export function renderScene(ctx, scene, time) {
+  paintScene(ctx, scene, time, true);
+}
+
+function paintScene(ctx, scene, time, background) {
   const width = scene.width;
   const height = scene.height;
   const current = Math.max(0, Math.min(scene.duration, time));
@@ -199,8 +203,10 @@ export function renderScene(ctx, scene, time) {
   ctx.beginPath();
   ctx.rect(0, 0, width, height);
   ctx.clip();
-  ctx.fillStyle = cssColor(scene.background);
-  ctx.fillRect(0, 0, width, height);
+  if (background) {
+    ctx.fillStyle = cssColor(scene.background);
+    ctx.fillRect(0, 0, width, height);
+  }
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   for (const object of scene.objects) {
@@ -224,17 +230,40 @@ export function renderScene(ctx, scene, time) {
   ctx.restore();
 }
 
-export function renderSceneFitted(ctx, scene, time, width, height) {
+export function renderSceneFitted(ctx, scene, time, width, height, { pixelBackground = false } = {}) {
   if (!(width > 0 && height > 0 && Number.isFinite(width) && Number.isFinite(height))) {
     throw new Error("The vector region must have positive finite dimensions");
   }
   const scale = Math.min(width / scene.width, height / scene.height);
+  const left = (width - scene.width * scale) / 2;
+  const top = (height - scene.height * scale) / 2;
   ctx.save();
+  if (pixelBackground) {
+    // The PDF poster and this canvas share one device-pixel grid. Replace the
+    // complete fitted background footprint before clipping the vector paths,
+    // otherwise fractional edges leave the old poster's antialiasing visible.
+    const transform = ctx.getTransform();
+    if (transform.b !== 0 || transform.c !== 0 || transform.a <= 0 || transform.d <= 0) {
+      ctx.restore();
+      throw new Error("Pixel background coverage requires a positive axis-aligned transform");
+    }
+    const x0 = Math.floor(transform.a * left + transform.e + 1e-9);
+    const y0 = Math.floor(transform.d * top + transform.f + 1e-9);
+    const x1 = Math.ceil(transform.a * (left + scene.width * scale) + transform.e - 1e-9);
+    const y1 = Math.ceil(transform.d * (top + scene.height * scale) + transform.f - 1e-9);
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = cssColor(scene.background);
+    ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+    ctx.restore();
+  }
   ctx.beginPath();
   ctx.rect(0, 0, width, height);
   ctx.clip();
-  ctx.translate((width - scene.width * scale) / 2, (height - scene.height * scale) / 2);
+  ctx.translate(left, top);
   ctx.scale(scale, scale);
-  renderScene(ctx, scene, time);
+  // The device-pixel fill already replaced the complete PDF poster. Repainting
+  // it through fractional clips can darken its edges through coverage rounding.
+  paintScene(ctx, scene, time, !pixelBackground);
   ctx.restore();
 }

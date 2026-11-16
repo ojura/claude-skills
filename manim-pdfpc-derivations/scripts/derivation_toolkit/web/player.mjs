@@ -48,6 +48,7 @@ let projectorRequested = false;
 let animationFrame = null;
 let latestRemote = null;
 let applyingRemote = false;
+let vectorScale = 1;
 
 function scheduleAnimation() {
   if (animationFrame === null) animationFrame = requestAnimationFrame(updateFrame);
@@ -104,45 +105,38 @@ function setProgress() {
     (!scene || time >= scene.duration - 0.0001);
 }
 
-function positionVector(meta, activeScene, canvas, box) {
+function positionVector(meta, activeScene, canvas, pdfCanvas) {
   const region = meta.scene?.rect;
   if (!region || !activeScene) {
     canvas.style.display = "none";
     return;
   }
-  const left = region[0] / meta.width;
-  const top = region[1] / meta.height;
-  const width = (region[2] - region[0]) / meta.width;
-  const height = (region[3] - region[1]) / meta.height;
-  canvas.style.left = (left * 100) + "%";
-  canvas.style.top = (top * 100) + "%";
-  canvas.style.width = (width * 100) + "%";
-  canvas.style.height = (height * 100) + "%";
+  // Identical canvas dimensions and CSS placement keep PDF and vector pixels
+  // aligned, including fractional link origins and device-pixel ratios.
+  canvas.style.left = "0";
+  canvas.style.top = "0";
+  canvas.style.width = "100%";
+  canvas.style.height = "100%";
   canvas.style.display = "block";
-  const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
-  const pixelWidth = Math.max(1, Math.round(box.width * width * dpr));
-  const pixelHeight = Math.max(1, Math.round(box.height * height * dpr));
-  if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
-  if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
+  canvas.width = pdfCanvas.width;
+  canvas.height = pdfCanvas.height;
 }
 
-function drawVector(canvas, activeScene, at, region) {
+function drawVector(canvas, activeScene, at, region, scale) {
   if (!activeScene) return;
   const ctx = canvas.getContext("2d", { alpha: true });
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   const width = region[2] - region[0];
   const height = region[3] - region[1];
-  // Fit in PDF coordinates, then map to the canvas. This preserves aspect
-  // ratio on screen even when device-pixel rounding differs between axes.
-  ctx.setTransform(canvas.width / width, 0, 0, canvas.height / height, 0, 0);
-  renderSceneFitted(ctx, activeScene, at, width, height);
+  ctx.setTransform(scale, 0, 0, scale, region[0] * scale, region[1] * scale);
+  renderSceneFitted(ctx, activeScene, at, width, height, { pixelBackground: true });
 }
 
 function paintVector() {
   if (!scene || !currentMeta().scene || ui.vector.style.display === "none") return;
   if (time === lastDisplayedTime) return;
-  drawVector(ui.vector, scene, time, currentMeta().scene.rect);
+  drawVector(ui.vector, scene, time, currentMeta().scene.rect, vectorScale);
   lastDisplayedTime = time;
 }
 
@@ -310,8 +304,9 @@ async function showPage(number, opts = {}) {
       time = entryTime(scene, time, request.backwards);
       if (changed || request.backwards) playTarget = time;
     }
-    positionVector(meta, scene, nextVector, box);
-    drawVector(nextVector, scene, time, meta.scene?.rect);
+    const nextVectorScale = viewport.scale * dpr;
+    positionVector(meta, scene, nextVector, nextPdf);
+    drawVector(nextVector, scene, time, meta.scene?.rect, nextVectorScale);
     // Keep the complete old slide visible until all three new layers are ready.
     ui.slide.style.width = box.width + "px";
     ui.slide.style.height = box.height + "px";
@@ -319,6 +314,7 @@ async function showPage(number, opts = {}) {
     ui.slide.replaceChildren(nextPdf, nextVector, nextText, ui.blank, ui.loading);
     ui.pdf = nextPdf;
     ui.vector = nextVector;
+    vectorScale = nextVectorScale;
     ui.text = nextText;
     currentPdfPage = page;
     lastDisplayedTime = time;
