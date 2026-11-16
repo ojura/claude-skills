@@ -141,10 +141,13 @@ output overrides can point outside the repository. Commit the source, installed
 toolkit and figure assets needed by the document's build. Publish tracked
 figures by exporting explicitly to the catalog's animation assets directory.
 
-Check the syncing tool's own ignore rules before building in a live replica.
-Overleaf Workshop's replica does not consult `.gitignore`; its project sync
-ignore patterns must include `**/build/**`. Keep work in the isolated worktree
-until that supported setting is confirmed.
+Check the active replica's **Respect .gitignore** setting and configured sync
+ignore patterns before building there. Overleaf Workshop reads root and nested
+`.gitignore` rules by default, including for tracked files, and also applies the
+configured replica exclusions. Keep build products excluded and required figure
+and toolkit inputs outside both ignore sets. Preserve the configured
+`**/build/**` exclusion so it also applies when **Respect .gitignore** is disabled.
+Keep development in the isolated worktree until the effective rules are confirmed.
 
 ## Build, inspect and exercise
 
