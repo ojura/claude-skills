@@ -13,7 +13,7 @@ COPY animation/requirements.lock animation/requirements-test.lock /opt/requireme
 RUN python3 -m venv /opt/manim \
     && /opt/manim/bin/python -m pip install --no-cache-dir \
       -r /opt/requirements/requirements.lock -r /opt/requirements/requirements-test.lock
-# System Poppler introspection stays separate from the locked Manim environment.
+# PDF inspection and video encoding use system tools alongside locked Manim.
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y python3-gi gir1.2-poppler-0.18 \
+    && apt-get install --no-install-recommends -y python3-gi gir1.2-poppler-0.18 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
