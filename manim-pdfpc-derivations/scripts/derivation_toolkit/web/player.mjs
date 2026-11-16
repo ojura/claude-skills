@@ -1,5 +1,5 @@
 import * as pdfjs from "pdfjs";
-import { checkpointAt, prepareScene, renderSceneFitted, seekCheckpoint } from "derivation-vector";
+import { checkpointAt, prepareTimeline, renderSceneFitted, seekCheckpoint } from "derivation-vector";
 import { configurePdfWorker, readManifest, openPdf, readVectors } from "derivation-resources";
 
 configurePdfWorker(pdfjs);
@@ -74,8 +74,8 @@ function themeAssets(name) {
   }
   if (!timelines.has(name)) {
     const entry = manifest.themes[name];
-    timelines.set(name, readVectors(entry.vectors).then((data) =>
-      new Map(data.scenes.map((source) => [source.id, prepareScene(source)]))));
+    timelines.set(name, entry.vectors === null ? Promise.resolve(new Map()) :
+      readVectors(entry.vectors).then(prepareTimeline));
   }
   return Promise.all([documents.get(name), timelines.get(name)]);
 }

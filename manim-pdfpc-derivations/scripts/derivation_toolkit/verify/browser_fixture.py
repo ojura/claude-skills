@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 import re
 
+from ..timeline import validate_timeline
+
 
 def load_fixture(html: Path) -> dict:
     """Use the bundled document's themes, page geometry and authored scene IDs."""
@@ -24,13 +26,10 @@ def load_fixture(html: Path) -> dict:
     for theme, entry in manifest["themes"].items():
         if not entry["pages"]:
             raise ValueError(f"{theme}: no PDF pages")
-        raw = base64.b64decode(payload["assets"][entry["vectors"]], validate=True)
-        timeline = json.loads(gzip.decompress(raw))
-        if timeline.get("version") != 1:
-            raise ValueError(f"{theme}: unsupported timeline version")
-        scenes = {scene["id"]: scene for scene in timeline["scenes"]}
-        if len(scenes) != len(timeline["scenes"]):
-            raise ValueError(f"{theme}: duplicate timeline scene IDs")
+        scenes = {}
+        if entry["vectors"] is not None:
+            raw = base64.b64decode(payload["assets"][entry["vectors"]], validate=True)
+            scenes = validate_timeline(json.loads(gzip.decompress(raw)))
         for page in entry["pages"]:
             if page.get("scene") and page["scene"]["id"] not in scenes:
                 raise ValueError(f"{theme}: missing linked scene {page['scene']['id']}")

@@ -18,6 +18,13 @@ function object(value, name) {
 
 function string(value, name, nonempty = false) {
   if (typeof value !== "string" || (nonempty && !value.length)) throw new Error(name + " must be a string" + (nonempty ? " with content" : ""));
+  if (value.includes("\0")) throw new Error(name + " must not contain NUL characters");
+  for (const character of value) {
+    const point = character.codePointAt(0);
+    if (point >= 0xd800 && point <= 0xdfff) {
+      throw new Error(name + " must be a well-formed Unicode string");
+    }
+  }
   return value;
 }
 
@@ -49,6 +56,20 @@ export function bracket(keyframes, time) {
   const alpha = lo === next || time <= a.time ? 0 :
     Math.max(0, Math.min(1, (time - a.time) / (b.time - a.time)));
   return { a, b, alpha };
+}
+
+export function prepareTimeline(source) {
+  object(source, "Timeline");
+  if (number(source.version, "Timeline version") !== 1) {
+    throw new Error("Unsupported vector timeline version");
+  }
+  const scenes = new Map();
+  for (const sourceScene of array(source.scenes, "Timeline scenes", 1, 1000)) {
+    const scene = prepareScene(sourceScene);
+    if (scenes.has(scene.id)) throw new Error("Duplicate scene ID: " + scene.id);
+    scenes.set(scene.id, scene);
+  }
+  return scenes;
 }
 
 export function prepareScene(source) {

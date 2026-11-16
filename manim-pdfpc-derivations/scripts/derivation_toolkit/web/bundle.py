@@ -56,7 +56,9 @@ def embed(root: Path) -> None:
                            '<html lang="' + html.escape(manifest.get("language", "en"), quote=True) + '">')
     assets = {"vendor/pdf.worker.mjs"}
     for theme in manifest["themes"].values():
-        assets.update((theme["pdf"], theme["vectors"]))
+        assets.add(theme["pdf"])
+        if theme["vectors"] is not None:
+            assets.add(theme["vectors"])
     payload = {
         "manifest": manifest,
         "assets": {path: _encoded(root, path) for path in sorted(assets)},

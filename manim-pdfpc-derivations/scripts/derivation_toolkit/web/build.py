@@ -92,7 +92,8 @@ def pdf_manifest(pdf_path: Path, vector_path: Path | None, theme: str,
                 "width": float(page.rect.width), "height": float(page.rect.height),
                 "scene": {"id": name, "rect": area} if name else None,
             })
-    return {"pdf": f"assets/{theme}.pdf", "vectors": f"assets/{theme}.vector.json.gz",
+    return {"pdf": f"assets/{theme}.pdf",
+            "vectors": f"assets/{theme}.vector.json.gz" if vector_path is not None else None,
             "pages": pages, "logicalSlides": logical_count}
 
 
@@ -189,9 +190,9 @@ def build_bundle(catalog: Catalog, deck: Deck, *, output: Path | None = None,
             entry = pdf_manifest(selected_pdf, selected_vectors, theme,
                                  edition["page_map"] if edition else page_map)
             shutil.copyfile(selected_pdf, stage / entry["pdf"])
-            timeline = (selected_vectors.read_bytes() if selected_vectors is not None
-                        else b'{"version":1,"scenes":[]}\n')
-            (stage / entry["vectors"]).write_bytes(gzip.compress(timeline, compresslevel=9, mtime=0))
+            if selected_vectors is not None:
+                timeline = selected_vectors.read_bytes()
+                (stage / entry["vectors"]).write_bytes(gzip.compress(timeline, compresslevel=9, mtime=0))
             manifest["themes"][theme] = entry
         layouts = [[(page["logical"], page["scene"]["id"] if page["scene"] else None)
                     for page in entry["pages"]] for entry in manifest["themes"].values()]

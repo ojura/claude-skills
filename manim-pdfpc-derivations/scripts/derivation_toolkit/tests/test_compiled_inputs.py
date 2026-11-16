@@ -17,6 +17,7 @@ from .. import pdf_inputs
 from ..package_assets import collect_assets, stage_assets
 from ..timeline import load_timeline
 from ..web.build import build_bundle, pdf_manifest
+from ..verify.browser_fixture import load_fixture
 
 
 def timeline(identifier="example"):
@@ -119,6 +120,15 @@ class CompiledInputs(unittest.TestCase):
         self.assertEqual(len(files), 2)
         self.assertEqual(len(pdf_manifest(self.pdf, self.vectors, "light")["pages"]), 1)
         self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_static_html_declares_no_timeline_instead_of_an_empty_native_input(self):
+        html = self.html(self.static)
+        fixture = load_fixture(html)
+        self.assertIsNone(fixture["manifest"]["themes"]["light"]["vectors"])
+        self.assertEqual(fixture["timelines"], {"light": {}})
+        self.write_timeline({"version": 1, "scenes": []})
+        with self.assertRaisesRegex(ValueError, "Timeline scenes"):
+            self.html(self.static, self.vectors)
 
     def test_native_collection_rejects_an_animation_link_without_a_timeline(self):
         with self.assertRaisesRegex(ValueError, "[Tt]imeline|[Ss]cene"):

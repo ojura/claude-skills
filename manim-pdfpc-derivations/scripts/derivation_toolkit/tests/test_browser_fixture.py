@@ -21,9 +21,10 @@ class BrowserFixtures(unittest.TestCase):
         manifest = {"version": 1, "title": "Independent document", "themes": {}}
         assets = {}
         for theme, (pages, scenes) in editions.items():
-            path = f"assets/{theme}.vector.json.gz"
-            assets[path] = base64.b64encode(gzip.compress(json.dumps({
-                "version": 1, "scenes": scenes}).encode(), mtime=0)).decode()
+            path = f"assets/{theme}.vector.json.gz" if scenes is not None else None
+            if path is not None:
+                assets[path] = base64.b64encode(gzip.compress(json.dumps({
+                    "version": 1, "scenes": scenes}).encode(), mtime=0)).decode()
             manifest["themes"][theme] = {"pages": pages, "vectors": path}
         payload = json.dumps({"manifest": manifest, "assets": assets})
         self.html.write_text('<script type="application/json" id="derivation-bundle">' +
@@ -35,8 +36,10 @@ class BrowserFixtures(unittest.TestCase):
                   "scene": {"id": "ratio-aggregation"} if n == 3 else None}
                  for n in range(1, 5)]
         source = {"id": "ratio-aggregation", "width": 1280, "height": 720,
+                  "background": [1, 1, 1, 1], "objects": [],
                   "duration": 7, "checkpoints": [
-                      {"time": 0}, {"time": 2.75}, {"time": 7}]}
+                      {"time": 0, "label": "Start"}, {"time": 2.75, "label": "Ratios"},
+                      {"time": 7, "label": "Result"}]}
         self.write_bundle({"light": (pages, [source])})
         fixture = load_fixture(self.html)
         self.assertEqual(list(fixture["manifest"]["themes"]), ["light"])
@@ -47,7 +50,7 @@ class BrowserFixtures(unittest.TestCase):
 
     def test_static_document_needs_no_authored_scene_or_second_theme(self):
         self.write_bundle({"light": ([{"number": 1, "logical": 1, "width": 800,
-                                      "height": 450, "scene": None}], [])})
+                                      "height": 450, "scene": None}], None)})
         fixture = load_fixture(self.html)
         self.assertEqual(fixture["timelines"], {"light": {}})
         self.assertIsNone(scene_at(fixture, "light", 1))
@@ -56,7 +59,10 @@ class BrowserFixtures(unittest.TestCase):
         page = {"number": 1, "logical": 1, "width": 800, "height": 450,
                 "scene": {"id": "novel"}}
         editions = {theme: ([page], [{"id": "novel", "duration": duration,
-                                    "checkpoints": [{"time": 0}, {"time": duration}]}])
+                                    "width": 800, "height": 450,
+                                    "background": [1, 1, 1, 1], "objects": [],
+                                    "checkpoints": [{"time": 0, "label": "Start"},
+                                                    {"time": duration, "label": "End"}]}])
                     for theme, duration in (("light", 4), ("dark", 6))}
         self.write_bundle(editions)
         fixture = load_fixture(self.html)
@@ -65,12 +71,17 @@ class BrowserFixtures(unittest.TestCase):
 
     def test_missing_linked_scene_and_duplicate_bundle_are_rejected(self):
         page = {"number": 1, "scene": {"id": "absent"}}
-        self.write_bundle({"light": ([page], [])})
+        self.write_bundle({"light": ([page], None)})
         with self.assertRaisesRegex(ValueError, "missing linked scene absent"):
             load_fixture(self.html)
-        self.write_bundle({"light": ([{"number": 1, "scene": None}], [])})
+        self.write_bundle({"light": ([{"number": 1, "scene": None}], None)})
         self.html.write_text(self.html.read_text() * 2)
         with self.assertRaisesRegex(ValueError, "one embedded"):
+            load_fixture(self.html)
+
+    def test_supplied_empty_native_timeline_is_not_a_static_document(self):
+        self.write_bundle({"light": ([{"number": 1, "scene": None}], [])})
+        with self.assertRaisesRegex(ValueError, "Timeline scenes"):
             load_fixture(self.html)
 
 
