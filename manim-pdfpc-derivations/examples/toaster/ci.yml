@@ -1,0 +1,21 @@
+# Copy to .github/workflows/toaster.yml after installing the toolkit with --ci.
+name: Toaster report and derivations
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  documents:
+    uses: ./.github/workflows/derivation-toolkit.yml
+    with:
+      artifact_name: toaster
+      html_deck: toaster-demo
+      authoring_dockerfile: report.Dockerfile
+      prepare_command: >-
+        python3 -B ci_build.py prepare
+        --report-revision 254c467d900a4880d6592bae5e4014402071f0b3
+      source_checks: python3 -B /src/test_ci_build.py
+      build_command: python3 -B /src/ci_build.py build
+      package_inputs: inputs.json

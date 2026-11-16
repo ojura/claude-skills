@@ -561,6 +561,24 @@ available themes and page map; the adapter relocates its `/assets` paths into
 the runner's downloaded artifact tree. Leave `html_deck` empty to omit the
 browser job.
 
+For additional document dependencies, set `authoring_dockerfile` to a consumer
+recipe and `authoring_context` to its build context; both paths are relative to
+`project`. The workflow first builds the locked toolkit image, then supplies that
+local base as the recipe's `AUTHORING_IMAGE` argument. Use
+`ARG AUTHORING_IMAGE` followed by `FROM ${AUTHORING_IMAGE}`. The resulting image
+runs the complete authoring job, including the installed tests, export comparison,
+consumer checks and runtime-fixture preparation. With no recipe, the generic
+image remains the default. Native package and runtime images are independent.
+
+`prepare_command` runs on the host from the consumer directory before offline
+container execution. Use it to fetch a declared external source revision into
+`$RUNNER_TEMP/derivation-cache`, available as `/cache` in the container. Keep the
+checkout unchanged; tools that write beside their inputs can stage a working copy
+under `/cache`. Publish compiled documents and their input map under `/assets`.
+The [toaster CI example](../examples/toaster/README.md#continuous-integration)
+demonstrates the report recipe, source preparation and original report checker
+from a clean consumer checkout.
+
 Document and check artifacts use the chosen `artifact_name` prefix. The HTML
 ZIP uses its deck ID. Native files are `<artifact_name>.appimage` and
 `<artifact_name>-data-only.appimage`; runtime diagnostics use
