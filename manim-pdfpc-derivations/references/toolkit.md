@@ -34,6 +34,20 @@ add `--source` to compare the lock with its committed canonical source. An updat
 requires the previous installation to match its lock. Preserve local edits in
 the canonical skill, publish them, then install the new revision.
 
+The generated entry text comes from the selected revision's `entrypoint.py.in`,
+not from the updater currently running. Offline verification also checks that
+the entry matches its installed template; `--check --source` compares both with
+the requested committed source. Earlier revisions with a literal `BOOTSTRAP`
+definition are read from that revision's `install.py` without executing it.
+
+An interrupted or failed update restores the prior package, entry point, lock
+and managed workflow. If restoration also fails, the error names a retained
+`.toolkit-install-*` directory beside the installed package. It contains the
+old package under `previous/`, saved generated files under `metadata/`, and
+`RECOVERY.txt` with their destination paths. Resolve the reported I/O error,
+restore those files, run the canonical installer with `--check`, then remove
+that recovery directory. Successful updates and rollbacks remove it themselves.
+
 Add `--ci` to install `.github/workflows/derivation-toolkit.yml` from the same
 committed toolkit. Commit that managed workflow too. Its hash is part of the
 lock, and later updates retain the CI opt-in. Keep project triggers and custom
