@@ -170,6 +170,15 @@ registered scene. Use `--output-dir` and `--preview-output` for explicit paths.
 An export to the catalog's declared assets directory publishes figures for
 direct document builds, including Overleaf.
 
+Use `--theme light` or `--theme dark` for a geometry or colour update whose
+shared captions, checkpoint times, figure dimensions and handout layout are
+unchanged. When those shared definitions change in an existing two-theme
+export, regenerate the affected scenes with `--theme both`. Both themes must
+produce matching definitions. Rendering and validation finish before figures,
+timelines, metadata and requested previews are published; a rejected update
+leaves the previous files intact. Successful updates remove obsolete generated
+panels named in the previous metadata and preserve unrelated output files.
+
 ## Include figures in TeX
 
 Load the installed modules after the document class. With compilation starting

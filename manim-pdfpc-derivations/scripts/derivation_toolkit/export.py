@@ -15,9 +15,10 @@ import sys
 import tempfile
 from types import ModuleType
 
-from .catalog import Catalog, Deck, PACKAGE_ROOT
+from .catalog import Catalog, Deck, PACKAGE_ROOT, THEMES
 from .palette import load_palettes, palette_tex
 from .paths import CachePaths, get_paths
+from .publication import publish_files
 
 
 REQUIREMENTS = Path(__file__).parent / "animation" / "requirements.lock"
@@ -239,45 +240,146 @@ def metadata_tex(metadata: dict, results: dict | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _filename(value: str) -> str:
+    if not isinstance(value, str) or not value or Path(value).name != value or value in (".", ".."):
+        raise ValueError(f"Invalid generated filename in steps metadata: {value!r}")
+    return value
+
+
+def _generated_files(metadata: dict, *, previews: bool = False) -> set[Path]:
+    """Identify generated files using the existing public steps metadata."""
+    result = set()
+    for theme in metadata.get("themes", []):
+        if theme not in THEMES:
+            raise ValueError(f"Invalid theme in steps metadata: {theme!r}")
+        if not previews:
+            result.add(Path(theme) / _filename(metadata["manifest"]))
+        for scene in metadata["scenes"]:
+            if previews:
+                result.add(Path(theme) / _filename(scene["id"] + "-midpoint.png"))
+            for step in scene["steps"]:
+                figure = _filename(step["figure"])
+                names = ((str(Path(figure).with_suffix(".png")), step["full_preview"])
+                         if previews else (figure, step["full_figure"]))
+                for name in names:
+                    if name is not None:
+                        result.add(Path(theme) / _filename(name))
+    return result
+
+
+def _validate_export(metadata: dict, timelines: dict, staged: Path, output: Path) -> None:
+    definitions = {item["id"]: item for item in metadata["scenes"]}
+    for theme, scenes in timelines.items():
+        if set(scenes) != set(definitions):
+            raise ValueError(
+                f"{theme}: scene metadata and timeline IDs differ; export all affected scenes in both themes")
+        for identifier, scene in scenes.items():
+            definition = definitions[identifier]
+            if any(scene[key] != definition[key] for key in ("duration", "width", "height")):
+                raise ValueError(f"{theme}/{identifier}: timeline dimensions or duration differ from shared metadata")
+            stops = [step["time"] for step in definition["steps"] if step["full_figure"] is not None]
+            if [point["time"] for point in scene["checkpoints"]] != stops:
+                raise ValueError(f"{theme}/{identifier}: timeline checkpoints differ from shared metadata")
+    for relative in _generated_files(metadata):
+        candidate = staged / relative
+        source = candidate if candidate.is_file() else output / relative
+        if not source.is_file() or source.stat().st_size == 0:
+            raise ValueError(f"Missing generated file {relative}; regenerate the affected scenes in both themes")
+
+
+def _stage_export(deck, themes, paths, output, staged, previews, provider, selected, scene_id, sample_rate):
+    from .animation.vector_scene import write_json
+
+    metadata_file = output / "steps.json"
+    previous = (json.loads(metadata_file.read_text(encoding="utf-8"))
+                if metadata_file.is_file() else {"version": 1, "scenes": []})
+    previous_manifest = previous.get("manifest", deck.animation.manifest)
+    previous_themes = previous.get("themes", [
+        theme for theme in THEMES if (output / theme / previous_manifest).is_file()])
+    previous = {**previous, "manifest": previous_manifest, "themes": previous_themes}
+    _generated_files(previous)
+    old_metadata = {item["id"]: item for item in previous["scenes"]}
+    registered = [cls.scene_id for cls in provider.SCENES]
+    reference_times = getattr(provider, "REFERENCE_TIMES", {})
+    all_themes = sorted(set(previous_themes) | set(themes))
+    timelines, definitions = {}, {}
+    for theme in all_themes:
+        source = output / theme / previous_manifest
+        retain = theme not in themes or scene_id is not None
+        existing = json.loads(source.read_text(encoding="utf-8"))["scenes"] if retain and source.is_file() else []
+        scenes = {item["id"]: item for item in existing if item["id"] in registered}
+        theme_metadata = {identifier: old_metadata[identifier] for identifier in scenes
+                          if identifier in old_metadata}
+        if theme in themes:
+            for cls in selected:
+                scene, scene_metadata = build_scene(
+                    cls, theme, staged, sample_rate, previews, paths=paths,
+                    reference_time=reference_times.get(cls.scene_id))
+                scenes[scene["id"]] = scene
+                theme_metadata[scene["id"]] = scene_metadata
+        timelines[theme] = scenes
+        definitions[theme] = theme_metadata
+    first_theme = all_themes[0]
+    common = definitions[first_theme]
+    for theme, theme_metadata in definitions.items():
+        if theme_metadata != common:
+            differing = sorted(identifier for identifier in set(common) | set(theme_metadata)
+                               if common.get(identifier) != theme_metadata.get(identifier))
+            hint = ("regenerate the affected scenes in both themes" if set(all_themes) - set(themes)
+                    else "author matching captions, checkpoints, dimensions and handout layouts for both themes")
+            raise ValueError(f"Shared metadata differs between {first_theme} and {theme} for "
+                             f"{', '.join(differing)}; {hint}")
+    metadata = {**previous, "manifest": deck.animation.manifest, "themes": all_themes,
+                "scenes": [common[identifier] for identifier in registered if identifier in common]}
+    for theme, scenes in timelines.items():
+        manifest_file = staged / theme / deck.animation.manifest
+        write_json(manifest_file, {"version": 1, "scenes": [
+            scenes[identifier] for identifier in registered if identifier in scenes]})
+        print(f"{theme} manifest: {manifest_file.stat().st_size / 1024 / 1024:.2f} MiB", flush=True)
+    _validate_export(metadata, timelines, staged, output)
+    (staged / "palettes.tex").write_text(palette_tex(deck.repository_root), encoding="utf-8")
+    write_json(staged / "steps.json", metadata)
+    (staged / "steps.tex").write_text(metadata_tex(metadata, getattr(provider, "RESULTS", {})), encoding="utf-8")
+    return previous, metadata
+
+
 def export_deck(deck: Deck, themes: list[str], paths: CachePaths, output: Path, *,
                 scene_id: str | None = None, sample_rate: int = 30,
                 preview_output: Path | None = None) -> None:
-    from .animation.vector_scene import write_json
-
     if not 10 <= sample_rate <= 120:
         raise ValueError("The sample rate must be from 10 to 120")
+    if not themes or set(themes) - set(THEMES):
+        raise ValueError("Select light, dark or both themes")
+    themes = list(dict.fromkeys(themes))
     provider = load_provider(deck)
     selected = [cls for cls in provider.SCENES if scene_id is None or cls.scene_id == scene_id]
     if not selected:
         raise ValueError(f"{deck.id}: unknown scene '{scene_id}'")
     output.mkdir(parents=True, exist_ok=True)
-    (output / "palettes.tex").write_text(palette_tex(deck.repository_root), encoding="utf-8")
-    metadata_file = output / "steps.json"
-    metadata = json.loads(metadata_file.read_text(encoding="utf-8")) if metadata_file.is_file() else {"version": 1, "scenes": []}
-    metadata["manifest"] = deck.animation.manifest
-    metadata["themes"] = sorted(set(metadata.get("themes", [])) | set(themes))
-    existing_metadata = {item["id"]: item for item in metadata["scenes"]}
-    reference_times = getattr(provider, "REFERENCE_TIMES", {})
-    for theme in themes:
-        manifest_file = output / theme / deck.animation.manifest
-        existing = (json.loads(manifest_file.read_text(encoding="utf-8"))["scenes"]
-                    if scene_id and manifest_file.is_file() else [])
-        scenes = {item["id"]: item for item in existing}
-        for cls in selected:
-            scene, scene_metadata = build_scene(
-                cls, theme, output, sample_rate, preview_output, paths=paths,
-                reference_time=reference_times.get(cls.scene_id),
-            )
-            scenes[scene["id"]] = scene
-            existing_metadata[scene["id"]] = scene_metadata
-            write_json(manifest_file, {"version": 1, "scenes": [
-                scenes[item.scene_id] for item in provider.SCENES if item.scene_id in scenes
-            ]})
-        print(f"{theme} manifest: {manifest_file.stat().st_size / 1024 / 1024:.2f} MiB", flush=True)
-    metadata["scenes"] = [existing_metadata[cls.scene_id]
-                          for cls in provider.SCENES if cls.scene_id in existing_metadata]
-    write_json(metadata_file, metadata)
-    (output / "steps.tex").write_text(metadata_tex(metadata, getattr(provider, "RESULTS", {})), encoding="utf-8")
+    paths.manim_work_dir.mkdir(parents=True, exist_ok=True)
+    # Lock the directory itself, whose identity stays fixed during publication.
+    # Exporters using a different cache still serialize updates to this output.
+    descriptor = os.open(output, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        with tempfile.TemporaryDirectory(prefix="export-", dir=paths.manim_work_dir) as temporary:
+            staged = Path(temporary) / "figures"
+            staged.mkdir()
+            previews = Path(temporary) / "previews" if preview_output is not None else None
+            previous, metadata = _stage_export(
+                deck, themes, paths, output, staged, previews, provider, selected, scene_id, sample_rate)
+            replacements = {output / source.relative_to(staged): source
+                            for source in sorted(staged.rglob("*")) if source.is_file()}
+            removals = {output / relative for relative in
+                        _generated_files(previous) - _generated_files(metadata)}
+            if previews is not None:
+                replacements.update({preview_output / source.relative_to(previews): source
+                                     for source in sorted(previews.rglob("*")) if source.is_file()})
+                removals.update(preview_output / relative for relative in
+                                _generated_files(previous, previews=True) - _generated_files(metadata, previews=True))
+            publish_files(replacements, removals)
+    finally:
+        os.close(descriptor)
     if preview_output is not None:
         print(f"PNG previews: {preview_output.resolve()}", flush=True)
 
