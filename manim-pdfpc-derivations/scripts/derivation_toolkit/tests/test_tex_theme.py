@@ -1,4 +1,4 @@
-"""Check copied math against the actual PDF glyphs and unchanged page pixels."""
+"""Check copied math, graphic backing and overlays in actual compiled PDFs."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -83,6 +83,87 @@ class TexThemeText(unittest.TestCase):
                             self.assertEqual(old.rect, new.rect)
                             self.assertEqual(old.get_pixmap(dpi=144).samples,
                                              new.get_pixmap(dpi=144).samples)
+
+
+@unittest.skipUnless(shutil.which("pdflatex"), "The graphics regression requires pdfTeX")
+class TexThemeGraphics(unittest.TestCase):
+    def check_graphics(self, document_class: str):
+        with tempfile.TemporaryDirectory(prefix="derivation-tex-graphics-") as directory:
+            root = Path(directory)
+            backgrounds = {"light": (221, 229, 238), "dark": (23, 32, 42)}
+            (root / "palette.tex").write_text("\n".join(
+                rf"\definecolor{{derivation{theme.title()}{role}}}{{HTML}}{{{value}}}"
+                for theme, background in backgrounds.items()
+                for role, value in (("Background", "".join(f"{x:02X}" for x in background)),
+                                    ("Foreground", "000000" if theme == "light" else "FFFFFF"),
+                                    ("Accent", "B72126"), ("Muted", "777777"),
+                                    ("Guide", "999999"), ("Faint", "DDDDDD"))))
+            # The empty part of this PDF is transparent, not painted white.
+            with fitz.open() as graphic:
+                page = graphic.new_page(width=20, height=20)
+                page.draw_rect(fitz.Rect(8, 8, 12, 12), color=None, fill=(0, 0, 0))
+                graphic.save(root / "graphic.pdf")
+            beamer = document_class == "beamer"
+            overlay = "<2->" if beamer else ""
+            picture = (r"\begin{tikzpicture}[remember picture,overlay]" + "\n" +
+                       r"\node[inner sep=0,outer sep=0,anchor=north west] at "
+                       r"([xshift=20bp,yshift=-20bp]current page.north west) {" +
+                       rf"\DerivationWhiteBackgroundGraphics{overlay}[width=40bp]{{graphic.pdf}}" + "};\n" +
+                       r"\node[inner sep=0,outer sep=0,anchor=north west] at "
+                       r"([xshift=80bp,yshift=-20bp]current page.north west) {" +
+                       rf"\DerivationUncoverGraphics{overlay}[width=40bp]{{graphic.pdf}}" + "};\n" +
+                       r"\end{tikzpicture}\mbox{}")
+            for theme, background in backgrounds.items():
+                with self.subTest(document_class=document_class, theme=theme):
+                    source = (rf"\documentclass{{{document_class}}}" + "\n" +
+                              rf"\def\DerivationTheme{{{theme}}}" + "\n" +
+                              rf"\def\DerivationRepositoryRoot{{{root.as_posix()}}}" + "\n" +
+                              rf"\input{{{THEME.as_posix()}}}" + "\n" +
+                              r"\pagestyle{empty}\pagecolor{derivationBackground}" + "\n" +
+                              r"\begin{document}" + "\n" +
+                              (r"\begin{frame}[plain]" if beamer else "") + picture +
+                              (r"\end{frame}" if beamer else "") +
+                              r"\end{document}" + "\n")
+                    (root / "fixture.tex").write_text(source)
+                    for _ in range(2):
+                        result = subprocess.run(
+                            ["pdflatex", "-interaction=nonstopmode", "-halt-on-error", "fixture.tex"],
+                            cwd=root, capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 0, result.stdout[-5000:])
+                    with fitz.open(root / "fixture.pdf") as document:
+                        self.assertEqual(len(document), 2 if beamer else 1)
+                        for number, page in enumerate(document):
+                            image = page.get_pixmap(dpi=144, alpha=False)
+
+                            def pixel(x, y):
+                                return image.pixel(round(x * 2), round(y * 2))[:3]
+
+                            def near(actual, expected):
+                                self.assertTrue(all(abs(a - e) <= 3 for a, e in zip(actual, expected)),
+                                                (document_class, theme, number, actual, expected))
+
+                            backing = (255, 255, 255) if theme == "dark" else background
+                            near(pixel(15, 15), background)
+                            if beamer and number == 0:
+                                near(pixel(24, 24), background)
+                                near(pixel(40, 40), background)
+                                near(pixel(84, 24), tuple(.16 * a + .84 * b
+                                                        for a, b in zip(backing, background)))
+                                near(pixel(100, 40), tuple(.84 * x for x in background))
+                            else:
+                                near(pixel(24, 24), backing)
+                                near(pixel(84, 24), backing)
+                                near(pixel(40, 40), (0, 0, 0))
+                                near(pixel(100, 40), (0, 0, 0))
+                                # The backing has no padding and graphics keep their requested size.
+                                near(pixel(19, 24), background)
+                                near(pixel(61, 24), background)
+
+    def test_article_graphics_backing_in_both_themes(self):
+        self.check_graphics("article")
+
+    def test_beamer_graphics_reveal_and_fade_in_both_themes(self):
+        self.check_graphics("beamer")
 
 
 if __name__ == "__main__":

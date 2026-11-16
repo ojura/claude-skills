@@ -38,6 +38,11 @@ If a symbol's position changes for layout, make that distinct from a geometric
 transformation. Check text at the start, middle and end of each motion for
 collisions, clipping, lingering glyphs and unexpected fills.
 
+Same-text fades and affine movement can be composed with `AnimationGroup` or
+`Succession`. The recorder checks each transformation target when that child
+starts, including delayed children. A transform into different text or an empty
+target is rejected; replace changed content with separately authored objects.
+
 ## Keep geometric annotations complete
 
 Build related geometric marks with one shared constructor and migrate comparable
@@ -82,4 +87,3 @@ and that the next-slide preview remains useful.
 For pacing, watch the complete sequence at normal speed after inspecting
 individual frames. Consider what the lecturer needs to say at each pause and
 what a student must visually follow during each movement.
-

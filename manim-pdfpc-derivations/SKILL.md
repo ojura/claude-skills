@@ -15,9 +15,9 @@ player.
 
 Read the repository's `AGENTS.md` and presentation build guide before editing.
 Check the working tree, publication workflow, supported themes and output paths.
-Use an isolated worktree for a repository that syncs edits to Overleaf. Preserve
-the existing deck order, notation and lecturer's teaching approach unless the
-task requests a broader revision.
+Use an isolated worktree on its own named branch for a repository that syncs
+edits to Overleaf. Preserve the existing deck order, notation and lecturer's
+teaching approach unless the task requests a broader revision.
 
 Read [Toolkit installation and interfaces](references/toolkit.md) when installing
 the suite, adding a project, changing a provider or integrating TeX, HTML or
@@ -39,7 +39,7 @@ update the consumer through the installer. Its lock check identifies local
 changes before an update.
 
 Register a new deck in the repository catalog before using the shared commands.
-For an isolated prototype, add that entry only in its detached worktree.
+For an isolated prototype, add that entry only on its worktree's named branch.
 
 Read the selected provider, scene registration, document figure macros and a
 comparable scene. Use the installed `derivation_toolkit.animation` modules. Read
@@ -103,8 +103,12 @@ or replacement with a supported operation. Preserve the intended object order
 and explicit z ordering. Check brackets, filled paths, masks and fading objects
 at intermediate times.
 
-Use `play()` for motion driven by updaters; `wait()` records a hold. Define
-checkpoints after the geometry and text have reached their complete state.
+Use `play()` for animated motion. `wait()` samples time-based mobject and scene
+updaters; use `frozen_frame=True` for an unchanged reading pause. Callbacks see
+the current absolute `scene.time`, and `wait_until()` stops at the first sampled
+state satisfying its condition. Instantaneous edits take effect at their current
+time without altering a completed hold. Define checkpoints after the geometry
+and text have reached their complete state.
 
 Use vector mobjects supported by the exporter. If an effect requires a raster
 image, shader, camera trick or unsupported text morph, adapt the design to the
@@ -212,5 +216,6 @@ by the user. Verify a packaged viewer from its delivered artifact when packaging
 changed, and report concrete remaining issues.
 
 Remove owned temporary processes and disposable build output after their use.
-Keep user windows, unrelated edits, needed figure assets and the requested
-worktree intact.
+Remove merged contribution worktrees after confirming their changes are
+integrated and no process still needs them. Keep user windows, unrelated edits,
+needed figure assets and any development worktree the user asked to retain.

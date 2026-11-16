@@ -73,6 +73,10 @@ def main(argv=None, *, default_project=None) -> int:
     html = commands.add_parser("html", help="Package compiled pages and vectors into a self-contained HTML file")
     add_arguments(html)
 
+    from .web.render_video import add_arguments as add_video_arguments
+    video = commands.add_parser("video", help="Render a requested MP4 from compiled pages and their vector timelines")
+    add_video_arguments(video)
+
     native = commands.add_parser("native", help="Build the pinned pdfpc viewer or headless vector probe")
     native.add_argument("--cache-root", type=Path)
     native.add_argument("--probe", action="store_true")
@@ -173,6 +177,10 @@ def main(argv=None, *, default_project=None) -> int:
                           inputs=args.inputs, host_output_dir=args.host_output_dir)
         print(json.dumps(report, indent=2))
         return 0 if report["ok"] else 1
+    if args.command == "video":
+        from .web.render_video import run
+        run(args, catalog, argv)
+        return 0
     themes = list(THEMES) if args.theme == "both" else [args.theme]
     if args.command == "html":
         from .web.build import run

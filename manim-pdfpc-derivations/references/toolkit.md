@@ -6,6 +6,7 @@
 - [Include figures in TeX](#include-figures-in-tex)
 - [Build the document editions](#build-the-document-editions)
 - [Package HTML](#package-html)
+- [Render a requested video](#render-a-requested-video)
 - [Use native presentation tools](#use-native-presentation-tools)
 - [Run the toaster example](#run-the-toaster-example)
 - [Add the reusable CI workflow](#add-the-reusable-ci-workflow)
@@ -33,6 +34,20 @@ an installation independently with the same installer and `--check --project`;
 add `--source` to compare the lock with its committed canonical source. An update
 requires the previous installation to match its lock. Preserve local edits in
 the canonical skill, publish them, then install the new revision.
+
+The generated entry text comes from the selected revision's `entrypoint.py.in`,
+not from the updater currently running. Offline verification also checks that
+the entry matches its installed template; `--check --source` compares both with
+the requested committed source. Earlier revisions with a literal `BOOTSTRAP`
+definition are read from that revision's `install.py` without executing it.
+
+An interrupted or failed update restores the prior package, entry point, lock
+and managed workflow. If restoration also fails, the error names a retained
+`.toolkit-install-*` directory beside the installed package. It contains the
+old package under `previous/`, saved generated files under `metadata/`, and
+`RECOVERY.txt` with their destination paths. Resolve the reported I/O error,
+restore those files, run the canonical installer with `--check`, then remove
+that recovery directory. Successful updates and rollbacks remove it themselves.
 
 Add `--ci` to install `.github/workflows/derivation-toolkit.yml` from the same
 committed toolkit. Commit that managed workflow too. Its hash is part of the
@@ -134,6 +149,27 @@ Layer values must be finite. Export sorts the layer and path order separately,
 then assigns numeric timeline ranks, so fractional and large layers retain the
 same overlap order as the static figures.
 
+`scene.time` is the absolute time of the state being evaluated, including inside
+animation and updater callbacks. `wait(duration, stop_condition=None,
+frozen_frame=None)` follows Manim's wait selection: time-based mobject updaters,
+scene updaters, `always_update_mobjects` or a stop condition require sampled
+updates. `frozen_frame=False` also evaluates position-only updaters;
+`frozen_frame=True` evaluates no updaters. `pause()` selects a frozen wait.
+`wait_until(condition, max_time)` stops at the first sampled state that satisfies
+the condition, or at the requested limit. A condition already true at the start
+does not advance time. A frozen wait cannot have a stop condition.
+
+Direct edits such as `remove()` or `shift()` at an already recorded time become
+instantaneous changes. The export retains the old state at the immediately
+preceding representable floating-point time and the new state at the boundary.
+Keyframe times remain strictly increasing; keep those full-precision timestamps
+when processing the JSON. Several edits at the same time preserve the original
+pre-edit state and publish their final result. New paths remain hidden before
+their introduction. At time zero, edits simply define the initial state.
+Animation durations must be finite and nonnegative; a positive duration must
+advance the microsecond authoring clock. Updaters and stop conditions are sampled
+at the scene's configured `sample_rate`, with the duration endpoint included.
+
 `checkpoint(label, caption, crop=None, handout=None, pause=True)` saves a printed
 state. `label` is the live control label; `caption` is authored TeX for the printed
 panel. `handout` accepts compact mobjects, and `crop` is `[x, y, width, height]` in
@@ -169,6 +205,15 @@ compact/full PDF figures, `steps.json` and `steps.tex`. `--scene` selects one
 registered scene. Use `--output-dir` and `--preview-output` for explicit paths.
 An export to the catalog's declared assets directory publishes figures for
 direct document builds, including Overleaf.
+
+Use `--theme light` or `--theme dark` for a geometry or colour update whose
+shared captions, checkpoint times, figure dimensions and handout layout are
+unchanged. When those shared definitions change in an existing two-theme
+export, regenerate the affected scenes with `--theme both`. Both themes must
+produce matching definitions. Rendering and validation finish before figures,
+timelines, metadata and requested previews are published; a rejected update
+leaves the previous files intact. Successful updates remove obsolete generated
+panels named in the previous metadata and preserve unrelated output files.
 
 ## Include figures in TeX
 
@@ -223,8 +268,10 @@ sets the row count and figure height. `\DerivationGraphicOptions` defaults to
 The theme exposes active `derivationBackground`, `derivationForeground` and
 the other palette roles. It applies Beamer colours and covered-item fading;
 article fonts and page colours remain under the report's control.
-`\DerivationLegacyGraphics` supplies a white backing for legacy figures in dark
-mode. `\DerivationUncoverGraphics` provides a fading overlay-aware figure.
+`\DerivationWhiteBackgroundGraphics` puts a zero-padding white background behind
+the included graphic in dark mode and includes it unchanged in light mode.
+Use it for figures whose labels and colours assume a light background.
+`\DerivationUncoverGraphics` applies the same treatment with overlay-aware fading.
 
 Load `tex/code.tex` after the theme when listings are needed. It defines
 `derivationconsole` and `derivationconsoletext`, each accepting an optional
@@ -255,6 +302,22 @@ auxiliaries under the build root. Each animated live PDF receives its matching
 frames using Beamer's actual navigation metadata. Handouts require one physical
 page per logical frame.
 
+Each build requires fresh PDF and navigation output, and compares the navigation
+with the PDF's actual page count using installed `pdfinfo` or TeX's `texlua` PDF
+reader. The Python build path needs only the standard library. The PDF, page map
+and live timeline are prepared together; validation or publication failure
+preserves the previous output set. Preparing an explicit PDF preserves its
+authored page map, or creates a physical-page map when the input has none, and
+removes an obsolete destination timeline when the input is static.
+
+Compiled inputs are checked before any delivery files are replaced. Native
+collection and document builds inspect actual PDF URI annotations through
+installed Poppler GLib or TeX Live's `texlua`; HTML packaging uses its PDF reader.
+Every `pdfpc-vector:` link must name a scene in the matching timeline. The shared
+version-1 validator checks every scene, checkpoint, path and keyframe, including
+sparse coordinates and numeric bounds. IDs and labels must be well-formed Unicode
+without NUL characters. A static PDF needs no timeline.
+
 ## Package HTML
 
 Install the pinned PDF.js dependency under `build/tools/html5` by copying the
@@ -270,6 +333,12 @@ The output contains a self-contained `index.html`, its license and instructions;
 an adjacent ZIP includes the same files. Open `index.html` directly in Chrome
 or Firefox. The embedded PDF.js, PDFs and vectors also support a synchronized
 projector window.
+
+The HTML, license, instructions and optional ZIP are prepared before publication.
+Replacing that complete set is serialized with other writers to the same output
+parent; a failed or interrupted replacement restores the prior files. Notes and
+other unrelated files beside `index.html` are preserved and excluded from the
+ZIP. `--no-zip` updates only the HTML bundle and leaves an existing ZIP unchanged.
 
 For an externally compiled document, pass its PDF and matching vector timeline:
 
@@ -294,9 +363,42 @@ supplies the mapping. Explicit maps use version 1, `logicalSlides`, and a `pages
 list with `number` and `logical` integers. Animated compiled inputs need their
 matching timeline; preserve the page-map sidecar when moving Beamer PDFs.
 
+An animation region may have a different aspect ratio from its scene. The player
+fits and centers the scene within that rectangle; keep the authored rectangle
+rather than resizing the PDF annotation to satisfy a packaging check.
+
 Use the shared [browser verification command](verification.md#exercise-the-standalone-browser-document)
 to exercise the actual file and projector in Chrome and Firefox, including
 transition frames.
+
+## Render a requested video
+
+Use the compiled live PDF and its matching timeline when a video is requested:
+
+```bash
+python3 tools/derivations.py video example \
+  --pdf build/decks/example/example-light-live.pdf \
+  --first-page 2 --last-page 4 --fps 60 --width 1920 \
+  --output build/video/example-excerpt.mp4
+```
+
+The command uses the toolkit's locked authoring interpreter and requires FFmpeg
+on `PATH`. Its first run prepares the authoring environment when necessary;
+`--cache-root` selects that environment's build location. The PDF's adjacent
+`.vector.json` is used by default, or `--vectors` selects an explicit timeline.
+Static pages need no timeline. Selected pages must share an aspect ratio.
+
+The H.264 MP4 retains authored motion timing and adds reading pauses: one second
+at an animation's opening, two seconds at its final state, and
+`--checkpoint-hold` seconds at intermediate stops (default one). Static slides
+use `--static-hold` seconds (default three). PDF pages become video chapters.
+`--snapshots build/video/review` also writes checkpoint and midpoint PNGs.
+
+Choose a new output filename for each render. The command publishes the complete
+movie only after encoding succeeds and preserves any file or symbolic link
+already at that name, including one created while the encoder runs. A failed
+or interrupted render closes and reaps its encoder and removes its partial
+movie. The default output is below `build/decks/<deck-id>/video/`.
 
 ## Use native presentation tools
 

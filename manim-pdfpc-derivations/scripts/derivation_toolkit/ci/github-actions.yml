@@ -93,6 +93,8 @@ jobs:
             --env SOURCE_CHECKS --env ARTIFACT_CHECKS --env BUILD_COMMAND --env PACKAGE_INPUTS \
             derivation-assets:ci bash -euc '
               export PATH="/opt/manim/bin:$PATH"
+              ffmpeg -version >/dev/null
+              ffprobe -version >/dev/null
               python3 -B -m unittest discover -s tools/vendor/manim_pdfpc/derivation_toolkit/tests \
                 -t tools/vendor/manim_pdfpc -v
               if [[ -n $SOURCE_CHECKS ]]; then bash -euc "$SOURCE_CHECKS"; fi

@@ -8,6 +8,7 @@ performed, and none of this metadata enters a native animation keyframe.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
 from functools import lru_cache
@@ -576,16 +577,71 @@ def validate_text_tree(mobjects):
                         f"for {member.tex_string!r}")
 
 
+def _validate_text_target(source, target):
+    before = _signature(source)
+    after = [] if target is None else _signature(target)
+    if any(item is not None for item in before + after) and before != after:
+        raise TextMappingError("Transform changes TeX content/topology; author an explicit semantic transition")
+
+
 def validate_text_transform(animation):
-    """Require an explicit semantic transition for a different-text morph."""
-    if isinstance(animation, Transform):
-        target = animation.target_mobject
-        if target is not None:
-            before, after = _signature(animation.mobject), _signature(target)
-            if any(item is not None for item in before + after) and before != after:
-                raise TextMappingError("Transform changes TeX content/topology; author an explicit semantic transition")
+    """Check explicit targets; use text_animation_checks while playing a scene."""
+    if isinstance(animation, Transform) and animation.target_mobject is not None:
+        _validate_text_target(animation.mobject, animation.target_mobject)
     for child in getattr(animation, "animations", ()):
         validate_text_transform(child)
+
+
+@contextmanager
+def text_animation_checks(animations):
+    """Check each target at its scheduled creation, before glyph alignment.
+
+    Succession creates later targets during playback. These instance-local
+    adapters leave that scheduling to Manim and restore the original methods
+    when play finishes or raises. No animation class is modified.
+    """
+    missing = object()
+    originals = []
+
+    def replace_method(animation, name, replacement):
+        originals.append((animation, name, animation.__dict__.get(name, missing)))
+        setattr(animation, name, replacement)
+
+    def check_transform(animation):
+        create_target, begin = animation.create_target, animation.begin
+
+        def checked_target(*args, **kwargs):
+            target = create_target(*args, **kwargs)
+            _validate_text_target(animation.mobject, target)
+            return target
+
+        def checked_begin(*args, **kwargs):
+            result = begin(*args, **kwargs)
+            # Some Transform subclasses implement begin without create_target.
+            # Check only this started child, not its still-deferred siblings.
+            _validate_text_target(animation.mobject, animation.target_mobject)
+            return result
+
+        replace_method(animation, "create_target", checked_target)
+        replace_method(animation, "begin", checked_begin)
+
+    try:
+        pending, seen = list(animations), set()
+        while pending:
+            animation = pending.pop()
+            if id(animation) in seen:
+                continue
+            seen.add(id(animation))
+            if isinstance(animation, Transform):
+                check_transform(animation)
+            pending.extend(getattr(animation, "animations", ()))
+        yield
+    finally:
+        for animation, name, original in reversed(originals):
+            if original is missing:
+                animation.__dict__.pop(name, None)
+            else:
+                setattr(animation, name, original)
 
 
 class _SemanticText:
