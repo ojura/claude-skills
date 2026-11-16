@@ -334,6 +334,12 @@ an adjacent ZIP includes the same files. Open `index.html` directly in Chrome
 or Firefox. The embedded PDF.js, PDFs and vectors also support a synchronized
 projector window.
 
+The HTML, license, instructions and optional ZIP are prepared before publication.
+Replacing that complete set is serialized with other writers to the same output
+parent; a failed or interrupted replacement restores the prior files. Notes and
+other unrelated files beside `index.html` are preserved and excluded from the
+ZIP. `--no-zip` updates only the HTML bundle and leaves an existing ZIP unchanged.
+
 For an externally compiled document, pass its PDF and matching vector timeline:
 
 ```bash
