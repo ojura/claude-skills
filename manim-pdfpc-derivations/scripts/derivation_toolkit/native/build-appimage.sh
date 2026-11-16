@@ -88,8 +88,7 @@ mkdir -p -- "$appdir"
 DESTDIR="$appdir" cmake --install "$native_build"
 payload="$appdir/usr/share/derivation-presentations"
 mkdir -p -- "$payload" "$appdir/etc/fonts" "$appdir/usr/share/fonts/truetype" \
-    "$appdir/usr/share/icons" "$appdir/usr/share/doc/$identity" \
-    "$appdir/usr/lib/gio/modules"
+    "$appdir/usr/share/icons" "$appdir/usr/lib/gio/modules"
 python3 -B -m derivation_toolkit.package_assets "${asset_args[@]}" --destination "$payload"
 mapfile -t asset_names < <(find "$payload" -type f -printf '%P\n' | LC_ALL=C sort)
 install -m 0644 -- "$packaging_dir/fonts.conf" "$appdir/etc/fonts/fonts.conf.in"
@@ -104,11 +103,6 @@ cp -a -- /usr/share/mime "$appdir/usr/share/"
 for package in fonts-dejavu-core adwaita-icon-theme hicolor-icon-theme shared-mime-info; do
     install -D -m 0644 -- "/usr/share/doc/$package/copyright" \
         "$appdir/usr/share/doc/$package/copyright"
-done
-for license in COPYING LICENSE; do
-    if [[ -f "$native_source/$license" ]]; then
-        install -m 0644 -- "$native_source/$license" "$appdir/usr/share/doc/$identity/$license"
-    fi
 done
 desktop_file="$work_dir/$identity.desktop"
 package_icon="$work_dir/$identity.svg"
@@ -188,6 +182,8 @@ build_info="$payload/build-info.txt"
     dpkg-query -W -f='${Package} ${Version}\n'
 } > "$build_info"
 cp -- "$build_info" "$output_file.build-info.txt"
+python3 -B -m derivation_toolkit.verify.runtime documentation \
+    --appdir "$appdir" --source "$native_source"
 ARCH=x86_64 "$appimagetool" --runtime-file "$tool_dir/runtime-x86_64" \
     --comp zstd "$appdir" "$output_file"
 chmod 0755 "$output_file"

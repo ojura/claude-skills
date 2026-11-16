@@ -20,6 +20,32 @@ import time
 import traceback
 
 
+NATIVE_DOCUMENTS = {
+    "LICENSE.txt": "LICENSE.txt",
+    "VECTOR_ANIMATIONS.md": "VECTOR_ANIMATIONS.md",
+    "examples/vector_animation.py": "demo/vector_animation.py",
+    "examples/vector-animation.pdf": "demo/vector-animation.pdf",
+    "examples/vector-animation.vector.json": "demo/vector-animation.vector.json",
+}
+
+
+def verify_native_documentation(appdir, source=None):
+    """Check the native install's documentation before packaging or playback tests."""
+    appdir = Path(appdir)
+    directory = appdir / "usr/share/doc/pdfpc"
+    installed = []
+    for relative, original in NATIVE_DOCUMENTS.items():
+        filename = directory / relative
+        if not filename.is_file() or not filename.stat().st_size:
+            raise ValueError("Missing or empty installed viewer document: " + str(filename))
+        if source is not None:
+            expected = Path(source) / original
+            if not expected.is_file() or filename.read_bytes() != expected.read_bytes():
+                raise ValueError("Installed viewer document differs from native source: " + str(filename))
+        installed.append(str(filename.relative_to(appdir)))
+    return installed
+
+
 
 def digest(filename):
     return hashlib.sha256(Path(filename).read_bytes()).hexdigest()
@@ -323,6 +349,7 @@ def catalog_smoke(appimage, fixtures, output, environment):
     with tempfile.TemporaryDirectory(prefix="extracted package ", dir=directory) as temporary:
         command([str(appimage), "--appimage-extract"], environment, timeout=120, cwd=temporary)
         appdir = Path(temporary) / "squashfs-root"
+        result["native_documentation"] = verify_native_documentation(appdir)
         invocation = [str(appdir / "AppRun"), "--cache-root", str(cache)]
         environment["APPDIR"] = str(appdir)
         environment["APPIMAGE"] = str(appimage)
@@ -667,9 +694,15 @@ def main():
     runtime.add_argument("--expected-ubuntu", choices=("20.04", "24.04"), required=True)
     fonts = commands.add_parser("font-check", help="Check the actual bundled Fontconfig environment")
     fonts.add_argument("--appdir", type=Path, required=True)
+    documentation = commands.add_parser("documentation", help="Check installed viewer documentation")
+    documentation.add_argument("--appdir", type=Path, required=True)
+    documentation.add_argument("--source", type=Path)
     options = parser.parse_args()
     if options.operation == "font-check":
         print(json.dumps(font_resolution(options.appdir), indent=2))
+        return 0
+    if options.operation == "documentation":
+        print(json.dumps(verify_native_documentation(options.appdir, options.source), indent=2))
         return 0
     return prepare(options) if options.operation == "prepare" else run(options)
 
