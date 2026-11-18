@@ -176,6 +176,110 @@ def exercise_scene(view, fixture, theme, page, output, prefix, reports):
             "continuousMotion": True, "initial": initial}
 
 
+def exercise_audience_controls(view, projector, fixture, url, page, theme):
+    """Drive real keys in the audience and observe both displayed windows."""
+    views = (view, projector)
+    source = scene_at(fixture, theme, page)
+    channel = "document.documentElement.dataset.presentationChannel"
+    connected = "document.documentElement.dataset.controllerConnected === 'true'"
+    projector.wait(connected)
+    checks = []
+    if source:
+        initial = projector.eval("document.getElementById('vector').toDataURL()")
+        presenter_initial = view.eval("document.getElementById('vector').toDataURL()")
+        first = source["checkpoints"][1]["time"]
+        projector.key("ArrowRight", ctrl=True)
+        for participant in views:
+            wait_time(participant, first)
+        # A teaching segment may deliberately hold the same figure. When the
+        # presenter changes pixels, check the audience's canvas independently.
+        if view.eval("document.getElementById('vector').toDataURL()") != presenter_initial:
+            assert projector.eval("document.getElementById('vector').toDataURL()") != initial
+        projector.key("ArrowLeft", ctrl=True)
+        for participant in views:
+            wait_time(participant, 0)
+        projector.key(" ")
+        for participant in views:
+            wait_time(participant, first)
+        projector.key("r")
+        for participant in views:
+            wait_time(participant, 0)
+        if source["duration"] >= .5:
+            projector.key("v")
+            for participant in views:
+                participant.wait("document.getElementById('clock').textContent.includes('playing')")
+            projector.key("a")
+            view.wait("document.getElementById('clock').textContent.includes('paused')")
+            clock = view.eval("document.getElementById('clock').textContent")
+            projector.wait("document.getElementById('clock').textContent === " + json.dumps(clock))
+        projector.key("e")
+        for participant in views:
+            wait_time(participant, source["duration"])
+        checks.append("audience-seek/segment/restart/continuous/pause/finish")
+    projector.key("b")
+    for participant in views:
+        participant.wait("document.getElementById('blank').hidden === false")
+    before = view.playback_state()
+    projector.key("a")
+    projector.key("v")
+    time.sleep(.2)
+    assert view.playback_state() == before
+    projector.key("b")
+    for participant in views:
+        participant.wait("document.getElementById('blank').hidden === true")
+    checks.append("audience-blank/paused-inputs")
+    if page < len(fixture["manifest"]["themes"][theme]["pages"]):
+        projector.key("ArrowRight")
+        for participant in views:
+            ready(participant, page + 1, theme)
+        projector.key("r")
+        projector.key("ArrowLeft")
+        for participant in views:
+            ready(participant, page, theme)
+        checks.append("audience-page-navigation")
+    projector.reload()
+    projector.wait(connected)
+    ready(projector, page, theme)
+    clock = view.eval("document.getElementById('clock').textContent")
+    projector.wait("document.getElementById('clock').textContent === " + json.dumps(clock))
+    checks.append("audience-reload")
+    old_channel = view.eval(channel)
+    view.reload()
+    ready(view, page, theme)
+    new_channel = view.eval(channel)
+    assert new_channel != old_channel
+    projector.wait(connected + " && " + channel + " === " + json.dumps(new_channel))
+    ready(projector, page, theme)
+    if source:
+        wait_time(projector, 0)
+    checks.append("presenter-reload/repaired-projector")
+    view.navigate("about:blank")
+    projector.wait("document.documentElement.dataset.controllerConnected === 'false' && "
+                   "document.getElementById('connection').hidden === false")
+    frozen = projector.eval("[document.getElementById('clock').textContent, "
+                            "document.getElementById('vector').toDataURL(), "
+                            "document.getElementById('blank').hidden]")
+    for key in ("ArrowRight", "v", "b"):
+        projector.key(key, ctrl=key == "ArrowRight")
+    time.sleep(.2)
+    assert projector.eval("[document.getElementById('clock').textContent, "
+                          "document.getElementById('vector').toDataURL(), "
+                          "document.getElementById('blank').hidden]") == frozen
+    view.navigate(url + "?theme=" + quote(theme) + "#p=" + str(page))
+    ready(view, page, theme)
+    projector.wait(connected + " && " + channel + " === " + json.dumps(view.eval(channel)))
+    ready(projector, page, theme)
+    if source:
+        projector.key("ArrowRight", ctrl=True)
+        for participant in views:
+            wait_time(participant, first)
+        projector.key("r")
+        for participant in views:
+            wait_time(participant, 0)
+    checks.append("presenter-disconnect/reconnect")
+    return checks
+
+
 def exercise_projector(view, fixture, url, output, prefix, reports):
     themes = list(fixture["manifest"]["themes"])
     theme = themes[-1]
@@ -193,6 +297,11 @@ def exercise_projector(view, fixture, url, output, prefix, reports):
     checks = ["visible-projector-control"]
     try:
         surface(projector, fixture, theme, anchor)
+        checks.extend(exercise_audience_controls(view, projector, fixture, url, anchor, theme))
+        # Reload restores the ordinary layout; the remaining checks include the
+        # presenter preview and need that layout enabled again.
+        view.click("presenter-mode")
+        surface(view, fixture, theme, anchor)
         source = scene_at(fixture, theme, anchor)
         if source:
             view.click("next")

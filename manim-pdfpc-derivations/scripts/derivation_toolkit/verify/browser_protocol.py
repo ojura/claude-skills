@@ -77,7 +77,9 @@ class CDP:
     def playback_state(self):
         # The projector protocol carries the unrounded time and playback target.
         return self.eval("""new Promise((resolve, reject) => {
-            const probe = new BroadcastChannel("derivation-html5-" + location.pathname);
+            const name = document.documentElement.dataset.presentationChannel ||
+                         "derivation-html5-" + location.pathname;
+            const probe = new BroadcastChannel(name);
             const timer = setTimeout(() => {
                 probe.close();
                 reject(new Error("No presenter state arrived"));
@@ -253,6 +255,14 @@ class Chrome(CDP):
         # that document so every fixture starts from its declared URL state.
         if not result.get("loaderId"):
             self.call("Page.reload")
+        self._wait_document(previous, url)
+
+    def reload(self):
+        previous = self.eval("performance.timeOrigin")
+        self.call("Page.reload")
+        self._wait_document(previous, "the current presentation")
+
+    def _wait_document(self, previous, url):
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
@@ -327,6 +337,9 @@ class Firefox:
     def pages(self):
         pages = self.protocol.call("browsingContext.getTree", {})["contexts"]
         return [{"id": page["context"], "url": page["url"]} for page in pages]
+
+    def reload(self):
+        self.protocol.call("browsingContext.reload", {"context": self.context, "wait": "complete"})
 
     def view(self, page):
         return Firefox(self.protocol, page["id"])

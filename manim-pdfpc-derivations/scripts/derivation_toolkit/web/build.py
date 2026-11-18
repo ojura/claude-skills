@@ -216,7 +216,8 @@ def build_bundle(catalog: Catalog, deck: Deck, *, output: Path | None = None,
             "Left returns to the previous step; Ctrl+Left/Right seeks within a page.\n"
             "A pauses/resumes, V plays continuously, R restarts, E shows the end.\n"
             "F is fullscreen, B blanks and pauses, P shows presenter layout.\n"
-            "Projector opens a synchronized audience window.\n"
+            "Projector opens a synchronized audience window; its keys control the same presentation.\n"
+            "Each presenter/projector pair is independent. Fullscreen affects only the focused window.\n"
             f"Contains Mozilla PDF.js {PDFJS_VERSION}, Apache 2.0; its license is included.\n",
             encoding="utf-8",
         )

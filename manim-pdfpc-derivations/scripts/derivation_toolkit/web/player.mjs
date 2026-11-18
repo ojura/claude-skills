@@ -17,14 +17,28 @@ const ui = {
   theme: byId("theme"), speed: byId("speed"), clock: byId("clock"),
   presenter: byId("presenter"), presenterMode: byId("presenter-mode"),
   fullscreen: byId("fullscreen"), projector: byId("projector"),
-  error: byId("error"),
+  error: byId("error"), connection: byId("connection"),
 };
 const query = new URLSearchParams(location.search);
 const audience = query.get("audience") === "1";
-const channel = "BroadcastChannel" in window ?
-  new BroadcastChannel("derivation-html5-" + location.pathname) : null;
+// A deck can be open in several presenter tabs. Pair each projector with the
+// controller that opened it, including when the same file is opened twice.
+let controllerId = audience ? query.get("controller") :
+  Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
+let channel = null;
+let controllerConnected = !audience;
+let connectionGeneration = 0;
+let projectorWindow = null;
+let pairingTimer = null;
+let lastControllerContact = 0;
 const documents = new Map();
 const timelines = new Map();
+const commandActions = new Set([
+  "next", "previous", "step-next", "step-back", "play", "continuous",
+  "restart", "finish", "blank", "first", "last", "theme", "speed",
+]);
+const commands = [];
+let executingCommands = false;
 
 let manifest;
 let theme;
@@ -44,10 +58,9 @@ let pendingPreview = 0;
 let previewTask = null;
 let lastBroadcast = 0;
 let lastDisplayedTime = -1;
-let projectorRequested = false;
 let animationFrame = null;
 let latestRemote = null;
-let applyingRemote = false;
+let applyingRemote = null;
 let vectorScale = 1;
 
 function scheduleAnimation() {
@@ -141,7 +154,7 @@ function paintVector() {
 }
 
 function sendState(force = false) {
-  if (!channel || audience) return;
+  if (!channel || audience || !manifest) return;
   const now = performance.now();
   if (!force && now - lastBroadcast < 100) return;
   lastBroadcast = now;
@@ -230,16 +243,19 @@ function fittedPageBox(meta) {
 }
 
 async function showPage(number, opts = {}) {
-  const requestedTheme = theme;
-  const entry = activeMetadata();
+  const requestedTheme = opts.theme || theme;
+  const entry = manifest.themes[requestedTheme];
   const next = Math.max(0, Math.min(entry.pages.length - 1, number));
   const changed = next !== pageIndex;
   const navigation = changed || ui.slide.dataset.renderedTheme !== requestedTheme;
   const previous = pageRender;
-  const sameRequest = previous?.page === next && previous.theme === requestedTheme;
+  const generation = connectionGeneration;
+  const sameRequest = previous?.page === next && previous.theme === requestedTheme &&
+    previous.generation === generation;
   const token = ++renderSerial;
+  const currentRequest = () => token === renderSerial && (!audience || generation === connectionGeneration);
   const request = {
-    page: next, theme: requestedTheme,
+    page: next, theme: requestedTheme, generation,
     backwards: opts.backwards || (opts.keepTime && sameRequest && previous.backwards),
     remoteState: opts.remoteState || (sameRequest && previous.remoteState),
     pdfTask: null, textLayer: null, finished: Promise.withResolvers(),
@@ -247,23 +263,25 @@ async function showPage(number, opts = {}) {
   pageRender = request;
   previous?.pdfTask?.cancel();
   previous?.textLayer?.cancel();
-  pageIndex = next;
-  if (changed && !opts.keepTime) time = 0;
+  if (!audience) {
+    pageIndex = next;
+    if (changed && !opts.keepTime) time = 0;
+    if (navigation) scene = null;
+    if (changed) playTarget = time;
+  }
   if (!opts.keepTime || navigation) playing = false;
-  if (navigation) scene = null;
-  if (changed) playTarget = time;
   ui.slide.setAttribute("aria-busy", "true");
   ui.loading.hidden = currentPdfPage !== null;
   ui.loading.textContent = "Rendering slide " + String(next + 1) + "…";
-  setProgress();
+  if (!audience || currentPdfPage) setProgress();
   if (!audience && navigation) {
     history.replaceState(null, "", "#p=" + String(next + 1));
   }
   try {
     const [pdf, scenes] = await themeAssets(requestedTheme);
-    if (token !== renderSerial) return;
+    if (!currentRequest()) return;
     const page = await pdf.getPage(next + 1);
-    if (token !== renderSerial) return;
+    if (!currentRequest()) return;
     const meta = entry.pages[next];
     const nextScene = meta.scene ? scenes.get(meta.scene.id) : null;
     if (meta.scene && !nextScene) throw new Error("Missing Manim scene: " + meta.scene.id);
@@ -287,7 +305,7 @@ async function showPage(number, opts = {}) {
     });
     await request.pdfTask.promise;
     request.pdfTask = null;
-    if (token !== renderSerial) return;
+    if (!currentRequest()) return;
     nextText.style.setProperty("--total-scale-factor", String(viewport.scale));
     request.textLayer = new pdfjs.TextLayer({
       textContentSource: page.streamTextContent(),
@@ -295,9 +313,13 @@ async function showPage(number, opts = {}) {
     });
     await request.textLayer.render();
     request.textLayer = null;
-    if (token !== renderSerial) return;
+    if (!currentRequest()) return;
     const remoteState = audience ? latestRemote || request.remoteState : null;
     if (remoteState && (remoteState.page !== next || remoteState.theme !== requestedTheme)) return;
+    // Keep projector metadata and playback attached to its displayed page until
+    // the current connection's PDF, vectors and text can commit together.
+    pageIndex = next;
+    theme = requestedTheme;
     scene = nextScene;
     if (remoteState) setRemotePlayback(remoteState);
     else {
@@ -332,7 +354,7 @@ async function showPage(number, opts = {}) {
       sendState(true);
     }
   } catch (error) {
-    if (token === renderSerial) {
+    if (currentRequest()) {
       ui.loading.hidden = true;
       errorMessage(error);
     }
@@ -427,80 +449,247 @@ function previous() {
   else stepSlide(-1);
 }
 
+function validCommand(action, value) {
+  if (!commandActions.has(action)) return false;
+  if (action === "theme") return typeof value === "string" && Object.hasOwn(manifest.themes, value);
+  if (action === "speed") return [0.5, 0.75, 1, 1.5, 2].includes(value);
+  return value === undefined;
+}
+
+function submitCommand(action, value) {
+  if (!validCommand(action, value)) return;
+  if (audience) {
+    if (channel && controllerConnected) channel.postMessage({ type: "command", action, value });
+    else requestPairing();
+    return;
+  }
+  commands.push({ action, value });
+  drainCommands();
+}
+
+async function drainCommands() {
+  if (executingCommands) return;
+  executingCommands = true;
+  try {
+    while (commands.length) {
+      // Navigation clears scene before PDF.js commits the incoming page.
+      // Decide each command only after that page is ready, so a second Next
+      // starts its derivation instead of accidentally skipping the page.
+      while (pageRender) await pageRender.finished.promise;
+      const { action, value } = commands.shift();
+      executeCommand(action, value);
+    }
+  } catch (error) {
+    commands.length = 0;
+    errorMessage(error);
+  } finally {
+    executingCommands = false;
+  }
+}
+
+function executeCommand(action, value) {
+  switch (action) {
+    case "next": next(); break;
+    case "previous": previous(); break;
+    case "step-next": nextCheckpoint(1); break;
+    case "step-back": nextCheckpoint(-1); break;
+    case "play": play(); break;
+    case "continuous": playContinuous(); break;
+    case "restart": seek(0); break;
+    case "finish": if (scene) seek(scene.duration); break;
+    case "blank": toggleBlank(); break;
+    case "first": showPage(0); break;
+    case "last": showPage(activeMetadata().pages.length - 1); break;
+    case "theme":
+      pause();
+      theme = value;
+      ui.theme.value = value;
+      showPage(pageIndex, { keepTime: true });
+      break;
+    case "speed":
+      pause();
+      speed = value;
+      ui.speed.value = String(value);
+      setProgress();
+      sendState(true);
+      break;
+  }
+}
+
+function keyboardAction(event) {
+  if (event.altKey || event.metaKey || event.isComposing) return null;
+  if (event.ctrlKey) {
+    if (event.shiftKey) return null;
+    return event.key === "ArrowRight" ? "step-next" : event.key === "ArrowLeft" ? "step-back" : null;
+  }
+  if (event.shiftKey && ["ArrowRight", "ArrowLeft", "Home", "End", " "].includes(event.key)) return null;
+  switch (event.key.toLowerCase()) {
+    case "arrowright": case " ": return "next";
+    case "arrowleft": return "previous";
+    case "v": return "continuous";
+    case "a": return "play";
+    case "r": return "restart";
+    case "e": return "finish";
+    case "b": return "blank";
+    case "home": return "first";
+    case "end": return "last";
+    case "f": return "fullscreen";
+    case "p": return audience ? null : "presenter";
+    default: return null;
+  }
+}
+
+function invalidateRemote() {
+  connectionGeneration++;
+  latestRemote = null;
+  playing = false;
+  const previous = pageRender;
+  pageRender = null;
+  previous?.pdfTask?.cancel();
+  previous?.textLayer?.cancel();
+  previous?.finished.resolve();
+  ui.slide.setAttribute("aria-busy", "false");
+  ui.loading.hidden = currentPdfPage !== null;
+}
+
+function setConnection(connected, message = "Connecting to presenter…") {
+  if (audience && connected !== controllerConnected) invalidateRemote();
+  controllerConnected = connected;
+  document.documentElement.dataset.controllerConnected = String(connected);
+  ui.connection.hidden = connected || !audience;
+  ui.connection.textContent = connected ? "" : message;
+  if (!connected && audience) {
+    playing = false;
+    if (manifest) setProgress();
+  }
+}
+
+function selectChannel(identifier) {
+  if (audience) invalidateRemote();
+  channel?.close();
+  controllerId = identifier;
+  const name = identifier ? "derivation-html5-" + location.pathname + "-" + identifier : "";
+  document.documentElement.dataset.presentationChannel = name;
+  channel = name && "BroadcastChannel" in window ? new BroadcastChannel(name) : null;
+  const selected = channel;
+  if (selected) selected.onmessage = ({ data }) => {
+    if (selected !== channel) return;
+    if (data?.type === "request" && !audience) sendState(true);
+    else if (data?.type === "command" && !audience) submitCommand(data.action, data.value);
+    else if (data?.type === "state" && audience && controllerConnected) receiveRemote(data);
+    else if (data?.type === "disconnect" && audience) setConnection(false);
+  };
+}
+
+function requestPairing() {
+  if (!audience) return;
+  if (!window.opener || window.opener.closed) {
+    setConnection(false, "Presenter closed. Open a projector window from the presentation again.");
+    return;
+  }
+  if (performance.now() - lastControllerContact > 5000) setConnection(false);
+  // WindowProxy survives a reload. Only this projector's specific opener can
+  // supply a replacement channel; another same-deck presenter cannot adopt it.
+  window.opener.postMessage({ type: "derivation-connect", path: location.pathname }, "*");
+}
+
+function installPairing() {
+  selectChannel(controllerId);
+  setConnection(!audience);
+  window.addEventListener("message", (event) => {
+    const data = event.data;
+    // File documents send an opaque postMessage origin even when their
+    // location.origin is "file://". The exact opener and path still pair them.
+    const messageOrigin = location.protocol === "file:" ? "null" : location.origin;
+    if (event.origin !== messageOrigin || data?.path !== location.pathname) return;
+    if (audience) {
+      if (event.source !== window.opener || data.type !== "derivation-connected" ||
+          typeof data.controller !== "string" || !/^[0-9a-f]{32}$/.test(data.controller)) return;
+      lastControllerContact = performance.now();
+      if (data.controller !== controllerId || !channel) {
+        selectChannel(data.controller);
+        query.set("controller", controllerId);
+        history.replaceState(null, "", location.pathname + "?" + query + location.hash);
+      }
+      setConnection(data.ready === true);
+      if (controllerConnected) channel?.postMessage({ type: "request" });
+    } else if (data.type === "derivation-connect") {
+      // Reading opener is permitted across WindowProxy boundaries, including
+      // local-file windows; guard revoked/navigated references nevertheless.
+      try {
+        if (!event.source || event.source.opener !== window) return;
+      } catch { return; }
+      projectorWindow = event.source;
+      projectorWindow.postMessage({ type: "derivation-connected", path: location.pathname,
+        controller: controllerId, ready: currentPdfPage !== null }, "*");
+    }
+  });
+  const start = () => {
+    if (!channel) selectChannel(controllerId);
+    if (audience && pairingTimer === null) {
+      requestPairing();
+      pairingTimer = window.setInterval(requestPairing, 1000);
+    }
+  };
+  window.addEventListener("pagehide", () => {
+    if (!audience) channel?.postMessage({ type: "disconnect" });
+    else {
+      invalidateRemote();
+      setConnection(false);
+    }
+    if (pairingTimer !== null) window.clearInterval(pairingTimer);
+    pairingTimer = null;
+    channel?.close();
+    channel = null;
+  });
+  window.addEventListener("pageshow", start);
+  start();
+}
+
 function installControls() {
-  ui.previous.addEventListener("click", previous);
-  ui.next.addEventListener("click", next);
-  ui.play.addEventListener("click", play);
-  ui.restart.addEventListener("click", () => seek(0));
-  ui.stepBack.addEventListener("click", () => nextCheckpoint(-1));
-  ui.stepNext.addEventListener("click", () => nextCheckpoint(1));
-  ui.theme.addEventListener("change", async () => {
-    pause();
-    theme = ui.theme.value;
-    await showPage(pageIndex, { keepTime: true });
-  });
-  ui.speed.addEventListener("change", () => {
-    pause();
-    speed = Number(ui.speed.value);
-    setProgress();
-    sendState(true);
-  });
+  installPairing();
+  for (const [control, action] of [[ui.previous, "previous"], [ui.next, "next"],
+    [ui.play, "play"], [ui.restart, "restart"], [ui.stepBack, "step-back"], [ui.stepNext, "step-next"]]) {
+    control.addEventListener("click", () => submitCommand(action));
+  }
+  ui.theme.addEventListener("change", () => submitCommand("theme", ui.theme.value));
+  ui.speed.addEventListener("change", () => submitCommand("speed", Number(ui.speed.value)));
   ui.presenterMode.addEventListener("click", () => setPresenter(ui.presenter.hidden));
   ui.fullscreen.addEventListener("click", () => {
     if (document.fullscreenElement) document.exitFullscreen();
     else document.body.requestFullscreen().catch(errorMessage);
   });
   ui.projector.addEventListener("click", () => {
-    projectorRequested = true;
+    if (audience || !channel) return;
+    if (projectorWindow && !projectorWindow.closed) {
+      projectorWindow.focus();
+      sendState(true);
+      return;
+    }
     const url = location.pathname + "?audience=1&theme=" + encodeURIComponent(theme) +
+      "&controller=" + encodeURIComponent(controllerId) +
       "#p=" + String(pageIndex + 1);
-    const windowRef = window.open(url, "derivation-projector-" + location.pathname,
-                                 "popup,width=1280,height=960");
-    if (windowRef) windowRef.focus();
+    projectorWindow = window.open(url, "derivation-projector-" + controllerId,
+                                  "popup,width=1280,height=960");
+    if (projectorWindow) projectorWindow.focus();
     else errorMessage(new Error("Allow pop-up windows for this presentation, then click Open projector window again."));
     sendState(true);
   });
   window.addEventListener("keydown", (event) => {
-    if (event.target instanceof HTMLSelectElement || event.target instanceof HTMLInputElement) return;
-    if (event.key === "ArrowRight") {
-      event.preventDefault();
-      if (event.ctrlKey) nextCheckpoint(1);
-      else next();
-    } else if (event.key === "ArrowLeft") {
-      event.preventDefault();
-      if (event.ctrlKey) nextCheckpoint(-1);
-      else previous();
-    } else if (event.key === " ") {
-      event.preventDefault();
-      next();
-    } else if (event.key.toLowerCase() === "v") {
-      event.preventDefault();
-      playContinuous();
-    } else if (event.key.toLowerCase() === "a") {
-      event.preventDefault();
-      play();
-    } else if (event.key.toLowerCase() === "r") {
-      seek(0);
-    } else if (event.key.toLowerCase() === "e") {
-      if (scene) seek(scene.duration);
-    } else if (event.key.toLowerCase() === "f") {
-      ui.fullscreen.click();
-    } else if (event.key.toLowerCase() === "b") {
-      toggleBlank();
-    } else if (event.key.toLowerCase() === "p" && !audience) {
-      setPresenter(ui.presenter.hidden);
-    } else if (event.key === "Home") {
-      showPage(0);
-    } else if (event.key === "End") {
-      showPage(activeMetadata().pages.length - 1);
-    }
+    if (event.target instanceof HTMLSelectElement || event.target instanceof HTMLInputElement ||
+        event.target instanceof HTMLTextAreaElement || event.target?.isContentEditable) return;
+    const action = keyboardAction(event);
+    if (!action) return;
+    event.preventDefault();
+    // Fullscreen needs the receiving window's user gesture. Only document
+    // controls go through the presenter, never window-local layout actions.
+    if (action === "fullscreen") ui.fullscreen.click();
+    else if (action === "presenter") setPresenter(ui.presenter.hidden);
+    else submitCommand(action);
   });
-  if (channel) channel.onmessage = ({ data }) => {
-    if (data?.type === "request" && !audience) sendState(true);
-    else if (data?.type === "state" && audience) receiveRemote(data);
-  };
   new ResizeObserver(() => {
-    if (currentPdfPage) showPage(pageIndex, { keepTime: true });
+    if (currentPdfPage) showPage(pageRender?.page ?? pageIndex,
+      { keepTime: true, theme: pageRender?.theme ?? theme });
   }).observe(ui.projection);
 }
 
@@ -518,25 +707,28 @@ function setRemotePlayback(state) {
   }
 }
 
-// One serialized state consumer and one animation-frame request per window.
+// One serialized state consumer per connection and one animation-frame request.
 // Presenter's 10 Hz clock updates must not start competing RAF loops or
 // invalidate a PDF render that's still loading in the projector window.
 async function receiveRemote(data) {
+  if (!controllerConnected) return;
+  const generation = connectionGeneration;
+  const currentConnection = () => controllerConnected && generation === connectionGeneration;
   latestRemote = data;
-  if (applyingRemote) return;
-  applyingRemote = true;
+  if (applyingRemote === generation) return;
+  applyingRemote = generation;
   try {
-    while (latestRemote) {
+    while (currentConnection() && latestRemote) {
       const state = latestRemote;
       latestRemote = null;
       const changedTheme = state.theme !== theme;
-      if (changedTheme) theme = state.theme;
       if (changedTheme || ui.slide.dataset.renderedPage !== String(state.page + 1) ||
           ui.slide.dataset.renderedTheme !== state.theme) {
         playing = false;
-        await showPage(state.page, { keepTime: true, remoteState: state });
+        await showPage(state.page, { keepTime: true, theme: state.theme, remoteState: state });
       }
-      while (pageRender) await pageRender.finished.promise;
+      while (currentConnection() && pageRender) await pageRender.finished.promise;
+      if (!currentConnection()) return;
       // A newer state supersedes a stale one after any network/PDF wait.
       if (latestRemote) continue;
       if (ui.slide.dataset.renderedPage !== String(state.page + 1) ||
@@ -548,9 +740,9 @@ async function receiveRemote(data) {
       setProgress();
     }
   } catch (error) {
-    errorMessage(error);
+    if (currentConnection()) errorMessage(error);
   } finally {
-    applyingRemote = false;
+    if (applyingRemote === generation) applyingRemote = null;
   }
 }
 
@@ -575,7 +767,7 @@ async function init() {
   pageIndex = match ? Math.max(0, Number(match[1]) - 1) : 0;
   installControls();
   await showPage(pageIndex);
-  if (audience && channel) channel.postMessage({ type: "request" });
+  if (audience) requestPairing();
 }
 
 init().catch(errorMessage);
